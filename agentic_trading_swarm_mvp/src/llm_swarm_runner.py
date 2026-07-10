@@ -367,7 +367,12 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
 
 
 def run_sequential(packet: dict, memory: list[dict]) -> list[dict]:
-    return [run_agent(agent, packet, memory) for agent in AGENTS]
+    recommendations: list[dict] = []
+    for agent in AGENTS:
+        agent_packet = dict(packet)
+        agent_packet["current_cycle_recommendations"] = recommendations
+        recommendations.append(run_agent(agent, agent_packet, memory))
+    return recommendations
 
 
 def run_langgraph_if_available(packet: dict, memory: list[dict]) -> list[dict]:
@@ -379,7 +384,9 @@ def run_langgraph_if_available(packet: dict, memory: list[dict]) -> list[dict]:
     try:
         def make_node(agent: dict):
             def node(state: dict) -> dict:
-                state["recommendations"].append(run_agent(agent, state["packet"], state["memory"]))
+                agent_packet = dict(state["packet"])
+                agent_packet["current_cycle_recommendations"] = state["recommendations"]
+                state["recommendations"].append(run_agent(agent, agent_packet, state["memory"]))
                 return state
 
             return node
@@ -459,6 +466,11 @@ def write_recommendations(recommendations: list[dict], max_items: int, settings:
         if not write_fallback and _is_fallback_recommendation(rec)
     ]
     selected = actionable[:max_items]
+    action_package = {
+        "ranked_actions": selected,
+        "rejected_or_suppressed": suppressed[:max_items],
+        "collaboration_mode": "shared_current_cycle_state",
+    }
     with INBOX.open("a", encoding="utf-8") as fh:
         for rec in selected:
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
@@ -470,6 +482,7 @@ def write_recommendations(recommendations: list[dict], max_items: int, settings:
                 "recommendations": selected,
                 "suppressed_recommendations": suppressed,
                 "suppressed_count": len(suppressed),
+                "action_package": action_package,
             },
             indent=2,
         ),

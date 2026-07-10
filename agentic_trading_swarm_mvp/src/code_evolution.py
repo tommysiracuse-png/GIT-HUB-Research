@@ -22,6 +22,16 @@ import tempfile
 from typing import Any
 
 from cost_router import complete
+from evolution.archive import write_candidate_archive
+from evolution.canary import run_radar_canary, skip_canary
+from evolution.evaluator import classify_sandbox_failure, evaluate_candidate
+from evolution.worktree import (
+    cleanup_worktree,
+    commit_candidate,
+    create_candidate_worktree,
+    promote_candidate,
+    release_preflight,
+)
 from storage import (
     RUNS_DIR,
     add_code_evolution_proposal,
@@ -40,7 +50,8 @@ WORKSPACE_KEPT_STATUS = "workspace_kept"
 LEGACY_PROBATION_STATUS = "merged_probation"
 LEGACY_KEPT_STATUS = "kept"
 PROBATION_STATUSES = {LEGACY_PROBATION_STATUS, WORKSPACE_PROBATION_STATUS}
-SUCCESS_STATUSES = {LEGACY_PROBATION_STATUS, LEGACY_KEPT_STATUS, WORKSPACE_PROBATION_STATUS, WORKSPACE_KEPT_STATUS}
+RELEASE_SUCCESS_STATUSES = {"candidate_committed", "canary_running", "promoted"}
+SUCCESS_STATUSES = {LEGACY_PROBATION_STATUS, LEGACY_KEPT_STATUS, WORKSPACE_PROBATION_STATUS, WORKSPACE_KEPT_STATUS, *RELEASE_SUCCESS_STATUSES}
 
 ALLOWED_CATEGORIES = {
     "runtime_pipeline_integration",
@@ -424,6 +435,12 @@ def _cfg(settings: dict) -> dict:
         "duplicate_failure_suppression_after": 3,
         "allowed_categories": sorted(ALLOWED_CATEGORIES),
         "allowed_path_prefixes": DEFAULT_ALLOWED_PATH_PREFIXES,
+        "git_release_enabled": False,
+        "run_candidate_canary": False,
+        "promote_candidate_after_canary": False,
+        "release_worktree_dir": str(RUNS_DIR / "evolution_worktrees"),
+        "canary_timeout_seconds": 180,
+        "canary_max_latency_seconds": 180.0,
     }
     return {**defaults, **settings.get("code_evolution", {})}
 
@@ -2080,6 +2097,170 @@ def _added_files_from_diff(diff_text: str) -> dict[str, str]:
     return files
 
 
+def _run_candidate_tests(payload: dict, cfg: dict, app_root: pathlib.Path) -> dict:
+    commands = []
+    timeout = int(cfg.get("sandbox_timeout_seconds", 120))
+    for command in _test_commands(payload, cfg, root=app_root):
+        result = _run(command, app_root, timeout)
+        commands.append(result)
+        if result["returncode"] != 0:
+            return {"passed": False, "stage": "tests", "commands": commands}
+    return {"passed": True, "stage": "passed", "commands": commands}
+
+
+def _run_git_release_pipeline(
+    proposal_id: str,
+    diff_text: str,
+    payload: dict,
+    settings: dict,
+    safety: dict,
+    sandbox: dict,
+    root: pathlib.Path,
+) -> dict:
+    cfg = _cfg(settings)
+    base_dir = pathlib.Path(str(cfg.get("release_worktree_dir") or RUNS_DIR / "evolution_worktrees"))
+    base_dir.mkdir(parents=True, exist_ok=True)
+    release, preflight = create_candidate_worktree(
+        root,
+        proposal_id,
+        base_dir=base_dir,
+        timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+    )
+    if release is None:
+        return {
+            "status": "release_preflight_failed",
+            "release": preflight,
+            "tests": {"sandbox": sandbox},
+            "evaluation": {"release": preflight},
+        }
+
+    app_root = pathlib.Path(release.app_worktree_path)
+    apply_result = apply_patch_to_workspace(
+        diff_text,
+        root=app_root,
+        timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+        local_context_patch_apply=bool(cfg.get("local_context_patch_apply", True)),
+    )
+    tests: dict[str, Any] = {"sandbox": sandbox, "candidate_apply": apply_result}
+    if not apply_result.get("applied"):
+        release.status = "implementation_failed"
+        cleanup = cleanup_worktree(release, root)
+        return {
+            "status": "implementation_failed",
+            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "tests": tests,
+            "evaluation": {"release": release.as_metadata(), "reason": "candidate_apply_failed"},
+        }
+
+    dependency_install = _install_dependency_manifests_for_diff(
+        diff_text,
+        app_root,
+        timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+        enabled=bool(cfg.get("install_changed_python_dependencies", True)),
+    )
+    if dependency_install:
+        tests["candidate_dependency_install"] = dependency_install
+    if any(result["returncode"] != 0 for result in dependency_install):
+        release.status = "implementation_failed"
+        cleanup = cleanup_worktree(release, root)
+        return {
+            "status": "dependency_install_failed",
+            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "tests": tests,
+            "evaluation": {"release": release.as_metadata(), "reason": "candidate_dependency_install_failed"},
+        }
+
+    candidate_tests = _run_candidate_tests(payload, cfg, app_root)
+    tests["candidate_tests"] = candidate_tests
+    if not candidate_tests.get("passed"):
+        status = classify_sandbox_failure(candidate_tests)
+        release.status = "implementation_failed"
+        cleanup = cleanup_worktree(release, root)
+        return {
+            "status": status,
+            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "tests": tests,
+            "evaluation": {"release": release.as_metadata(), "reason": "candidate_tests_failed"},
+        }
+
+    release, commit_result = commit_candidate(
+        release,
+        f"Autonomous candidate {proposal_id}",
+        timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+    )
+    tests["candidate_commit"] = commit_result
+    if not commit_result.get("ok"):
+        release.status = "implementation_failed"
+        cleanup = cleanup_worktree(release, root)
+        return {
+            "status": "implementation_failed",
+            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "tests": tests,
+            "evaluation": {"release": release.as_metadata(), "reason": commit_result.get("reason")},
+        }
+
+    canary = (
+        run_radar_canary(
+            app_root,
+            timeout_seconds=int(cfg.get("canary_timeout_seconds", 180)),
+            max_latency_seconds=float(cfg.get("canary_max_latency_seconds", 180.0)),
+        )
+        if cfg.get("run_candidate_canary", False)
+        else skip_canary("candidate_canary_disabled")
+    )
+    release.canary = canary
+    gate = evaluate_candidate(
+        sandbox={"passed": True, "stage": "passed", "commands": tests.get("candidate_tests", {}).get("commands", [])},
+        canary=canary,
+        category=str(safety.get("category") or ""),
+        changed_files=list(safety.get("changed_files") or []),
+    )
+    evaluation = {"release": release.as_metadata(), "gate": gate}
+    if not gate.get("passed"):
+        release.status = str(gate.get("status") or "archived_failed")
+        cleanup = cleanup_worktree(release, root)
+        return {
+            "status": release.status,
+            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "tests": tests,
+            "canary": canary,
+            "evaluation": evaluation,
+        }
+
+    if cfg.get("promote_candidate_after_canary", False):
+        release, promotion = promote_candidate(
+            release,
+            root,
+            timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+        )
+        evaluation["promotion"] = promotion
+        if not promotion.get("ok"):
+            release.status = "archived_failed"
+            cleanup = cleanup_worktree(release, root)
+            return {
+                "status": "archived_failed",
+                "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+                "tests": tests,
+                "canary": canary,
+                "evaluation": evaluation,
+            }
+        status = "promoted"
+    else:
+        status = "candidate_committed"
+
+    archive_path = RUNS_DIR / "candidate_archive.jsonl"
+    metadata = {**release.as_metadata(), "preflight": preflight, "status": status}
+    write_candidate_archive(archive_path, metadata)
+    cleanup = cleanup_worktree(release, root)
+    return {
+        "status": status,
+        "release": {**metadata, "cleanup": cleanup},
+        "tests": tests,
+        "canary": canary,
+        "evaluation": evaluation,
+    }
+
+
 def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, root: pathlib.Path = ROOT) -> list[dict]:
     payload = dict(rec.get("payload") or {})
     cfg = _cfg(settings)
@@ -2173,6 +2354,27 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         )
         _append_ledger(conn, proposal_id, safety["decision"])
         return [_artifact(proposal_id, "created", safety["decision"], safety.get("reasons"))]
+
+    if cfg.get("git_release_enabled", False):
+        release_gate = release_preflight(root)
+        if not release_gate.get("ok"):
+            safety = validate_and_scan(payload, diff_text, settings, preflight=preflight)
+            safety["allowed"] = False
+            safety["decision"] = "release_preflight_failed"
+            safety["release_preflight"] = release_gate
+            update_code_evolution_proposal(
+                conn,
+                proposal_id,
+                patch_text=diff_text or None,
+                changed_files=safety.get("changed_files", []),
+                safety={**safety, "patch_generation": patch_generation},
+                status="release_preflight_failed",
+                evaluation={"release": release_gate},
+                parent_commit=release_gate.get("parent_commit"),
+            )
+            _append_ledger(conn, proposal_id, "release_preflight_failed")
+            return [_artifact(proposal_id, "created", "release_preflight_failed", [str(release_gate.get("reason"))])]
+
     if not diff_text and cfg.get("generate_patch_when_missing", True):
         planned_tier = _patch_generation_tier(payload, settings, preflight=preflight)
         if planned_tier == "frontier":
@@ -2295,19 +2497,50 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
                 status=safety["decision"],
             )
     if not sandbox.get("passed"):
-        safety = _with_frontier_usefulness(safety, "discarded_test_failure", patch_generation)
+        failure_status = classify_sandbox_failure(sandbox)
+        safety = _with_frontier_usefulness(safety, failure_status, patch_generation)
         safety["patch_generation"] = patch_generation
         if repair_history:
             safety["repair_history"] = repair_history
         update_code_evolution_proposal(
             conn,
             proposal_id,
-            status="discarded_test_failure",
+            status=failure_status,
             safety=safety,
             tests={**sandbox, "repair_history": repair_history} if repair_history else sandbox,
         )
-        _append_ledger(conn, proposal_id, "discarded_test_failure")
-        return [_artifact(proposal_id, "created", "discarded_test_failure")]
+        _append_ledger(conn, proposal_id, failure_status)
+        return [_artifact(proposal_id, "created", failure_status)]
+
+    if cfg.get("git_release_enabled", False):
+        release_result = _run_git_release_pipeline(proposal_id, diff_text, payload, settings, safety, sandbox, root)
+        release_info = release_result.get("release") or {}
+        status = str(release_result.get("status") or "implementation_failed")
+        safety = _with_frontier_usefulness(safety, status, patch_generation)
+        safety["patch_generation"] = patch_generation
+        safety["release"] = release_info
+        if repair_history:
+            safety["repair_history"] = repair_history
+        update_code_evolution_proposal(
+            conn,
+            proposal_id,
+            status=status,
+            patch_text=diff_text,
+            changed_files=safety.get("changed_files", []),
+            safety=safety,
+            tests=release_result.get("tests") or {"sandbox": sandbox},
+            evaluation=release_result.get("evaluation") or {"release": release_info},
+            parent_commit=release_info.get("parent_commit"),
+            candidate_commit=release_info.get("candidate_commit"),
+            branch_name=release_info.get("branch_name"),
+            worktree_path=release_info.get("worktree_path"),
+            canary=release_result.get("canary"),
+            promotion_reason=release_info.get("promotion_reason"),
+            applied_at=_utc_now() if status == "promoted" else None,
+            probation_loops_observed=0,
+        )
+        _append_ledger(conn, proposal_id, status)
+        return [_artifact(proposal_id, "created", status)]
 
     apply_result = apply_patch_to_workspace(
         diff_text,

@@ -214,6 +214,9 @@ DEFAULT_SETTINGS = {
     },
     "code_evolution": {
         "enabled": True,
+        "git_release_enabled": True,
+        "run_candidate_canary": True,
+        "promote_candidate_after_canary": True,
         "workspace_status_names": True,
         "auto_merge_paper_only": True,
         "max_auto_merges_per_loop": 12,
@@ -257,6 +260,9 @@ DEFAULT_SETTINGS = {
     },
     "hunter_directive_hygiene": {
         "enabled": True,
+    },
+    "hunter_allocation": {
+        "buckets": {"exploit": 0.5, "explore": 0.3, "diagnose": 0.2},
     },
     "signal_safety": {
         "enabled": True,

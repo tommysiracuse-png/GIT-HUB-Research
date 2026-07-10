@@ -156,6 +156,9 @@
     "demotion_avg_bps": -5.0,
     "decay_recent_vs_lifetime_bps": -10.0
   },
+  "hunter_allocation": {
+    "buckets": {"exploit": 0.5, "explore": 0.3, "diagnose": 0.2}
+  },
   "llm_bridge": {
     "enabled": true,
     "ingest_recommendations": true,
@@ -208,6 +211,9 @@
   },
   "code_evolution": {
     "enabled": true,
+    "git_release_enabled": true,
+    "run_candidate_canary": true,
+    "promote_candidate_after_canary": true,
     "workspace_status_names": true,
     "auto_merge_paper_only": true,
     "max_auto_merges_per_loop": 12,

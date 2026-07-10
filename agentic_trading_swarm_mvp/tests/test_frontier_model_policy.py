@@ -211,6 +211,28 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(rec["code_change"]["implementation_mode"], "runtime_active")
         self.assertIn("src/frontier_crypto_adapter.py", rec["code_change"]["expected_files"])
 
+    def test_sequential_swarm_passes_prior_outputs_to_later_agents(self) -> None:
+        seen_counts: list[int] = []
+
+        def fake_run_agent(agent: dict, packet: dict, _memory: list[dict]) -> dict:
+            seen_counts.append(len(packet.get("current_cycle_recommendations") or []))
+            return {
+                "action": "propose_hunter_directive",
+                "priority": 50,
+                "title": agent["name"],
+                "rationale": "unit test",
+                "market_key": agent["name"],
+                "evidence": {},
+                "proposed_change": "unit test",
+                "agent_name": agent["name"],
+            }
+
+        with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=fake_run_agent):
+            recs = llm_swarm_runner.run_sequential({"allowed_recommendation_actions": ["propose_hunter_directive"]}, [])
+
+        self.assertEqual(len(recs), len(llm_swarm_runner.AGENTS))
+        self.assertEqual(seen_counts, [0, 1, 2, 3, 4])
+
     def test_swarm_suppresses_fallback_recommendations_from_inbox(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_inbox = llm_swarm_runner.INBOX

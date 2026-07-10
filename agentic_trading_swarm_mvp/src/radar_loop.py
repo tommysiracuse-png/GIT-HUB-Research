@@ -26,6 +26,7 @@ from execution_engine import execute_order
 from frontier_crypto_adapter import REPORT_JSON as FRONTIER_CRYPTO_REPORT_JSON
 from frontier_crypto_adapter import build_scan_batch as build_frontier_crypto_scan_batch
 from global_proxy_scanner import build_scan_batch as build_global_proxy_scan_batch
+from hunter_allocation import allocate_candidate_review
 from learning import load_adjustments, stats_snapshot, update_signal_stats
 from llm_bridge import ingest_llm_recommendations, write_llm_state_packet
 from llm_swarm_runner import run_once as run_llm_swarm_once
@@ -57,6 +58,7 @@ from storage import (
     has_open_trade,
     llm_inbox_summary,
     llm_cost_summary,
+    open_hunter_directives,
     open_experiments,
     open_trade_instruments,
     open_signal_trial_instruments,
@@ -239,10 +241,16 @@ def run_once(settings: dict) -> dict:
         signal_safety_governor = run_signal_safety_governor(conn, settings)
         contextual_failure_filters = run_contextual_failure_filters(conn, settings)
         policies = active_signal_policies(conn)
+        review_candidates, hunter_allocation = allocate_candidate_review(
+            candidates,
+            open_hunter_directives(conn),
+            int(scan_cfg["review_top"]),
+            buckets=settings.get("hunter_allocation", {}).get("buckets"),
+        )
 
         reviewed = []
         opened = []
-        for candidate in candidates[: int(scan_cfg["review_top"])]:
+        for candidate in review_candidates:
             review = review_candidate(candidate, settings, adjustments, policies=policies)
             save_opportunity(conn, candidate, review)
             record_review_policy_effects(conn, review)
@@ -328,6 +336,7 @@ def run_once(settings: dict) -> dict:
             "signal_safety_governor": signal_safety_governor,
             "contextual_failure_filters": contextual_failure_filters,
             "strategy_reliability": strategy_reliability,
+            "hunter_allocation": hunter_allocation,
             "auxiliary_runtime": auxiliary_policy,
         }
         payload["market_hunter_directives"] = run_market_hunter(conn, settings)

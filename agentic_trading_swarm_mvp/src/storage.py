@@ -207,11 +207,23 @@ def init_db(conn: sqlite3.Connection) -> None:
             safety_json text not null default '{}',
             tests_json text not null default '{}',
             evaluation_json text not null default '{}',
+            parent_commit text,
+            candidate_commit text,
+            branch_name text,
+            worktree_path text,
+            canary_json text not null default '{}',
+            promotion_reason text,
             applied_at text,
             probation_loops_observed integer not null default 0
         )
         """
     )
+    _ensure_column(conn, "code_evolution_proposals", "parent_commit", "text")
+    _ensure_column(conn, "code_evolution_proposals", "candidate_commit", "text")
+    _ensure_column(conn, "code_evolution_proposals", "branch_name", "text")
+    _ensure_column(conn, "code_evolution_proposals", "worktree_path", "text")
+    _ensure_column(conn, "code_evolution_proposals", "canary_json", "text not null default '{}'")
+    _ensure_column(conn, "code_evolution_proposals", "promotion_reason", "text")
     conn.execute(
         """
         create table if not exists memory_facts (
@@ -1498,6 +1510,12 @@ def update_code_evolution_proposal(
     safety: dict | None = None,
     tests: dict | None = None,
     evaluation: dict | None = None,
+    parent_commit: str | None = None,
+    candidate_commit: str | None = None,
+    branch_name: str | None = None,
+    worktree_path: str | None = None,
+    canary: dict | None = None,
+    promotion_reason: str | None = None,
     applied_at: str | None = None,
     probation_loops_observed: int | None = None,
 ) -> None:
@@ -1521,6 +1539,12 @@ def update_code_evolution_proposal(
             safety_json = ?,
             tests_json = ?,
             evaluation_json = ?,
+            parent_commit = ?,
+            candidate_commit = ?,
+            branch_name = ?,
+            worktree_path = ?,
+            canary_json = ?,
+            promotion_reason = ?,
             applied_at = ?,
             probation_loops_observed = ?
         where proposal_id = ?
@@ -1534,6 +1558,12 @@ def update_code_evolution_proposal(
             json.dumps(safety, sort_keys=True) if safety is not None else current["safety_json"],
             json.dumps(tests, sort_keys=True) if tests is not None else current["tests_json"],
             json.dumps(evaluation, sort_keys=True) if evaluation is not None else current["evaluation_json"],
+            parent_commit if parent_commit is not None else current.get("parent_commit"),
+            candidate_commit if candidate_commit is not None else current.get("candidate_commit"),
+            branch_name if branch_name is not None else current.get("branch_name"),
+            worktree_path if worktree_path is not None else current.get("worktree_path"),
+            json.dumps(canary, sort_keys=True) if canary is not None else current.get("canary_json", "{}"),
+            promotion_reason if promotion_reason is not None else current.get("promotion_reason"),
             applied_at if applied_at is not None else current["applied_at"],
             int(probation_loops_observed)
             if probation_loops_observed is not None
@@ -1546,7 +1576,7 @@ def update_code_evolution_proposal(
 
 def _decode_code_evolution_row(row: sqlite3.Row) -> dict:
     item = dict(row)
-    for key in ("payload_json", "evidence_json", "changed_files_json", "safety_json", "tests_json", "evaluation_json"):
+    for key in ("payload_json", "evidence_json", "changed_files_json", "safety_json", "tests_json", "evaluation_json", "canary_json"):
         target = key.removesuffix("_json")
         try:
             item[target] = json.loads(item.pop(key) or "{}")
