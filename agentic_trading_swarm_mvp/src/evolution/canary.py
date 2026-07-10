@@ -52,5 +52,5 @@ def run_radar_canary(app_root: pathlib.Path, *, timeout_seconds: int = 180, max_
     }
 
 
-def skip_canary(reason: str) -> dict[str, Any]:
-    return {"passed": True, "stage": "skipped", "reason": reason}
+def skip_canary(reason: str, *, stage: str = "deferred_by_policy") -> dict[str, Any]:
+    return {"passed": True, "stage": stage, "reason": reason}

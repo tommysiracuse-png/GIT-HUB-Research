@@ -215,7 +215,7 @@ DEFAULT_SETTINGS = {
     "code_evolution": {
         "enabled": True,
         "git_release_enabled": True,
-        "run_candidate_canary": True,
+        "run_candidate_canary": False,
         "promote_candidate_after_canary": True,
         "workspace_status_names": True,
         "auto_merge_paper_only": True,

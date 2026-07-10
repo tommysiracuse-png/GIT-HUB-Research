@@ -2,7 +2,9 @@
 
 import json
 import pathlib
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -388,8 +390,61 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
             )()
             diff, meta = code_evolution.generate_patch_with_frontier_model(payload, settings())
         self.assertIn("src/frontier_crypto_adapter.py", complete.call_args.args[1])
+        self.assertIn("BUILDER_CONTEXT version=1", complete.call_args.args[1])
         self.assertTrue(diff.startswith("diff --git"))
         self.assertEqual(meta["status"], "model_call:responses")
+        self.assertEqual(meta["builder_context"]["version"], 1)
+
+    def test_patch_repair_reloads_current_builder_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "repo"
+            root.mkdir()
+            (root / "src").mkdir()
+            (root / "src" / "llm_bridge.py").write_text(
+                "def current_function():\n"
+                "    return 'current file text'\n",
+                encoding="utf-8",
+            )
+            payload = proposal(
+                "",
+                expected_files=["src/llm_bridge.py"],
+                change_category="llm_prompt_state_packet",
+                tests_to_run=[],
+            )
+            diff = """diff --git a/src/llm_bridge.py b/src/llm_bridge.py
+--- a/src/llm_bridge.py
++++ b/src/llm_bridge.py
+@@ -99 +99,2 @@
+ missing stale line
++paper-only note
+"""
+            with mock.patch.object(code_evolution, "complete") as complete:
+                complete.return_value = type(
+                    "Result",
+                    (),
+                    {
+                        "text": "diff --git a/src/llm_bridge.py b/src/llm_bridge.py\n",
+                        "status": "model_call:responses",
+                        "model_name": "openai/gpt-5.4-mini",
+                        "model_tier": "fast",
+                        "estimated_cost_usd": 0.0,
+                        "prompt_tokens": 10,
+                        "completion_tokens": 10,
+                    },
+                )()
+                _repaired, meta = code_evolution.repair_patch_with_frontier_model(
+                    payload,
+                    settings(repair_patch_tier="fast"),
+                    diff,
+                    {"stage": "patch_check", "commands": [{"stderr_tail": "patch failed"}]},
+                    root=root,
+                )
+
+        prompt = complete.call_args.args[1]
+        self.assertIn("BUILDER_CONTEXT version=1", prompt)
+        self.assertIn("current_function", prompt)
+        self.assertIn("current file text", prompt)
+        self.assertEqual(meta["builder_context"]["files"][0]["path"], "src/llm_bridge.py")
 
     def test_preflight_repairs_known_bad_paths(self) -> None:
         payload = proposal(
@@ -912,6 +967,48 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
         self.assertEqual(report["normalized_statuses"], {"no_changed_files": 1})
         self.assertEqual(row["status"], "no_changed_files")
 
+    def test_report_exposes_deferred_canary_and_failure_benchmark(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = pathlib.Path(tmp) / "radar.sqlite"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            old_json = code_evolution.REPORT_JSON
+            old_md = code_evolution.REPORT_MD
+            try:
+                code_evolution.REPORT_JSON = pathlib.Path(tmp) / "evolution.json"
+                code_evolution.REPORT_MD = pathlib.Path(tmp) / "evolution.md"
+                storage.add_code_evolution_proposal(
+                    conn,
+                    "proposal-deferred",
+                    "rec-deferred",
+                    "build_planner",
+                    "openai/gpt-5.4-mini",
+                    "fast",
+                    None,
+                    "Fast path",
+                    "llm_prompt_state_packet",
+                    90,
+                    proposal("", expected_files=["src/llm_bridge.py"], change_category="llm_prompt_state_packet"),
+                    {},
+                )
+                storage.update_code_evolution_proposal(
+                    conn,
+                    "proposal-deferred",
+                    status="promoted",
+                    safety={"reasons": []},
+                    canary={"passed": True, "stage": "deferred_by_policy", "reason": "candidate_canary_disabled"},
+                )
+                report = code_evolution.write_code_evolution_reports(conn, settings())
+            finally:
+                code_evolution.REPORT_JSON = old_json
+                code_evolution.REPORT_MD = old_md
+                conn.close()
+
+        summary = report["summary"]
+        self.assertEqual(summary["canary_stage_counts"]["deferred_by_policy"], 1)
+        self.assertIn("failure_benchmark", summary)
+
     def test_duplicate_structural_failures_are_suppressed_before_model_spend(self) -> None:
         payload = proposal(
             "",
@@ -1016,6 +1113,79 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                 conn.close()
         self.assertEqual(rows[0]["status"], "workspace_applied_probation")
         self.assertEqual(rows[0]["changed_files"], ["src/llm_bridge.py"])
+
+    @unittest.skipUnless(shutil.which("git"), "git executable is required")
+    def test_git_release_promotes_after_sandbox_when_canary_is_deferred(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp) / "repo"
+            app = repo / "agentic_trading_swarm_mvp"
+            (app / "src").mkdir(parents=True)
+            (app / "tests").mkdir()
+            (app / "config").mkdir()
+            (app / "src" / "llm_bridge.py").write_text("# bridge\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "codex@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Codex Test"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "tag", "champion/test"], cwd=repo, check=True)
+            conn = sqlite3.connect(pathlib.Path(tmp) / "radar.sqlite")
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            old_runs = code_evolution.RUNS_DIR
+            old_ledger = code_evolution.LEDGER_JSONL
+            code_evolution.RUNS_DIR = pathlib.Path(tmp) / "runs"
+            code_evolution.LEDGER_JSONL = code_evolution.RUNS_DIR / "evolution_ledger.jsonl"
+            diff = """diff --git a/src/llm_bridge.py b/src/llm_bridge.py
+--- a/src/llm_bridge.py
++++ b/src/llm_bridge.py
+@@ -1 +1,2 @@
+ # bridge
++FAST_PROMOTION_MARKER = True
+"""
+            try:
+                rec = {
+                    "recommendation_id": "rec-fast-release",
+                    "title": "Fast release",
+                    "payload": proposal(
+                        diff,
+                        expected_files=["src/llm_bridge.py"],
+                        change_category="llm_prompt_state_packet",
+                        tests_to_run=[],
+                    ),
+                }
+                created = code_evolution.process_code_change_recommendation(
+                    conn,
+                    rec,
+                    settings(
+                        git_release_enabled=True,
+                        run_candidate_canary=False,
+                        promote_candidate_after_canary=True,
+                        run_full_regression=False,
+                        release_worktree_dir=str(pathlib.Path(tmp) / "worktrees"),
+                    ),
+                    root=app,
+                )
+                row = storage.code_evolution_recent(conn)[0]
+            finally:
+                code_evolution.RUNS_DIR = old_runs
+                code_evolution.LEDGER_JSONL = old_ledger
+                conn.close()
+            updated_text = (app / "src" / "llm_bridge.py").read_text(encoding="utf-8")
+            latest = subprocess.run(
+                ["git", "rev-parse", "champion/latest"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        self.assertEqual(created[0]["status"], "promoted")
+        self.assertEqual(row["status"], "promoted")
+        self.assertEqual(row["canary"]["stage"], "deferred_by_policy")
+        self.assertTrue(row["candidate_commit"])
+        self.assertIn("FAST_PROMOTION_MARKER", updated_text)
+        self.assertEqual(latest, row["candidate_commit"])
 
     def test_pytest_paths_are_translated_to_safe_unittest_commands(self) -> None:
         payload = proposal(

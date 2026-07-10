@@ -52,7 +52,9 @@ class EvolutionCanaryTests(unittest.TestCase):
             self.assertFalse(canary["live_flag_ok"])
 
     def test_skip_canary_records_passed_skip_reason(self) -> None:
-        self.assertEqual(skip_canary("unit")["reason"], "unit")
+        skipped = skip_canary("unit")
+        self.assertEqual(skipped["reason"], "unit")
+        self.assertEqual(skipped["stage"], "deferred_by_policy")
 
 
 if __name__ == "__main__":

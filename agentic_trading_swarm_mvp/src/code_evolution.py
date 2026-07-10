@@ -23,8 +23,14 @@ from typing import Any
 
 from cost_router import complete
 from evolution.archive import write_candidate_archive
+from evolution.builder_context import build_builder_context, render_builder_context
 from evolution.canary import run_radar_canary, skip_canary
-from evolution.evaluator import classify_sandbox_failure, evaluate_candidate
+from evolution.evaluator import (
+    benchmark_builder_change,
+    classify_sandbox_failure,
+    evaluate_candidate,
+    run_builder_failure_benchmark,
+)
 from evolution.worktree import (
     cleanup_worktree,
     commit_candidate,
@@ -672,6 +678,80 @@ def rewrite_diff_paths(diff_text: str) -> str:
             line = "rename to " + rewrite_header_path(line[len("rename to ") :].strip())
         repaired.append(line)
     return "\n".join(repaired) + ("\n" if diff_text.endswith("\n") else "")
+
+
+def _prefix_diff_paths(diff_text: str, prefix: str) -> str:
+    prefix = prefix.replace("\\", "/").strip("/")
+    if not prefix or not diff_text.strip():
+        return diff_text
+
+    def prefix_token(token: str) -> str:
+        if token == "/dev/null":
+            return token
+        token_prefix = ""
+        body = token
+        if token.startswith("a/") or token.startswith("b/"):
+            token_prefix, body = token[:2], token[2:]
+        if body.startswith(f"{prefix}/"):
+            return token
+        return f"{token_prefix}{prefix}/{body}"
+
+    def prefix_header_path(value: str) -> str:
+        path, sep, suffix = value.partition("\t")
+        return prefix_token(path) + (sep + suffix if sep else "")
+
+    repaired: list[str] = []
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                parts[2] = prefix_token(parts[2])
+                parts[3] = prefix_token(parts[3])
+                line = " ".join(parts)
+        elif line.startswith("--- ") or line.startswith("+++ "):
+            line = line[:4] + prefix_header_path(line[4:].strip())
+        elif line.startswith("rename from "):
+            line = "rename from " + prefix_header_path(line[len("rename from ") :].strip())
+        elif line.startswith("rename to "):
+            line = "rename to " + prefix_header_path(line[len("rename to ") :].strip())
+        repaired.append(line)
+    return "\n".join(repaired) + ("\n" if diff_text.endswith("\n") else "")
+
+
+def _git_toplevel(root: pathlib.Path, timeout: int = 30) -> pathlib.Path | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            shell=False,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    top = completed.stdout.strip()
+    return pathlib.Path(top) if top else None
+
+
+def _patch_apply_location(root: pathlib.Path, diff_text: str, timeout: int) -> tuple[pathlib.Path, str, str | None]:
+    top = _git_toplevel(root, timeout=timeout)
+    if top is None:
+        return root, diff_text, None
+    try:
+        root_resolved = root.resolve()
+        top_resolved = top.resolve()
+    except OSError:
+        return root, diff_text, None
+    if root_resolved == top_resolved:
+        return root, diff_text, None
+    try:
+        prefix = root_resolved.relative_to(top_resolved).as_posix()
+    except ValueError:
+        return root, diff_text, None
+    return top, _prefix_diff_paths(diff_text, prefix), prefix
 
 
 def _looks_like_unified_diff(diff_text: str) -> bool:
@@ -1416,6 +1496,27 @@ def _path_blocked(path: str, cfg: dict) -> bool:
     return not any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in allowed)
 
 
+def _command_display(command: list[str]) -> str:
+    return " ".join(str(part) for part in command)
+
+
+def _builder_context_metadata(context: dict) -> dict:
+    return {
+        "version": context.get("version"),
+        "likely_tests": context.get("likely_tests", []),
+        "files": [
+            {
+                "path": entry.get("path"),
+                "exists": entry.get("exists"),
+                "sha256": entry.get("sha256"),
+                "symbols": entry.get("symbols", [])[:20],
+                "truncated": entry.get("truncated", False),
+            }
+            for entry in context.get("files", [])
+        ],
+    }
+
+
 def generate_patch_with_frontier_model(
     payload: dict,
     settings: dict,
@@ -1442,17 +1543,13 @@ def generate_patch_with_frontier_model(
     patch_tier = _patch_generation_tier(payload, settings, preflight=preflight)
     reasoning_effort = _patch_reasoning_effort(patch_tier)
     max_chars = int(cfg.get("patch_generation_max_file_chars", 12000))
-    contexts = []
-    for rel in safe_files:
-        path = root / rel
-        if not path.exists() or not path.is_file():
-            contexts.append(f"--- {rel}\n<missing file>")
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")[:max_chars]
-        except OSError as exc:
-            text = f"<read failed: {exc}>"
-        contexts.append(f"--- {rel}\n{text}")
+    builder_context = build_builder_context(
+        root,
+        safe_files,
+        max_chars=max_chars,
+        likely_tests=[_command_display(command) for command in _test_commands(payload, {**cfg, "run_full_regression": False}, root=root)],
+    )
+    rendered_context = render_builder_context(builder_context)
 
     system = (
         "You are the Build Planner for a paper-only trading research system. "
@@ -1470,7 +1567,7 @@ def generate_patch_with_frontier_model(
         "- wiring existing helper code into the normal paper runner/report/LLM packet is allowed;\n"
         "- fixing or improving prior generated paper-only code is allowed;\n"
         "- feature-flag paper-only scoring, policy, variant, and adapter changes when behavior could affect trades;\n"
-        "- use exact current file context from FILE CONTEXT;\n"
+        "- use exact current file context, hashes, and symbols from BUILDER_CONTEXT;\n"
         "- return a valid `git apply` compatible unified diff with exact hunk headers;\n"
         "- do not use placeholder hunks like `@@?`, ellipses, omitted context, or prose outside the diff;\n"
         "- include complete added files and complete modified hunks; no truncated patches;\n"
@@ -1478,7 +1575,7 @@ def generate_patch_with_frontier_model(
         "- if the proposal is too large, implement the highest-value safe part that is actually used by runtime code.\n\n"
         f"PREFLIGHT:\n{json.dumps(preflight, sort_keys=True)}\n\n"
         f"PROPOSAL:\n{json.dumps(payload, sort_keys=True)}\n\n"
-        f"FILE CONTEXT:\n{chr(10).join(contexts)}"
+        f"{rendered_context}"
     )
     result = complete(
         "build_planner",
@@ -1508,6 +1605,7 @@ def generate_patch_with_frontier_model(
         "estimated_cost_usd": result.estimated_cost_usd,
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
+        "builder_context": _builder_context_metadata(builder_context),
         "returned_patch_format": "unified_diff" if _looks_like_unified_diff(generated_text) else "invalid_or_empty",
     }
 
@@ -1537,17 +1635,13 @@ def repair_patch_with_frontier_model(
         return "", {"status": "skipped", "reason": "no_safe_files_for_repair"}
 
     max_chars = int(cfg.get("patch_generation_max_file_chars", 12000))
-    contexts = []
-    for rel in safe_files:
-        path = root / rel
-        if not path.exists() or not path.is_file():
-            contexts.append(f"--- {rel}\n<missing file>")
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")[:max_chars]
-        except OSError as exc:
-            text = f"<read failed: {exc}>"
-        contexts.append(f"--- {rel}\n{text}")
+    builder_context = build_builder_context(
+        root,
+        safe_files,
+        max_chars=max_chars,
+        likely_tests=[_command_display(command) for command in _test_commands(payload, {**cfg, "run_full_regression": False}, root=root)],
+    )
+    rendered_context = render_builder_context(builder_context)
 
     commands = failure.get("commands") if isinstance(failure, dict) else []
     error_tail = ""
@@ -1562,7 +1656,7 @@ def repair_patch_with_frontier_model(
     )
     prompt = (
         f"The previous safe-scope patch failed at sandbox stage `{failure_stage}`. "
-        "Return a corrected full unified diff only, using the exact current file context. "
+        "Return a corrected full unified diff only, using the exact current BUILDER_CONTEXT. "
         "Keep the same intended paper-only behavior and touch only the same safe files. "
         "Use valid `git apply` compatible hunk headers, no `@@?` placeholders, no ellipses, "
         "and no prose outside the diff. If tests failed, fix the patch so the requested "
@@ -1570,7 +1664,7 @@ def repair_patch_with_frontier_model(
         f"APPLY_ERROR:\n{error_tail}\n\n"
         f"PROPOSAL:\n{json.dumps(payload, sort_keys=True)}\n\n"
         f"FAILED_DIFF:\n{diff_text[:20000]}\n\n"
-        f"CURRENT_FILE_CONTEXT:\n{chr(10).join(contexts)}"
+        f"{rendered_context}"
     )
     category = _normalize_category(_field(payload, "change_category", "category"))
     repair_tier = str(cfg.get("repair_patch_tier", cfg.get("standard_patch_tier", "fast")))
@@ -1602,6 +1696,7 @@ def repair_patch_with_frontier_model(
         "estimated_cost_usd": result.estimated_cost_usd,
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
+        "builder_context": _builder_context_metadata(builder_context),
         "returned_patch_format": "unified_diff" if _looks_like_unified_diff(repaired_text) else "invalid_or_empty",
     }
 
@@ -2000,17 +2095,20 @@ def apply_patch_to_workspace(
     local_context_patch_apply: bool = True,
 ) -> dict:
     diff_text = rewrite_diff_paths(diff_text)
+    apply_root, apply_diff, apply_prefix = _patch_apply_location(root, diff_text, timeout)
     with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".patch") as fh:
-        fh.write(diff_text)
+        fh.write(apply_diff)
         patch_name = fh.name
     try:
-        check = _run(["git", "apply", "--check", "--recount", patch_name], root, timeout)
+        check = _run(["git", "apply", "--check", "--recount", patch_name], apply_root, timeout)
         if check["returncode"] == 0:
-            apply = _run(["git", "apply", "--recount", patch_name], root, timeout)
+            apply = _run(["git", "apply", "--recount", patch_name], apply_root, timeout)
             materialized = _materialize_added_files_if_missing(diff_text, root) if apply["returncode"] == 0 else []
             return {
                 "applied": apply["returncode"] == 0,
                 "stage": "patch_apply",
+                "apply_root": str(apply_root),
+                "app_path_prefix": apply_prefix,
                 "commands": [check, apply],
                 "materialized_added_files": materialized,
             }
@@ -2018,6 +2116,8 @@ def apply_patch_to_workspace(
         return {
             "applied": internal["returncode"] == 0,
             "stage": "internal_context_apply" if internal["returncode"] == 0 else "patch_check",
+            "apply_root": str(root),
+            "app_path_prefix": None,
             "commands": [check, internal],
             "materialized_added_files": [],
         }
@@ -2030,15 +2130,28 @@ def apply_patch_to_workspace(
 
 def reverse_patch_in_workspace(diff_text: str, root: pathlib.Path = ROOT, timeout: int = 120) -> dict:
     diff_text = rewrite_diff_paths(diff_text)
+    apply_root, apply_diff, apply_prefix = _patch_apply_location(root, diff_text, timeout)
     with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".patch") as fh:
-        fh.write(diff_text)
+        fh.write(apply_diff)
         patch_name = fh.name
     try:
-        check = _run(["git", "apply", "-R", "--check", "--recount", patch_name], root, timeout)
+        check = _run(["git", "apply", "-R", "--check", "--recount", patch_name], apply_root, timeout)
         if check["returncode"] != 0:
-            return {"reverted": False, "stage": "reverse_check", "commands": [check]}
-        apply = _run(["git", "apply", "-R", "--recount", patch_name], root, timeout)
-        return {"reverted": apply["returncode"] == 0, "stage": "reverse_apply", "commands": [check, apply]}
+            return {
+                "reverted": False,
+                "stage": "reverse_check",
+                "apply_root": str(apply_root),
+                "app_path_prefix": apply_prefix,
+                "commands": [check],
+            }
+        apply = _run(["git", "apply", "-R", "--recount", patch_name], apply_root, timeout)
+        return {
+            "reverted": apply["returncode"] == 0,
+            "stage": "reverse_apply",
+            "apply_root": str(apply_root),
+            "app_path_prefix": apply_prefix,
+            "commands": [check, apply],
+        }
     finally:
         try:
             os.unlink(patch_name)
@@ -2135,6 +2248,12 @@ def _run_git_release_pipeline(
         }
 
     app_root = pathlib.Path(release.app_worktree_path)
+
+    def archive(status: str, **extra: Any) -> dict:
+        metadata = {**release.as_metadata(), "preflight": preflight, "status": status, **extra}
+        write_candidate_archive(RUNS_DIR / "candidate_archive.jsonl", metadata)
+        return metadata
+
     apply_result = apply_patch_to_workspace(
         diff_text,
         root=app_root,
@@ -2145,9 +2264,10 @@ def _run_git_release_pipeline(
     if not apply_result.get("applied"):
         release.status = "implementation_failed"
         cleanup = cleanup_worktree(release, root)
+        archived = archive("implementation_failed", cleanup=cleanup, reason="candidate_apply_failed")
         return {
             "status": "implementation_failed",
-            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "release": archived,
             "tests": tests,
             "evaluation": {"release": release.as_metadata(), "reason": "candidate_apply_failed"},
         }
@@ -2163,9 +2283,10 @@ def _run_git_release_pipeline(
     if any(result["returncode"] != 0 for result in dependency_install):
         release.status = "implementation_failed"
         cleanup = cleanup_worktree(release, root)
+        archived = archive("dependency_install_failed", cleanup=cleanup, reason="candidate_dependency_install_failed")
         return {
             "status": "dependency_install_failed",
-            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "release": archived,
             "tests": tests,
             "evaluation": {"release": release.as_metadata(), "reason": "candidate_dependency_install_failed"},
         }
@@ -2176,12 +2297,39 @@ def _run_git_release_pipeline(
         status = classify_sandbox_failure(candidate_tests)
         release.status = "implementation_failed"
         cleanup = cleanup_worktree(release, root)
+        archived = archive(status, cleanup=cleanup, reason="candidate_tests_failed")
         return {
             "status": status,
-            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "release": archived,
             "tests": tests,
             "evaluation": {"release": release.as_metadata(), "reason": "candidate_tests_failed"},
         }
+
+    category = str(safety.get("category") or "")
+    if category == "evolution_loop_improvement":
+        before_benchmark = run_builder_failure_benchmark(root)
+        after_benchmark = run_builder_failure_benchmark(app_root)
+        benchmark_gate = benchmark_builder_change(
+            {
+                "before_solve_rate": before_benchmark.get("solve_rate"),
+                "after_solve_rate": after_benchmark.get("solve_rate"),
+            }
+        )
+        tests["builder_failure_benchmark"] = {
+            "before": before_benchmark,
+            "after": after_benchmark,
+            "gate": benchmark_gate,
+        }
+        if not after_benchmark.get("passed") or not benchmark_gate.get("passed"):
+            release.status = "archived_failed"
+            cleanup = cleanup_worktree(release, root)
+            archived = archive("archived_failed", cleanup=cleanup, reason="builder_failure_benchmark_failed")
+            return {
+                "status": "archived_failed",
+                "release": archived,
+                "tests": tests,
+                "evaluation": {"release": release.as_metadata(), "reason": "builder_failure_benchmark_failed"},
+            }
 
     release, commit_result = commit_candidate(
         release,
@@ -2192,9 +2340,10 @@ def _run_git_release_pipeline(
     if not commit_result.get("ok"):
         release.status = "implementation_failed"
         cleanup = cleanup_worktree(release, root)
+        archived = archive("implementation_failed", cleanup=cleanup, reason=commit_result.get("reason"))
         return {
             "status": "implementation_failed",
-            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "release": archived,
             "tests": tests,
             "evaluation": {"release": release.as_metadata(), "reason": commit_result.get("reason")},
         }
@@ -2219,9 +2368,10 @@ def _run_git_release_pipeline(
     if not gate.get("passed"):
         release.status = str(gate.get("status") or "archived_failed")
         cleanup = cleanup_worktree(release, root)
+        archived = archive(release.status, cleanup=cleanup, reason=gate.get("reason"))
         return {
             "status": release.status,
-            "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+            "release": archived,
             "tests": tests,
             "canary": canary,
             "evaluation": evaluation,
@@ -2237,24 +2387,25 @@ def _run_git_release_pipeline(
         if not promotion.get("ok"):
             release.status = "archived_failed"
             cleanup = cleanup_worktree(release, root)
+            archived = archive("archived_failed", cleanup=cleanup, reason=promotion.get("reason"), promotion=promotion)
             return {
                 "status": "archived_failed",
-                "release": {**release.as_metadata(), "preflight": preflight, "cleanup": cleanup},
+                "release": archived,
                 "tests": tests,
                 "canary": canary,
                 "evaluation": evaluation,
             }
+        release.promotion_reason = str(gate.get("reason") or "candidate passed sandbox gates")
+        promotion["promotion_reason"] = release.promotion_reason
         status = "promoted"
     else:
         status = "candidate_committed"
 
-    archive_path = RUNS_DIR / "candidate_archive.jsonl"
-    metadata = {**release.as_metadata(), "preflight": preflight, "status": status}
-    write_candidate_archive(archive_path, metadata)
     cleanup = cleanup_worktree(release, root)
+    metadata = archive(status, cleanup=cleanup)
     return {
         "status": status,
-        "release": {**metadata, "cleanup": cleanup},
+        "release": metadata,
         "tests": tests,
         "canary": canary,
         "evaluation": evaluation,
@@ -2686,9 +2837,18 @@ def code_evolution_summary(conn: Any) -> dict:
     rows = code_evolution_recent(conn, limit=50)
     counts: dict[str, int] = {}
     failure_causes: dict[str, int] = {}
+    failure_class_counts: dict[str, int] = {
+        "invalid_paths": 0,
+        "invalid_tests": 0,
+        "stale_hunks_or_patch_apply": 0,
+        "no_op_or_empty_patch": 0,
+        "malformed_diff": 0,
+        "safety_blocks": 0,
+    }
     implementation_mode_counts: dict[str, int] = {}
     model_tier_counts: dict[str, int] = {}
     frontier_waste_reasons: dict[str, int] = {}
+    canary_stage_counts: dict[str, int] = {}
     repaired_path_count = 0
     preflight_reject_count = 0
     repair_attempt_count = 0
@@ -2696,6 +2856,9 @@ def code_evolution_summary(conn: Any) -> dict:
     quality_scores: list[float] = []
     for row in rows:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
+        canary = row.get("canary") if isinstance(row.get("canary"), dict) else {}
+        canary_stage = str(canary.get("stage") or "none")
+        canary_stage_counts[canary_stage] = canary_stage_counts.get(canary_stage, 0) + 1
         safety = row.get("safety") or {}
         preflight = safety.get("preflight") or {}
         mode = (
@@ -2713,6 +2876,26 @@ def code_evolution_summary(conn: Any) -> dict:
             frontier_waste_reasons[str(wasted)] = frontier_waste_reasons.get(str(wasted), 0) + 1
         for reason in safety.get("reasons", []) or []:
             failure_causes[reason] = failure_causes.get(reason, 0) + 1
+            if "invalid_target" in reason or "invalid_target_files" in reason or reason.startswith("path_not_allowed"):
+                failure_class_counts["invalid_paths"] += 1
+            if "invalid_test" in reason:
+                failure_class_counts["invalid_tests"] += 1
+            if "patch_apply" in reason or "stale" in reason:
+                failure_class_counts["stale_hunks_or_patch_apply"] += 1
+            if reason in {"no_changed_files", "missing_unified_diff"}:
+                failure_class_counts["no_op_or_empty_patch"] += 1
+            if "invalid_patch_format" in reason:
+                failure_class_counts["malformed_diff"] += 1
+            if reason in {
+                "enables_live_trading",
+                "touches_credentials",
+                "broker_write_or_order_api",
+                "real_notional_increase",
+                "startup_or_system_task",
+                "destructive_filesystem_action",
+                "installer_command_in_code",
+            }:
+                failure_class_counts["safety_blocks"] += 1
         if preflight.get("path_repairs"):
             repaired_path_count += 1
         scorecard = safety.get("proposal_scorecard") or preflight.get("quality_scorecard") or {}
@@ -2729,6 +2912,7 @@ def code_evolution_summary(conn: Any) -> dict:
                 pass
     useful = sum(counts.get(status, 0) for status in SUCCESS_STATUSES)
     attempted = len(rows)
+    tracked_failures = sum(failure_class_counts.values())
     return {
         "report": str(REPORT_MD),
         "ledger": str(LEDGER_JSONL),
@@ -2736,8 +2920,15 @@ def code_evolution_summary(conn: Any) -> dict:
         "status_counts": counts,
         "implementation_mode_counts": implementation_mode_counts,
         "model_tier_counts": model_tier_counts,
+        "canary_stage_counts": canary_stage_counts,
         "frontier_waste_reasons": frontier_waste_reasons,
         "failure_cause_counts": failure_causes,
+        "failure_benchmark": {
+            "class_counts": failure_class_counts,
+            "tracked_failure_count": tracked_failures,
+            "useful_merge_count": useful,
+            "solve_rate": round(useful / (useful + tracked_failures), 3) if useful + tracked_failures else None,
+        },
         "path_repair_proposal_count": repaired_path_count,
         "preflight_reject_count": preflight_reject_count,
         "proposal_quality_avg": round(sum(quality_scores) / len(quality_scores), 3) if quality_scores else None,
@@ -2766,6 +2957,7 @@ def code_evolution_summary(conn: Any) -> dict:
                 "proposal_quality_score": ((row.get("safety") or {}).get("proposal_scorecard") or {}).get(
                     "proposal_quality_score"
                 ),
+                "canary_stage": ((row.get("canary") or {}).get("stage") if isinstance(row.get("canary"), dict) else None),
                 "updated_at": row["updated_at"],
             }
             for row in rows[:10]
@@ -2812,9 +3004,11 @@ def _markdown(report: dict) -> str:
         f"- Status counts: `{summary.get('status_counts', {})}`",
         f"- Implementation modes: `{summary.get('implementation_mode_counts', {})}`",
         f"- Model tiers: `{summary.get('model_tier_counts', {})}`",
+        f"- Canary stages: `{summary.get('canary_stage_counts', {})}`",
         f"- Frontier waste reasons: `{summary.get('frontier_waste_reasons', {})}`",
         f"- Normalized old statuses this report: `{report.get('normalized_statuses', {})}`",
         f"- Failure causes: `{summary.get('failure_cause_counts', {})}`",
+        f"- Failure benchmark: `{summary.get('failure_benchmark', {})}`",
         f"- Path repair proposal count: `{summary.get('path_repair_proposal_count', 0)}`",
         f"- Preflight reject count: `{summary.get('preflight_reject_count', 0)}`",
         f"- Proposal quality avg: `{summary.get('proposal_quality_avg')}`",

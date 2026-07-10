@@ -10,7 +10,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from evolution.evaluator import benchmark_builder_change, classify_sandbox_failure, evaluate_candidate  # noqa: E402
+from evolution.evaluator import (  # noqa: E402
+    benchmark_builder_change,
+    classify_sandbox_failure,
+    evaluate_candidate,
+    run_builder_failure_benchmark,
+)
 
 
 class EvolutionEvaluatorTests(unittest.TestCase):
@@ -54,6 +59,18 @@ class EvolutionEvaluatorTests(unittest.TestCase):
         self.assertEqual(gate["status"], "archived_failed")
         self.assertEqual(gate["reason"], "canary_failed")
 
+    def test_candidate_gate_promotes_when_canary_is_deferred_by_policy(self) -> None:
+        gate = evaluate_candidate(
+            sandbox={"passed": True},
+            canary={"passed": True, "stage": "deferred_by_policy"},
+            category="llm_prompt_state_packet",
+            changed_files=["src/llm_bridge.py"],
+        )
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["status"], "promoted")
+        self.assertIn("canary deferred", gate["reason"])
+
     def test_adapter_candidate_must_have_a_capability_change(self) -> None:
         gate = evaluate_candidate(
             sandbox={"passed": True},
@@ -68,6 +85,12 @@ class EvolutionEvaluatorTests(unittest.TestCase):
     def test_builder_benchmark_requires_non_negative_uplift(self) -> None:
         self.assertTrue(benchmark_builder_change({"before_solve_rate": 0.2, "after_solve_rate": 0.3})["passed"])
         self.assertFalse(benchmark_builder_change({"before_solve_rate": 0.3, "after_solve_rate": 0.2})["passed"])
+
+    def test_builder_failure_benchmark_passes_current_repo(self) -> None:
+        result = run_builder_failure_benchmark(ROOT)
+
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["solve_rate"], 1.0)
 
 
 if __name__ == "__main__":

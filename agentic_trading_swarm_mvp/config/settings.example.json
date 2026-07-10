@@ -212,7 +212,7 @@
   "code_evolution": {
     "enabled": true,
     "git_release_enabled": true,
-    "run_candidate_canary": true,
+    "run_candidate_canary": false,
     "promote_candidate_after_canary": true,
     "workspace_status_names": true,
     "auto_merge_paper_only": true,

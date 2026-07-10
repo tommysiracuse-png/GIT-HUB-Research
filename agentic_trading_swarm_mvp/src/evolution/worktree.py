@@ -171,10 +171,12 @@ def promote_candidate(release: CandidateRelease, app_root: pathlib.Path, *, time
         if cherry["returncode"] != 0:
             return release, {"ok": False, "reason": "promotion_failed", "merge": merge, "cherry_pick": cherry}
     tag_name = "champion/latest"
-    run_git(["tag", "-f", tag_name], root, timeout=timeout)
+    tag = run_git(["tag", "-f", tag_name, release.candidate_commit], root, timeout=timeout)
+    if tag["returncode"] != 0:
+        return release, {"ok": False, "reason": "champion_tag_failed", "tag": tag}
     release.status = "promoted"
     release.promotion_reason = "candidate passed sandbox and canary gates"
-    return release, {"ok": True, "status": "promoted", "champion_tag": tag_name}
+    return release, {"ok": True, "status": "promoted", "champion_tag": tag_name, "tag": tag}
 
 
 def cleanup_worktree(release: CandidateRelease, app_root: pathlib.Path, *, timeout: int = 120) -> dict[str, Any]:
