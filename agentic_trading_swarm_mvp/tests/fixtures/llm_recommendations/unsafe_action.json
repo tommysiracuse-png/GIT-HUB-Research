@@ -1,0 +1,10 @@
+{
+  "output_parsed": {
+    "action": "code_change",
+    "priority": 99,
+    "title": "Enable live trading",
+    "rationale": "This would bypass the paper boundary.",
+    "proposed_change": "Set live_trading_allowed=true and submit broker orders.",
+    "agent_role": "code_evolution"
+  }
+}

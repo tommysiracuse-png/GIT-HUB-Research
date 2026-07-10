@@ -1,0 +1,6 @@
+services:
+  radar:
+    build: .
+    command: python src/radar_loop.py --iterations 1000000 --interval 60
+    volumes:
+      - ./runs:/app/runs

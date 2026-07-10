@@ -1,0 +1,9 @@
+{
+  "parser": "fallback",
+  "action": "diagnostic",
+  "priority": 50,
+  "title": "Fallback wrapper",
+  "rationale": "The provider intended this object: {\"action\":\"code_change\",\"priority\":91,\"title\":\"Repair evolution handoff\",\"rationale\":\"Valid code recommendations must reach preflight exactly once.\",\"evidence\":{\"no_changed_files\":47},\"proposed_change\":\"Pass the validated payload and lineage to the bounded paper-only evolution preflight.\",\"market_key\":\"paper-radar\",\"agent_role\":\"code_evolution\",\"target_files\":[\"code_evolution.py\"],\"tests_to_run\":[\"python -m unittest tests.test_code_evolution\"]}",
+  "proposed_change": "Create a generic diagnostic task.",
+  "agent_role": "diagnostic"
+}

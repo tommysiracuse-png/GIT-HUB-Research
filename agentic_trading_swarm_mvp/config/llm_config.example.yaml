@@ -1,0 +1,77 @@
+﻿{
+  "daily_budget_usd": 25.0,
+  "default_mode": "paid_when_key_available",
+  "require_env_to_call_models": true,
+  "fallback_to_litellm_for_non_openai": true,
+  "tiers": {
+    "fast": {
+      "model": "openai/gpt-5.4-mini",
+      "api": "responses",
+      "reasoning_effort": "low",
+      "verbosity": "low",
+      "structured_json": true,
+      "prompt_cache_retention": "in_memory",
+      "input_cost_per_1m": 0.8,
+      "output_cost_per_1m": 3.2,
+      "estimated_completion_tokens": 800,
+      "max_prompt_chars": 12000
+    },
+    "cheap": {
+      "model": "openai/gpt-5.4-mini",
+      "api": "responses",
+      "reasoning_effort": "low",
+      "verbosity": "low",
+      "structured_json": true,
+      "prompt_cache_retention": "in_memory",
+      "input_cost_per_1m": 0.8,
+      "output_cost_per_1m": 3.2,
+      "estimated_completion_tokens": 800,
+      "max_prompt_chars": 12000
+    },
+    "standard": {
+      "model": "openai/gpt-5.4",
+      "api": "responses",
+      "reasoning_effort": "medium",
+      "verbosity": "medium",
+      "structured_json": true,
+      "prompt_cache_retention": "in_memory",
+      "input_cost_per_1m": 2.5,
+      "output_cost_per_1m": 15.0,
+      "estimated_completion_tokens": 3000,
+      "max_prompt_chars": 40000
+    },
+    "codex": {
+      "model": "openai/gpt-5.3-codex",
+      "api": "responses",
+      "reasoning_effort": "medium",
+      "verbosity": "medium",
+      "structured_json": true,
+      "prompt_cache_retention": "in_memory",
+      "input_cost_per_1m": 1.75,
+      "output_cost_per_1m": 14.0,
+      "estimated_completion_tokens": 3000,
+      "max_prompt_chars": 30000
+    },
+    "frontier": {
+      "model": "openai/gpt-5.6-sol",
+      "api": "responses",
+      "reasoning_effort": "max",
+      "reasoning_mode": "pro",
+      "verbosity": "medium",
+      "structured_json": true,
+      "prompt_cache_retention": "24h",
+      "input_cost_per_1m": 5.0,
+      "output_cost_per_1m": 30.0,
+      "estimated_completion_tokens": 8000,
+      "max_prompt_chars": 80000
+    }
+  },
+  "agents": {
+    "market_scout": {"tier": "fast", "daily_budget_usd": 3.0},
+    "cross_market_researcher": {"tier": "fast", "daily_budget_usd": 4.0},
+    "red_team": {"tier": "fast", "daily_budget_usd": 4.0},
+    "execution_route_hunter": {"tier": "fast", "daily_budget_usd": 3.0},
+    "build_planner": {"tier": "fast", "daily_budget_usd": 6.0}
+  }
+}
+

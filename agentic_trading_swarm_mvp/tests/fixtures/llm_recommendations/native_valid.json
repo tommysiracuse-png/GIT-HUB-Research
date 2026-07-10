@@ -1,0 +1,20 @@
+{
+  "output_parsed": {
+    "action": "code_change",
+    "priority": 97,
+    "title": "Preserve structured recommendation intent",
+    "rationale": "Validated recommendations should retain their intended route.",
+    "evidence": {
+      "fallback_count": 4
+    },
+    "proposed_change": "Use the canonical paper-only recommendation normalizer.",
+    "market_key": "paper-radar",
+    "agent_role": "self_improvement",
+    "target_files": [
+      "llm_recommendation_ingestion.py"
+    ],
+    "tests_to_run": [
+      "python -m unittest tests.test_llm_recommendation_ingestion"
+    ]
+  }
+}

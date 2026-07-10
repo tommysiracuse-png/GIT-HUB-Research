@@ -1,0 +1,5 @@
+{
+  "parser": "fallback",
+  "agent_role": "self_improvement",
+  "raw_response": "{\"action\":\"code_change\",\"priority\":97,\"title\":\"Incomplete response\",\"rationale\":\"The provider output ended early\",\"proposed_change\":\"Update the paper-only parser\""
+}

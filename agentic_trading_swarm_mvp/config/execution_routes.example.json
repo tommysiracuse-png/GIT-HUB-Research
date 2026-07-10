@@ -1,0 +1,546 @@
+{
+  "purpose": "Read-only registry of possible execution routes. The radar may paper-test standard, conditional, and route_unknown ideas, but live execution must only use confirmed standard routes after separate live-trading gates are enabled.",
+  "route_states": {
+    "standard": "All hard paper-route requirements are confirmed or not applicable.",
+    "conditional": "The idea is paper-testable, but live execution needs confirmed broker, borrow, permission, fee, margin, jurisdiction, or API capability.",
+    "route_unknown": "The asset may be tradable, but no practical route family is documented yet.",
+    "blocked": "The route is not paper-testable or should not be used."
+  },
+  "requirements_schema": {
+    "statuses": ["confirmed", "missing", "unknown", "not_applicable"],
+    "categories": [
+      "account",
+      "api_access",
+      "jurisdiction",
+      "borrow",
+      "margin",
+      "market_data",
+      "fee_model",
+      "market_hours",
+      "instrument_eligibility"
+    ],
+    "blocking_levels": ["hard", "soft", "info"]
+  },
+  "routes": [
+    {
+      "route_id": "okx_derivatives_paper",
+      "status": "paper_configured",
+      "asset_class": "crypto_derivatives",
+      "assets": ["crypto_perps"],
+      "broker": "OKX public derivatives data / paper route",
+      "required_permissions": ["crypto_derivatives"],
+      "notes": "Paper route for OKX perpetual-only or perp-plus-long-spot hedge ideas. Live execution still requires credentials, jurisdiction checks, limits, and explicit live enablement.",
+      "jurisdiction_notes": ["Verify venue availability and legal access before any live route."],
+      "requirements": [
+        {
+          "requirement_id": "crypto_derivatives",
+          "category": "account",
+          "description": "Account/config allows crypto derivatives paper routing.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "crypto_derivatives",
+          "how_to_verify": "Confirm account_capabilities.crypto_derivatives is true and the venue supports the instrument.",
+          "evidence_source": "settings.account_capabilities.crypto_derivatives"
+        },
+        {
+          "requirement_id": "okx_public_market_data",
+          "category": "market_data",
+          "description": "OKX public market data is reachable.",
+          "status": "confirmed",
+          "blocking_level": "hard",
+          "how_to_verify": "Run the OKX scanner and confirm recent ticker/funding data is returned.",
+          "evidence_source": "okx_perp_scanner"
+        },
+        {
+          "requirement_id": "okx_fee_model",
+          "category": "fee_model",
+          "description": "Fees and slippage are estimated from local risk config.",
+          "status": "unknown",
+          "blocking_level": "soft",
+          "how_to_verify": "Compare configured taker fee/slippage against current venue fee tier before live use.",
+          "evidence_source": "settings.risk"
+        },
+        {
+          "requirement_id": "okx_jurisdiction_live",
+          "category": "jurisdiction",
+          "description": "Live OKX derivatives eligibility has not been checked.",
+          "status": "unknown",
+          "blocking_level": "soft",
+          "how_to_verify": "Confirm jurisdiction, account eligibility, and venue terms before live trading.",
+          "evidence_source": "manual_live_check"
+        }
+      ]
+    },
+    {
+      "route_id": "conditional_crypto_route_paper",
+      "status": "paper_conditional",
+      "asset_class": "crypto_spot_perp",
+      "assets": ["crypto_spot", "crypto_perps", "borrowed_spot", "margin"],
+      "broker": "Crypto venue, CCXT, or Hummingbot route to be confirmed",
+      "required_permissions": ["crypto_derivatives", "crypto_spot", "spot_borrow"],
+      "notes": "Paper route for reverse cash-and-carry or hedge structures requiring borrow, margin, or venue-specific permissions.",
+      "jurisdiction_notes": ["Short spot/margin support and venue terms must be confirmed before live use."],
+      "requirements": [
+        {
+          "requirement_id": "crypto_derivatives",
+          "category": "account",
+          "description": "Derivatives leg can be represented in paper.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "crypto_derivatives",
+          "how_to_verify": "Confirm account_capabilities.crypto_derivatives is true.",
+          "evidence_source": "settings.account_capabilities.crypto_derivatives"
+        },
+        {
+          "requirement_id": "crypto_spot",
+          "category": "account",
+          "description": "Spot leg can be represented in paper.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "crypto_spot",
+          "how_to_verify": "Confirm account_capabilities.crypto_spot is true.",
+          "evidence_source": "settings.account_capabilities.crypto_spot"
+        },
+        {
+          "requirement_id": "spot_borrow",
+          "category": "borrow",
+          "description": "Short spot, borrow, margin, or equivalent hedge route is confirmed.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "spot_borrow",
+          "how_to_verify": "Confirm borrow/margin availability for the asset or define an equivalent hedge route.",
+          "evidence_source": "settings.account_capabilities.spot_borrow"
+        },
+        {
+          "requirement_id": "crypto_margin_workflow",
+          "category": "margin",
+          "description": "Margin workflow and collateral treatment are documented.",
+          "status": "unknown",
+          "blocking_level": "soft",
+          "how_to_verify": "Document margin mode, collateral currency, liquidation risk, and maintenance requirements.",
+          "evidence_source": "manual_route_research"
+        },
+        {
+          "requirement_id": "crypto_fee_model",
+          "category": "fee_model",
+          "description": "Fees, borrow cost, and slippage are estimated but not venue-confirmed.",
+          "status": "unknown",
+          "blocking_level": "soft",
+          "how_to_verify": "Compare local fee/slippage assumptions with target venue fee tier and borrow cost.",
+          "evidence_source": "settings.risk"
+        }
+      ]
+    },
+    {
+      "route_id": "frontier_crypto_spot_paper",
+      "status": "paper_configured",
+      "asset_class": "crypto_spot",
+      "assets": ["crypto_spot", "frontier_crypto_public_data"],
+      "broker": "Public crypto venue data / paper route",
+      "required_permissions": ["crypto_spot"],
+      "notes": "Paper route for long-only spot observations from reachable public crypto venues. Live execution still requires venue account, credentials, legal access, balances, and limits.",
+      "jurisdiction_notes": ["Verify venue availability and legal access before any live route."],
+      "requirements": [
+        {
+          "requirement_id": "crypto_spot",
+          "category": "account",
+          "description": "Spot paper route is enabled.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "crypto_spot",
+          "how_to_verify": "Confirm account_capabilities.crypto_spot is true.",
+          "evidence_source": "settings.account_capabilities.crypto_spot"
+        },
+        {
+          "requirement_id": "public_data_reachable",
+          "category": "market_data",
+          "description": "Public venue data is reachable from this machine.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Run the frontier venue scan and confirm data_status is reachable.",
+          "evidence_source": "frontier_crypto_adapter"
+        },
+        {
+          "requirement_id": "frontier_spot_live_jurisdiction",
+          "category": "jurisdiction",
+          "description": "Live spot venue eligibility is not checked.",
+          "status": "unknown",
+          "blocking_level": "soft",
+          "how_to_verify": "Confirm venue/account eligibility before live use.",
+          "evidence_source": "manual_live_check"
+        }
+      ]
+    },
+    {
+      "route_id": "frontier_crypto_perp_paper",
+      "status": "paper_configured",
+      "asset_class": "crypto_derivatives",
+      "assets": ["crypto_perps", "frontier_crypto_public_data"],
+      "broker": "Public crypto derivatives venue data / paper route",
+      "required_permissions": ["crypto_derivatives"],
+      "notes": "Paper route for perpetual observations from reachable public derivatives venues. Live execution still requires account, credentials, jurisdiction checks, and explicit live enablement.",
+      "jurisdiction_notes": ["Verify derivatives venue availability, leverage rules, and legal access before any live route."],
+      "requirements": [
+        {
+          "requirement_id": "crypto_derivatives",
+          "category": "account",
+          "description": "Derivatives paper route is enabled.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "crypto_derivatives",
+          "how_to_verify": "Confirm account_capabilities.crypto_derivatives is true.",
+          "evidence_source": "settings.account_capabilities.crypto_derivatives"
+        },
+        {
+          "requirement_id": "public_data_reachable",
+          "category": "market_data",
+          "description": "Public derivatives venue data is reachable from this machine.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Run the frontier venue scan and confirm data_status is reachable.",
+          "evidence_source": "frontier_crypto_adapter"
+        },
+        {
+          "requirement_id": "frontier_derivatives_live_jurisdiction",
+          "category": "jurisdiction",
+          "description": "Live derivatives venue eligibility is not checked.",
+          "status": "unknown",
+          "blocking_level": "soft",
+          "how_to_verify": "Confirm venue/account eligibility, leverage rules, and regional restrictions before live use.",
+          "evidence_source": "manual_live_check"
+        }
+      ]
+    },
+    {
+      "route_id": "frontier_crypto_blocked_public_data",
+      "status": "blocked",
+      "asset_class": "crypto_public_data",
+      "assets": ["blocked_public_endpoint"],
+      "broker": "none",
+      "required_permissions": ["venue_api_access"],
+      "notes": "Public data endpoint is blocked, unavailable, or degraded from this machine. Keep as route-probe evidence only.",
+      "requirements": [
+        {
+          "requirement_id": "venue_api_access",
+          "category": "api_access",
+          "description": "Public data endpoint must be reachable before paper routing.",
+          "status": "missing",
+          "blocking_level": "hard",
+          "how_to_verify": "Run the venue health scan and confirm a reachable status.",
+          "evidence_source": "crypto_venue_scanner"
+        }
+      ]
+    },
+    {
+      "route_id": "equity_proxy_paper",
+      "status": "paper_configured",
+      "asset_class": "global_equity_proxy",
+      "assets": ["etfs", "adrs", "listed_equities"],
+      "broker": "Generic equity brokerage / IBKR candidate route",
+      "required_permissions": ["equity_long"],
+      "notes": "Paper route for long ETF/ADR/global proxy exposure.",
+      "requirements": [
+        {
+          "requirement_id": "equity_long",
+          "category": "account",
+          "description": "Long equity/ETF paper route is enabled.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "equity_long",
+          "how_to_verify": "Confirm account_capabilities.equity_long is true.",
+          "evidence_source": "settings.account_capabilities.equity_long"
+        },
+        {
+          "requirement_id": "equity_market_hours",
+          "category": "market_hours",
+          "description": "Exchange session and stale-data behavior are estimated.",
+          "status": "unknown",
+          "blocking_level": "soft",
+          "how_to_verify": "Confirm exchange hours and holiday behavior for the proxy instrument.",
+          "evidence_source": "global_proxy_scanner"
+        }
+      ]
+    },
+    {
+      "route_id": "conditional_equity_route_paper",
+      "status": "paper_conditional",
+      "asset_class": "global_equity_proxy",
+      "assets": ["short_etfs", "short_adrs", "options", "inverse_products"],
+      "broker": "IBKR or other margin/short-capable equity broker",
+      "required_permissions": ["equity_short_or_options"],
+      "notes": "Paper route for short proxy exposure requiring borrow, margin, options approval, or inverse products.",
+      "requirements": [
+        {
+          "requirement_id": "equity_short",
+          "category": "borrow",
+          "description": "Equity short borrow or margin route is confirmed.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "equity_short",
+          "how_to_verify": "Confirm the broker supports shorting this instrument and locate/borrow is available.",
+          "evidence_source": "settings.account_capabilities.equity_short"
+        },
+        {
+          "requirement_id": "options_or_inverse_product",
+          "category": "instrument_eligibility",
+          "description": "Options approval or inverse-product substitute is confirmed.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "options",
+          "how_to_verify": "Confirm options approval or map a liquid inverse ETF/substitute.",
+          "evidence_source": "settings.account_capabilities.options"
+        },
+        {
+          "requirement_id": "equity_margin_workflow",
+          "category": "margin",
+          "description": "Short/margin workflow is documented.",
+          "status": "unknown",
+          "blocking_level": "soft",
+          "how_to_verify": "Document borrow fees, margin, settlement, and locate workflow.",
+          "evidence_source": "manual_route_research"
+        }
+      ]
+    },
+    {
+      "route_id": "ibkr_global",
+      "status": "not_configured",
+      "asset_class": "global_multi_asset",
+      "assets": ["global_equities", "etfs", "adrs", "options", "futures", "fx", "bonds"],
+      "broker": "Interactive Brokers",
+      "required_permissions": ["account", "market_data", "asset_class_permission"],
+      "notes": "Broad legal gateway for international stocks/options/futures/FX where account permissions and market data are approved.",
+      "requirements": [
+        {
+          "requirement_id": "ibkr_account",
+          "category": "account",
+          "description": "IBKR account route is configured.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Confirm account exists, API gateway is available, and trading is disabled until live gates are explicitly enabled.",
+          "evidence_source": "manual_account_check"
+        },
+        {
+          "requirement_id": "ibkr_market_data",
+          "category": "market_data",
+          "description": "Required market data subscriptions are active.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Check IBKR market data permissions for target exchanges/instruments.",
+          "evidence_source": "read_only_capability_probe"
+        },
+        {
+          "requirement_id": "ibkr_asset_class_permission",
+          "category": "instrument_eligibility",
+          "description": "Target asset class trading permission is approved.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Check IBKR permissions for equities, options, futures, FX, or bonds.",
+          "evidence_source": "read_only_capability_probe"
+        }
+      ]
+    },
+    {
+      "route_id": "hummingbot_crypto",
+      "status": "not_configured",
+      "asset_class": "crypto_multi_venue",
+      "assets": ["crypto_spot", "crypto_perps", "dex"],
+      "broker": "Hummingbot/venue connectors",
+      "required_permissions": ["venue_api_key", "balances", "trading_enabled"],
+      "notes": "Useful for multi-exchange crypto market making/arbitrage after venue legality, balances, and API keys are configured.",
+      "requirements": [
+        {
+          "requirement_id": "venue_api_key",
+          "category": "api_access",
+          "description": "Venue API key exists and has the intended read/trade permissions.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Confirm connector credentials exist outside repo-tracked files and can be read by Hummingbot.",
+          "evidence_source": "manual_secret_check"
+        },
+        {
+          "requirement_id": "balances",
+          "category": "account",
+          "description": "Venue account balances/collateral are available.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Use a read-only balance probe once credentials exist.",
+          "evidence_source": "read_only_capability_probe"
+        },
+        {
+          "requirement_id": "trading_enabled",
+          "category": "instrument_eligibility",
+          "description": "Trading permission is enabled for the venue/instrument.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Confirm exchange API permissions and symbol eligibility.",
+          "evidence_source": "read_only_capability_probe"
+        },
+        {
+          "requirement_id": "crypto_venue_jurisdiction",
+          "category": "jurisdiction",
+          "description": "Venue is legally available to the user.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Confirm regional availability and venue terms.",
+          "evidence_source": "manual_live_check"
+        }
+      ]
+    },
+    {
+      "route_id": "kalshi_events",
+      "status": "not_configured",
+      "asset_class": "prediction_markets",
+      "assets": ["event_contracts"],
+      "broker": "Kalshi",
+      "required_permissions": ["prediction_markets_account", "venue_api_access", "jurisdiction_eligibility"],
+      "notes": "US-regulated event contracts. Execution depends on account/API access and event eligibility.",
+      "jurisdiction_notes": ["Check account eligibility, contract rules, and API permission before live use."],
+      "requirements": [
+        {
+          "requirement_id": "prediction_markets_account",
+          "category": "account",
+          "description": "Prediction market account exists and is approved.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "prediction_markets",
+          "how_to_verify": "Confirm account_capabilities.prediction_markets is true after account approval.",
+          "evidence_source": "settings.account_capabilities.prediction_markets"
+        },
+        {
+          "requirement_id": "venue_api_access",
+          "category": "api_access",
+          "description": "Kalshi API access is configured.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Confirm read-only API access first; do not enable live order placement.",
+          "evidence_source": "manual_secret_check"
+        },
+        {
+          "requirement_id": "jurisdiction_eligibility",
+          "category": "jurisdiction",
+          "description": "User and contract jurisdiction eligibility are confirmed.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Confirm user eligibility, contract rules, and venue terms.",
+          "evidence_source": "manual_live_check"
+        }
+      ]
+    },
+    {
+      "route_id": "polymarket_events",
+      "status": "not_configured",
+      "asset_class": "prediction_markets",
+      "assets": ["event_contracts"],
+      "broker": "Polymarket",
+      "required_permissions": ["prediction_markets_account", "venue_api_access", "jurisdiction_eligibility"],
+      "notes": "Use only where legally available and after account/API checks.",
+      "jurisdiction_notes": ["Check user eligibility and venue terms before any live use."],
+      "requirements": [
+        {
+          "requirement_id": "prediction_markets_account",
+          "category": "account",
+          "description": "Prediction market account exists and is approved.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "capability_key": "prediction_markets",
+          "how_to_verify": "Confirm account_capabilities.prediction_markets is true after account approval.",
+          "evidence_source": "settings.account_capabilities.prediction_markets"
+        },
+        {
+          "requirement_id": "venue_api_access",
+          "category": "api_access",
+          "description": "Polymarket API or supported execution workflow is configured.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Confirm read-only API/workflow access first; do not enable live order placement.",
+          "evidence_source": "manual_secret_check"
+        },
+        {
+          "requirement_id": "jurisdiction_eligibility",
+          "category": "jurisdiction",
+          "description": "User and market jurisdiction eligibility are confirmed.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Confirm user eligibility, market rules, and venue terms.",
+          "evidence_source": "manual_live_check"
+        }
+      ]
+    },
+    {
+      "route_id": "local_or_specialist_broker",
+      "status": "research_only",
+      "asset_class": "specialist_or_frontier",
+      "assets": ["frontier_equities", "local_bonds", "local_futures", "special_situations", "otc"],
+      "broker": "Manual/custom",
+      "required_permissions": ["broker_or_venue", "permissions", "fees", "market_hours", "api_or_manual_workflow"],
+      "notes": "Long-tail markets may need local brokers, specialist access, OTC desks, or manual execution. Keep paper-only until a route is documented.",
+      "requirements": [
+        {
+          "requirement_id": "broker_or_venue",
+          "category": "account",
+          "description": "A practical broker, venue, OTC desk, or manual execution path is identified.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Research legal broker/venue access for this market and document the route.",
+          "evidence_source": "manual_route_research"
+        },
+        {
+          "requirement_id": "permissions",
+          "category": "instrument_eligibility",
+          "description": "Required product permissions are known.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Document account/product permissions and any suitability requirements.",
+          "evidence_source": "manual_route_research"
+        },
+        {
+          "requirement_id": "fees",
+          "category": "fee_model",
+          "description": "Fee, tax, spread, and settlement costs are known.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Document all explicit and implicit costs before paper results are trusted.",
+          "evidence_source": "manual_route_research"
+        },
+        {
+          "requirement_id": "market_hours",
+          "category": "market_hours",
+          "description": "Trading session, holidays, and stale-data behavior are known.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Document local market calendar and trading hours.",
+          "evidence_source": "manual_route_research"
+        },
+        {
+          "requirement_id": "api_or_manual_workflow",
+          "category": "api_access",
+          "description": "API, broker portal, or manual order workflow is documented.",
+          "status": "unknown",
+          "blocking_level": "hard",
+          "how_to_verify": "Document whether execution is API, broker portal, phone/manual, or impossible.",
+          "evidence_source": "manual_route_research"
+        }
+      ]
+    },
+    {
+      "route_id": "watch_only",
+      "status": "blocked",
+      "asset_class": "none",
+      "assets": [],
+      "broker": "none",
+      "required_permissions": [],
+      "notes": "Scanner produced no executable route.",
+      "requirements": [
+        {
+          "requirement_id": "no_executable_signal",
+          "category": "instrument_eligibility",
+          "description": "Scanner produced no executable direction.",
+          "status": "not_applicable",
+          "blocking_level": "info",
+          "how_to_verify": "Wait for a scanner direction other than watch_only.",
+          "evidence_source": "scanner"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,175 @@
+"""Execution ticket engine.
+
+This is the missing layer between "approved idea" and "trade." In paper mode it
+creates order tickets and simulated fills. Live adapters can later implement the
+same order schema for IBKR, Hummingbot/CCXT, Kalshi, Polymarket, or specialist
+routes.
+"""
+
+from __future__ import annotations
+
+import math
+import sqlite3
+
+from paper_order_router import apply_frontier_paper_guard
+from storage import save_execution_fill, save_execution_order
+
+
+def _side_for_direction(direction: str) -> str:
+    if direction.startswith("buy_") or direction.startswith("long_"):
+        return "buy"
+    if direction.startswith("sell_") or direction.startswith("short_"):
+        return "sell"
+    if direction in {
+        "long_perp_short_spot",
+        "basis_mean_reversion_long_perp",
+        "funding_capture_long_perp",
+        "long_proxy",
+        "buy_yes_event",
+        "buy_no_event",
+    }:
+        return "buy"
+    if direction in {"short_perp_long_spot", "basis_mean_reversion_short_perp", "funding_capture_short_perp", "short_proxy"}:
+        return "sell"
+    return "hold"
+
+
+def _route_for_candidate(candidate: dict, review: dict) -> str:
+    resolved_route = (
+        review.get("route_id")
+        or candidate.get("route_id")
+        or (candidate.get("execution_route") or {}).get("route_id")
+        or (candidate.get("execution_feasibility") or {}).get("route_id")
+    )
+    if resolved_route:
+        return str(resolved_route)
+    venue = candidate.get("venue", "unknown")
+    trade_type = candidate.get("trade_type", "unknown")
+    status = review.get("feasibility_status", candidate.get("execution_feasibility", {}).get("status", "unknown"))
+    if venue == "OKX" and trade_type == "perp_funding_basis":
+        return "okx_derivatives_paper" if status == "standard" else "conditional_crypto_route_paper"
+    if venue == "YAHOO_PROXY":
+        return "equity_proxy_paper" if status == "standard" else "conditional_equity_route_paper"
+    if venue in {"POLYMARKET", "KALSHI"}:
+        return "prediction_market_paper" if status == "standard" else "conditional_prediction_route_paper"
+    return "generic_paper_route"
+
+
+def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
+    risk = settings["risk"]
+    mode = settings.get("mode", "paper")
+    notional = float(risk.get("paper_notional_usd", 1000.0))
+    if mode == "paper":
+        notional *= max(0.0, min(1.0, float(review.get("paper_allocation_multiplier", 1.0))))
+    if mode == "live":
+        notional = min(notional, float(risk.get("max_live_notional_usd", 0.0)))
+
+    side = _side_for_direction(candidate["direction"])
+    price = float(candidate["last"])
+    quantity = 0.0 if price <= 0 else notional / price
+    leg = {
+        "leg_index": 0,
+        "symbol": candidate["inst_id"],
+        "venue": candidate.get("venue"),
+        "side": side,
+        "order_type": "market_paper" if mode == "paper" else "market",
+        "quantity": round(quantity, 8),
+        "reference_price": price,
+        "notional_usd": notional,
+        "estimated_slippage_bps": candidate.get("entry_slippage_bps_estimate"),
+        "estimated_fee_bps": candidate.get("estimated_fee_bps_per_side"),
+    }
+
+    status = "ready_for_paper_execution"
+    if side == "hold":
+        status = "blocked_no_side"
+    if mode == "live":
+        status = "blocked_live_not_enabled"
+
+    return {
+        "mode": mode,
+        "route_id": _route_for_candidate(candidate, review),
+        "status": status,
+        "notional_usd": notional,
+        "direction": candidate["direction"],
+        "trade_type": candidate.get("trade_type", "unknown"),
+        "feasibility_status": review.get("feasibility_status"),
+        "route_status": review.get("route_status"),
+        "missing_requirements": review.get("missing_requirements", []),
+        "legs": [leg],
+        "risk": {
+            "confidence": review.get("confidence"),
+            "net_edge_bps_estimate": review.get("net_edge_bps_estimate"),
+            "max_live_notional_usd": risk.get("max_live_notional_usd", 0.0),
+        },
+        "notes": [
+            "Paper order ticket generated from approved opportunity.",
+            "Live execution is blocked until explicit mode, route, credentials, and limits are configured.",
+        ],
+    }
+
+
+def _paper_fill_for_leg(leg: dict, settings: dict) -> dict:
+    risk = settings["risk"]
+    slippage_bps = float(
+        leg.get("estimated_slippage_bps")
+        if leg.get("estimated_slippage_bps") is not None
+        else risk.get("slippage_bps_per_leg", 3.0)
+    )
+    fee_bps = float(
+        leg.get("estimated_fee_bps")
+        if leg.get("estimated_fee_bps") is not None
+        else risk.get("taker_fee_bps_per_leg", 5.0)
+    )
+    reference = float(leg["reference_price"])
+    side = leg["side"]
+    sign = 1.0 if side == "buy" else -1.0
+    fill_price = reference * (1.0 + sign * slippage_bps / 10_000.0)
+    return {
+        "leg_index": leg["leg_index"],
+        "symbol": leg["symbol"],
+        "side": side,
+        "quantity": leg["quantity"],
+        "fill_price": round(fill_price, 10),
+        "reference_price": reference,
+        "notional_usd": leg["notional_usd"],
+        "fee_bps": fee_bps,
+        "slippage_bps": slippage_bps,
+    }
+
+
+def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
+    candidate = apply_frontier_paper_guard(candidate, settings)
+    order = build_order_ticket(candidate, review, settings)
+    if candidate.get("shadow_filtered"):
+        order["status"] = "shadow_filtered"
+        order["shadow_filter"] = candidate.get("candidate_reject_detail")
+        order["notes"].append("Paper fill suppressed by the frontier paper guard.")
+        order_id = save_execution_order(conn, order, candidate, review)
+        return {"order_id": order_id, "order": order, "fills": [], "paper_filled": False}
+
+    if settings.get("mode") == "live" or settings.get("allow_live_trading"):
+        order["status"] = "blocked_live_trading_not_implemented"
+        order_id = save_execution_order(conn, order, candidate, review)
+        return {"order_id": order_id, "order": order, "fills": [], "paper_filled": False}
+
+    if order["status"] != "ready_for_paper_execution":
+        order_id = save_execution_order(conn, order, candidate, review)
+        return {"order_id": order_id, "order": order, "fills": [], "paper_filled": False}
+
+    fills = [_paper_fill_for_leg(leg, settings) for leg in order["legs"]]
+    order["status"] = "paper_filled"
+    order_id = save_execution_order(conn, order, candidate, review)
+    fill_ids = []
+    for fill in fills:
+        fill_id = save_execution_fill(conn, order_id, fill)
+        fill["fill_id"] = fill_id
+        fill_ids.append(fill_id)
+
+    return {
+        "order_id": order_id,
+        "order": order,
+        "fills": fills,
+        "fill_ids": fill_ids,
+        "paper_filled": True,
+    }
