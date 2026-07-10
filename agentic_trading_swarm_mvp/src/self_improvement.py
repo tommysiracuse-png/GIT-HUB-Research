@@ -1142,17 +1142,28 @@ def evaluate_active_experiments(conn: sqlite3.Connection, settings: dict) -> lis
     return evaluated
 
 
-def run_auto_improvement(conn: sqlite3.Connection, settings: dict) -> dict:
+def run_auto_improvement(
+    conn: sqlite3.Connection,
+    settings: dict,
+    *,
+    include_code_changes: bool | None = None,
+) -> dict:
     cfg = settings.get("self_improvement", {})
     if not cfg.get("enabled", True):
         return write_reports(conn, {"enabled": False}, settings=settings)
+    if include_code_changes is None:
+        include_code_changes = bool(cfg.get("process_code_changes_in_radar_loop", False))
 
     expired = expire_signal_policies(conn)
     evaluated = evaluate_active_experiments(conn, settings)
     code_evolution_evaluated = evaluate_code_evolution(conn, settings)
     consumed = []
     max_tasks = int(cfg.get("max_tasks_per_loop", 5))
-    for rec in llm_recommendations_for_auto_execution(conn, limit=max_tasks):
+    for rec in llm_recommendations_for_auto_execution(
+        conn,
+        limit=max_tasks,
+        include_code_changes=include_code_changes,
+    ):
         payload = rec["payload"]
         task_type = classify_recommendation(payload)
         created: list[dict] = []
@@ -1196,6 +1207,7 @@ def run_auto_improvement(conn: sqlite3.Connection, settings: dict) -> dict:
     report = {
         "enabled": True,
         "generated_at": _utc_now(),
+        "code_changes_enabled": bool(include_code_changes),
         "consumed": consumed,
         "evaluated": evaluated,
         "code_evolution_evaluated": code_evolution_evaluated,

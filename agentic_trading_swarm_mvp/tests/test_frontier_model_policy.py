@@ -34,7 +34,9 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(cfg["agents"]["cross_market_researcher"]["tier"], "fast")
         self.assertEqual(cfg["agents"]["red_team"]["tier"], "fast")
         self.assertEqual(cfg["agents"]["build_planner"]["tier"], "fast")
-        self.assertLess(cfg["daily_budget_usd"], 50.0)
+        self.assertGreaterEqual(cfg["daily_budget_usd"], 500.0)
+        self.assertGreaterEqual(cfg["agents"]["autonomous_builder"]["daily_budget_usd"], 100.0)
+        self.assertGreaterEqual(cfg["agents"]["code_evolution"]["daily_budget_usd"], 100.0)
 
     def test_router_fallback_logs_responses_metadata_without_key(self) -> None:
         captured: list[ModelResult] = []

@@ -154,6 +154,7 @@ DEFAULT_SETTINGS = {
     },
     "self_improvement": {
         "enabled": True,
+        "process_code_changes_in_radar_loop": False,
         "max_tasks_per_loop": 5,
         "max_policies_per_task": 5,
         "default_policy_trade_ttl": 30,
@@ -180,15 +181,21 @@ DEFAULT_SETTINGS = {
     "llm_swarm": {
         "enabled": True,
         "auto_run": True,
+        "run_in_radar_loop": False,
         "min_minutes_between_runs": 10,
         "max_recommendations_per_run": 20,
         "write_fallback_recommendations_to_inbox": False,
         "cooldown_on_model_unavailable": True,
         "model_failure_cooldown_minutes": 60,
     },
+    "evolution_worker": {
+        "enabled": True,
+        "interval_seconds": 300,
+    },
     "autonomous_builder": {
         "enabled": True,
         "auto_run": True,
+        "run_in_radar_loop": False,
         "min_minutes_between_runs": 0,
         "lock_stale_minutes": 180,
         "model_tier": "frontier",
@@ -207,6 +214,7 @@ DEFAULT_SETTINGS = {
     },
     "code_evolution": {
         "enabled": True,
+        "workspace_status_names": True,
         "auto_merge_paper_only": True,
         "max_auto_merges_per_loop": 12,
         "require_frontier_model": False,

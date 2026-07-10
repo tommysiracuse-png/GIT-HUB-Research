@@ -1008,13 +1008,13 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                     ),
                 }
                 created = code_evolution.process_code_change_recommendation(conn, rec, settings(), root=root)
-                self.assertEqual(created[0]["status"], "merged_probation")
+                self.assertEqual(created[0]["status"], "workspace_applied_probation")
                 self.assertIn("paper-only note", (root / "src" / "llm_bridge.py").read_text(encoding="utf-8"))
                 rows = storage.code_evolution_recent(conn)
             finally:
                 code_evolution.LEDGER_JSONL = old_ledger
                 conn.close()
-        self.assertEqual(rows[0]["status"], "merged_probation")
+        self.assertEqual(rows[0]["status"], "workspace_applied_probation")
         self.assertEqual(rows[0]["changed_files"], ["src/llm_bridge.py"])
 
     def test_pytest_paths_are_translated_to_safe_unittest_commands(self) -> None:
@@ -1090,7 +1090,7 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                         settings(generate_patch_when_missing=True, patch_repair_attempts=3),
                         root=root,
                     )
-                self.assertEqual(created[0]["status"], "merged_probation")
+                self.assertEqual(created[0]["status"], "workspace_applied_probation")
                 self.assertEqual(repair.call_count, 1)
                 self.assertIn("paper-only note", (root / "src" / "llm_bridge.py").read_text(encoding="utf-8"))
             finally:
@@ -1136,11 +1136,11 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                         settings(patch_repair_attempts=3, local_context_patch_apply=True),
                         root=root,
                     )
-                self.assertEqual(created[0]["status"], "merged_probation")
+                self.assertEqual(created[0]["status"], "workspace_applied_probation")
                 self.assertEqual(repair.call_count, 0)
                 self.assertIn("paper-only note", (root / "src" / "llm_bridge.py").read_text(encoding="utf-8"))
                 rows = storage.code_evolution_recent(conn)
-                self.assertEqual(rows[0]["status"], "merged_probation")
+                self.assertEqual(rows[0]["status"], "workspace_applied_probation")
             finally:
                 code_evolution.LEDGER_JSONL = old_ledger
                 conn.close()

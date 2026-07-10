@@ -69,6 +69,24 @@ from storage import (
 )
 
 
+def _auxiliary_runtime_policy(settings: dict) -> dict:
+    """Return explicit slow-task policy for this radar process.
+
+    The market loop must stay independent from long LLM/code-evolution work.
+    Slow research/build tasks belong in ``evolution_worker.py`` unless an
+    operator deliberately opts back into in-radar execution.
+    """
+
+    llm_cfg = settings.get("llm_swarm", {})
+    builder_cfg = settings.get("autonomous_builder", {})
+    worker_cfg = settings.get("evolution_worker", {})
+    return {
+        "llm_swarm_in_radar": bool(llm_cfg.get("run_in_radar_loop", False)),
+        "autonomous_builder_in_radar": bool(builder_cfg.get("run_in_radar_loop", False)),
+        "evolution_worker_expected": bool(worker_cfg.get("enabled", True)),
+    }
+
+
 def _build_expansion_map(
     frontier_crypto_venues: dict,
     route_resolver_report: dict,
@@ -112,6 +130,7 @@ def _build_expansion_map(
 
 
 def run_once(settings: dict) -> dict:
+    auxiliary_policy = _auxiliary_runtime_policy(settings)
     capabilities = settings["account_capabilities"]
     scan_cfg = settings["scanner"]
     risk_cfg = settings["risk"]
@@ -216,7 +235,7 @@ def run_once(settings: dict) -> dict:
         stats = update_signal_stats(conn, settings) if settings["learning"]["enabled"] else {}
         adjustments = load_adjustments(conn)
         llm_recommendations_ingested = ingest_llm_recommendations(conn, settings)
-        auto_improvement = run_auto_improvement(conn, settings)
+        auto_improvement = run_auto_improvement(conn, settings, include_code_changes=False)
         signal_safety_governor = run_signal_safety_governor(conn, settings)
         contextual_failure_filters = run_contextual_failure_filters(conn, settings)
         policies = active_signal_policies(conn)
@@ -309,6 +328,7 @@ def run_once(settings: dict) -> dict:
             "signal_safety_governor": signal_safety_governor,
             "contextual_failure_filters": contextual_failure_filters,
             "strategy_reliability": strategy_reliability,
+            "auxiliary_runtime": auxiliary_policy,
         }
         payload["market_hunter_directives"] = run_market_hunter(conn, settings)
         payload["llm_recommendations_ingested"] = llm_recommendations_ingested
@@ -316,8 +336,23 @@ def run_once(settings: dict) -> dict:
         payload["memory_facts_added"] = len(ingest_radar_memory(conn, payload))
         payload["llm_cost_summary"] = llm_cost_summary(conn)
         write_llm_state_packet(conn, payload, settings)
-        payload["llm_swarm_generated"] = run_llm_swarm_once(settings=settings)
-        payload["autonomous_builder"] = run_autonomous_builder(settings=settings, conn=conn)
+        if auxiliary_policy["llm_swarm_in_radar"]:
+            payload["llm_swarm_generated"] = run_llm_swarm_once(settings=settings)
+        else:
+            payload["llm_swarm_generated"] = []
+            payload["llm_swarm_status"] = {
+                "status": "skipped",
+                "reason": "separate_evolution_worker",
+                "worker_expected": auxiliary_policy["evolution_worker_expected"],
+            }
+        if auxiliary_policy["autonomous_builder_in_radar"]:
+            payload["autonomous_builder"] = run_autonomous_builder(settings=settings, conn=conn)
+        else:
+            payload["autonomous_builder"] = {
+                "status": "skipped",
+                "reason": "separate_evolution_worker",
+                "worker_expected": auxiliary_policy["evolution_worker_expected"],
+            }
         payload["llm_inbox"] = llm_inbox_summary()
         payload["llm_cost_summary"] = llm_cost_summary(conn)
         write_llm_state_packet(conn, payload, settings)

@@ -35,6 +35,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPORT_JSON = RUNS_DIR / "evolution_report.json"
 REPORT_MD = RUNS_DIR / "evolution_report.md"
 LEDGER_JSONL = RUNS_DIR / "evolution_ledger.jsonl"
+WORKSPACE_PROBATION_STATUS = "workspace_applied_probation"
+WORKSPACE_KEPT_STATUS = "workspace_kept"
+LEGACY_PROBATION_STATUS = "merged_probation"
+LEGACY_KEPT_STATUS = "kept"
+PROBATION_STATUSES = {LEGACY_PROBATION_STATUS, WORKSPACE_PROBATION_STATUS}
+SUCCESS_STATUSES = {LEGACY_PROBATION_STATUS, LEGACY_KEPT_STATUS, WORKSPACE_PROBATION_STATUS, WORKSPACE_KEPT_STATUS}
 
 ALLOWED_CATEGORIES = {
     "runtime_pipeline_integration",
@@ -1253,7 +1259,7 @@ def _frontier_requirement_satisfied(payload: dict, patch_generation: dict | None
 def _frontier_wasted_reason(decision: str, reasons: list[str], patch_generation: dict | None) -> str | None:
     if not _frontier_model_called(patch_generation):
         return None
-    if decision in {"auto_allowed", "merged_probation", "kept"}:
+    if decision in {"auto_allowed", *SUCCESS_STATUSES}:
         return None
     text = json.dumps(patch_generation or {}, sort_keys=True).lower()
     if "insufficient_quota" in text or "429" in text:
@@ -1279,7 +1285,7 @@ def _with_frontier_usefulness(safety: dict, status: str, patch_generation: dict 
         output["frontier_call_useful"] = None
         output["frontier_call_wasted_reason"] = None
         return output
-    useful = status in {"merged_probation", "kept"} and bool(output.get("changed_files"))
+    useful = status in SUCCESS_STATUSES and bool(output.get("changed_files"))
     output["frontier_call_useful"] = useful
     output["frontier_call_wasted_reason"] = None if useful else _frontier_wasted_reason(
         status,
@@ -1303,7 +1309,7 @@ def _frontier_waste_guard(conn: Any, cfg: dict, preflight: dict) -> dict | None:
         patch_generation = safety.get("patch_generation") or {}
         if not _frontier_model_called(patch_generation):
             continue
-        if row.get("status") in {"merged_probation", "kept"}:
+        if row.get("status") in SUCCESS_STATUSES:
             continue
         if safety.get("frontier_call_wasted_reason") or row.get("status") in {
             "blocked_model_quota",
@@ -1336,7 +1342,7 @@ def _duplicate_failure_guard(conn: Any, payload: dict, preflight: dict, cfg: dic
     examples: list[str] = []
     for row in code_evolution_recent(conn, limit=int(cfg.get("duplicate_failure_suppression_recent", 80))):
         status = str(row.get("status") or "")
-        if status in {"kept", "merged_probation", "queued_probation_limit"}:
+        if status in {*SUCCESS_STATUSES, "queued_probation_limit"}:
             continue
         safety = row.get("safety") or {}
         if _patch_generation_unavailable_reason(safety.get("patch_generation") or {}):
@@ -2140,7 +2146,7 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         _append_ledger(conn, proposal_id, safety["decision"])
         return [_artifact(proposal_id, "created", safety["decision"], safety.get("reasons"))]
 
-    active = code_evolution_by_status(conn, ["merged_probation"], limit=10)
+    active = code_evolution_by_status(conn, sorted(PROBATION_STATUSES), limit=10)
     if len(active) >= int(cfg.get("max_auto_merges_per_loop", 1)):
         update_code_evolution_proposal(
             conn,
@@ -2332,14 +2338,15 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         _append_ledger(conn, proposal_id, "dependency_install_failed")
         return [_artifact(proposal_id, "created", "dependency_install_failed")]
 
-    safety = _with_frontier_usefulness(safety, "merged_probation", patch_generation)
+    probation_status = WORKSPACE_PROBATION_STATUS if cfg.get("workspace_status_names", True) else LEGACY_PROBATION_STATUS
+    safety = _with_frontier_usefulness(safety, probation_status, patch_generation)
     safety["patch_generation"] = patch_generation
     if repair_history:
         safety["repair_history"] = repair_history
     update_code_evolution_proposal(
         conn,
         proposal_id,
-        status="merged_probation",
+        status=probation_status,
         patch_text=diff_text,
         changed_files=safety.get("changed_files", []),
         safety=safety,
@@ -2347,8 +2354,8 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         applied_at=_utc_now(),
         probation_loops_observed=0,
     )
-    _append_ledger(conn, proposal_id, "merged_probation")
-    return [_artifact(proposal_id, "created", "merged_probation")]
+    _append_ledger(conn, proposal_id, probation_status)
+    return [_artifact(proposal_id, "created", probation_status)]
 
 
 def _artifact(proposal_id: str, action_status: str, status: str, reasons: list[str] | None = None) -> dict:
@@ -2365,19 +2372,19 @@ def _artifact(proposal_id: str, action_status: str, status: str, reasons: list[s
 def evaluate_code_evolution(conn: Any, settings: dict, root: pathlib.Path = ROOT) -> list[dict]:
     cfg = _cfg(settings)
     evaluated = []
-    for row in code_evolution_by_status(conn, ["merged_probation"], limit=20):
+    for row in code_evolution_by_status(conn, sorted(PROBATION_STATUSES), limit=20):
         loops = int(row.get("probation_loops_observed") or 0) + 1
         evaluation = dict(row.get("evaluation") or {})
         evaluation["last_checked_at"] = _utc_now()
         evaluation["live_trading_allowed"] = bool(settings.get("allow_live_trading", False))
-        status = "merged_probation"
+        status = row.get("status") or WORKSPACE_PROBATION_STATUS
         decision = "continue_probation"
         if settings.get("allow_live_trading"):
             decision = "revert_live_flag"
             status = "revert_required"
         elif loops >= int(cfg.get("probation_loops", 3)):
             decision = "keep"
-            status = "kept"
+            status = WORKSPACE_KEPT_STATUS if cfg.get("workspace_status_names", True) else LEGACY_KEPT_STATUS
         update_code_evolution_proposal(
             conn,
             row["proposal_id"],
@@ -2487,7 +2494,7 @@ def code_evolution_summary(conn: Any) -> dict:
                 quality_scores.append(float(scorecard["proposal_quality_score"]))
             except (TypeError, ValueError):
                 pass
-    useful = sum(counts.get(status, 0) for status in ("merged_probation", "kept"))
+    useful = sum(counts.get(status, 0) for status in SUCCESS_STATUSES)
     attempted = len(rows)
     return {
         "report": str(REPORT_MD),

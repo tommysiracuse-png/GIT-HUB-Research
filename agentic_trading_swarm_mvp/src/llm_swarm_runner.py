@@ -102,7 +102,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
     if agent["name"] == "build_planner":
         build_planner_instruction = (
             "As build_planner, prefer propose_code_change when code_evolution is enabled and no code change is "
-            "currently merged_probation. You are allowed to evolve the paper-only system, including fixing prior "
+            "currently workspace_applied_probation. You are allowed to evolve the paper-only system, including fixing prior "
             "generated code and wiring useful pieces into the running loop. Favor runtime evolution over orphan "
             "helper modules: "
             "wire reports/helpers into the radar loop or LLM packet, improve public-data adapters/parsers, add "

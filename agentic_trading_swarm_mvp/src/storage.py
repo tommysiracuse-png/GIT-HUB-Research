@@ -1285,7 +1285,12 @@ def add_llm_recommendation(
         return False
 
 
-def llm_recommendations_for_auto_execution(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+def llm_recommendations_for_auto_execution(
+    conn: sqlite3.Connection,
+    limit: int = 20,
+    *,
+    include_code_changes: bool = True,
+) -> list[dict]:
     conn.execute(
         """
         create table if not exists llm_recommendations (
@@ -1314,8 +1319,9 @@ def llm_recommendations_for_auto_execution(conn: sqlite3.Connection, limit: int 
         "request_red_team",
         "propose_signal_variant",
         "propose_diagnostic_hypothesis",
-        "propose_code_change",
     }
+    if include_code_changes:
+        allowed.add("propose_code_change")
     output = []
     for row in rows:
         item = dict(row)

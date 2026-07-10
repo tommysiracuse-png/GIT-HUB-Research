@@ -175,15 +175,21 @@
   "llm_swarm": {
     "enabled": true,
     "auto_run": true,
+    "run_in_radar_loop": false,
     "min_minutes_between_runs": 10,
     "max_recommendations_per_run": 20,
     "write_fallback_recommendations_to_inbox": false,
     "cooldown_on_model_unavailable": true,
     "model_failure_cooldown_minutes": 60
   },
+  "evolution_worker": {
+    "enabled": true,
+    "interval_seconds": 300
+  },
   "autonomous_builder": {
     "enabled": true,
     "auto_run": true,
+    "run_in_radar_loop": false,
     "min_minutes_between_runs": 0,
     "lock_stale_minutes": 180,
     "model_tier": "frontier",
@@ -202,6 +208,7 @@
   },
   "code_evolution": {
     "enabled": true,
+    "workspace_status_names": true,
     "auto_merge_paper_only": true,
     "max_auto_merges_per_loop": 12,
     "require_frontier_model": false,
@@ -261,6 +268,7 @@
   },
   "self_improvement": {
     "enabled": true,
+    "process_code_changes_in_radar_loop": false,
     "max_tasks_per_loop": 5,
     "max_policies_per_task": 5,
     "default_policy_trade_ttl": 30,
