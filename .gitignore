@@ -1,0 +1,9 @@
+agentic_trading_swarm_mvp/runs/
+agentic_trading_swarm_mvp/.venv/
+agentic_trading_swarm_mvp/venv/
+agentic_trading_swarm_mvp/**/*.sqlite
+agentic_trading_swarm_mvp/**/*.sqlite-*
+agentic_trading_swarm_mvp/**/*.db
+agentic_trading_swarm_mvp/**/*.log
+agentic_trading_swarm_mvp/**/__pycache__/
+agentic_trading_swarm_mvp/**/*.pyc
