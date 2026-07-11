@@ -753,6 +753,70 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
         self.assertIn("patch_generation_unavailable:budget_guard", row["safety"]["reasons"])
         self.assertNotIn("no_changed_files", row["safety"]["reasons"])
 
+    def test_patch_generation_preflight_budget_guard_skips_model_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "repo"
+            root.mkdir()
+            (root / "src").mkdir()
+            (root / "src" / "llm_bridge.py").write_text("# bridge\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "config").mkdir()
+            db = pathlib.Path(tmp) / "radar.sqlite"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            try:
+                rec = {
+                    "recommendation_id": "rec-preflight-budget",
+                    "title": "Budget unavailable patch",
+                    "payload": proposal(
+                        "",
+                        expected_files=["src/llm_bridge.py"],
+                        change_category="llm_prompt_state_packet",
+                    ),
+                }
+                with mock.patch.object(
+                    code_evolution,
+                    "completion_preflight_status",
+                    return_value={
+                        "ok": False,
+                        "status": "global_budget_guard:1+1>1",
+                        "model_name": "openai/gpt-5.4",
+                        "model_tier": "standard",
+                        "prompt_tokens": 123,
+                    },
+                ):
+                    with mock.patch.object(code_evolution, "complete") as complete:
+                        created = code_evolution.process_code_change_recommendation(
+                            conn,
+                            rec,
+                            settings(generate_patch_when_missing=True, require_frontier_model=False),
+                            root=root,
+                        )
+                row = storage.code_evolution_recent(conn)[0]
+            finally:
+                conn.close()
+
+        self.assertEqual(complete.call_count, 0)
+        self.assertEqual(created[0]["status"], "patch_generation_unavailable_retry_later")
+        self.assertIn("patch_generation_unavailable:budget_guard", row["safety"]["reasons"])
+        self.assertTrue(row["safety"]["patch_generation"]["preflight_skipped_model_call"])
+        self.assertNotIn("no_changed_files", row["safety"]["reasons"])
+
+    def test_temp_database_uses_temp_evolution_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = pathlib.Path(tmp) / "radar.sqlite"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            try:
+                self.assertEqual(
+                    code_evolution._ledger_path_for_connection(conn),
+                    pathlib.Path(tmp) / "evolution_ledger.jsonl",
+                )
+            finally:
+                conn.close()
+
     def test_report_normalizes_old_no_changed_fallbacks_and_invalid_formats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = pathlib.Path(tmp) / "radar.sqlite"

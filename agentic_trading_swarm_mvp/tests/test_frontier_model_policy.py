@@ -316,6 +316,52 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(llm_swarm_runner.LAST_SWARM_STATE["graph_trace"][-1]["node"], "ranker")
         self.assertEqual(recs[0]["title"], "build_planner")
 
+    def test_langgraph_ranker_coerces_label_priorities(self) -> None:
+        sequence = [
+            {
+                "action": "propose_hunter_directive",
+                "priority": "high",
+                "title": "High label",
+                "rationale": "unit test",
+                "market_key": "LABEL",
+                "evidence": {},
+                "proposed_change": "Probe",
+                "agent_name": "market_scout",
+            },
+            {
+                "action": "propose_hunter_directive",
+                "priority": 70,
+                "title": "Numeric",
+                "rationale": "unit test",
+                "market_key": "NUMERIC",
+                "evidence": {},
+                "proposed_change": "Probe",
+                "agent_name": "cross_market_researcher",
+            },
+        ]
+        sequence.extend(
+            {
+                "action": "propose_hunter_directive",
+                "priority": 40,
+                "title": f"low {idx}",
+                "rationale": "unit test",
+                "market_key": f"LOW{idx}",
+                "evidence": {},
+                "proposed_change": "Probe",
+                "agent_name": agent["name"],
+            }
+            for idx, agent in enumerate(llm_swarm_runner.AGENTS[2:], start=1)
+        )
+
+        with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=sequence):
+            recs = llm_swarm_runner.run_langgraph_if_available(
+                {"allowed_recommendation_actions": ["propose_hunter_directive"]},
+                [],
+            )
+
+        self.assertEqual(recs[0]["title"], "High label")
+        self.assertEqual(recs[0]["priority"], 90)
+
     def test_red_team_can_reject_prior_market_idea(self) -> None:
         packet = {"allowed_recommendation_actions": ["propose_hunter_directive", "propose_diagnostic_hypothesis"]}
         scout = {

@@ -160,6 +160,59 @@ def _budget_allows_call(agent_name: str, cfg: dict, agent_cfg: dict, tier_cfg: d
     return True, "budget_ok"
 
 
+def completion_preflight_status(
+    agent_name: str,
+    prompt: str,
+    system: str = "",
+    tier_override: str | None = None,
+) -> dict:
+    """Return model-call availability without making the model call."""
+
+    cfg = load_llm_config()
+    agent_cfg = cfg.get("agents", {}).get(agent_name, {"tier": "fast"})
+    tier_name = tier_override or agent_cfg.get("tier", "fast")
+    tier_cfg = cfg.get("tiers", {}).get(tier_name, cfg.get("tiers", {}).get("fast", {}))
+    model_name = tier_cfg.get("model", "fallback")
+    max_prompt_chars = int(tier_cfg.get("max_prompt_chars", 12000))
+    prompt_tokens = estimate_tokens(system + prompt[:max_prompt_chars])
+    provider = _provider_name(model_name)
+    api = str(tier_cfg.get("api") or ("responses" if provider == "openai" else "litellm"))
+
+    if cfg.get("require_env_to_call_models", True) and os.environ.get("RADAR_USE_LITELLM") != "1":
+        return {
+            "ok": False,
+            "status": "fallback_no_cost",
+            "model_name": model_name,
+            "model_tier": tier_name,
+            "provider": provider,
+            "api": api,
+            "prompt_tokens": prompt_tokens,
+        }
+
+    ready, provider_status = _provider_ready(model_name)
+    if not ready:
+        return {
+            "ok": False,
+            "status": provider_status,
+            "model_name": model_name,
+            "model_tier": tier_name,
+            "provider": provider,
+            "api": api,
+            "prompt_tokens": prompt_tokens,
+        }
+
+    allowed, budget_status = _budget_allows_call(agent_name, cfg, agent_cfg, tier_cfg, prompt_tokens)
+    return {
+        "ok": bool(allowed),
+        "status": budget_status,
+        "model_name": model_name,
+        "model_tier": tier_name,
+        "provider": provider,
+        "api": api,
+        "prompt_tokens": prompt_tokens,
+    }
+
+
 def complete(
     agent_name: str,
     prompt: str,

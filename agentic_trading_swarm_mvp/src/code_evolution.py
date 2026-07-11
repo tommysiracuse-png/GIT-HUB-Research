@@ -21,7 +21,7 @@ import sys
 import tempfile
 from typing import Any
 
-from cost_router import complete
+from cost_router import complete, completion_preflight_status
 from evolution.archive import write_candidate_archive
 from evolution.builder_context import build_builder_context, render_builder_context
 from evolution.canary import run_radar_canary, skip_canary
@@ -1237,7 +1237,11 @@ def _patch_generation_unavailable_reason(patch_generation: dict | None) -> str |
     status = str((patch_generation or {}).get("status") or "").lower()
     if not status:
         return None
-    if "agent_budget_guard" in status:
+    if "fallback_no_cost" in status:
+        return "model_calls_disabled"
+    if "fallback_missing_provider_key" in status:
+        return "missing_provider_key"
+    if "agent_budget_guard" in status or "global_budget_guard" in status:
         return "budget_guard"
     if "insufficient_quota" in status or "429" in status:
         return "quota_429"
@@ -1359,6 +1363,8 @@ def _frontier_wasted_reason(decision: str, reasons: list[str], patch_generation:
     if decision in {"auto_allowed", *SUCCESS_STATUSES}:
         return None
     text = json.dumps(patch_generation or {}, sort_keys=True).lower()
+    if _patch_generation_unavailable_reason(patch_generation):
+        return None
     if "insufficient_quota" in text or "429" in text:
         return "model_quota"
     if "timeout" in text or "timed out" in text:
@@ -1577,6 +1583,26 @@ def generate_patch_with_frontier_model(
         f"PROPOSAL:\n{json.dumps(payload, sort_keys=True)}\n\n"
         f"{rendered_context}"
     )
+    preflight_status = completion_preflight_status(
+        "build_planner",
+        prompt,
+        system=system,
+        tier_override=patch_tier,
+    )
+    if not preflight_status.get("ok"):
+        return "", {
+            "status": preflight_status.get("status"),
+            "model_name": preflight_status.get("model_name"),
+            "model_tier": preflight_status.get("model_tier"),
+            "requested_model_tier": patch_tier,
+            "implementation_mode": preflight.get("implementation_mode"),
+            "estimated_cost_usd": 0.0,
+            "prompt_tokens": preflight_status.get("prompt_tokens", 0),
+            "completion_tokens": 0,
+            "builder_context": _builder_context_metadata(builder_context),
+            "returned_patch_format": "unavailable_before_model_call",
+            "preflight_skipped_model_call": True,
+        }
     result = complete(
         "build_planner",
         prompt,
@@ -3058,7 +3084,22 @@ def _append_ledger(conn: Any, proposal_id: str, event: str) -> None:
         "recorded_at": _utc_now(),
         "proposal": rows[0] if rows else {"proposal_id": proposal_id},
     }
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    with LEDGER_JSONL.open("a", encoding="utf-8") as fh:
+    ledger_path = _ledger_path_for_connection(conn)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    with ledger_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _ledger_path_for_connection(conn: Any) -> pathlib.Path:
+    default_ledger = RUNS_DIR / "evolution_ledger.jsonl"
+    if LEDGER_JSONL != default_ledger:
+        return LEDGER_JSONL
+    try:
+        row = conn.execute("pragma database_list").fetchone()
+        db_path = pathlib.Path(str(row[2])).resolve() if row and row[2] else None
+    except Exception:  # noqa: BLE001
+        db_path = None
+    if db_path and db_path != (RUNS_DIR / "radar.sqlite").resolve():
+        return db_path.parent / "evolution_ledger.jsonl"
+    return LEDGER_JSONL
 
