@@ -171,6 +171,18 @@ def _is_confirmed_borrow(candidate: Mapping[str, Any]) -> bool:
     route = candidate.get("execution_route")
     if isinstance(route, Mapping) and str(route.get("borrow_status") or "").strip().lower() in {"confirmed", "configured", "available"}:
         return True
+    for container in (candidate.get("execution_feasibility"), candidate.get("execution_route")):
+        if not isinstance(container, Mapping):
+            continue
+        alternative = container.get("best_route_alternative") or {}
+        if not isinstance(alternative, Mapping):
+            continue
+        if (
+            alternative.get("status") == "paper_testable_proxy"
+            and "spot_borrow" in _coerce_flags(alternative.get("replaces_blockers"))
+            and not _coerce_flags(alternative.get("missing_permissions"))
+        ):
+            return True
     return False
 
 

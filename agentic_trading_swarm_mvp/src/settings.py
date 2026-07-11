@@ -276,6 +276,12 @@ DEFAULT_SETTINGS = {
         "apply_to_candidate_review": True,
         "buckets": {"exploit": 0.5, "explore": 0.3, "diagnose": 0.2},
     },
+    "route_unblocker": {
+        "enabled": True,
+        "allow_paper_proxy_routes": True,
+        "spot_borrow_proxy_allocation_multiplier": 0.25,
+        "prediction_market_research_allocation_multiplier": 0.10,
+    },
     "signal_safety": {
         "enabled": True,
         "min_closed_for_action": 5,

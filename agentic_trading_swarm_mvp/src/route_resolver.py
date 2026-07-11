@@ -183,6 +183,98 @@ def _route_probe_priority(candidate: dict, route_status: str, blockers: list[dic
     return max(0, min(100, priority))
 
 
+def _route_unblocker_enabled(settings: dict) -> bool:
+    cfg = settings.get("route_unblocker", {})
+    return bool(cfg.get("enabled", True) and cfg.get("allow_paper_proxy_routes", True))
+
+
+def _paper_route_alternatives(
+    candidate: dict,
+    missing_permissions: list[str],
+    caps: dict,
+    settings: dict,
+    *,
+    direct_route_id: str,
+) -> list[dict]:
+    if not _route_unblocker_enabled(settings):
+        return []
+    missing = set(missing_permissions or [])
+    cfg = settings.get("route_unblocker", {})
+    alternatives: list[dict] = []
+    if "spot_borrow" in missing:
+        derivatives_available = bool(caps.get("crypto_derivatives", False))
+        alternatives.append(
+            {
+                "alternative_id": "crypto_perp_proxy_for_spot_borrow",
+                "status": "paper_testable_proxy" if derivatives_available else "unavailable",
+                "route_id": "okx_derivatives_paper"
+                if candidate.get("venue") == "OKX"
+                else "frontier_crypto_perp_proxy_paper",
+                "direct_route_id": direct_route_id,
+                "replaces_blockers": ["spot_borrow"],
+                "required_permissions": ["crypto_derivatives"],
+                "missing_permissions": [] if derivatives_available else ["crypto_derivatives"],
+                "paper_allocation_multiplier": float(cfg.get("spot_borrow_proxy_allocation_multiplier", 0.25)),
+                "execution_semantics": "proxy_not_live_equivalent",
+                "notes": [
+                    "Direct short-spot route still requires borrow or margin confirmation.",
+                    "Paper proxy uses derivatives exposure to keep testing the edge direction where a perp route is available.",
+                    "Do not treat proxy paper results as proof that the direct short-spot route is executable.",
+                ],
+            }
+        )
+    prediction_blockers = {"prediction_markets_account", "venue_api_access", "jurisdiction_eligibility"}
+    if missing & prediction_blockers:
+        alternatives.append(
+            {
+                "alternative_id": "prediction_public_probability_research",
+                "status": "paper_testable_research",
+                "route_id": "prediction_market_public_research_paper",
+                "direct_route_id": direct_route_id,
+                "replaces_blockers": sorted(missing & prediction_blockers),
+                "required_permissions": [],
+                "missing_permissions": [],
+                "paper_allocation_multiplier": float(cfg.get("prediction_market_research_allocation_multiplier", 0.10)),
+                "execution_semantics": "research_only_not_live_equivalent",
+                "notes": [
+                    "Public prediction-market prices can be paper-tracked for signal value.",
+                    "Account, API, and jurisdiction requirements remain hard blockers for any real execution route.",
+                    "No credentials, account changes, jurisdiction assumptions, or order APIs are enabled.",
+                ],
+            }
+        )
+    if "venue_api_access" in missing and direct_route_id == "frontier_crypto_blocked_public_data":
+        alternatives.append(
+            {
+                "alternative_id": "public_data_route_probe",
+                "status": "research_only",
+                "route_id": "route_probe_only",
+                "direct_route_id": direct_route_id,
+                "replaces_blockers": ["venue_api_access"],
+                "required_permissions": [],
+                "missing_permissions": ["reachable_public_market_data"],
+                "paper_allocation_multiplier": 0.0,
+                "execution_semantics": "no_price_no_paper_trade",
+                "notes": [
+                    "No paper entry is allowed until public market data is reachable.",
+                    "Keep this as a route probe and venue-health target.",
+                ],
+            }
+        )
+    return alternatives
+
+
+def _best_route_alternative(alternatives: list[dict]) -> dict | None:
+    priority = {
+        "paper_testable_proxy": 0,
+        "paper_testable_research": 1,
+        "research_only": 2,
+        "unavailable": 3,
+    }
+    usable = sorted(alternatives or [], key=lambda item: priority.get(str(item.get("status")), 99))
+    return usable[0] if usable else None
+
+
 def _compact_missing(requirements: list[dict]) -> list[str]:
     return [str(item["requirement_id"]) for item in _hard_requirement_blockers(requirements)]
 
@@ -211,6 +303,7 @@ def _base_route(
     market_hours_status: str = "not_checked",
     jurisdiction_notes: list[str] | None = None,
     requirement_status_overrides: dict[str, str] | None = None,
+    route_alternatives: list[dict] | None = None,
 ) -> dict:
     route_meta = _route_lookup(registry).get(route_id, {})
     requirements = _build_requirements(
@@ -229,6 +322,8 @@ def _base_route(
         borrow_status = "configured" if _requirement_status(requirements, "spot_borrow") == "confirmed" else "required_unconfirmed"
     else:
         borrow_status = "not_required"
+    alternatives = route_alternatives or []
+    best_alternative = _best_route_alternative(alternatives)
     return {
         "route_id": route_id,
         "route_status": resolved_status,
@@ -241,6 +336,8 @@ def _base_route(
         "requirements": requirements,
         "route_next_actions": _route_next_actions(blockers),
         "route_blockers": _route_blocker_labels(blockers),
+        "route_alternatives": alternatives,
+        "best_route_alternative": best_alternative,
         "route_probe_priority": _route_probe_priority(candidate, resolved_status, blockers),
         "borrow_required": bool(borrow_required),
         "borrow_status": borrow_status,
@@ -320,8 +417,9 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
                 missing.append("crypto_spot")
             if not caps.get("spot_borrow", False):
                 missing.append("spot_borrow")
+            direct_route_id = "conditional_crypto_route_paper"
             return _base_route(
-                route_id="conditional_crypto_route_paper",
+                route_id=direct_route_id,
                 route_status=_legacy_status(not missing, missing=missing),
                 candidate=candidate,
                 required_permissions=required,
@@ -334,6 +432,13 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
                 api_access_status="public_data_only",
                 market_hours_status="24_7",
                 requirement_status_overrides={"crypto_derivatives": "not_applicable"},
+                route_alternatives=_paper_route_alternatives(
+                    candidate,
+                    missing,
+                    caps,
+                    settings,
+                    direct_route_id=direct_route_id,
+                ),
             )
         if market_type == "perp" and direction in {"long_frontier_perp", "short_frontier_perp"}:
             required = ["crypto_derivatives"]
@@ -403,6 +508,13 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
             registry=registry,
             api_access_status="public_data_only",
             market_hours_status="24_7",
+            route_alternatives=_paper_route_alternatives(
+                candidate,
+                missing,
+                caps,
+                settings,
+                direct_route_id=route_id,
+            ),
         )
 
     if venue == "YAHOO_PROXY":
@@ -472,6 +584,13 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
             market_hours_status="venue_hours_unconfirmed",
             jurisdiction_notes=["Check user eligibility and venue terms before any live route."],
             requirement_status_overrides=overrides,
+            route_alternatives=_paper_route_alternatives(
+                candidate,
+                missing,
+                caps,
+                settings,
+                direct_route_id=venue_key,
+            ),
         )
 
     return _base_route(
@@ -510,6 +629,8 @@ def enrich_candidate_with_route(candidate: dict, settings: dict, registry: dict 
             "requirements": route["requirements"],
             "route_next_actions": route["route_next_actions"],
             "route_blockers": route["route_blockers"],
+            "route_alternatives": route.get("route_alternatives", []),
+            "best_route_alternative": route.get("best_route_alternative"),
             "route_probe_priority": route["route_probe_priority"],
             "route_confidence": route["confidence"],
             "route_notes": route["route_notes"],
@@ -569,6 +690,7 @@ def summarize_routes(candidates: Iterable[dict]) -> dict:
     by_missing: collections.Counter[str] = collections.Counter()
     by_requirement_category: collections.Counter[tuple[str, str]] = collections.Counter()
     by_requirement_id: collections.Counter[tuple[str, str]] = collections.Counter()
+    by_alternative_status: collections.Counter[str] = collections.Counter()
     manual_actions: dict[tuple[str, str], dict] = {}
     samples = {"conditional": [], "route_unknown": [], "blocked": [], "standard": []}
     total = 0
@@ -587,6 +709,8 @@ def summarize_routes(candidates: Iterable[dict]) -> dict:
             by_requirement_id[(req_id, req_status)] += 1
         for missing in route.get("missing_permissions", []) or []:
             by_missing[missing] += 1
+        for alternative in route.get("route_alternatives", []) or []:
+            by_alternative_status[str(alternative.get("status") or "unknown")] += 1
         blockers = _hard_requirement_blockers(route.get("requirements", []) or [])
         for blocker in blockers:
             action = str(blocker.get("how_to_verify") or blocker.get("description") or blocker.get("requirement_id"))
@@ -623,6 +747,7 @@ def summarize_routes(candidates: Iterable[dict]) -> dict:
                     "missing_permissions": route.get("missing_permissions", []),
                     "route_next_actions": route.get("route_next_actions", [])[:3],
                     "route_blockers": route.get("route_blockers", [])[:3],
+                    "best_route_alternative": route.get("best_route_alternative"),
                     "route_notes": route.get("route_notes", [])[:3],
                     "route_probe_priority": route.get("route_probe_priority"),
                 }
@@ -634,6 +759,9 @@ def summarize_routes(candidates: Iterable[dict]) -> dict:
         "by_missing_requirement": dict(by_missing),
         "by_requirement_category": _requirement_counter_to_dict(by_requirement_category),
         "by_requirement_id": _requirement_counter_to_dict(by_requirement_id),
+        "by_route_alternative_status": dict(by_alternative_status),
+        "paper_proxy_available_count": int(by_alternative_status.get("paper_testable_proxy", 0)),
+        "paper_research_available_count": int(by_alternative_status.get("paper_testable_research", 0)),
         "top_manual_actions": _ranked_manual_actions(manual_actions),
         "samples": samples,
     }
@@ -645,12 +773,19 @@ def summarize_route_intelligence(candidates: Iterable[dict], min_interesting_sco
     spot_borrow_assets: collections.Counter[str] = collections.Counter()
     interesting_blocked = []
     potentially_executable_soon = []
+    proxy_testable = []
+    research_testable = []
     for candidate in candidates:
         route = candidate.get("execution_route") or {}
         score = float(candidate.get("score") or 0.0)
         status = route.get("route_status") or candidate.get("route_status") or "unknown"
         route_id = route.get("route_id") or candidate.get("route_id") or "unknown"
         missing = list(route.get("missing_permissions", []) or [])
+        best_alternative = route.get("best_route_alternative") or {}
+        if best_alternative.get("status") == "paper_testable_proxy":
+            proxy_testable.append(candidate)
+        elif best_alternative.get("status") == "paper_testable_research":
+            research_testable.append(candidate)
         surface = str(candidate.get("trade_type") or candidate.get("asset_class") or "unknown")
         for requirement in missing:
             blocker_counts[requirement] += 1
@@ -669,6 +804,7 @@ def summarize_route_intelligence(candidates: Iterable[dict], min_interesting_sco
                 "route_id": route_id,
                 "route_status": status,
                 "missing_requirements": missing,
+                "best_route_alternative": best_alternative,
                 "next_actions": route.get("route_next_actions", [])[:3],
             }
             interesting_blocked.append(row)
@@ -688,8 +824,30 @@ def summarize_route_intelligence(candidates: Iterable[dict], min_interesting_sco
         "spot_borrow_assets": dict(spot_borrow_assets.most_common(25)),
         "interesting_but_not_executable_count": len(interesting_blocked),
         "potentially_executable_soon_count": len(potentially_executable_soon),
+        "paper_proxy_available_count": len(proxy_testable),
+        "paper_research_available_count": len(research_testable),
         "interesting_but_not_executable": interesting_blocked[:30],
         "potentially_executable_soon": potentially_executable_soon[:30],
+        "paper_proxy_available": [
+            {
+                "inst_id": item.get("inst_id"),
+                "venue": item.get("venue"),
+                "direction": item.get("direction"),
+                "score": item.get("score"),
+                "alternative": (item.get("execution_route") or {}).get("best_route_alternative"),
+            }
+            for item in proxy_testable[:30]
+        ],
+        "paper_research_available": [
+            {
+                "inst_id": item.get("inst_id"),
+                "venue": item.get("venue"),
+                "direction": item.get("direction"),
+                "score": item.get("score"),
+                "alternative": (item.get("execution_route") or {}).get("best_route_alternative"),
+            }
+            for item in research_testable[:30]
+        ],
         "route_decision_pack": decision_pack,
         "hard_limits": [
             "Read-only route intelligence.",
@@ -828,6 +986,8 @@ def _route_intelligence_markdown(report: dict) -> str:
         f"- Read only: `{report.get('read_only')}`",
         f"- Interesting but not executable: `{report.get('interesting_but_not_executable_count', 0)}`",
         f"- Potentially executable soon: `{report.get('potentially_executable_soon_count', 0)}`",
+        f"- Paper proxy available: `{report.get('paper_proxy_available_count', 0)}`",
+        f"- Paper research available: `{report.get('paper_research_available_count', 0)}`",
         "",
         "## Blocker Counts",
         "",
@@ -850,7 +1010,8 @@ def _route_intelligence_markdown(report: dict) -> str:
     for row in soon[:20]:
         lines.append(
             f"- `{row.get('inst_id')}` {row.get('direction')} score=`{row.get('score')}` "
-            f"missing={row.get('missing_requirements')} route=`{row.get('route_id')}`"
+            f"missing={row.get('missing_requirements')} route=`{row.get('route_id')}` "
+            f"alt=`{(row.get('best_route_alternative') or {}).get('alternative_id')}`"
         )
     lines.extend(["", "## Human Route Decision Pack", ""])
     for blocker, item in report.get("route_decision_pack", {}).items():
@@ -911,6 +1072,12 @@ def _markdown(report: dict) -> str:
         lines.append("No missing requirements in the considered candidate set.")
     for item, count in sorted(missing.items(), key=lambda row: row[1], reverse=True):
         lines.append(f"- `{item}`: `{count}`")
+    lines.extend(["", "## Alternative Paper Routes", ""])
+    alternatives = summary.get("by_route_alternative_status", {})
+    if not alternatives:
+        lines.append("No alternative paper routes attached.")
+    for status, count in sorted(alternatives.items(), key=lambda row: row[0]):
+        lines.append(f"- `{status}`: `{count}`")
     lines.extend(["", "## Requirement Categories", ""])
     categories = summary.get("by_requirement_category", {})
     if not categories:
@@ -939,6 +1106,8 @@ def _markdown(report: dict) -> str:
     lines.extend(["", "## Route Intelligence", ""])
     lines.append(f"- Interesting but not executable: `{intelligence.get('interesting_but_not_executable_count', 0)}`")
     lines.append(f"- Potentially executable soon: `{intelligence.get('potentially_executable_soon_count', 0)}`")
+    lines.append(f"- Paper proxy available: `{intelligence.get('paper_proxy_available_count', 0)}`")
+    lines.append(f"- Paper research available: `{intelligence.get('paper_research_available_count', 0)}`")
     lines.append(f"- Blockers: `{intelligence.get('blocker_counts', {})}`")
     lines.append(f"- Spot-borrow assets: `{intelligence.get('spot_borrow_assets', {})}`")
     lines.append(f"- Human route decision pack: `{intelligence.get('route_decision_pack', {})}`")

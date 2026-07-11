@@ -291,10 +291,17 @@ def _compact_route_resolver(report: dict) -> dict:
         "by_missing_requirement": summary.get("by_missing_requirement", {}),
         "by_requirement_category": summary.get("by_requirement_category", {}),
         "by_requirement_id": summary.get("by_requirement_id", {}),
+        "by_route_alternative_status": summary.get("by_route_alternative_status", {}),
+        "paper_proxy_available_count": summary.get("paper_proxy_available_count", 0),
+        "paper_research_available_count": summary.get("paper_research_available_count", 0),
         "top_manual_actions": summary.get("top_manual_actions", [])[:10],
         "route_intelligence": {
             "blocker_counts": (report.get("route_intelligence") or {}).get("blocker_counts", {}),
             "spot_borrow_assets": (report.get("route_intelligence") or {}).get("spot_borrow_assets", {}),
+            "paper_proxy_available_count": (report.get("route_intelligence") or {}).get("paper_proxy_available_count", 0),
+            "paper_research_available_count": (report.get("route_intelligence") or {}).get("paper_research_available_count", 0),
+            "paper_proxy_available": (report.get("route_intelligence") or {}).get("paper_proxy_available", [])[:10],
+            "paper_research_available": (report.get("route_intelligence") or {}).get("paper_research_available", [])[:10],
             "interesting_but_not_executable_count": (report.get("route_intelligence") or {}).get(
                 "interesting_but_not_executable_count", 0
             ),
@@ -363,6 +370,7 @@ def _compact_frontier_crypto(report: dict) -> dict:
                 "data_status": row.get("data_status"),
                 "route_status": (row.get("execution_feasibility") or {}).get("status"),
                 "route_blockers": (row.get("execution_feasibility") or {}).get("route_blockers", []),
+                "best_route_alternative": (row.get("execution_feasibility") or {}).get("best_route_alternative"),
                 "candidate_reject_reason": row.get("candidate_reject_reason"),
             }
         )

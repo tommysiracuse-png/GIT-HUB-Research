@@ -49,6 +49,8 @@ class RouteResolverTests(unittest.TestCase):
         self.assertEqual(route["route_id"], "conditional_crypto_route_paper")
         self.assertEqual(route["route_status"], "conditional")
         self.assertIn("spot_borrow", route["missing_permissions"])
+        self.assertEqual(route["best_route_alternative"]["status"], "paper_testable_proxy")
+        self.assertEqual(route["best_route_alternative"]["route_id"], "okx_derivatives_paper")
         self.assertTrue(route["route_next_actions"])
         self.assertGreaterEqual(route["route_probe_priority"], 70)
 
@@ -68,6 +70,8 @@ class RouteResolverTests(unittest.TestCase):
             set(route["missing_permissions"]),
             {"prediction_markets_account", "venue_api_access", "jurisdiction_eligibility"},
         )
+        self.assertEqual(route["best_route_alternative"]["status"], "paper_testable_research")
+        self.assertEqual(route["best_route_alternative"]["route_id"], "prediction_market_public_research_paper")
 
     def test_watch_only_route_is_blocked(self) -> None:
         candidate = {
@@ -159,6 +163,8 @@ class RouteResolverTests(unittest.TestCase):
         self.assertTrue(summary["top_manual_actions"])
         self.assertIn("route_intelligence", report)
         self.assertIn("spot_borrow", report["route_intelligence"]["blocker_counts"])
+        self.assertGreaterEqual(summary["paper_proxy_available_count"], 1)
+        self.assertGreaterEqual(summary["paper_research_available_count"], 1)
         self.assertTrue(report["route_intelligence"]["potentially_executable_soon"])
         self.assertIn("route_decision_pack", report["route_intelligence"])
         self.assertEqual(
@@ -195,6 +201,8 @@ class RouteResolverTests(unittest.TestCase):
         self.assertEqual(report["spot_borrow_assets"]["DOGE"], 1)
         self.assertIn("prediction_markets_account", report["blocker_counts"])
         self.assertEqual(report["potentially_executable_soon_count"], 2)
+        self.assertEqual(report["paper_proxy_available_count"], 1)
+        self.assertEqual(report["paper_research_available_count"], 1)
         decision_pack = report["route_decision_pack"]
         self.assertTrue(decision_pack["spot_borrow"]["shadow_testing_can_continue"])
         self.assertEqual(decision_pack["prediction_markets_account"]["affected_opportunity_count"], 1)

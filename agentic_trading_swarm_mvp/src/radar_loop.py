@@ -296,7 +296,9 @@ def run_once(settings: dict) -> dict:
                     "confidence": review["confidence"],
                     "net_edge_bps_estimate": review["net_edge_bps_estimate"],
                     "route_id": review.get("route_id"),
+                    "effective_route_id": review.get("effective_route_id"),
                     "route_status": review.get("route_status"),
+                    "route_alternative_used": review.get("route_alternative_used"),
                 }
             )
 
@@ -334,6 +336,8 @@ def run_once(settings: dict) -> dict:
                     "confidence": item["review"]["confidence"],
                     "blocks": item["review"]["hard_blocks"],
                     "route_id": item["review"].get("route_id"),
+                    "effective_route_id": item["review"].get("effective_route_id"),
+                    "route_alternative_used": item["review"].get("route_alternative_used"),
                     "route_status": item["review"].get("route_status"),
                     "missing_requirements": item["review"].get("missing_requirements", []),
                     "hunter_bucket": item["candidate"].get("_hunter_bucket"),

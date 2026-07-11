@@ -161,6 +161,12 @@
     "apply_to_candidate_review": true,
     "buckets": {"exploit": 0.5, "explore": 0.3, "diagnose": 0.2}
   },
+  "route_unblocker": {
+    "enabled": true,
+    "allow_paper_proxy_routes": true,
+    "spot_borrow_proxy_allocation_multiplier": 0.25,
+    "prediction_market_research_allocation_multiplier": 0.10
+  },
   "llm_bridge": {
     "enabled": true,
     "ingest_recommendations": true,

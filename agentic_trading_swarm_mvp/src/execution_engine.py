@@ -36,7 +36,8 @@ def _side_for_direction(direction: str) -> str:
 
 def _route_for_candidate(candidate: dict, review: dict) -> str:
     resolved_route = (
-        review.get("route_id")
+        review.get("effective_route_id")
+        or review.get("route_id")
         or candidate.get("route_id")
         or (candidate.get("execution_route") or {}).get("route_id")
         or (candidate.get("execution_feasibility") or {}).get("route_id")
@@ -96,6 +97,9 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         "feasibility_status": review.get("feasibility_status"),
         "route_status": review.get("route_status"),
         "missing_requirements": review.get("missing_requirements", []),
+        "direct_missing_requirements": review.get("direct_missing_requirements", []),
+        "route_alternative_used": bool(review.get("route_alternative_used")),
+        "route_alternative": review.get("route_alternative", {}),
         "legs": [leg],
         "risk": {
             "confidence": review.get("confidence"),

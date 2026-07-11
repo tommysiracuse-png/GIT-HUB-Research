@@ -54,6 +54,23 @@ def estimate_net_edge_bps(candidate: dict, settings: dict) -> float:
     return round(gross - estimated_cost, 3)
 
 
+def _best_route_alternative(feasibility: dict, route: dict) -> dict:
+    alternative = feasibility.get("best_route_alternative") or route.get("best_route_alternative") or {}
+    return alternative if isinstance(alternative, dict) else {}
+
+
+def _route_alternative_covers_missing(missing_requirements: list[str], alternative: dict) -> bool:
+    if not alternative:
+        return False
+    if alternative.get("status") not in {"paper_testable_proxy", "paper_testable_research"}:
+        return False
+    if alternative.get("missing_permissions"):
+        return False
+    missing = set(str(item) for item in missing_requirements or [])
+    replaced = set(str(item) for item in alternative.get("replaces_blockers", []) or [])
+    return bool(missing) and missing.issubset(replaced)
+
+
 def review_candidate(
     candidate: dict,
     settings: dict,
@@ -70,6 +87,8 @@ def review_candidate(
     route_status = feasibility.get("route_status") or route.get("route_status") or feasibility_status
     route_id = feasibility.get("route_id") or route.get("route_id")
     missing_requirements = feasibility.get("missing_requirements") or route.get("missing_permissions") or []
+    route_alternative = _best_route_alternative(feasibility, route)
+    route_alternative_usable = _route_alternative_covers_missing(missing_requirements, route_alternative)
     net_edge_bps = estimate_net_edge_bps(candidate, settings)
     context_features = build_context_features(candidate, {}, net_edge_bps=net_edge_bps)
     matched_policies = _matching_policies(key, policies, context_features)
@@ -109,7 +128,21 @@ def review_candidate(
     if net_edge_bps < risk["min_net_edge_bps"]:
         hard_blocks.append(f"estimated net edge too small after costs: {net_edge_bps} bps")
     if feasibility_status == "conditional":
-        if missing_requirements:
+        if missing_requirements and route_alternative_usable:
+            allocation_multiplier = min(
+                allocation_multiplier,
+                max(0.0, min(1.0, float(route_alternative.get("paper_allocation_multiplier", 1.0)))),
+            )
+            warnings.append(
+                "direct route blocked by "
+                f"{', '.join(missing_requirements)}; using paper-only alternative "
+                f"{route_alternative.get('alternative_id')} at reduced allocation"
+            )
+            evidence.append(
+                f"paper route alternative {route_alternative.get('alternative_id')} "
+                f"status {route_alternative.get('status')}"
+            )
+        elif missing_requirements:
             hard_blocks.append(f"trade requires unconfirmed route capability: {', '.join(missing_requirements)}")
         else:
             hard_blocks.append("trade requires unconfirmed borrow, margin, or venue capability")
@@ -215,6 +248,8 @@ def review_candidate(
         decision = "approve_paper_trade"
     if decision == "approve_paper_trade" and candidate.get("quality_action") == "conditional":
         decision = "approve_conditional_paper_trade"
+    if decision == "approve_paper_trade" and route_alternative_usable:
+        decision = "approve_conditional_paper_trade"
 
     confidence = 0.5
     confidence += min(abs(candidate["funding_bps"]) / 40.0, 0.15)
@@ -239,8 +274,12 @@ def review_candidate(
         "context_features": context_features,
         "feasibility_status": feasibility_status,
         "route_id": route_id,
+        "effective_route_id": route_alternative.get("route_id") if route_alternative_usable else route_id,
         "route_status": route_status,
         "missing_requirements": missing_requirements,
+        "direct_missing_requirements": missing_requirements if route_alternative_usable else [],
+        "route_alternative": route_alternative if route_alternative_usable else {},
+        "route_alternative_used": bool(route_alternative_usable),
         "route_confidence": feasibility.get("route_confidence") or route.get("confidence"),
         "route_notes": feasibility.get("route_notes") or route.get("route_notes", []),
         "evidence": evidence,
