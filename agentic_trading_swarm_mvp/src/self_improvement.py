@@ -1489,6 +1489,38 @@ def _report_markdown(report: dict) -> str:
             f"potentially executable soon `{route.get('potentially_executable_soon_count', 0)}`"
         )
 
+    research_path = RUNS_DIR / "research_worker_latest.json"
+    if research_path.exists():
+        try:
+            research = json.loads(research_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            research = {"status": "unreadable"}
+        research_summary = research.get("summary", {})
+        lines.extend(["", "## Global Market Discovery", ""])
+        lines.append(f"- Status: `{research.get('status')}`")
+        lines.append(
+            f"- Candidates this run: `{research_summary.get('candidate_count', 0)}`, "
+            f"new `{research_summary.get('new_candidate_count', 0)}`, "
+            f"total known `{research_summary.get('total_known_candidate_count', 0)}`"
+        )
+        lines.append(f"- Surface types: `{research_summary.get('by_surface_type', {})}`")
+        lines.append(f"- Regions: `{research_summary.get('by_region', {})}`")
+        lines.append(f"- Artifact inserts: `{research_summary.get('inserted_artifact_counts', {})}`")
+        lines.append(f"- Report: `{RUNS_DIR / 'research_worker_report.md'}`")
+
+    allocation_path = RUNS_DIR / "hunter_allocation_report.json"
+    if allocation_path.exists():
+        try:
+            allocation = json.loads(allocation_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            allocation = {"enabled": "unreadable"}
+        lines.extend(["", "## Hunter Allocation", ""])
+        lines.append(f"- Enabled: `{allocation.get('enabled')}`")
+        lines.append(f"- Slot targets: `{allocation.get('slot_targets', {})}`")
+        lines.append(f"- Selected by bucket: `{allocation.get('selected_by_bucket', {})}`")
+        lines.append(f"- Global discovery: `{allocation.get('global_discovery', {})}`")
+        lines.append(f"- Report: `{RUNS_DIR / 'hunter_allocation_report.md'}`")
+
     open_pack = report.get("self_improvement_open_pack") or {}
     if open_pack:
         borrow = open_pack.get("route_borrow_intelligence") or {}

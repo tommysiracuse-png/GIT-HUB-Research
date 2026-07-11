@@ -19,6 +19,7 @@ from typing import Any
 from autonomous_builder import run_autonomous_builder
 from llm_bridge import STATE_JSON, ingest_llm_recommendations
 from llm_swarm_runner import run_once as run_llm_swarm_once
+from research_worker import run_once as run_research_worker_once
 from self_improvement import run_auto_improvement
 from settings import load_settings
 from storage import RUNS_DIR, connect, llm_cost_summary, llm_inbox_summary
@@ -42,6 +43,8 @@ def _write_report(report: dict) -> dict:
         "",
         f"- Generated: `{report.get('generated_at')}`",
         f"- Status: `{report.get('status')}`",
+        f"- Research worker status: `{(report.get('research_worker') or {}).get('status')}`",
+        f"- Research candidates: `{((report.get('research_worker') or {}).get('summary') or {}).get('candidate_count', 0)}`",
         f"- LLM swarm recommendations: `{len(report.get('llm_swarm_generated') or [])}`",
         f"- Inbox ingested: `{len(report.get('llm_recommendations_ingested') or [])}`",
         f"- Auto-improvement consumed: `{len((report.get('self_improvement') or {}).get('consumed') or [])}`",
@@ -73,6 +76,11 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         )
 
     worker_settings = _worker_settings(settings)
+    research_worker_report = {}
+    if settings.get("research_worker", {}).get("enabled", True) and settings.get("research_worker", {}).get(
+        "run_every_evolution_cycle", True
+    ):
+        research_worker_report = run_research_worker_once(settings=worker_settings)
     llm_swarm_generated = run_llm_swarm_once(settings=settings, force=force_swarm)
     with connect() as conn:
         ingested = ingest_llm_recommendations(conn, settings)
@@ -83,6 +91,7 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
             "status": "ok",
             "mode": settings.get("mode"),
             "live_trading_allowed": bool(settings.get("allow_live_trading", False)),
+            "research_worker": research_worker_report,
             "llm_swarm_generated": llm_swarm_generated,
             "llm_recommendations_ingested": ingested,
             "self_improvement": self_improvement,
@@ -108,6 +117,7 @@ def main(argv: list[str]) -> int:
         print(
             "Evolution worker "
             f"status={report.get('status')} "
+            f"research={((report.get('research_worker') or {}).get('summary') or {}).get('candidate_count', 0)} "
             f"swarm={len(report.get('llm_swarm_generated') or [])} "
             f"ingested={len(report.get('llm_recommendations_ingested') or [])} "
             f"consumed={len((report.get('self_improvement') or {}).get('consumed') or [])} "

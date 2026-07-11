@@ -192,6 +192,16 @@ DEFAULT_SETTINGS = {
         "enabled": True,
         "interval_seconds": 300,
     },
+    "research_worker": {
+        "enabled": True,
+        "global_market_discovery": True,
+        "web_research_enabled": True,
+        "run_every_evolution_cycle": True,
+        "max_candidates_per_run": 50,
+        "max_artifacts_per_run": 20,
+        "artifact_priority_floor": 70,
+        "discovery_seeds": [],
+    },
     "autonomous_builder": {
         "enabled": True,
         "auto_run": True,
@@ -262,6 +272,8 @@ DEFAULT_SETTINGS = {
         "enabled": True,
     },
     "hunter_allocation": {
+        "enabled": True,
+        "apply_to_candidate_review": True,
         "buckets": {"exploit": 0.5, "explore": 0.3, "diagnose": 0.2},
     },
     "signal_safety": {

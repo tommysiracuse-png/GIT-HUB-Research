@@ -269,6 +269,27 @@ def write_growth_plan(conn: sqlite3.Connection) -> pathlib.Path:
     for task in tasks[:20]:
         lines.append(f"- P{task['priority']} #{task['id']}: {task['title']}")
         lines.append(f"  - {task['rationale']}")
+    research_path = RUNS_DIR / "research_worker_latest.json"
+    if research_path.exists():
+        try:
+            research = json.loads(research_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            research = {}
+        summary = research.get("summary", {})
+        lines.extend(["", "## Global Market Discovery", ""])
+        lines.append(
+            f"- Candidates this run: `{summary.get('candidate_count', 0)}`, "
+            f"new `{summary.get('new_candidate_count', 0)}`, "
+            f"total known `{summary.get('total_known_candidate_count', 0)}`"
+        )
+        lines.append(f"- Surface types: `{summary.get('by_surface_type', {})}`")
+        lines.append(f"- Regions: `{summary.get('by_region', {})}`")
+        lines.append(f"- Artifact inserts: `{summary.get('inserted_artifact_counts', {})}`")
+        for item in summary.get("top_candidates", [])[:10]:
+            lines.append(
+                f"- P{item.get('priority')} `{item.get('venue_or_source')}` "
+                f"`{item.get('surface_type_classified')}` -> `{item.get('recommended_next_action')}`"
+            )
     lines.extend(["", "## Signal Stats", ""])
     if not stats:
         lines.append("No closed signal stats yet.")

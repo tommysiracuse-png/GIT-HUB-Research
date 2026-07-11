@@ -174,6 +174,8 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
     route_probe_tasks = open_route_probe_tasks(conn, limit=30)
     adapter_specs = open_adapter_specs(conn, limit=30)
     buckets = _bucketize(stats, directives)
+    global_market_discovery = _compact_global_market_discovery(payload.get("research_worker"))
+    hunter_allocation = payload.get("hunter_allocation", {})
     packet = {
         "purpose": "Read-only state packet for LLM agents. Recommend actions through llm_recommendations_inbox.jsonl only.",
         "mode": settings.get("mode"),
@@ -182,6 +184,8 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "execution_summary": payload.get("execution_summary", {}),
         "route_resolver": _compact_route_resolver(payload.get("route_resolver", {})),
         "expansion_map": payload.get("expansion_map", {}),
+        "global_market_discovery": global_market_discovery,
+        "hunter_allocation": hunter_allocation,
         "llm_cost_summary": payload.get("llm_cost_summary", {}),
         "llm_inbox": payload.get("llm_inbox", {}),
         "maintenance": payload.get("maintenance", {}),
@@ -249,6 +253,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
             "Use implementation_mode='shadow_trial' only for uncertain new signal logic, not for basic data-coverage expansion.",
             "Autonomous execution is limited to paper-only bounded policies, route probes, adapter specs, memory, reports, tests, and Build-Governor-approved code evolution.",
             "Live trading, credentials, real notional, destructive data changes, startup changes, and broker writes remain blocked.",
+            "Global market discovery may research any public market surface worldwide; non-public, stolen, hacked, or credential-only information must not be used as a trading signal.",
         ],
     }
     STATE_JSON.write_text(json.dumps(packet, indent=2), encoding="utf-8")
@@ -568,6 +573,38 @@ def _compact_experiment(item: dict) -> dict:
     }
 
 
+def _compact_global_market_discovery(report: dict | None = None) -> dict:
+    if not report:
+        path = RUNS_DIR / "research_worker_latest.json"
+        if path.exists():
+            try:
+                report = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                report = {"status": "unreadable", "report": str(path)}
+    if not report:
+        return {
+            "status": "missing",
+            "report": str(RUNS_DIR / "research_worker_report.md"),
+            "candidate_ledger": str(RUNS_DIR / "market_discovery_candidates.jsonl"),
+        }
+    summary = report.get("summary", {})
+    return {
+        "status": report.get("status"),
+        "global_market_discovery": report.get("global_market_discovery"),
+        "web_research_enabled": report.get("web_research_enabled"),
+        "candidate_count": summary.get("candidate_count", 0),
+        "new_candidate_count": summary.get("new_candidate_count", 0),
+        "total_known_candidate_count": summary.get("total_known_candidate_count", 0),
+        "by_surface_type": summary.get("by_surface_type", {}),
+        "by_region": summary.get("by_region", {}),
+        "by_recommended_next_action": summary.get("by_recommended_next_action", {}),
+        "inserted_artifact_counts": summary.get("inserted_artifact_counts", {}),
+        "top_candidates": summary.get("top_candidates", [])[:10],
+        "report": str(RUNS_DIR / "research_worker_report.md"),
+        "candidate_ledger": str(RUNS_DIR / "market_discovery_candidates.jsonl"),
+    }
+
+
 def _packet_to_markdown(packet: dict) -> str:
     lines = [
         "# LLM State Packet",
@@ -580,6 +617,8 @@ def _packet_to_markdown(packet: dict) -> str:
         f"- Execution: `{packet['execution_summary']}`",
         f"- Route resolver: `{packet.get('route_resolver', {})}`",
         f"- Expansion map: `{packet.get('expansion_map', {})}`",
+        f"- Global market discovery: `{packet.get('global_market_discovery', {})}`",
+        f"- Hunter allocation: `{packet.get('hunter_allocation', {})}`",
         f"- Frontier crypto venues: `{packet.get('frontier_crypto_venues', {})}`",
         f"- Signal redesign: `{packet.get('signal_redesign', {})}`",
         f"- OKX signal research: `{packet.get('okx_signal_research', {})}`",

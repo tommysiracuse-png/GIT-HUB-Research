@@ -157,6 +157,8 @@
     "decay_recent_vs_lifetime_bps": -10.0
   },
   "hunter_allocation": {
+    "enabled": true,
+    "apply_to_candidate_review": true,
     "buckets": {"exploit": 0.5, "explore": 0.3, "diagnose": 0.2}
   },
   "llm_bridge": {
@@ -188,6 +190,16 @@
   "evolution_worker": {
     "enabled": true,
     "interval_seconds": 300
+  },
+  "research_worker": {
+    "enabled": true,
+    "global_market_discovery": true,
+    "web_research_enabled": true,
+    "run_every_evolution_cycle": true,
+    "max_candidates_per_run": 50,
+    "max_artifacts_per_run": 20,
+    "artifact_priority_floor": 70,
+    "discovery_seeds": []
   },
   "autonomous_builder": {
     "enabled": true,

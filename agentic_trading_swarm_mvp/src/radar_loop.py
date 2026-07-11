@@ -26,7 +26,7 @@ from execution_engine import execute_order
 from frontier_crypto_adapter import REPORT_JSON as FRONTIER_CRYPTO_REPORT_JSON
 from frontier_crypto_adapter import build_scan_batch as build_frontier_crypto_scan_batch
 from global_proxy_scanner import build_scan_batch as build_global_proxy_scan_batch
-from hunter_allocation import allocate_candidate_review
+from hunter_allocation import allocate_candidate_review, write_hunter_allocation_report
 from learning import load_adjustments, stats_snapshot, update_signal_stats
 from llm_bridge import ingest_llm_recommendations, write_llm_state_packet
 from llm_swarm_runner import run_once as run_llm_swarm_once
@@ -241,12 +241,25 @@ def run_once(settings: dict) -> dict:
         signal_safety_governor = run_signal_safety_governor(conn, settings)
         contextual_failure_filters = run_contextual_failure_filters(conn, settings)
         policies = active_signal_policies(conn)
-        review_candidates, hunter_allocation = allocate_candidate_review(
-            candidates,
-            open_hunter_directives(conn),
-            int(scan_cfg["review_top"]),
-            buckets=settings.get("hunter_allocation", {}).get("buckets"),
-        )
+        hunter_cfg = settings.get("hunter_allocation", {})
+        if hunter_cfg.get("enabled", True) and hunter_cfg.get("apply_to_candidate_review", True):
+            review_candidates, hunter_allocation = allocate_candidate_review(
+                candidates,
+                open_hunter_directives(conn),
+                int(scan_cfg["review_top"]),
+                buckets=hunter_cfg.get("buckets"),
+            )
+        else:
+            review_candidates = [dict(candidate, _hunter_bucket="disabled") for candidate in candidates[: int(scan_cfg["review_top"])]]
+            hunter_allocation = {
+                "enabled": False,
+                "selected_count": len(review_candidates),
+                "selected_by_bucket": {"disabled": len(review_candidates)},
+                "slot_targets": {},
+                "directive_counts": {},
+                "minimum_exploration_floor": 0,
+            }
+        hunter_allocation = write_hunter_allocation_report(hunter_allocation, review_candidates, candidates, settings)
 
         reviewed = []
         opened = []
@@ -323,6 +336,8 @@ def run_once(settings: dict) -> dict:
                     "route_id": item["review"].get("route_id"),
                     "route_status": item["review"].get("route_status"),
                     "missing_requirements": item["review"].get("missing_requirements", []),
+                    "hunter_bucket": item["candidate"].get("_hunter_bucket"),
+                    "hunter_allocation_reason": item["candidate"].get("_hunter_allocation_reason"),
                 }
                 for item in reviewed[:10]
             ],
