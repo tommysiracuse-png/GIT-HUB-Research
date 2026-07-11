@@ -13,14 +13,32 @@ import argparse
 import datetime as dt
 import json
 import pathlib
+import re
 import sys
-from typing import Any
+import time
+from typing import Any, TypedDict
 
 from cost_router import complete
 from llm_bridge import INBOX, STATE_JSON
 from memory_graph import query_memory
 from settings import load_settings
 from storage import RUNS_DIR, connect
+
+
+COLLABORATION_MODE = "langgraph_typed_action_package"
+FALLBACK_COLLABORATION_MODE = "sequential_typed_action_package"
+LAST_SWARM_STATE: dict[str, Any] = {}
+
+
+class SwarmState(TypedDict, total=False):
+    packet: dict
+    memory: list[dict]
+    agent_outputs: list[dict]
+    critiques: list[dict]
+    ranked_actions: list[dict]
+    rejected_actions: list[dict]
+    graph_trace: list[dict]
+    collaboration_mode: str
 
 
 AGENTS = [
@@ -97,6 +115,9 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "code_evolution": packet.get("code_evolution", {}),
         "recent_memory": memory[:20],
         "allowed_actions": packet.get("allowed_recommendation_actions", []),
+        "current_cycle_agent_outputs": packet.get("current_cycle_agent_outputs", [])[:10],
+        "current_cycle_critiques": packet.get("current_cycle_critiques", [])[:10],
+        "current_cycle_ranked_actions": packet.get("current_cycle_ranked_actions", [])[:10],
     }
     build_planner_instruction = ""
     if agent["name"] == "build_planner":
@@ -155,6 +176,8 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "report_only; market-expansion work should normally be runtime_active.\n"
         "Do not place trades, enable live trading, add credentials, install dependencies, "
         "change startup/system tasks, or request unrestricted code mutation.\n"
+        "When current-cycle outputs are present, explicitly cite which earlier agent output you used, "
+        "refined, or rejected. Red-team weak ideas instead of repeating them.\n"
         f"If uncertain, use action {agent['default_action']}.\n\n"
         f"STATE:\n{json.dumps(compact, sort_keys=True)}"
     )
@@ -162,23 +185,10 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
 
 def parse_recommendation(text: str, agent: dict, packet: dict) -> dict:
     allowed = set(packet.get("allowed_recommendation_actions", []))
-    parsed_from_fallback = False
-    try:
-        rec = json.loads(text)
-    except json.JSONDecodeError:
-        parsed_from_fallback = True
-        fallback_action = agent["default_action"]
-        if agent["name"] == "build_planner":
-            fallback_action = "propose_build_task"
-        rec = {
-            "action": fallback_action,
-            "priority": 50,
-            "title": f"{agent['name']} unstructured recommendation",
-            "rationale": text[:1000],
-            "market_key": agent["name"],
-            "evidence": {"parser": "fallback", "downgraded_from_code_change": agent["name"] == "build_planner"},
-            "proposed_change": text[:1000],
-        }
+    rec, parse_status, reason = _parse_json_recommendation(text)
+    if rec is None:
+        return _reject_recommendation(agent, text, parse_status, reason)
+    rec["parse_status"] = parse_status
     if rec.get("action") not in allowed:
         rec["action"] = agent["default_action"]
     if rec.get("action") == "propose_code_change":
@@ -195,7 +205,7 @@ def parse_recommendation(text: str, agent: dict, packet: dict) -> dict:
                     **(rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}),
                     "downgraded_from_code_change": True,
                     "downgrade_reason": "missing_actionable_code_change_fields",
-                    "parser": "fallback" if parsed_from_fallback else "structured_guard",
+                    "parser": "structured_guard",
                 },
             }
     rec.setdefault("priority", 50)
@@ -349,6 +359,28 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
         structured_json=True,
     )
     rec = parse_recommendation(result.text, agent, packet)
+    if _should_retry_schema(
+        rec,
+        {
+            "status": result.status,
+            "tier": result.model_tier,
+        },
+    ):
+        retry = complete(
+            agent["name"],
+            _schema_retry_prompt(agent, result.text),
+            system=system,
+            tier_override=tier,
+            operation="llm_swarm_schema_retry",
+            frontier_escalation_reason=escalation_reason if tier == "frontier" else None,
+            reasoning_effort_override=reasoning_override,
+            structured_json=True,
+        )
+        retry_rec = parse_recommendation(retry.text, agent, packet)
+        retry_rec["retry_count"] = 1
+        retry_rec["initial_parse_status"] = rec.get("parse_status")
+        result = retry
+        rec = retry_rec
     if result.model_tier == "frontier" and not rec.get("frontier_escalation_reason"):
         rec["frontier_escalation_reason"] = escalation_reason or "Frontier tier selected by model policy."
     rec["model"] = {
@@ -366,46 +398,301 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
     return rec
 
 
+def _json_objects(text: str) -> list[dict]:
+    decoder = json.JSONDecoder()
+    objects: list[dict] = []
+    visited: set[int] = set()
+    for match in re.finditer(r"\{", text or ""):
+        start = match.start()
+        if start in visited:
+            continue
+        visited.add(start)
+        try:
+            value, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            objects.append(value)
+    return objects
+
+
+def _appears_truncated_json(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped or "{" not in stripped:
+        return False
+    in_string = False
+    escaped = False
+    depth = 0
+    for char in stripped[stripped.find("{") :]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+    return depth > 0 or in_string
+
+
+def _parse_json_recommendation(text: str) -> tuple[dict | None, str, str | None]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, "empty_response", "empty_response"
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        embedded = _json_objects(raw)
+        if embedded:
+            return embedded[0], "recovered_valid", None
+        if _appears_truncated_json(raw):
+            return None, "truncated_json", "truncated_json"
+        return None, "invalid_json", "no_complete_json_object"
+    if not isinstance(parsed, dict):
+        return None, "invalid_schema", "top_level_json_not_object"
+    return parsed, "native_valid", None
+
+
+def _reject_recommendation(agent: dict, text: str, parse_status: str, reason: str | None) -> dict:
+    return {
+        "_rejected": True,
+        "accepted": False,
+        "action": "no_action",
+        "priority": 0,
+        "title": f"{agent['name']} rejected output",
+        "rationale": (text or "")[:1000],
+        "market_key": agent["name"],
+        "evidence": {"parser": "strict", "parse_status": parse_status},
+        "proposed_change": "",
+        "agent_name": agent["name"],
+        "parse_status": parse_status,
+        "terminal_failure_reason": reason or parse_status,
+        "provenance": {
+            "state_packet": str(STATE_JSON),
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        },
+    }
+
+
+def _is_rejected(rec: dict) -> bool:
+    return bool(rec.get("_rejected") or rec.get("accepted") is False or rec.get("action") == "no_action")
+
+
+def _should_retry_schema(rec: dict, model: dict) -> bool:
+    status = str(model.get("status") or "").lower()
+    if status.startswith("fallback_") or "budget_guard" in status:
+        return False
+    return _is_rejected(rec) and rec.get("parse_status") in {"invalid_json", "truncated_json", "empty_response", "invalid_schema"}
+
+
+def _schema_retry_prompt(agent: dict, original_text: str) -> str:
+    return (
+        f"The previous {agent['name']} response was not a complete valid JSON recommendation. "
+        "Return exactly one complete JSON object with: action, priority, title, rationale, "
+        "market_key, evidence, proposed_change, and optional code_change or variant_config. "
+        "No markdown, no commentary, no arrays. Keep it paper-only.\n\n"
+        f"Previous response preview:\n{(original_text or '')[:1200]}"
+    )
+
+
+def _dedupe_key(rec: dict) -> tuple:
+    code_change = rec.get("code_change") if isinstance(rec.get("code_change"), dict) else {}
+    files = tuple(sorted(str(path) for path in code_change.get("expected_files", []) or rec.get("expected_files", []) or []))
+    title = re.sub(r"\s+", " ", str(rec.get("title") or "").strip().lower())
+    return (
+        str(rec.get("action") or ""),
+        str(rec.get("market_key") or ""),
+        str(rec.get("signal_key") or ""),
+        files,
+        title,
+    )
+
+
+def _critique_from_recommendation(agent: dict, rec: dict) -> dict | None:
+    if agent["name"] not in {"red_team", "build_planner"}:
+        return None
+    evidence = rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}
+    return {
+        "agent_name": agent["name"],
+        "title": rec.get("title"),
+        "rationale": rec.get("rationale"),
+        "reject_market_keys": evidence.get("reject_market_keys", []),
+        "reject_signal_keys": evidence.get("reject_signal_keys", []),
+        "reject_titles": evidence.get("reject_titles", []),
+        "used_agent_outputs": evidence.get("used_agent_outputs", []),
+        "rejected_agent_outputs": evidence.get("rejected_agent_outputs", []),
+    }
+
+
+def _rejected_by_critiques(rec: dict, critiques: list[dict]) -> str | None:
+    market = str(rec.get("market_key") or "")
+    signal = str(rec.get("signal_key") or "")
+    title = str(rec.get("title") or "")
+    for critique in critiques:
+        if market and market in set(str(item) for item in critique.get("reject_market_keys", []) or []):
+            return f"rejected_by_{critique.get('agent_name')}:market_key"
+        if signal and signal in set(str(item) for item in critique.get("reject_signal_keys", []) or []):
+            return f"rejected_by_{critique.get('agent_name')}:signal_key"
+        if title and title in set(str(item) for item in critique.get("reject_titles", []) or []):
+            return f"rejected_by_{critique.get('agent_name')}:title"
+    return None
+
+
+def _accepted_outputs(state: SwarmState) -> list[dict]:
+    accepted: list[dict] = []
+    for item in state.get("agent_outputs", []):
+        rec = item.get("recommendation") if isinstance(item, dict) else None
+        if isinstance(rec, dict) and not _is_rejected(rec):
+            accepted.append(rec)
+    return accepted
+
+
+def _initial_state(packet: dict, memory: list[dict], mode: str) -> SwarmState:
+    return {
+        "packet": packet,
+        "memory": memory,
+        "agent_outputs": [],
+        "critiques": [],
+        "ranked_actions": [],
+        "rejected_actions": [],
+        "graph_trace": [],
+        "collaboration_mode": mode,
+    }
+
+
+def _record_agent_result(state: SwarmState, agent: dict, rec: dict, elapsed_ms: int) -> SwarmState:
+    model = rec.get("model") if isinstance(rec.get("model"), dict) else {}
+    output = {
+        "agent_name": agent["name"],
+        "accepted": not _is_rejected(rec),
+        "parse_status": rec.get("parse_status", "native_valid"),
+        "recommendation": rec,
+        "model": model,
+    }
+    state.setdefault("agent_outputs", []).append(output)
+    if _is_rejected(rec):
+        state.setdefault("rejected_actions", []).append(
+            {
+                "agent_name": agent["name"],
+                "title": rec.get("title"),
+                "parse_status": rec.get("parse_status"),
+                "reason": rec.get("terminal_failure_reason"),
+                "recommendation": rec,
+            }
+        )
+    critique = _critique_from_recommendation(agent, rec)
+    if critique:
+        state.setdefault("critiques", []).append(critique)
+    state.setdefault("graph_trace", []).append(
+        {
+            "node": agent["name"],
+            "elapsed_ms": elapsed_ms,
+            "accepted": not _is_rejected(rec),
+            "parse_status": rec.get("parse_status", "native_valid"),
+            "model_status": model.get("status"),
+            "model_tier": model.get("tier"),
+            "estimated_cost_usd": model.get("estimated_cost_usd"),
+        }
+    )
+    return state
+
+
+def _run_agent_node(agent: dict, state: SwarmState) -> SwarmState:
+    started = time.perf_counter()
+    agent_packet = dict(state["packet"])
+    agent_packet["current_cycle_recommendations"] = _accepted_outputs(state)
+    agent_packet["current_cycle_agent_outputs"] = state.get("agent_outputs", [])
+    agent_packet["current_cycle_critiques"] = state.get("critiques", [])
+    agent_packet["current_cycle_ranked_actions"] = state.get("ranked_actions", [])
+    rec = run_agent(agent, agent_packet, state["memory"])
+    return _record_agent_result(state, agent, rec, int((time.perf_counter() - started) * 1000))
+
+
+def rank_action_package(state: SwarmState, max_items: int | None = None) -> SwarmState:
+    seen: set[tuple] = set()
+    ranked: list[dict] = []
+    rejected = list(state.get("rejected_actions", []))
+    for rec in _accepted_outputs(state):
+        if _is_fallback_recommendation(rec):
+            rejected.append({"agent_name": rec.get("agent_name"), "title": rec.get("title"), "reason": "fallback_suppressed", "recommendation": rec})
+            continue
+        critique_reason = _rejected_by_critiques(rec, state.get("critiques", []))
+        if critique_reason:
+            rejected.append({"agent_name": rec.get("agent_name"), "title": rec.get("title"), "reason": critique_reason, "recommendation": rec})
+            continue
+        key = _dedupe_key(rec)
+        if key in seen:
+            rejected.append({"agent_name": rec.get("agent_name"), "title": rec.get("title"), "reason": "duplicate_same_cycle", "recommendation": rec})
+            continue
+        seen.add(key)
+        ranked.append(rec)
+    ranked.sort(key=lambda item: (int(item.get("priority") or 0), item.get("agent_name") == "build_planner"), reverse=True)
+    if max_items is not None:
+        overflow = ranked[max_items:]
+        ranked = ranked[:max_items]
+        for rec in overflow:
+            rejected.append({"agent_name": rec.get("agent_name"), "title": rec.get("title"), "reason": "ranked_below_limit", "recommendation": rec})
+    state["ranked_actions"] = ranked
+    state["rejected_actions"] = rejected
+    state.setdefault("graph_trace", []).append(
+        {
+            "node": "ranker",
+            "accepted_count": len(ranked),
+            "rejected_count": len(rejected),
+            "collaboration_mode": state.get("collaboration_mode"),
+        }
+    )
+    return state
+
+
 def run_sequential(packet: dict, memory: list[dict]) -> list[dict]:
-    recommendations: list[dict] = []
+    global LAST_SWARM_STATE
+    state = _initial_state(packet, memory, FALLBACK_COLLABORATION_MODE)
     for agent in AGENTS:
-        agent_packet = dict(packet)
-        agent_packet["current_cycle_recommendations"] = recommendations
-        recommendations.append(run_agent(agent, agent_packet, memory))
-    return recommendations
+        state = _run_agent_node(agent, state)
+    state = rank_action_package(state)
+    LAST_SWARM_STATE = dict(state)
+    return list(state["ranked_actions"])
 
 
 def run_langgraph_if_available(packet: dict, memory: list[dict]) -> list[dict]:
+    global LAST_SWARM_STATE
     try:
         from langgraph.graph import END, StateGraph  # type: ignore
     except Exception:
         return run_sequential(packet, memory)
 
-    try:
-        def make_node(agent: dict):
-            def node(state: dict) -> dict:
-                agent_packet = dict(state["packet"])
-                agent_packet["current_cycle_recommendations"] = state["recommendations"]
-                state["recommendations"].append(run_agent(agent, agent_packet, state["memory"]))
-                return state
+    def make_node(agent: dict):
+        def node(state: SwarmState) -> SwarmState:
+            return _run_agent_node(agent, state)
 
-            return node
+        return node
 
-        graph = StateGraph(dict)
-        previous = None
-        for agent in AGENTS:
-            graph.add_node(agent["name"], make_node(agent))
-            if previous is None:
-                graph.set_entry_point(agent["name"])
-            else:
-                graph.add_edge(previous, agent["name"])
-            previous = agent["name"]
-        graph.add_edge(previous, END)
-        app = graph.compile()
-        output = app.invoke({"packet": packet, "memory": memory, "recommendations": []})
-        return output["recommendations"]
-    except Exception:
-        return run_sequential(packet, memory)
+    def ranker_node(state: SwarmState) -> SwarmState:
+        return rank_action_package(state)
+
+    graph = StateGraph(SwarmState)
+    previous = None
+    for agent in AGENTS:
+        graph.add_node(agent["name"], make_node(agent))
+        if previous is None:
+            graph.set_entry_point(agent["name"])
+        else:
+            graph.add_edge(previous, agent["name"])
+        previous = agent["name"]
+    graph.add_node("ranker", ranker_node)
+    graph.add_edge(previous, "ranker")
+    graph.add_edge("ranker", END)
+    app = graph.compile()
+    output = app.invoke(_initial_state(packet, memory, COLLABORATION_MODE))
+    LAST_SWARM_STATE = dict(output)
+    return list(output.get("ranked_actions", []))
 
 
 def _is_fallback_recommendation(rec: dict) -> bool:
@@ -451,25 +738,32 @@ def _latest_failure_cooldown_active(settings: dict) -> bool:
     return bool(statuses) and all(any(token in status for token in unavailable) for status in statuses)
 
 
-def write_recommendations(recommendations: list[dict], max_items: int, settings: dict | None = None) -> pathlib.Path:
+def write_recommendations(
+    recommendations: list[dict],
+    max_items: int,
+    settings: dict | None = None,
+    swarm_state: dict | None = None,
+) -> pathlib.Path:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     cfg = (settings or {}).get("llm_swarm", {})
     write_fallback = bool(cfg.get("write_fallback_recommendations_to_inbox", False))
+    state = swarm_state or LAST_SWARM_STATE or {}
+    state_rejected = list(state.get("rejected_actions") or [])
     actionable = [
         rec
         for rec in recommendations
-        if write_fallback or not _is_fallback_recommendation(rec)
+        if not _is_rejected(rec) and (write_fallback or not _is_fallback_recommendation(rec))
     ]
     suppressed = [
         rec
         for rec in recommendations
-        if not write_fallback and _is_fallback_recommendation(rec)
+        if _is_rejected(rec) or (not write_fallback and _is_fallback_recommendation(rec))
     ]
     selected = actionable[:max_items]
     action_package = {
         "ranked_actions": selected,
-        "rejected_or_suppressed": suppressed[:max_items],
-        "collaboration_mode": "shared_current_cycle_state",
+        "rejected_or_suppressed": [*state_rejected, *suppressed][: max_items * 2],
+        "collaboration_mode": state.get("collaboration_mode") or COLLABORATION_MODE,
     }
     with INBOX.open("a", encoding="utf-8") as fh:
         for rec in selected:
@@ -481,7 +775,13 @@ def write_recommendations(recommendations: list[dict], max_items: int, settings:
                 "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "recommendations": selected,
                 "suppressed_recommendations": suppressed,
-                "suppressed_count": len(suppressed),
+                "suppressed_count": len(suppressed) + len(state_rejected),
+                "collaboration_mode": action_package["collaboration_mode"],
+                "graph_trace": state.get("graph_trace", []),
+                "agent_outputs": state.get("agent_outputs", []),
+                "critiques": state.get("critiques", []),
+                "ranked_actions": selected,
+                "rejected_actions": [*state_rejected, *suppressed],
                 "action_package": action_package,
             },
             indent=2,
@@ -525,6 +825,7 @@ def run_once(settings: dict | None = None, force: bool = False) -> list[dict]:
         recommendations,
         int(settings.get("llm_swarm", {}).get("max_recommendations_per_run", 10)),
         settings=settings,
+        swarm_state=LAST_SWARM_STATE,
     )
     mark_auto_run()
     return recommendations

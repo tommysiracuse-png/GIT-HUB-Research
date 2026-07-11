@@ -141,6 +141,45 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertIn("frontier_escalation_reason", rec)
         self.assertEqual(rec["model"]["frontier_escalation_reason"], rec["frontier_escalation_reason"])
 
+    def test_malformed_agent_output_retries_once_with_schema_prompt(self) -> None:
+        first = ModelResult(
+            text='{"action":"propose_hunter_directive","priority":88',
+            model_name="openai/gpt-5.4",
+            model_tier="standard",
+            prompt_tokens=10,
+            completion_tokens=10,
+            estimated_cost_usd=0.01,
+            status="model_call:responses",
+            api="responses",
+            reasoning_effort="medium",
+            verbosity="medium",
+            structured_json=True,
+        )
+        second = ModelResult(
+            text='{"action":"propose_hunter_directive","priority":88,"title":"Retry ok","rationale":"fixed","market_key":"OKX","evidence":{},"proposed_change":"Probe"}',
+            model_name="openai/gpt-5.4",
+            model_tier="standard",
+            prompt_tokens=10,
+            completion_tokens=10,
+            estimated_cost_usd=0.01,
+            status="model_call:responses",
+            api="responses",
+            reasoning_effort="medium",
+            verbosity="medium",
+            structured_json=True,
+        )
+        packet = {"allowed_recommendation_actions": ["propose_hunter_directive"], "growth_experiments": []}
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "market_scout")
+
+        with mock.patch.object(llm_swarm_runner, "complete", side_effect=[first, second]) as call:
+            rec = llm_swarm_runner.run_agent(agent, packet, [])
+
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(call.call_args.kwargs["operation"], "llm_swarm_schema_retry")
+        self.assertEqual(rec["title"], "Retry ok")
+        self.assertEqual(rec["retry_count"], 1)
+        self.assertEqual(rec["initial_parse_status"], "truncated_json")
+
     def test_build_planner_unstructured_output_is_not_fake_code_change(self) -> None:
         packet = {
             "allowed_recommendation_actions": [
@@ -152,8 +191,25 @@ class FrontierModelPolicyTests(unittest.TestCase):
 
         rec = llm_swarm_runner.parse_recommendation("not json", agent, packet)
 
-        self.assertEqual(rec["action"], "propose_build_task")
-        self.assertTrue(rec["evidence"]["downgraded_from_code_change"])
+        self.assertTrue(rec["_rejected"])
+        self.assertEqual(rec["parse_status"], "invalid_json")
+        self.assertEqual(rec["action"], "no_action")
+
+    def test_embedded_json_is_recovered_instead_of_fallback(self) -> None:
+        packet = {"allowed_recommendation_actions": ["propose_hunter_directive"]}
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "market_scout")
+
+        rec = llm_swarm_runner.parse_recommendation(
+            'Sure. {"action":"propose_hunter_directive","priority":81,"title":"Regional depth probe",'
+            '"rationale":"Evidence-backed","market_key":"LUNO","evidence":{},'
+            '"proposed_change":"Probe regional depth."}',
+            agent,
+            packet,
+        )
+
+        self.assertFalse(rec.get("_rejected", False))
+        self.assertEqual(rec["parse_status"], "recovered_valid")
+        self.assertEqual(rec["priority"], 81)
 
     def test_build_planner_malformed_code_change_is_downgraded(self) -> None:
         packet = {
@@ -232,6 +288,88 @@ class FrontierModelPolicyTests(unittest.TestCase):
 
         self.assertEqual(len(recs), len(llm_swarm_runner.AGENTS))
         self.assertEqual(seen_counts, [0, 1, 2, 3, 4])
+        self.assertEqual(llm_swarm_runner.LAST_SWARM_STATE["collaboration_mode"], llm_swarm_runner.FALLBACK_COLLABORATION_MODE)
+
+    def test_langgraph_swarm_builds_ranked_action_package(self) -> None:
+        calls: list[str] = []
+
+        def fake_run_agent(agent: dict, packet: dict, _memory: list[dict]) -> dict:
+            calls.append(agent["name"])
+            return {
+                "action": "propose_hunter_directive",
+                "priority": 60 + len(calls),
+                "title": agent["name"],
+                "rationale": "unit test",
+                "market_key": agent["name"],
+                "evidence": {},
+                "proposed_change": "unit test",
+                "agent_name": agent["name"],
+                "model": {"status": "model_call:test", "tier": "fast", "estimated_cost_usd": 0.0},
+            }
+
+        packet = {"allowed_recommendation_actions": ["propose_hunter_directive"]}
+        with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=fake_run_agent):
+            recs = llm_swarm_runner.run_langgraph_if_available(packet, [])
+
+        self.assertEqual(calls, [agent["name"] for agent in llm_swarm_runner.AGENTS])
+        self.assertEqual(llm_swarm_runner.LAST_SWARM_STATE["collaboration_mode"], llm_swarm_runner.COLLABORATION_MODE)
+        self.assertEqual(llm_swarm_runner.LAST_SWARM_STATE["graph_trace"][-1]["node"], "ranker")
+        self.assertEqual(recs[0]["title"], "build_planner")
+
+    def test_red_team_can_reject_prior_market_idea(self) -> None:
+        packet = {"allowed_recommendation_actions": ["propose_hunter_directive", "propose_diagnostic_hypothesis"]}
+        scout = {
+            "action": "propose_hunter_directive",
+            "priority": 90,
+            "title": "Scout bad market",
+            "rationale": "unit test",
+            "market_key": "BAD_MARKET",
+            "evidence": {},
+            "proposed_change": "Probe",
+            "agent_name": "market_scout",
+        }
+        red_team = {
+            "action": "propose_diagnostic_hypothesis",
+            "priority": 95,
+            "title": "Reject bad market",
+            "rationale": "unit test",
+            "market_key": "red_team",
+            "evidence": {"reject_market_keys": ["BAD_MARKET"]},
+            "proposed_change": "Reject",
+            "agent_name": "red_team",
+        }
+        sequence = [
+            scout,
+            {**scout, "agent_name": "cross_market_researcher", "market_key": "OTHER"},
+            red_team,
+            {**scout, "agent_name": "execution_route_hunter", "market_key": "ROUTE"},
+            {**scout, "agent_name": "build_planner", "market_key": "BUILD"},
+        ]
+
+        with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=sequence):
+            recs = llm_swarm_runner.run_langgraph_if_available(packet, [])
+
+        self.assertNotIn("BAD_MARKET", {rec["market_key"] for rec in recs})
+        rejected_reasons = [row["reason"] for row in llm_swarm_runner.LAST_SWARM_STATE["rejected_actions"]]
+        self.assertTrue(any("rejected_by_red_team" in reason for reason in rejected_reasons))
+
+    def test_same_cycle_duplicate_recommendations_are_suppressed(self) -> None:
+        packet = {"allowed_recommendation_actions": ["propose_hunter_directive"]}
+        duplicate = {
+            "action": "propose_hunter_directive",
+            "priority": 80,
+            "title": "Duplicate",
+            "rationale": "unit test",
+            "market_key": "DUP",
+            "evidence": {},
+            "proposed_change": "Probe",
+            "agent_name": "market_scout",
+        }
+        with mock.patch.object(llm_swarm_runner, "run_agent", return_value=duplicate):
+            recs = llm_swarm_runner.run_langgraph_if_available(packet, [])
+
+        self.assertEqual(len(recs), 1)
+        self.assertTrue(any(row["reason"] == "duplicate_same_cycle" for row in llm_swarm_runner.LAST_SWARM_STATE["rejected_actions"]))
 
     def test_swarm_suppresses_fallback_recommendations_from_inbox(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,6 +396,36 @@ class FrontierModelPolicyTests(unittest.TestCase):
                 latest = json.loads((pathlib.Path(tmp) / "llm_swarm_latest.json").read_text(encoding="utf-8"))
                 self.assertEqual(latest["recommendations"], [])
                 self.assertEqual(latest["suppressed_count"], 1)
+
+                llm_swarm_runner.write_recommendations(
+                    [
+                        {
+                            "action": "propose_hunter_directive",
+                            "title": "ok",
+                            "priority": 80,
+                            "market_key": "OK",
+                            "evidence": {},
+                            "proposed_change": "Probe",
+                            "agent_name": "market_scout",
+                        }
+                    ],
+                    10,
+                    settings={"llm_swarm": {"write_fallback_recommendations_to_inbox": False}},
+                    swarm_state={
+                        "collaboration_mode": llm_swarm_runner.COLLABORATION_MODE,
+                        "graph_trace": [{"node": "ranker"}],
+                        "agent_outputs": [{"agent_name": "market_scout"}],
+                        "critiques": [{"agent_name": "red_team"}],
+                        "rejected_actions": [{"reason": "duplicate_same_cycle"}],
+                    },
+                )
+                latest = json.loads((pathlib.Path(tmp) / "llm_swarm_latest.json").read_text(encoding="utf-8"))
+                self.assertEqual(latest["collaboration_mode"], llm_swarm_runner.COLLABORATION_MODE)
+                self.assertIn("graph_trace", latest)
+                self.assertIn("agent_outputs", latest)
+                self.assertIn("critiques", latest)
+                self.assertIn("ranked_actions", latest)
+                self.assertIn("rejected_actions", latest)
             finally:
                 llm_swarm_runner.INBOX = old_inbox
                 llm_swarm_runner.RUNS_DIR = old_runs
