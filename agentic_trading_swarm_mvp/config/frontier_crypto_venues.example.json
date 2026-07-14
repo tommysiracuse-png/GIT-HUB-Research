@@ -20,7 +20,8 @@
     "watchlist_promotion": "two_step_confirm",
     "require_close_above_trigger": true,
     "require_next_interval_hold": true,
-    "assumed_position_size": "reduced"
+    "assumed_position_size": "reduced",
+    "require_complete_json": true
   },
   "venues": [
     {
