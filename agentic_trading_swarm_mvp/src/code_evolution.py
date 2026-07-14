@@ -64,6 +64,12 @@ SUPPRESSION_ACTIONS = {
     "wait_for_complete_valid_json_recommendation_with_market_context",
 }
 
+_FORBIDDEN_MARKDOWN_TOKENS = (
+    "```",
+    "\n```",
+    "**",
+    "__",
+)
 
 def _has_meaningful_value(value: Any) -> bool:
     if value in (None, "", {}, [], ()):
@@ -114,6 +120,13 @@ def _strip_markdown_fences(text: str) -> str:
     return cleaned
 
 
+def _has_forbidden_markdown_tokens(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in text for token in _FORBIDDEN_MARKDOWN_TOKENS) or any(
+        token in lowered for token in ("json",)
+    )
+
+
 def _default_recommendation() -> dict[str, Any]:
     return {
         "action": "monitor_only",
@@ -136,6 +149,8 @@ def normalize_recommendation_response(value: Any) -> dict[str, Any]:
     if isinstance(candidate, str):
         candidate = _strip_markdown_fences(candidate)
         try:
+            if _has_forbidden_markdown_tokens(candidate):
+                return _default_recommendation()
             candidate = json.loads(candidate)
         except ValueError:
             candidate = _default_recommendation()
