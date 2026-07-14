@@ -70,6 +70,85 @@ STABLE_OR_FIAT_BASES = {
     *REGIONAL_FIAT_QUOTES,
 }
 
+DEFAULT_ROUTE_FEASIBILITY_POLICY = {
+    "enabled": True,
+    "default_status": "uncertain",
+    "default_reason": "missing_route_rule",
+    "uncertain_action": "downweight",
+    "uncertain_confidence_multiplier": 0.6,
+    "infeasible_action": "suppress",
+    "log_all_reviews": True,
+    "rules": [
+        {
+            "rule_id": "watch_only_yellow_card",
+            "venue": "YELLOW_CARD",
+            "instrument_type": "rfq_rail",
+            "static_status": "watch_only",
+            "status": "infeasible",
+            "reason_code": "watch_only_route",
+        },
+        {
+            "rule_id": "watch_only_bitnob",
+            "venue": "BITNOB",
+            "instrument_type": "rfq_rail",
+            "static_status": "watch_only",
+            "status": "infeasible",
+            "reason_code": "watch_only_route",
+        },
+        {
+            "rule_id": "conditional_spot_short_requires_borrow",
+            "venue": "*",
+            "instrument_type": "spot",
+            "directionality": ["short", "short_spot"],
+            "strategy_family": ["conditional", "basis", "cash_carry", "pair_trade"],
+            "status": "infeasible",
+            "reason_code": "borrow_or_margin_unverified",
+        },
+        {
+            "rule_id": "multi_leg_basis_needs_fee_and_api_review",
+            "venue": "*",
+            "instrument_type": ["spot", "perp"],
+            "directionality": ["hedged", "market_neutral"],
+            "strategy_family": ["basis", "cash_carry", "pair_trade"],
+            "status": "uncertain",
+            "reason_code": "multi_leg_fee_tier_or_api_support_unverified",
+        },
+        {
+            "rule_id": "latam_public_spot_review_only",
+            "venue": ["BITSO", "MERCADO_BITCOIN", "BUDA"],
+            "instrument_type": "spot",
+            "directionality": "long",
+            "strategy_family": ["standard", "momentum", "breakout"],
+            "status": "uncertain",
+            "reason_code": "regional_fiat_manual_review",
+        },
+        {
+            "rule_id": "public_spot_long_supported",
+            "venue": [
+                "KUCOIN",
+                "GATE",
+                "MEXC",
+                "BITGET",
+                "BINANCE_US",
+                "COINBASE",
+                "KRAKEN",
+                "OKX_SPOT",
+                "BYBIT_SPOT",
+                "LUNO",
+                "VALR",
+                "QUIDAX",
+                "INDODAX",
+                "BITKUB",
+            ],
+            "instrument_type": "spot",
+            "directionality": "long",
+            "strategy_family": ["standard", "momentum", "breakout"],
+            "status": "feasible",
+            "reason_code": "public_spot_long_supported",
+        },
+    ],
+}
+
 DEFAULT_PAPER_TRADE_POLICY = {
     "market_key": "paper.signal_confirmation.v1",
     "mode": "paper_only",
@@ -116,6 +195,7 @@ DEFAULT_PAPER_TRADE_POLICY = {
             "shadow_outcome_tag",
         ],
     },
+    "route_feasibility": DEFAULT_ROUTE_FEASIBILITY_POLICY,
     "pyramiding": "disabled",
 }
 
@@ -136,6 +216,7 @@ DEFAULT_REGISTRY = {
         "regional_fx_stale_confidence_haircut": 0.35,
     },
     "paper_trade_policy": DEFAULT_PAPER_TRADE_POLICY,
+    "route_feasibility": DEFAULT_ROUTE_FEASIBILITY_POLICY,
     "venues": [
         {
             "venue": "KUCOIN",
@@ -537,6 +618,59 @@ def _deep_merge_dict(base: dict, overrides: dict) -> dict:
         base[key] = copy.deepcopy(value)
     return base
 
+
+def _route_feasibility_policy_from_loaded_registry(loaded: dict | None = None) -> dict:
+    policy = copy.deepcopy(DEFAULT_ROUTE_FEASIBILITY_POLICY)
+    if not isinstance(loaded, dict):
+        return policy
+    top_level = loaded.get("route_feasibility")
+    if isinstance(top_level, dict):
+        _deep_merge_dict(policy, top_level)
+    loaded_policy = loaded.get("paper_trade_policy")
+    if isinstance(loaded_policy, dict):
+        nested = loaded_policy.get("route_feasibility")
+        if isinstance(nested, dict):
+            _deep_merge_dict(policy, nested)
+    rules = policy.get("rules")
+    policy["rules"] = [copy.deepcopy(rule) for rule in rules if isinstance(rule, dict)] if isinstance(rules, list) else []
+    return policy
+
+
+def _route_feasibility_value_matches(expected: object, observed: object) -> bool:
+    if expected in (None, "", "*"):
+        return True
+    if isinstance(expected, (list, tuple, set, frozenset)):
+        return any(_route_feasibility_value_matches(item, observed) for item in expected)
+    observed_values = observed if isinstance(observed, (list, tuple, set, frozenset)) else [observed]
+    normalized_observed = {str(value).strip().upper() for value in observed_values if value not in (None, "")}
+    normalized_expected = str(expected).strip().upper()
+    if normalized_expected in {"", "*", "ANY"}:
+        return True
+    return normalized_expected in normalized_observed
+
+
+def paper_route_feasibility_review(
+    observation: dict,
+    loaded_registry: dict | None = None,
+    strategy_family: str | None = None,
+    directionality: str | None = None,
+) -> dict:
+    policy = _route_feasibility_policy_from_loaded_registry(loaded_registry)
+    if not policy.get("enabled", True):
+        return {
+            "enabled": False,
+            "status": "feasible",
+            "reason_code": "route_feasibility_disabled",
+            "action": "allow",
+            "confidence_multiplier": 1.0,
+            "matched_rule_id": None,
+            "instrument_type": str(observation.get("instrument_type") or observation.get("market_type") or "spot"),
+            "directionality": str(directionality or observation.get("directionality") or observation.get("direction") or "long"),
+            "strategy_family": str(strategy_family or observation.get("strategy_family") or observation.get("strategy") or observation.get("setup_type") or "standard"),
+            "observation_key": f"{observation.get('venue', 'UNKNOWN')}|{observation.get('symbol', 'UNKNOWN')}",
+        }
+    instrument_type = observation.get("instrument_type") or observation.get("market_type") or observation.get("instrument") or "spot"
+    res
 
 def _paper_trade_policy_from_loaded_registry(loaded: dict | None = None) -> dict:
     policy = copy.deepcopy(DEFAULT_PAPER_TRADE_POLICY)
