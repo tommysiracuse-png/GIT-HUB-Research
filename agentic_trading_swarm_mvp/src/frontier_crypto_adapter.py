@@ -23,6 +23,58 @@ import urllib.request
 from regional_fx_reference import get_regional_fx_references
 from scan_batch import ScanBatch, normalize_observation
 
+DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY = {
+    "fee_buffer_bps": 4.0,
+    "slippage_buffer_bps": 6.0,
+    "min_net_edge_bps": 12.0,
+    "max_quote_age_ms": 1500.0,
+    "max_spread_as_pct_of_edge": 0.35,
+    "min_depth_multiple_of_paper_size": 3.0,
+}
+
+
+def paper_only_executable_quality_check(
+    *,
+    expected_edge_bps: float,
+    quoted_spread_bps: float,
+    top_of_book_depth: float | None = None,
+    paper_order_size: float | None = None,
+    quote_age_ms: float | None = None,
+    fee_buffer_bps: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY["fee_buffer_bps"],
+    slippage_buffer_bps: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY["slippage_buffer_bps"],
+    min_net_edge_bps: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY["min_net_edge_bps"],
+    max_quote_age_ms: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY["max_quote_age_ms"],
+    max_spread_as_pct_of_edge: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY["max_spread_as_pct_of_edge"],
+    min_depth_multiple_of_paper_size: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY[
+        "min_depth_multiple_of_paper_size"
+    ],
+) -> dict:
+    """Paper-only executable quality filter for cross-market observations."""
+
+    reasons = []
+    edge_after_costs = float(expected_edge_bps) - float(fee_buffer_bps) - float(slippage_buffer_bps)
+    spread_limit_bps = max(0.0, float(expected_edge_bps) * float(max_spread_as_pct_of_edge))
+
+    if edge_after_costs < float(min_net_edge_bps):
+        reasons.append("net_edge_below_minimum")
+    if float(quoted_spread_bps) > spread_limit_bps:
+        reasons.append("spread_exceeds_edge_fraction")
+    if quote_age_ms is not None and float(quote_age_ms) > float(max_quote_age_ms):
+        reasons.append("quote_stale")
+    if top_of_book_depth is not None and paper_order_size is not None:
+        required_depth = float(paper_order_size) * float(min_depth_multiple_of_paper_size)
+        if float(top_of_book_depth) < required_depth:
+            reasons.append("insufficient_depth")
+
+    passed = not reasons
+    return {
+        "passed": passed,
+        "reasons": reasons,
+        "edge_after_costs_bps": edge_after_costs,
+        "spread_limit_bps": spread_limit_bps,
+        "score_multiplier": 1.0 if passed else 0.0,
+    }
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "config"
