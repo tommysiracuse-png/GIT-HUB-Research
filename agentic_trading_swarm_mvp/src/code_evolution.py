@@ -47,6 +47,34 @@ from storage import (
 )
 
 
+STRICT_REQUIRED_RECOMMENDATION_FIELDS = (
+    "action",
+    "priority",
+    "title",
+    "rationale",
+    "market_key",
+    "evidence",
+    "proposed_change",
+)
+
+
+def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool, str]:
+    """Validate a paper-only market recommendation packet.
+
+    This is intentionally strict so incomplete frontier outputs do not flow
+    into the paper runner or reporting pipeline as if they were usable signals.
+    """
+
+    if not isinstance(packet, dict):
+        return False, "packet must be a mapping"
+
+    missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in packet or packet[field] in (None, "", {}, [], ())]
+    if missing:
+        return False, f"missing required fields: {', '.join(missing)}"
+
+    return True, ""
+
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPORT_JSON = RUNS_DIR / "evolution_report.json"
 REPORT_MD = RUNS_DIR / "evolution_report.md"
