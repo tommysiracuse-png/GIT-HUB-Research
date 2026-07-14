@@ -169,6 +169,30 @@ def _raw_audit(value: Any) -> Dict[str, str]:
     }
 
 
+def _strip_markdown_fences(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def _single_top_level_object_text(text: str) -> Optional[str]:
+    stripped = _strip_markdown_fences(text)
+    if not stripped or stripped.startswith("[") or not stripped.startswith("{"):
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        value, end = decoder.raw_decode(stripped)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(value, Mapping) or stripped[end:].strip():
+        return None
+    return stripped[:end]
+
+
 def _clean_role(value: Any) -> str:
     role = str(value or "").strip().lower()
     return re.sub(r"[\s-]+", "_", role)
@@ -297,9 +321,15 @@ def _provider_texts(response: Any) -> List[str]:
     seen: Set[str] = set()
 
     def add(value: Any) -> None:
-        if isinstance(value, str) and value and value not in seen:
-            seen.add(value)
-            texts.append(value)
+        if not isinstance(value, str):
+            return
+        raw = value.strip()
+        if not raw:
+            return
+        for candidate in (_single_top_level_object_text(raw), raw):
+            if isinstance(candidate, str) and candidate and candidate not in seen:
+                seen.add(candidate)
+                texts.append(candidate)
 
     if isinstance(response, str):
         add(response)
@@ -342,8 +372,29 @@ def _provider_texts(response: Any) -> List[str]:
 def _json_objects(text: str) -> Iterable[Mapping[str, Any]]:
     """Yield complete JSON objects without guessing or repairing delimiters."""
 
+    stripped = _strip_markdown_fences(text).strip()
+    if not stripped:
+        return
+    if stripped.startswith("["):
+        return
+
     decoder = json.JSONDecoder()
-    stripped = text.strip()
+    strict_object = _single_top_level_object_text(stripped)
+    if strict_object is not None:
+        try:
+            value, end = decoder.raw_decode(strict_object)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return
+        if end != len(strict_object) or not isinstance(value, Mapping):
+            return
+        repaired = _repair_execution_route_hunter_payload(value)
+        yield repaired or value
+        nested = value.get("recommendation")
+        if isinstance(nested, Mapping):
+            repaired_nested = _repair_execution_route_hunter_payload(nested)
+            yield repaired_nested or nested
+        return
+
     starts: List[int] = []
     if stripped.startswith("{"):
         starts.append(text.find("{"))

@@ -225,10 +225,13 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "allowed_recommendation_actions": settings.get("llm_bridge", {}).get("allowed_actions", []),
         "recommendation_schema": {
             "action": "one allowed action",
+            "required_fields": ["action", "priority", "title", "rationale", "market_key", "evidence", "proposed_change"],
             "response_contract": "Return exactly one top-level JSON object and nothing else.",
+            "top_level_shape": "A single JSON object is required; top-level arrays are invalid.",
             "format_guardrails": "No markdown, commentary, code fences, or wrapper arrays around the recommendation object.",
             "paper_only_default": "Recommendations must remain limited to paper-trading simulation, reports, tests, adapters, routing analysis, and code evolution.",
             "priority": "integer 1-100",
+            "fallback_behavior": "If any required field is unavailable, emit one conservative paper-only parser-hardening recommendation instead of partial output.",
             "title": "short directive",
             "rationale": "why this matters",
             "signal_key": "optional",
