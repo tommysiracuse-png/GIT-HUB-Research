@@ -135,7 +135,7 @@ EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION = {
     "proposed_change": {
         "summary": "Return one schema-complete paper-only route recommendation or a conservative hold/refine decision.",
         "fallback_behavior": "Prefer refine or hold when route confidence or payload completeness is insufficient.",
-        "required_fields": list(REQUIRED_RECOMMENDATION_FIELDS),
+        "required_fields": ", ".join(REQUIRED_RECOMMENDATION_FIELDS),
         "safety_mode": "paper_only",
         "suppress_live_execution_wording": True,
     },
@@ -248,12 +248,19 @@ def _bucketize(stats: list[dict], directives: list[dict]) -> dict:
 
 def _recommendation_schema(allowed_actions: list[str]) -> dict:
     required_fields = list(REQUIRED_RECOMMENDATION_FIELDS)
+    required_fields_csv = ", ".join(REQUIRED_RECOMMENDATION_FIELDS)
     return {
         "action": "one allowed action",
         "required_fields": required_fields,
+        "required_fields_csv": required_fields_csv,
         "response_contract": "Return exactly one top-level JSON object and nothing else.",
         "top_level_shape": "A single JSON object is required; top-level arrays are invalid.",
         "format_guardrails": "No markdown, commentary, code fences, or wrapper arrays around the recommendation object.",
+        "final_serialization_guard": (
+            "Before returning, build the full recommendation object, verify every required "
+            "field is present, confirm no field value is an array, serialize the object as "
+            "valid JSON, and return only that serialized object."
+        ),
         "paper_only_default": "Recommendations must remain limited to paper-trading simulation, reports, tests, adapters, routing analysis, and code evolution.",
         "priority": "integer 1-100",
         "fallback_behavior": (
@@ -265,11 +272,15 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "publish_only_single_json_object": True,
             "reject_non_json": True,
             "reject_wrapper_arrays": True,
+            "reject_array_values_anywhere": True,
             "reject_missing_required_fields": True,
             "required_fields": required_fields,
+            "required_fields_csv": required_fields_csv,
             "paper_execution_route_hunter_fallback": "refine_or_hold_with_validation_evidence",
             "require_non_empty_market_key": True,
             "require_non_empty_rationale": True,
+            "require_no_extra_text_outside_object": True,
+            "serialize_then_return_single_object": True,
             "require_non_empty_evidence_object": True,
             "require_non_empty_proposed_change_object": True,
             "require_priority_integer_range": [1, 100],
@@ -289,6 +300,7 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "required_only_for": "propose_code_change",
             "required_actionable_fields": list(CODE_CHANGE_ACTIONABLE_FIELDS),
             "change_category": "one allowed code-evolution category",
+            "required_actionable_fields_csv": ", ".join(CODE_CHANGE_ACTIONABLE_FIELDS),
             "implementation_mode": "runtime_active, paper_policy, shadow_trial, or report_only",
             "expected_files": "list of repo-relative files expected to change",
             "tests_to_run": "safe unittest commands or empty list for full regression",
@@ -296,6 +308,7 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "unified_diff": "optional patch; if missing, GPT-5.5 Build Planner may generate one",
             "detail_fields_to_prefer": list(CODE_CHANGE_OPTIONAL_DETAIL_FIELDS),
             "field_quality_gate": (
+                "Arrays are forbidden in the returned recommendation object; stringify field sets when needed. "
                 "Populate every required actionable field inside code_change. Sparse "
                 "code_change objects are downgraded because Build Planner needs category, "
                 "implementation mode, expected files, tests, and rollback criteria."

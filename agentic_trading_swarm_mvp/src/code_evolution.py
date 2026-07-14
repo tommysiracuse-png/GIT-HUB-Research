@@ -66,6 +66,18 @@ def _has_meaningful_value(value: Any) -> bool:
     return True
 
 
+def _find_array_path(value: Any, path: str = "$") -> str | None:
+    if isinstance(value, (list, tuple)):
+        return path
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            child_path = f"{path}.{key}" if path != "$" else f"$.{key}"
+            found = _find_array_path(nested_value, child_path)
+            if found:
+                return found
+    return None
+
+
 def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool, str]:
     """Validate a paper-only market recommendation packet.
 
@@ -75,6 +87,17 @@ def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool,
 
     if not isinstance(packet, dict):
         return False, "packet must be a mapping"
+
+    try:
+        serialized = json.dumps(packet, ensure_ascii=False)
+        reparsed = json.loads(serialized)
+    except (TypeError, ValueError) as exc:
+        return False, f"packet must be JSON serializable: {exc}"
+    if not isinstance(reparsed, dict):
+        return False, "packet must serialize to a top-level JSON object"
+    array_path = _find_array_path(reparsed)
+    if array_path:
+        return False, f"array values are not allowed: {array_path}"
 
     missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in packet or not _has_meaningful_value(packet[field])]
     if missing:
@@ -100,6 +123,12 @@ def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool,
         return False, "proposed_change must be a non-empty object"
     if not any(_has_meaningful_value(value) for value in proposed_change.values()):
         return False, "proposed_change must contain at least one non-empty value"
+
+    for field in ("code_change", "variant_config"):
+        if field not in packet or packet[field] in (None, ""):
+            continue
+        if not isinstance(packet[field], dict):
+            return False, f"{field} must be an object when provided"
 
     return True, ""
 
