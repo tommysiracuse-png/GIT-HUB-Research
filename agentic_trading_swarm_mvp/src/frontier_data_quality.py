@@ -202,6 +202,25 @@ def _extract_depth(parser: str, payload: object, received_at: str) -> dict:
     }
 
 
+def _should_prefer_trailing_price_quantity(
+    first_price: float | None,
+    first_quantity: float | None,
+    trailing_price: float | None,
+    trailing_quantity: float | None,
+) -> bool:
+    if trailing_price is None or trailing_quantity is None:
+        return False
+    if trailing_price <= 0 or trailing_quantity <= 0:
+        return False
+    if first_price is None or first_quantity is None:
+        return True
+    if first_price <= 0 or first_quantity <= 0:
+        return True
+    if first_price >= 1_000_000_000:
+        return True
+    return first_price < first_quantity
+
+
 def _normalize_levels(raw_levels: list, side: str, max_levels: int) -> tuple[list[list[float]], list[str]]:
     valid: list[list[float]] = []
     anomalies: list[str] = []
@@ -229,10 +248,10 @@ def _normalize_levels(raw_levels: list, side: str, max_levels: int) -> tuple[lis
             # should still leave the last two usable values in order.
             price = _as_float(raw[0])
             quantity = _as_float(raw[1])
-            if len(raw) >= 4 and (price is not None and quantity is not None and price < quantity):
+            if len(raw) >= 4:
                 alt_quantity = _as_float(raw[-2])
                 alt_price = _as_float(raw[-1])
-                if alt_price is not None and alt_quantity is not None:
+                if _should_prefer_trailing_price_quantity(price, quantity, alt_price, alt_quantity):
                     price = alt_price
                     quantity = alt_quantity
         else:
