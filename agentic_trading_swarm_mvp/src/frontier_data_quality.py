@@ -41,6 +41,10 @@ def _parse_iso(value: str | None) -> dt.datetime | None:
 
 
 def _timestamp_to_iso(value: object, unit: str = "auto") -> str | None:
+    if isinstance(value, str):
+        parsed = _parse_iso(value)
+        if parsed is not None:
+            return parsed.isoformat()
     try:
         numeric = float(value)
     except (TypeError, ValueError):
@@ -182,7 +186,7 @@ def _extract_depth(parser: str, payload: object, received_at: str) -> dict:
         body = data.get("payload") or data
         bids = body.get("bids") or []
         asks = body.get("asks") or []
-        book_timestamp = body.get("updated_at")
+        book_timestamp = _timestamp_to_iso(body.get("updated_at")) or body.get("updated_at")
     elif parser in {"mercado_bitcoin_orderbook", "buda_order_book"}:
         body = data.get("order_book") if parser == "buda_order_book" else data
         body = body or {}

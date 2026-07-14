@@ -101,6 +101,10 @@ DEFAULT_REGISTRY = {
         "frontier_max_listing_count": 3,
         "min_frontier_quote_volume_usd": 25_000,
         "min_cross_venue_count": 2,
+        "regional_fx_normalization_enabled": True,
+        "regional_fx_require_fresh_reference": True,
+        "regional_fx_max_age_seconds": 21_600,
+        "regional_fx_stale_confidence_haircut": 0.35,
     },
     "paper_trade_policy": DEFAULT_PAPER_TRADE_POLICY,
     "venues": [
@@ -464,6 +468,7 @@ def _status_from_error(exc: Exception) -> tuple[str, str]:
 
 def fetch_json(url: str, timeout: int = 8) -> dict:
     started = time.perf_counter()
+    received_at = _utc_now()
     try:
         req = urllib.request.Request(
             url,
@@ -473,11 +478,13 @@ def fetch_json(url: str, timeout: int = 8) -> dict:
             },
         )
         with urllib.request.urlopen(req, timeout=timeout) as response:
+            received_at = _utc_now()
             body = response.read().decode("utf-8")
             return {
                 "ok": True,
                 "data_status": "reachable",
                 "http_status": str(response.status),
+                "received_at": received_at,
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
                 "payload": json.loads(body),
             }
@@ -486,6 +493,7 @@ def fetch_json(url: str, timeout: int = 8) -> dict:
         return {
             "ok": False,
             "data_status": data_status,
+            "received_at": received_at,
             "http_status": http_status,
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
             "payload": None,
