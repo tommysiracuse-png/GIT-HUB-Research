@@ -102,6 +102,51 @@ def _coerce_confirm_score_min(value: Any) -> tuple[float | None, str]:
     return score, ""
 
 
+def _strip_markdown_fences(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def _default_recommendation() -> dict[str, Any]:
+    return {
+        "action": "monitor_only",
+        "priority": 1,
+        "title": "Fallback paper-only recommendation",
+        "rationale": "Validation failed; returning a minimal safe recommendation.",
+        "market_key": "paper_global_macro_radar",
+        "evidence": {"status": "fallback"},
+        "proposed_change": {
+            "summary": "No-op fallback recommendation for paper-only workflows.",
+            "safety": "paper_only",
+        },
+    }
+
+
+def normalize_recommendation_response(value: Any) -> dict[str, Any]:
+    """Return a single safe JSON object for planner consumers."""
+
+    candidate: Any = value
+    if isinstance(candidate, str):
+        candidate = _strip_markdown_fences(candidate)
+        try:
+            candidate = json.loads(candidate)
+        except ValueError:
+            candidate = _default_recommendation()
+    if not isinstance(candidate, dict):
+        candidate = _default_recommendation()
+    valid, _reason = validate_strict_recommendation_schema(candidate)
+    if not valid:
+        return _default_recommendation()
+    return candidate
+
+
 def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool, str]:
     """Validate a paper-only market recommendation packet.
 
