@@ -97,6 +97,9 @@ def _fetch_json(url: str, timeout: int) -> dict:
 
 
 def _format_symbol(venue: str, symbol: str) -> str:
+    if venue in {"BYBIT", "BYBIT_SPOT"}:
+        compact = re.sub(r"[^A-Za-z0-9]", "", symbol or "")
+        return compact.upper() or str(symbol).upper()
     if venue == "BITGET":
         return symbol.replace("_SPBL", "")
     if venue in {"INDODAX", "QUIDAX", "BITSO", "BUDA"}:
