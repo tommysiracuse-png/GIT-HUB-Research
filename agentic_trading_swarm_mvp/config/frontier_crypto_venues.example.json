@@ -16,6 +16,12 @@
     "min_frontier_quote_volume_usd": 25000,
     "min_cross_venue_count": 2
   },
+  "paper_only_rules": {
+    "watchlist_promotion": "two_step_confirm",
+    "require_close_above_trigger": true,
+    "require_next_interval_hold": true,
+    "assumed_position_size": "reduced"
+  },
   "venues": [
     {
       "venue": "KUCOIN",
