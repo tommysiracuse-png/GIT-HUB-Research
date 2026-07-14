@@ -35,6 +35,28 @@ NEXT_ACTIONS = {"adapter_spec", "route_probe", "growth_experiment", "hunter_dire
 
 DEFAULT_GLOBAL_DISCOVERY_SEEDS: list[dict[str, Any]] = [
     {
+        "surface_type_raw": "crypto global spot public market data",
+        "venue_or_source": "Bybit",
+        "country": "Global",
+        "region": "Global",
+        "asset_or_event": "BTCUSDT and other major spot books/tickers via public V5 spot endpoints",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "directly_tradable",
+        "public_docs_url": "https://bybit-exchange.github.io/docs/v5/market/tickers",
+        "source_urls": [
+            "https://bybit-exchange.github.io/docs/v5/market/tickers",
+            "https://bybit-exchange.github.io/docs/v5/market/orderbook",
+        ],
+        "why_interesting": "Bybit already shows promising frontier paper behavior, but the current linear public ticker route can return 403 and leave scanner coverage degraded.",
+        "inefficiency_hypothesis": "Switching paper discovery and venue-health reads to public spot ticker/book endpoints can restore observability for an otherwise strong venue without adding any live execution scope.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "major global spot books",
+        "route_blockers": ["public_endpoint_selection"],
+        "recommended_next_action": "adapter_spec",
+        "priority": 89,
+        "confidence": 0.83,
+    },
+    {
         "surface_type_raw": "crypto regional fiat spot rails",
         "venue_or_source": "Bitso",
         "country": "Mexico",

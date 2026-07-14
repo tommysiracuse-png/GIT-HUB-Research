@@ -179,6 +179,33 @@ def _contextual_stats(conn: sqlite3.Connection) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _crypto_venue_health_gaps(items: list[dict]) -> list[dict]:
+    gaps = []
+    for item in items or []:
+        venue = str(item.get("venue") or "").lower()
+        status = str(item.get("status") or "")
+        route_id = str(item.get("route_id") or "")
+        url = str(item.get("url") or "")
+        if venue != "bybit" or "403" not in status:
+            continue
+        linear_hint = "category=linear" in url or "linear" in route_id or "perp" in route_id
+        if not linear_hint:
+            continue
+        gaps.append(
+            {
+                "venue": item.get("venue"),
+                "route_id": item.get("route_id"),
+                "asset": item.get("asset"),
+                "status": item.get("status"),
+                "fallback_route_id": "bybit_spot_public",
+                "fallback_endpoints": ["/v5/market/tickers?category=spot", "/v5/market/orderbook?category=spot"],
+                "paper_only_use": "scanner_inputs_and_venue_health",
+                "rationale": "Bybit linear public reads returned 403; keep paper observability alive with spot public ticker/book endpoints.",
+            }
+        )
+    return gaps[:10]
+
+
 def _bucketize(stats: list[dict], directives: list[dict]) -> dict:
     buckets = {"exploit": [], "explore": [], "diagnose": []}
 
@@ -322,6 +349,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
     global_market_discovery = _compact_global_market_discovery(payload.get("research_worker"))
     hunter_allocation = payload.get("hunter_allocation", {})
     allowed_actions = settings.get("llm_bridge", {}).get("allowed_actions", [])
+    crypto_venue_health = payload.get("crypto_venue_health", [])
     packet = {
         "purpose": "Read-only state packet for LLM agents. Recommend actions through llm_recommendations_inbox.jsonl only.",
         "mode": settings.get("mode"),
@@ -336,7 +364,8 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "llm_inbox": payload.get("llm_inbox", {}),
         "maintenance": payload.get("maintenance", {}),
         "horizon_outcomes": payload.get("horizon_outcomes", []),
-        "crypto_venue_health": payload.get("crypto_venue_health", []),
+        "crypto_venue_health": crypto_venue_health,
+        "crypto_venue_health_gaps": _crypto_venue_health_gaps(crypto_venue_health),
         "frontier_crypto_venues": _compact_frontier_crypto(payload.get("frontier_crypto_venues", {})),
         "signal_redesign": _compact_signal_redesign(payload.get("signal_redesign", {})),
         "okx_signal_research": _compact_okx_signal_research(payload.get("okx_signal_research", {})),
