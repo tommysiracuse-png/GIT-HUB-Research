@@ -29,17 +29,28 @@ ACTION_ALIASES = {
     "change_code": "code_change",
     "modify_code": "code_change",
     "recommend_code_change": "code_change",
+    "propose_code_change": "code_change",
     "implementation": "code_change",
     "diagnose": "diagnostic",
+    "propose_diagnostic": "diagnostic",
     "analysis": "diagnostic",
     "research": "market_research",
+    "propose_market_research": "market_research",
     "add_market": "market_data_change",
+    "propose_market_data_change": "market_data_change",
     "market_data": "market_data_change",
     "strategy": "strategy_change",
+    "propose_strategy_change": "strategy_change",
     "adjust_strategy": "strategy_change",
     "quality": "quality_control",
+    "propose_quality_control": "quality_control",
+    "propose_report_change": "report_change",
+    "propose_test_change": "test_change",
+    "propose_paper_experiment": "paper_experiment",
+    "propose_route_review": "route_review",
     "no-op": "no_action",
     "noop": "no_action",
+    "propose_no_action": "no_action",
 }
 
 ALLOWED_ACTIONS = {
@@ -182,7 +193,54 @@ def _nonempty(value: Any) -> bool:
     return value is not None and value != [] and value != {}
 
 
+def _repair_execution_route_hunter_payload(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    market_key = str(_first(value, ("market_key", "market"), "") or "").strip()
+    if market_key != "paper.execution_route_hunter":
+        return None
+
+    proposed_change = _first(value, ("proposed_change", "proposed change", "change"))
+    evidence = value.get("evidence")
+    if not _nonempty(proposed_change) and not _nonempty(evidence):
+        return None
+
+    repaired: Dict[str, Any] = dict(value)
+    action = _clean_action(_first(repaired, ("action", "proposed_action"), "code_change"))
+    if action not in ALLOWED_ACTIONS:
+        action = "code_change"
+    repaired["action"] = action
+
+    try:
+        priority = int(repaired.get("priority"))
+    except (TypeError, ValueError):
+        priority = 90
+    repaired["priority"] = max(1, min(100, priority))
+
+    if not _nonempty(repaired.get("title")):
+        repaired["title"] = "Harden execution_route_hunter paper recommendation output"
+    if not _nonempty(repaired.get("rationale")):
+        repaired["rationale"] = (
+            "Preserve parser compatibility by requiring execution_route_hunter "
+            "to emit one complete paper-only recommendation object."
+        )
+    if not _nonempty(repaired.get("proposed_change")):
+        repaired["proposed_change"] = (
+            "Require a single schema-complete paper-only JSON recommendation object "
+            "for execution_route_hunter responses."
+        )
+    if not _nonempty(repaired.get("evidence")):
+        repaired["evidence"] = {
+            "issue": "Incomplete execution_route_hunter recommendation object threatened parser compatibility.",
+            "impact": "Recommendation ingestion could fail before any paper-routing review.",
+        }
+    return repaired
+
+
 def _looks_like_recommendation(value: Any) -> bool:
+    repaired = _repair_execution_route_hunter_payload(value)
+    if repaired is not None:
+        return True
     if not isinstance(value, Mapping):
         return False
     keys = {str(key).lower().replace(" ", "_") for key in value}
@@ -202,17 +260,33 @@ def _native_payload(response: Any) -> Optional[Mapping[str, Any]]:
     parser = str(response.get("parser", "")).strip().lower()
     if parser == "fallback":
         return None
+
+    repaired = _repair_execution_route_hunter_payload(response)
+    if repaired is not None:
+        return repaired
+
     for key in ("output_parsed", "parsed", "structured_output"):
         candidate = response.get(key)
+        repaired = _repair_execution_route_hunter_payload(candidate)
+        if repaired is not None:
+            return repaired
         if _looks_like_recommendation(candidate):
             return candidate
         if isinstance(candidate, Mapping):
             nested = candidate.get("recommendation")
+            repaired = _repair_execution_route_hunter_payload(nested)
+            if repaired is not None:
+                return repaired
             if _looks_like_recommendation(nested):
                 return nested
+
     candidate = response.get("recommendation")
+    repaired = _repair_execution_route_hunter_payload(candidate)
+    if repaired is not None:
+        return repaired
     if _looks_like_recommendation(candidate):
         return candidate
+
     if _looks_like_recommendation(response):
         return response
     return None
@@ -284,10 +358,12 @@ def _json_objects(text: str) -> Iterable[Mapping[str, Any]]:
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
         if isinstance(value, Mapping):
-            yield value
+            repaired = _repair_execution_route_hunter_payload(value)
+            yield repaired or value
             nested = value.get("recommendation")
             if isinstance(nested, Mapping):
-                yield nested
+                repaired_nested = _repair_execution_route_hunter_payload(nested)
+                yield repaired_nested or nested
 
 
 def _appears_truncated(text: str) -> bool:

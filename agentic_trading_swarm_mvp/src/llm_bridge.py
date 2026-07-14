@@ -225,6 +225,9 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "allowed_recommendation_actions": settings.get("llm_bridge", {}).get("allowed_actions", []),
         "recommendation_schema": {
             "action": "one allowed action",
+            "response_contract": "Return exactly one top-level JSON object and nothing else.",
+            "format_guardrails": "No markdown, commentary, code fences, or wrapper arrays around the recommendation object.",
+            "paper_only_default": "Recommendations must remain limited to paper-trading simulation, reports, tests, adapters, routing analysis, and code evolution.",
             "priority": "integer 1-100",
             "title": "short directive",
             "rationale": "why this matters",
@@ -243,6 +246,9 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
                 "unified_diff": "optional patch; if missing, GPT-5.5 Build Planner may generate one",
                 "frontier_escalation_reason": "required for GPT-5.5 code evolution",
             },
+            "market_key_contracts": {
+                "paper.execution_route_hunter": "Always emit one schema-complete recommendation object with action, priority, title, rationale, market_key, evidence, and proposed_change. If context is incomplete, emit one conservative paper-only parser-hardening recommendation instead of partial output."
+            },
         },
         "hard_limits": [
             "Do not place live trades.",
@@ -254,6 +260,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
             "Autonomous execution is limited to paper-only bounded policies, route probes, adapter specs, memory, reports, tests, and Build-Governor-approved code evolution.",
             "Live trading, credentials, real notional, destructive data changes, startup changes, and broker writes remain blocked.",
             "Global market discovery may research any public market surface worldwide; non-public, stolen, hacked, or credential-only information must not be used as a trading signal.",
+            "Recommendation responses must be a single top-level JSON object only; do not emit markdown, commentary, or wrapper arrays.",
         ],
     }
     STATE_JSON.write_text(json.dumps(packet, indent=2), encoding="utf-8")
