@@ -56,6 +56,7 @@ STRICT_REQUIRED_RECOMMENDATION_FIELDS = (
     "evidence",
     "proposed_change",
 )
+MIN_PAPER_CONFIRM_SCORE_MIN = 0.68
 
 
 def _has_meaningful_value(value: Any) -> bool:
@@ -76,6 +77,23 @@ def _find_array_path(value: Any, path: str = "$") -> str | None:
             if found:
                 return found
     return None
+
+
+def _coerce_confirm_score_min(value: Any) -> tuple[float | None, str]:
+    if isinstance(value, bool):
+        return None, "confirm_score_min must be a number between 0 and 1"
+    if isinstance(value, (int, float)):
+        score = float(value)
+    elif isinstance(value, str):
+        try:
+            score = float(value.strip())
+        except ValueError:
+            return None, "confirm_score_min must be a number between 0 and 1"
+    else:
+        return None, "confirm_score_min must be a number between 0 and 1"
+    if not 0.0 <= score <= 1.0:
+        return None, "confirm_score_min must be a number between 0 and 1"
+    return score, ""
 
 
 def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool, str]:
@@ -129,6 +147,17 @@ def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool,
             continue
         if not isinstance(packet[field], dict):
             return False, f"{field} must be an object when provided"
+
+    variant_config = packet.get("variant_config")
+    if isinstance(variant_config, dict) and "confirm_score_min" in variant_config:
+        confirm_score_min, error = _coerce_confirm_score_min(variant_config.get("confirm_score_min"))
+        if error:
+            return False, error
+        if confirm_score_min is not None and confirm_score_min < MIN_PAPER_CONFIRM_SCORE_MIN:
+            return (
+                False,
+                f"confirm_score_min must be at least {MIN_PAPER_CONFIRM_SCORE_MIN:.2f} for paper-only variants",
+            )
 
     return True, ""
 
