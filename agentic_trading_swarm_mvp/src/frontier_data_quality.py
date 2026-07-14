@@ -101,6 +101,8 @@ def _format_symbol(venue: str, symbol: str) -> str:
         return symbol.replace("_SPBL", "")
     if venue in {"INDODAX", "QUIDAX", "BITSO", "BUDA"}:
         return symbol.lower()
+    if venue == "VALR":
+        return symbol.replace("-", "").replace("_", "").replace("/", "").upper()
     if venue == "BITKUB":
         parts = [part for part in symbol.lower().split("_") if part]
         if len(parts) == 2:

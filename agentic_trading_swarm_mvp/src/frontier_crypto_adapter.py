@@ -557,6 +557,152 @@ def _is_paper_only_review_fiat_quote(quote: str | None) -> bool:
     return str(quote or "").upper() in PAPER_ONLY_REVIEW_FIAT_QUOTES
 
 
+VALR_PRIORITY_MARKETS = ("BTCZAR", "ETHZAR", "USDTZAR")
+
+
+def _valr_payload_rows(payload: object) -> list[dict]:
+    body = payload
+    if isinstance(body, dict) and "payload" in body and any(
+        key in body for key in ("ok", "data_status", "http_status", "latency_ms")
+    ):
+        body = body.get("payload")
+    if isinstance(body, list):
+        return [row for row in body if isinstance(row, dict)]
+    if not isinstance(body, dict):
+        return []
+    for key in ("marketsummary", "marketSummary", "market_summaries", "marketSummaries", "data"):
+        rows = body.get(key)
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+def _valr_market_quote_volume(row: dict) -> float:
+    quote_volume = as_float(
+        row.get("quoteVolume")
+        or row.get("quoteCurrencyVolume")
+        or row.get("volumeQuote")
+        or row.get("quote_volume"),
+        None,
+    )
+    if quote_volume is not None and quote_volume > 0:
+        return float(quote_volume)
+    last_price = as_float(
+        row.get("lastTradedPrice") or row.get("lastPrice") or row.get("last") or row.get("price"),
+        None,
+    )
+    base_volume = as_float(
+        row.get("baseVolume")
+        or row.get("volume")
+        or row.get("baseCurrencyVolume")
+        or row.get("volume24Hour"),
+        None,
+    )
+    if last_price is not None and last_price > 0 and base_volume is not None and base_volume > 0:
+        return float(last_price * base_volume)
+    return 0.0
+
+
+def _valr_timestamp_ms(row: dict) -> str | None:
+    for key in ("timestamp", "createdTimestamp", "lastTradedTimestamp"):
+        value = as_float(row.get(key), None)
+        if value is not None and value > 0:
+            return str(int(value))
+    for key in ("created", "createdAt", "updatedAt", "lastTradedAt", "tradedAt"):
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        numeric = as_float(value, None)
+        if numeric is not None and numeric > 0:
+            return str(int(numeric))
+        if isinstance(value, str):
+            try:
+                parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            return str(int(parsed.timestamp() * 1000.0))
+    return None
+
+
+def _valr_as_luno_payload(payload: object) -> dict:
+    rows = _valr_payload_rows(payload)
+    selected: dict[str, dict] = {}
+    usd_like_choice: tuple[str, dict] | None = None
+    usd_like_metric = -1.0
+    for row in rows:
+        raw_symbol = str(
+            row.get("currencyPair") or row.get("symbol") or row.get("pair") or row.get("market") or ""
+        ).upper()
+        symbol = raw_symbol.replace("-", "").replace("_", "").replace("/", "")
+        if not symbol:
+            continue
+        base_asset, quote_asset = _split_symbol(symbol, QUOTE_ASSETS)
+        if symbol in VALR_PRIORITY_MARKETS:
+            selected[symbol] = row
+            continue
+        if quote_asset in USD_LIKE_QUOTES and base_asset and base_asset not in STABLE_OR_FIAT_BASES:
+            metric = _valr_market_quote_volume(row)
+            if metric > usd_like_metric:
+                usd_like_metric = metric
+                usd_like_choice = (symbol, row)
+    ordered_symbols = list(VALR_PRIORITY_MARKETS)
+    if usd_like_choice is not None:
+        selected[usd_like_choice[0]] = usd_like_choice[1]
+        ordered_symbols.append(usd_like_choice[0])
+    tickers = []
+    for symbol in ordered_symbols:
+        row = selected.get(symbol)
+        if not isinstance(row, dict):
+            continue
+        last_trade = row.get("lastTradedPrice") or row.get("lastPrice") or row.get("last") or row.get("price")
+        rolling_volume = (
+            row.get("baseVolume")
+            or row.get("volume")
+            or row.get("baseCurrencyVolume")
+            or row.get("volume24Hour")
+        )
+        if rolling_volume in (None, "", 0, "0"):
+            quote_volume = _valr_market_quote_volume(row)
+            last_price = as_float(last_trade, None)
+            if quote_volume > 0 and last_price is not None and last_price > 0:
+                rolling_volume = quote_volume / last_price
+        ticker = {
+            "pair": symbol,
+            "bid": row.get("bidPrice") or row.get("bid") or row.get("bestBid"),
+            "ask": row.get("askPrice") or row.get("ask") or row.get("bestAsk"),
+            "last_trade": last_trade,
+            "rolling_24_hour_volume": rolling_volume or "0",
+            "status": "ACTIVE",
+        }
+        timestamp = _valr_timestamp_ms(row)
+        if timestamp is not None:
+            ticker["timestamp"] = timestamp
+        tickers.append(ticker)
+    return {"tickers": tickers}
+
+
+def _parse_valr_market_summary(payload: object, *args, **kwargs) -> list[dict]:
+    transformed = _valr_as_luno_payload(payload)
+    candidates = [transformed]
+    if isinstance(payload, dict) and "payload" in payload and any(
+        key in payload for key in ("ok", "data_status", "http_status", "latency_ms")
+    ):
+        wrapped = dict(payload)
+        wrapped["payload"] = transformed
+        candidates.insert(0, wrapped)
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            return _parse_luno_tickers(candidate, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return []
+
+
 def _append_note(row: dict, note: str) -> None:
     notes = row.setdefault("notes", [])
     if note not in notes:
