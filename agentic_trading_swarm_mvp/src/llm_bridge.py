@@ -268,13 +268,22 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "reject_missing_required_fields": True,
             "required_fields": required_fields,
             "paper_execution_route_hunter_fallback": "refine_or_hold_with_validation_evidence",
+            "require_non_empty_market_key": True,
+            "require_non_empty_rationale": True,
+            "require_non_empty_evidence_object": True,
+            "require_non_empty_proposed_change_object": True,
+            "require_priority_integer_range": [1, 100],
         },
         "title": "short directive",
-        "rationale": "why this matters",
+        "rationale": "non-empty explanation of why this matters",
         "signal_key": "optional",
         "market_key": "required stable routing key",
-        "evidence": "object",
-        "proposed_change": "what should be built/tested/researched",
+        "evidence": "non-empty object with concrete supporting facts, validation details, or observed failures",
+        "proposed_change": "non-empty object describing what should be built/tested/researched",
+        "allocation_update_gate": (
+            "If market_key, rationale, evidence, or proposed_change would be blank, partial, "
+            "or non-JSON, emit a conservative hold/refine recommendation instead of suggesting a paper allocation change."
+        ),
         "variant_config": "required only for propose_signal_variant; bounded frontier variant object",
         "code_change": {
             "required_only_for": "propose_code_change",

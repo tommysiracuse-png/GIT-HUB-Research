@@ -58,6 +58,14 @@ STRICT_REQUIRED_RECOMMENDATION_FIELDS = (
 )
 
 
+def _has_meaningful_value(value: Any) -> bool:
+    if value in (None, "", {}, [], ()):
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
 def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool, str]:
     """Validate a paper-only market recommendation packet.
 
@@ -68,9 +76,30 @@ def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool,
     if not isinstance(packet, dict):
         return False, "packet must be a mapping"
 
-    missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in packet or packet[field] in (None, "", {}, [], ())]
+    missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in packet or not _has_meaningful_value(packet[field])]
     if missing:
         return False, f"missing required fields: {', '.join(missing)}"
+
+    for field in ("action", "title", "rationale", "market_key"):
+        value = packet.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return False, f"{field} must be a non-empty string"
+
+    priority = packet.get("priority")
+    if isinstance(priority, bool) or not isinstance(priority, int) or not 1 <= priority <= 100:
+        return False, "priority must be an integer between 1 and 100"
+
+    evidence = packet.get("evidence")
+    if not isinstance(evidence, dict) or not evidence:
+        return False, "evidence must be a non-empty object"
+    if not any(_has_meaningful_value(value) for value in evidence.values()):
+        return False, "evidence must contain at least one non-empty value"
+
+    proposed_change = packet.get("proposed_change")
+    if not isinstance(proposed_change, dict) or not proposed_change:
+        return False, "proposed_change must be a non-empty object"
+    if not any(_has_meaningful_value(value) for value in proposed_change.values()):
+        return False, "proposed_change must contain at least one non-empty value"
 
     return True, ""
 
