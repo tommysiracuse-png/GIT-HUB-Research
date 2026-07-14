@@ -122,9 +122,7 @@ def _strip_markdown_fences(text: str) -> str:
 
 def _has_forbidden_markdown_tokens(text: str) -> bool:
     lowered = text.lower()
-    return any(token in text for token in _FORBIDDEN_MARKDOWN_TOKENS) or any(
-        token in lowered for token in ("json",)
-    )
+    return any(token in text for token in _FORBIDDEN_MARKDOWN_TOKENS)
 
 
 def _default_recommendation() -> dict[str, Any]:
