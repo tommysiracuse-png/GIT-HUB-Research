@@ -484,6 +484,7 @@ def _cfg(settings: dict) -> dict:
         "probation_loops": 1,
         "rollback_on_health_failure": True,
         "generate_patch_when_missing": True,
+        "repair_invalid_patch_format": True,
         "repair_patch_when_apply_fails": True,
         "repair_patch_when_sandbox_fails": True,
         "patch_repair_attempts": 2,
@@ -1879,6 +1880,70 @@ def repair_patch_with_frontier_model(
     }
 
 
+def _repair_invalid_patch_format_once(
+    payload: dict,
+    settings: dict,
+    diff_text: str,
+    safety: dict,
+    patch_generation: dict,
+    preflight: dict,
+    root: pathlib.Path = ROOT,
+) -> tuple[str, dict, dict, list[dict[str, Any]]]:
+    if not diff_text.strip():
+        return diff_text, safety, patch_generation, []
+    if safety.get("decision") != "invalid_patch_format":
+        return diff_text, safety, patch_generation, []
+    if not _cfg(settings).get("repair_invalid_patch_format", True):
+        return diff_text, safety, patch_generation, []
+
+    failure = {
+        "passed": False,
+        "stage": "invalid_patch_format",
+        "error": "model output was not a git-applyable unified diff",
+        "commands": [
+            {
+                "returncode": 1,
+                "stderr_tail": "Patch generation returned text, but no changed files could be parsed. Convert the intended change into a valid unified diff only.",
+            }
+        ],
+    }
+    repaired_diff, repair_generation = repair_patch_with_frontier_model(
+        payload,
+        settings,
+        diff_text,
+        failure,
+        root=root,
+    )
+    repaired_diff = rewrite_diff_paths(repaired_diff)
+    repair_generation = {**repair_generation, "attempt": 1, "repair_reason": "invalid_patch_format"}
+    repair_entry: dict[str, Any] = {
+        "attempt": 1,
+        "previous_stage": "invalid_patch_format",
+        "generation": repair_generation,
+    }
+    if not repaired_diff.strip():
+        repair_entry["result"] = "empty_repair"
+        return diff_text, safety, patch_generation, [repair_entry]
+
+    repaired_safety = validate_and_scan(
+        payload,
+        repaired_diff,
+        settings,
+        patch_generation=repair_generation,
+        preflight=preflight,
+    )
+    repair_entry["safety"] = repaired_safety
+    repair_entry["result"] = "passed" if repaired_safety.get("allowed") else "blocked_by_safety"
+    combined_generation = {
+        **patch_generation,
+        "invalid_patch_format_repair": repair_generation,
+        "returned_patch_format": repair_generation.get("returned_patch_format"),
+    }
+    if repaired_safety.get("allowed"):
+        return repaired_diff, repaired_safety, combined_generation, [repair_entry]
+    return repaired_diff, repaired_safety, combined_generation, [repair_entry]
+
+
 def run_sandbox_checks(diff_text: str, payload: dict, settings: dict, root: pathlib.Path = ROOT) -> dict:
     diff_text = rewrite_diff_paths(diff_text)
     cfg = _cfg(settings)
@@ -2733,7 +2798,20 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         diff_text = rewrite_diff_paths(diff_text)
 
     safety = validate_and_scan(payload, diff_text, settings, patch_generation=patch_generation, preflight=preflight)
+    invalid_format_repair_history: list[dict[str, Any]] = []
+    if safety["decision"] == "invalid_patch_format":
+        diff_text, safety, patch_generation, invalid_format_repair_history = _repair_invalid_patch_format_once(
+            payload,
+            settings,
+            diff_text,
+            safety,
+            patch_generation,
+            preflight,
+            root=root,
+        )
     safety = _with_frontier_usefulness(safety, safety["decision"], patch_generation)
+    if invalid_format_repair_history:
+        safety["repair_history"] = invalid_format_repair_history
     update_code_evolution_proposal(
         conn,
         proposal_id,
@@ -2752,7 +2830,7 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         return [_artifact(proposal_id, "created", "approved_pending_manual_merge")]
 
     sandbox = run_sandbox_checks(diff_text, payload, settings, root=root)
-    repair_history: list[dict[str, Any]] = []
+    repair_history: list[dict[str, Any]] = list(invalid_format_repair_history)
     if not sandbox.get("passed") and diff_text.strip():
         max_repairs = int(cfg.get("patch_repair_attempts", 1))
         repairable_stages = {"patch_check", "patch_apply"}

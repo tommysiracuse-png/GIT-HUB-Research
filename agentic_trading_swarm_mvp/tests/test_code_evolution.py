@@ -722,6 +722,81 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
         self.assertIn("invalid_patch_format", safety["reasons"])
         self.assertNotIn("no_changed_files", safety["reasons"])
 
+    def test_process_repairs_non_diff_model_output_before_invalid_patch_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "repo"
+            root.mkdir()
+            (root / "src").mkdir()
+            (root / "src" / "llm_bridge.py").write_text("# bridge\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "config").mkdir()
+            db = pathlib.Path(tmp) / "radar.sqlite"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            old_ledger = code_evolution.LEDGER_JSONL
+            code_evolution.LEDGER_JSONL = pathlib.Path(tmp) / "evolution_ledger.jsonl"
+            non_diff = "I would add a paper-only note to src/llm_bridge.py."
+            repaired = """diff --git a/src/llm_bridge.py b/src/llm_bridge.py
+--- a/src/llm_bridge.py
++++ b/src/llm_bridge.py
+@@ -1 +1,2 @@
+ # bridge
++paper-only note
+"""
+            try:
+                rec = {
+                    "recommendation_id": "rec-non-diff-repair",
+                    "title": "Repair non-diff model output",
+                    "payload": proposal(
+                        "",
+                        expected_files=["src/llm_bridge.py"],
+                        change_category="llm_prompt_state_packet",
+                        tests_to_run=[],
+                    ),
+                }
+                with mock.patch.object(
+                    code_evolution,
+                    "generate_patch_with_frontier_model",
+                    return_value=(
+                        non_diff,
+                        {
+                            "status": "model_call:responses",
+                            "model_tier": "fast",
+                            "returned_patch_format": "invalid_or_empty",
+                        },
+                    ),
+                ), mock.patch.object(
+                    code_evolution,
+                    "repair_patch_with_frontier_model",
+                    return_value=(
+                        repaired,
+                        {
+                            "status": "model_call:responses",
+                            "model_tier": "fast",
+                            "returned_patch_format": "unified_diff",
+                        },
+                    ),
+                ) as repair:
+                    created = code_evolution.process_code_change_recommendation(
+                        conn,
+                        rec,
+                        settings(generate_patch_when_missing=True, patch_repair_attempts=2),
+                        root=root,
+                    )
+                row = storage.code_evolution_recent(conn)[0]
+                updated_text = (root / "src" / "llm_bridge.py").read_text(encoding="utf-8")
+            finally:
+                code_evolution.LEDGER_JSONL = old_ledger
+                conn.close()
+
+        self.assertEqual(created[0]["status"], "workspace_applied_probation")
+        self.assertEqual(repair.call_count, 1)
+        self.assertIn("paper-only note", updated_text)
+        self.assertEqual(row["status"], "workspace_applied_probation")
+        self.assertEqual(row["changed_files"], ["src/llm_bridge.py"])
+        self.assertEqual(row["safety"]["repair_history"][0]["previous_stage"], "invalid_patch_format")
+
     def test_unavailable_patch_generation_does_not_store_fallback_as_patch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp) / "repo"
