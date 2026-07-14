@@ -50,6 +50,7 @@ REGIONAL_FIAT_QUOTES = {
     "PEN",
     "ARS",
 }
+LATAM_FIAT_QUOTES = {"MXN", "BRL", "CLP", "COP", "PEN", "ARS"}
 QUOTE_ASSETS = USD_LIKE_QUOTES | REGIONAL_FIAT_QUOTES
 STABLE_OR_FIAT_BASES = {
     "USD",
@@ -500,6 +501,29 @@ def _canonical_asset(value: str | None) -> str | None:
     return aliases.get(upper, upper)
 
 
+def _is_latam_fiat_quote(quote: str | None) -> bool:
+    return str(quote or "").upper() in LATAM_FIAT_QUOTES
+
+
+def _append_note(row: dict, note: str) -> None:
+    notes = row.setdefault("notes", [])
+    if note not in notes:
+        notes.append(note)
+
+
+def _apply_paper_only_review_policy(row: dict) -> dict:
+    quote = str(row.get("quote") or "").upper()
+    if not _is_latam_fiat_quote(quote):
+        return row
+    row["local_quote_observe_only"] = True
+    row["paper_only_review_scope"] = "frontier_candidate_review"
+    normalized_last = as_float(row.get("usd_normalized_last"), default=None)
+    if normalized_last is not None and normalized_last > 0 and row.get("quote_normalization_source"):
+        _append_note(row, "usd_normalized_via_reference_fx")
+    else:
+        _append_note(row, "review_only_pending_usd_normalization")
+    return row
+
 def _target_quote_assets(target: dict) -> set[str]:
     return {str(item).upper() for item in target.get("quote_assets", sorted(QUOTE_ASSETS))}
 
@@ -539,6 +563,7 @@ def _base_observation(target: dict, result: dict, symbol: str | None = None) -> 
         "quote_normalization_source": None,
         "local_quote_observe_only": False,
         "source_url": target["url"],
+        "paper_only_review_scope": None,
         "notes": [],
     }
 
@@ -553,7 +578,7 @@ def _finalize_observation(row: dict) -> dict:
         row["quote"] = row.get("quote") or quote
     row["base"] = _canonical_asset(row.get("base"))
     row["comparison_key"] = row.get("base")
-    return row
+    return _apply_paper_only_review_policy(row)
 
 
 def _max_product_tickers(target: dict, default: int = 50) -> int:
