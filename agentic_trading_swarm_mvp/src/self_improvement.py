@@ -116,6 +116,163 @@ def _payload_text(payload: dict) -> str:
     return " ".join(parts).lower()
 
 
+def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
+    return any(term in text for term in terms)
+
+
+def _term_score(text: str, terms: tuple[str, ...], *, cap: int | None = None) -> int:
+    score = sum(1 for term in terms if term in text)
+    return min(score, cap) if cap is not None else score
+
+
+def _market_data_adapter_score(payload: dict, text: str) -> int:
+    action = str(payload.get("action") or "")
+    score = 0
+    if action == "request_market_adapter":
+        score += 5
+    elif action == "request_data_source":
+        score += 4
+    elif action == "propose_build_task":
+        score += 1
+    score += 2 * _term_score(
+        text,
+        (
+            "adapter",
+            "parser",
+            "scanner",
+            "ingest",
+            "ingestion",
+            "collector",
+            "normalize",
+            "normaliz",
+        ),
+        cap=3,
+    )
+    score += _term_score(
+        text,
+        (
+            "market data",
+            "public data",
+            "public no-key",
+            "no-key",
+            "official docs",
+            "api docs",
+            "endpoint",
+            "rest",
+            "websocket",
+            "feed",
+            "ticker",
+            "quote",
+            "bid",
+            "ask",
+            "order book",
+            "orderbook",
+            "book depth",
+            "trades",
+            "ohlcv",
+            "settlement",
+            "auction",
+            "instrument list",
+            "symbol list",
+            "contract list",
+        ),
+        cap=6,
+    )
+    score += _term_score(
+        text,
+        (
+            "exchange",
+            "venue",
+            "market surface",
+            "asset class",
+            "regional market",
+            "local market",
+            "derivatives",
+            "futures",
+            "options",
+            "rates",
+            "fx",
+            "commodit",
+            "credit",
+            "lending",
+            "prediction market",
+            "event market",
+            "sports odds",
+        ),
+        cap=4,
+    )
+    return score
+
+
+def _scanner_expansion_score(text: str) -> int:
+    return _term_score(
+        text,
+        (
+            "depth enrichment",
+            "candidate cap",
+            "candidate generation",
+            "scanner breadth",
+            "scanner expansion",
+            "starved venue",
+            "exploration quota",
+            "quality coverage",
+            "quote normalization",
+            "fx normalization",
+            "regional normalization",
+            "market-tested",
+            "markets tested",
+        ),
+        cap=8,
+    )
+
+
+def _paper_scoring_score(text: str) -> int:
+    return _term_score(
+        text,
+        (
+            "score",
+            "scoring",
+            "paper scorer",
+            "gate",
+            "filter",
+            "decay",
+            "freshness",
+            "guard",
+            "sample-size",
+            "sample size",
+            "confirmation",
+            "quarantine",
+            "penalty",
+            "eligibility",
+            "admission",
+            "ranking",
+            "allocation",
+        ),
+        cap=8,
+    )
+
+
+def _route_intelligence_score(text: str) -> int:
+    return _term_score(
+        text,
+        (
+            "route",
+            "borrow",
+            "margin",
+            "fee",
+            "conditional",
+            "capability",
+            "permission",
+            "broker",
+            "api support",
+            "jurisdiction",
+            "account",
+            "eligibility",
+        ),
+        cap=8,
+    )
+
+
 def _looks_like_runtime_implementation(payload: dict) -> bool:
     action = str(payload.get("action") or "")
     if action == "propose_code_change" or isinstance(payload.get("code_change"), dict):
@@ -148,6 +305,9 @@ def _looks_like_runtime_implementation(payload: dict) -> bool:
         "gate",
         "score",
         "normaliz",
+        "ingest",
+        "collect",
+        "map ",
         "surface",
         "expose",
     )
@@ -157,6 +317,17 @@ def _looks_like_runtime_implementation(payload: dict) -> bool:
         "scanner",
         "adapter",
         "parser",
+        "market data",
+        "public data",
+        "endpoint",
+        "exchange",
+        "feed",
+        "ticker",
+        "order book",
+        "auction",
+        "settlement",
+        "instrument",
+        "symbol",
         "ingestion",
         "recommendation",
         "json",
@@ -249,17 +420,40 @@ def classify_recommendation(payload: dict) -> str:
 
 def _infer_code_category(payload: dict) -> str:
     text = _payload_text(payload)
-    if any(term in text for term in ("json", "schema", "swarm", "ingestion")):
+    if _contains_any(text, ("json", "schema", "swarm")):
         return "evolution_loop_improvement"
-    if any(term in text for term in ("adapter", "venue", "public data", "bybit", "valr", "luno", "bitso")):
-        return "public_data_adapter"
-    if any(term in text for term in ("frontier", "depth", "fx", "fiat", "quote", "normaliz", "candidate cap")):
-        return "scanner_expansion"
-    if any(term in text for term in ("score", "scoring", "gate", "filter", "decay", "freshness", "yahoo", "proxy")):
+    adapter_score = _market_data_adapter_score(payload, text)
+    scanner_score = _scanner_expansion_score(text)
+    scoring_score = _paper_scoring_score(text)
+    route_score = _route_intelligence_score(text)
+    explicit_scoring = _contains_any(
+        text,
+        (
+            "score",
+            "scoring",
+            "paper scorer",
+            "gate",
+            "gating",
+            "guard",
+            "ranking",
+            "allocation",
+            "eligibility",
+            "admission",
+            "quarantine",
+            "decay",
+        ),
+    )
+    if explicit_scoring and adapter_score < 6:
         return "paper_scoring_logic"
-    if any(term in text for term in ("route", "borrow", "margin", "fee", "conditional")):
+    if scoring_score >= 2 and scoring_score >= adapter_score and scoring_score >= scanner_score:
+        return "paper_scoring_logic"
+    if scanner_score >= 2 and scanner_score > adapter_score:
+        return "scanner_expansion"
+    if adapter_score >= 4:
+        return "public_data_adapter"
+    if route_score >= 2:
         return "read_only_route_intelligence"
-    if any(term in text for term in ("packet", "report", "dashboard")):
+    if _contains_any(text, ("packet", "report", "dashboard")):
         return "llm_prompt_state_packet"
     if "recommendation" in text:
         return "evolution_loop_improvement"
@@ -280,9 +474,25 @@ def _infer_expected_files(payload: dict, category: str) -> list[str]:
                 "tests/test_self_improvement_recommendation_flow.py",
             ]
         )
-    if category in {"public_data_adapter", "scanner_expansion", "quality_scoring"} or any(
-        term in text for term in ("frontier", "fx", "fiat", "quote", "depth", "bybit", "valr", "luno", "bitso")
-    ):
+    crypto_surface = _contains_any(
+        text,
+        (
+            "crypto",
+            "spot",
+            "perp",
+            "stablecoin",
+            "token",
+            "order book",
+            "orderbook",
+            "frontier",
+            "fiat quote",
+            "quote normalization",
+            "depth enrichment",
+        ),
+    )
+    prediction_surface = _contains_any(text, ("prediction market", "event market", "kalshi", "polymarket"))
+    global_discovery_surface = category == "public_data_adapter" and not crypto_surface and not prediction_surface
+    if category in {"public_data_adapter", "scanner_expansion", "quality_scoring"} and not global_discovery_surface:
         files.extend(
             [
                 "src/frontier_crypto_adapter.py",
@@ -291,6 +501,10 @@ def _infer_expected_files(payload: dict, category: str) -> list[str]:
                 "tests/test_frontier_data_quality.py",
             ]
         )
+    if prediction_surface:
+        files.extend(["src/prediction_market_scanner.py", "tests/test_prediction_market_scanner.py"])
+    if global_discovery_surface:
+        files.extend(["src/research_worker.py", "src/llm_bridge.py", "tests/test_research_worker.py"])
     if category == "read_only_route_intelligence" or any(
         term in text for term in ("route", "borrow", "conditional", "margin", "fee")
     ):

@@ -135,6 +135,46 @@ class EvolutionWorkerSeparationTests(unittest.TestCase):
 
         self.assertEqual("route_resolver", self_improvement.classify_recommendation(payload))
 
+    def test_unseen_global_market_surface_maps_by_intent_not_name(self) -> None:
+        payload = {
+            "action": "request_market_adapter",
+            "priority": 88,
+            "title": "Add Nairobi Coffee Exchange auction feed",
+            "proposed_change": (
+                "Build a public no-key parser for the official auction price feed, "
+                "daily settlement data, and instrument list. Ingest observations into "
+                "paper research so the global discovery worker can rank the market surface."
+            ),
+            "evidence": {"surface_type_raw": "agricultural auction market", "data_access_type": "public_no_key"},
+        }
+
+        self.assertEqual("code_change", self_improvement.classify_recommendation(payload))
+        normalized = self_improvement._normalize_code_change_recommendation(
+            {"recommendation_id": "rec-nairobi", "title": payload["title"], "payload": payload}
+        )
+
+        self.assertEqual("public_data_adapter", normalized["payload"]["change_category"])
+        self.assertIn("src/research_worker.py", normalized["payload"]["expected_files"])
+        self.assertNotIn("src/frontier_crypto_adapter.py", normalized["payload"]["expected_files"])
+
+    def test_unknown_crypto_exchange_still_maps_to_frontier_adapter_without_name_allowlist(self) -> None:
+        payload = {
+            "action": "request_market_adapter",
+            "priority": 88,
+            "title": "Add MeridianX crypto order book feed",
+            "proposed_change": (
+                "Create a public REST parser for spot ticker and order book depth, normalize "
+                "bid ask quotes, and wire the observations into the frontier scanner."
+            ),
+        }
+
+        normalized = self_improvement._normalize_code_change_recommendation(
+            {"recommendation_id": "rec-meridianx", "title": payload["title"], "payload": payload}
+        )
+
+        self.assertEqual("public_data_adapter", normalized["payload"]["change_category"])
+        self.assertIn("src/frontier_crypto_adapter.py", normalized["payload"]["expected_files"])
+
 
 if __name__ == "__main__":
     unittest.main()
