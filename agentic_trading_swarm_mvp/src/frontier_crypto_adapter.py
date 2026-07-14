@@ -33,6 +33,43 @@ DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY = {
 }
 
 
+DEFAULT_PAPER_ONLY_CONFIDENCE_POLICY = {
+    "min_confidence": 0.70,
+    "trend_weight": 0.40,
+    "momentum_weight": 0.35,
+    "liquidity_weight": 0.25,
+}
+
+
+def paper_only_confidence_score(
+    *,
+    trend_score: float,
+    momentum_score: float,
+    liquidity_score: float,
+    min_confidence: float = DEFAULT_PAPER_ONLY_CONFIDENCE_POLICY["min_confidence"],
+    trend_weight: float = DEFAULT_PAPER_ONLY_CONFIDENCE_POLICY["trend_weight"],
+    momentum_weight: float = DEFAULT_PAPER_ONLY_CONFIDENCE_POLICY["momentum_weight"],
+    liquidity_weight: float = DEFAULT_PAPER_ONLY_CONFIDENCE_POLICY["liquidity_weight"],
+) -> dict:
+    """Compute a normalized paper-only confidence score and threshold gate."""
+
+    weights = [float(trend_weight), float(momentum_weight), float(liquidity_weight)]
+    raw_score = (
+        float(trend_score) * weights[0]
+        + float(momentum_score) * weights[1]
+        + float(liquidity_score) * weights[2]
+    )
+    weight_total = sum(weights) or 1.0
+    confidence = max(0.0, min(1.0, raw_score / weight_total))
+    blocked = confidence < float(min_confidence)
+    return {
+        "confidence": confidence,
+        "min_confidence": float(min_confidence),
+        "blocked": blocked,
+        "alert_allowed": not blocked,
+    }
+
+
 def paper_only_executable_quality_check(
     *,
     expected_edge_bps: float,
@@ -66,6 +103,18 @@ def paper_only_executable_quality_check(
         if float(top_of_book_depth) < required_depth:
             reasons.append("insufficient_depth")
 
+    confidence_inputs = {
+        "trend_score": 1.0 if float(expected_edge_bps) > 0.0 else 0.0,
+        "momentum_score": min(1.0, max(0.0, float(expected_edge_bps) / max(float(min_net_edge_bps), 1.0))),
+        "liquidity_score": 1.0
+        if top_of_book_depth is None or paper_order_size is None
+        else min(1.0, max(0.0, float(top_of_book_depth) / max(float(paper_order_size), 1.0) / 3.0)),
+    }
+    confidence = paper_only_confidence_score(
+        **confidence_inputs,
+        min_confidence=0.70,
+    )
+
     passed = not reasons
     return {
         "passed": passed,
@@ -73,6 +122,9 @@ def paper_only_executable_quality_check(
         "edge_after_costs_bps": edge_after_costs,
         "spread_limit_bps": spread_limit_bps,
         "score_multiplier": 1.0 if passed else 0.0,
+        "confidence": confidence["confidence"],
+        "confidence_gate": confidence,
+        "alert_blocked": not passed or confidence["blocked"],
     }
 
 
