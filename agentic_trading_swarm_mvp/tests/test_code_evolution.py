@@ -152,6 +152,26 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
         self.assertEqual(safety["category"], "runtime_pipeline_integration")
         self.assertEqual(safety["implementation_mode"], "runtime_active")
 
+    def test_scan_accepts_string_evidence_as_structured_evidence(self) -> None:
+        diff = """diff --git a/src/llm_bridge.py b/src/llm_bridge.py
+--- a/src/llm_bridge.py
++++ b/src/llm_bridge.py
+@@ -1 +1,2 @@
+ # bridge
++STRING_EVIDENCE_ACCEPTED = True
+"""
+        payload = proposal(
+            diff,
+            change_category="runtime_pipeline_integration",
+            expected_files=["src/llm_bridge.py"],
+            evidence="Previous recommendation response was malformed and blocked parser automation.",
+        )
+
+        safety = code_evolution.validate_and_scan(payload, diff, settings())
+
+        self.assertTrue(safety["allowed"], safety)
+        self.assertNotIn("missing_evidence", safety["reasons"])
+
     def test_market_expansion_defaults_to_runtime_active_and_can_use_standard_model(self) -> None:
         diff = """diff --git a/src/frontier_data_quality.py b/src/frontier_data_quality.py
 --- a/src/frontier_data_quality.py

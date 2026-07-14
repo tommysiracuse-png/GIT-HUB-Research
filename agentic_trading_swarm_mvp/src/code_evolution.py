@@ -622,8 +622,20 @@ def _field(payload: dict, *names: str) -> object:
 
 def _proposal_evidence(payload: dict) -> dict:
     evidence: dict = {}
-    top = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
-    nested = _code_change(payload).get("evidence") if isinstance(_code_change(payload).get("evidence"), dict) else {}
+    raw_top = payload.get("evidence")
+    raw_nested = _code_change(payload).get("evidence")
+    if isinstance(raw_nested, dict):
+        nested = raw_nested
+    elif isinstance(raw_nested, str) and raw_nested.strip():
+        nested = {"summary": raw_nested.strip(), "source": "code_change.evidence"}
+    else:
+        nested = {}
+    if isinstance(raw_top, dict):
+        top = raw_top
+    elif isinstance(raw_top, str) and raw_top.strip():
+        top = {"summary": raw_top.strip(), "source": "payload.evidence"}
+    else:
+        top = {}
     evidence.update(nested)
     evidence.update(top)
     return evidence

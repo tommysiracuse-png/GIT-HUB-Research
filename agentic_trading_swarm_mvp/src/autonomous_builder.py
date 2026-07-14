@@ -74,6 +74,7 @@ def _cfg(settings: dict) -> dict:
         "max_code_file_chars": 12000,
         "plan_max_output_tokens": 24000,
         "max_output_tokens": 24000,
+        "implementation_strategy": "code_evolution_handoff",
         "require_unified_diff": True,
         "use_hard_model_timeout": True,
     }
@@ -566,6 +567,54 @@ def _run_with_conn_locked(conn: Any, settings: dict) -> dict:
                 "model": plan_model,
                 "plan_model": plan_model,
                 "reason": plan_result.text[:2000],
+            }
+        )
+
+    strategy = str(cfg.get("implementation_strategy", "code_evolution_handoff")).strip().lower()
+    if strategy in {"code_evolution_handoff", "handoff", "plan_handoff", "plan_only"}:
+        code_change = {
+            "change_category": plan.get("change_category"),
+            "implementation_mode": plan.get("implementation_mode"),
+            "expected_files": plan.get("expected_files") or [],
+            "tests_to_run": plan.get("tests_to_run") or [],
+            "rollback_criteria": plan.get("rollback_criteria")
+            or "Revert if tests fail or paper-only safety checks fail.",
+            "frontier_escalation_reason": plan.get("frontier_escalation_reason")
+            or "Direct outside-flow autonomous code-evolution handoff.",
+            "evidence": plan.get("evidence") if isinstance(plan.get("evidence"), dict) else {"summary": str(plan.get("evidence") or ""), "source": "autonomous_builder_plan"},
+        }
+        payload = {
+            "action": "propose_code_change",
+            "agent_name": "autonomous_builder",
+            "title": plan.get("title") or "Autonomous builder handoff",
+            "priority": int(plan.get("priority") or 95),
+            "rationale": plan.get("expected_behavior_change") or plan.get("plan") or "Direct autonomous builder plan.",
+            "proposed_change": plan.get("plan") or plan.get("expected_behavior_change") or "",
+            "evidence": code_change["evidence"],
+            "frontier_escalation_reason": code_change["frontier_escalation_reason"],
+            "model": plan_model,
+            "plan_model": plan_model,
+            "autonomous_plan": plan,
+            "autonomous_builder_strategy": strategy,
+            "code_change": code_change,
+        }
+        rec = {
+            "recommendation_id": _proposal_id_seed({"plan": plan, "strategy": strategy}, plan_result.text),
+            "title": payload["title"],
+            "priority": payload["priority"],
+            "payload": payload,
+        }
+        created = process_code_change_recommendation(conn, rec, settings)
+        write_code_evolution_reports(conn, settings)
+        return _write_report(
+            {
+                "generated_at": _utc_now(),
+                "status": "handed_off_to_code_evolution",
+                "model": plan_model,
+                "plan_model": plan_model,
+                "title": payload["title"],
+                "plan": plan,
+                "created": created,
             }
         )
 

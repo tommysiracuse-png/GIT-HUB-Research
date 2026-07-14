@@ -220,6 +220,7 @@ DEFAULT_SETTINGS = {
         "max_code_file_chars": 12000,
         "plan_max_output_tokens": 24000,
         "max_output_tokens": 24000,
+        "implementation_strategy": "code_evolution_handoff",
         "require_unified_diff": True,
     },
     "code_evolution": {

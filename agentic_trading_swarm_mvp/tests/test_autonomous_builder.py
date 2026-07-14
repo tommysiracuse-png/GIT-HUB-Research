@@ -63,7 +63,61 @@ class AutonomousBuilderTests(unittest.TestCase):
             finally:
                 self._restore_report_paths(old_paths)
 
-    def test_valid_builder_patch_flows_to_code_evolution(self) -> None:
+    def test_default_builder_hands_plan_to_code_evolution_without_direct_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_paths = self._patch_report_paths(tmp)
+            try:
+                plan_text = json.dumps(
+                    {
+                        "plan": "Wire a tiny state-packet marker.",
+                        "title": "Autonomous marker",
+                        "priority": 95,
+                        "expected_behavior_change": "Adds a runtime-visible marker.",
+                        "evidence": "unit test evidence",
+                        "implementation_notes": ["Patch llm_bridge", "Run focused test"],
+                        "expected_files": ["src/llm_bridge.py"],
+                        "tests_to_run": ["python -m unittest tests/test_frontier_model_policy.py"],
+                        "change_category": "llm_prompt_state_packet",
+                        "implementation_mode": "runtime_active",
+                        "rollback_criteria": "Revert if tests fail.",
+                        "frontier_escalation_reason": "unit test",
+                    }
+                )
+                plan_result = ModelResult(
+                    text=plan_text,
+                    model_name="openai/gpt-5.6-sol",
+                    model_tier="frontier",
+                    prompt_tokens=10,
+                    completion_tokens=20,
+                    estimated_cost_usd=0.01,
+                    status="model_call:responses",
+                )
+                with mock.patch.object(autonomous_builder, "complete", return_value=plan_result) as complete:
+                    with mock.patch.object(
+                        autonomous_builder,
+                        "process_code_change_recommendation",
+                        return_value=[{"artifact_type": "code_evolution", "proposal_id": "p1", "status": "promoted"}],
+                    ) as process:
+                        with mock.patch.object(autonomous_builder, "write_code_evolution_reports"):
+                            report = autonomous_builder._run_with_conn(
+                                object(),
+                                {"autonomous_builder": {"use_hard_model_timeout": False}},
+                                force=True,
+                            )
+
+                self.assertEqual(report["status"], "handed_off_to_code_evolution")
+                self.assertEqual(complete.call_count, 1)
+                self.assertEqual(complete.call_args.kwargs["operation"], "autonomous_builder_plan")
+                payload = process.call_args.args[1]["payload"]
+                self.assertEqual(payload["agent_name"], "autonomous_builder")
+                self.assertEqual(payload["autonomous_builder_strategy"], "code_evolution_handoff")
+                self.assertNotIn("unified_diff", payload)
+                self.assertNotIn("unified_diff", payload["code_change"])
+                self.assertEqual(payload["evidence"]["summary"], "unit test evidence")
+            finally:
+                self._restore_report_paths(old_paths)
+
+    def test_valid_builder_patch_flows_to_code_evolution_when_direct_diff_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_paths = self._patch_report_paths(tmp)
             try:
@@ -118,7 +172,12 @@ class AutonomousBuilderTests(unittest.TestCase):
                         with mock.patch.object(autonomous_builder, "write_code_evolution_reports"):
                             report = autonomous_builder._run_with_conn(
                                 object(),
-                                {"autonomous_builder": {"use_hard_model_timeout": False}},
+                                {
+                                    "autonomous_builder": {
+                                        "implementation_strategy": "direct_diff",
+                                        "use_hard_model_timeout": False,
+                                    }
+                                },
                                 force=True,
                             )
 
