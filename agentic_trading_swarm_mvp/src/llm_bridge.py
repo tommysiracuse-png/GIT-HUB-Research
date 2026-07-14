@@ -117,6 +117,30 @@ MARKET_SCOUT_FALLBACK_RECOMMENDATION = {
     "proposed_change": {"goal": "preserve parser compatibility"},
 }
 
+EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION = {
+    "action": "refine",
+    "priority": 85,
+    "title": "Refine paper execution route recommendation",
+    "rationale": (
+        "Auto-generated because the primary execution-route response failed strict "
+        "single-object validation, omitted required fields, or did not provide "
+        "enough paper-only evidence to support routing analysis."
+    ),
+    "market_key": "paper.execution_route_hunter",
+    "evidence": {
+        "issue": "route_validation_failed",
+        "validation_error": "schema_validation_failed",
+        "paper_only": True,
+    },
+    "proposed_change": {
+        "summary": "Return one schema-complete paper-only route recommendation or a conservative hold/refine decision.",
+        "fallback_behavior": "Prefer refine or hold when route confidence or payload completeness is insufficient.",
+        "required_fields": list(REQUIRED_RECOMMENDATION_FIELDS),
+        "safety_mode": "paper_only",
+        "suppress_live_execution_wording": True,
+    },
+}
+
 
 def _signal_stats(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
@@ -191,18 +215,23 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
         "format_guardrails": "No markdown, commentary, code fences, or wrapper arrays around the recommendation object.",
         "paper_only_default": "Recommendations must remain limited to paper-trading simulation, reports, tests, adapters, routing analysis, and code evolution.",
         "priority": "integer 1-100",
-        "fallback_behavior": "If any required field is unavailable, emit one conservative paper-only parser-hardening recommendation instead of partial output.",
+        "fallback_behavior": (
+            "If any required field is unavailable, route construction fails validation, "
+            "or the response would otherwise be partial, emit one conservative paper-only "
+            "fallback recommendation instead of partial output."
+        ),
         "validation_policy": {
             "publish_only_single_json_object": True,
             "reject_non_json": True,
             "reject_wrapper_arrays": True,
             "reject_missing_required_fields": True,
             "required_fields": required_fields,
+            "paper_execution_route_hunter_fallback": "refine_or_hold_with_validation_evidence",
         },
         "title": "short directive",
         "rationale": "why this matters",
         "signal_key": "optional",
-        "market_key": "optional",
+        "market_key": "required stable routing key",
         "evidence": "object",
         "proposed_change": "what should be built/tested/researched",
         "variant_config": "required only for propose_signal_variant; bounded frontier variant object",
@@ -217,10 +246,24 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "frontier_escalation_reason": "required for GPT-5.5 code evolution",
         },
         "market_key_contracts": {
-            "paper.execution_route_hunter": "Always emit one schema-complete recommendation object with action, priority, title, rationale, market_key, evidence, and proposed_change. If context is incomplete, emit one conservative paper-only parser-hardening recommendation instead of partial output.",
+            "paper.execution_route_hunter": (
+                "Always emit exactly one schema-complete top-level JSON object with "
+                "action, priority, title, rationale, market_key, evidence, and "
+                "proposed_change. No markdown, commentary, wrapper arrays, or live "
+                "execution wording. If route construction fails validation or context "
+                "is incomplete, emit the provided paper-only refine/hold fallback "
+                "recommendation object with the validation failure captured in evidence."
+            ),
             "paper_system.integrity.market_scout": "Always emit exactly one schema-complete top-level JSON object with action, priority, title, rationale, market_key, evidence, and proposed_change. If generation or validation fails, emit the provided fallback paper-only hold recommendation object instead of partial output.",
         },
-        "fallback_recommendations": {"paper_system.integrity.market_scout": MARKET_SCOUT_FALLBACK_RECOMMENDATION},
+        "paper_safety_policies": {
+            "paper.execution_route_hunter": {
+                "mode": "paper_only",
+                "forbid_live_execution_wording": True,
+                "required_fields": required_fields,
+            },
+        },
+        "fallback_recommendations": {"paper.execution_route_hunter": EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION, "paper_system.integrity.market_scout": MARKET_SCOUT_FALLBACK_RECOMMENDATION},
         "allowed_actions": allowed_actions,
     }
 
