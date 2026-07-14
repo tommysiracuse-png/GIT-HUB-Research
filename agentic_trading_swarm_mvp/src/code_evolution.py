@@ -173,13 +173,16 @@ def is_paper_only_suppression_recommendation(packet: dict[str, Any]) -> bool:
 
     if not isinstance(packet, dict):
         return False
+
     action = packet.get("action")
     proposed_change = packet.get("proposed_change")
     if not isinstance(action, str) or not isinstance(proposed_change, dict):
         return False
     if action not in SUPPRESSION_ACTIONS:
         return False
-    if packet.get("variant_config", {}).get("paper_only") is not True:
+
+    variant_config = packet.get("variant_config")
+    if not isinstance(variant_config, dict) or variant_config.get("paper_only") is not True:
         return False
     entry_condition = proposed_change.get("entry_condition", "")
     return isinstance(entry_condition, str) and "complete valid json recommendation" in entry_condition.lower()
