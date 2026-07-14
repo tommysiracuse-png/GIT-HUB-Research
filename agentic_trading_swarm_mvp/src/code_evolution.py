@@ -57,6 +57,12 @@ STRICT_REQUIRED_RECOMMENDATION_FIELDS = (
     "proposed_change",
 )
 MIN_PAPER_CONFIRM_SCORE_MIN = 0.68
+SUPPRESSION_ACTIONS = {
+    "suppress_trade_generation_for_this_case",
+    "no_trade",
+    "monitor_only",
+    "wait_for_complete_valid_json_recommendation_with_market_context",
+}
 
 
 def _has_meaningful_value(value: Any) -> bool:
@@ -160,6 +166,23 @@ def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool,
             )
 
     return True, ""
+
+
+def is_paper_only_suppression_recommendation(packet: dict[str, Any]) -> bool:
+    """Return True when the packet intentionally avoids trade generation."""
+
+    if not isinstance(packet, dict):
+        return False
+    action = packet.get("action")
+    proposed_change = packet.get("proposed_change")
+    if not isinstance(action, str) or not isinstance(proposed_change, dict):
+        return False
+    if action not in SUPPRESSION_ACTIONS:
+        return False
+    if packet.get("variant_config", {}).get("paper_only") is not True:
+        return False
+    entry_condition = proposed_change.get("entry_condition", "")
+    return isinstance(entry_condition, str) and "complete valid json recommendation" in entry_condition.lower()
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
