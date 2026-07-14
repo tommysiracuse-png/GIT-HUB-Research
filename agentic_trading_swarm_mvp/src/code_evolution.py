@@ -1134,6 +1134,20 @@ def _runtime_integration_status(payload: dict, category: str, target_files: list
     return "missing"
 
 
+def _actual_runtime_integration_status(payload: dict, category: str, changed_files: list[str]) -> str:
+    status = _runtime_integration_status(payload, category, changed_files)
+    if status == "integrated":
+        return status
+    changed_source_files = [
+        path
+        for path in changed_files
+        if path.startswith("src/") and path.endswith(".py")
+    ]
+    if changed_source_files and category in RUNTIME_INTEGRATED_CATEGORIES:
+        return "changed_source_without_runtime_wiring"
+    return status
+
+
 def _expected_behavior_change(payload: dict, runtime_status: str) -> str:
     proposed = str(_field(payload, "proposed_change", "expected_paper_only_impact") or payload.get("rationale") or "").strip()
     if runtime_status == "integrated":
@@ -1369,6 +1383,13 @@ def validate_and_scan(
             if status:
                 reasons.append(str(status))
 
+    actual_runtime_status = _actual_runtime_integration_status(payload, category, changed_files) if changed_files else None
+    if (
+        cfg.get("reject_orphan_helpers", True)
+        and actual_runtime_status == "changed_source_without_runtime_wiring"
+    ):
+        reasons.append("no_runtime_integration_target")
+
     for path in changed_files:
         if _path_blocked(path, cfg):
             reasons.append(f"path_not_allowed:{path}")
@@ -1389,6 +1410,7 @@ def validate_and_scan(
         "preflight": preflight or {},
         "proposal_quality_score": (preflight or {}).get("quality_scorecard", {}).get("proposal_quality_score"),
         "proposal_scorecard": (preflight or {}).get("quality_scorecard", {}),
+        "actual_runtime_integration_status": actual_runtime_status,
         "frontier_call_useful": None,
         "frontier_call_wasted_reason": _frontier_wasted_reason(decision, reasons, patch_generation),
         "scanned_at": _utc_now(),

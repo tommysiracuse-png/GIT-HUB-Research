@@ -980,6 +980,41 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
             "integration_claim_without_target",
         )
 
+    def test_scan_rejects_orphan_source_helper_even_when_preflight_targeted_runtime_files(self) -> None:
+        diff = """diff --git a/src/recommendation_schema.py b/src/recommendation_schema.py
+new file mode 100644
+--- /dev/null
++++ b/src/recommendation_schema.py
+@@ -0,0 +1,2 @@
++def validate_recommendation_object(payload):
++    return isinstance(payload, dict)
+diff --git a/tests/test_recommendation_schema.py b/tests/test_recommendation_schema.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_recommendation_schema.py
+@@ -0,0 +1,2 @@
++def test_validate_recommendation_object():
++    assert True
+"""
+        payload = proposal(
+            diff,
+            change_category="evolution_loop_improvement",
+            expected_files=["src/code_evolution.py", "tests/test_code_evolution.py"],
+            proposed_change="Add a helper for recommendation schema validation.",
+        )
+        preflight = code_evolution.preflight_proposal(payload, settings())
+        self.assertEqual(preflight["quality_scorecard"]["runtime_integration_status"], "integrated")
+
+        safety = code_evolution.validate_and_scan(payload, diff, settings(), preflight=preflight)
+
+        self.assertFalse(safety["allowed"])
+        self.assertEqual(safety["decision"], "rejected_preflight_no_runtime_integration")
+        self.assertIn("no_runtime_integration_target", safety["reasons"])
+        self.assertEqual(
+            safety["actual_runtime_integration_status"],
+            "changed_source_without_runtime_wiring",
+        )
+
     def test_patch_generation_timeout_is_classified(self) -> None:
         safety = code_evolution.validate_and_scan(
             proposal("", expected_files=["src/llm_bridge.py"], change_category="llm_prompt_state_packet"),
