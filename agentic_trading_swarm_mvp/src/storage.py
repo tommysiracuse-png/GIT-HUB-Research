@@ -12,6 +12,15 @@ import sqlite3
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
 DB_PATH = RUNS_DIR / "radar.sqlite"
+SQLITE_BUSY_TIMEOUT_MS = 60_000
+
+
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
 
 
 def utc_now() -> str:
@@ -43,11 +52,36 @@ def _parse_storage_iso(value: str) -> dt.datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
-def connect(db_path: pathlib.Path = DB_PATH) -> sqlite3.Connection:
+def _is_memory_db(db_path: pathlib.Path | str) -> bool:
+    return str(db_path) == ":memory:"
+
+
+def _configure_connection(conn: sqlite3.Connection, db_path: pathlib.Path | str) -> None:
+    conn.execute(f"pragma busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    if not _is_memory_db(db_path):
+        try:
+            conn.execute("pragma journal_mode = wal")
+        except sqlite3.OperationalError:
+            # If another process holds the database, keep the connection usable
+            # and let the busy timeout handle normal read/write contention.
+            pass
+    try:
+        conn.execute("pragma synchronous = normal")
+    except sqlite3.OperationalError:
+        pass
+
+
+def connect(db_path: pathlib.Path = DB_PATH, *, initialize: bool = True) -> sqlite3.Connection:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(
+        db_path,
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0,
+        factory=ClosingConnection,
+    )
     conn.row_factory = sqlite3.Row
-    init_db(conn)
+    _configure_connection(conn, db_path)
+    if initialize:
+        init_db(conn)
     return conn
 
 
@@ -580,29 +614,41 @@ def _migrate_paper_trade_outcomes(conn: sqlite3.Connection) -> None:
         for column, ddl in required.items():
             _ensure_column(conn, "paper_trade_outcomes", column, ddl)
 
-    conn.execute(
+    needs_backfill = conn.execute(
         """
-        update paper_trade_outcomes
-        set target_at = coalesce(
-                target_at,
-                datetime(
-                    (select opened_at from paper_trades where paper_trades.id = paper_trade_outcomes.trade_id),
-                    '+' || horizon_minutes || ' minutes'
-                )
-            ),
-            observed_at = coalesce(observed_at, measured_at),
-            delay_seconds = coalesce(
-                delay_seconds,
-                max(0, (julianday(coalesce(observed_at, measured_at)) - julianday(target_at)) * 86400.0)
-            ),
-            measurement_status = coalesce(measurement_status, 'legacy_unverified'),
-            price_source = coalesce(price_source, 'legacy_scanner_candidate')
+        select 1
+        from paper_trade_outcomes
         where target_at is null
            or observed_at is null
            or measurement_status is null
            or price_source is null
+        limit 1
         """
-    )
+    ).fetchone()
+    if needs_backfill:
+        conn.execute(
+            """
+            update paper_trade_outcomes
+            set target_at = coalesce(
+                    target_at,
+                    datetime(
+                        (select opened_at from paper_trades where paper_trades.id = paper_trade_outcomes.trade_id),
+                        '+' || horizon_minutes || ' minutes'
+                    )
+                ),
+                observed_at = coalesce(observed_at, measured_at),
+                delay_seconds = coalesce(
+                    delay_seconds,
+                    max(0, (julianday(coalesce(observed_at, measured_at)) - julianday(target_at)) * 86400.0)
+                ),
+                measurement_status = coalesce(measurement_status, 'legacy_unverified'),
+                price_source = coalesce(price_source, 'legacy_scanner_candidate')
+            where target_at is null
+               or observed_at is null
+               or measurement_status is null
+               or price_source is null
+            """
+        )
 
 
 def signal_key(candidate: dict) -> str:

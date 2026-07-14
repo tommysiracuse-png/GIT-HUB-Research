@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import sqlite3
 from dataclasses import dataclass
 
 from storage import connect, record_llm_cost_event
@@ -18,6 +19,7 @@ from storage import connect, record_llm_cost_event
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config" / "llm_config.example.yaml"
+COST_LOG_DEFERRED_PATH = ROOT / "runs" / "llm_cost_events_deferred.jsonl"
 
 PROVIDER_KEY_ENV = {
     "openai": "OPENAI_API_KEY",
@@ -123,25 +125,57 @@ def _provider_ready(model_name: str) -> tuple[bool, str]:
     return False, f"fallback_missing_provider_key:{key_name}"
 
 
+def _is_sqlite_locked(exc: BaseException) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def _needs_schema_init(exc: BaseException) -> bool:
+    return "no such table" in str(exc).lower()
+
+
 def _spent_today(agent_name: str | None = None) -> float:
-    with connect() as conn:
-        if agent_name:
-            row = conn.execute(
-                """
-                select coalesce(sum(estimated_cost_usd), 0) as cost
-                from llm_cost_events
-                where agent_name = ? and substr(created_at, 1, 10) = date('now')
-                """,
-                (agent_name,),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                """
-                select coalesce(sum(estimated_cost_usd), 0) as cost
-                from llm_cost_events
-                where substr(created_at, 1, 10) = date('now')
-                """
-            ).fetchone()
+    try:
+        with connect(initialize=False) as conn:
+            if agent_name:
+                row = conn.execute(
+                    """
+                    select coalesce(sum(estimated_cost_usd), 0) as cost
+                    from llm_cost_events
+                    where agent_name = ? and substr(created_at, 1, 10) = date('now')
+                    """,
+                    (agent_name,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    select coalesce(sum(estimated_cost_usd), 0) as cost
+                    from llm_cost_events
+                    where substr(created_at, 1, 10) = date('now')
+                    """
+                ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_locked(exc):
+            return float("inf")
+        if not _needs_schema_init(exc):
+            raise
+        with connect() as conn:
+            if agent_name:
+                row = conn.execute(
+                    """
+                    select coalesce(sum(estimated_cost_usd), 0) as cost
+                    from llm_cost_events
+                    where agent_name = ? and substr(created_at, 1, 10) = date('now')
+                    """,
+                    (agent_name,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    select coalesce(sum(estimated_cost_usd), 0) as cost
+                    from llm_cost_events
+                    where substr(created_at, 1, 10) = date('now')
+                    """
+                ).fetchone()
     return float(row["cost"] or 0.0)
 
 
@@ -519,22 +553,79 @@ def _complete_litellm(
 
 
 def _log(agent_name: str, result: ModelResult) -> None:
-    with connect() as conn:
-        record_llm_cost_event(
-            conn,
-            agent_name,
-            result.model_tier,
-            result.model_name,
-            result.prompt_tokens,
-            result.completion_tokens,
-            result.estimated_cost_usd,
-            result.status,
-            provider=result.provider,
-            api=result.api,
-            reasoning_effort=result.reasoning_effort,
-            verbosity=result.verbosity,
-            operation=result.operation,
-            prompt_cache_key=result.prompt_cache_key,
-            frontier_escalation_reason=result.frontier_escalation_reason,
-            structured_json=result.structured_json,
-        )
+    try:
+        conn_ctx = connect(initialize=False)
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_locked(exc):
+            _defer_cost_log(agent_name, result, reason="database_locked_on_connect")
+            return
+        conn_ctx = connect()
+    try:
+        with conn_ctx as conn:
+            record_llm_cost_event(
+                conn,
+                agent_name,
+                result.model_tier,
+                result.model_name,
+                result.prompt_tokens,
+                result.completion_tokens,
+                result.estimated_cost_usd,
+                result.status,
+                provider=result.provider,
+                api=result.api,
+                reasoning_effort=result.reasoning_effort,
+                verbosity=result.verbosity,
+                operation=result.operation,
+                prompt_cache_key=result.prompt_cache_key,
+                frontier_escalation_reason=result.frontier_escalation_reason,
+                structured_json=result.structured_json,
+            )
+    except sqlite3.OperationalError as exc:
+        if not _is_sqlite_locked(exc):
+            if not _needs_schema_init(exc):
+                raise
+            with connect() as conn:
+                record_llm_cost_event(
+                    conn,
+                    agent_name,
+                    result.model_tier,
+                    result.model_name,
+                    result.prompt_tokens,
+                    result.completion_tokens,
+                    result.estimated_cost_usd,
+                    result.status,
+                    provider=result.provider,
+                    api=result.api,
+                    reasoning_effort=result.reasoning_effort,
+                    verbosity=result.verbosity,
+                    operation=result.operation,
+                    prompt_cache_key=result.prompt_cache_key,
+                    frontier_escalation_reason=result.frontier_escalation_reason,
+                    structured_json=result.structured_json,
+                )
+            return
+        _defer_cost_log(agent_name, result, reason="database_locked_on_insert")
+
+
+def _defer_cost_log(agent_name: str, result: ModelResult, *, reason: str) -> None:
+    COST_LOG_DEFERRED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "agent_name": agent_name,
+        "model_tier": result.model_tier,
+        "model_name": result.model_name,
+        "prompt_tokens": result.prompt_tokens,
+        "completion_tokens": result.completion_tokens,
+        "estimated_cost_usd": result.estimated_cost_usd,
+        "status": result.status,
+        "provider": result.provider,
+        "api": result.api,
+        "reasoning_effort": result.reasoning_effort,
+        "verbosity": result.verbosity,
+        "operation": result.operation,
+        "prompt_cache_key": result.prompt_cache_key,
+        "frontier_escalation_reason": result.frontier_escalation_reason,
+        "structured_json": result.structured_json,
+        "deferred_reason": reason,
+    }
+    with COST_LOG_DEFERRED_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, sort_keys=True) + "\n")
