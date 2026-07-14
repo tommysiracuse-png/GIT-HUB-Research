@@ -70,17 +70,33 @@ STABLE_OR_FIAT_BASES = {
     *REGIONAL_FIAT_QUOTES,
 }
 
+DEFAULT_PAPER_TRADE_POLICY = {
+    "market_key": "paper.signal_confirmation.v1",
+    "mode": "paper_only",
+    "execution": "simulated",
+    "summary": "Convert the recommendation into a paper-only gated setup that stays flat unless trend and liquidity both confirm.",
+    "state_if_unconfirmed": "flat",
+    "entry_rule": "Enter paper long only if price closes above the prior session high and current volume is greater than the 20-session average volume; otherwise remain flat.",
+    "exit_rule": "Exit the paper position on a close below the prior session low or after 3 trading sessions, whichever comes first.",
+    "risk_limit": "Cap paper risk at 0.50 percent of notional per simulated trade and do not pyramid.",
+    "fractional_risk": 0.005,
+    "sizing": "fixed_fractional",
+    "pyramiding": "disabled",
+}
+
 
 DEFAULT_REGISTRY = {
     "filters": {
         "quote_assets": sorted(QUOTE_ASSETS),
         "exclude_base_assets": sorted(STABLE_OR_FIAT_BASES),
+        "paper_trade_policy_enabled": True,
         "top_volume_per_venue": 80,
         "frontier_symbols_per_venue": 40,
         "frontier_max_listing_count": 3,
         "min_frontier_quote_volume_usd": 25_000,
         "min_cross_venue_count": 2,
     },
+    "paper_trade_policy": DEFAULT_PAPER_TRADE_POLICY,
     "venues": [
         {
             "venue": "KUCOIN",
@@ -470,15 +486,44 @@ def fetch_json(url: str, timeout: int = 8) -> dict:
         }
 
 
+def _paper_trade_policy_from_loaded_registry(loaded: dict | None = None) -> dict:
+    policy = copy.deepcopy(DEFAULT_PAPER_TRADE_POLICY)
+    if not isinstance(loaded, dict):
+        return policy
+    loaded_policy = loaded.get("paper_trade_policy")
+    if isinstance(loaded_policy, dict):
+        policy.update(copy.deepcopy(loaded_policy))
+    return policy
+
+
 def load_venue_registry() -> dict:
     path = CUSTOM_REGISTRY_PATH if CUSTOM_REGISTRY_PATH.exists() else EXAMPLE_REGISTRY_PATH
     if not path.exists():
-        return DEFAULT_REGISTRY
-    loaded = json.loads(path.read_text(encoding="utf-8"))
-    return {
-        "filters": {**DEFAULT_REGISTRY.get("filters", {}), **loaded.get("filters", {})},
-        "venues": loaded.get("venues", DEFAULT_REGISTRY["venues"]),
-    }
+        registry = copy.deepcopy(DEFAULT_REGISTRY)
+    else:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        registry = {
+            "filters": {**DEFAULT_REGISTRY.get("filters", {}), **loaded.get("filters", {})},
+            "paper_trade_policy": _paper_trade_policy_from_loaded_registry(loaded),
+            "venues": loaded.get("venues", DEFAULT_REGISTRY["venues"]),
+        }
+    registry.setdefault("paper_trade_policy", copy.deepcopy(DEFAULT_PAPER_TRADE_POLICY))
+    policy_enabled = bool(registry.get("filters", {}).get("paper_trade_policy_enabled", True))
+    if not policy_enabled:
+        return registry
+    venues = []
+    for venue in registry.get("venues", []):
+        if not isinstance(venue, dict):
+            venues.append(venue)
+            continue
+        venue_copy = copy.deepcopy(venue)
+        venue_copy.setdefault(
+            "paper_trade_policy",
+            copy.deepcopy(registry["paper_trade_policy"]),
+        )
+        venues.append(venue_copy)
+    registry["venues"] = venues
+    return registry
 
 
 def _split_symbol(symbol: str, quote_assets: set[str]) -> tuple[str | None, str | None]:
@@ -553,6 +598,9 @@ def _base_observation(target: dict, result: dict, symbol: str | None = None) -> 
         "comparison_key": base,
         "instrument_id": _instrument_id(target, symbol),
         "route_id": target.get("route_id", f"{target['venue'].lower()}_public"),
+        "paper_trade_policy": copy.deepcopy(target.get("paper_trade_policy"))
+        if isinstance(target.get("paper_trade_policy"), dict)
+        else None,
         "data_status": result["data_status"],
         "http_status": result["http_status"],
         "latency_ms": result["latency_ms"],
