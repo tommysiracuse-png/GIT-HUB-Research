@@ -4,6 +4,7 @@ import pathlib
 import sqlite3
 import sys
 import unittest
+import json
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -13,6 +14,7 @@ if str(SRC) not in sys.path:
 
 import evolution_worker
 import radar_loop
+import self_improvement
 import storage
 
 
@@ -78,6 +80,60 @@ class EvolutionWorkerSeparationTests(unittest.TestCase):
             [item["recommendation_id"] for item in worker_items],
             ["rec-code", "rec-task"],
         )
+
+    def test_route_probe_task_serializes_dict_rationale(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        try:
+            created = storage.add_route_probe_task(
+                conn,
+                "rec-route",
+                "execution_routes",
+                "conditional",
+                90,
+                "read_only_capability_probe",
+                {"behavior": "validate paper route", "paper_only": True},
+                {"blockers": {"spot_borrow": 12}},
+            )
+            row = conn.execute("select rationale, evidence_json from route_probe_tasks").fetchone()
+        finally:
+            conn.close()
+
+        self.assertTrue(created)
+        self.assertIn("validate paper route", row["rationale"])
+        self.assertEqual({"blockers": {"spot_borrow": 12}}, json.loads(row["evidence_json"]))
+
+    def test_implementation_like_build_task_routes_to_code_change(self) -> None:
+        payload = {
+            "action": "propose_build_task",
+            "priority": 93,
+            "title": "Add context-aware paper scoring for route and liquidity divergence",
+            "proposed_change": {
+                "expected_behavior": "Promote standard-feasibility carry and suppress weak conditional routes.",
+                "paper_scope": "Use only for paper recommendation scoring.",
+            },
+            "evidence": {"source": "llm_swarm"},
+        }
+
+        self.assertEqual("code_change", self_improvement.classify_recommendation(payload))
+        normalized = self_improvement._normalize_code_change_recommendation(
+            {"recommendation_id": "rec-build", "title": payload["title"], "payload": payload}
+        )
+
+        self.assertEqual("propose_code_change", normalized["payload"]["action"])
+        self.assertEqual("paper_scoring_logic", normalized["payload"]["change_category"])
+        self.assertIn("src/strategy_reliability.py", normalized["payload"]["expected_files"])
+
+    def test_manual_account_route_task_stays_route_resolver(self) -> None:
+        payload = {
+            "action": "propose_build_task",
+            "priority": 90,
+            "title": "Review prediction market account and jurisdiction eligibility",
+            "proposed_change": "Human decision needed for account setup and jurisdiction eligibility.",
+        }
+
+        self.assertEqual("route_resolver", self_improvement.classify_recommendation(payload))
 
 
 if __name__ == "__main__":

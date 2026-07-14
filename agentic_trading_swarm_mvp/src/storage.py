@@ -18,6 +18,26 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def _json_default(value: object) -> str:
+    return repr(value)
+
+
+def _storage_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True, default=_json_default)
+
+
+def _storage_json_object(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    return {"value": value}
+
+
 def _parse_storage_iso(value: str) -> dt.datetime:
     parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
@@ -1768,6 +1788,8 @@ def add_route_probe_task(
     rationale: str,
     evidence: dict,
 ) -> bool:
+    rationale_text = _storage_text(rationale)
+    evidence_payload = _storage_json_object(evidence)
     try:
         conn.execute(
             """
@@ -1783,8 +1805,8 @@ def add_route_probe_task(
                 route_key,
                 int(priority),
                 probe_type,
-                rationale,
-                json.dumps(evidence, sort_keys=True),
+                rationale_text,
+                json.dumps(evidence_payload, sort_keys=True, default=_json_default),
             ),
         )
         conn.commit()

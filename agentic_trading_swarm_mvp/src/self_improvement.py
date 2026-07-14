@@ -102,18 +102,113 @@ def _parse_iso(value: str | None) -> dt.datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
+def _payload_text(payload: dict) -> str:
+    parts = []
+    for key in ("title", "rationale", "proposed_change", "action", "market_key", "signal_key"):
+        value = payload.get(key, "")
+        if isinstance(value, (dict, list)):
+            parts.append(json.dumps(value, sort_keys=True, default=repr))
+        else:
+            parts.append(str(value))
+    code_change = payload.get("code_change")
+    if isinstance(code_change, dict):
+        parts.append(json.dumps(code_change, sort_keys=True, default=repr))
+    return " ".join(parts).lower()
+
+
+def _looks_like_runtime_implementation(payload: dict) -> bool:
+    action = str(payload.get("action") or "")
+    if action == "propose_code_change" or isinstance(payload.get("code_change"), dict):
+        return True
+    if action not in {
+        "propose_build_task",
+        "request_market_adapter",
+        "request_data_source",
+        "request_red_team",
+        "propose_diagnostic_hypothesis",
+    }:
+        return False
+    text = _payload_text(payload)
+    implementation_terms = (
+        "add ",
+        "implement",
+        "wire",
+        "build",
+        "create",
+        "extend",
+        "modify",
+        "patch",
+        "fix ",
+        "repair",
+        "upgrade",
+        "integrat",
+        "enforce",
+        "validate",
+        "fallback",
+        "gate",
+        "score",
+        "normaliz",
+        "surface",
+        "expose",
+    )
+    runtime_terms = (
+        "runtime",
+        "pipeline",
+        "scanner",
+        "adapter",
+        "parser",
+        "ingestion",
+        "recommendation",
+        "json",
+        "schema",
+        "llm packet",
+        "state packet",
+        "report",
+        "scoring",
+        "quality",
+        "depth",
+        "candidate",
+        "frontier",
+        "fx",
+        "quote",
+        "route",
+        "borrow",
+        "paper",
+        "module",
+        "function",
+        "tests",
+    )
+    if not any(term in text for term in implementation_terms):
+        return False
+    if not any(term in text for term in runtime_terms):
+        return False
+    manual_only_terms = (
+        "human decision",
+        "manual action",
+        "open account",
+        "account setup",
+        "credentials",
+        "jurisdiction decision",
+        "broker approval",
+    )
+    if any(term in text for term in manual_only_terms) and not any(
+        term in text for term in ("report", "packet", "scoring", "validation", "adapter", "parser", "scanner")
+    ):
+        return False
+    return True
+
+
 def classify_recommendation(payload: dict) -> str:
     action = str(payload.get("action") or "")
     if action == "propose_code_change":
         return "code_change"
     if action == "propose_signal_variant":
         return "signal_variant"
+    if _looks_like_runtime_implementation(payload):
+        return "code_change"
     if action == "propose_diagnostic_hypothesis":
         return "diagnostic_hypothesis"
-    text = " ".join(
-        str(payload.get(key, ""))
-        for key in ("title", "rationale", "proposed_change", "action", "market_key", "signal_key")
-    ).lower()
+    text = _payload_text(payload)
     if any(
         term in text
         for term in (
@@ -131,11 +226,131 @@ def classify_recommendation(payload: dict) -> str:
         )
     ):
         return "failure_filter"
-    if any(term in text for term in ("route", "borrow", "margin", "broker", "permission", "fee", "api support")):
+    if any(
+        term in text
+        for term in (
+            "route",
+            "borrow",
+            "margin",
+            "broker",
+            "permission",
+            "fee",
+            "api support",
+            "account",
+            "jurisdiction",
+            "eligibility",
+        )
+    ):
         return "route_resolver"
     if any(term in text for term in ("adapter", "venue", "frontier", "underserved", "data source", "watchlist")):
         return "market_adapter"
     return "research_note"
+
+
+def _infer_code_category(payload: dict) -> str:
+    text = _payload_text(payload)
+    if any(term in text for term in ("json", "schema", "swarm", "ingestion")):
+        return "evolution_loop_improvement"
+    if any(term in text for term in ("adapter", "venue", "public data", "bybit", "valr", "luno", "bitso")):
+        return "public_data_adapter"
+    if any(term in text for term in ("frontier", "depth", "fx", "fiat", "quote", "normaliz", "candidate cap")):
+        return "scanner_expansion"
+    if any(term in text for term in ("score", "scoring", "gate", "filter", "decay", "freshness", "yahoo", "proxy")):
+        return "paper_scoring_logic"
+    if any(term in text for term in ("route", "borrow", "margin", "fee", "conditional")):
+        return "read_only_route_intelligence"
+    if any(term in text for term in ("packet", "report", "dashboard")):
+        return "llm_prompt_state_packet"
+    if "recommendation" in text:
+        return "evolution_loop_improvement"
+    return "runtime_pipeline_integration"
+
+
+def _infer_expected_files(payload: dict, category: str) -> list[str]:
+    text = _payload_text(payload)
+    files: list[str] = []
+    if category == "evolution_loop_improvement":
+        files.extend(
+            [
+                "src/llm_swarm_runner.py",
+                "src/llm_bridge.py",
+                "src/llm_recommendation_ingestion.py",
+                "tests/test_frontier_model_policy.py",
+                "tests/test_llm_recommendation_ingestion.py",
+                "tests/test_self_improvement_recommendation_flow.py",
+            ]
+        )
+    if category in {"public_data_adapter", "scanner_expansion", "quality_scoring"} or any(
+        term in text for term in ("frontier", "fx", "fiat", "quote", "depth", "bybit", "valr", "luno", "bitso")
+    ):
+        files.extend(
+            [
+                "src/frontier_crypto_adapter.py",
+                "src/frontier_data_quality.py",
+                "tests/test_frontier_crypto_adapter.py",
+                "tests/test_frontier_data_quality.py",
+            ]
+        )
+    if category == "read_only_route_intelligence" or any(
+        term in text for term in ("route", "borrow", "conditional", "margin", "fee")
+    ):
+        files.extend(
+            [
+                "src/route_resolver.py",
+                "src/route_intelligence.py",
+                "tests/test_route_resolver.py",
+                "tests/test_route_intelligence.py",
+            ]
+        )
+    if category == "paper_scoring_logic" or any(term in text for term in ("yahoo", "proxy", "score", "decay")):
+        files.extend(["src/strategy_reliability.py", "src/global_proxy_scanner.py", "tests/test_strategy_reliability.py"])
+    if category == "llm_prompt_state_packet" or "packet" in text:
+        files.extend(["src/llm_state_packet.py", "src/llm_bridge.py", "tests/test_llm_state_packet.py"])
+    if not files:
+        files.extend(["src/self_improvement.py", "tests/test_evolution_worker.py"])
+    deduped = []
+    seen = set()
+    for file in files:
+        if file not in seen:
+            deduped.append(file)
+            seen.add(file)
+    return deduped
+
+
+def _normalize_code_change_recommendation(rec: dict) -> dict:
+    payload = dict(rec.get("payload") or {})
+    code_change = dict(payload.get("code_change") if isinstance(payload.get("code_change"), dict) else {})
+    category = code_change.get("change_category") or payload.get("change_category") or _infer_code_category(payload)
+    expected_files = code_change.get("expected_files") or payload.get("expected_files") or _infer_expected_files(
+        payload, str(category)
+    )
+    implementation_mode = (
+        code_change.get("implementation_mode")
+        or payload.get("implementation_mode")
+        or ("paper_policy" if str(category) == "paper_scoring_logic" else "runtime_active")
+    )
+    code_change.update(
+        {
+            "change_category": category,
+            "implementation_mode": implementation_mode,
+            "expected_files": expected_files,
+            "tests_to_run": code_change.get("tests_to_run") or payload.get("tests_to_run") or [],
+            "rollback_criteria": code_change.get("rollback_criteria")
+            or payload.get("rollback_criteria")
+            or "Revert if tests fail, reports stop refreshing, or paper-only safety checks fail.",
+            "evidence": code_change.get("evidence")
+            or (payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}),
+        }
+    )
+    payload["original_action"] = payload.get("action")
+    payload["action"] = "propose_code_change"
+    payload["change_category"] = category
+    payload["implementation_mode"] = implementation_mode
+    payload["expected_files"] = expected_files
+    payload["code_change"] = code_change
+    if not payload.get("proposed_change"):
+        payload["proposed_change"] = payload.get("rationale") or rec.get("rationale") or rec.get("title")
+    return {**rec, "payload": payload}
 
 
 def _implemented_manual_category_exists(conn: sqlite3.Connection, category: str) -> bool:
@@ -1178,7 +1393,7 @@ def run_auto_improvement(
         elif task_type == "diagnostic_hypothesis":
             created = _execute_diagnostic_hypothesis(conn, rec)
         elif task_type == "code_change":
-            created = process_code_change_recommendation(conn, rec, settings)
+            created = process_code_change_recommendation(conn, _normalize_code_change_recommendation(rec), settings)
 
         created_artifacts = [item for item in created if item.get("action_status", "created") == "created"]
         if created_artifacts:
