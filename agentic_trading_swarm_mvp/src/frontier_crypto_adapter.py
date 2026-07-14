@@ -38,6 +38,8 @@ REGIONAL_FIAT_QUOTES = {
     "NGN",
     "GHS",
     "KES",
+    "TZS",
+    "UGX",
     "IDR",
     "THB",
     "SGD",
@@ -51,6 +53,7 @@ REGIONAL_FIAT_QUOTES = {
     "ARS",
 }
 LATAM_FIAT_QUOTES = {"MXN", "BRL", "CLP", "COP", "PEN", "ARS"}
+PAPER_ONLY_REVIEW_FIAT_QUOTES = LATAM_FIAT_QUOTES | {"TZS", "UGX"}
 QUOTE_ASSETS = USD_LIKE_QUOTES | REGIONAL_FIAT_QUOTES
 STABLE_OR_FIAT_BASES = {
     "USD",
@@ -505,6 +508,10 @@ def _is_latam_fiat_quote(quote: str | None) -> bool:
     return str(quote or "").upper() in LATAM_FIAT_QUOTES
 
 
+def _is_paper_only_review_fiat_quote(quote: str | None) -> bool:
+    return str(quote or "").upper() in PAPER_ONLY_REVIEW_FIAT_QUOTES
+
+
 def _append_note(row: dict, note: str) -> None:
     notes = row.setdefault("notes", [])
     if note not in notes:
@@ -513,7 +520,7 @@ def _append_note(row: dict, note: str) -> None:
 
 def _apply_paper_only_review_policy(row: dict) -> dict:
     quote = str(row.get("quote") or "").upper()
-    if not _is_latam_fiat_quote(quote):
+    if not _is_paper_only_review_fiat_quote(quote):
         return row
     row["local_quote_observe_only"] = True
     row["paper_only_review_scope"] = "frontier_candidate_review"
@@ -523,6 +530,7 @@ def _apply_paper_only_review_policy(row: dict) -> dict:
     else:
         _append_note(row, "review_only_pending_usd_normalization")
     return row
+
 
 def _target_quote_assets(target: dict) -> set[str]:
     return {str(item).upper() for item in target.get("quote_assets", sorted(QUOTE_ASSETS))}
