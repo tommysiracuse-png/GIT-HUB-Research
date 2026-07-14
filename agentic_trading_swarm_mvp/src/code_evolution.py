@@ -720,6 +720,102 @@ def changed_files_from_diff(diff_text: str) -> list[str]:
     return sorted(files)
 
 
+def _extract_apply_patch_block(text: str) -> str:
+    begin = text.find("*** Begin Patch")
+    end = text.find("*** End Patch")
+    if begin < 0 or end < begin:
+        return ""
+    return text[begin : end + len("*** End Patch")]
+
+
+def _apply_patch_to_context_diff(patch_text: str) -> str:
+    """Convert Codex apply_patch text into context-applied diff form.
+
+    The autonomous builder often returns the same patch grammar used by the
+    local apply_patch tool. The code-evolution sandbox expects a unified diff,
+    but its internal applier can already apply context hunks when line numbers
+    drift. This conversion preserves the files and hunk bodies so those patches
+    can use the same safety/test path instead of being discarded as malformed.
+    """
+
+    block = _extract_apply_patch_block(patch_text)
+    if not block:
+        return patch_text
+
+    lines = block.splitlines()
+    out: list[str] = []
+    index = 0
+    converted = False
+
+    def append_update(path: str, hunks: list[list[str]]) -> None:
+        nonlocal converted
+        if not path or not hunks:
+            return
+        out.extend([f"diff --git a/{path} b/{path}", f"--- a/{path}", f"+++ b/{path}"])
+        for hunk in hunks:
+            if hunk:
+                out.append("@@ -1 +1 @@")
+                out.extend(hunk)
+        converted = True
+
+    def append_add(path: str, added_lines: list[str]) -> None:
+        nonlocal converted
+        if not path:
+            return
+        out.extend(
+            [
+                f"diff --git a/{path} b/{path}",
+                "new file mode 100644",
+                "--- /dev/null",
+                f"+++ b/{path}",
+                "@@ -0,0 +1 @@",
+            ]
+        )
+        out.extend(added_lines)
+        converted = True
+
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith("*** Update File: "):
+            path = _canonical_path(line.split(":", 1)[1].strip())
+            index += 1
+            hunks: list[list[str]] = []
+            current: list[str] = []
+            while index < len(lines):
+                body = lines[index]
+                if body.startswith("*** "):
+                    break
+                if body.startswith("@@"):
+                    if current:
+                        hunks.append(current)
+                    current = []
+                    index += 1
+                    continue
+                if body[:1] in {" ", "+", "-"}:
+                    current.append(body)
+                index += 1
+            if current:
+                hunks.append(current)
+            append_update(path, hunks)
+            continue
+        if line.startswith("*** Add File: "):
+            path = _canonical_path(line.split(":", 1)[1].strip())
+            index += 1
+            added: list[str] = []
+            while index < len(lines):
+                body = lines[index]
+                if body.startswith("*** "):
+                    break
+                if body.startswith("+"):
+                    added.append(body)
+                index += 1
+            append_add(path, added)
+            continue
+        index += 1
+
+    return ("\n".join(out).rstrip() + "\n") if converted else patch_text
+
+
 def rewrite_diff_paths(diff_text: str) -> str:
     """Canonicalize generated diff headers before sandboxing.
 
@@ -730,6 +826,7 @@ def rewrite_diff_paths(diff_text: str) -> str:
     discarded after a valid preflight repair.
     """
 
+    diff_text = _apply_patch_to_context_diff(diff_text)
     if not diff_text.strip():
         return diff_text
 

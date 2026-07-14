@@ -707,13 +707,26 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                 self.assertIn(reason, safety["reasons"])
                 self.assertNotIn("no_changed_files", safety["reasons"])
 
-    def test_model_non_diff_patch_is_invalid_patch_format(self) -> None:
+    def test_model_apply_patch_format_is_converted_before_scan(self) -> None:
         safety = code_evolution.validate_and_scan(
             proposal(
-                "*** Begin Patch\n*** Update File: README.md\n@@\n+note\n*** End Patch\n",
+                "*** Begin Patch\n*** Update File: README.md\n@@\n hello\n+note\n*** End Patch\n",
                 expected_files=["README.md"],
             ),
-            "*** Begin Patch\n*** Update File: README.md\n@@\n+note\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: README.md\n@@\n hello\n+note\n*** End Patch\n",
+            settings(),
+            patch_generation={"status": "model_call:responses", "model_tier": "standard"},
+        )
+
+        self.assertTrue(safety["allowed"])
+        self.assertEqual(safety["decision"], "auto_allowed")
+        self.assertEqual(safety["changed_files"], ["README.md"])
+        self.assertNotIn("invalid_patch_format", safety["reasons"])
+
+    def test_model_plain_non_diff_patch_is_invalid_patch_format(self) -> None:
+        safety = code_evolution.validate_and_scan(
+            proposal("I would add a note to README.md.", expected_files=["README.md"]),
+            "I would add a note to README.md.",
             settings(),
             patch_generation={"status": "model_call:responses", "model_tier": "standard"},
         )
@@ -721,6 +734,67 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
         self.assertEqual(safety["decision"], "invalid_patch_format")
         self.assertIn("invalid_patch_format", safety["reasons"])
         self.assertNotIn("no_changed_files", safety["reasons"])
+
+    def test_process_converts_apply_patch_model_output_without_repair_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "repo"
+            root.mkdir()
+            (root / "src").mkdir()
+            (root / "src" / "llm_bridge.py").write_text("# bridge\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "config").mkdir()
+            db = pathlib.Path(tmp) / "radar.sqlite"
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            old_ledger = code_evolution.LEDGER_JSONL
+            code_evolution.LEDGER_JSONL = pathlib.Path(tmp) / "evolution_ledger.jsonl"
+            apply_patch_text = """*** Begin Patch
+*** Update File: src/llm_bridge.py
+@@
+ # bridge
++paper-only note
+*** End Patch
+"""
+            try:
+                rec = {
+                    "recommendation_id": "rec-apply-patch-format",
+                    "title": "Convert apply patch output",
+                    "payload": proposal(
+                        "",
+                        expected_files=["src/llm_bridge.py"],
+                        change_category="llm_prompt_state_packet",
+                        tests_to_run=[],
+                    ),
+                }
+                with mock.patch.object(
+                    code_evolution,
+                    "generate_patch_with_frontier_model",
+                    return_value=(
+                        apply_patch_text,
+                        {
+                            "status": "model_call:responses",
+                            "model_tier": "fast",
+                            "returned_patch_format": "invalid_or_empty",
+                        },
+                    ),
+                ), mock.patch.object(code_evolution, "repair_patch_with_frontier_model") as repair:
+                    created = code_evolution.process_code_change_recommendation(
+                        conn,
+                        rec,
+                        settings(generate_patch_when_missing=True, patch_repair_attempts=2),
+                        root=root,
+                    )
+                row = storage.code_evolution_recent(conn)[0]
+                updated_text = (root / "src" / "llm_bridge.py").read_text(encoding="utf-8")
+            finally:
+                code_evolution.LEDGER_JSONL = old_ledger
+                conn.close()
+
+        self.assertEqual(created[0]["status"], "workspace_applied_probation")
+        self.assertEqual(repair.call_count, 0)
+        self.assertIn("paper-only note", updated_text)
+        self.assertEqual(row["changed_files"], ["src/llm_bridge.py"])
 
     def test_process_repairs_non_diff_model_output_before_invalid_patch_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
