@@ -97,6 +97,25 @@ DEFAULT_PAPER_TRADE_POLICY = {
     "review_rule": "Keep manual review enabled for any suppressed high-volatility event.",
     "fractional_risk": 0.005,
     "sizing": "fixed_fractional",
+    "shadow_evaluation": {
+        "enabled": False,
+        "scope": "paper_only_shadow",
+        "target_market_keys": ["YAHOO_PROXY|global_proxy_momentum"],
+        "control_mode": "paper_baseline",
+        "candidate_mode": "freshness_and_session_gate",
+        "freshness_gate_seconds": 90,
+        "freshness_action": "suppress_new_entries",
+        "session_boundary_block_minutes": 15,
+        "session_boundary_action": "suppress_new_entries",
+        "session_boundary_reference": "local_market_session",
+        "log_fields": [
+            "proxy_age_seconds",
+            "session_state",
+            "signal_timestamp_delta_seconds",
+            "suppressed_reason",
+            "shadow_outcome_tag",
+        ],
+    },
     "pyramiding": "disabled",
 }
 
@@ -510,13 +529,25 @@ def fetch_json(url: str, timeout: int = 8) -> dict:
         }
 
 
+def _deep_merge_dict(base: dict, overrides: dict) -> dict:
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge_dict(base[key], value)
+            continue
+        base[key] = copy.deepcopy(value)
+    return base
+
+
 def _paper_trade_policy_from_loaded_registry(loaded: dict | None = None) -> dict:
     policy = copy.deepcopy(DEFAULT_PAPER_TRADE_POLICY)
     if not isinstance(loaded, dict):
         return policy
     loaded_policy = loaded.get("paper_trade_policy")
     if isinstance(loaded_policy, dict):
-        policy.update(copy.deepcopy(loaded_policy))
+        _deep_merge_dict(policy, loaded_policy)
+        shadow = policy.get("shadow_evaluation")
+        if isinstance(shadow, dict) and isinstance(shadow.get("target_market_keys"), str):
+            shadow["target_market_keys"] = [shadow["target_market_keys"]]
     return policy
 
 
