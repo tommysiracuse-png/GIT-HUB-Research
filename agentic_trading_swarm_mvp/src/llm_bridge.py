@@ -141,6 +141,20 @@ EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION = {
     },
 }
 
+CODE_CHANGE_ACTIONABLE_FIELDS = (
+    "change_category",
+    "implementation_mode",
+    "expected_files",
+    "tests_to_run",
+    "rollback_criteria",
+)
+
+CODE_CHANGE_OPTIONAL_DETAIL_FIELDS = (
+    "summary",
+    "expected_effect",
+    "validation",
+)
+
 
 def _signal_stats(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
@@ -237,12 +251,34 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
         "variant_config": "required only for propose_signal_variant; bounded frontier variant object",
         "code_change": {
             "required_only_for": "propose_code_change",
+            "required_actionable_fields": list(CODE_CHANGE_ACTIONABLE_FIELDS),
             "change_category": "one allowed code-evolution category",
             "implementation_mode": "runtime_active, paper_policy, shadow_trial, or report_only",
             "expected_files": "list of repo-relative files expected to change",
             "tests_to_run": "safe unittest commands or empty list for full regression",
             "rollback_criteria": "when the governor should revert/demote",
             "unified_diff": "optional patch; if missing, GPT-5.5 Build Planner may generate one",
+            "detail_fields_to_prefer": list(CODE_CHANGE_OPTIONAL_DETAIL_FIELDS),
+            "field_quality_gate": (
+                "Populate every required actionable field inside code_change. Sparse "
+                "code_change objects are downgraded because Build Planner needs category, "
+                "implementation mode, expected files, tests, and rollback criteria."
+            ),
+            "detail_placement_rule": (
+                "If implementation details such as summary, expected effect, validation, "
+                "ingestion, normalization, or scanner_logic are known, place them under "
+                "code_change instead of only at the top level."
+            ),
+            "mirror_top_level_when_nested_omitted": (
+                "If compatibility requires repeating implementation details at the top "
+                "level, duplicate the same values under code_change so the proposal is "
+                "not downgraded as missing actionable code-change fields."
+            ),
+            "partial_output_policy": (
+                "If a safe code change cannot be described with these fields, emit one "
+                "conservative paper-only hold/refine recommendation instead of a thin "
+                "propose_code_change payload."
+            ),
             "frontier_escalation_reason": "required for GPT-5.5 code evolution",
         },
         "market_key_contracts": {
