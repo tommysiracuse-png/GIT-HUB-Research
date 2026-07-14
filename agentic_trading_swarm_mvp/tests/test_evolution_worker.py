@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
 
 import evolution_worker
 import radar_loop
+import code_evolution
 import self_improvement
 import storage
 
@@ -123,7 +124,9 @@ class EvolutionWorkerSeparationTests(unittest.TestCase):
 
         self.assertEqual("propose_code_change", normalized["payload"]["action"])
         self.assertEqual("paper_scoring_logic", normalized["payload"]["change_category"])
-        self.assertIn("src/strategy_reliability.py", normalized["payload"]["expected_files"])
+        self.assertNotIn("expected_files", normalized["payload"])
+        preflight = code_evolution.preflight_proposal(normalized["payload"], {"code_evolution": {}})
+        self.assertIn("src/strategy_reliability.py", preflight["target_files"])
 
     def test_manual_account_route_task_stays_route_resolver(self) -> None:
         payload = {
@@ -154,8 +157,10 @@ class EvolutionWorkerSeparationTests(unittest.TestCase):
         )
 
         self.assertEqual("public_data_adapter", normalized["payload"]["change_category"])
-        self.assertIn("src/research_worker.py", normalized["payload"]["expected_files"])
-        self.assertNotIn("src/frontier_crypto_adapter.py", normalized["payload"]["expected_files"])
+        self.assertNotIn("expected_files", normalized["payload"])
+        preflight = code_evolution.preflight_proposal(normalized["payload"], {"code_evolution": {}})
+        self.assertIn("src/research_worker.py", preflight["target_files"])
+        self.assertNotIn("src/frontier_crypto_adapter.py", preflight["target_files"])
 
     def test_unknown_crypto_exchange_still_maps_to_frontier_adapter_without_name_allowlist(self) -> None:
         payload = {
@@ -173,7 +178,9 @@ class EvolutionWorkerSeparationTests(unittest.TestCase):
         )
 
         self.assertEqual("public_data_adapter", normalized["payload"]["change_category"])
-        self.assertIn("src/frontier_crypto_adapter.py", normalized["payload"]["expected_files"])
+        self.assertNotIn("expected_files", normalized["payload"])
+        preflight = code_evolution.preflight_proposal(normalized["payload"], {"code_evolution": {}})
+        self.assertIn("src/frontier_crypto_adapter.py", preflight["target_files"])
 
 
 if __name__ == "__main__":

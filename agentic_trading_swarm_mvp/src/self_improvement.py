@@ -460,84 +460,20 @@ def _infer_code_category(payload: dict) -> str:
     return "runtime_pipeline_integration"
 
 
-def _infer_expected_files(payload: dict, category: str) -> list[str]:
-    text = _payload_text(payload)
-    files: list[str] = []
-    if category == "evolution_loop_improvement":
-        files.extend(
-            [
-                "src/llm_swarm_runner.py",
-                "src/llm_bridge.py",
-                "src/llm_recommendation_ingestion.py",
-                "tests/test_frontier_model_policy.py",
-                "tests/test_llm_recommendation_ingestion.py",
-                "tests/test_self_improvement_recommendation_flow.py",
-            ]
-        )
-    crypto_surface = _contains_any(
-        text,
-        (
-            "crypto",
-            "spot",
-            "perp",
-            "stablecoin",
-            "token",
-            "order book",
-            "orderbook",
-            "frontier",
-            "fiat quote",
-            "quote normalization",
-            "depth enrichment",
-        ),
-    )
-    prediction_surface = _contains_any(text, ("prediction market", "event market", "kalshi", "polymarket"))
-    global_discovery_surface = category == "public_data_adapter" and not crypto_surface and not prediction_surface
-    if category in {"public_data_adapter", "scanner_expansion", "quality_scoring"} and not global_discovery_surface:
-        files.extend(
-            [
-                "src/frontier_crypto_adapter.py",
-                "src/frontier_data_quality.py",
-                "tests/test_frontier_crypto_adapter.py",
-                "tests/test_frontier_data_quality.py",
-            ]
-        )
-    if prediction_surface:
-        files.extend(["src/prediction_market_scanner.py", "tests/test_prediction_market_scanner.py"])
-    if global_discovery_surface:
-        files.extend(["src/research_worker.py", "src/llm_bridge.py", "tests/test_research_worker.py"])
-    if category == "read_only_route_intelligence" or any(
-        term in text for term in ("route", "borrow", "conditional", "margin", "fee")
-    ):
-        files.extend(
-            [
-                "src/route_resolver.py",
-                "src/route_intelligence.py",
-                "tests/test_route_resolver.py",
-                "tests/test_route_intelligence.py",
-            ]
-        )
-    if category == "paper_scoring_logic" or any(term in text for term in ("yahoo", "proxy", "score", "decay")):
-        files.extend(["src/strategy_reliability.py", "src/global_proxy_scanner.py", "tests/test_strategy_reliability.py"])
-    if category == "llm_prompt_state_packet" or "packet" in text:
-        files.extend(["src/llm_state_packet.py", "src/llm_bridge.py", "tests/test_llm_state_packet.py"])
-    if not files:
-        files.extend(["src/self_improvement.py", "tests/test_evolution_worker.py"])
-    deduped = []
-    seen = set()
-    for file in files:
-        if file not in seen:
-            deduped.append(file)
-            seen.add(file)
-    return deduped
+def _explicit_expected_files(payload: dict, code_change: dict) -> list[str]:
+    for value in (code_change.get("expected_files"), payload.get("expected_files"), payload.get("files_expected_to_change")):
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+    return []
 
 
 def _normalize_code_change_recommendation(rec: dict) -> dict:
     payload = dict(rec.get("payload") or {})
     code_change = dict(payload.get("code_change") if isinstance(payload.get("code_change"), dict) else {})
     category = code_change.get("change_category") or payload.get("change_category") or _infer_code_category(payload)
-    expected_files = code_change.get("expected_files") or payload.get("expected_files") or _infer_expected_files(
-        payload, str(category)
-    )
+    expected_files = _explicit_expected_files(payload, code_change)
     implementation_mode = (
         code_change.get("implementation_mode")
         or payload.get("implementation_mode")
@@ -547,20 +483,23 @@ def _normalize_code_change_recommendation(rec: dict) -> dict:
         {
             "change_category": category,
             "implementation_mode": implementation_mode,
-            "expected_files": expected_files,
             "tests_to_run": code_change.get("tests_to_run") or payload.get("tests_to_run") or [],
             "rollback_criteria": code_change.get("rollback_criteria")
             or payload.get("rollback_criteria")
             or "Revert if tests fail, reports stop refreshing, or paper-only safety checks fail.",
             "evidence": code_change.get("evidence")
             or (payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}),
+            "target_selection_mode": "explicit" if expected_files else "repo_aware_preflight",
         }
     )
+    if expected_files:
+        code_change["expected_files"] = expected_files
     payload["original_action"] = payload.get("action")
     payload["action"] = "propose_code_change"
     payload["change_category"] = category
     payload["implementation_mode"] = implementation_mode
-    payload["expected_files"] = expected_files
+    if expected_files:
+        payload["expected_files"] = expected_files
     payload["code_change"] = code_change
     if not payload.get("proposed_change"):
         payload["proposed_change"] = payload.get("rationale") or rec.get("rationale") or rec.get("title")

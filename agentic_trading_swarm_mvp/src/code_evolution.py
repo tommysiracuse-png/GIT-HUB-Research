@@ -825,12 +825,52 @@ def _semantic_target_files(raw: str, category: str, payload: dict) -> list[str]:
             str(_field(payload, "proposed_change", "rationale") or ""),
         ]
     ).lower()
-    if any(token in text for token in ("bitso", "frontier scanner", "frontier crypto", "depth enrichment", "order-book")):
+    if any(token in text for token in ("prediction", "kalshi", "polymarket", "event market")):
+        return [
+            "src/prediction_market_scanner.py",
+            "tests/test_prediction_market_scanner.py",
+        ]
+    crypto_market_terms = (
+        "crypto",
+        "stablecoin",
+        "token",
+        "perp",
+        "frontier scanner",
+        "frontier crypto",
+        "depth enrichment",
+        "fiat quote",
+        "quote normalization",
+    )
+    if any(token in text for token in crypto_market_terms):
         return [
             "src/frontier_crypto_adapter.py",
             "src/frontier_data_quality.py",
             "tests/test_frontier_crypto_adapter.py",
             "tests/test_frontier_data_quality.py",
+        ]
+    global_public_data_terms = (
+        "public data",
+        "public no-key",
+        "no-key",
+        "official docs",
+        "api docs",
+        "endpoint",
+        "feed",
+        "ticker",
+        "quote",
+        "settlement",
+        "auction",
+        "instrument list",
+        "symbol list",
+        "market surface",
+        "exchange",
+        "venue",
+    )
+    if category == "public_data_adapter" and any(token in text for token in global_public_data_terms):
+        return [
+            "src/research_worker.py",
+            "src/llm_bridge.py",
+            "tests/test_research_worker.py",
         ]
     if any(token in text for token in ("paper scoring", "signal scoring", "score_adjustment", "quarantine", "shadow_filtered")):
         return [
@@ -845,11 +885,6 @@ def _semantic_target_files(raw: str, category: str, payload: dict) -> list[str]:
             "src/route_resolver.py",
             "tests/test_route_intelligence.py",
             "tests/test_route_resolver.py",
-        ]
-    if any(token in text for token in ("prediction", "kalshi", "polymarket")):
-        return [
-            "src/prediction_market_scanner.py",
-            "tests/test_prediction_market_scanner.py",
         ]
     if any(token in text for token in ("hunter directive", "self-improvement", "self improvement", "exploit directive")):
         return [
@@ -918,12 +953,23 @@ def preflight_proposal(payload: dict, settings: dict, root: pathlib.Path = ROOT)
                 continue
         target_files.append(canonical)
     if not target_files:
-        used_default_targets = True
-        target_files = [
-            rel
-            for rel in DEFAULT_CATEGORY_FILES.get(category, [])
-            if not _path_blocked(rel, cfg) and (root / rel).exists()
-        ][:8]
+        semantic_defaults = _semantic_target_files("", category, payload)
+        if semantic_defaults:
+            used_default_targets = True
+            target_files = [
+                rel
+                for rel in semantic_defaults
+                if not _path_blocked(rel, cfg) and ((root / rel).exists() or rel in DEFAULT_CATEGORY_FILES.get(category, []))
+            ][:8]
+            if target_files:
+                path_repairs.append({"from": "repo_aware_preflight", "to": target_files})
+        if not target_files:
+            used_default_targets = True
+            target_files = [
+                rel
+                for rel in DEFAULT_CATEGORY_FILES.get(category, [])
+                if not _path_blocked(rel, cfg) and (root / rel).exists()
+            ][:8]
     test_issues = []
     test_repairs = []
     parsed_tests = []
