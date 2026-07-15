@@ -139,7 +139,7 @@ def _strip_markdown_fences(text: str) -> str:
 
 def _has_forbidden_markdown_tokens(text: str) -> bool:
     lowered = text.lower()
-    return any(token in text for token in _FORBIDDEN_MARKDOWN_TOKENS)
+    return any(token in lowered for token in _FORBIDDEN_MARKDOWN_TOKENS)
 
 
 def _extract_single_json_object(text: str) -> str | None:
@@ -179,6 +179,15 @@ def _default_recommendation() -> dict[str, Any]:
         },
         "variant_config": dict(_PAPER_ONLY_VOLATILITY_GATE_DEFAULTS),
     }
+
+
+def _regen_hint_for_invalid_recommendation(reason: str) -> str:
+    return (
+        "Return exactly one valid JSON object with required keys "
+        f"{', '.join(STRICT_REQUIRED_RECOMMENDATION_FIELDS)}. "
+        "Do not include markdown fences, trailing text, arrays, or multiple objects. "
+        f"Validation issue: {reason}"
+    )
 
 
 def _coerce_recommendation_object(value: Any) -> dict[str, Any] | None:
