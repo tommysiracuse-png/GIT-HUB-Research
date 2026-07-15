@@ -73,6 +73,11 @@ _FORBIDDEN_MARKDOWN_TOKENS = (
 )
 
 _STRICT_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_OPTIONAL_RECOMMENDATION_FIELDS = (
+    "code_change",
+    "variant_config",
+)
+_REQUIRED_TOP_LEVEL_KEYS = STRICT_REQUIRED_RECOMMENDATION_FIELDS + _OPTIONAL_RECOMMENDATION_FIELDS
 
 def _has_meaningful_value(value: Any) -> bool:
     if value in (None, "", {}, [], ()):
