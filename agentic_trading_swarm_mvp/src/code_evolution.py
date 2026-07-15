@@ -72,6 +72,8 @@ _FORBIDDEN_MARKDOWN_TOKENS = (
     "__",
 )
 
+_STRICT_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
 def _has_meaningful_value(value: Any) -> bool:
     if value in (None, "", {}, [], ()):
         return False
@@ -126,6 +128,29 @@ def _has_forbidden_markdown_tokens(text: str) -> bool:
     return any(token in text for token in _FORBIDDEN_MARKDOWN_TOKENS)
 
 
+def _extract_single_json_object(text: str) -> str | None:
+    """Extract the first and only JSON object from a model response."""
+
+    if not isinstance(text, str):
+        return None
+    cleaned = _strip_markdown_fences(text)
+    match = _STRICT_JSON_OBJECT_RE.search(cleaned)
+    if not match:
+        return None
+    candidate = match.group(0).strip()
+    try:
+        parsed = json.loads(candidate)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    trailing = cleaned[match.end() :].strip()
+    leading = cleaned[: match.start()].strip()
+    if leading or trailing:
+        return None
+    return candidate
+
+
 def _default_recommendation() -> dict[str, Any]:
     return {
         "action": "monitor_only",
@@ -146,13 +171,16 @@ def normalize_recommendation_response(value: Any) -> dict[str, Any]:
 
     candidate: Any = value
     if isinstance(candidate, str):
-        candidate = _strip_markdown_fences(candidate)
-        try:
-            if _has_forbidden_markdown_tokens(candidate):
-                return _default_recommendation()
-            candidate = json.loads(candidate)
-        except ValueError:
+        if _has_forbidden_markdown_tokens(candidate):
+            return _default_recommendation()
+        extracted = _extract_single_json_object(candidate)
+        if extracted is None:
             candidate = _default_recommendation()
+        else:
+            try:
+                candidate = json.loads(extracted)
+            except ValueError:
+                candidate = _default_recommendation()
     if not isinstance(candidate, dict):
         candidate = _default_recommendation()
     valid, _reason = validate_strict_recommendation_schema(candidate)
@@ -195,6 +223,8 @@ def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool,
     array_path = _find_array_path(reparsed)
     if array_path:
         return False, f"array values are not allowed: {array_path}"
+    if set(reparsed.keys()) != set(packet.keys()):
+        return False, "packet must remain a single stable JSON object"
 
     missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in packet or not _has_meaningful_value(packet[field])]
     if missing:
