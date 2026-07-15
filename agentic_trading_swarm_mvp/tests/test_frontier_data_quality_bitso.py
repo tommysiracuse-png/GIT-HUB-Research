@@ -8,6 +8,41 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from frontier_data_quality import _timestamp_to_iso
+
+
+class BitsoTimestampSafetyTests(unittest.TestCase):
+    def test_rejects_nonfinite_numeric_timestamps(self):
+        self.assertIsNone(_timestamp_to_iso(float("nan")))
+        self.assertIsNone(_timestamp_to_iso(float("inf")))
+        self.assertIsNone(_timestamp_to_iso(float("-inf")))
+
+    def test_rejects_invalid_string_payloads(self):
+        self.assertIsNone(_timestamp_to_iso("not-a-timestamp"))
+        self.assertIsNone(_timestamp_to_iso(object()))
+
+    def test_preserves_iso_payloads(self):
+        self.assertEqual(
+            _timestamp_to_iso("2024-06-01T12:34:56Z"),
+            "2024-06-01T12:34:56+00:00",
+        )
+
+    def test_explicit_microseconds_are_supported(self):
+        self.assertEqual(
+            _timestamp_to_iso(1_700_000_000_000_000, unit="microseconds"),
+            "2023-11-14T22:13:20+00:00",
+        )
+
+import pathlib
+import sys
+import unittest
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
 import frontier_data_quality as fdq
 
 

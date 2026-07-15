@@ -49,8 +49,22 @@ def _timestamp_to_iso(value: object, unit: str = "auto") -> str | None:
         numeric = float(value)
     except (TypeError, ValueError):
         return None
-    if unit == "milliseconds" or (unit == "auto" and numeric > 10_000_000_000):
+    if not math.isfinite(numeric):
+        return None
+    if unit == "nanoseconds":
+        numeric /= 1_000_000_000.0
+    elif unit == "microseconds":
+        numeric /= 1_000_000.0
+    elif unit == "milliseconds":
         numeric /= 1000.0
+    elif unit == "auto":
+        abs_numeric = abs(numeric)
+        if abs_numeric > 10_000_000_000_000_000:
+            numeric /= 1_000_000_000.0
+        elif abs_numeric > 10_000_000_000_000:
+            numeric /= 1_000_000.0
+        elif abs_numeric > 10_000_000_000:
+            numeric /= 1000.0
     try:
         return dt.datetime.fromtimestamp(numeric, tz=dt.timezone.utc).isoformat()
     except (OSError, OverflowError, ValueError):
