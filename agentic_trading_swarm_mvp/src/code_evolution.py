@@ -214,7 +214,7 @@ def serialize_strict_recommendation(packet: dict[str, Any]) -> str:
 
     valid, reason = validate_strict_recommendation_schema(packet)
     if not valid:
-        raise ValueError(reason)
+        raise ValueError(f"strict recommendation validation failed: {reason}")
     return json.dumps(
         packet,
         ensure_ascii=False,
