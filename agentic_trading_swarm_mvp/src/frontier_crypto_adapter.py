@@ -41,6 +41,21 @@ DEFAULT_PAPER_ONLY_CONFIDENCE_POLICY = {
 }
 
 
+DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY = {
+    "enabled": True,
+    "min_closed_trades": 8,
+    "min_confidence_to_allow": 0.55,
+    "min_multiplier_to_allow": 1.0,
+    "expectancy_scale_bps": 18.0,
+    "max_abs_expectancy_contribution": 0.22,
+    "max_abs_win_rate_contribution": 0.12,
+    "max_abs_payoff_contribution": 0.10,
+    "sample_size_pivot": 18,
+    "multiplier_floor": 0.65,
+    "multiplier_ceiling": 1.20,
+    "block_on_negative_expectancy": True,
+}
+
 DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY = {
     "enabled": True,
     "min_closed_trades": 12,
@@ -122,6 +137,170 @@ def paper_only_frontier_long_cohort_gate(
         "suppressed": suppressed,
         "score_multiplier": score_multiplier,
         "reasons": reasons,
+    }
+
+
+def _clamp_paper_score(value: float, minimum: float, maximum: float) -> float:
+    return max(float(minimum), min(float(maximum), float(value)))
+
+
+def _paper_stat_value(stats: dict, *keys: str) -> float | None:
+    for key in keys:
+        value = stats.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _paper_venue_direction_context_stats(
+    stats_by_context: dict | None,
+    *,
+    venue: str,
+    direction: str,
+) -> dict | None:
+    if not isinstance(stats_by_context, dict):
+        return None
+
+    normalized_venue = str(venue or "").upper()
+    normalized_direction = str(direction or "").lower()
+    composite_keys = (
+        f"{normalized_venue}|{normalized_direction}",
+        f"{normalized_venue}:{normalized_direction}",
+        f"{normalized_venue}/{normalized_direction}",
+    )
+    for key in composite_keys:
+        value = stats_by_context.get(key)
+        if isinstance(value, dict):
+            return value
+
+    venue_bucket = stats_by_context.get(normalized_venue) or stats_by_context.get(str(venue or ""))
+    if isinstance(venue_bucket, dict):
+        for key in (normalized_direction, str(direction or ""), normalized_direction.upper()):
+            value = venue_bucket.get(key)
+            if isinstance(value, dict):
+                return value
+    return None
+
+
+def paper_only_venue_direction_expectancy_gate(
+    *,
+    venue: str,
+    direction: str,
+    stats_by_context: dict | None,
+    enabled: bool = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["enabled"],
+    min_closed_trades: int = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["min_closed_trades"],
+    min_confidence_to_allow: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY[
+        "min_confidence_to_allow"
+    ],
+    min_multiplier_to_allow: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY[
+        "min_multiplier_to_allow"
+    ],
+    expectancy_scale_bps: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["expectancy_scale_bps"],
+    max_abs_expectancy_contribution: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY[
+        "max_abs_expectancy_contribution"
+    ],
+    max_abs_win_rate_contribution: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY[
+        "max_abs_win_rate_contribution"
+    ],
+    max_abs_payoff_contribution: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY[
+        "max_abs_payoff_contribution"
+    ],
+    sample_size_pivot: int = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["sample_size_pivot"],
+    multiplier_floor: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["multiplier_floor"],
+    multiplier_ceiling: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["multiplier_ceiling"],
+    block_on_negative_expectancy: bool = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY[
+        "block_on_negative_expectancy"
+    ],
+) -> dict:
+    """Paper-only venue-direction gate using realized expectancy with shrinkage to neutral."""
+
+    context_key = f"{str(venue or '').upper()}|{str(direction or '').lower()}"
+    if not enabled:
+        return {
+            "enabled": False,
+            "blocked": False,
+            "score_multiplier": 1.0,
+            "confidence": 0.0,
+            "closed_trade_count": 0,
+            "context_key": context_key,
+            "reasons": ["disabled"],
+        }
+
+    context_stats = _paper_venue_direction_context_stats(stats_by_context, venue=venue, direction=direction)
+    if not isinstance(context_stats, dict):
+        return {
+            "enabled": True,
+            "blocked": False,
+            "score_multiplier": 1.0,
+            "confidence": 0.0,
+            "closed_trade_count": 0,
+            "context_key": context_key,
+            "reasons": ["missing_context_stats"],
+        }
+
+    closed_trade_count = int(round(_paper_stat_value(context_stats, "closed_trade_count", "closed_trades", "sample_size") or 0.0))
+    if closed_trade_count < int(min_closed_trades):
+        return {
+            "enabled": True,
+            "blocked": False,
+            "score_multiplier": 1.0,
+            "confidence": 0.0,
+            "closed_trade_count": closed_trade_count,
+            "context_key": context_key,
+            "reasons": ["insufficient_closed_trades"],
+        }
+
+    win_rate = _paper_stat_value(context_stats, "recent_win_rate", "win_rate")
+    wins = _paper_stat_value(context_stats, "wins", "win_count")
+    if win_rate is None and closed_trade_count > 0 and wins is not None:
+        win_rate = wins / max(closed_trade_count, 1)
+    win_rate = _clamp_paper_score(win_rate if win_rate is not None else 0.5, 0.0, 1.0)
+
+    avg_win_bps = _paper_stat_value(context_stats, "avg_win_bps", "average_win_bps")
+    avg_loss_bps = _paper_stat_value(context_stats, "avg_loss_bps", "average_loss_bps")
+    expectancy_bps = _paper_stat_value(context_stats, "recent_expectancy_bps", "expectancy_bps")
+    if expectancy_bps is None and avg_win_bps is not None and avg_loss_bps is not None:
+        expectancy_bps = (win_rate * float(avg_win_bps)) - ((1.0 - win_rate) * abs(float(avg_loss_bps)))
+    expectancy_bps = float(expectancy_bps if expectancy_bps is not None else 0.0)
+
+    payoff_ratio = _paper_stat_value(context_stats, "payoff_ratio")
+    if payoff_ratio is None and avg_win_bps is not None and avg_loss_bps not in (None, 0.0):
+        payoff_ratio = abs(float(avg_win_bps) / float(avg_loss_bps))
+    payoff_ratio = max(0.0, float(payoff_ratio if payoff_ratio is not None else 1.0))
+
+    confidence = closed_trade_count / float(max(closed_trade_count + int(sample_size_pivot), 1))
+    expectancy_component = _clamp_paper_score(expectancy_bps / max(float(expectancy_scale_bps), 1.0), -1.0, 1.0)
+    expectancy_component *= float(max_abs_expectancy_contribution)
+    win_rate_component = _clamp_paper_score((win_rate - 0.5) / 0.20, -1.0, 1.0)
+    win_rate_component *= float(max_abs_win_rate_contribution)
+    payoff_component = _clamp_paper_score((payoff_ratio - 1.0) / 0.75, -1.0, 1.0)
+    payoff_component *= float(max_abs_payoff_contribution)
+    multiplier = 1.0 + (confidence * (expectancy_component + win_rate_component + payoff_component))
+    multiplier = _clamp_paper_score(multiplier, multiplier_floor, multiplier_ceiling)
+
+    reasons = []
+    if confidence < float(min_confidence_to_allow):
+        reasons.append("low_sample_confidence")
+    if multiplier <= float(min_multiplier_to_allow):
+        reasons.append("multiplier_not_above_neutral")
+    if bool(block_on_negative_expectancy) and expectancy_bps < 0.0 and multiplier <= 1.0:
+        reasons.append("negative_expectancy")
+
+    return {
+        "enabled": True,
+        "blocked": bool(reasons),
+        "score_multiplier": multiplier,
+        "confidence": confidence,
+        "closed_trade_count": closed_trade_count,
+        "context_key": context_key,
+        "expectancy_bps": expectancy_bps,
+        "win_rate": win_rate,
+        "payoff_ratio": payoff_ratio,
+        "reasons": list(dict.fromkeys(reasons)),
     }
 
 
@@ -217,6 +396,7 @@ def paper_only_executable_quality_check(
     min_depth_multiple_of_paper_size: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY[
         "min_depth_multiple_of_paper_size"
     ],
+    venue_direction_gate: dict | None = None,
     min_recent_volume_multiple_vs_baseline: float = 1.25,
 ) -> dict:
     """Paper-only executable quality filter for cross-market observations."""
@@ -251,10 +431,20 @@ def paper_only_executable_quality_check(
         **confidence_inputs,
         min_confidence=0.70,
     )
+    applied_venue_direction_gate = (
+        venue_direction_gate
+        if isinstance(venue_direction_gate, dict)
+        else {"enabled": False, "blocked": False, "score_multiplier": 1.0, "reasons": []}
+    )
+    if bool(applied_venue_direction_gate.get("enabled")) and float(applied_venue_direction_gate.get("score_multiplier", 1.0)) < 1.0:
+        reasons.append("venue_direction_expectancy_below_neutral")
+    if bool(applied_venue_direction_gate.get("blocked")):
+        reasons.append("venue_direction_expectancy_gate")
 
     passed = not reasons
     return {
         "passed": passed,
+        "venue_direction_gate": applied_venue_direction_gate,
         "reasons": reasons,
         "edge_after_costs_bps": edge_after_costs,
         "spread_limit_bps": spread_limit_bps,
@@ -436,6 +626,7 @@ DEFAULT_PAPER_TRADE_POLICY = {
             "shadow_outcome_tag",
         ],
     },
+    "venue_direction_expectancy_gate": DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY,
     "route_feasibility": DEFAULT_ROUTE_FEASIBILITY_POLICY,
     "pyramiding": "disabled",
 }
