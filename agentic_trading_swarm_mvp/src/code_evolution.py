@@ -56,6 +56,7 @@ STRICT_REQUIRED_RECOMMENDATION_FIELDS = (
     "evidence",
     "proposed_change",
 )
+STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
 STRICT_RECOMMENDATION_JSON_SEPARATORS = (",", ":")
 MIN_PAPER_CONFIRM_SCORE_MIN = 0.68
 SUPPRESSION_ACTIONS = {
@@ -207,6 +208,28 @@ def normalize_recommendation_response(value: Any) -> dict[str, Any]:
     if not valid:
         return _default_recommendation()
     return json.loads(serialize_strict_recommendation(candidate))
+
+
+def validate_strict_recommendation_schema(packet: Any) -> tuple[bool, str]:
+    if not isinstance(packet, dict):
+        return False, "recommendation must be a JSON object"
+    missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in packet]
+    if missing:
+        return False, f"missing required fields: {', '.join(missing)}"
+    for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS:
+        if not _has_meaningful_value(packet.get(field)):
+            return False, f"{field} must be present and non-empty"
+    if packet.get("action") == "live_trade":
+        return False, "live trading is not permitted"
+    if packet.get("paper_only") is False:
+        return False, "paper_only must be true or omitted"
+    evidence = packet.get("evidence")
+    if not isinstance(evidence, dict):
+        return False, "evidence must be a JSON object"
+    proposed_change = packet.get("proposed_change")
+    if not isinstance(proposed_change, dict):
+        return False, "proposed_change must be a JSON object"
+    return True, ""
 
 
 def serialize_strict_recommendation(packet: dict[str, Any]) -> str:
