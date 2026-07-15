@@ -107,6 +107,10 @@ def _normalize_bitso_symbol(symbol: str) -> str:
     value = value.replace("-", "_").replace("/", "_").replace(":", "_")
     if "_" in value:
         parts = [part for part in value.split("_") if part]
+        while parts and parts[-1] in {"spot", "book", "orderbook"}:
+            parts = parts[:-1]
+        while len(parts) >= 3 and parts[-1] == parts[-2]:
+            parts = parts[:-1]
         return "_".join(parts)
     if len(value) > 3 and value.endswith("mxn"):
         return f"{value[:-3]}_mxn"
