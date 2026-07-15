@@ -41,6 +41,90 @@ DEFAULT_PAPER_ONLY_CONFIDENCE_POLICY = {
 }
 
 
+DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY = {
+    "enabled": True,
+    "min_closed_trades": 12,
+    "min_recent_expectancy_bps": -6.0,
+    "min_recent_win_rate": 0.42,
+    "low_feasibility_max_share": 0.35,
+    "decay_floor": 0.55,
+    "suppress_floor": 0.60,
+}
+
+
+def paper_only_frontier_long_cohort_gate(
+    *,
+    closed_trade_count: int,
+    recent_expectancy_bps: float,
+    recent_win_rate: float,
+    low_feasibility_share: float,
+    enabled: bool = DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY["enabled"],
+    min_closed_trades: int = DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY["min_closed_trades"],
+    min_recent_expectancy_bps: float = DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY["min_recent_expectancy_bps"],
+    min_recent_win_rate: float = DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY["min_recent_win_rate"],
+    low_feasibility_max_share: float = DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY["low_feasibility_max_share"],
+    decay_floor: float = DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY["decay_floor"],
+    suppress_floor: float = DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY["suppress_floor"],
+) -> dict:
+    """Paper-only gate for frontier long cohorts based on recent closed-trade quality."""
+
+    if not enabled:
+        return {
+            "enabled": False,
+            "suppressed": False,
+            "score_multiplier": 1.0,
+            "reasons": ["disabled"],
+        }
+
+    if int(closed_trade_count) < int(min_closed_trades):
+        return {
+            "enabled": True,
+            "suppressed": False,
+            "score_multiplier": 1.0,
+            "reasons": ["insufficient_closed_trades"],
+        }
+
+    expectancy = float(recent_expectancy_bps)
+    win_rate = float(recent_win_rate)
+    feasibility_share = float(low_feasibility_share)
+
+    score_multiplier = 1.0
+    reasons = []
+
+    if expectancy <= float(min_recent_expectancy_bps) and win_rate <= float(min_recent_win_rate):
+        score_multiplier *= float(decay_floor)
+        reasons.append("negative_expectancy_and_weak_win_rate")
+
+    if feasibility_share >= float(low_feasibility_max_share):
+        score_multiplier *= 0.85
+        reasons.append("low_feasibility_share")
+
+    suppressed = (
+        expectancy <= float(min_recent_expectancy_bps)
+        and win_rate <= float(min_recent_win_rate)
+        and feasibility_share >= float(low_feasibility_max_share)
+        and score_multiplier <= float(suppress_floor)
+    )
+    if (
+        not suppressed
+        and expectancy <= float(min_recent_expectancy_bps)
+        and win_rate <= float(min_recent_win_rate)
+        and feasibility_share >= max(float(low_feasibility_max_share), 0.50)
+    ):
+        suppressed = True
+
+    if suppressed:
+        reasons.append("cohort_suppressed")
+        score_multiplier = 0.0
+
+    return {
+        "enabled": True,
+        "suppressed": suppressed,
+        "score_multiplier": score_multiplier,
+        "reasons": reasons,
+    }
+
+
 def paper_only_confidence_score(
     *,
     trend_score: float,
