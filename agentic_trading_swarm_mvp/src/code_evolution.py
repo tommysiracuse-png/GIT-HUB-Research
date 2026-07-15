@@ -78,6 +78,15 @@ _OPTIONAL_RECOMMENDATION_FIELDS = {
     "variant_config",
 }
 _REQUIRED_TOP_LEVEL_KEYS = STRICT_REQUIRED_RECOMMENDATION_FIELDS + tuple(_OPTIONAL_RECOMMENDATION_FIELDS)
+
+_PAPER_ONLY_VOLATILITY_GATE_DEFAULTS = {
+    "paper_only": True,
+    "true_range_multiple_cap": 1.8,
+    "trend_confirmation_threshold": "moderately_stricter",
+    "momentum_confirmation_threshold": "moderately_stricter",
+}
+
+
 def _has_meaningful_value(value: Any) -> bool:
     if value in (None, "", {}, [], ()):
         return False
@@ -167,6 +176,7 @@ def _default_recommendation() -> dict[str, Any]:
             "summary": "No-op fallback recommendation for paper-only workflows.",
             "safety": "paper_only",
         },
+        "variant_config": dict(_PAPER_ONLY_VOLATILITY_GATE_DEFAULTS),
     }
 
 
