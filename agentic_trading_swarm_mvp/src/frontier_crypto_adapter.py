@@ -80,6 +80,85 @@ DEFAULT_PAPER_ONLY_FRONTIER_VENUE_DIRECTION_EXPECTANCY_REGISTRY = {
 }
 
 
+def paper_only_frontier_score_adjustment(
+    *,
+    venue: str,
+    direction: str,
+    context_stats: dict | None = None,
+    registry: dict | None = None,
+    long_cohort_closed_trade_count: int | None = None,
+    long_cohort_recent_expectancy_bps: float | None = None,
+    long_cohort_recent_win_rate: float | None = None,
+    long_cohort_low_feasibility_share: float | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Paper-only frontier score adjustment for safe, reportable gating."""
+
+    stats = context_stats or {}
+    cohort_closed = int(
+        long_cohort_closed_trade_count
+        if long_cohort_closed_trade_count is not None
+        else stats.get("closed_trade_count")
+        or stats.get("closed_trades")
+        or 0
+    )
+    cohort_expectancy = float(
+        long_cohort_recent_expectancy_bps
+        if long_cohort_recent_expectancy_bps is not None
+        else stats.get("recent_expectancy_bps")
+        or stats.get("expectancy_bps")
+        or 0.0
+    )
+    cohort_win_rate = float(
+        long_cohort_recent_win_rate
+        if long_cohort_recent_win_rate is not None
+        else stats.get("recent_win_rate")
+        or stats.get("win_rate")
+        or 0.0
+    )
+    cohort_low_feasibility_share = float(
+        long_cohort_low_feasibility_share
+        if long_cohort_low_feasibility_share is not None
+        else stats.get("low_feasibility_share")
+        or 0.0
+    )
+
+    gate = paper_only_frontier_venue_direction_expectancy_gate(
+        venue=venue,
+        direction=direction,
+        context_stats=stats,
+        registry=registry,
+        enabled=enabled,
+    )
+    cohort_gate = paper_only_frontier_long_cohort_gate(
+        closed_trade_count=cohort_closed,
+        recent_expectancy_bps=cohort_expectancy,
+        recent_win_rate=cohort_win_rate,
+        low_feasibility_share=cohort_low_feasibility_share,
+        enabled=enabled,
+    )
+
+    score_multiplier = 1.0
+    if gate.get("allow", False):
+        score_multiplier *= float(gate.get("score_multiplier", 1.0) or 1.0)
+    else:
+        score_multiplier *= 0.0
+
+    if not cohort_gate.get("suppressed", False):
+        score_multiplier *= float(cohort_gate.get("score_multiplier", 1.0) or 1.0)
+    else:
+        score_multiplier *= 0.0
+
+    return {
+        "enabled": bool(enabled),
+        "allow": bool(gate.get("allow", False)),
+        "suppressed": bool(cohort_gate.get("suppressed", False)),
+        "score_multiplier": max(0.0, min(1.0, score_multiplier)),
+        "venue_direction_gate": gate,
+        "long_cohort_gate": cohort_gate,
+    }
+
+
 def _paper_frontier_venue_direction_key(venue: str, direction: str) -> str:
     return f"{str(venue).strip().upper()}_{str(direction).strip().upper()}"
 
