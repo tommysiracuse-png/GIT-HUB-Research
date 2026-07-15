@@ -213,6 +213,25 @@ def normalize_recommendation_response(value: Any) -> dict[str, Any]:
     candidate = _coerce_recommendation_object(value)
     if candidate is None:
         candidate = _default_recommendation()
+    missing_required = [
+        key for key in STRICT_REQUIRED_RECOMMENDATION_FIELDS if key not in candidate
+    ]
+    if missing_required:
+        candidate = _default_recommendation()
+    if _find_array_path(candidate) is not None:
+        candidate = _default_recommendation()
+    if not isinstance(candidate.get("evidence"), dict):
+        candidate = _default_recommendation()
+    if not _has_meaningful_value(candidate.get("action")):
+        candidate = _default_recommendation()
+    if not _has_meaningful_value(candidate.get("title")):
+        candidate = _default_recommendation()
+    if not _has_meaningful_value(candidate.get("rationale")):
+        candidate = _default_recommendation()
+    if not _has_meaningful_value(candidate.get("market_key")):
+        candidate = _default_recommendation()
+    if not _has_meaningful_value(candidate.get("proposed_change")):
+        return _default_recommendation()
     valid, _reason = validate_strict_recommendation_schema(candidate)
     if not valid:
         return _default_recommendation()
