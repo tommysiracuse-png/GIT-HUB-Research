@@ -154,6 +154,52 @@ def paper_only_confidence_score(
     }
 
 
+def paper_only_long_entry_confirmation(
+    *,
+    price: float,
+    ema_20: float,
+    rsi_1h: float,
+    volume: float,
+    avg_volume_20: float,
+    min_rsi: float = 55.0,
+    min_volume_ratio: float = 1.2,
+) -> dict:
+    """Paper-only long entry gate requiring momentum and participation confirmation."""
+
+    price = float(price)
+    ema_20 = float(ema_20)
+    rsi_1h = float(rsi_1h)
+    volume = float(volume)
+    avg_volume_20 = float(avg_volume_20)
+    min_rsi = float(min_rsi)
+    min_volume_ratio = float(min_volume_ratio)
+
+    volume_ratio = volume / avg_volume_20 if avg_volume_20 > 0 else 0.0
+    price_above_ema = price > ema_20
+    rsi_ok = rsi_1h > min_rsi
+    volume_ok = volume_ratio >= min_volume_ratio
+    allowed = price_above_ema and rsi_ok and volume_ok
+
+    reasons = []
+    if not price_above_ema:
+        reasons.append("price_below_ema20")
+    if not rsi_ok:
+        reasons.append("rsi_below_min")
+    if not volume_ok:
+        reasons.append("volume_below_min_ratio")
+
+    return {
+        "allowed": allowed,
+        "price_above_ema20": price_above_ema,
+        "rsi_ok": rsi_ok,
+        "volume_ok": volume_ok,
+        "volume_ratio": volume_ratio,
+        "min_rsi": min_rsi,
+        "min_volume_ratio": min_volume_ratio,
+        "reasons": reasons,
+    }
+
+
 def paper_only_executable_quality_check(
     *,
     expected_edge_bps: float,
