@@ -56,6 +56,7 @@ STRICT_REQUIRED_RECOMMENDATION_FIELDS = (
     "evidence",
     "proposed_change",
 )
+STRICT_RECOMMENDATION_JSON_SEPARATORS = (",", ":")
 MIN_PAPER_CONFIRM_SCORE_MIN = 0.68
 SUPPRESSION_ACTIONS = {
     "suppress_trade_generation_for_this_case",
@@ -157,7 +158,21 @@ def normalize_recommendation_response(value: Any) -> dict[str, Any]:
     valid, _reason = validate_strict_recommendation_schema(candidate)
     if not valid:
         return _default_recommendation()
-    return candidate
+    return json.loads(serialize_strict_recommendation(candidate))
+
+
+def serialize_strict_recommendation(packet: dict[str, Any]) -> str:
+    """Return the canonical single-object JSON representation."""
+
+    valid, reason = validate_strict_recommendation_schema(packet)
+    if not valid:
+        raise ValueError(reason)
+    return json.dumps(
+        packet,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=STRICT_RECOMMENDATION_JSON_SEPARATORS,
+    )
 
 
 def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool, str]:
