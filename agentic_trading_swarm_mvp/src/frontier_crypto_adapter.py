@@ -76,6 +76,8 @@ def paper_only_executable_quality_check(
     quoted_spread_bps: float,
     top_of_book_depth: float | None = None,
     paper_order_size: float | None = None,
+    recent_trade_volume: float | None = None,
+    baseline_trade_volume: float | None = None,
     quote_age_ms: float | None = None,
     fee_buffer_bps: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY["fee_buffer_bps"],
     slippage_buffer_bps: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY["slippage_buffer_bps"],
@@ -85,6 +87,7 @@ def paper_only_executable_quality_check(
     min_depth_multiple_of_paper_size: float = DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY[
         "min_depth_multiple_of_paper_size"
     ],
+    min_recent_volume_multiple_vs_baseline: float = 1.25,
 ) -> dict:
     """Paper-only executable quality filter for cross-market observations."""
 
@@ -102,6 +105,10 @@ def paper_only_executable_quality_check(
         required_depth = float(paper_order_size) * float(min_depth_multiple_of_paper_size)
         if float(top_of_book_depth) < required_depth:
             reasons.append("insufficient_depth")
+    if recent_trade_volume is not None and baseline_trade_volume is not None:
+        required_volume = float(baseline_trade_volume) * float(min_recent_volume_multiple_vs_baseline)
+        if float(recent_trade_volume) < required_volume:
+            reasons.append("insufficient_recent_volume")
 
     confidence_inputs = {
         "trend_score": 1.0 if float(expected_edge_bps) > 0.0 else 0.0,
