@@ -73,12 +73,11 @@ _FORBIDDEN_MARKDOWN_TOKENS = (
 )
 
 _STRICT_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-_OPTIONAL_RECOMMENDATION_FIELDS = (
+_OPTIONAL_RECOMMENDATION_FIELDS = {
     "code_change",
     "variant_config",
-)
-_REQUIRED_TOP_LEVEL_KEYS = STRICT_REQUIRED_RECOMMENDATION_FIELDS + _OPTIONAL_RECOMMENDATION_FIELDS
-
+}
+_REQUIRED_TOP_LEVEL_KEYS = STRICT_REQUIRED_RECOMMENDATION_FIELDS + tuple(_OPTIONAL_RECOMMENDATION_FIELDS)
 def _has_meaningful_value(value: Any) -> bool:
     if value in (None, "", {}, [], ()):
         return False
@@ -217,6 +216,10 @@ def validate_strict_recommendation_schema(packet: dict[str, Any]) -> tuple[bool,
 
     if not isinstance(packet, dict):
         return False, "packet must be a mapping"
+    allowed_keys = set(_REQUIRED_TOP_LEVEL_KEYS)
+    extra_keys = sorted(set(packet) - allowed_keys)
+    if extra_keys:
+        return False, f"unexpected top-level keys: {', '.join(extra_keys)}"
 
     try:
         serialized = json.dumps(packet, ensure_ascii=False)
