@@ -100,13 +100,32 @@ def _fetch_json(url: str, timeout: int) -> dict:
         }
 
 
+def _normalize_bitso_symbol(symbol: str) -> str:
+    value = re.sub(r"\s+", "", str(symbol or "")).strip().lower()
+    if not value:
+        return value
+    value = value.replace("-", "_").replace("/", "_").replace(":", "_")
+    if "_" in value:
+        parts = [part for part in value.split("_") if part]
+        return "_".join(parts)
+    if len(value) > 3 and value.endswith("mxn"):
+        return f"{value[:-3]}_mxn"
+    return value
+
+
 def _format_symbol(venue: str, symbol: str) -> str:
     if venue in {"BYBIT", "BYBIT_SPOT"}:
         compact = re.sub(r"[^A-Za-z0-9]", "", symbol or "")
         return compact.upper() or str(symbol).upper()
     if venue == "BITGET":
         return symbol.replace("_SPBL", "")
-    if venue in {"INDODAX", "QUIDAX", "BITSO", "BUDA"}:
+    if venue == "BITSO":
+        # Bitso depth endpoints expect lowercase book ids like ``btc_mxn``.
+        # Frontier observations may carry slash, dash, or compact MXN pairs
+        # after venue-map normalization, so normalize them here before URL
+        # construction to keep paper-only depth enrichment active for MXN books.
+        return _normalize_bitso_symbol(symbol)
+    if venue in {"INDODAX", "QUIDAX", "BUDA"}:
         return symbol.lower()
     if venue == "VALR":
         return symbol.replace("-", "").replace("_", "").replace("/", "").upper()
