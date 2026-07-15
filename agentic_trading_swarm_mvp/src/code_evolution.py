@@ -180,22 +180,28 @@ def _default_recommendation() -> dict[str, Any]:
     }
 
 
+def _coerce_recommendation_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    if _has_forbidden_markdown_tokens(value):
+        return None
+    extracted = _extract_single_json_object(value)
+    if extracted is None:
+        return None
+    try:
+        parsed = json.loads(extracted)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def normalize_recommendation_response(value: Any) -> dict[str, Any]:
     """Return a single safe JSON object for planner consumers."""
 
-    candidate: Any = value
-    if isinstance(candidate, str):
-        if _has_forbidden_markdown_tokens(candidate):
-            return _default_recommendation()
-        extracted = _extract_single_json_object(candidate)
-        if extracted is None:
-            candidate = _default_recommendation()
-        else:
-            try:
-                candidate = json.loads(extracted)
-            except ValueError:
-                candidate = _default_recommendation()
-    if not isinstance(candidate, dict):
+    candidate = _coerce_recommendation_object(value)
+    if candidate is None:
         candidate = _default_recommendation()
     valid, _reason = validate_strict_recommendation_schema(candidate)
     if not valid:
