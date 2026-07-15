@@ -283,7 +283,7 @@ def run_once(settings: dict) -> dict:
             execution = execute_order(conn, candidate, review, settings)
             if not execution["paper_filled"]:
                 continue
-            trade_id = open_paper_trade(conn, candidate, review, execution=execution)
+            trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=settings)
             record_open_policy_effects(conn, review)
             opened.append(
                 {

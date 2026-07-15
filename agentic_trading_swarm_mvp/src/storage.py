@@ -137,6 +137,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "paper_trades", "close_delay_seconds", "real")
     _ensure_column(conn, "paper_trades", "close_measurement_status", "text")
     _ensure_column(conn, "paper_trades", "close_price_source", "text")
+    _ensure_column(conn, "paper_trades", "selected_hold_minutes", "integer")
+    _ensure_column(conn, "paper_trades", "hold_decision_json", "text")
     conn.execute(
         """
         create table if not exists execution_orders (
@@ -195,6 +197,22 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_paper_trade_outcomes(conn)
+    conn.execute(
+        """
+        create table if not exists paper_hold_policies (
+            id integer primary key autoincrement,
+            created_at text not null,
+            updated_at text not null,
+            group_name text not null,
+            group_value text not null,
+            selected_hold_minutes integer not null,
+            previous_hold_minutes integer,
+            source text not null,
+            evidence_json text not null,
+            unique(group_name, group_value)
+        )
+        """
+    )
     conn.execute(
         """
         create table if not exists contextual_stats (
@@ -540,6 +558,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_opportunities_seen on opportunities(seen_at)")
     conn.execute("create index if not exists idx_paper_open on paper_trades(status, inst_id, direction)")
     conn.execute("create index if not exists idx_outcomes_trade on paper_trade_outcomes(trade_id)")
+    conn.execute("create index if not exists idx_paper_hold_policies_group on paper_hold_policies(group_name, group_value)")
     conn.execute("create index if not exists idx_memory_subject on memory_facts(subject)")
     conn.execute("create index if not exists idx_signal_policies_active on signal_policies(status, signal_key)")
     conn.execute("create index if not exists idx_self_improvement_status on self_improvement_experiments(status)")
@@ -768,7 +787,13 @@ def _bucket(value: float | int | None, thresholds: list[float], reverse: bool = 
     return labels[-1]
 
 
-def open_paper_trade(conn: sqlite3.Connection, candidate: dict, review: dict, execution: dict | None = None) -> int:
+def open_paper_trade(
+    conn: sqlite3.Connection,
+    candidate: dict,
+    review: dict,
+    execution: dict | None = None,
+    settings: dict | None = None,
+) -> int:
     entry = candidate["last"]
     execution_order_id = None
     route_id = None
@@ -783,14 +808,24 @@ def open_paper_trade(conn: sqlite3.Connection, candidate: dict, review: dict, ex
             entry_fee_bps = float(fills[0].get("fee_bps", 0.0))
             entry_slippage_bps = float(fills[0].get("slippage_bps", 0.0))
     context = _candidate_context(candidate, review)
+    candidate_signal_key = signal_key(candidate)
+    fallback_hold = int(((settings or {}).get("scanner") or {}).get("hold_minutes", 60)) if isinstance(settings, dict) else 60
+    hold_trade_row = {
+        "venue": candidate.get("venue"),
+        "trade_type": candidate.get("trade_type", "unknown"),
+        "direction": candidate.get("direction"),
+        "signal_key": candidate_signal_key,
+    }
+    hold_decision = select_paper_hold_minutes(conn, hold_trade_row, fallback_hold, settings)
+    selected_hold_minutes = int(hold_decision["hold_minutes"])
     cur = conn.execute(
         """
         insert into paper_trades (
             opened_at, venue, inst_id, direction, trade_type, signal_key, base_score,
             learned_score, entry, status, thesis, candidate_json, review_json,
             execution_order_id, route_id, entry_fee_bps, entry_slippage_bps, context_json,
-            signal_variant_id
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            signal_variant_id, selected_hold_minutes, hold_decision_json
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utc_now(),
@@ -798,7 +833,7 @@ def open_paper_trade(conn: sqlite3.Connection, candidate: dict, review: dict, ex
             candidate["inst_id"],
             candidate["direction"],
             candidate.get("trade_type", "unknown"),
-            signal_key(candidate),
+            candidate_signal_key,
             candidate["score"],
             review["learned_score"],
             entry,
@@ -811,10 +846,337 @@ def open_paper_trade(conn: sqlite3.Connection, candidate: dict, review: dict, ex
             entry_slippage_bps,
             json.dumps(context, sort_keys=True),
             candidate.get("signal_variant_id"),
+            selected_hold_minutes,
+            json.dumps(hold_decision, sort_keys=True),
         ),
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+def _hold_optimizer_config(settings: dict | None, fallback_hold_minutes: int) -> dict:
+    cfg = (settings or {}).get("paper_hold_optimizer", {}) if isinstance(settings, dict) else {}
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "default_hold_minutes": int(cfg.get("default_hold_minutes", fallback_hold_minutes)),
+        "candidate_horizons_minutes": [
+            int(item)
+            for item in cfg.get("candidate_horizons_minutes", [fallback_hold_minutes])
+            if int(item) > 0
+        ],
+        "min_samples": int(cfg.get("min_samples", 12)),
+        "min_avg_uplift_bps": float(cfg.get("min_avg_uplift_bps", 2.0)),
+        "switch_uplift_bps": float(cfg.get("switch_uplift_bps", 6.0)),
+        "max_horizon_steps_per_update": max(1, int(cfg.get("max_horizon_steps_per_update", 1))),
+        "recency_weighting_enabled": bool(cfg.get("recency_weighting_enabled", True)),
+        "recency_half_life_days": float(cfg.get("recency_half_life_days", 3.0)),
+        "confidence_adjustment_enabled": bool(cfg.get("confidence_adjustment_enabled", True)),
+        "confidence_target_effective_samples": float(cfg.get("confidence_target_effective_samples", 48.0)),
+        "confidence_floor": float(cfg.get("confidence_floor", 0.25)),
+        "prefer_shorter_on_tie_bps": float(cfg.get("prefer_shorter_on_tie_bps", 1.0)),
+        "group_hierarchy": list(cfg.get("group_hierarchy", ["signal_key", "venue_trade_direction", "trade_direction"])),
+    }
+
+
+def _row_get(row: sqlite3.Row | dict, key: str, default: object = None) -> object:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    if key in row.keys():
+        return row[key]
+    return default
+
+
+def _hold_group_value(row: sqlite3.Row | dict, group_name: str) -> str | None:
+    if group_name == "signal_key":
+        value = _row_get(row, "signal_key")
+        return str(value) if value not in (None, "") else None
+    if group_name == "venue_trade_direction":
+        return "|".join(
+            str(_row_get(row, key) or "")
+            for key in ("venue", "trade_type", "direction")
+            if str(_row_get(row, key) or "")
+        )
+    if group_name == "trade_direction":
+        return "|".join(
+            str(_row_get(row, key) or "")
+            for key in ("trade_type", "direction")
+            if str(_row_get(row, key) or "")
+        )
+    keys = row.keys() if not isinstance(row, dict) else row.keys()
+    if group_name in keys:
+        value = _row_get(row, group_name)
+        return str(value) if value not in (None, "") else None
+    return None
+
+
+def _hold_policy(conn: sqlite3.Connection, group_name: str, group_value: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        select group_name, group_value, selected_hold_minutes, source, evidence_json, updated_at
+        from paper_hold_policies
+        where group_name = ? and group_value = ?
+        limit 1
+        """,
+        (group_name, group_value),
+    ).fetchone()
+
+
+def _step_horizon_toward(current: int, target: int, horizons: list[int], max_steps: int) -> int:
+    ordered = sorted(set(int(item) for item in horizons))
+    if current not in ordered or target not in ordered:
+        return target
+    current_idx = ordered.index(current)
+    target_idx = ordered.index(target)
+    if current_idx == target_idx:
+        return current
+    direction = 1 if target_idx > current_idx else -1
+    next_idx = current_idx + direction * min(abs(target_idx - current_idx), max(1, int(max_steps)))
+    return int(ordered[next_idx])
+
+
+def _upsert_hold_policy(
+    conn: sqlite3.Connection,
+    *,
+    group_name: str,
+    group_value: str,
+    selected_hold_minutes: int,
+    previous_hold_minutes: int | None,
+    source: str,
+    evidence: dict,
+) -> None:
+    now = utc_now()
+    conn.execute(
+        """
+        insert into paper_hold_policies (
+            created_at, updated_at, group_name, group_value, selected_hold_minutes,
+            previous_hold_minutes, source, evidence_json
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(group_name, group_value) do update set
+            updated_at = excluded.updated_at,
+            selected_hold_minutes = excluded.selected_hold_minutes,
+            previous_hold_minutes = excluded.previous_hold_minutes,
+            source = excluded.source,
+            evidence_json = excluded.evidence_json
+        """,
+        (
+            now,
+            now,
+            group_name,
+            group_value,
+            int(selected_hold_minutes),
+            previous_hold_minutes,
+            source,
+            json.dumps(evidence, sort_keys=True),
+        ),
+    )
+
+
+def _horizon_metrics_for_group(
+    conn: sqlite3.Connection,
+    group_name: str,
+    group_value: str,
+    horizons: list[int],
+    *,
+    recency_weighting_enabled: bool = True,
+    recency_half_life_days: float = 3.0,
+    confidence_adjustment_enabled: bool = True,
+    confidence_target_effective_samples: float = 48.0,
+    confidence_floor: float = 0.25,
+) -> list[dict]:
+    if not horizons:
+        return []
+    placeholders = ",".join("?" for _ in horizons)
+    if group_name == "signal_key":
+        where_sql = "p.signal_key = ?"
+        params: list[object] = [group_value]
+    elif group_name == "venue_trade_direction":
+        parts = group_value.split("|")
+        if len(parts) != 3:
+            return []
+        where_sql = "p.venue = ? and p.trade_type = ? and p.direction = ?"
+        params = parts
+    elif group_name == "trade_direction":
+        parts = group_value.split("|")
+        if len(parts) != 2:
+            return []
+        where_sql = "p.trade_type = ? and p.direction = ?"
+        params = parts
+    else:
+        return []
+    rows = conn.execute(
+        f"""
+        select o.horizon_minutes,
+               o.pnl_bps,
+               coalesce(o.observed_at, o.measured_at, o.target_at, p.opened_at) as evidence_at
+        from paper_trade_outcomes o
+        join paper_trades p on p.id = o.trade_id
+        where {where_sql}
+          and o.horizon_minutes in ({placeholders})
+          and o.measurement_status = 'valid'
+          and o.pnl_bps is not null
+        """,
+        (*params, *horizons),
+    ).fetchall()
+    now = dt.datetime.now(dt.timezone.utc)
+    grouped: dict[int, list[tuple[float, float]]] = {}
+    half_life = max(float(recency_half_life_days or 0.0), 0.001)
+    target_effective = max(float(confidence_target_effective_samples or 0.0), 1.0)
+    floor = max(0.0, min(1.0, float(confidence_floor)))
+    for row in rows:
+        pnl = float(row["pnl_bps"])
+        weight = 1.0
+        if recency_weighting_enabled:
+            try:
+                evidence_at = _parse_storage_iso(str(row["evidence_at"]))
+                age_days = max(0.0, (now - evidence_at).total_seconds() / 86_400.0)
+                weight = 0.5 ** (age_days / half_life)
+            except (TypeError, ValueError):
+                weight = 1.0
+        grouped.setdefault(int(row["horizon_minutes"]), []).append((pnl, weight))
+    metrics = []
+    for horizon, values in sorted(grouped.items()):
+        count = len(values)
+        weight_sum = sum(weight for _pnl, weight in values) or float(count or 1)
+        weighted_avg = sum(pnl * weight for pnl, weight in values) / weight_sum
+        raw_avg = sum(pnl for pnl, _weight in values) / float(count or 1)
+        weighted_wins = sum(weight for pnl, weight in values if pnl > 0)
+        confidence = min(1.0, max(floor, weight_sum / target_effective))
+        confidence_score = weighted_avg * confidence if confidence_adjustment_enabled else weighted_avg
+        metrics.append(
+            {
+                "horizon_minutes": int(horizon),
+                "count": count,
+                "avg_pnl_bps": float(weighted_avg),
+                "confidence_adjusted_score_bps": float(confidence_score),
+                "confidence": float(confidence),
+                "raw_avg_pnl_bps": float(raw_avg),
+                "win_rate": float(weighted_wins / weight_sum),
+                "weight_sum": float(weight_sum),
+                "recency_weighted": bool(recency_weighting_enabled),
+                "recency_half_life_days": half_life,
+                "confidence_adjusted": bool(confidence_adjustment_enabled),
+                "confidence_target_effective_samples": target_effective,
+            }
+        )
+    return metrics
+
+
+def select_paper_hold_minutes(
+    conn: sqlite3.Connection,
+    trade_row: sqlite3.Row,
+    fallback_hold_minutes: int,
+    settings: dict | None = None,
+) -> dict:
+    cfg = _hold_optimizer_config(settings, fallback_hold_minutes)
+    default_hold = int(cfg["default_hold_minutes"] or fallback_hold_minutes)
+    if not cfg["enabled"]:
+        return {
+            "hold_minutes": int(fallback_hold_minutes),
+            "source": "static_config",
+            "group_name": None,
+            "group_value": None,
+            "metrics": [],
+        }
+    horizons = sorted(set(int(item) for item in cfg["candidate_horizons_minutes"]))
+    if default_hold not in horizons:
+        horizons.append(default_hold)
+        horizons.sort()
+    min_samples = int(cfg["min_samples"])
+    min_uplift = float(cfg["min_avg_uplift_bps"])
+    switch_uplift = float(cfg["switch_uplift_bps"])
+    tie_bps = float(cfg["prefer_shorter_on_tie_bps"])
+    max_steps = int(cfg["max_horizon_steps_per_update"])
+    for group_name in cfg["group_hierarchy"]:
+        group_value = _hold_group_value(trade_row, str(group_name))
+        if not group_value:
+            continue
+        metrics = _horizon_metrics_for_group(
+            conn,
+            str(group_name),
+            group_value,
+            horizons,
+            recency_weighting_enabled=bool(cfg["recency_weighting_enabled"]),
+            recency_half_life_days=float(cfg["recency_half_life_days"]),
+            confidence_adjustment_enabled=bool(cfg["confidence_adjustment_enabled"]),
+            confidence_target_effective_samples=float(cfg["confidence_target_effective_samples"]),
+            confidence_floor=float(cfg["confidence_floor"]),
+        )
+        eligible = [item for item in metrics if int(item["count"]) >= min_samples]
+        policy = _hold_policy(conn, str(group_name), group_value)
+        current_hold = int(policy["selected_hold_minutes"]) if policy and int(policy["selected_hold_minutes"]) in horizons else default_hold
+        if not eligible:
+            if policy and current_hold in horizons:
+                return {
+                    "hold_minutes": current_hold,
+                    "source": "sticky_existing_insufficient_evidence",
+                    "group_name": str(group_name),
+                    "group_value": group_value,
+                    "metrics": metrics,
+                    "min_samples": min_samples,
+                    "default_hold_minutes": default_hold,
+                    "previous_hold_minutes": current_hold,
+                }
+            continue
+        default_metric = next((item for item in eligible if int(item["horizon_minutes"]) == default_hold), None)
+        current_metric = next((item for item in eligible if int(item["horizon_minutes"]) == current_hold), None)
+        anchor_metric = current_metric or default_metric
+        anchor_avg = float(anchor_metric["confidence_adjusted_score_bps"]) if anchor_metric else None
+
+        def sort_key(item: dict) -> tuple[float, float, int]:
+            avg = float(item["confidence_adjusted_score_bps"])
+            # Prefer shorter horizons only when expectancy is effectively tied.
+            tie_bonus = max(0, max(horizons) - int(item["horizon_minutes"])) if anchor_avg is not None and abs(avg - anchor_avg) <= tie_bps else 0
+            return (avg, tie_bonus, -int(item["horizon_minutes"]))
+
+        best = max(eligible, key=sort_key)
+        required_uplift = switch_uplift if policy else min_uplift
+        if anchor_avg is not None and float(best["confidence_adjusted_score_bps"]) < anchor_avg + required_uplift:
+            chosen = current_hold
+            source = "sticky_no_material_uplift" if policy else "default_no_material_uplift"
+        else:
+            chosen = _step_horizon_toward(current_hold, int(best["horizon_minutes"]), horizons, max_steps)
+            source = "optimized_valid_outcomes"
+            if chosen != int(best["horizon_minutes"]):
+                source = "optimized_gradual_step"
+        evidence = {
+            "metrics": metrics,
+            "best": best,
+            "anchor_confidence_adjusted_score_bps": anchor_avg,
+            "current_hold_minutes": current_hold,
+            "required_uplift_bps": required_uplift,
+            "max_horizon_steps_per_update": max_steps,
+        }
+        _upsert_hold_policy(
+            conn,
+            group_name=str(group_name),
+            group_value=group_value,
+            selected_hold_minutes=chosen,
+            previous_hold_minutes=current_hold,
+            source=source,
+            evidence=evidence,
+        )
+        return {
+            "hold_minutes": chosen,
+            "source": source,
+            "group_name": str(group_name),
+            "group_value": group_value,
+            "metrics": metrics,
+            "min_samples": min_samples,
+            "default_hold_minutes": default_hold,
+            "previous_hold_minutes": current_hold,
+            "best_hold_minutes": int(best["horizon_minutes"]),
+            "required_uplift_bps": required_uplift,
+            "score_field": "confidence_adjusted_score_bps",
+        }
+    return {
+        "hold_minutes": default_hold,
+        "source": "default_insufficient_evidence",
+        "group_name": None,
+        "group_value": None,
+        "metrics": [],
+        "min_samples": min_samples,
+        "default_hold_minutes": default_hold,
+    }
 
 
 def close_due_trades(
@@ -827,12 +1189,27 @@ def close_due_trades(
     closed = []
     rows = conn.execute(
         """
-        select id, opened_at, inst_id, direction, entry
+        select id, opened_at, venue, inst_id, direction, trade_type, signal_key, entry,
+               selected_hold_minutes, hold_decision_json
         from paper_trades
         where status = 'open'
         """
     ).fetchall()
     for row in rows:
+        if row["selected_hold_minutes"]:
+            selected_hold_minutes = int(row["selected_hold_minutes"])
+            try:
+                hold_decision = json.loads(row["hold_decision_json"] or "{}")
+            except ValueError:
+                hold_decision = {}
+            hold_decision = {
+                "hold_minutes": selected_hold_minutes,
+                "source": hold_decision.get("source", "stored_on_trade"),
+                **hold_decision,
+            }
+        else:
+            hold_decision = select_paper_hold_minutes(conn, row, hold_minutes, settings)
+            selected_hold_minutes = int(hold_decision["hold_minutes"])
         outcome = conn.execute(
             """
             select target_at, observed_at, delay_seconds, measurement_status,
@@ -841,7 +1218,7 @@ def close_due_trades(
             where trade_id = ? and horizon_minutes = ?
             limit 1
             """,
-            (row["id"], int(hold_minutes)),
+            (row["id"], selected_hold_minutes),
         ).fetchone()
         if not outcome:
             continue
@@ -873,6 +1250,8 @@ def close_due_trades(
                     "direction": row["direction"],
                     "pnl_bps": None,
                     "measurement_status": status,
+                    "hold_minutes": selected_hold_minutes,
+                    "hold_decision": hold_decision,
                 }
             )
             continue
@@ -906,6 +1285,8 @@ def close_due_trades(
                 "direction": row["direction"],
                 "pnl_bps": round(pnl_bps, 3),
                 "measurement_status": status,
+                "hold_minutes": selected_hold_minutes,
+                "hold_decision": hold_decision,
             }
         )
     conn.commit()
