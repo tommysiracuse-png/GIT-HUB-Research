@@ -66,6 +66,69 @@ DEFAULT_PAPER_ONLY_FRONTIER_LONG_COHORT_POLICY = {
     "suppress_floor": 0.60,
 }
 
+DEFAULT_PAPER_ONLY_FRONTIER_VENUE_DIRECTION_EXPECTANCY_REGISTRY = {
+    "OKX_SPOT_LONG": {
+        "enabled": True,
+        "min_closed_trades": 8,
+        "min_expectancy_bps": 0.0,
+    },
+    "BYBIT_SPOT_LONG": {
+        "enabled": True,
+        "min_closed_trades": 8,
+        "min_expectancy_bps": 0.0,
+    },
+}
+
+
+def _paper_frontier_venue_direction_key(venue: str, direction: str) -> str:
+    return f"{str(venue).strip().upper()}_{str(direction).strip().upper()}"
+
+
+def paper_only_frontier_venue_direction_expectancy_gate(
+    *,
+    venue: str,
+    direction: str,
+    context_stats: dict | None = None,
+    registry: dict | None = None,
+    enabled: bool = True,
+    min_closed_trades: int = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["min_closed_trades"],
+    min_confidence_to_allow: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["min_confidence_to_allow"],
+    min_multiplier_to_allow: float = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["min_multiplier_to_allow"],
+    block_on_negative_expectancy: bool = DEFAULT_PAPER_ONLY_VENUE_DIRECTION_EXPECTANCY_POLICY["block_on_negative_expectancy"],
+) -> dict:
+    """Paper-only gate for frontier spot venue-direction entries."""
+
+    key = _paper_frontier_venue_direction_key(venue, direction)
+    registry = registry or DEFAULT_PAPER_ONLY_FRONTIER_VENUE_DIRECTION_EXPECTANCY_REGISTRY
+    entry = copy.deepcopy(registry.get(key, {}))
+    stats = context_stats or {}
+
+    if not enabled:
+        return {"enabled": False, "allow": False, "key": key, "reason": "disabled"}
+
+    if not entry.get("enabled", False):
+        return {"enabled": True, "allow": False, "key": key, "reason": "not_allowlisted"}
+
+    closed_trades = int(stats.get("closed_trade_count") or stats.get("closed_trades") or 0)
+    expectancy_bps = float(stats.get("recent_expectancy_bps") or stats.get("expectancy_bps") or 0.0)
+    confidence = float(stats.get("confidence") or stats.get("paper_confidence") or 0.0)
+    multiplier = float(stats.get("score_multiplier") or 0.0)
+
+    if closed_trades < int(entry.get("min_closed_trades", min_closed_trades)):
+        return {"enabled": True, "allow": False, "key": key, "reason": "insufficient_closed_trades"}
+
+    if confidence and confidence < float(min_confidence_to_allow):
+        return {"enabled": True, "allow": False, "key": key, "reason": "low_confidence"}
+
+    if multiplier and multiplier < float(min_multiplier_to_allow):
+        return {"enabled": True, "allow": False, "key": key, "reason": "low_multiplier"}
+
+    min_expectancy = float(entry.get("min_expectancy_bps", 0.0))
+    if block_on_negative_expectancy and expectancy_bps < min_expectancy:
+        return {"enabled": True, "allow": False, "key": key, "reason": "negative_expectancy"}
+
+    return {"enabled": True, "allow": True, "key": key, "reason": "allowlisted"}
+
 
 def paper_only_frontier_long_cohort_gate(
     *,
