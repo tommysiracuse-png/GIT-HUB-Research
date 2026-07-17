@@ -263,6 +263,77 @@ class SmartFailureFilterTests(unittest.TestCase):
         self.assertEqual(result[0]["action_status"], "skipped")
         self.assertEqual(result[0]["skip_reason"], "route_requirements_already_implemented")
 
+    def test_duplicate_global_discovery_tasks_are_skipped_after_implementation(self) -> None:
+        conn = memory_conn()
+        conn.execute(
+            """
+            insert into growth_experiments (created_at, priority, signal_key, hypothesis, action, evidence_json, status)
+            values ('now', 82, 'global_discovery|equity_or_proxy',
+                    'implemented global market discovery scan', 'done', '{}',
+                    'implemented_global_market_discovery_scan')
+            """
+        )
+        conn.commit()
+
+        llm_bridge._apply_recommendation(
+            conn,
+            "request_market_adapter",
+            "Extend global market discovery scanner for London Stock Exchange",
+            "Global discovery proxy map already covers LSE equities and ADR proxies.",
+            82,
+            {
+                "market_key": "global_discovery|London Stock Exchange",
+                "proposed_change": "Extend global market discovery scanner for London Stock Exchange.",
+            },
+        )
+        rows = conn.execute("select title from improvement_tasks where status = 'open'").fetchall()
+        self.assertEqual(rows, [])
+
+        result = self_improvement._execute_adapter_spec(
+            conn,
+            {
+                "recommendation_id": "gmd-dup",
+                "payload": {
+                    "title": "Global discovery adapter for London Stock Exchange",
+                    "market_key": "global_discovery|London Stock Exchange",
+                    "rationale": "The scanner/proxy map already covers this surface.",
+                    "proposed_change": "Add another global discovery scanner proxy map for LSE.",
+                },
+            },
+        )
+        self.assertEqual(result[0]["action_status"], "skipped")
+        self.assertEqual(result[0]["skip_reason"], "global_market_discovery_scan_already_implemented")
+
+    def test_unseen_global_market_still_creates_task_after_global_scan_implementation(self) -> None:
+        conn = memory_conn()
+        conn.execute(
+            """
+            insert into growth_experiments (created_at, priority, signal_key, hypothesis, action, evidence_json, status)
+            values ('now', 82, 'global_discovery|equity_or_proxy',
+                    'implemented global market discovery scan', 'done', '{}',
+                    'implemented_global_market_discovery_scan')
+            """
+        )
+        conn.commit()
+
+        llm_bridge._apply_recommendation(
+            conn,
+            "request_market_adapter",
+            "Add Nairobi Coffee Exchange auction feed",
+            "Build public observations for a new unlisted market so the global discovery worker can rank it.",
+            88,
+            {
+                "market_key": "global_discovery|Nairobi Coffee Exchange",
+                "proposed_change": (
+                    "Add unseen public auction data for coffee settlement prices and paper-only observation."
+                ),
+            },
+        )
+
+        rows = conn.execute("select title from improvement_tasks where status = 'open'").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertIn("Nairobi Coffee Exchange", rows[0]["title"])
+
 
 if __name__ == "__main__":
     unittest.main()

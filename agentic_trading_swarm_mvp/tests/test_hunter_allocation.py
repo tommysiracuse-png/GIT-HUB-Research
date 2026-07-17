@@ -104,6 +104,62 @@ class HunterAllocationTests(unittest.TestCase):
                 hunter_allocation.REPORT_MD = old_md
                 hunter_allocation.DISCOVERY_JSONL = old_discovery
 
+    def test_global_discovery_candidates_receive_explore_floor_without_directive(self) -> None:
+        candidates = [
+            {"inst_id": "OKX-BTC-SWAP", "venue": "OKX", "signal_key": "OKX funding", "score": 99},
+            {
+                "inst_id": "B3:EWZ",
+                "venue": "B3",
+                "trade_type": "global_market_discovery_proxy",
+                "market_surface": "global_market_discovery",
+                "market_key": "global_discovery|B3",
+                "score": 42,
+            },
+            {"inst_id": "MEXC-XYZ-USDT", "venue": "MEXC", "signal_key": "frontier", "score": 98},
+        ]
+
+        selected, report = allocate_candidate_review(
+            candidates,
+            [],
+            2,
+            buckets={"exploit": 0.0, "explore": 0.5, "diagnose": 0.0},
+        )
+
+        b3 = next(row for row in selected if row["inst_id"] == "B3:EWZ")
+        self.assertEqual(b3["_hunter_bucket"], "explore")
+        self.assertEqual(b3["_hunter_allocation_reason"], "global_discovery_exploration_floor")
+        self.assertEqual(report["selected_by_bucket"]["explore"], 1)
+
+    def test_global_discovery_floor_reserves_four_explore_slots_when_available(self) -> None:
+        candidates = [
+            {"inst_id": "OKX-BTC-SWAP", "venue": "OKX", "signal_key": "OKX funding", "score": 99},
+            {"inst_id": "MEXC-XYZ-USDT", "venue": "MEXC", "signal_key": "frontier", "score": 98},
+        ]
+        for idx, venue in enumerate(("B3", "LONDON_STOCK_EXCHANGE", "TMX_GROUP", "CBOE_GLOBAL_MARKETS", "HKEX"), start=1):
+            candidates.append(
+                {
+                    "inst_id": f"{venue}:PROXY{idx}",
+                    "venue": venue,
+                    "trade_type": "global_market_discovery_proxy",
+                    "market_surface": "global_market_discovery",
+                    "market_key": f"global_discovery|{venue}",
+                    "score": 60 - idx,
+                }
+            )
+
+        selected, report = allocate_candidate_review(
+            candidates,
+            [],
+            6,
+            buckets={"exploit": 0.0, "explore": 1.0, "diagnose": 0.0},
+        )
+
+        floor_selected = [
+            row for row in selected if row.get("_hunter_allocation_reason") == "global_discovery_exploration_floor"
+        ]
+        self.assertGreaterEqual(len(floor_selected), 4)
+        self.assertEqual(report["selected_by_bucket"]["explore"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

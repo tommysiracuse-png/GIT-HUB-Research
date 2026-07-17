@@ -572,7 +572,7 @@ def _repair_okx_candidate(candidate: dict) -> dict | None:
 
 
 def _repair_proxy_candidate(candidate: dict) -> dict | None:
-    if candidate.get("trade_type") != "global_proxy_momentum":
+    if candidate.get("trade_type") not in {"global_proxy_momentum", "global_market_discovery_proxy"}:
         return None
     direction = str(candidate.get("direction") or "")
     move = _as_float(candidate.get("change_24h_pct"), 0.0)
@@ -643,7 +643,7 @@ def _apply_one(candidate: dict) -> dict | None:
         return _repair_frontier_candidate(candidate)
     if trade_type == "perp_funding_basis":
         return _repair_okx_candidate(candidate)
-    if trade_type == "global_proxy_momentum":
+    if trade_type in {"global_proxy_momentum", "global_market_discovery_proxy"}:
         return _repair_proxy_candidate(candidate)
     return None
 

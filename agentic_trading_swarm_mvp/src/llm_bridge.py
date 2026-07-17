@@ -93,7 +93,45 @@ IMPLEMENTED_MANUAL_STATUSES = {
         "implemented_kucoin_long_repair_diagnostics",
         ("improvement_tasks", "growth_experiments"),
     ),
+    "global_market_discovery_scan": (
+        "implemented_global_market_discovery_scan",
+        ("adapter_specs", "growth_experiments", "route_probe_tasks", "market_hunter_directives"),
+    ),
 }
+
+GLOBAL_MARKET_DISCOVERY_IMPLEMENTED_TERMS = (
+    "proxy map",
+    "proxy-priced",
+    "bybit",
+    "bitso",
+    "valr",
+    "luno",
+    "b3",
+    "cme group",
+    "eurex",
+    "national stock exchange of india",
+    "japan exchange group",
+    "frankfurter",
+    "ecb reference fx",
+    "manifold markets",
+    "finra trace",
+    "pinnacle api",
+    "london stock exchange",
+    "tmx group",
+    "hong kong exchanges",
+    "euronext",
+    "taiwan stock exchange",
+    "korea exchange",
+    "bolsa mexicana",
+    "australian securities exchange",
+    "six swiss exchange",
+    "cboe global markets",
+    "johannesburg stock exchange",
+    "singapore exchange",
+    "intercontinental exchange",
+    "saudi exchange",
+    "london metal exchange",
+)
 
 REQUIRED_RECOMMENDATION_FIELDS = (
     "action",
@@ -889,6 +927,18 @@ def _implemented_manual_category(text: str) -> str | None:
     text = text.lower()
     if is_duplicate_open_pack_text(text):
         return "self_improvement_open_pack"
+    global_discovery_implemented = (
+        "global_discovery|" in text
+        or any(term in text for term in GLOBAL_MARKET_DISCOVERY_IMPLEMENTED_TERMS)
+        or (
+            any(term in text for term in ("global market discovery", "global_market_discovery", "global discovery"))
+            and any(term in text for term in ("scanner", "scan", "proxy", "seed", "surface list", "coverage map"))
+        )
+    )
+    if global_discovery_implemented and not any(
+        term in text for term in ("new unlisted market", "new venue not in scanner", "add unseen")
+    ):
+        return "global_market_discovery_scan"
     if any(
         term in text
         for term in (

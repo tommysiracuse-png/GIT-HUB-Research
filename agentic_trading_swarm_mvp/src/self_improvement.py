@@ -85,7 +85,45 @@ IMPLEMENTED_MANUAL_STATUSES = {
         "implemented_regional_fx_frontier_prediction_pack",
         ("route_probe_tasks", "improvement_tasks", "adapter_specs"),
     ),
+    "global_market_discovery_scan": (
+        "implemented_global_market_discovery_scan",
+        ("adapter_specs", "growth_experiments", "route_probe_tasks", "market_hunter_directives"),
+    ),
 }
+
+GLOBAL_MARKET_DISCOVERY_IMPLEMENTED_TERMS = (
+    "proxy map",
+    "proxy-priced",
+    "bybit",
+    "bitso",
+    "valr",
+    "luno",
+    "b3",
+    "cme group",
+    "eurex",
+    "national stock exchange of india",
+    "japan exchange group",
+    "frankfurter",
+    "ecb reference fx",
+    "manifold markets",
+    "finra trace",
+    "pinnacle api",
+    "london stock exchange",
+    "tmx group",
+    "hong kong exchanges",
+    "euronext",
+    "taiwan stock exchange",
+    "korea exchange",
+    "bolsa mexicana",
+    "australian securities exchange",
+    "six swiss exchange",
+    "cboe global markets",
+    "johannesburg stock exchange",
+    "singapore exchange",
+    "intercontinental exchange",
+    "saudi exchange",
+    "london metal exchange",
+)
 
 
 def _utc_now() -> str:
@@ -672,6 +710,21 @@ def _duplicate_regional_fx_frontier_prediction_pack_payload(payload: dict) -> bo
     return regional_fx or adaptive_depth or prediction_intelligence
 
 
+def _duplicate_global_market_discovery_scan_payload(payload: dict) -> bool:
+    text = _text_for_payload(payload)
+    if any(term in text for term in ("new unlisted market", "new venue not in scanner", "add unseen")):
+        return False
+    if "global_discovery|" in text or any(term in text for term in GLOBAL_MARKET_DISCOVERY_IMPLEMENTED_TERMS):
+        return True
+    mentions_global_discovery = any(
+        term in text for term in ("global market discovery", "global_market_discovery", "global discovery")
+    )
+    mentions_implemented_scan = any(
+        term in text for term in ("scanner", "scan", "proxy", "seed", "surface list", "coverage map")
+    )
+    return mentions_global_discovery and mentions_implemented_scan
+
+
 def _duplicate_strategy_reliability_pack_payload(payload: dict) -> bool:
     text = _text_for_payload(payload)
     return any(
@@ -1199,6 +1252,17 @@ def _execute_failure_filter(conn: sqlite3.Connection, rec: dict, settings: dict)
 
 def _execute_route_resolver(conn: sqlite3.Connection, rec: dict) -> list[dict]:
     payload = rec["payload"]
+    if _duplicate_global_market_discovery_scan_payload(payload) and _implemented_manual_category_exists(
+        conn, "global_market_discovery_scan"
+    ):
+        return [
+            {
+                "action_status": "skipped",
+                "skip_reason": "global_market_discovery_scan_already_implemented",
+                "market_key": payload.get("market_key") or "global_discovery",
+                "route_key": payload.get("signal_key") or "global_market_discovery",
+            }
+        ]
     if _duplicate_regional_fx_frontier_prediction_pack_payload(payload) and _implemented_manual_category_exists(
         conn, "regional_fx_frontier_prediction_pack"
     ):
@@ -1263,6 +1327,16 @@ def _execute_route_resolver(conn: sqlite3.Connection, rec: dict) -> list[dict]:
 
 def _execute_adapter_spec(conn: sqlite3.Connection, rec: dict) -> list[dict]:
     payload = rec["payload"]
+    if _duplicate_global_market_discovery_scan_payload(payload) and _implemented_manual_category_exists(
+        conn, "global_market_discovery_scan"
+    ):
+        return [
+            {
+                "action_status": "skipped",
+                "skip_reason": "global_market_discovery_scan_already_implemented",
+                "market_key": payload.get("market_key") or payload.get("signal_key") or "global_market_discovery",
+            }
+        ]
     if _duplicate_regional_fx_frontier_prediction_pack_payload(payload) and _implemented_manual_category_exists(
         conn, "regional_fx_frontier_prediction_pack"
     ):
@@ -1447,6 +1521,16 @@ def _execute_signal_variant(conn: sqlite3.Connection, rec: dict) -> list[dict]:
 
 def _execute_diagnostic_hypothesis(conn: sqlite3.Connection, rec: dict) -> list[dict]:
     payload = rec["payload"]
+    if _duplicate_global_market_discovery_scan_payload(payload) and _implemented_manual_category_exists(
+        conn, "global_market_discovery_scan"
+    ):
+        return [
+            {
+                "action_status": "skipped",
+                "skip_reason": "global_market_discovery_scan_already_implemented",
+                "signal_key": payload.get("signal_key") or payload.get("market_key") or "global_market_discovery",
+            }
+        ]
     evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
     signal = str(payload.get("signal_key") or payload.get("market_key") or "signal_redesign")
     add_growth_experiment(

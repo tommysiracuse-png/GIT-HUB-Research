@@ -25,6 +25,7 @@ from crypto_venue_scanner import scan as scan_crypto_venues, write_outputs as wr
 from execution_engine import execute_order
 from frontier_crypto_adapter import REPORT_JSON as FRONTIER_CRYPTO_REPORT_JSON
 from frontier_crypto_adapter import build_scan_batch as build_frontier_crypto_scan_batch
+from global_market_discovery_scanner import build_scan_batch as build_global_market_discovery_scan_batch
 from global_proxy_scanner import build_scan_batch as build_global_proxy_scan_batch
 from hunter_allocation import allocate_candidate_review, write_hunter_allocation_report
 from learning import load_adjustments, stats_snapshot, update_signal_stats
@@ -93,6 +94,7 @@ def _build_expansion_map(
     frontier_crypto_venues: dict,
     route_resolver_report: dict,
     prediction_summary: dict,
+    global_market_discovery_scan: dict | None = None,
 ) -> dict:
     frontier_summary = (frontier_crypto_venues or {}).get("summary", {})
     frontier_expansion = frontier_summary.get("expansion_map", {})
@@ -106,6 +108,7 @@ def _build_expansion_map(
             regional_fx = {"status": "unreadable", "path": str(fx_path)}
     return {
         "frontier_crypto": frontier_expansion,
+        "global_market_discovery_scan": global_market_discovery_scan or {},
         "regional_fx_reference": {
             "reference_count": regional_fx.get("reference_count", 0),
             "stale_count": regional_fx.get("stale_count", 0),
@@ -124,6 +127,7 @@ def _build_expansion_map(
         },
         "reports": {
             "frontier": str(RUNS_DIR / "frontier_crypto_venues_report.md"),
+            "global_market_discovery_scan": str(RUNS_DIR / "global_market_discovery_scan_report.md"),
             "regional_fx_reference": str(fx_path),
             "prediction_markets": str(RUNS_DIR / "prediction_markets_latest.json"),
             "route_intelligence": str(RUNS_DIR / "route_intelligence_report.md"),
@@ -169,6 +173,19 @@ def run_once(settings: dict) -> dict:
             batches.append(global_batch)
             candidates.extend(global_batch.candidates)
             candidates.sort(key=lambda row: row["score"], reverse=True)
+        global_market_discovery_scan = {}
+        if scan_cfg.get("enable_global_market_discovery_scan", True) and settings.get(
+            "global_market_discovery_scanner", {}
+        ).get("enabled", True):
+            global_discovery_batch = build_global_market_discovery_scan_batch(
+                settings,
+                limit=int(scan_cfg.get("global_market_discovery_review_top", 35)),
+                required_inst_ids=required.get("global_market_discovery_proxy", set()),
+            )
+            batches.append(global_discovery_batch)
+            candidates.extend(global_discovery_batch.candidates)
+            candidates.sort(key=lambda row: row["score"], reverse=True)
+            global_market_discovery_scan = global_discovery_batch.metadata.get("global_market_discovery_scan", {})
         if scan_cfg.get("enable_prediction_market_scan", False):
             prediction_batch = build_prediction_market_scan_batch(
                 settings,
@@ -218,7 +235,12 @@ def run_once(settings: dict) -> dict:
         candidates = enrich_candidates(candidates, settings)
         candidates, strategy_reliability = apply_strategy_reliability(candidates, settings, conn=conn)
         route_resolver_report = write_route_resolver_report(candidates, settings)
-        expansion_map = _build_expansion_map(frontier_crypto_venues, route_resolver_report, prediction_summary)
+        expansion_map = _build_expansion_map(
+            frontier_crypto_venues,
+            route_resolver_report,
+            prediction_summary,
+            global_market_discovery_scan,
+        )
         self_improvement_open_pack = build_open_pack_report(
             conn,
             settings,
@@ -319,6 +341,7 @@ def run_once(settings: dict) -> dict:
             "horizon_outcomes": horizon_outcomes,
             "crypto_venue_health": venue_health,
             "frontier_crypto_venues": frontier_crypto_venues,
+            "global_market_discovery_scan": global_market_discovery_scan,
             "signal_redesign": signal_redesign,
             "okx_signal_research": okx_signal_research,
             "strategy_reliability": strategy_reliability,

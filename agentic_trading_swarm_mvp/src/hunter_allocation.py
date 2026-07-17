@@ -11,6 +11,7 @@ from storage import RUNS_DIR
 
 
 DEFAULT_BUCKETS = {"exploit": 0.5, "explore": 0.3, "diagnose": 0.2}
+GLOBAL_DISCOVERY_MIN_EXPLORE_SLOTS = 4
 REPORT_JSON = RUNS_DIR / "hunter_allocation_report.json"
 REPORT_MD = RUNS_DIR / "hunter_allocation_report.md"
 DISCOVERY_JSONL = RUNS_DIR / "market_discovery_candidates.jsonl"
@@ -74,6 +75,14 @@ def _best_matching_directive(candidate: dict[str, Any], directives: list[dict[st
     return sorted(matches, key=lambda row: int(row.get("priority") or 0), reverse=True)[0]
 
 
+def _is_global_discovery_candidate(candidate: dict[str, Any]) -> bool:
+    return (
+        candidate.get("market_surface") == "global_market_discovery"
+        or candidate.get("trade_type") == "global_market_discovery_proxy"
+        or str(candidate.get("market_key") or "").lower().startswith("global_discovery|")
+    )
+
+
 def allocate_candidate_review(
     candidates: list[dict[str, Any]],
     directives: list[dict[str, Any]],
@@ -87,6 +96,23 @@ def allocate_candidate_review(
     for bucket, bucket_directives in allocation["selected_directives"].items():
         target = allocation["slot_targets"].get(bucket, 0)
         bucket_selected = 0
+        if bucket == "explore" and target > 0:
+            floor = min(target, GLOBAL_DISCOVERY_MIN_EXPLORE_SLOTS)
+            for candidate in candidates:
+                if bucket_selected >= floor:
+                    break
+                if id(candidate) in selected_ids:
+                    continue
+                if not _is_global_discovery_candidate(candidate):
+                    continue
+                row = dict(candidate)
+                row["_hunter_bucket"] = "explore"
+                row["_hunter_directive_id"] = None
+                row["_hunter_allocation_reason"] = "global_discovery_exploration_floor"
+                selected.append(row)
+                selected_ids.add(id(candidate))
+                by_bucket["explore"] += 1
+                bucket_selected += 1
         for candidate in candidates:
             if bucket_selected >= target:
                 break
@@ -101,6 +127,22 @@ def allocate_candidate_review(
                 selected.append(row)
                 selected_ids.add(id(candidate))
                 by_bucket[bucket] += 1
+                bucket_selected += 1
+        if bucket == "explore" and bucket_selected < target:
+            for candidate in candidates:
+                if bucket_selected >= target:
+                    break
+                if id(candidate) in selected_ids:
+                    continue
+                if not _is_global_discovery_candidate(candidate):
+                    continue
+                row = dict(candidate)
+                row["_hunter_bucket"] = "explore"
+                row["_hunter_directive_id"] = None
+                row["_hunter_allocation_reason"] = "global_discovery_exploration_floor"
+                selected.append(row)
+                selected_ids.add(id(candidate))
+                by_bucket["explore"] += 1
                 bucket_selected += 1
     for candidate in candidates:
         if len(selected) >= total_slots:

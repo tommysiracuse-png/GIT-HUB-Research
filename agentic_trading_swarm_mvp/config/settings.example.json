@@ -15,10 +15,12 @@
     "scan_universe": 100,
     "review_top": 25,
     "enable_global_proxy_scan": true,
+    "enable_global_market_discovery_scan": true,
     "enable_prediction_market_scan": true,
     "enable_crypto_venue_health_scan": true,
     "enable_frontier_crypto_adapter_scan": true,
     "global_review_top": 40,
+    "global_market_discovery_review_top": 75,
     "prediction_review_top": 40,
     "frontier_crypto_review_top": 40,
     "paper_trade_conditional": true,
@@ -46,6 +48,16 @@
     "enabled": true,
     "timeout_seconds": 8,
     "min_dislocation_bps": 12.0
+  },
+  "global_market_discovery_scanner": {
+    "enabled": true,
+    "min_discovery_priority": 70,
+    "max_surfaces_per_cycle": 28,
+    "max_proxy_symbols_per_surface": 4,
+    "workers": 12,
+    "merge_default_seeds": true,
+    "watch_only_stale_minutes": 180,
+    "priceable_candidate_score_floor": 42.0
   },
   "frontier_data_quality": {
     "enabled": true,
@@ -218,9 +230,10 @@
     "global_market_discovery": true,
     "web_research_enabled": true,
     "run_every_evolution_cycle": true,
-    "max_candidates_per_run": 50,
+    "max_candidates_per_run": 80,
     "max_artifacts_per_run": 20,
     "artifact_priority_floor": 70,
+    "suppress_implemented_global_discovery_artifacts": true,
     "discovery_seeds": []
   },
   "autonomous_builder": {

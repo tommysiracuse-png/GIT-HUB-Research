@@ -101,6 +101,21 @@ class RouteResolverTests(unittest.TestCase):
         self.assertIn("broker_or_venue", route["missing_permissions"])
         self.assertIn("api_or_manual_workflow", route["missing_permissions"])
 
+    def test_global_market_discovery_proxy_uses_existing_equity_paper_route(self) -> None:
+        candidate = {
+            "venue": "B3",
+            "trade_type": "global_market_discovery_proxy",
+            "direction": "long_proxy",
+            "asset_class": "equity_or_proxy",
+            "score": 78.0,
+        }
+        route = route_resolver.resolve_candidate_route(candidate, settings())
+
+        self.assertEqual(route["route_id"], "equity_proxy_paper")
+        self.assertEqual(route["route_status"], "standard")
+        self.assertEqual(route["missing_permissions"], [])
+        self.assertIn("Global discovery proxy exposure", route["route_notes"][0])
+
     def test_enriched_candidate_preserves_legacy_feasibility_fields(self) -> None:
         candidate = {
             "venue": "OKX",

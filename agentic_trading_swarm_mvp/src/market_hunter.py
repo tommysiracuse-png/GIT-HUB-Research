@@ -62,6 +62,10 @@ IMPLEMENTED_CATEGORY_STATUSES = {
         "implemented_self_improvement_open_pack_2026_06_29",
         ("improvement_tasks", "growth_experiments"),
     ),
+    "global_market_discovery_scan": (
+        "implemented_global_market_discovery_scan",
+        ("adapter_specs", "growth_experiments", "route_probe_tasks", "market_hunter_directives"),
+    ),
 }
 
 
@@ -102,6 +106,8 @@ def _classify_implemented_directive(item: dict) -> str | None:
     ).lower()
     evidence = item.get("evidence") or {}
     text = primary_text + " " + json.dumps(evidence, sort_keys=True).lower()
+    if "global_market_discovery" in text or "global discovery" in text or primary_text.startswith("global_discovery|"):
+        return "global_market_discovery_scan"
     if "okx" in primary_text and "reliable" in primary_text and any(
         term in primary_text for term in ("label", "outcome", "legacy_unverified")
     ):

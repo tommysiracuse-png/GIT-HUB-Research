@@ -28,6 +28,7 @@ from storage import (
 REPORT_JSON = RUNS_DIR / "research_worker_latest.json"
 REPORT_MD = RUNS_DIR / "research_worker_report.md"
 CANDIDATES_JSONL = RUNS_DIR / "market_discovery_candidates.jsonl"
+IMPLEMENTED_GLOBAL_DISCOVERY_STATUS = "implemented_global_market_discovery_scan"
 
 DATA_ACCESS_TYPES = {"public_no_key", "public_key_required", "broker_account", "paid_data", "unknown"}
 TRADABILITY_GUESSES = {"directly_tradable", "route_needed", "watch_only", "unknown"}
@@ -284,6 +285,291 @@ DEFAULT_GLOBAL_DISCOVERY_SEEDS: list[dict[str, Any]] = [
         "priority": 72,
         "confidence": 0.55,
     },
+    {
+        "surface_type_raw": "local exchange equities, ETFs, and derivatives",
+        "venue_or_source": "London Stock Exchange",
+        "country": "United Kingdom",
+        "region": "Europe",
+        "asset_or_event": "UK equities, ETFs, ADR relationships, and index-linked products",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.londonstockexchange.com/",
+        "source_urls": ["https://www.londonstockexchange.com/"],
+        "why_interesting": "UK cash equities and ADR/ETF proxies trade across different sessions and currencies.",
+        "inefficiency_hypothesis": "Local close, GBP/USD moves, and ADR/ETF proxy repricing can create stale-price or session-gap opportunities.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "large developed-market exchange",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 82,
+        "confidence": 0.69,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "TMX Group",
+        "country": "Canada",
+        "region": "North America",
+        "asset_or_event": "Canadian equities, ETFs, banks, miners, and CAD-sensitive assets",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.tmx.com/",
+        "source_urls": ["https://www.tmx.com/"],
+        "why_interesting": "Canada has liquid cross-listed equities and commodity-sensitive local markets.",
+        "inefficiency_hypothesis": "CAD, commodities, and US-listed proxies may temporarily misprice local Canadian exposure.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "large exchange with many cross-listed names",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 80,
+        "confidence": 0.68,
+    },
+    {
+        "surface_type_raw": "local exchange equities, ETFs, and derivatives",
+        "venue_or_source": "Hong Kong Exchanges and Clearing",
+        "country": "Hong Kong",
+        "region": "Asia",
+        "asset_or_event": "Hong Kong equities, China ADR/H-share relationships, ETFs and derivatives",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.hkex.com.hk/",
+        "source_urls": ["https://www.hkex.com.hk/"],
+        "why_interesting": "Hong Kong links mainland China, US ADRs, regional ETFs, and local market hours.",
+        "inefficiency_hypothesis": "ADR/H-share, ETF, FX, and overnight news relationships can produce short-horizon proxy gaps.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "large regional exchange",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 80,
+        "confidence": 0.68,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "Euronext",
+        "country": "Multiple",
+        "region": "Europe",
+        "asset_or_event": "France, Netherlands, Belgium, Portugal, Ireland and pan-European equity products",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.euronext.com/",
+        "source_urls": ["https://www.euronext.com/"],
+        "why_interesting": "Pan-European local markets provide many ETF and ADR proxy relationships.",
+        "inefficiency_hypothesis": "Regional session timing, EUR moves, and index/sector proxies can produce temporary dislocations.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "large multi-country exchange group",
+        "route_blockers": ["broker_route", "market_data_terms"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 79,
+        "confidence": 0.66,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "Bolsa Mexicana de Valores",
+        "country": "Mexico",
+        "region": "LATAM",
+        "asset_or_event": "Mexican equities, ETFs, ADRs, and MXN-sensitive listed exposure",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.bmv.com.mx/",
+        "source_urls": ["https://www.bmv.com.mx/"],
+        "why_interesting": "Mexico combines local equities, ADRs, MXN exposure, and LATAM regional flows.",
+        "inefficiency_hypothesis": "Local market, ADR, ETF and FX timing gaps may create short-horizon proxy edges.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "regional exchange with ADR links",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 78,
+        "confidence": 0.64,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "Taiwan Stock Exchange",
+        "country": "Taiwan",
+        "region": "Asia",
+        "asset_or_event": "Taiwan equities, semiconductors, ETFs and ADR-linked local exposure",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.twse.com.tw/",
+        "source_urls": ["https://www.twse.com.tw/"],
+        "why_interesting": "Taiwan is semiconductor-heavy and has liquid ETF/ADR proxy exposure.",
+        "inefficiency_hypothesis": "Semiconductor news, local hours, and ADR/ETF repricing can create tradable proxy lag.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "large regional exchange",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 78,
+        "confidence": 0.66,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "Korea Exchange",
+        "country": "South Korea",
+        "region": "Asia",
+        "asset_or_event": "Korean equities, index futures/options, ETFs and ADR-linked exposure",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://global.krx.co.kr/",
+        "source_urls": ["https://global.krx.co.kr/"],
+        "why_interesting": "Korea has liquid global-linked technology, financial and index exposure.",
+        "inefficiency_hypothesis": "Local session moves and ADR/ETF proxies may lag each other around regional catalysts.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "large regional exchange",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 78,
+        "confidence": 0.65,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "SIX Swiss Exchange",
+        "country": "Switzerland",
+        "region": "Europe",
+        "asset_or_event": "Swiss equities, ETFs, defensive mega-cap ADR/local relationships",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.six-group.com/en/products-services/the-swiss-stock-exchange.html",
+        "source_urls": ["https://www.six-group.com/en/products-services/the-swiss-stock-exchange.html"],
+        "why_interesting": "Swiss defensive equities and CHF exposure can diverge from US-listed proxies.",
+        "inefficiency_hypothesis": "CHF moves and local/ADR session timing may create proxy dislocations.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "large developed-market exchange",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 77,
+        "confidence": 0.63,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "Australian Securities Exchange",
+        "country": "Australia",
+        "region": "Asia-Pacific",
+        "asset_or_event": "Australian equities, banks, miners, ETFs and AUD-sensitive assets",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.asx.com.au/",
+        "source_urls": ["https://www.asx.com.au/"],
+        "why_interesting": "Australia links commodities, banks, AUD, local equities, and global miner ADRs.",
+        "inefficiency_hypothesis": "Commodity moves, AUD, and local/ADR timing gaps may create proxy lag.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "large regional exchange",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 77,
+        "confidence": 0.64,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "Johannesburg Stock Exchange",
+        "country": "South Africa",
+        "region": "Africa",
+        "asset_or_event": "South African equities, miners, banks, ETFs and ZAR-sensitive assets",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.jse.co.za/",
+        "source_urls": ["https://www.jse.co.za/"],
+        "why_interesting": "South Africa is a frontier/regional market with miners, FX, and ADR-linked proxies.",
+        "inefficiency_hypothesis": "ZAR, metals, and local/ADR timing gaps may reveal regional inefficiencies.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "regional exchange with global-linked resource names",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 76,
+        "confidence": 0.62,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "Singapore Exchange",
+        "country": "Singapore",
+        "region": "Asia",
+        "asset_or_event": "Singapore equities, REITs, ETFs and regional financial exposure",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.sgx.com/",
+        "source_urls": ["https://www.sgx.com/"],
+        "why_interesting": "Singapore is a regional hub with cross-Asia financial and REIT exposure.",
+        "inefficiency_hypothesis": "Regional flow, SGD, and US-listed proxy timing may create short-horizon gaps.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "regional exchange and derivatives hub",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 76,
+        "confidence": 0.6,
+    },
+    {
+        "surface_type_raw": "options and volatility exchange",
+        "venue_or_source": "Cboe Global Markets",
+        "country": "United States",
+        "region": "Global",
+        "asset_or_event": "Volatility index futures/options, ETF/ETN proxies, listed options market surfaces",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.cboe.com/",
+        "source_urls": ["https://www.cboe.com/"],
+        "why_interesting": "Volatility products can move sharply and provide cross-asset risk-regime signals.",
+        "inefficiency_hypothesis": "Volatility proxy products may lag risk-on/risk-off moves or term-structure shifts.",
+        "latency_sensitivity": "high",
+        "liquidity_hint": "large options and volatility venue",
+        "route_blockers": ["options_account", "market_data_terms"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 76,
+        "confidence": 0.63,
+    },
+    {
+        "surface_type_raw": "commodities futures and options exchange",
+        "venue_or_source": "Intercontinental Exchange",
+        "country": "United States",
+        "region": "Global",
+        "asset_or_event": "Energy, agriculture, rates, FX and equity futures/options surfaces",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.ice.com/",
+        "source_urls": ["https://www.ice.com/"],
+        "why_interesting": "ICE spans energy, agriculture, rates, FX and global index derivatives.",
+        "inefficiency_hypothesis": "Commodity ETF and futures proxy moves may expose short-term carry or news dislocations.",
+        "latency_sensitivity": "high",
+        "liquidity_hint": "large global derivatives venue",
+        "route_blockers": ["futures_account", "market_data_terms"],
+        "recommended_next_action": "route_probe",
+        "priority": 75,
+        "confidence": 0.62,
+    },
+    {
+        "surface_type_raw": "local exchange equities and ETFs",
+        "venue_or_source": "Saudi Exchange",
+        "country": "Saudi Arabia",
+        "region": "Middle East",
+        "asset_or_event": "Saudi and GCC equity exposure, ETFs and regional-market proxies",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.saudiexchange.sa/",
+        "source_urls": ["https://www.saudiexchange.sa/"],
+        "why_interesting": "GCC markets have distinct trading hours, oil sensitivity and regional capital flows.",
+        "inefficiency_hypothesis": "Oil moves, local trading week differences, and ETF proxies may create lagged reactions.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "large regional exchange",
+        "route_blockers": ["broker_route", "market_data_terms", "fx_normalization"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 75,
+        "confidence": 0.58,
+    },
+    {
+        "surface_type_raw": "metals marketplace and futures reference",
+        "venue_or_source": "London Metal Exchange",
+        "country": "United Kingdom",
+        "region": "Global",
+        "asset_or_event": "Industrial metals prices, futures references, warehouse-sensitive markets",
+        "data_access_type": "public_no_key",
+        "tradability_guess": "route_needed",
+        "public_docs_url": "https://www.lme.com/",
+        "source_urls": ["https://www.lme.com/"],
+        "why_interesting": "Industrial metals can lead miners, FX, inflation expectations, and commodity ETFs.",
+        "inefficiency_hypothesis": "Base-metal proxy ETFs and miner equities may lag futures/reference-price shocks.",
+        "latency_sensitivity": "medium",
+        "liquidity_hint": "global metals venue/reference market",
+        "route_blockers": ["futures_account", "market_data_terms"],
+        "recommended_next_action": "growth_experiment",
+        "priority": 74,
+        "confidence": 0.6,
+    },
 ]
 
 
@@ -443,10 +729,63 @@ def _source_evidence(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _implemented_global_discovery_markers(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    markers = {
+        "market_keys": set(),
+        "text": set(),
+        "default_venues": {
+            str(seed.get("venue_or_source") or "").strip().lower()
+            for seed in DEFAULT_GLOBAL_DISCOVERY_SEEDS
+            if str(seed.get("venue_or_source") or "").strip()
+        },
+        "scan_implemented": set(),
+    }
+    for table in ("adapter_specs", "route_probe_tasks", "market_hunter_directives"):
+        try:
+            rows = conn.execute(
+                f"select market_key from {table} where status = ? and market_key like 'global_discovery|%'",
+                (IMPLEMENTED_GLOBAL_DISCOVERY_STATUS,),
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        markers["market_keys"].update(str(row["market_key"]).lower() for row in rows if row["market_key"])
+    try:
+        rows = conn.execute(
+            """
+            select hypothesis
+            from growth_experiments
+            where status = ?
+              and signal_key like 'global_discovery|%'
+            """,
+            (IMPLEMENTED_GLOBAL_DISCOVERY_STATUS,),
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    markers["text"].update(str(row["hypothesis"]).lower() for row in rows if row["hypothesis"])
+    if markers["market_keys"] or markers["text"]:
+        markers["scan_implemented"].add("true")
+    return markers
+
+
+def _global_discovery_candidate_implemented(candidate: dict[str, Any], markers: dict[str, set[str]]) -> bool:
+    venue = str(candidate.get("venue_or_source") or "").strip()
+    if not venue:
+        return False
+    market_key = f"global_discovery|{venue}".lower()
+    if market_key in markers["market_keys"]:
+        return True
+    venue_text = venue.lower()
+    if markers.get("scan_implemented") and venue_text in markers.get("default_venues", set()):
+        return True
+    return any(venue_text and venue_text in text for text in markers["text"])
+
+
 def create_downstream_artifacts(conn: sqlite3.Connection, candidates: list[dict[str, Any]], settings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     cfg = (settings or {}).get("research_worker", {})
     priority_floor = int(cfg.get("artifact_priority_floor", 70))
     max_artifacts = int(cfg.get("max_artifacts_per_run", 20))
+    suppress_implemented = bool(cfg.get("suppress_implemented_global_discovery_artifacts", True))
+    implemented_markers = _implemented_global_discovery_markers(conn) if suppress_implemented else {"market_keys": set(), "text": set()}
     created: list[dict[str, Any]] = []
     for candidate in candidates:
         if len(created) >= max_artifacts:
@@ -458,6 +797,19 @@ def create_downstream_artifacts(conn: sqlite3.Connection, candidates: list[dict[
         source_id = f"research:{candidate['candidate_id']}"
         evidence = _source_evidence(candidate)
         created_item: dict[str, Any] | None = None
+        if suppress_implemented and _global_discovery_candidate_implemented(candidate, implemented_markers):
+            created.append(
+                {
+                    "type": action,
+                    "inserted": False,
+                    "skipped": True,
+                    "skip_reason": "global_market_discovery_scan_already_implemented",
+                    "candidate_id": candidate["candidate_id"],
+                    "venue_or_source": candidate["venue_or_source"],
+                    "recommended_next_action": action,
+                }
+            )
+            continue
         if action == "adapter_spec":
             inserted = add_adapter_spec(
                 conn,

@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import research_worker  # noqa: E402
+import storage  # noqa: E402
 
 
 class ResearchWorkerTests(unittest.TestCase):
@@ -90,6 +91,78 @@ class ResearchWorkerTests(unittest.TestCase):
                 research_worker.REPORT_MD = old_md
                 research_worker.CANDIDATES_JSONL = old_candidates
                 research_worker.RUNS_DIR = old_runs
+
+    def test_implemented_global_discovery_artifacts_are_not_recreated(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        conn.execute(
+            """
+            insert into growth_experiments (created_at, priority, signal_key, hypothesis, action, evidence_json, status)
+            values ('now', 82, 'global_discovery|listed_derivatives',
+                    'Explore London Stock Exchange UK equities and ADR relationships',
+                    'done', '{}', 'implemented_global_market_discovery_scan')
+            """
+        )
+        conn.commit()
+        candidate = research_worker.normalize_market_candidate(
+            {
+                "surface_type_raw": "local exchange equities and derivatives",
+                "venue_or_source": "London Stock Exchange",
+                "asset_or_event": "UK equities and ADR relationships",
+                "public_docs_url": "https://example.com/lse",
+                "recommended_next_action": "growth_experiment",
+                "priority": 82,
+            }
+        )
+
+        created = research_worker.create_downstream_artifacts(
+            conn,
+            [candidate],
+            {"research_worker": {"suppress_implemented_global_discovery_artifacts": True}},
+        )
+
+        self.assertEqual(created[0]["skip_reason"], "global_market_discovery_scan_already_implemented")
+        open_rows = conn.execute("select * from growth_experiments where status='open'").fetchall()
+        self.assertEqual(open_rows, [])
+        conn.close()
+
+    def test_new_global_discovery_artifact_still_gets_created(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        conn.execute(
+            """
+            insert into growth_experiments (created_at, priority, signal_key, hypothesis, action, evidence_json, status)
+            values ('now', 82, 'global_discovery|equity_or_proxy',
+                    'Explore London Stock Exchange UK equities and ADR relationships',
+                    'done', '{}', 'implemented_global_market_discovery_scan')
+            """
+        )
+        conn.commit()
+        candidate = research_worker.normalize_market_candidate(
+            {
+                "surface_type_raw": "agricultural auction market",
+                "venue_or_source": "Nairobi Coffee Exchange",
+                "asset_or_event": "coffee auction settlement prices",
+                "public_docs_url": "https://example.com/nairobi-coffee",
+                "recommended_next_action": "growth_experiment",
+                "priority": 88,
+            }
+        )
+
+        created = research_worker.create_downstream_artifacts(
+            conn,
+            [candidate],
+            {"research_worker": {"suppress_implemented_global_discovery_artifacts": True}},
+        )
+
+        self.assertEqual(created[0]["type"], "growth_experiment")
+        self.assertFalse(created[0].get("skipped", False))
+        open_rows = conn.execute("select hypothesis from growth_experiments where status='open'").fetchall()
+        self.assertEqual(len(open_rows), 1)
+        self.assertIn("Nairobi Coffee Exchange", open_rows[0]["hypothesis"])
+        conn.close()
 
 
 if __name__ == "__main__":
