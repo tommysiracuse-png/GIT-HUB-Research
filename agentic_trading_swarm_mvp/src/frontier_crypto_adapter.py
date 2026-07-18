@@ -87,6 +87,9 @@ DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY = {
     "mean_reversion_bps": 0.5,
     "stale_penalty_multiplier": 0.0,
     "record_multiplier": 1.0,
+    "min_confidence": 0.72,
+    "required_persistence_cycles": 2,
+    "volatility_expansion_filter": True,
 }
 
 
