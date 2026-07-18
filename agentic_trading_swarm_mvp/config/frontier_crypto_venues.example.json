@@ -32,6 +32,11 @@
       "max_spread_pct": 0.35,
       "require_above_vwap": true,
       "require_above_20ema": true
+    },
+    "confirmation_proxy": {
+      "preferred": "vwap_or_equivalent_intraday_trend",
+      "reclaim_after_first_pullback": true,
+      "invalidate_on_expanding_sell_volume_loss_of_breakout": true
     }
   },
   "venues": [
