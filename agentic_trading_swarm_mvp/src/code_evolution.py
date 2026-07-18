@@ -74,6 +74,8 @@ _FORBIDDEN_MARKDOWN_TOKENS = (
 )
 
 _STRICT_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_STRICT_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n.*\n```\s*$", re.DOTALL | re.IGNORECASE)
+STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
 _OPTIONAL_RECOMMENDATION_FIELDS = {
     "code_change",
     "variant_config",
@@ -152,6 +154,8 @@ def _extract_single_json_object(text: str) -> dict[str, Any] | None:
     if not isinstance(text, str):
         return None
     stripped = text.strip()
+    if not stripped:
+        return None
     if not stripped or any(token in stripped for token in _FORBIDDEN_MARKDOWN_TOKENS):
         return None
     if not (stripped.startswith("{") and stripped.endswith("}")):
@@ -161,6 +165,28 @@ def _extract_single_json_object(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def _normalize_single_recommendation_payload(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(payload, dict):
+        return None
+    if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(payload):
+        return None
+    return payload
+
+
+def parse_strict_single_recommendation(text: str) -> dict[str, Any] | None:
+    """Parse and validate exactly one paper-only recommendation object."""
+
+    candidate = _extract_single_json_object(text)
+    if candidate is None:
+        return None
+    return _normalize_single_recommendation_payload(candidate)
 
 
 def _has_meaningful_value(value: Any) -> bool:
