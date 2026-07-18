@@ -53,6 +53,76 @@ def paper_only_cross_market_confirmation_gate(
     }
 
 
+def paper_only_signal_freshness_audit(
+    payload,
+    *,
+    max_age_seconds=300,
+    freshness_buckets=(30, 120, 300),
+    horizon_label=None,
+):
+    """Paper-only diagnostic helper for stale-data and horizon mismatch checks.
+
+    Returns audit fields only; it never changes routing, position sizing, or
+    capital allocation.
+    """
+
+    if not isinstance(payload, dict):
+        return {
+            "eligible": False,
+            "reason": "invalid_payload",
+            "data_age_seconds": None,
+            "freshness_bucket": "unknown",
+            "horizon_label": horizon_label,
+            "horizon_alignment": "unknown",
+        }
+
+    try:
+        data_age_seconds = float(payload.get("data_age_seconds"))
+    except (TypeError, ValueError):
+        data_age_seconds = None
+
+    freshness_buckets = tuple(sorted(float(value) for value in freshness_buckets))
+    max_age_seconds = float(max_age_seconds)
+
+    if data_age_seconds is None:
+        freshness_bucket = "unknown"
+        eligible = False
+        reason = "missing_data_age"
+    else:
+        if data_age_seconds <= freshness_buckets[0]:
+            freshness_bucket = f"<= {int(freshness_buckets[0])}s"
+        elif data_age_seconds <= freshness_buckets[1]:
+            freshness_bucket = f"{int(freshness_buckets[0]) + 1}-{int(freshness_buckets[1])}s"
+        elif data_age_seconds <= freshness_buckets[2]:
+            freshness_bucket = f"{int(freshness_buckets[1]) + 1}-{int(freshness_buckets[2])}s"
+        else:
+            freshness_bucket = f"> {int(freshness_buckets[2])}s"
+
+        eligible = data_age_seconds <= max_age_seconds
+        reason = "eligible" if eligible else "stale_data"
+
+    horizon_seconds = None
+    horizon_alignment = "unknown"
+    horizon_seconds_value = payload.get("forecast_horizon_seconds", payload.get("holding_period_seconds"))
+    try:
+        horizon_seconds = None if horizon_seconds_value is None else float(horizon_seconds_value)
+    except (TypeError, ValueError):
+        horizon_seconds = None
+    if horizon_seconds is not None and data_age_seconds is not None:
+        horizon_alignment = "aligned" if horizon_seconds >= data_age_seconds else "lagging"
+
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "data_age_seconds": data_age_seconds,
+        "freshness_bucket": freshness_bucket,
+        "max_age_seconds": max_age_seconds,
+        "horizon_label": horizon_label,
+        "forecast_horizon_seconds": horizon_seconds,
+        "horizon_alignment": horizon_alignment,
+    }
+
+
 def paper_only_radar_alert_gate(payload, minimum_confidence=0.68):
     """Paper-only alert gate for radar recommendation payloads.
 
