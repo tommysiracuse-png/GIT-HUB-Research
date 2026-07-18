@@ -93,6 +93,16 @@ DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY = {
 }
 
 
+DEFAULT_PAPER_ONLY_CROSS_MARKET_SIGNAL_QUALITY_POLICY = {
+    "enabled": True,
+    "min_confidence": 0.68,
+    "confirmation_window_ms": 15 * 60 * 1000.0,
+    "require_primary_trigger": True,
+    "require_related_market_confirmation": True,
+    "below_threshold_state": "observe_only",
+}
+
+
 DEFAULT_PAPER_ONLY_ROUTE_FRESHNESS_POLICY = {
     "enabled": True,
     "quote_stale_threshold_ms": 750.0,
@@ -176,6 +186,60 @@ def paper_only_cross_market_risk_gate(
         "divergence_bps": divergence,
         "trigger_bps": trigger,
         "freshness_limit_ms": freshness_limit,
+    }
+
+
+def paper_only_cross_market_signal_quality_gate(
+    *,
+    confidence: float | None = None,
+    primary_trigger_present: bool = False,
+    related_market_confirmed: bool = False,
+    signal_age_ms: float | None = None,
+    confirmation_window_ms: float | None = None,
+    enabled: bool = True,
+    min_confidence: float | None = None,
+    below_threshold_state: str | None = None,
+) -> dict:
+    """Paper-only signal ranking gate for cross-market confirmation."""
+
+    threshold = float(
+        min_confidence
+        if min_confidence is not None
+        else DEFAULT_PAPER_ONLY_CROSS_MARKET_SIGNAL_QUALITY_POLICY["min_confidence"]
+    )
+    window_ms = float(
+        confirmation_window_ms
+        if confirmation_window_ms is not None
+        else DEFAULT_PAPER_ONLY_CROSS_MARKET_SIGNAL_QUALITY_POLICY["confirmation_window_ms"]
+    )
+    state = str(
+        below_threshold_state
+        if below_threshold_state is not None
+        else DEFAULT_PAPER_ONLY_CROSS_MARKET_SIGNAL_QUALITY_POLICY["below_threshold_state"]
+    )
+    score = float(confidence or 0.0)
+    age_ms = float(signal_age_ms or 0.0)
+    within_window = age_ms <= window_ms
+    promote = bool(
+        enabled
+        and primary_trigger_present
+        and related_market_confirmed
+        and within_window
+        and score >= threshold
+    )
+    observe_only = bool(not promote)
+    return {
+        "enabled": bool(enabled),
+        "promote": promote,
+        "observe_only": observe_only,
+        "primary_trigger_present": bool(primary_trigger_present),
+        "related_market_confirmed": bool(related_market_confirmed),
+        "within_confirmation_window": within_window,
+        "confidence": score,
+        "min_confidence": threshold,
+        "signal_age_ms": age_ms,
+        "confirmation_window_ms": window_ms,
+        "state": "promoted" if promote else state,
     }
 
 
