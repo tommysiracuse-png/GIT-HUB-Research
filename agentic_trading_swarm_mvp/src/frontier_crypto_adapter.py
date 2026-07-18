@@ -251,6 +251,109 @@ def _paper_only_route_direction_pattern(recommendation=None):
     return None
 
 
+def route_feasible_for_paper_conditional_short(recommendation=None):
+    recommendation = dict(recommendation or {})
+    market_key = _paper_only_route_token(recommendation.get("market_key"))
+    venue_name = _paper_only_route_token(recommendation.get("venue"))
+    asset_class = _paper_only_route_token(recommendation.get("asset_class"))
+    signal_text = " ".join(
+        _paper_only_route_token(recommendation.get(key))
+        for key in (
+            "signal",
+            "signal_direction",
+            "strategy",
+            "title",
+            "condition",
+            "condition_type",
+        )
+        if recommendation.get(key) not in (None, "")
+    )
+    is_conditional = bool(
+        _paper_only_is_truthy(recommendation.get("conditional"))
+        or _paper_only_route_token(recommendation.get("recommendation_type")) == "CONDITIONAL"
+        or _paper_only_route_token(recommendation.get("signal_context")) == "CONDITIONAL"
+        or "CONDITIONAL" in market_key
+        or "CONDITIONAL" in signal_text
+    )
+    is_crypto = bool(
+        asset_class == "CRYPTO"
+        or "CRYPTO" in market_key
+        or any(
+            marker in " ".join((market_key, venue_name, signal_text))
+            for marker in (
+                "OKX",
+                "BINANCE",
+                "BYBIT",
+                "BITGET",
+                "MEXC",
+                "KUCOIN",
+                "KRAKEN",
+                "COINBASE",
+                "GATE",
+                "INDODAX",
+            )
+        )
+    )
+    direction_pattern = _paper_only_route_direction_pattern(recommendation)
+    short_context = bool(
+        _paper_only_route_side_family(recommendation.get("route_primary_side")) == "short"
+        or _paper_only_route_side_family(recommendation.get("signal_direction")) == "short"
+        or direction_pattern == "short_perp_long_spot"
+        or "SHORT" in signal_text
+    )
+    applicable = bool(is_conditional and is_crypto and short_context)
+
+    required_route_fields = (
+        "route_primary_venue",
+        "route_primary_symbol",
+        "route_primary_instrument_type",
+        "route_primary_side",
+        "route_hedge_venue",
+        "route_hedge_symbol",
+        "route_hedge_instrument_type",
+        "route_hedge_side",
+        "route_inventory_mode",
+    )
+    missing_route_fields = [
+        field for field in required_route_fields if _paper_only_route_value_missing(recommendation.get(field))
+    ]
+    route_metadata_complete = not missing_route_fields
+    if recommendation.get("route_metadata_complete") not in (None, ""):
+        route_metadata_complete = route_metadata_complete and _paper_only_is_truthy(
+            recommendation.get("route_metadata_complete")
+        )
+
+    gating = {
+        "is_shortable": _paper_only_is_truthy(recommendation.get("is_shortable")),
+        "supports_conditional_orders": _paper_only_is_truthy(recommendation.get("supports_conditional_orders")),
+        "simulated_margin_ok": _paper_only_is_truthy(recommendation.get("simulated_margin_ok")),
+        "simulated_borrow_available": _paper_only_is_truthy(recommendation.get("simulated_borrow_available")),
+        "supports_paper_trading": _paper_only_is_truthy(recommendation.get("supports_paper_trading")),
+        "route_metadata_complete": route_metadata_complete,
+    }
+    failed_reasons = []
+    if applicable and not gating["route_metadata_complete"]:
+        failed_reasons.append("route_metadata_incomplete_or_inconsistent")
+    if applicable and not gating["is_shortable"]:
+        failed_reasons.append("shorting_unavailable_or_unknown")
+    if applicable and not gating["supports_conditional_orders"]:
+        failed_reasons.append("conditional_orders_unsupported_or_unknown")
+    if applicable and not gating["simulated_margin_ok"]:
+        failed_reasons.append("margin_unavailable_or_unknown")
+    if applicable and not gating["simulated_borrow_available"]:
+        failed_reasons.append("borrow_unavailable_or_unknown")
+    if applicable and not gating["supports_paper_trading"]:
+        failed_reasons.append("paper_trading_unsupported_or_unknown")
+
+    feasible = not failed_reasons if applicable else True
+    return {
+        "applicable": applicable,
+        "destination_valid": feasible,
+        "paper_only_warning": failed_reasons[0] if failed_reasons else None,
+        "failed_reasons": failed_reasons,
+    }
+
+
 def _paper_only_is_okx_basis_market(recommendation=None):
     recommendation = recommendation or {}
     joined = " ".join(
