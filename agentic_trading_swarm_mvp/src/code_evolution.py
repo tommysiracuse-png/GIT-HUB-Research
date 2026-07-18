@@ -87,6 +87,12 @@ _PAPER_ONLY_VOLATILITY_GATE_DEFAULTS = {
     "momentum_confirmation_threshold": "moderately_stricter",
 }
 
+_PAPER_ONLY_CROSS_MARKET_CONFIRMATION = {
+    "equities": "firm",
+    "credit_spreads": "tightening",
+    "usd_or_rates": "stable_or_less_adverse",
+}
+
 
 def _has_meaningful_value(value: Any) -> bool:
     if value in (None, "", {}, [], ()):
@@ -172,7 +178,14 @@ def _default_recommendation(overrides: dict[str, Any] | None = None) -> dict[str
         "title": "Fallback paper-only recommendation",
         "rationale": "Validation failed; returning a minimal safe recommendation.",
         "market_key": "paper_global_macro_radar",
-        "evidence": {"status": "fallback"},
+        "evidence": {
+            "status": "fallback",
+            "confirmation_requirement": (
+                "Require alignment between equities, credit spreads, and USD or rates "
+                "before changing paper positioning."
+            ),
+            "paper_confirmation_profile": dict(_PAPER_ONLY_CROSS_MARKET_CONFIRMATION),
+        },
         "proposed_change": {
             "summary": "No-op fallback recommendation for paper-only workflows.",
             "safety": "paper_only",
