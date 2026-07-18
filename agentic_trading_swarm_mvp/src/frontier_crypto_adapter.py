@@ -10,6 +10,58 @@ from __future__ import annotations
 import datetime as dt
 
 
+def paper_only_strategy_decay_guard(
+    *,
+    strategy_family,
+    long_expectancy_recent=None,
+    short_expectancy_recent=None,
+    sample_size_recent=None,
+    min_sample_size=20,
+    negative_margin=0.0,
+    recovery_expectancy=0.0,
+):
+    """Paper-only decay diagnostic for strategy selection metadata.
+
+    Returns a small dict suitable for LLM packet/report enrichment. Missing or
+    non-numeric inputs fail closed into a neutral state.
+    """
+
+    family = str(strategy_family or "").strip().lower()
+    if not family:
+        return {"strategy_decay_state": "unknown", "recovery_gate": False}
+
+    try:
+        long_value = float(long_expectancy_recent)
+        short_value = float(short_expectancy_recent)
+        sample_value = int(sample_size_recent)
+    except (TypeError, ValueError):
+        return {
+            "strategy_decay_state": "unknown",
+            "recovery_gate": False,
+            "strategy_family": family,
+        }
+
+    decay_block = (
+        sample_value >= int(min_sample_size)
+        and long_value <= -abs(float(negative_margin))
+        and short_value <= -abs(float(negative_margin))
+    )
+    recovery_gate = (
+        sample_value >= int(min_sample_size)
+        and (long_value >= float(recovery_expectancy) or short_value >= float(recovery_expectancy))
+    )
+
+    return {
+        "strategy_family": family,
+        "sample_size_recent": sample_value,
+        "long_expectancy_recent": long_value,
+        "short_expectancy_recent": short_value,
+        "strategy_decay_state": "blocked_for_paper_selection" if decay_block else "active",
+        "decay_score": round(max(0.0, -long_value) + max(0.0, -short_value), 6),
+        "recovery_gate": bool(recovery_gate),
+    }
+
+
 def paper_only_liquidity_volatility_entry_gate(
     *,
     spread_bps=None,
