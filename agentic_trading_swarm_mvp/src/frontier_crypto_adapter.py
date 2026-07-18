@@ -12,7 +12,7 @@ from __future__ import annotations
 def paper_only_cross_market_confirmation_gate(
     confirmation_score,
     confirmation_age_seconds=None,
-    minimum_score=0.65,
+    minimum_score=0.70,
     maximum_age_seconds=120,
     allow_neutral_alignment=False,
 ):
