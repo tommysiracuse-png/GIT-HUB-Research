@@ -99,6 +99,35 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK = {
     },
 }
 
+
+def _paper_only_recommendation_fallback(*, title: str | None = None, rationale: str | None = None) -> dict[str, Any]:
+    """Return a conservative paper-only fallback recommendation."""
+
+    fallback = json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
+    if title:
+        fallback["title"] = title
+    if rationale:
+        fallback["rationale"] = rationale
+    return fallback
+
+
+def _normalize_single_recommendation_payload(candidate: Any) -> dict[str, Any] | None:
+    """Validate a single recommendation object and reject partial payloads."""
+
+    if not isinstance(candidate, dict):
+        return None
+
+    if set(candidate) - _ALLOWED_TOP_LEVEL_KEYS:
+        return None
+
+    if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
+        return None
+
+    if _recommendation_schema_error(candidate) is not None:
+        return None
+
+    return candidate
+
 _PAPER_ONLY_VOLATILITY_GATE_DEFAULTS = {
     "paper_only": True,
     "true_range_multiple_cap": 1.8,
