@@ -14,9 +14,9 @@ def paper_only_liquidity_volatility_entry_gate(
     spread_bps=None,
     realized_volatility_zscore=None,
     volume_ratio=None,
-    max_spread_bps=12.0,
+    max_spread_bps=35.0,
     max_volatility_zscore=2.0,
-    min_volume_ratio=1.1,
+    min_volume_ratio=1.25,
 ):
     """Paper-only entry gate for market quality.
 
