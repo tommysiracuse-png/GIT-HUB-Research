@@ -73,7 +73,6 @@ STRICT_RECOMMENDATION_FALLBACK_ACTIONS = {
 }
 
 _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
-_STRICT_RECOMMENDATION_TOP_LEVEL_KEYS.add("implementation_notes")
 
 _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
     "action": "monitor_only",
@@ -88,7 +87,7 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
     "proposed_change": {
         "goal": "Guarantee exactly one valid JSON object with required keys.",
         "validation": "Validate schema before returning and fall back to this conservative object on failure.",
-        "constraints": "Paper-only recommendations, no markdown, no commentary, no arrays.",
+        "constraints": "Paper-only recommendations, no markdown, no commentary, no arrays."
     },
 }
 
