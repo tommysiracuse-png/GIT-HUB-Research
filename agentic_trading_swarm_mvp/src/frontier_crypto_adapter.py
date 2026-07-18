@@ -10,6 +10,48 @@ from __future__ import annotations
 import datetime as dt
 
 
+def paper_only_entry_confirmation_gate(
+    *,
+    entry_confidence=None,
+    trend_confirmation=None,
+    liquidity_confirmation=None,
+    entry_confidence_min=0.72,
+    require_trend_confirmation=True,
+    require_liquidity_confirmation=True,
+):
+    """Paper-only entry confirmation gate.
+
+    This is diagnostic-only and fail-closed: missing or invalid inputs reject
+    the signal for paper selection.
+    """
+
+    try:
+        confidence_value = float(entry_confidence)
+    except (TypeError, ValueError):
+        return {"eligible": False, "reason": "incomplete_confirmation_inputs"}
+
+    trend_ok = bool(trend_confirmation)
+    liquidity_ok = bool(liquidity_confirmation)
+
+    if confidence_value < float(entry_confidence_min):
+        return {"eligible": False, "reason": "confidence_below_threshold"}
+    if require_trend_confirmation and not trend_ok:
+        return {"eligible": False, "reason": "trend_confirmation_missing"}
+    if require_liquidity_confirmation and not liquidity_ok:
+        return {"eligible": False, "reason": "liquidity_confirmation_missing"}
+
+    return {
+        "eligible": True,
+        "reason": "eligible",
+        "entry_confidence": confidence_value,
+        "entry_confidence_min": float(entry_confidence_min),
+        "trend_confirmation_required": bool(require_trend_confirmation),
+        "liquidity_confirmation_required": bool(require_liquidity_confirmation),
+        "trend_confirmation": trend_ok,
+        "liquidity_confirmation": liquidity_ok,
+    }
+
+
 def paper_only_strategy_decay_guard(
     *,
     strategy_family,
