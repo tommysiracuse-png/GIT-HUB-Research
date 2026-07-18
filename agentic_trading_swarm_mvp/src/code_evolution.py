@@ -133,6 +133,26 @@ def _recommendation_schema_error(candidate: Any) -> str:
         return "invalid_action"
     return "invalid"
 
+
+def _recommendation_needs_regeneration(candidate: dict[str, Any] | None, raw_text: str) -> bool:
+    if candidate is None:
+        return True
+    if any(token in raw_text for token in _FORBIDDEN_MARKDOWN_TOKENS):
+        return True
+    if not _contains_exactly_one_json_object(raw_text):
+        return True
+    return False
+
+
+def _normalize_recommendation_payload(
+    candidate: dict[str, Any] | None,
+    raw_text: str,
+) -> dict[str, Any]:
+    if _recommendation_needs_regeneration(candidate, raw_text):
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    assert candidate is not None
+    return candidate
+
 _FORBIDDEN_MARKDOWN_TOKENS = (
     "```",
     "\n```",
