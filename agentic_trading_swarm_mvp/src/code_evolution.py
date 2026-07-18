@@ -160,10 +160,34 @@ def _normalize_single_recommendation_payload(candidate: Any) -> dict[str, Any] |
     if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
         return None
 
+    if not _has_complete_recommendation_core(candidate):
+        return None
+
     if _recommendation_schema_error(candidate) is not None:
         return None
 
     return candidate
+
+
+def _has_complete_recommendation_core(candidate: dict[str, Any]) -> bool:
+    """Require complete nested recommendation content for paper-only payloads."""
+
+    evidence = candidate.get("evidence")
+    proposed_change = candidate.get("proposed_change")
+
+    if not isinstance(evidence, dict) or not evidence:
+        return False
+    if not isinstance(proposed_change, dict) or not proposed_change:
+        return False
+
+    if not _has_meaningful_value(evidence.get("confidence")):
+        return False
+    if not _has_meaningful_value(evidence.get("issue")):
+        return False
+    if not _has_meaningful_value(proposed_change.get("decision")):
+        return False
+
+    return True
 
 
 def _contains_exactly_one_json_object(candidate: Any) -> bool:
