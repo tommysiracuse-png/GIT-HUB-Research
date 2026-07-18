@@ -92,6 +92,29 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
 }
 
 
+def _contains_array_anywhere(value: Any) -> bool:
+    if isinstance(value, (list, tuple)):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_array_anywhere(item) for item in value.values())
+    return False
+
+
+def validate_strict_paper_recommendation(candidate: Any) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+    if _recommendation_schema_error(candidate):
+        return None
+    return candidate
+
+
+def compose_strict_paper_recommendation(candidate: Any) -> dict[str, Any]:
+    validated = validate_strict_paper_recommendation(candidate)
+    if validated is not None:
+        return validated
+    return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+
+
 def _has_meaningful_value(value: Any) -> bool:
     if value is None:
         return False
