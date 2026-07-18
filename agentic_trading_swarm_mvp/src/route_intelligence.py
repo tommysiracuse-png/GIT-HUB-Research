@@ -46,6 +46,14 @@ _PRIORITY_SPOT_BORROW_INST_IDS = (
     "COINBASE:XRP-USDT",
 )
 
+CONDITIONAL_SHORT_DECAY_FLIP_GUARD = {
+    "cooldown_cycles": 12,
+    "drawdown_guard_bps": 25.0,
+    "min_confirm_count_after_promotion": 20,
+    "negative_flip_bps_threshold": 0.0,
+    "score_clamp": "set_to_non_admissible",
+}
+
 
 def build_route_requirements_matrix(
     opportunities: Iterable[dict[str, Any]],
@@ -85,6 +93,7 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
 
     gated: list[dict[str, Any]] = []
     reason_counts: dict[str, int] = {}
+    decay_flip_guard_count = 0
     for opportunity in opportunities:
         reasons = _conditional_gate_reasons(opportunity)
         if not reasons:
@@ -93,6 +102,10 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
         gated.append(
             {
+                "market_key": _first_known(
+                    opportunity,
+                    "market_key",
+                ),
                 "inst_id": str(opportunity.get("inst_id") or opportunity.get("instrument") or UNKNOWN),
                 "venue": _venue(opportunity),
                 "direction": str(opportunity.get("direction") or UNKNOWN),
@@ -105,6 +118,8 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
                     "net_edge_after_borrow_cost_bps",
                     "depth_adjusted_edge_bps",
                 ),
+                "paper_policy_action": _conditional_paper_policy_action(opportunity),
+                "paper_policy_guard": _conditional_decay_flip_guard(opportunity),
                 "reasons": reasons,
                 "paper_only": True,
             }
@@ -112,11 +127,24 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
     gated.sort(key=lambda item: (-len(item["reasons"]), str(item["inst_id"])))
     return {
         "paper_only": True,
+        "policy_mode": "paper_policy",
         "gate_count": len(gated),
         "reason_counts": dict(sorted(reason_counts.items())),
+        "paper_policy": {
+            "conditional_short_decay_flip_guard": {
+                **CONDITIONAL_SHORT_DECAY_FLIP_GUARD,
+                "policy_scope": "diagnostic_read_only_output_only",
+                "score_clamp_effective_state": "score_clamped_non_admissible",
+                "exploit_more_recovery_rule": "positive_expectancy_must_be_reestablished_after_cooldown",
+            },
+        },
         "top_examples": gated[:10],
         "hard_limits": [
             "Diagnostic gate only.",
+            (
+                "Paper policy guidance is advisory output only and does not place "
+                "orders, write broker state, or enable live execution."
+            ),
             "No credentials, broker writes, account changes, or live orders.",
         ],
     }
@@ -309,6 +337,100 @@ def _route_blockers(opportunity: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(str(blocker) for blocker in blockers if blocker))
 
 
+def _conditional_paper_policy_action(opportunity: dict[str, Any]) -> str:
+    guard = _conditional_decay_flip_guard(opportunity)
+    if not guard:
+        return "none"
+    return str(guard.get("policy_action") or "none")
+
+
+def _conditional_decay_flip_guard(opportunity: dict[str, Any]) -> dict[str, Any] | None:
+    route_status = str(opportunity.get("route_status") or "").lower()
+    direction = str(_first_known(opportunity, "direction", "side") or "").lower()
+    if route_status != "conditional" or not direction.startswith("short"):
+        return None
+
+    prior_count = _numeric_first_known(
+        opportunity,
+        "prior_count",
+        "paper_promotion_sample_count",
+        "promotion_sample_count",
+        "exploit_more_prior_count",
+    )
+    prior_avg_bps = _numeric_first_known(
+        opportunity,
+        "prior_avg_bps",
+        "prior_expectancy_bps",
+        "promotion_avg_bps",
+        "exploit_more_prior_avg_bps",
+    )
+    current_count = _numeric_first_known(
+        opportunity,
+        "paper_count",
+        "rolling_count",
+        "sample_count",
+        "observed_count",
+    )
+    rolling_expectancy_bps = _numeric_first_known(
+        opportunity,
+        "rolling_expectancy_bps",
+        "paper_expectancy_bps",
+        "realized_avg_bps",
+        "rolling_avg_bps",
+        "avg_bps",
+    )
+    drawdown_bps = _numeric_first_known(
+        opportunity,
+        "paper_drawdown_bps",
+        "drawdown_bps",
+        "rolling_drawdown_bps",
+    )
+    if prior_count is None or prior_avg_bps is None or current_count is None:
+        return None
+
+    min_confirm = float(CONDITIONAL_SHORT_DECAY_FLIP_GUARD["min_confirm_count_after_promotion"])
+    negative_flip_threshold = float(CONDITIONAL_SHORT_DECAY_FLIP_GUARD["negative_flip_bps_threshold"])
+    drawdown_guard_bps = float(CONDITIONAL_SHORT_DECAY_FLIP_GUARD["drawdown_guard_bps"])
+    promoted_from_sparse_positive_history = 0 < prior_count < min_confirm and prior_avg_bps > negative_flip_threshold
+    if not promoted_from_sparse_positive_history:
+        return None
+
+    if current_count < min_confirm:
+        return {
+            "triggered": False,
+            "guard_state": "awaiting_expanded_sample_confirmation",
+            "policy_action": "hold_conditional_paper_only",
+            "exploit_more_eligible": False,
+            "cooldown_cycles_remaining": 0,
+            "min_confirm_count_after_promotion": int(min_confirm),
+            "confirmation_progress_count": current_count,
+            "prior_count": prior_count,
+            "prior_avg_bps": prior_avg_bps,
+            "rolling_expectancy_bps": rolling_expectancy_bps,
+            "drawdown_bps": drawdown_bps,
+        }
+
+    negative_flip = rolling_expectancy_bps is not None and rolling_expectancy_bps < negative_flip_threshold
+    drawdown_breach = drawdown_bps is not None and drawdown_bps >= drawdown_guard_bps
+    if not negative_flip and not drawdown_breach:
+        return None
+    return {
+        "triggered": True,
+        "guard_state": "score_clamped_non_admissible",
+        "policy_action": "score_clamped_non_admissible",
+        "exploit_more_eligible": False,
+        "cooldown_cycles_remaining": int(CONDITIONAL_SHORT_DECAY_FLIP_GUARD["cooldown_cycles"]),
+        "negative_flip": negative_flip,
+        "drawdown_breach": drawdown_breach,
+        "min_confirm_count_after_promotion": int(min_confirm),
+        "prior_count": prior_count,
+        "prior_avg_bps": prior_avg_bps,
+        "current_count": current_count,
+        "rolling_expectancy_bps": rolling_expectancy_bps,
+        "drawdown_bps": drawdown_bps,
+    }
+
+
 def _conditional_gate_reasons(opportunity: dict[str, Any]) -> list[str]:
     blockers = set(_route_blockers(opportunity))
     direction = str(opportunity.get("direction") or "").lower()
@@ -331,6 +453,12 @@ def _conditional_gate_reasons(opportunity: dict[str, Any]) -> list[str]:
     )
     if edge is not None and edge <= 0 and any("slippage" in anomaly for anomaly in anomaly_set):
         reasons.append("slippage_exceeds_nonpositive_edge")
+    decay_flip_guard = _conditional_decay_flip_guard(opportunity)
+    if decay_flip_guard:
+        if decay_flip_guard.get("triggered"):
+            reasons.append("decay_flip_guard_non_admissible")
+        elif decay_flip_guard.get("guard_state") == "awaiting_expanded_sample_confirmation":
+            reasons.append("expanded_sample_confirmation_pending")
     return list(dict.fromkeys(reasons))
 
 
