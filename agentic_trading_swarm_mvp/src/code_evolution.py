@@ -165,8 +165,8 @@ def _extract_single_json_object(text: str) -> str | None:
     return candidate
 
 
-def _default_recommendation() -> dict[str, Any]:
-    return {
+def _default_recommendation(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    recommendation = {
         "action": "monitor_only",
         "priority": 1,
         "title": "Fallback paper-only recommendation",
@@ -179,6 +179,25 @@ def _default_recommendation() -> dict[str, Any]:
         },
         "variant_config": dict(_PAPER_ONLY_VOLATILITY_GATE_DEFAULTS),
     }
+    if isinstance(overrides, dict):
+        variant_config = overrides.get("variant_config")
+        if isinstance(variant_config, dict):
+            recommendation["variant_config"].update(variant_config)
+        for key, value in overrides.items():
+            if key == "variant_config" or value is None:
+                continue
+            recommendation[key] = value
+    return recommendation
+
+
+def default_paper_recommendation(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return a canonical schema-valid fallback recommendation."""
+
+    candidate = _default_recommendation(overrides)
+    valid, _reason = validate_strict_recommendation_schema(candidate)
+    if not valid:
+        candidate = _default_recommendation()
+    return json.loads(serialize_strict_recommendation(candidate))
 
 
 def _regen_hint_for_invalid_recommendation(reason: str) -> str:
@@ -207,34 +226,38 @@ def _coerce_recommendation_object(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def normalize_recommendation_response(value: Any) -> dict[str, Any]:
+def normalize_recommendation_response(
+    value: Any,
+    fallback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return a single safe JSON object for planner consumers."""
 
+    fallback_packet = default_paper_recommendation(fallback)
     candidate = _coerce_recommendation_object(value)
     if candidate is None:
-        candidate = _default_recommendation()
+        return fallback_packet
     missing_required = [
         key for key in STRICT_REQUIRED_RECOMMENDATION_FIELDS if key not in candidate
     ]
     if missing_required:
-        candidate = _default_recommendation()
+        return fallback_packet
     if _find_array_path(candidate) is not None:
-        candidate = _default_recommendation()
+        return fallback_packet
     if not isinstance(candidate.get("evidence"), dict):
-        candidate = _default_recommendation()
+        return fallback_packet
     if not _has_meaningful_value(candidate.get("action")):
-        candidate = _default_recommendation()
+        return fallback_packet
     if not _has_meaningful_value(candidate.get("title")):
-        candidate = _default_recommendation()
+        return fallback_packet
     if not _has_meaningful_value(candidate.get("rationale")):
-        candidate = _default_recommendation()
+        return fallback_packet
     if not _has_meaningful_value(candidate.get("market_key")):
-        candidate = _default_recommendation()
+        return fallback_packet
     if not _has_meaningful_value(candidate.get("proposed_change")):
-        return _default_recommendation()
+        return fallback_packet
     valid, _reason = validate_strict_recommendation_schema(candidate)
     if not valid:
-        return _default_recommendation()
+        return fallback_packet
     return json.loads(serialize_strict_recommendation(candidate))
 
 

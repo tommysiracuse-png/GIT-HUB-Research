@@ -26,7 +26,7 @@ from storage import (
     open_self_improvement_experiments,
     open_tasks,
 )
-from code_evolution import code_evolution_summary
+from code_evolution import code_evolution_summary, default_paper_recommendation
 from self_improvement_open_pack import IMPLEMENTED_STATUS as OPEN_PACK_IMPLEMENTED_STATUS
 from self_improvement_open_pack import is_duplicate_open_pack_text
 
@@ -155,29 +155,31 @@ MARKET_SCOUT_FALLBACK_RECOMMENDATION = {
     "proposed_change": {"goal": "preserve parser compatibility"},
 }
 
-EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION = {
-    "action": "refine",
-    "priority": 85,
-    "title": "Refine paper execution route recommendation",
-    "rationale": (
-        "Auto-generated because the primary execution-route response failed strict "
-        "single-object validation, omitted required fields, or did not provide "
-        "enough paper-only evidence to support routing analysis."
-    ),
-    "market_key": "paper.execution_route_hunter",
-    "evidence": {
-        "issue": "route_validation_failed",
-        "validation_error": "schema_validation_failed",
-        "paper_only": True,
-    },
-    "proposed_change": {
-        "summary": "Return one schema-complete paper-only route recommendation or a conservative hold/refine decision.",
-        "fallback_behavior": "Prefer refine or hold when route confidence or payload completeness is insufficient.",
-        "required_fields": ", ".join(REQUIRED_RECOMMENDATION_FIELDS),
-        "safety_mode": "paper_only",
-        "suppress_live_execution_wording": True,
-    },
-}
+EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION = default_paper_recommendation(
+    {
+        "action": "refine",
+        "priority": 85,
+        "title": "Refine paper execution route recommendation",
+        "rationale": (
+            "Auto-generated because the primary execution-route response failed strict "
+            "single-object validation, omitted required fields, or did not provide "
+            "enough paper-only evidence to support routing analysis."
+        ),
+        "market_key": "paper.execution_route_hunter",
+        "evidence": {
+            "issue": "route_validation_failed",
+            "validation_error": "schema_validation_failed",
+            "paper_only": True,
+        },
+        "proposed_change": {
+            "summary": "Return one schema-complete paper-only route recommendation or a conservative hold/refine decision.",
+            "fallback_behavior": "refine_or_hold_with_validation_evidence",
+            "required_fields": ", ".join(REQUIRED_RECOMMENDATION_FIELDS),
+            "safety_mode": "paper_only",
+            "suppress_live_execution_wording": True,
+        },
+    }
+)
 
 CODE_CHANGE_ACTIONABLE_FIELDS = (
     "change_category",
