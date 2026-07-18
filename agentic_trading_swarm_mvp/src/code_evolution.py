@@ -59,6 +59,7 @@ STRICT_REQUIRED_RECOMMENDATION_FIELDS = (
 STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
 STRICT_RECOMMENDATION_JSON_SEPARATORS = (",", ":")
 MIN_PAPER_CONFIRM_SCORE_MIN = 0.68
+PAPER_MARKET_KEY_PREFIX = "paper_"
 SUPPRESSION_ACTIONS = {
     "suppress_trade_generation_for_this_case",
     "no_trade",
@@ -100,6 +101,10 @@ def _has_meaningful_value(value: Any) -> bool:
     if isinstance(value, (list, tuple, set, dict)):
         return len(value) > 0
     return True
+
+
+def _is_paper_scoped_market_key(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().startswith(PAPER_MARKET_KEY_PREFIX)
 
 
 def _contains_exactly_one_json_object(value: Any) -> bool:
@@ -154,6 +159,8 @@ def _recommendation_schema_error(candidate: Any) -> str:
         return f"extra:{','.join(extra)}"
     if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
         return "empty_required_field"
+    if not _is_paper_scoped_market_key(candidate.get("market_key")):
+        return "market_key_out_of_scope"
     action = candidate.get("action")
     if action not in STRICT_RECOMMENDATION_FALLBACK_ACTIONS and action not in SUPPRESSION_ACTIONS:
         return "invalid_action"

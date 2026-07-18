@@ -1,5 +1,38 @@
 import unittest
 
+from src.code_evolution import (
+    _contains_exactly_one_json_object,
+    _is_paper_scoped_market_key,
+    _recommendation_schema_error,
+)
+
+
+class CodeEvolutionRecommendationSchemaTests(unittest.TestCase):
+    def test_market_key_must_be_paper_scoped(self) -> None:
+        self.assertTrue(_is_paper_scoped_market_key("paper_cross_market_default"))
+        self.assertFalse(_is_paper_scoped_market_key("live_cross_market_default"))
+
+    def test_schema_rejects_non_paper_market_key(self) -> None:
+        candidate = {
+            "action": "propose_code_change",
+            "priority": "90",
+            "title": "t",
+            "rationale": "r",
+            "market_key": "live_cross_market_default",
+            "evidence": "e",
+            "proposed_change": "p",
+        }
+        self.assertEqual(_recommendation_schema_error(candidate), "market_key_out_of_scope")
+
+    def test_exactly_one_json_object_guard_rejects_commentary(self) -> None:
+        self.assertFalse(_contains_exactly_one_json_object('{"a":1} trailing commentary'))
+        self.assertTrue(_contains_exactly_one_json_object('{"a":1}'))
+
+
+if __name__ == "__main__":
+    unittest.main()
+import unittest
+
 from src.code_evolution import normalize_recommendation_response, validate_strict_recommendation_schema
 
 
