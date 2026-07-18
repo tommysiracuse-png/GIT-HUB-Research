@@ -72,7 +72,7 @@ STRICT_RECOMMENDATION_FALLBACK_ACTIONS = {
 }
 
 _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
-    "action": "propose_diagnostic_hypothesis",
+    "action": "monitor_only",
     "priority": 0,
     "title": "Return a single valid paper-only JSON recommendation",
     "rationale": "Fallback emitted because the candidate response was not a complete schema-valid object.",
@@ -110,6 +110,10 @@ def _contains_exactly_one_json_object(value: Any) -> bool:
             return False
         if text.count("{") != 1 or text.count("}") != 1:
             return False
+        if text.startswith("[") or text.endswith("]"):
+            return False
+        if "\n{" in text or "}\n" in text:
+            return False
         return True
     return False
 
@@ -118,6 +122,8 @@ def _extract_single_json_object(text: str) -> dict[str, Any] | None:
     """Extract and parse one JSON object from a text response."""
 
     stripped = text.strip()
+    if any(token in stripped for token in _FORBIDDEN_MARKDOWN_TOKENS):
+        return None
     if _STRICT_JSON_FENCE_RE.match(stripped):
         stripped = stripped.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
     if stripped.startswith("[") or stripped.endswith("]"):
@@ -148,6 +154,8 @@ def _recommendation_schema_error(candidate: Any) -> str:
     action = candidate.get("action")
     if action not in STRICT_RECOMMENDATION_FALLBACK_ACTIONS and action not in SUPPRESSION_ACTIONS:
         return "invalid_action"
+    if action in SUPPRESSION_ACTIONS and action != "monitor_only":
+        return "hold_only"
     return "invalid"
 
 
@@ -178,8 +186,8 @@ def _finalize_recommendation_payload(
     """Return exactly one schema-valid paper-only recommendation object."""
 
     normalized = _normalize_recommendation_payload(candidate, raw_text)
-    if _recommendation_schema_error(normalized) == "invalid":
-        return normalized
+    if _recommendation_schema_error(normalized) in {"invalid", "hold_only"}:
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
     return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
 
 _FORBIDDEN_MARKDOWN_TOKENS = (
