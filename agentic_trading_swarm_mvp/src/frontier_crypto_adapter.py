@@ -451,20 +451,36 @@ def paper_only_route_freshness_gate(
 
 
 def _paper_only_route_requirement_keys(venue: str) -> tuple[str, ...]:
+    """Build progressively simplified lookup keys for paper-only route metadata."""
+
     normalized = str(venue or "").strip().upper().replace("-", "_").replace("/", "_")
     if not normalized:
         return ("",)
 
     keys: list[str] = []
+    pending: list[str] = []
 
     def _append(value: str) -> None:
         if value and value not in keys:
             keys.append(value)
+            pending.append(value)
 
     _append(normalized)
-    for suffix in ("_SPOT", "_PUBLIC"):
-        if normalized.endswith(suffix):
-            _append(normalized[: -len(suffix)])
+
+    trim_suffixes = (
+        "_SPOT_PUBLIC",
+        "_PERP_PUBLIC",
+        "_PUBLIC",
+        "_SPOT",
+        "_PERP",
+        "_SWAP",
+        "_MARGIN",
+    )
+    while pending:
+        candidate = pending.pop(0)
+        for suffix in trim_suffixes:
+            if candidate.endswith(suffix) and len(candidate) > len(suffix):
+                _append(candidate[: -len(suffix)])
 
     if normalized in {"GATEIO", "GATE_IO"}:
         _append("GATE")
@@ -472,6 +488,9 @@ def _paper_only_route_requirement_keys(venue: str) -> tuple[str, ...]:
         _append("OKX")
     if normalized in {"BINANCEUS", "BINANCE_US"}:
         _append("BINANCE_US")
+    if normalized.startswith("VALR"):
+        _append("VALR")
+
     return tuple(keys)
 
 
