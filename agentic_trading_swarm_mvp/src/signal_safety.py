@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import sqlite3
 
 from storage import RUNS_DIR, add_memory_fact, add_self_improvement_experiment, add_signal_policy, utc_now
@@ -71,6 +72,16 @@ def _freshness_guard(stats: dict, recent: dict, cfg: dict) -> tuple[str, str] | 
     return None
 
 
+def _coerce_finite_pnl_bps(value: object) -> float | None:
+    try:
+        pnl = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(pnl):
+        return None
+    return pnl
+
+
 def _closed_metrics(conn: sqlite3.Connection, signal_key: str, *, since: str | None = None, limit: int | None = None) -> dict:
     params: list[object] = [signal_key]
     clause = "signal_key = ? and status = 'closed' and pnl_bps is not null"
@@ -87,7 +98,11 @@ def _closed_metrics(conn: sqlite3.Connection, signal_key: str, *, since: str | N
         sql += " limit ?"
         params.append(int(limit))
     rows = conn.execute(sql, params).fetchall()
-    pnls = [float(row["pnl_bps"]) for row in rows]
+    pnls: list[float] = []
+    for row in rows:
+        pnl = _coerce_finite_pnl_bps(row["pnl_bps"])
+        if pnl is not None:
+            pnls.append(pnl)
     if not pnls:
         return {"closed_count": 0, "avg_pnl_bps": None, "win_rate": None, "best_bps": None, "worst_bps": None}
     wins = sum(1 for pnl in pnls if pnl > 0)
