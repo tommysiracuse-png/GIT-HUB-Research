@@ -124,13 +124,13 @@ def _recommendation_schema_error(value: Any) -> str | None:
     unexpected = [key for key in value if key not in _ALLOWED_TOP_LEVEL_KEYS]
     if unexpected:
         return f"unexpected top-level fields: {', '.join(sorted(unexpected))}"
+    for required_key in STRICT_REQUIRED_RECOMMENDATION_FIELDS:
+        if not _has_meaningful_value(value.get(required_key)):
+            return f"{required_key} must contain a non-empty value"
     if not isinstance(value.get("evidence"), dict) or not value["evidence"]:
         return "evidence must be a JSON object"
     if not isinstance(value.get("proposed_change"), dict) or not value["proposed_change"]:
         return "proposed_change must be a JSON object"
-    for required_key in ("action", "priority", "title", "rationale", "market_key"):
-        if not _has_meaningful_value(value.get(required_key)):
-            return f"{required_key} must be a non-empty value"
     for optional_key in _OPTIONAL_RECOMMENDATION_FIELDS:
         if optional_key in value and value[optional_key] is None:
             return f"{optional_key} must be omitted or contain an object"
@@ -141,6 +141,16 @@ def _recommendation_schema_error(value: Any) -> str | None:
         if isinstance(value.get(required_key), str) and _has_forbidden_markdown_tokens(value[required_key]):
             return f"markdown is not allowed in {required_key}"
     return None
+
+
+def _recommendation_or_paper_hold(value: Any, *, validation_error: str | None = None) -> dict[str, Any]:
+    """Return a validated recommendation or a strict paper-only hold fallback."""
+
+    recommendation = value if isinstance(value, dict) else {}
+    error_message = validation_error or _recommendation_schema_error(recommendation)
+    if error_message is None:
+        return recommendation
+    return _schema_complete_fallback_recommendation(error_message)
 
 
 def _schema_complete_fallback_recommendation(error_message: str | None = None) -> dict[str, Any]:
