@@ -72,7 +72,7 @@
     "red_team": {"tier": "fast", "daily_budget_usd": 80.0},
     "execution_route_hunter": {"tier": "fast", "daily_budget_usd": 60.0},
     "build_planner": {"tier": "fast", "daily_budget_usd": 120.0},
-    "autonomous_builder": {"tier": "frontier", "daily_budget_usd": 180.0},
+    "autonomous_builder": {"tier": "standard", "daily_budget_usd": 180.0},
     "code_evolution": {"tier": "standard", "daily_budget_usd": 120.0}
   }
 }
