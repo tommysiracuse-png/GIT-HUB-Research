@@ -9,6 +9,61 @@ uses credentials, private/account APIs, or order endpoints.
 from __future__ import annotations
 
 
+def paper_only_volatility_liquidity_entry_gate(
+    *,
+    spread_bps,
+    realized_volatility_zscore,
+    recent_volume_ratio,
+    max_spread_bps=12.0,
+    max_volatility_zscore=2.0,
+    min_volume_ratio=1.1,
+):
+    """Paper-only entry gate for execution-quality filtering.
+
+    Rejects new paper entries when the spread is wide, volatility is elevated,
+    or recent volume is thin. This is diagnostic-only and does not affect live
+    routing or broker behavior.
+    """
+
+    def _to_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    spread_value = _to_float(spread_bps)
+    volatility_value = _to_float(realized_volatility_zscore)
+    volume_ratio_value = _to_float(recent_volume_ratio)
+
+    meets_spread = spread_value is not None and spread_value <= float(max_spread_bps)
+    meets_volatility = volatility_value is not None and volatility_value <= float(max_volatility_zscore)
+    meets_volume = volume_ratio_value is not None and volume_ratio_value >= float(min_volume_ratio)
+
+    eligible = bool(meets_spread and meets_volatility and meets_volume)
+
+    if spread_value is None or volatility_value is None or volume_ratio_value is None:
+        reason = "input_incomplete"
+    elif not meets_spread:
+        reason = "spread_above_threshold"
+    elif not meets_volatility:
+        reason = "volatility_above_threshold"
+    elif not meets_volume:
+        reason = "volume_below_baseline"
+    else:
+        reason = "eligible"
+
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "spread_bps": spread_value,
+        "realized_volatility_zscore": volatility_value,
+        "recent_volume_ratio": volume_ratio_value,
+        "max_spread_bps": float(max_spread_bps),
+        "max_volatility_zscore": float(max_volatility_zscore),
+        "min_volume_ratio": float(min_volume_ratio),
+    }
+
+
 def paper_only_frontier_short_route_profile_gate(
     route_profile=None,
     *,
