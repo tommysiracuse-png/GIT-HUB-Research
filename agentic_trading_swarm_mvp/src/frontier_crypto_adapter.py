@@ -109,6 +109,46 @@ def paper_only_adjusted_route_score(raw_edge_bps=None, estimated_slippage_bps=No
     }
 
 
+def paper_only_validate_recommendation(recommendation=None, execution_destination=None,
+                                       fallback_action="no_op"):
+    """
+    Mandatory paper-mode recommendation validator.
+
+    Tags all outputs as simulation-only, rejects live destinations, and defaults
+    uncertain cases to a no-op.
+    """
+    recommendation = dict(recommendation or {})
+    destination = (execution_destination or recommendation.get("execution_destination") or "").strip().lower()
+    live_route_markers = (
+        recommendation.get("live_route"),
+        recommendation.get("live_execution"),
+        recommendation.get("broker_destination"),
+        recommendation.get("order_endpoint"),
+    )
+
+    has_live_marker = any(bool(marker) for marker in live_route_markers)
+    destination_is_live = destination in {"live", "production", "prod", "real", "broker", "exchange"}
+    uncertain = not recommendation or not recommendation.get("signal") or recommendation.get("confidence") is None
+
+    rejected = bool(has_live_marker or destination_is_live)
+    approved = not rejected and not uncertain
+    action = "simulate_only" if approved else fallback_action
+
+    return {
+        "paper_only": True,
+        "simulation_only": True,
+        "approved": approved,
+        "rejected": rejected,
+        "action": action,
+        "execution_destination": None if rejected else destination or "paper",
+        "warning": (
+            "live destination rejected" if rejected else
+            "uncertain recommendation defaulted to no-op" if uncertain else
+            None
+        ),
+    }
+
+
 def paper_only_confirmation_gate(primary_signal=None, confirming_signals=None, liquidity_snapshot=None,
                                  min_confirming_markets=1):
     """
