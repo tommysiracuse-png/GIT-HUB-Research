@@ -75,7 +75,6 @@ _FORBIDDEN_MARKDOWN_TOKENS = (
 
 _STRICT_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 _STRICT_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n.*\n```\s*$", re.DOTALL | re.IGNORECASE)
-STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
 _OPTIONAL_RECOMMENDATION_FIELDS = {
     "code_change",
     "variant_config",
@@ -114,12 +113,19 @@ def _paper_only_recommendation_fallback(*, title: str | None = None, rationale: 
 
 
 def _normalize_single_recommendation_payload(candidate: Any) -> dict[str, Any] | None:
-    """Validate a single recommendation object and reject partial payloads."""
+    """Return one schema-valid paper-only recommendation or None."""
 
+    if isinstance(candidate, str):
+        candidate = _extract_single_json_object(candidate)
+        if candidate is None:
+            return None
     if not isinstance(candidate, dict):
         return None
 
     if set(candidate) - _ALLOWED_TOP_LEVEL_KEYS:
+        return None
+
+    if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(candidate):
         return None
 
     if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
@@ -129,6 +135,19 @@ def _normalize_single_recommendation_payload(candidate: Any) -> dict[str, Any] |
         return None
 
     return candidate
+
+
+def _recommendation_schema_error(candidate: dict[str, Any]) -> str | None:
+    """Validate the strict paper-only recommendation schema."""
+
+    if candidate.get("action") not in SUPPRESSION_ACTIONS and candidate.get("action") != "propose_code_change":
+        return "invalid_action"
+
+    priority = candidate.get("priority")
+    if not isinstance(priority, int) or priority < 0:
+        return "invalid_priority"
+
+    return None
 
 _PAPER_ONLY_VOLATILITY_GATE_DEFAULTS = {
     "paper_only": True,
