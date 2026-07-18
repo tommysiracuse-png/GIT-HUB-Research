@@ -11,6 +11,7 @@ import hashlib
 import json
 import pathlib
 import sqlite3
+from typing import Any
 
 from storage import (
     RUNS_DIR,
@@ -246,6 +247,141 @@ def _crypto_venue_health_gaps(items: list[dict]) -> list[dict]:
     return gaps[:10]
 
 
+def _safe_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_text_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _extract_candidate_rows(report: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(report, dict):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for key in ("candidates", "top_candidates", "normalized_candidates", "recent_candidates"):
+        value = report.get(key)
+        if isinstance(value, list):
+            candidates.extend(item for item in value if isinstance(item, dict))
+    return candidates
+
+
+def _infer_route_feasibility_state(item: dict[str, Any]) -> str:
+    explicit_state = str(item.get("route_feasibility_state") or "").strip().lower()
+    if explicit_state in {"standard", "conditional", "blocked"}:
+        return explicit_state
+    blockers = {text.lower() for text in _as_text_list(item.get("route_blockers") or item.get("blockers"))}
+    access = str(item.get("data_access_type") or "").strip().lower()
+    tradability = str(item.get("tradability_guess") or "").strip().lower()
+    next_action = str(item.get("recommended_next_action") or "").strip().lower()
+    if access in {"broker_account", "paid_data"} or next_action == "ignore":
+        return "blocked"
+    if access == "public_no_key" and tradability == "directly_tradable" and not blockers:
+        return "standard"
+    if blockers or tradability in {"route_needed", "watch_only"} or access in {"public_key_required", "unknown"}:
+        return "conditional"
+    return "blocked"
+
+
+def _compact_frontier_execution_quality(research_worker: dict[str, Any] | None) -> dict[str, Any]:
+    report = research_worker if isinstance(research_worker, dict) else {}
+    review = report.get("execution_quality_review")
+    if not isinstance(review, dict):
+        review = report.get("frontier_execution_quality")
+    review = review if isinstance(review, dict) else {}
+    candidates = _extract_candidate_rows(report)
+    quote_age_ms_max = _safe_float(review.get("quote_age_ms_max")) or 15000.0
+    normalized_spread_bps_max = _safe_float(review.get("normalized_spread_bps_max")) or 25.0
+    short_frontier_spot_spread_bps_max = (
+        _safe_float(review.get("normalized_spread_bps_max_short_frontier_spot"))
+        or min(normalized_spread_bps_max, 18.0)
+    )
+    minimum_depth_notional = _safe_float(review.get("minimum_depth_notional")) or 1000.0
+    hold_on_missing_metrics = bool(review.get("hold_on_missing_metrics", True))
+    route_counts = {"standard": 0, "conditional": 0, "blocked": 0}
+    failing_gate_counts = {
+        "route_feasibility_state": 0,
+        "quote_age_ms": 0,
+        "normalized_spread_bps": 0,
+        "top_of_book_depth_notional": 0,
+        "missing_quote_metrics": 0,
+    }
+    priority_watchlist: list[dict[str, Any]] = []
+    hold_candidate_count = 0
+    for item in candidates:
+        route_state = _infer_route_feasibility_state(item)
+        route_counts[route_state] = route_counts.get(route_state, 0) + 1
+        surface_type = str(item.get("surface_type_raw") or item.get("surface_type") or "")
+        direction = str(item.get("side") or item.get("direction") or "")
+        quote_age_ms = _safe_float(item.get("quote_age_ms"))
+        spread_bps = _safe_float(item.get("normalized_spread_bps"))
+        depth_notional = (
+            _safe_float(item.get("top_of_book_depth_notional"))
+            or _safe_float(item.get("best_bid_ask_depth_notional"))
+            or _safe_float(item.get("depth_notional"))
+        )
+        required_notional = _safe_float(item.get("required_paper_notional")) or minimum_depth_notional
+        spread_limit = normalized_spread_bps_max
+        if direction.strip().lower() == "short" and "spot" in surface_type.lower():
+            spread_limit = short_frontier_spot_spread_bps_max
+        failed_gates: list[str] = []
+        if route_state != "standard":
+            failing_gate_counts["route_feasibility_state"] += 1
+            failed_gates.append("route_feasibility_state")
+        missing_metrics = quote_age_ms is None or spread_bps is None or depth_notional is None
+        if quote_age_ms is not None and quote_age_ms > quote_age_ms_max:
+            failing_gate_counts["quote_age_ms"] += 1
+            failed_gates.append("quote_age_ms")
+        if spread_bps is not None and spread_bps > spread_limit:
+            failing_gate_counts["normalized_spread_bps"] += 1
+            failed_gates.append("normalized_spread_bps")
+        if depth_notional is not None and depth_notional < required_notional:
+            failing_gate_counts["top_of_book_depth_notional"] += 1
+            failed_gates.append("top_of_book_depth_notional")
+        if missing_metrics and hold_on_missing_metrics:
+            failing_gate_counts["missing_quote_metrics"] += 1
+            failed_gates.append("missing_quote_metrics")
+        if failed_gates:
+            hold_candidate_count += 1
+            if len(priority_watchlist) < 10:
+                priority_watchlist.append(
+                    {
+                        "venue_or_source": item.get("venue_or_source"),
+                        "asset_or_event": item.get("asset_or_event"),
+                        "surface_type_raw": surface_type,
+                        "route_feasibility_state": route_state,
+                        "failed_gates": failed_gates,
+                        "route_blockers": _as_text_list(item.get("route_blockers") or item.get("blockers")),
+                    }
+                )
+    return {
+        "paper_only": True,
+        "admission_gate": {
+            "quote_age_ms_max": int(quote_age_ms_max),
+            "normalized_spread_bps_max": normalized_spread_bps_max,
+            "normalized_spread_bps_max_short_frontier_spot": short_frontier_spot_spread_bps_max,
+            "minimum_depth_notional": minimum_depth_notional,
+            "require_route_feasibility_state": "standard",
+            "hold_on_missing_metrics": hold_on_missing_metrics,
+        },
+        "candidate_count": len(candidates),
+        "route_feasibility_counts": route_counts,
+        "hold_candidate_count": hold_candidate_count,
+        "failing_gate_counts": failing_gate_counts,
+        "priority_watchlist": priority_watchlist,
+    }
+
+
 def _bucketize(stats: list[dict], directives: list[dict]) -> dict:
     buckets = {"exploit": [], "explore": [], "diagnose": []}
 
@@ -429,6 +565,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "route_resolver": _compact_route_resolver(payload.get("route_resolver", {})),
         "expansion_map": payload.get("expansion_map", {}),
         "global_market_discovery": global_market_discovery,
+        "frontier_execution_quality": _compact_frontier_execution_quality(payload.get("research_worker")),
         "hunter_allocation": hunter_allocation,
         "llm_cost_summary": payload.get("llm_cost_summary", {}),
         "llm_inbox": payload.get("llm_inbox", {}),
