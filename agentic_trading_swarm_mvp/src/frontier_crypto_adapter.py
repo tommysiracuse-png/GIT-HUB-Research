@@ -9,6 +9,56 @@ uses credentials, private/account APIs, or order endpoints.
 from __future__ import annotations
 
 
+def paper_only_liquidity_volatility_entry_gate(
+    *,
+    spread_bps=None,
+    realized_volatility_zscore=None,
+    volume_ratio=None,
+    max_spread_bps=12.0,
+    max_volatility_zscore=2.0,
+    min_volume_ratio=1.1,
+):
+    """Paper-only entry gate for market quality.
+
+    Fails closed when required inputs are missing or non-numeric.
+    """
+
+    try:
+        spread_bps_value = float(spread_bps)
+    except (TypeError, ValueError):
+        spread_bps_value = None
+
+    try:
+        volatility_zscore_value = float(realized_volatility_zscore)
+    except (TypeError, ValueError):
+        volatility_zscore_value = None
+
+    try:
+        volume_ratio_value = float(volume_ratio)
+    except (TypeError, ValueError):
+        volume_ratio_value = None
+
+    if spread_bps_value is None or volatility_zscore_value is None or volume_ratio_value is None:
+        return {"eligible": False, "reason": "incomplete_market_quality_inputs"}
+    if spread_bps_value > float(max_spread_bps):
+        return {"eligible": False, "reason": "spread_above_threshold"}
+    if volatility_zscore_value > float(max_volatility_zscore):
+        return {"eligible": False, "reason": "volatility_above_threshold"}
+    if volume_ratio_value < float(min_volume_ratio):
+        return {"eligible": False, "reason": "volume_below_threshold"}
+
+    return {
+        "eligible": True,
+        "reason": "eligible",
+        "spread_bps": spread_bps_value,
+        "realized_volatility_zscore": volatility_zscore_value,
+        "volume_ratio": volume_ratio_value,
+        "max_spread_bps": float(max_spread_bps),
+        "max_volatility_zscore": float(max_volatility_zscore),
+        "min_volume_ratio": float(min_volume_ratio),
+    }
+
+
 def paper_only_volatility_liquidity_entry_gate(
     *,
     spread_bps,
