@@ -43,9 +43,13 @@ _BYBIT_READ_ONLY_BROWSER_HEADERS = {
     "Pragma": "no-cache",
     "Origin": "https://www.bybit.com",
     "Referer": "https://www.bybit.com/",
+    'Sec-CH-UA': '"Chromium";v="126", "Google Chrome";v="126", "Not.A/Brand";v="99"',
+    "Sec-CH-UA-Mobile": "?0",
+    'Sec-CH-UA-Platform': '"Windows"',
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-site",
+    "Priority": "u=1, i",
     "X-Requested-With": "XMLHttpRequest",
 }
 
