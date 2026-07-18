@@ -66,6 +66,65 @@ SUPPRESSION_ACTIONS = {
     "wait_for_complete_valid_json_recommendation_with_market_context",
 }
 
+
+def _has_meaningful_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return True
+
+
+def _contains_exactly_one_json_object(value: Any) -> bool:
+    """Best-effort guard to ensure a payload is one object, not arrays or bundles."""
+
+    if isinstance(value, dict):
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        if not (text.startswith("{") and text.endswith("}")):
+            return False
+        if text.count("{") != 1 or text.count("}") != 1:
+            return False
+        return True
+    return False
+
+
+def _extract_single_json_object(text: str) -> dict[str, Any] | None:
+    """Extract and parse one JSON object from a text response."""
+
+    stripped = text.strip()
+    if _STRICT_JSON_FENCE_RE.match(stripped):
+        stripped = stripped.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
+    if stripped.startswith("[") or stripped.endswith("]"):
+        return None
+    if not stripped.startswith("{"):
+        match = _STRICT_JSON_OBJECT_RE.search(stripped)
+        if match is None:
+            return None
+        stripped = match.group(0)
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _recommendation_schema_error(candidate: Any) -> str:
+    if not isinstance(candidate, dict):
+        return "not_object"
+    missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in candidate]
+    if missing:
+        return f"missing:{','.join(missing)}"
+    extra = sorted(set(candidate) - _ALLOWED_TOP_LEVEL_KEYS)
+    if extra:
+        return f"extra:{','.join(extra)}"
+    if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
+        return "empty_required_field"
+    return "invalid"
+
 _FORBIDDEN_MARKDOWN_TOKENS = (
     "```",
     "\n```",
