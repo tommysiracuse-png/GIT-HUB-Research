@@ -22,6 +22,19 @@
     "require_next_interval_hold": true,
     "assumed_position_size": "reduced",
     "require_complete_json": true,
+    "regime_entry_gate": {
+      "mode": "paper_only",
+      "market_key": "okx_basis_mean_reversion",
+      "block_new_entries_on_persistent_carry": true,
+      "funding_sign_persistence_hours_min": 24,
+      "basis_zscore_abs_min": 1.5,
+      "basis_percentile_high": 80,
+      "basis_percentile_low": 20,
+      "reenable_funding_sign_persistence_hours_max": 6,
+      "reenable_basis_zscore_abs_max": 0.75,
+      "keep_exits_active": true,
+      "emit_telemetry": true
+    },
     "breakout_quality_filter": {
       "mode": "paper_only",
       "scanner_profile": "breakout_momentum_v2",
