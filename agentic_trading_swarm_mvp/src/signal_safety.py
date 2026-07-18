@@ -31,6 +31,46 @@ def _parse_iso(value: str | None) -> dt.datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
+def _freshness_terms(cfg: dict) -> tuple[str, ...]:
+    configured = cfg.get("stale_signal_terms")
+    if isinstance(configured, (list, tuple, set)):
+        terms = tuple(str(term).strip().lower() for term in configured if str(term).strip())
+        if terms:
+            return terms
+    return ("opportunistic", "exploit")
+
+
+def _freshness_sensitive_signal(signal_key: str, cfg: dict) -> bool:
+    lowered = str(signal_key or "").lower()
+    return any(term in lowered for term in _freshness_terms(cfg))
+
+
+def _signal_age_seconds(updated_at: str | None) -> float | None:
+    parsed = _parse_iso(updated_at)
+    if not parsed:
+        return None
+    return max(0.0, (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds())
+
+
+def _freshness_guard(stats: dict, recent: dict, cfg: dict) -> tuple[str, str] | None:
+    if not bool(cfg.get("stale_signal_guard_enabled", True)):
+        return None
+    if not _freshness_sensitive_signal(str(stats.get("signal_key") or ""), cfg):
+        return None
+
+    horizon_seconds = int(cfg.get("stale_signal_horizon_seconds", 6 * 3600) or 0)
+    age_seconds = _signal_age_seconds(stats.get("updated_at"))
+    if horizon_seconds > 0 and age_seconds is not None and age_seconds > horizon_seconds:
+        return "quarantine", "stale_signal_decayed"
+
+    min_recent_avg = float(cfg.get("stale_signal_min_recent_avg_bps", 0.0))
+    recent_avg = recent.get("avg_pnl_bps")
+    if recent_avg is not None and float(recent_avg) < min_recent_avg:
+        return "quarantine", "stale_signal_decayed"
+
+    return None
+
+
 def _closed_metrics(conn: sqlite3.Connection, signal_key: str, *, since: str | None = None, limit: int | None = None) -> dict:
     params: list[object] = [signal_key]
     clause = "signal_key = ? and status = 'closed' and pnl_bps is not null"
@@ -90,6 +130,10 @@ def _cfg(settings: dict) -> dict:
         "release_min_avg_pnl_bps": 10.0,
         "release_min_win_rate": 0.55,
         "release_max_worst_bps": -500.0,
+        "stale_signal_guard_enabled": True,
+        "stale_signal_horizon_seconds": 6 * 3600,
+        "stale_signal_min_recent_avg_bps": 0.0,
+        "stale_signal_terms": ("opportunistic", "exploit"),
     }
     return {**defaults, **settings.get("signal_safety", {})}
 
@@ -102,6 +146,10 @@ def _classify_signal(stats: dict, recent: dict, cfg: dict) -> tuple[str, str]:
     recent_avg = recent.get("avg_pnl_bps")
     recent_wr = recent.get("win_rate")
     worst = recent.get("worst_bps")
+
+    freshness_override = _freshness_guard(stats, recent, cfg)
+    if freshness_override:
+        return freshness_override
 
     if closed < int(cfg["min_closed_for_action"]):
         return "observe", "not_enough_closed_trades"
