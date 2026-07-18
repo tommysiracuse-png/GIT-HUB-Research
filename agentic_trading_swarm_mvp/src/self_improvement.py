@@ -47,6 +47,25 @@ ACTIVE_POLICIES_JSON = RUNS_DIR / "active_signal_policies.json"
 REPORT_JSON = RUNS_DIR / "self_improvement_report.json"
 REPORT_MD = RUNS_DIR / "self_improvement_report.md"
 TIMELINE_JSONL = RUNS_DIR / "self_improvement_timeline.jsonl"
+RECOMMENDATION_ALLOWED_PATH_PREFIXES = ("src/", "tests/", "config/", "docs/")
+RECOMMENDATION_ALLOWED_FILES = {
+    "README.md",
+    "COST_AWARE_SWARM.md",
+    "LLM_AGENT_BRIDGE.md",
+    "requirements-autonomous.txt",
+    "requirements-llm.txt",
+}
+RECOMMENDATION_REJECTION_TTL_SECONDS = 6 * 3600
+_CONSUMER_REJECTION_CACHE: dict[str, dt.datetime] = {}
+
+
+def _utc_now_dt() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _proposal_fingerprint(payload: dict) -> str:
+    raw = json.dumps(payload or {}, sort_keys=True, default=repr)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 IMPLEMENTED_MANUAL_STATUSES = {
     "route_requirements": ("implemented_route_requirements", ("improvement_tasks", "route_probe_tasks")),
@@ -519,38 +538,132 @@ def _explicit_expected_files(payload: dict, code_change: dict) -> list[str]:
     return []
 
 
+def _allowed_expected_file(path: str) -> bool:
+    normalized = str(path or "").strip().replace("\\", "/")
+    if not normalized:
+        return False
+    if normalized in RECOMMENDATION_ALLOWED_FILES:
+        return True
+    if normalized.startswith(("/", "./", "../")) or ":" in normalized:
+        return False
+    if "/../" in f"/{normalized}/" or normalized.endswith("/.."):
+        return False
+    return any(normalized.startswith(prefix) for prefix in RECOMMENDATION_ALLOWED_PATH_PREFIXES)
+
+
+def _source_agent_for_recommendation(rec: dict, payload: dict) -> str:
+    return str(
+        payload.get("source_agent")
+        or payload.get("agent_name")
+        or rec.get("source_agent")
+        or rec.get("agent_name")
+        or payload.get("market_key")
+        or "unknown"
+    )
+
+
+def _consumer_validation_audit(
+    rec: dict,
+    payload: dict,
+    *,
+    invalid_expected_files: list[str],
+    invalid_implementation_mode: str | None,
+) -> dict:
+    fingerprint = _proposal_fingerprint(payload)
+    reasons: list[str] = []
+    if invalid_expected_files:
+        reasons.append("disallowed_expected_files")
+    if invalid_implementation_mode:
+        reasons.append("invalid_implementation_mode")
+    now = _utc_now_dt()
+    suppressed_until = None
+    if reasons:
+        cached_until = _CONSUMER_REJECTION_CACHE.get(fingerprint)
+        if cached_until and cached_until > now:
+            suppressed_until = cached_until.isoformat()
+        else:
+            cached_until = now + dt.timedelta(seconds=RECOMMENDATION_REJECTION_TTL_SECONDS)
+            _CONSUMER_REJECTION_CACHE[fingerprint] = cached_until
+            suppressed_until = cached_until.isoformat()
+    return {
+        "validation_stage": "consumer",
+        "source_agent": _source_agent_for_recommendation(rec, payload),
+        "proposal_fingerprint": fingerprint,
+        "rejection_reason": ", ".join(reasons) if reasons else None,
+        "invalid_expected_files": invalid_expected_files,
+        "invalid_implementation_mode": invalid_implementation_mode,
+        "suppressed_until": suppressed_until,
+    }
+
+
 def _normalize_code_change_recommendation(rec: dict) -> dict:
     payload = dict(rec.get("payload") or {})
     code_change = dict(payload.get("code_change") if isinstance(payload.get("code_change"), dict) else {})
     category = code_change.get("change_category") or payload.get("change_category") or _infer_code_category(payload)
-    expected_files = _explicit_expected_files(payload, code_change)
-    implementation_mode = (
+    raw_expected_files = _explicit_expected_files(payload, code_change)
+    expected_files: list[str] = []
+    invalid_expected_files: list[str] = []
+    for path in raw_expected_files:
+        normalized = str(path).strip().replace("\\", "/")
+        if not normalized:
+            continue
+        if _allowed_expected_file(normalized):
+            expected_files.append(normalized)
+        else:
+            invalid_expected_files.append(normalized)
+    inferred_implementation_mode = (
+        "paper_policy" if str(category) == "paper_scoring_logic" else "runtime_active"
+    )
+    raw_implementation_mode = (
         code_change.get("implementation_mode")
         or payload.get("implementation_mode")
-        or ("paper_policy" if str(category) == "paper_scoring_logic" else "runtime_active")
+        or inferred_implementation_mode
+    )
+    implementation_mode = (
+        raw_implementation_mode if raw_implementation_mode in {"paper_policy", "runtime_active"} else inferred_implementation_mode
+    )
+    tests_to_run = code_change.get("tests_to_run") or payload.get("tests_to_run") or []
+    if isinstance(tests_to_run, str):
+        tests_to_run = [tests_to_run] if tests_to_run.strip() else []
+    else:
+        tests_to_run = [str(item) for item in tests_to_run if str(item).strip()]
+    consumer_validation = _consumer_validation_audit(
+        rec,
+        payload,
+        invalid_expected_files=invalid_expected_files,
+        invalid_implementation_mode=raw_implementation_mode if raw_implementation_mode != implementation_mode else None,
     )
     code_change.update(
         {
             "change_category": category,
             "implementation_mode": implementation_mode,
-            "tests_to_run": code_change.get("tests_to_run") or payload.get("tests_to_run") or [],
+            "tests_to_run": tests_to_run,
             "rollback_criteria": code_change.get("rollback_criteria")
             or payload.get("rollback_criteria")
             or "Revert if tests fail, reports stop refreshing, or paper-only safety checks fail.",
             "evidence": code_change.get("evidence")
             or (payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}),
             "target_selection_mode": "explicit" if expected_files else "repo_aware_preflight",
+            "consumer_validation": consumer_validation,
         }
     )
     if expected_files:
         code_change["expected_files"] = expected_files
+    else:
+        code_change.pop("expected_files", None)
     payload["original_action"] = payload.get("action")
     payload["action"] = "propose_code_change"
     payload["change_category"] = category
     payload["implementation_mode"] = implementation_mode
     if expected_files:
         payload["expected_files"] = expected_files
+    else:
+        payload.pop("expected_files", None)
     payload["code_change"] = code_change
+    payload["consumer_validation"] = consumer_validation
+    payload["source_agent"] = payload.get("source_agent") or consumer_validation["source_agent"]
+    if consumer_validation["proposal_fingerprint"]:
+        payload["proposal_fingerprint"] = consumer_validation["proposal_fingerprint"]
     if not payload.get("proposed_change"):
         payload["proposed_change"] = payload.get("rationale") or rec.get("rationale") or rec.get("title")
     return {**rec, "payload": payload}
