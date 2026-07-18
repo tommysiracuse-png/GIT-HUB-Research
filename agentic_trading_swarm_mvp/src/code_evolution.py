@@ -190,6 +190,17 @@ def _paper_only_recommendation_fallback() -> dict[str, Any]:
     return json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
 
 
+def _finalize_recommendation_payload(text: str) -> dict[str, Any]:
+    """Return one validated recommendation object or a paper-only fallback."""
+
+    parsed = _extract_single_json_object(text)
+    if parsed is None:
+        return _paper_only_recommendation_fallback()
+    if _recommendation_schema_error(parsed) is not None:
+        return _paper_only_recommendation_fallback()
+    return parsed
+
+
 def _strict_recommendation_json_error(text: str) -> str | None:
     """Validate model output as one strict recommendation object."""
 
