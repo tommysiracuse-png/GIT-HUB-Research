@@ -45,6 +45,52 @@ def classify_fiat_corridor(base_asset, quote_asset, venue_name=None, venue_notes
     }
 
 
+def paper_only_validate_recommendation_destination(recommendation=None, execution_destination=None,
+                                                   allow_simulation_only=True):
+    """
+    Mandatory paper-mode destination validation.
+
+    Ensures downstream recommendation packets remain simulation-only and never
+    target a live execution destination. Uncertain or missing destinations are
+    converted to a no-op with a warning marker.
+    """
+    recommendation = dict(recommendation or {})
+    destination = (execution_destination or recommendation.get("execution_destination") or "").strip().lower()
+    route_mode = (recommendation.get("mode") or "paper").strip().lower()
+    route_policy = (recommendation.get("execution_gate") or "simulate_only").strip().lower()
+
+    live_markers = ("live", "real", "production", "prod", "broker", "exchange", "order", "submit")
+    is_live_destination = any(marker in destination for marker in live_markers)
+    is_uncertain = not destination or destination in {"unknown", "unspecified", "n/a", "na", "none"}
+
+    recommendation["mode"] = "paper"
+    recommendation["execution_gate"] = "simulate_only"
+    recommendation["simulation_only"] = True
+
+    if is_live_destination:
+        recommendation["action"] = "no_op"
+        recommendation["paper_only_warning"] = "rejected_live_execution_destination"
+        recommendation["destination_valid"] = False
+    elif is_uncertain:
+        recommendation["action"] = "no_op"
+        recommendation["paper_only_warning"] = "uncertain_destination_defaulted_to_no_op"
+        recommendation["destination_valid"] = False
+    else:
+        recommendation["destination_valid"] = True
+
+    if not allow_simulation_only or route_mode not in {"paper", "simulation", "sim"} or route_policy != "simulate_only":
+        recommendation["action"] = "no_op"
+        recommendation["paper_only_warning"] = "non_paper_route_normalized"
+
+    return {
+        "recommendation": recommendation,
+        "destination": destination or None,
+        "simulation_only": True,
+        "destination_valid": bool(recommendation.get("destination_valid", False)),
+        "paper_only_warning": recommendation.get("paper_only_warning"),
+    }
+
+
 def apply_fiat_corridor_penalty(opportunity_score, corridor_type=None, liquidity_confidence=None,
                                 depth_confidence=None, turnover_confidence=None):
     """
