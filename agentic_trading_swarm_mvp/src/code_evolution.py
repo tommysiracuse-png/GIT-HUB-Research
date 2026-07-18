@@ -175,10 +175,15 @@ def _normalize_strict_paper_recommendation(candidate: dict[str, Any]) -> dict[st
         return None
     if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
         return None
+    if _contains_array_anywhere(evidence):
+        return None
+
     proposed_change = normalized.get("proposed_change")
     if not isinstance(proposed_change, dict):
         return None
     if not STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET.issubset(proposed_change):
+        return None
+    if _contains_array_anywhere(proposed_change):
         return None
     if _contains_array_anywhere(candidate):
         return None
