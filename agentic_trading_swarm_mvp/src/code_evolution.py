@@ -119,6 +119,57 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK = {
 }
 
 
+def _extract_single_json_object(text: str) -> dict[str, Any] | None:
+    """Extract one JSON object from a strict recommendation string."""
+
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped or stripped.startswith("["):
+        return None
+    if _STRIP_MARKDOWN_FENCE_IF_PRESENT(stripped) is None:
+        return None
+    candidate = _strip_markdown_fence(text).strip()
+    if not candidate.startswith("{") or not candidate.endswith("}"):
+        return None
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _strip_markdown_fence(text: str) -> str:
+    """Remove a single JSON markdown fence if present."""
+
+    match = _STRICT_JSON_FENCE_RE.match(text)
+    if not match:
+        return text
+    lines = text.splitlines()
+    if len(lines) < 3:
+        return text
+    return "\n".join(lines[1:-1])
+
+
+def _contains_exactly_one_json_object(candidate: Any) -> bool:
+    """Return True when candidate is a single object without extra JSON payloads."""
+
+    if isinstance(candidate, dict):
+        return True
+    if not isinstance(candidate, str):
+        return False
+    stripped = candidate.strip()
+    if not stripped.startswith("{") or not stripped.endswith("}"):
+        return False
+    if len(_STRICT_JSON_OBJECTS_RE.findall(stripped)) != 1:
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict)
+
+
 def _paper_only_guard_json_text(payload: Any) -> str:
     """Serialize a paper-only recommendation as exactly one JSON object."""
 
