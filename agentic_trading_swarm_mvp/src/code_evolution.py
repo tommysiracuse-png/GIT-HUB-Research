@@ -110,6 +110,10 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
 }
 
 
+def _has_meaningful_value(value: Any) -> bool:
+    return value is not None and (not isinstance(value, str) or value.strip() != "")
+
+
 def _contains_array_anywhere(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return True
@@ -160,6 +164,10 @@ def _normalize_strict_paper_recommendation(candidate: dict[str, Any]) -> dict[st
         return None
     if _contains_array_anywhere(candidate):
         return None
+    if not _has_meaningful_value(normalized["title"]):
+        return None
+    if not _has_meaningful_value(normalized["rationale"]):
+        return None
     if not _has_meaningful_value(normalized["action"]):
         return None
     if not _is_paper_scoped_market_key(normalized["market_key"]):
@@ -171,6 +179,8 @@ def _recommendation_schema_error(candidate: dict[str, Any]) -> bool:
     if not _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS.issubset(set(candidate)):
         return True
     if not isinstance(candidate.get("priority"), int):
+        return True
+    if not _has_meaningful_value(candidate.get("title")) or not _has_meaningful_value(candidate.get("rationale")):
         return True
     if not isinstance(candidate.get("proposed_change"), dict):
         return True
