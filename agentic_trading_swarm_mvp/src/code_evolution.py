@@ -82,6 +82,23 @@ _OPTIONAL_RECOMMENDATION_FIELDS = {
 }
 _REQUIRED_TOP_LEVEL_KEYS = STRICT_REQUIRED_RECOMMENDATION_FIELDS + tuple(_OPTIONAL_RECOMMENDATION_FIELDS)
 _ALLOWED_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS) | _OPTIONAL_RECOMMENDATION_FIELDS
+_PAPER_ONLY_GUARDRAIL_PHRASES = (
+    "paper-only",
+    "paper simulation",
+    "research-only",
+    "simulation-only",
+)
+_FORBIDDEN_LIVE_TRADING_PHRASES = (
+    "buy",
+    "sell",
+    "short",
+    "execute",
+    "place order",
+    "route order",
+    "order placement",
+    "broker",
+    "brokerage",
+)
 
 _PAPER_ONLY_RECOMMENDATION_FALLBACK = {
     "action": "propose_code_change",
@@ -166,6 +183,9 @@ def _normalize_single_recommendation_payload(candidate: Any) -> dict[str, Any] |
     if _recommendation_schema_error(candidate) is not None:
         return None
 
+    if not _has_paper_only_guardrail_language(candidate):
+        return None
+
     return candidate
 
 
@@ -188,6 +208,33 @@ def _has_complete_recommendation_core(candidate: dict[str, Any]) -> bool:
         return False
 
     return True
+
+
+def _has_paper_only_guardrail_language(candidate: dict[str, Any]) -> bool:
+    """Require explicit paper-only language and reject live-trading phrasing."""
+
+    text = json.dumps(candidate, ensure_ascii=False, sort_keys=True).lower()
+    if any(phrase in text for phrase in _FORBIDDEN_LIVE_TRADING_PHRASES):
+        return False
+    return any(phrase in text for phrase in _PAPER_ONLY_GUARDRAIL_PHRASES)
+
+
+def _extract_single_json_object(text: str) -> dict[str, Any] | None:
+    """Extract exactly one JSON object from text when possible."""
+
+    stripped = text.strip()
+    if not stripped.startswith("{") or not stripped.endswith("}"):
+        return None
+
+    matches = _STRICT_JSON_OBJECTS_RE.findall(stripped)
+    if len(matches) != 1:
+        return None
+
+    try:
+        parsed = json.loads(matches[0])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _contains_exactly_one_json_object(candidate: Any) -> bool:
