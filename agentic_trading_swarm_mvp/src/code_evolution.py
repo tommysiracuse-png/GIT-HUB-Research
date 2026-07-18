@@ -85,6 +85,10 @@ STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS = (
 STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET = set(
     STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS
 )
+STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS = (
+    "code_change",
+    "variant_config",
+)
 
 _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
 
@@ -141,7 +145,7 @@ def _normalize_strict_paper_recommendation(candidate: dict[str, Any]) -> dict[st
 
 
 def _recommendation_schema_error(candidate: dict[str, Any]) -> bool:
-    if set(candidate) != _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS:
+    if not _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS.issubset(set(candidate)):
         return True
     if not isinstance(candidate.get("priority"), int):
         return True
@@ -156,6 +160,13 @@ def _recommendation_schema_error(candidate: dict[str, Any]) -> bool:
     if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
         return True
     return False
+
+
+def _reject_invalid_strict_recommendation(candidate: Any) -> dict[str, Any]:
+    normalized = validate_strict_paper_recommendation(candidate)
+    if normalized is not None:
+        return normalized
+    return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
 
 
 def validate_strict_paper_recommendation(candidate: Any) -> dict[str, Any] | None:
