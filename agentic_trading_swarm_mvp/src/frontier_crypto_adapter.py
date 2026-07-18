@@ -59,6 +59,45 @@ def apply_fiat_corridor_penalty(opportunity_score, corridor_type=None, liquidity
         score *= 0.9
     return score
 
+
+def paper_only_cross_market_review_state(evidence=None, signal_state=None, required_fields=None):
+    """
+    Paper-only review gate for cross-market recommendations.
+
+    When the evidence package is incomplete, the safe default is observe-only
+    with no simulated allocation change.
+    """
+    evidence = evidence or {}
+    required_fields = tuple(required_fields or ("data_quality", "execution_scope", "risk_view", "signal_state"))
+    missing_fields = [field for field in required_fields if not str(evidence.get(field, "")).strip()]
+
+    normalized_signal_state = (signal_state or evidence.get("signal_state") or "").strip().lower()
+    if missing_fields:
+        return {
+            "paper_review_state": "observe_only",
+            "portfolio_action": "no position change",
+            "sizing": "0 simulated allocation change",
+            "missing_evidence_fields": missing_fields,
+            "signal_state": normalized_signal_state or "inconclusive",
+        }
+
+    if normalized_signal_state in {"inconclusive", "uncertain", "observe_only", "defer"}:
+        return {
+            "paper_review_state": "observe_only",
+            "portfolio_action": "no position change",
+            "sizing": "0 simulated allocation change",
+            "missing_evidence_fields": [],
+            "signal_state": normalized_signal_state,
+        }
+
+    return {
+        "paper_review_state": "review_ok",
+        "portfolio_action": "paper candidate eligible",
+        "sizing": "paper-sized allocation permitted",
+        "missing_evidence_fields": [],
+        "signal_state": normalized_signal_state or "validated",
+    }
+
 import argparse
 import collections
 import copy
