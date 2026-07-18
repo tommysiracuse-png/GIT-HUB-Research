@@ -98,6 +98,55 @@ def paper_only_cross_market_review_state(evidence=None, signal_state=None, requi
         "signal_state": normalized_signal_state or "validated",
     }
 
+
+def validate_paper_recommendation_payload(payload=None, confidence_threshold=0.65):
+    """
+    Paper-only safety gate for machine-actionable recommendations.
+
+    If the payload is incomplete or confidence is below threshold, return a
+    complete hold recommendation instead of a directional action.
+    """
+    payload = payload or {}
+    required_fields = (
+        "action",
+        "evidence",
+        "market_key",
+        "priority",
+        "proposed_change",
+        "rationale",
+        "title",
+    )
+    missing_fields = [field for field in required_fields if payload.get(field) in (None, "", [], {}, ())]
+
+    raw_confidence = payload.get("confidence", payload.get("confidence_score", 0.0))
+    try:
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    if missing_fields or confidence < float(confidence_threshold or 0.0):
+        return {
+            "action": "hold",
+            "title": "Insufficient evidence for directional paper recommendation",
+            "market_key": payload.get("market_key") or "paper.market_radar.signal_quality",
+            "priority": payload.get("priority", 0),
+            "evidence": {
+                "issue_type": "insufficient_recommendation_evidence",
+                "missing_fields": missing_fields,
+                "confidence": round(confidence, 3),
+                "confidence_threshold": float(confidence_threshold or 0.0),
+                "paper_scope": "Paper-trading only; no live orders.",
+            },
+            "proposed_change": {
+                "default_fallback": "hold",
+                "objective": "Emit only fully-formed paper recommendations with stronger gating.",
+                "rule": "Fallback to hold when confidence or required fields are missing.",
+            },
+            "rationale": "Recommendation was incomplete or below confidence threshold; safe fallback is hold.",
+        }
+
+    return payload
+
 import argparse
 import collections
 import copy
