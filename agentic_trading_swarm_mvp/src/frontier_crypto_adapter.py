@@ -9,6 +9,50 @@ uses credentials, private/account APIs, or order endpoints.
 from __future__ import annotations
 
 
+def paper_only_cross_market_confirmation_gate(
+    confirmation_score,
+    confirmation_age_seconds=None,
+    minimum_score=0.65,
+    maximum_age_seconds=120,
+    allow_neutral_alignment=False,
+):
+    try:
+        score = float(confirmation_score)
+    except (TypeError, ValueError):
+        score = 0.0
+
+    try:
+        age_seconds = None if confirmation_age_seconds is None else float(confirmation_age_seconds)
+    except (TypeError, ValueError):
+        age_seconds = None
+
+    minimum_score = float(minimum_score)
+    maximum_age_seconds = float(maximum_age_seconds)
+    meets_score = score >= minimum_score
+    meets_age = age_seconds is None or age_seconds <= maximum_age_seconds
+    neutral_alignment = score == 0.0
+    eligible = bool(meets_score and meets_age and (allow_neutral_alignment or not neutral_alignment))
+
+    if neutral_alignment and not allow_neutral_alignment:
+        reason = "neutral_alignment_disallowed"
+    elif not meets_score:
+        reason = "below_minimum_score"
+    elif not meets_age:
+        reason = "stale_confirmation"
+    else:
+        reason = "eligible"
+
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "score": score,
+        "age_seconds": age_seconds,
+        "minimum_score": minimum_score,
+        "maximum_age_seconds": maximum_age_seconds,
+        "allow_neutral_alignment": bool(allow_neutral_alignment),
+    }
+
+
 _LATAM_FIAT_QUOTE_ALIASES = {
     "CLP": "CLP",
     "CLP$": "CLP",
