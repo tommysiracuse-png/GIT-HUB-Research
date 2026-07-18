@@ -53,6 +53,89 @@ def paper_only_cross_market_confirmation_gate(
     }
 
 
+def paper_only_route_toxicity_key(buy_venue, sell_venue):
+    buy = (buy_venue or "").strip().upper()
+    sell = (sell_venue or "").strip().upper()
+    if not buy or not sell:
+        return None
+    return f"{buy}->{sell}"
+
+
+class RouteToxicityRegistry:
+    """Paper-only directional route quality tracker.
+
+    Tracks realized route outcomes for paper analytics only. It is intentionally
+    conservative: routes only become suppressed after enough samples and
+    recover automatically when recent EWMA edge improves.
+    """
+
+    def __init__(
+        self,
+        min_samples=25,
+        ewma_alpha=0.18,
+        toxic_cutoff_bps=-12.0,
+        recovery_cutoff_bps=-3.0,
+        cooldown_hours=12.0,
+        stale_quote_penalty_bps=4.0,
+    ):
+        self.min_samples = int(min_samples)
+        self.ewma_alpha = float(ewma_alpha)
+        self.toxic_cutoff_bps = float(toxic_cutoff_bps)
+        self.recovery_cutoff_bps = float(recovery_cutoff_bps)
+        self.cooldown_hours = float(cooldown_hours)
+        self.stale_quote_penalty_bps = float(stale_quote_penalty_bps)
+        self._routes = {}
+
+    def _state(self, key):
+        return self._routes.setdefault(
+            key,
+            {
+                "samples": 0,
+                "ewma_net_bps": 0.0,
+                "win_count": 0,
+                "toxic": False,
+            },
+        )
+
+    def score_route(self, buy_venue, sell_venue):
+        key = paper_only_route_toxicity_key(buy_venue, sell_venue)
+        if key is None:
+            return {"eligible": True, "reason": "missing_route_key", "route_key": None}
+        state = self._routes.get(key)
+        if not state:
+            return {"eligible": True, "reason": "unseen_route", "route_key": key}
+        eligible = not state.get("toxic", False)
+        return {
+            "eligible": eligible,
+            "reason": "toxic_route" if not eligible else "eligible",
+            "route_key": key,
+            "samples": state.get("samples", 0),
+            "ewma_net_bps": state.get("ewma_net_bps", 0.0),
+            "win_rate": (state.get("win_count", 0) / state["samples"]) if state.get("samples", 0) else 0.0,
+        }
+
+    def update_from_fill(self, buy_venue, sell_venue, realized_net_bps, stale_quote=False):
+        key = paper_only_route_toxicity_key(buy_venue, sell_venue)
+        if key is None:
+            return None
+        state = self._state(key)
+        net_bps = float(realized_net_bps)
+        if stale_quote:
+            net_bps -= self.stale_quote_penalty_bps
+        state["samples"] += 1
+        state["win_count"] += int(net_bps > 0.0)
+        if state["samples"] == 1:
+            state["ewma_net_bps"] = net_bps
+        else:
+            a = self.ewma_alpha
+            state["ewma_net_bps"] = (a * net_bps) + ((1.0 - a) * state["ewma_net_bps"])
+        if state["samples"] >= self.min_samples and state["ewma_net_bps"] <= self.toxic_cutoff_bps:
+            state["toxic"] = True
+        elif state["toxic"] and state["ewma_net_bps"] >= self.recovery_cutoff_bps:
+            state["toxic"] = False
+        return dict(state, route_key=key)
+
+
 _LATAM_FIAT_QUOTE_ALIASES = {
     "CLP": "CLP",
     "CLP$": "CLP",
