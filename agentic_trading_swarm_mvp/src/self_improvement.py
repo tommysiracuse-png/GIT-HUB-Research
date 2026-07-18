@@ -338,6 +338,30 @@ def _route_intelligence_score(text: str) -> int:
     )
 
 
+def _runtime_pipeline_integration_score(text: str) -> int:
+    return _term_score(
+        text,
+        (
+            "base_asset",
+            "quote_asset",
+            "asset context",
+            "candidate builder",
+            "paper trade",
+            "trade recorder",
+            "position serializer",
+            "open position",
+            "close record",
+            "closed trade",
+            "persist",
+            "persistence",
+            "preserve",
+            "serialize",
+            "serialization",
+        ),
+        cap=10,
+    )
+
+
 def _looks_like_runtime_implementation(payload: dict) -> bool:
     action = str(payload.get("action") or "")
     if action == "propose_code_change" or isinstance(payload.get("code_change"), dict):
@@ -490,6 +514,8 @@ def _infer_code_category(payload: dict) -> str:
     adapter_score = _market_data_adapter_score(payload, text)
     scanner_score = _scanner_expansion_score(text)
     scoring_score = _paper_scoring_score(text)
+    pipeline_score = _runtime_pipeline_integration_score(text)
+    pipeline_asset_context = _contains_any(text, ("base_asset", "quote_asset", "asset context"))
     route_score = _route_intelligence_score(text)
     explicit_scoring = _contains_any(
         text,
@@ -512,6 +538,20 @@ def _infer_code_category(payload: dict) -> str:
             "decay",
         ),
     )
+    pipeline_handoff = _contains_any(
+        text,
+        (
+            "persist",
+            "persistence",
+            "preserve",
+            "serialize",
+            "serialization",
+            "candidate builder",
+            "paper trade",
+        ),
+    )
+    if pipeline_score >= 3 and pipeline_asset_context and pipeline_handoff:
+        return "runtime_pipeline_integration"
     if explicit_scoring and adapter_score < 6:
         return "paper_scoring_logic"
     if scoring_score >= 2 and scoring_score >= adapter_score and scoring_score >= scanner_score:
