@@ -79,6 +79,7 @@ _OPTIONAL_RECOMMENDATION_FIELDS = {
     "variant_config",
 }
 _REQUIRED_TOP_LEVEL_KEYS = STRICT_REQUIRED_RECOMMENDATION_FIELDS + tuple(_OPTIONAL_RECOMMENDATION_FIELDS)
+_ALLOWED_TOP_LEVEL_KEYS = set(_REQUIRED_TOP_LEVEL_KEYS)
 
 _PAPER_ONLY_VOLATILITY_GATE_DEFAULTS = {
     "paper_only": True,
@@ -120,9 +121,22 @@ def _recommendation_schema_error(value: Any) -> str | None:
     missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in value]
     if missing:
         return f"missing required fields: {', '.join(missing)}"
+    unexpected = [key for key in value if key not in _ALLOWED_TOP_LEVEL_KEYS]
+    if unexpected:
+        return f"unexpected top-level fields: {', '.join(sorted(unexpected))}"
+    if not isinstance(value.get("evidence"), dict):
+        return "evidence must be a JSON object"
+    if not isinstance(value.get("proposed_change"), dict):
+        return "proposed_change must be a JSON object"
+    for optional_key in _OPTIONAL_RECOMMENDATION_FIELDS:
+        if optional_key in value and value[optional_key] is None:
+            return f"{optional_key} must be omitted or contain an object"
     array_path = _find_array_path(value)
     if array_path:
         return f"arrays are not allowed in recommendation payloads: {array_path}"
+    for required_key in ("action", "priority", "title", "rationale", "market_key"):
+        if isinstance(value.get(required_key), str) and _has_forbidden_markdown_tokens(value[required_key]):
+            return f"markdown is not allowed in {required_key}"
     return None
 
 
