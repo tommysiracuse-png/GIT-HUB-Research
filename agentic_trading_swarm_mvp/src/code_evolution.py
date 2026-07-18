@@ -160,6 +160,12 @@ def _recommendation_schema_error(candidate: Any) -> str | None:
     if not isinstance(proposed_change, dict):
         return "proposed_change must be a JSON object"
 
+    if "variant_config" in candidate and not isinstance(candidate.get("variant_config"), dict):
+        return "variant_config must be a JSON object"
+
+    if "code_change" in candidate and not isinstance(candidate.get("code_change"), dict):
+        return "code_change must be a JSON object"
+
     return None
 
 
