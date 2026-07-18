@@ -60,6 +60,40 @@ def apply_fiat_corridor_penalty(opportunity_score, corridor_type=None, liquidity
     return score
 
 
+def paper_only_confirmation_gate(primary_signal=None, confirming_signals=None, liquidity_snapshot=None,
+                                 min_confirming_markets=1):
+    """
+    Paper-only confirmation gate for recommendation emission.
+
+    This keeps the system in observation mode unless the primary signal agrees
+    with at least one confirming market signal and the instrument passes a
+    basic liquidity screen.
+    """
+    primary_signal = (primary_signal or "").strip().lower()
+    confirming_signals = tuple((signal or "").strip().lower() for signal in (confirming_signals or ()))
+    liquidity_snapshot = liquidity_snapshot or {}
+
+    spread = liquidity_snapshot.get("spread_bps")
+    recent_trades = liquidity_snapshot.get("recent_trade_count")
+    spread_ok = spread is None or float(spread) <= 25.0
+    activity_ok = recent_trades is None or float(recent_trades) >= 3.0
+
+    confirming_count = sum(1 for signal in confirming_signals if signal and signal == primary_signal)
+    confirmed = confirming_count >= int(min_confirming_markets or 1)
+    passes_liquidity = bool(spread_ok and activity_ok)
+
+    return {
+        "confirmation_required": True,
+        "primary_signal": primary_signal or "inconclusive",
+        "confirming_signals": [signal for signal in confirming_signals if signal],
+        "confirming_count": confirming_count,
+        "min_confirming_markets": int(min_confirming_markets or 1),
+        "passes_liquidity": passes_liquidity,
+        "emit_recommendation": bool(primary_signal and confirmed and passes_liquidity),
+        "paper_only": True,
+    }
+
+
 def paper_only_cross_market_review_state(evidence=None, signal_state=None, required_fields=None):
     """
     Paper-only review gate for cross-market recommendations.
