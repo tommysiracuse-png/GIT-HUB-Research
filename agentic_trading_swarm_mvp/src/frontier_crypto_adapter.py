@@ -284,6 +284,14 @@ DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_REQUIREMENTS = {
         "margin_mode_hint": "unsupported",
         "api_route_hint": "unsupported",
     },
+    "VALR": {
+        "supports_spot_short": False,
+        "requires_margin_permission": None,
+        "requires_borrow_check": None,
+        "fee_bps_hint": None,
+        "margin_mode_hint": "unsupported",
+        "api_route_hint": "unsupported",
+    },
     "BITSO": {},
 }
 
