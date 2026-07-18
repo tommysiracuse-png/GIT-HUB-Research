@@ -545,11 +545,104 @@ def route_feasible_for_paper_conditional_short(recommendation=None):
         failed_reasons.append("paper_trading_unsupported_or_unknown")
 
     feasible = not failed_reasons if applicable else True
+    asset_context = _paper_only_extract_okx_asset_context(recommendation)
     return {
         "applicable": applicable,
         "destination_valid": feasible,
         "paper_only_warning": failed_reasons[0] if failed_reasons else None,
         "failed_reasons": failed_reasons,
+        **asset_context,
+    }
+
+
+_PAPER_ONLY_OKX_QUOTE_ASSET_SUFFIXES = (
+    "USDT",
+    "USDC",
+    "FDUSD",
+    "DAI",
+    "USD",
+    "EUR",
+    "BTC",
+    "ETH",
+    "TRY",
+    "BRL",
+    "GBP",
+    "AUD",
+    "JPY",
+    "MXN",
+    "CLP",
+    "IDR",
+)
+
+
+def _paper_only_okx_asset_context_status(value, source_field):
+    normalized = _paper_only_route_token(value)
+    segments = [segment for segment in normalized.replace("/", "-").split("-") if segment]
+    has_instrument_suffix = len(segments) >= 3 or normalized.endswith(("_SWAP", "_PERP", "_SPOT"))
+    if "INSTRUMENT_ID" in _paper_only_route_token(source_field) or has_instrument_suffix:
+        return "parsed_from_instrument_id"
+    return "parsed_from_symbol"
+
+
+def _paper_only_okx_assets_from_value(value):
+    normalized = str(value or "").strip().upper()
+    if _paper_only_route_value_missing(normalized):
+        return None
+
+    tokenized = normalized.replace("/", "-").replace("_", "-")
+    segments = [segment for segment in tokenized.split("-") if segment]
+    if len(segments) >= 2:
+        base_asset = segments[0]
+        quote_asset = segments[1]
+        if base_asset.isalnum() and quote_asset.isalnum():
+            return {"base_asset": base_asset, "quote_asset": quote_asset, "parsed_value": normalized}
+
+    compact = "".join(ch for ch in normalized if ch.isalnum())
+    for quote_asset in _PAPER_ONLY_OKX_QUOTE_ASSET_SUFFIXES:
+        if compact.endswith(quote_asset) and len(compact) > len(quote_asset):
+            base_asset = compact[: -len(quote_asset)]
+            if base_asset.isalnum() and 2 <= len(base_asset) <= 12:
+                return {"base_asset": base_asset, "quote_asset": quote_asset, "parsed_value": normalized}
+    return None
+
+
+def _paper_only_extract_okx_asset_context(recommendation=None):
+    recommendation = recommendation or {}
+    venue_tokens = " ".join(
+        _paper_only_route_token(recommendation.get(key))
+        for key in ("venue", "route_primary_venue", "route_hedge_venue", "market_key", "strategy", "title")
+        if recommendation.get(key) not in (None, "")
+    )
+    if "OKX" not in venue_tokens:
+        return {
+            "base_asset": "unknown",
+            "quote_asset": "unknown",
+            "asset_context_source": None,
+            "asset_context_status": "not_okx_market",
+        }
+
+    for source_field in (
+        "route_primary_symbol",
+        "route_primary_instrument_id",
+        "route_hedge_symbol",
+        "route_hedge_instrument_id",
+        "instrument_id",
+        "symbol",
+        "instId",
+    ):
+        parsed = _paper_only_okx_assets_from_value(recommendation.get(source_field))
+        if parsed:
+            return {
+                "base_asset": parsed["base_asset"],
+                "quote_asset": parsed["quote_asset"],
+                "asset_context_source": source_field,
+                "asset_context_status": _paper_only_okx_asset_context_status(parsed["parsed_value"], source_field),
+            }
+    return {
+        "base_asset": "unknown",
+        "quote_asset": "unknown",
+        "asset_context_source": None,
+        "asset_context_status": "unknown",
     }
 
 
