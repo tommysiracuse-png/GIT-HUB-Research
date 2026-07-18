@@ -80,6 +80,26 @@ def _as_float(value: object) -> float | None:
         return None
 
 
+def _response_access_metadata(response_status: object = None, exc: Exception | None = None) -> dict:
+    if exc is None:
+        return {
+            "endpoint_access": "reachable",
+            "blocked_http_status": None,
+            "blocked_reason": None,
+        }
+    blocked_http_status = None
+    blocked_reason = None
+    endpoint_access = "unavailable"
+    if isinstance(exc, urllib.error.HTTPError):
+        blocked_http_status = str(exc.code)
+        if exc.code in {401, 403, 451}:
+            endpoint_access = "restricted"
+            blocked_reason = f"http_{exc.code}"
+    return {
+        "endpoint_access": endpoint_access,
+        "blocked_http_status": blocked_http_status,
+        "blocked_reason": blocked_reason,
+    }
 def _fetch_json(url: str, timeout: int) -> dict:
     started = time.perf_counter()
     received_at = _utc_now()
@@ -101,6 +121,7 @@ def _fetch_json(url: str, timeout: int) -> dict:
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
                 "received_at": received_at,
                 "payload": payload,
+                **_response_access_metadata(response.status),
             }
     except Exception as exc:  # noqa: BLE001
         status = "blocked" if isinstance(exc, urllib.error.HTTPError) and exc.code in {401, 403, 451} else "unavailable"
@@ -111,6 +132,7 @@ def _fetch_json(url: str, timeout: int) -> dict:
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             "received_at": received_at,
             "payload": None,
+            **_response_access_metadata(exc=exc),
         }
 
 

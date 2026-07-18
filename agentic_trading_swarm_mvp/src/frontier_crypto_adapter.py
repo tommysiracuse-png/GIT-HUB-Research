@@ -347,6 +347,23 @@ DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_REQUIREMENTS = {
         "margin_mode_hint": "spot_margin",
         "api_route_hint": "margin_spot",
     },
+    "BYBIT": {
+        "supports_spot_short": True,
+        "requires_margin_permission": True,
+        "requires_borrow_check": True,
+        "fee_bps_hint": 9.0,
+        "margin_mode_hint": "unified_margin",
+        "api_route_hint": "spot_margin",
+    },
+    "BYBIT_SPOT": {
+        "supports_spot_short": True,
+        "requires_margin_permission": True,
+        "requires_borrow_check": True,
+        "fee_bps_hint": 9.0,
+        "margin_mode_hint": "unified_margin",
+        "api_route_hint": "spot_margin",
+    },
+    "BYBIT_LINEAR": {},
     "BINANCE_US": {
         "supports_spot_short": False,
         "requires_margin_permission": None,
