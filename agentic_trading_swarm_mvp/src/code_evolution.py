@@ -142,6 +142,54 @@ def _has_meaningful_value(value: Any) -> bool:
     return True
 
 
+def _recommendation_schema_error(candidate: Any) -> str | None:
+    if not isinstance(candidate, dict):
+        return "recommendation must be a JSON object"
+
+    missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in candidate]
+    if missing:
+        return f"missing required fields: {', '.join(missing)}"
+
+    evidence = candidate.get("evidence")
+    if not isinstance(evidence, dict):
+        return "evidence must be a JSON object"
+    if not evidence:
+        return "evidence must contain a non-empty value"
+
+    proposed_change = candidate.get("proposed_change")
+    if not isinstance(proposed_change, dict):
+        return "proposed_change must be a JSON object"
+
+    return None
+
+
+def coerce_paper_only_recommendation(candidate: Any) -> dict[str, Any]:
+    parsed_candidate = candidate
+    if isinstance(candidate, str):
+        parsed_candidate = _extract_single_json_object(candidate)
+
+    schema_error: str | None = None
+    if isinstance(parsed_candidate, dict):
+        evidence = parsed_candidate.get("evidence")
+        if not isinstance(evidence, dict):
+            schema_error = "evidence must be a JSON object"
+        else:
+            schema_error = _recommendation_schema_error(parsed_candidate)
+    else:
+        schema_error = _recommendation_schema_error(parsed_candidate)
+
+    if schema_error is None:
+        return parsed_candidate
+
+    fallback = dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    fallback["evidence"] = dict(fallback["evidence"])
+    fallback["evidence"]["schema_error"] = schema_error
+    fallback["evidence"]["original_type"] = type(candidate).__name__
+    fallback["proposed_change"] = dict(fallback["proposed_change"])
+    fallback["proposed_change"]["schema_error"] = schema_error
+    return fallback
+
+
 def _find_array_path(value: Any, path: str = "$") -> str | None:
     if isinstance(value, (list, tuple)):
         return path
