@@ -118,6 +118,52 @@ def _response_access_metadata(response_status: object = None, exc: Exception | N
     }
 
 
+def _route_access_report(
+    requested_url: str,
+    effective_url: str | None,
+    primary_access: dict | None,
+    fallback_url: str | None = None,
+    fallback_access: dict | None = None,
+    fallback_attempted: bool = False,
+) -> dict:
+    primary = {
+        "url": requested_url,
+        **(primary_access or _response_access_metadata()),
+    }
+    fallback = None
+    if fallback_url:
+        fallback = {
+            "url": fallback_url,
+            **(
+                fallback_access
+                or {
+                    "endpoint_access": "not_attempted",
+                    "blocked_http_status": None,
+                    "blocked_reason": None,
+                }
+            ),
+        }
+    primary_state = primary.get("endpoint_access") or "unknown"
+    fallback_state = (fallback or {}).get("endpoint_access") or "unknown"
+    if fallback_attempted and fallback_state == "reachable":
+        resolution = "fallback"
+    elif primary_state == "reachable":
+        resolution = "primary"
+    elif fallback_url:
+        resolution = f"{primary_state}_then_{fallback_state}"
+    else:
+        resolution = primary_state
+    return {
+        "requested_url": requested_url,
+        "effective_url": effective_url or requested_url,
+        "fallback_candidate_url": fallback_url,
+        "fallback_attempted": bool(fallback_attempted),
+        "resolution": resolution,
+        "primary": primary,
+        "fallback": fallback,
+    }
+
+
 def _build_public_request(url: str, headers: dict | None = None) -> urllib.request.Request:
     request_headers = dict(_DEFAULT_PUBLIC_HEADERS)
     if headers:
@@ -163,12 +209,28 @@ def _fetch_json(url: str, timeout: int) -> dict:
     received_at = _utc_now()
     try:
         result = _open_json_request(_build_public_request(url), timeout, started)
+        primary_access = {
+            "endpoint_access": result.get("endpoint_access"),
+            "blocked_http_status": result.get("blocked_http_status"),
+            "blocked_reason": result.get("blocked_reason"),
+        }
         result.update(
             {
+                "requested_url": url,
                 "source_url": url,
+                "effective_url": url,
+                "fallback_url": None,
                 "fallback_used": False,
                 "fallback_status": None,
                 "primary_http_status": None,
+                "route_access": _route_access_report(
+                    requested_url=url,
+                    effective_url=url,
+                    primary_access=primary_access,
+                    fallback_url=None,
+                    fallback_access=None,
+                    fallback_attempted=False,
+                ),
             }
         )
         return result
@@ -176,6 +238,7 @@ def _fetch_json(url: str, timeout: int) -> dict:
         fallback_url = None
         if isinstance(exc, urllib.error.HTTPError) and exc.code == 403:
             fallback_url = _bybit_public_failover_url(url)
+        primary_access = _response_access_metadata(exc=exc)
         if fallback_url:
             try:
                 result = _open_json_request(
@@ -183,12 +246,28 @@ def _fetch_json(url: str, timeout: int) -> dict:
                     timeout,
                     started,
                 )
+                fallback_access = {
+                    "endpoint_access": result.get("endpoint_access"),
+                    "blocked_http_status": result.get("blocked_http_status"),
+                    "blocked_reason": result.get("blocked_reason"),
+                }
                 result.update(
                     {
+                        "requested_url": url,
                         "source_url": fallback_url,
+                        "effective_url": fallback_url,
+                        "fallback_url": fallback_url,
                         "fallback_used": True,
                         "fallback_status": "fallback_success",
                         "primary_http_status": str(exc.code),
+                        "route_access": _route_access_report(
+                            requested_url=url,
+                            effective_url=fallback_url,
+                            primary_access=primary_access,
+                            fallback_url=fallback_url,
+                            fallback_access=fallback_access,
+                            fallback_attempted=True,
+                        ),
                     }
                 )
                 return result
@@ -198,6 +277,7 @@ def _fetch_json(url: str, timeout: int) -> dict:
                     if isinstance(fallback_exc, urllib.error.HTTPError) and fallback_exc.code in {401, 403, 451}
                     else "unavailable"
                 )
+                fallback_access = _response_access_metadata(exc=fallback_exc)
                 received_at = _utc_now()
                 return {
                     "ok": False,
@@ -206,10 +286,21 @@ def _fetch_json(url: str, timeout: int) -> dict:
                     "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
                     "received_at": received_at,
                     "payload": None,
+                    "requested_url": url,
                     "source_url": fallback_url,
+                    "effective_url": fallback_url,
+                    "fallback_url": fallback_url,
                     "fallback_used": True,
                     "fallback_status": "blocked_403" if getattr(fallback_exc, "code", None) == 403 else "fallback_failed",
                     "primary_http_status": str(exc.code),
+                    "route_access": _route_access_report(
+                        requested_url=url,
+                        effective_url=fallback_url,
+                        primary_access=primary_access,
+                        fallback_url=fallback_url,
+                        fallback_access=fallback_access,
+                        fallback_attempted=True,
+                    ),
                     **_response_access_metadata(exc=fallback_exc),
                 }
             received_at = _utc_now()
@@ -220,10 +311,21 @@ def _fetch_json(url: str, timeout: int) -> dict:
             "http_status": str(exc)[:300],
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             "received_at": received_at,
+            "requested_url": url,
             "source_url": url,
+            "effective_url": url,
+            "fallback_url": None,
             "fallback_used": False,
             "fallback_status": "blocked_403" if getattr(exc, "code", None) == 403 and _bybit_public_failover_url(url) else None,
             "primary_http_status": str(exc.code) if isinstance(exc, urllib.error.HTTPError) else None,
+            "route_access": _route_access_report(
+                requested_url=url,
+                effective_url=url,
+                primary_access=primary_access,
+                fallback_url=fallback_url,
+                fallback_access=None,
+                fallback_attempted=False,
+            ),
             "payload": None,
             **_response_access_metadata(exc=exc),
         }
