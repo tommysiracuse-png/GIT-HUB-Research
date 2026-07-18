@@ -95,21 +95,21 @@ STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS = (
 )
 
 _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
+_STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY = "paper.execution_route_hunter"
 
 _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
-    "action": "monitor_only",
-    "priority": 0,
-    "title": "Return a single valid paper-only JSON recommendation",
-    "rationale": "Fallback emitted because the candidate response was not a complete schema-valid object.",
-    "market_key": "paper_system",
+    "action": "modify",
+    "priority": 90,
+    "title": "Fallback schema recovery",
+    "rationale": "Generated output failed schema validation; emitting a safe paper-only recommendation.",
+    "market_key": _STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY,
     "evidence": {
-        "issue": "missing_or_invalid_recommendation_schema",
-        "impact": "Downstream paper-only consumers require exactly one valid JSON object.",
+        "observed_issue": "schema_validation_failed",
+        "execution_safety": "paper_only",
     },
     "proposed_change": {
-        "goal": "Guarantee exactly one valid JSON object with required keys.",
-        "validation": "Validate schema before returning and fall back to this conservative object on failure.",
-        "constraints": "Paper-only recommendations, no markdown, no commentary, no arrays."
+        "summary": "Retry with strict single-object schema enforcement.",
+        "validation_rule": "single object, required keys present, no live execution terms",
     },
 }
 
