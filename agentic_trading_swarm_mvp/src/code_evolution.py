@@ -103,9 +103,12 @@ def _contains_array_anywhere(value: Any) -> bool:
 def validate_strict_paper_recommendation(candidate: Any) -> dict[str, Any] | None:
     if not isinstance(candidate, dict):
         return None
-    if _recommendation_schema_error(candidate):
+    normalized = _normalize_strict_paper_recommendation(candidate)
+    if normalized is None:
         return None
-    return candidate
+    if _recommendation_schema_error(normalized):
+        return None
+    return normalized
 
 
 def compose_strict_paper_recommendation(candidate: Any) -> dict[str, Any]:
@@ -146,6 +149,23 @@ def _contains_exactly_one_json_object(value: Any) -> bool:
             return False
         return True
     return False
+
+
+def _normalize_strict_paper_recommendation(candidate: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate and normalize a paper-only recommendation object."""
+
+    normalized = dict(candidate)
+    if "market_key" not in normalized or not _has_meaningful_value(normalized.get("market_key")):
+        normalized["market_key"] = "paper.execution_route_hunter.default"
+    if not _is_paper_scoped_market_key(normalized.get("market_key")):
+        return None
+    if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(normalized):
+        return None
+    if any(not _has_meaningful_value(normalized.get(key)) for key in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
+        return None
+    if _contains_array_anywhere(normalized):
+        return None
+    return normalized
 
 
 def _extract_single_json_object(text: str) -> dict[str, Any] | None:
