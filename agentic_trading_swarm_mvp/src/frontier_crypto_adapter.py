@@ -45,6 +45,181 @@ def classify_fiat_corridor(base_asset, quote_asset, venue_name=None, venue_notes
     }
 
 
+def _paper_only_is_truthy(value):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "y", "on", "enabled"}
+
+
+def _paper_only_route_token(value):
+    return str(value or "").strip().upper().replace("-", "_").replace("/", "_").replace(" ", "_")
+
+
+def _paper_only_route_value_missing(value):
+    normalized = str(value or "").strip().lower()
+    return normalized in {"", "unknown", "unspecified", "n/a", "na", "none", "null"}
+
+
+def _paper_only_route_instrument_family(value):
+    normalized = _paper_only_route_token(value)
+    if any(token in normalized for token in ("PERP", "PERPETUAL", "SWAP", "FUTURE", "FUTURES")):
+        return "perp"
+    if "SPOT" in normalized:
+        return "spot"
+    return normalized.lower() or None
+
+
+def _paper_only_route_side_family(value):
+    normalized = _paper_only_route_token(value)
+    if normalized in {"BUY", "LONG", "BID"}:
+        return "long"
+    if normalized in {"SELL", "SHORT", "ASK"}:
+        return "short"
+    return None
+
+
+def _paper_only_route_direction_pattern(recommendation=None):
+    recommendation = recommendation or {}
+    joined = " ".join(
+        _paper_only_route_token(recommendation.get(key))
+        for key in (
+            "signal_direction",
+            "signal",
+            "strategy",
+            "route_pattern",
+            "market_key",
+            "title",
+            "condition",
+            "condition_type",
+        )
+        if recommendation.get(key) not in (None, "")
+    )
+    if "LONG_PERP_SHORT_SPOT" in joined:
+        return "long_perp_short_spot"
+    if "SHORT_PERP_LONG_SPOT" in joined:
+        return "short_perp_long_spot"
+    return None
+
+
+def _paper_only_conditional_crypto_route_review(recommendation=None):
+    recommendation = dict(recommendation or {})
+    market_key = _paper_only_route_token(recommendation.get("market_key"))
+    venue_name = _paper_only_route_token(recommendation.get("venue"))
+    asset_class = _paper_only_route_token(recommendation.get("asset_class"))
+    signal_text = " ".join(
+        _paper_only_route_token(recommendation.get(key))
+        for key in ("signal", "signal_direction", "strategy", "title")
+        if recommendation.get(key) not in (None, "")
+    )
+    is_conditional = bool(
+        _paper_only_is_truthy(recommendation.get("conditional"))
+        or _paper_only_route_token(recommendation.get("recommendation_type")) == "CONDITIONAL"
+        or _paper_only_route_token(recommendation.get("signal_context")) == "CONDITIONAL"
+        or "CONDITIONAL" in market_key
+        or "CONDITIONAL" in signal_text
+    )
+    is_crypto = bool(
+        asset_class == "CRYPTO"
+        or "CRYPTO" in market_key
+        or any(
+            marker in " ".join((market_key, venue_name, signal_text))
+            for marker in ("OKX", "BINANCE", "BYBIT", "BITGET", "MEXC", "KUCOIN", "KRAKEN", "COINBASE", "GATE", "INDODAX")
+        )
+    )
+    applicable = bool(is_conditional and is_crypto)
+    gate_flag = recommendation.get("paper_route_gate_enabled")
+    enabled = applicable if gate_flag is None else _paper_only_is_truthy(gate_flag)
+    required_fields = (
+        "route_primary_venue",
+        "route_primary_symbol",
+        "route_primary_instrument_type",
+        "route_primary_side",
+        "route_hedge_venue",
+        "route_hedge_symbol",
+        "route_hedge_instrument_type",
+        "route_hedge_side",
+        "route_inventory_mode",
+        "route_confidence",
+    )
+    if not applicable or not enabled:
+        return {
+            "applicable": applicable,
+            "enabled": enabled,
+            "approved": True,
+            "required_route_fields": list(required_fields),
+            "missing_route_fields": [],
+            "inconsistent_route_fields": [],
+            "direction_pattern": _paper_only_route_direction_pattern(recommendation),
+            "route_confidence": recommendation.get("route_confidence"),
+            "requires_zero_confidence": False,
+            "paper_only": True,
+        }
+
+    missing_fields = []
+    for field in required_fields:
+        if field == "route_confidence":
+            continue
+        if _paper_only_route_value_missing(recommendation.get(field)):
+            missing_fields.append(field)
+
+    raw_confidence = recommendation.get("route_confidence")
+    try:
+        route_confidence = float(raw_confidence)
+    except (TypeError, ValueError):
+        route_confidence = None
+        missing_fields.append("route_confidence")
+
+    inconsistent_fields = []
+    base_asset = _paper_only_route_token(recommendation.get("base_asset"))
+    quote_asset = _paper_only_route_token(recommendation.get("quote_asset"))
+    requires_zero_confidence = not base_asset or not quote_asset
+    if requires_zero_confidence:
+        inconsistent_fields.append("unknown_base_or_quote_asset")
+        route_confidence = 0.0
+    elif route_confidence is not None and route_confidence <= 0.0:
+        inconsistent_fields.append("route_confidence_not_positive")
+    elif route_confidence is not None and route_confidence > 1.0:
+        inconsistent_fields.append("route_confidence_above_one")
+
+    direction_pattern = _paper_only_route_direction_pattern(recommendation)
+    primary_type = _paper_only_route_instrument_family(recommendation.get("route_primary_instrument_type"))
+    hedge_type = _paper_only_route_instrument_family(recommendation.get("route_hedge_instrument_type"))
+    primary_side = _paper_only_route_side_family(recommendation.get("route_primary_side"))
+    hedge_side = _paper_only_route_side_family(recommendation.get("route_hedge_side"))
+    if direction_pattern == "long_perp_short_spot":
+        if primary_type != "perp":
+            inconsistent_fields.append("route_primary_instrument_type")
+        if primary_side != "long":
+            inconsistent_fields.append("route_primary_side")
+        if hedge_type != "spot":
+            inconsistent_fields.append("route_hedge_instrument_type")
+        if hedge_side != "short":
+            inconsistent_fields.append("route_hedge_side")
+    elif direction_pattern == "short_perp_long_spot":
+        if primary_type != "perp":
+            inconsistent_fields.append("route_primary_instrument_type")
+        if primary_side != "short":
+            inconsistent_fields.append("route_primary_side")
+        if hedge_type != "spot":
+            inconsistent_fields.append("route_hedge_instrument_type")
+        if hedge_side != "long":
+            inconsistent_fields.append("route_hedge_side")
+
+    return {
+        "applicable": True,
+        "enabled": True,
+        "approved": not missing_fields and not inconsistent_fields,
+        "required_route_fields": list(required_fields),
+        "missing_route_fields": missing_fields,
+        "inconsistent_route_fields": sorted(set(inconsistent_fields)),
+        "direction_pattern": direction_pattern,
+        "route_confidence": route_confidence,
+        "requires_zero_confidence": requires_zero_confidence,
+        "paper_only": True,
+    }
+
+
 def paper_only_validate_recommendation_destination(recommendation=None, execution_destination=None,
                                                    allow_simulation_only=True):
     """
@@ -67,6 +242,11 @@ def paper_only_validate_recommendation_destination(recommendation=None, executio
     recommendation["execution_gate"] = "simulate_only"
     recommendation["simulation_only"] = True
 
+    route_review = _paper_only_conditional_crypto_route_review(recommendation)
+    if route_review.get("applicable"):
+        recommendation["paper_route_review"] = route_review
+        if route_review.get("requires_zero_confidence"):
+            recommendation["route_confidence"] = 0.0
     if is_live_destination:
         recommendation["action"] = "no_op"
         recommendation["paper_only_warning"] = "rejected_live_execution_destination"
@@ -75,6 +255,12 @@ def paper_only_validate_recommendation_destination(recommendation=None, executio
         recommendation["action"] = "no_op"
         recommendation["paper_only_warning"] = "uncertain_destination_defaulted_to_no_op"
         recommendation["destination_valid"] = False
+    elif route_review.get("applicable") and route_review.get("enabled") and not route_review.get("approved"):
+        recommendation["action"] = "no_op"
+        recommendation["paper_only_warning"] = "conditional_route_incomplete_or_inconsistent"
+        recommendation["destination_valid"] = False
+        recommendation["route_publication_blocked"] = True
+        recommendation["simulation_only"] = True
     else:
         recommendation["destination_valid"] = True
 
@@ -88,6 +274,7 @@ def paper_only_validate_recommendation_destination(recommendation=None, executio
         "simulation_only": True,
         "destination_valid": bool(recommendation.get("destination_valid", False)),
         "paper_only_warning": recommendation.get("paper_only_warning"),
+        "paper_route_review": recommendation.get("paper_route_review"),
     }
 
 
@@ -175,20 +362,29 @@ def paper_only_validate_recommendation(recommendation=None, execution_destinatio
     has_live_marker = any(bool(marker) for marker in live_route_markers)
     destination_is_live = destination in {"live", "production", "prod", "real", "broker", "exchange"}
     uncertain = not recommendation or not recommendation.get("signal") or recommendation.get("confidence") is None
+    route_review = _paper_only_conditional_crypto_route_review(recommendation)
+    route_rejected = bool(
+        route_review.get("applicable")
+        and route_review.get("enabled")
+        and not route_review.get("approved")
+    )
 
-    rejected = bool(has_live_marker or destination_is_live)
+    rejected = bool(has_live_marker or destination_is_live or route_rejected)
     approved = not rejected and not uncertain
     action = "simulate_only" if approved else fallback_action
 
     return {
         "paper_only": True,
         "simulation_only": True,
+        "route_publication_blocked": route_rejected,
         "approved": approved,
         "rejected": rejected,
         "action": action,
         "execution_destination": None if rejected else destination or "paper",
+        "route_review": route_review,
         "warning": (
             "live destination rejected" if rejected else
+            "conditional route incomplete or inconsistent" if route_rejected else
             "uncertain recommendation defaulted to no-op" if uncertain else
             None
         ),
