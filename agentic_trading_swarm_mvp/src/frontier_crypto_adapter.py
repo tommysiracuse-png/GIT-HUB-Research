@@ -8,6 +8,57 @@ uses credentials, private/account APIs, or order endpoints.
 
 from __future__ import annotations
 
+
+def classify_fiat_corridor(base_asset, quote_asset, venue_name=None, venue_notes=None):
+    """
+    Classify a public paper-only market into a broad liquidity corridor.
+
+    This is metadata only: no routing, no execution, no trade decisions.
+    """
+    base = (base_asset or "").strip().upper()
+    quote = (quote_asset or "").strip().upper()
+    venue = (venue_name or "").strip().upper()
+    notes = (venue_notes or "").strip().upper()
+
+    if quote in {"USD", "USDT", "USDC"}:
+        corridor_type = f"global_{quote.lower()}"
+        corridor_confidence = 0.95
+    elif quote in {"BTC", "ETH"}:
+        corridor_type = f"{quote.lower()}_cross"
+        corridor_confidence = 0.88
+    else:
+        corridor_type = "local_fiat"
+        corridor_confidence = 0.72
+
+    if any(token in venue for token in ("BINANCE", "COINBASE", "KRAKEN", "GATE", "KUCOIN", "MEXC", "BITGET")):
+        corridor_confidence = min(0.99, corridor_confidence + 0.03)
+    if "LOCAL" in notes or "FIAT" in notes:
+        corridor_confidence = min(0.99, corridor_confidence + 0.02)
+
+    return {
+        "corridor_base": base,
+        "corridor_quote": quote,
+        "corridor_type": corridor_type,
+        "corridor_confidence": round(corridor_confidence, 3),
+    }
+
+
+def apply_fiat_corridor_penalty(opportunity_score, corridor_type=None, liquidity_confidence=None,
+                                depth_confidence=None, turnover_confidence=None):
+    """
+    Paper-only score adjustment for locally constrained fiat corridors.
+    """
+    score = float(opportunity_score or 0.0)
+    corridor = (corridor_type or "").strip().lower()
+    liquidity = float(liquidity_confidence or 0.0)
+    depth = float(depth_confidence or 0.0)
+    turnover = float(turnover_confidence or 0.0)
+
+    strong_liquidity = liquidity >= 0.8 or (depth >= 0.75 and turnover >= 0.75)
+    if corridor == "local_fiat" and not strong_liquidity:
+        score *= 0.9
+    return score
+
 import argparse
 import collections
 import copy
