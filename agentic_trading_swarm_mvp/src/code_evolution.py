@@ -102,6 +102,31 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK = {
 }
 
 
+def _paper_only_guard_json_text(payload: Any) -> str:
+    """Serialize a paper-only recommendation as exactly one JSON object."""
+
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if not stripped.startswith("{") or not stripped.endswith("}"):
+            raise ValueError("non_json_text")
+        if stripped != payload:
+            raise ValueError("top_level_whitespace")
+        payload = json.loads(stripped)
+
+    candidate = _normalize_single_recommendation_payload(payload)
+    if candidate is None:
+        raise ValueError("invalid_recommendation_payload")
+
+    if "market_key" not in candidate or not candidate.get("market_key"):
+        candidate = dict(candidate)
+        candidate["market_key"] = "paper.execution_route_hunter.output_contract"
+
+    serialized = json.dumps(candidate, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, sort_keys=True)
+    if not _contains_exactly_one_json_object(candidate):
+        raise ValueError("multiple_json_objects")
+    return serialized
+
+
 def _paper_only_recommendation_fallback(*, title: str | None = None, rationale: str | None = None) -> dict[str, Any]:
     """Return a conservative paper-only fallback recommendation."""
 
