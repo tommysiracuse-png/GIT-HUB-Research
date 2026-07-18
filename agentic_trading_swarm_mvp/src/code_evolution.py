@@ -114,6 +114,18 @@ def _find_array_path(value: Any, path: str = "$") -> str | None:
     return None
 
 
+def _recommendation_schema_error(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return "recommendation must be a JSON object"
+    missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in value]
+    if missing:
+        return f"missing required fields: {', '.join(missing)}"
+    array_path = _find_array_path(value)
+    if array_path:
+        return f"arrays are not allowed in recommendation payloads: {array_path}"
+    return None
+
+
 def _coerce_confirm_score_min(value: Any) -> tuple[float | None, str]:
     if isinstance(value, bool):
         return None, "confirm_score_min must be a number between 0 and 1"
@@ -199,7 +211,12 @@ def _default_recommendation(overrides: dict[str, Any] | None = None) -> dict[str
         for key, value in overrides.items():
             if key == "variant_config" or value is None:
                 continue
+            if _find_array_path(value):
+                continue
             recommendation[key] = value
+    schema_error = _recommendation_schema_error(recommendation)
+    if schema_error:
+        raise ValueError(schema_error)
     return recommendation
 
 
