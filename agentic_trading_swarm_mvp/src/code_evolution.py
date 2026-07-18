@@ -164,6 +164,25 @@ def _recommendation_schema_error(value: Any) -> str | None:
     return None
 
 
+def _strict_recommendation_json_error(text: str) -> str | None:
+    """Validate model output as one strict recommendation object."""
+
+    if not isinstance(text, str):
+        return "recommendation output must be a string"
+    stripped = text.strip()
+    if not stripped:
+        return "recommendation output must not be empty"
+    if any(token in stripped for token in _FORBIDDEN_MARKDOWN_TOKENS):
+        return "markdown fences are not allowed"
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return "recommendation must be a single JSON object"
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        return f"invalid JSON: {exc.msg}"
+    return _recommendation_schema_error(payload)
+
+
 def _recommendation_or_paper_hold(value: Any, *, validation_error: str | None = None) -> dict[str, Any]:
     """Return a validated recommendation or a strict paper-only hold fallback."""
 
