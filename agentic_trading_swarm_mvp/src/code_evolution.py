@@ -71,6 +71,9 @@ STRICT_RECOMMENDATION_FALLBACK_ACTIONS = {
     "propose_policy_update",
 }
 
+_STRICT_RECOMMENDATION_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
+_STRICT_RECOMMENDATION_TOP_LEVEL_KEYS.add("implementation_notes")
+
 _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
     "action": "monitor_only",
     "priority": 0,
@@ -146,7 +149,7 @@ def _recommendation_schema_error(candidate: Any) -> str:
     missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in candidate]
     if missing:
         return f"missing:{','.join(missing)}"
-    extra = sorted(set(candidate) - _ALLOWED_TOP_LEVEL_KEYS)
+    extra = sorted(set(candidate) - _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS)
     if extra:
         return f"extra:{','.join(extra)}"
     if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
@@ -176,6 +179,10 @@ def _normalize_recommendation_payload(
     if _recommendation_needs_regeneration(candidate, raw_text):
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
     assert candidate is not None
+    if not isinstance(candidate.get("evidence"), dict):
+        candidate["evidence"] = {"detail": str(candidate.get("evidence", "")).strip()}
+    if candidate.get("implementation_notes") is not None and not isinstance(candidate.get("implementation_notes"), dict):
+        candidate["implementation_notes"] = {"detail": str(candidate.get("implementation_notes", "")).strip()}
     return candidate
 
 
