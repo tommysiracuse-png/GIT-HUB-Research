@@ -99,6 +99,45 @@ DEFAULT_PAPER_ONLY_ROUTE_FRESHNESS_POLICY = {
     "all_routes_stale_behavior": "suppress_fill",
 }
 
+DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_POLICY = {
+    "enabled": True,
+    "unsupported_behavior": "suppress",
+    "unknown_behavior": "penalize",
+    "unknown_multiplier": 0.75,
+    "margin_permission_multiplier": 0.96,
+    "borrow_check_multiplier": 0.94,
+    "fee_bps_reference": 10.0,
+    "max_fee_penalty_reduction": 0.06,
+}
+
+DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_REQUIREMENTS = {
+    "GATE": {
+        "supports_spot_short": True,
+        "requires_margin_permission": True,
+        "requires_borrow_check": True,
+        "fee_bps_hint": 10.0,
+        "margin_mode_hint": "cross_or_isolated_margin",
+        "api_route_hint": "spot_margin",
+    },
+    "OKX": {
+        "supports_spot_short": True,
+        "requires_margin_permission": True,
+        "requires_borrow_check": True,
+        "fee_bps_hint": 8.0,
+        "margin_mode_hint": "spot_margin",
+        "api_route_hint": "margin_spot",
+    },
+    "BINANCE_US": {
+        "supports_spot_short": False,
+        "requires_margin_permission": None,
+        "requires_borrow_check": None,
+        "fee_bps_hint": None,
+        "margin_mode_hint": "unsupported",
+        "api_route_hint": "unsupported",
+    },
+    "BITSO": {},
+}
+
 
 def paper_only_cross_market_risk_gate(
     *,
@@ -183,6 +222,204 @@ def paper_only_route_freshness_gate(
     }
 
 
+def _paper_only_route_requirement_keys(venue: str) -> tuple[str, ...]:
+    normalized = str(venue or "").strip().upper().replace("-", "_").replace("/", "_")
+    if not normalized:
+        return ("",)
+
+    keys: list[str] = []
+
+    def _append(value: str) -> None:
+        if value and value not in keys:
+            keys.append(value)
+
+    _append(normalized)
+    for suffix in ("_SPOT", "_PUBLIC"):
+        if normalized.endswith(suffix):
+            _append(normalized[: -len(suffix)])
+
+    if normalized in {"GATEIO", "GATE_IO"}:
+        _append("GATE")
+    if normalized.startswith("OKX"):
+        _append("OKX")
+    if normalized in {"BINANCEUS", "BINANCE_US"}:
+        _append("BINANCE_US")
+    return tuple(keys)
+
+
+def paper_only_conditional_short_route_requirements(
+    *,
+    venue: str,
+    registry: dict | None = None,
+) -> dict:
+    """Resolve paper-only spot-short route requirements for a frontier venue."""
+
+    registry = registry or DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_REQUIREMENTS
+    resolved_key = None
+    resolved_entry: dict = {}
+    for key in _paper_only_route_requirement_keys(venue):
+        candidate = registry.get(key)
+        if isinstance(candidate, dict):
+            resolved_key = key
+            resolved_entry = copy.deepcopy(candidate)
+            break
+
+    normalized_venue = str(venue or "").strip().upper()
+    supports_spot_short = resolved_entry.get("supports_spot_short")
+    if supports_spot_short is True:
+        support_status = "supported"
+    elif supports_spot_short is False:
+        support_status = "unsupported"
+    else:
+        support_status = "unknown"
+
+    notes = []
+    if resolved_entry.get("requires_margin_permission") is True:
+        notes.append("margin_permission_required")
+    if resolved_entry.get("requires_borrow_check") is True:
+        notes.append("borrow_check_required")
+    if support_status == "unknown":
+        notes.append("support_unknown")
+    elif support_status == "unsupported":
+        notes.append("spot_short_unsupported")
+
+    return {
+        "venue": normalized_venue,
+        "venue_key": resolved_key or normalized_venue,
+        "supports_spot_short": resolved_entry.get("supports_spot_short"),
+        "requires_margin_permission": resolved_entry.get("requires_margin_permission"),
+        "requires_borrow_check": resolved_entry.get("requires_borrow_check"),
+        "fee_bps_hint": resolved_entry.get("fee_bps_hint"),
+        "margin_mode_hint": resolved_entry.get("margin_mode_hint"),
+        "api_route_hint": resolved_entry.get("api_route_hint"),
+        "support_status": support_status,
+        "notes": notes,
+    }
+
+
+def _paper_only_is_conditional_short_context(direction: str, context_stats: dict | None) -> bool:
+    normalized_direction = str(direction or "").strip().lower()
+    if "short" not in normalized_direction:
+        return False
+
+    stats = context_stats or {}
+    if bool(stats.get("conditional")):
+        return True
+
+    for key in (
+        "opportunity_style",
+        "route_type",
+        "route_style",
+        "execution_style",
+        "entry_style",
+        "context_key",
+        "signal_key",
+    ):
+        value = stats.get(key)
+        if value is not None and "conditional" in str(value).lower():
+            return True
+    return False
+
+
+def paper_only_conditional_short_route_feasibility_gate(
+    *,
+    venue: str,
+    direction: str,
+    context_stats: dict | None = None,
+    registry: dict | None = None,
+    policy: dict | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Paper-only feasibility gate for conditional frontier spot shorts."""
+
+    merged_policy = copy.deepcopy(DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_POLICY)
+    if isinstance(policy, dict):
+        merged_policy.update(policy)
+
+    if not enabled or not bool(merged_policy.get("enabled", True)):
+        return {
+            "enabled": False,
+            "applied": False,
+            "allow": True,
+            "suppressed": False,
+            "score_multiplier": 1.0,
+            "reason": "disabled",
+            "reasons": ["disabled"],
+            "route_requirements": None,
+        }
+
+    if not _paper_only_is_conditional_short_context(direction, context_stats):
+        return {
+            "enabled": True,
+            "applied": False,
+            "allow": True,
+            "suppressed": False,
+            "score_multiplier": 1.0,
+            "reason": "not_applicable",
+            "reasons": ["not_applicable"],
+            "route_requirements": None,
+        }
+
+    requirements = paper_only_conditional_short_route_requirements(venue=venue, registry=registry)
+    support_status = requirements.get("support_status")
+    reasons: list[str] = []
+    suppressed = False
+    allow = True
+    score_multiplier = 1.0
+
+    if support_status == "unsupported":
+        reasons.append("unsupported_spot_short")
+        if str(merged_policy.get("unsupported_behavior", "suppress")).strip().lower() == "suppress":
+            suppressed = True
+            allow = False
+            score_multiplier = 0.0
+    elif support_status == "unknown":
+        reasons.append("unknown_spot_short_support")
+        if str(merged_policy.get("unknown_behavior", "penalize")).strip().lower() == "suppress":
+            suppressed = True
+            allow = False
+            score_multiplier = 0.0
+        else:
+            score_multiplier *= max(0.0, min(1.0, float(merged_policy.get("unknown_multiplier", 0.75) or 0.75)))
+    else:
+        if requirements.get("requires_margin_permission") is True:
+            reasons.append("margin_permission_required")
+            score_multiplier *= max(
+                0.0,
+                min(1.0, float(merged_policy.get("margin_permission_multiplier", 0.96) or 0.96)),
+            )
+        if requirements.get("requires_borrow_check") is True:
+            reasons.append("borrow_check_required")
+            score_multiplier *= max(
+                0.0,
+                min(1.0, float(merged_policy.get("borrow_check_multiplier", 0.94) or 0.94)),
+            )
+        fee_bps_hint = requirements.get("fee_bps_hint")
+        try:
+            fee_bps = float(fee_bps_hint)
+        except (TypeError, ValueError):
+            fee_bps = 0.0
+        if fee_bps > 0.0:
+            fee_reference = max(float(merged_policy.get("fee_bps_reference", 10.0) or 10.0), 1.0)
+            max_fee_penalty_reduction = max(
+                0.0,
+                min(0.25, float(merged_policy.get("max_fee_penalty_reduction", 0.06) or 0.06)),
+            )
+            score_multiplier *= 1.0 - (max_fee_penalty_reduction * min(fee_bps / fee_reference, 1.0))
+            reasons.append("fee_hint_penalty")
+
+    return {
+        "enabled": True,
+        "applied": True,
+        "allow": allow,
+        "suppressed": suppressed,
+        "score_multiplier": max(0.0, min(1.0, score_multiplier)),
+        "reason": reasons[0] if reasons else "supported",
+        "reasons": reasons or ["supported"],
+        "route_requirements": requirements,
+    }
+
+
 def paper_only_frontier_score_adjustment(
     *,
     venue: str,
@@ -193,6 +430,7 @@ def paper_only_frontier_score_adjustment(
     long_cohort_recent_expectancy_bps: float | None = None,
     long_cohort_recent_win_rate: float | None = None,
     long_cohort_low_feasibility_share: float | None = None,
+    route_feasibility_policy: dict | None = None,
     enabled: bool = True,
 ) -> dict:
     """Paper-only frontier score adjustment for safe, reportable gating."""
@@ -249,6 +487,15 @@ def paper_only_frontier_score_adjustment(
         mean_reversion_bps=stats.get("mean_reversion_bps"),
         enabled=enabled,
     )
+    route_feasibility_gate = paper_only_conditional_short_route_feasibility_gate(
+        venue=venue,
+        direction=direction,
+        context_stats=stats,
+        policy=route_feasibility_policy,
+        enabled=enabled,
+    )
+    allow = bool(gate.get("allow", False))
+    suppressed = bool(cohort_gate.get("suppressed", False))
 
     score_multiplier = 1.0
     if gate.get("allow", False):
@@ -264,12 +511,19 @@ def paper_only_frontier_score_adjustment(
     if cross_market_gate.get("enabled", False):
         score_multiplier *= float(cross_market_gate.get("score_multiplier", 1.0) or 1.0)
 
+    if route_feasibility_gate.get("enabled", False) and route_feasibility_gate.get("applied", False):
+        score_multiplier *= float(route_feasibility_gate.get("score_multiplier", 1.0) or 1.0)
+        if route_feasibility_gate.get("suppressed", False):
+            allow = False
+            suppressed = True
+
     return {
         "enabled": bool(enabled),
-        "allow": bool(gate.get("allow", False)),
-        "suppressed": bool(cohort_gate.get("suppressed", False)),
+        "allow": allow,
+        "suppressed": suppressed,
         "cross_market_gate": cross_market_gate,
         "score_multiplier": max(0.0, min(1.0, score_multiplier)),
+        "route_feasibility_gate": route_feasibility_gate,
         "venue_direction_gate": gate,
         "long_cohort_gate": cohort_gate,
     }
