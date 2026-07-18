@@ -243,6 +243,17 @@ LEG_CONTAINER_KEYS = ("legs", "leg_metadata")
 
 LEG_VALUE_KEYS = ("perp_leg", "spot_leg", "long_leg", "short_leg", "buy_leg", "sell_leg")
 
+CANONICAL_MARKET_ID_KEYS = (
+    "canonical_venue",
+    "canonical_underlying",
+    "canonical_instrument_id",
+    "contract_context",
+    "instrument_type",
+    "tenor",
+    "expiry",
+    "canonical_market_identity",
+)
+
 
 def _signal_stats(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
@@ -457,6 +468,99 @@ def _parse_candidate_assets(item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _identity_sources(item: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item, *_iter_candidate_legs(item)]
+
+
+def _first_present_text(item: dict[str, Any], *keys: str) -> str | None:
+    for source in _identity_sources(item):
+        for key in keys:
+            value = source.get(key)
+            if not _is_missing_text(value):
+                return str(value).strip()
+    return None
+
+
+def _contract_context_from_instrument_id(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    if not text:
+        return None
+    parts = [part for part in re.split(r"[-/_:]", text) if part]
+    if len(parts) < 3:
+        return None
+    tail = parts[2:]
+    if not tail:
+        return None
+    has_contract_hint = any(
+        part in {"SWAP", "PERP", "FUTURE", "FUTURES", "THISWEEK", "NEXTWEEK", "QUARTER", "NEXTQUARTER"}
+        or re.fullmatch(r"\d{6,8}", part)
+        for part in tail
+    )
+    if not has_contract_hint:
+        return None
+    return "-".join(tail)
+
+
+def _normalized_market_identity(item: dict[str, Any]) -> dict[str, Any]:
+    venue = _first_present_text(item, "canonical_venue") or _candidate_venue(item) or None
+    base_asset = _normalized_asset_token(
+        _first_present_text(item, "base_asset", "baseAsset", "baseCcy", "base_currency")
+    )
+    quote_asset = _normalized_asset_token(
+        _first_present_text(item, "quote_asset", "quoteAsset", "quoteCcy", "quote_currency")
+    )
+    canonical_underlying = _normalized_asset_token(
+        _first_present_text(item, "canonical_underlying", "underlying", "underlying_asset", "uly")
+    ) or base_asset
+    canonical_instrument_id = _first_present_text(
+        item,
+        "canonical_instrument_id",
+        "normalized_instrument_id",
+        "instrument_id",
+        "instId",
+        "inst_id",
+        "market_symbol",
+    )
+    contract_context = _first_present_text(
+        item,
+        "contract_context",
+        "contract",
+        "contract_code",
+        "contract_family",
+        "tenor",
+        "expiry",
+        "expiry_date",
+        "maturity_date",
+        "settlement_date",
+    ) or _contract_context_from_instrument_id(canonical_instrument_id)
+    instrument_type = _first_present_text(item, "instrument_type", "instType")
+    normalized_pair = _normalized_candidate_pair(
+        base_asset,
+        quote_asset,
+        str(venue or "").lower(),
+        "identity",
+        require_known_quote=False,
+    )
+    fields: dict[str, Any] = {}
+    if venue:
+        fields["canonical_venue"] = str(venue).strip().lower()
+    if canonical_underlying:
+        fields["canonical_underlying"] = canonical_underlying
+    if canonical_instrument_id:
+        fields["canonical_instrument_id"] = str(canonical_instrument_id).strip().upper()
+    if contract_context:
+        fields["contract_context"] = str(contract_context).strip().upper()
+    if instrument_type:
+        fields["instrument_type"] = str(instrument_type).strip().upper()
+    if normalized_pair:
+        fields.update(normalized_pair)
+    symbol_or_underlying = fields.get("normalized_symbol") or canonical_underlying
+    disambiguator = fields.get("contract_context") or fields.get("instrument_type") or fields.get("canonical_instrument_id")
+    if fields.get("canonical_venue") and symbol_or_underlying and disambiguator:
+        fields["canonical_market_identity"] = f"{fields['canonical_venue']}:{symbol_or_underlying}:{disambiguator}"
+    return fields
+
+
 def _extract_candidate_rows(report: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(report, dict):
         return []
@@ -494,6 +598,10 @@ def _extract_candidate_rows(report: dict[str, Any] | None) -> list[dict[str, Any
                         enriched["normalized_symbol"] = normalized_existing["normalized_symbol"]
                     if _is_missing_text(enriched.get("asset_key")):
                         enriched["asset_key"] = normalized_existing["asset_key"]
+                identity_fields = _normalized_market_identity(enriched)
+                for field, value in identity_fields.items():
+                    if _is_missing_text(enriched.get(field)):
+                        enriched[field] = value
                 candidates.append(enriched)
     return candidates
 
