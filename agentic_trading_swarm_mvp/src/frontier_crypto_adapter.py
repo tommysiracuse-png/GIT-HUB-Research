@@ -344,7 +344,88 @@ def paper_only_signal_freshness_audit(
     }
 
 
-def paper_only_radar_alert_gate(payload, minimum_confidence=0.68):
+def _paper_only_route_review_context(payload):
+    if not isinstance(payload, dict):
+        return {}
+
+    context = {}
+    for field in (
+        "symbol",
+        "market",
+        "route",
+        "route_key",
+        "buy_venue",
+        "sell_venue",
+        "venue",
+        "side",
+        "order_type",
+        "signal_id",
+        "strategy",
+    ):
+        value = payload.get(field)
+        if isinstance(value, str):
+            value = value.strip()
+        if value not in (None, "", [], {}, ()):
+            context[field] = value
+    return context
+
+
+def paper_only_execution_mode_guard(payload, *, required_mode="paper", allow_route_evaluation=True):
+    """Paper-only guard that blocks non-paper dispatch attempts.
+
+    Route evaluation and analytics may still proceed, but any live-capable
+    submission path must be considered blocked unless execution_mode resolves
+    to the required paper mode.
+    """
+
+    if not isinstance(payload, dict):
+        return {
+            "eligible": False,
+            "status": "blocked",
+            "reason": "invalid_payload",
+            "execution_mode": None,
+            "required_execution_mode": str(required_mode or "paper").strip().lower() or "paper",
+            "route_evaluation_allowed": bool(allow_route_evaluation),
+            "submission_allowed": False,
+            "review_context": {},
+        }
+
+    normalized_required_mode = str(required_mode or "paper").strip().lower() or "paper"
+    explicit_execution_mode = payload.get("execution_mode")
+    normalized_execution_mode = str(explicit_execution_mode or "").strip().lower() or None
+    review_context = _paper_only_route_review_context(payload)
+
+    if normalized_execution_mode is None and "paper_mode" in payload:
+        normalized_execution_mode = "paper" if bool(payload.get("paper_mode")) else "disabled"
+
+    eligible = normalized_execution_mode == normalized_required_mode
+
+    if eligible:
+        reason = "eligible"
+        status = "eligible"
+    elif explicit_execution_mode not in (None, ""):
+        reason = "execution_mode_blocked"
+        status = "blocked"
+    elif "paper_mode" in payload and not bool(payload.get("paper_mode")):
+        reason = "paper_mode_disabled"
+        status = "blocked"
+    else:
+        reason = "execution_mode_missing"
+        status = "blocked"
+
+    return {
+        "eligible": eligible,
+        "status": status,
+        "reason": reason,
+        "execution_mode": normalized_execution_mode,
+        "required_execution_mode": normalized_required_mode,
+        "route_evaluation_allowed": bool(allow_route_evaluation),
+        "submission_allowed": bool(eligible),
+        "review_context": review_context,
+    }
+
+
+def paper_only_radar_alert_gate(payload, minimum_confidence=0.68, require_execution_mode_paper=True):
     """Paper-only alert gate for radar recommendation payloads.
 
     Rejects incomplete payloads and suppresses alerts unless paper_mode is true
@@ -354,7 +435,17 @@ def paper_only_radar_alert_gate(payload, minimum_confidence=0.68):
     if not isinstance(payload, dict):
         return {"eligible": False, "reason": "invalid_payload", "missing_required_fields": ["payload"]}
 
-    required_fields = ("paper_mode", "confidence")
+    execution_guard = paper_only_execution_mode_guard(payload) if require_execution_mode_paper else None
+    if execution_guard is not None and not execution_guard["eligible"]:
+        return {
+            "eligible": False,
+            "status": execution_guard["status"],
+            "reason": execution_guard["reason"],
+            "execution_guard": execution_guard,
+            "paper_mode": False,
+        }
+
+    required_fields = ("confidence",)
     missing_required_fields = [field for field in required_fields if field not in payload]
     if missing_required_fields:
         return {
@@ -362,10 +453,6 @@ def paper_only_radar_alert_gate(payload, minimum_confidence=0.68):
             "reason": "missing_required_fields",
             "missing_required_fields": missing_required_fields,
         }
-
-    paper_mode = bool(payload.get("paper_mode", False))
-    if not paper_mode:
-        return {"eligible": False, "reason": "paper_mode_disabled"}
 
     try:
         confidence = float(payload.get("confidence"))
@@ -386,7 +473,8 @@ def paper_only_radar_alert_gate(payload, minimum_confidence=0.68):
         "reason": "eligible",
         "confidence": confidence,
         "minimum_confidence": minimum_confidence,
-        "paper_mode": True,
+        "paper_mode": True if execution_guard is not None else bool(payload.get("paper_mode", False)),
+        "execution_guard": execution_guard,
     }
 
 
