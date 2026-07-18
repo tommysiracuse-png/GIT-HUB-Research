@@ -152,6 +152,153 @@ def _paper_only_route_direction_pattern(recommendation=None):
     return None
 
 
+def _paper_only_is_okx_basis_market(recommendation=None):
+    recommendation = recommendation or {}
+    joined = " ".join(
+        _paper_only_route_token(recommendation.get(key))
+        for key in ("market_key", "venue", "exchange", "strategy", "variant", "signal", "title")
+        if recommendation.get(key) not in (None, "")
+    )
+    return "OKX" in joined and "BASIS" in joined
+
+
+def _paper_only_okx_parse_status_valid(parse_status):
+    return str(parse_status or "").strip().lower() in {"parsed_delimited", "parsed_compact_suffix"}
+
+
+def _paper_only_parse_okx_instrument_id(instrument_id=None):
+    raw = str(instrument_id or "").strip().upper()
+    if not raw:
+        return {
+            "base_asset": None,
+            "quote_asset": None,
+            "normalized_instrument_id": None,
+            "instrument_family": None,
+            "parse_status": "missing_instrument_id",
+        }
+
+    normalized = raw.replace("/", "-").replace("_", "-").replace(":", "-")
+    parts = [part for part in normalized.split("-") if part]
+    derivative_suffixes = {
+        "SWAP",
+        "PERP",
+        "PERPETUAL",
+        "FUTURE",
+        "FUTURES",
+        "THISWEEK",
+        "NEXTWEEK",
+        "QUARTER",
+        "BIQUARTER",
+    }
+    if len(parts) >= 2 and parts[1] not in derivative_suffixes and parts[0] != parts[1]:
+        base_asset = parts[0]
+        quote_asset = parts[1]
+        return {
+            "base_asset": base_asset,
+            "quote_asset": quote_asset,
+            "normalized_instrument_id": f"{base_asset}-{quote_asset}",
+            "instrument_family": _paper_only_route_instrument_family(raw),
+            "parse_status": "parsed_delimited",
+        }
+
+    compact_candidate = parts[0] if parts else normalized
+    for quote_asset in ("USDT", "USDC", "USD", "BTC", "ETH"):
+        if compact_candidate.endswith(quote_asset) and len(compact_candidate) > len(quote_asset):
+            base_asset = compact_candidate[:-len(quote_asset)]
+            if base_asset and base_asset != quote_asset:
+                return {
+                    "base_asset": base_asset,
+                    "quote_asset": quote_asset,
+                    "normalized_instrument_id": f"{base_asset}-{quote_asset}",
+                    "instrument_family": _paper_only_route_instrument_family(raw),
+                    "parse_status": "parsed_compact_suffix",
+                }
+
+    return {
+        "base_asset": None,
+        "quote_asset": None,
+        "normalized_instrument_id": normalized,
+        "instrument_family": _paper_only_route_instrument_family(raw),
+        "parse_status": "unparsed_instrument_id",
+    }
+
+
+def _paper_only_enrich_okx_basis_context(recommendation=None):
+    recommendation = dict(recommendation or {})
+    if not _paper_only_is_okx_basis_market(recommendation):
+        return recommendation
+
+    instrument_source = (
+        recommendation.get("instrument_id")
+        or recommendation.get("symbol")
+        or recommendation.get("route_primary_symbol")
+        or recommendation.get("route_hedge_symbol")
+    )
+    parsed = _paper_only_parse_okx_instrument_id(instrument_source)
+    recommendation["parse_status"] = parsed.get("parse_status")
+    recommendation["instrument_parse_status"] = parsed.get("parse_status")
+    recommendation["normalized_instrument_id"] = parsed.get("normalized_instrument_id")
+    if _paper_only_route_value_missing(recommendation.get("instrument_id")) and instrument_source:
+        recommendation["instrument_id"] = instrument_source
+    if _paper_only_route_value_missing(recommendation.get("base_asset")) and parsed.get("base_asset"):
+        recommendation["base_asset"] = parsed.get("base_asset")
+    if _paper_only_route_value_missing(recommendation.get("quote_asset")) and parsed.get("quote_asset"):
+        recommendation["quote_asset"] = parsed.get("quote_asset")
+    if _paper_only_route_value_missing(recommendation.get("instrument_family")) and parsed.get("instrument_family"):
+        recommendation["instrument_family"] = parsed.get("instrument_family")
+    return recommendation
+
+
+def _paper_only_apply_okx_basis_variant_gate(recommendation=None):
+    recommendation = _paper_only_enrich_okx_basis_context(recommendation)
+    if not _paper_only_is_okx_basis_market(recommendation):
+        return recommendation
+
+    joined = " ".join(
+        _paper_only_route_token(recommendation.get(key))
+        for key in ("strategy_variant", "variant", "strategy", "signal", "title")
+        if recommendation.get(key) not in (None, "")
+    )
+    blocked_variant = None
+    if "BASIS_MEAN_REVERSION_LONG_PERP" in joined:
+        blocked_variant = "basis_mean_reversion_long_perp"
+    elif "BASIS_MEAN_REVERSION_SHORT_PERP" in joined:
+        blocked_variant = "basis_mean_reversion_short_perp"
+
+    parse_status = recommendation.get("parse_status")
+    variant_blocked = bool(blocked_variant and _paper_only_okx_parse_status_valid(parse_status))
+    if (
+        _paper_only_route_value_missing(recommendation.get("base_asset"))
+        or _paper_only_route_value_missing(recommendation.get("quote_asset"))
+        or not _paper_only_okx_parse_status_valid(parse_status)
+    ):
+        recommendation["route_confidence"] = 0.0
+        recommendation["route_rejected"] = True
+        recommendation["route_rejection_reason"] = "missing_or_unparsed_okx_basis_asset_context"
+        recommendation["paper_only_variant_gate"] = {
+            "paper_only": True,
+            "market_key": recommendation.get("market_key"),
+            "variant": blocked_variant or recommendation.get("variant"),
+            "parse_status": parse_status,
+            "blocked": True,
+            "reason": "missing_or_unparsed_okx_basis_asset_context",
+        }
+        return recommendation
+
+    recommendation["paper_only_variant_gate"] = {
+        "paper_only": True,
+        "market_key": recommendation.get("market_key"),
+        "variant": blocked_variant or recommendation.get("variant"),
+        "parse_status": parse_status,
+        "blocked": variant_blocked,
+        "reason": "blocked_okx_basis_mean_reversion_variant" if variant_blocked else "allowed_okx_basis_variant",
+    }
+    if variant_blocked:
+        recommendation["route_confidence"] = 0.0
+        recommendation["route_rejected"] = True
+        recommendation["route_rejection_reason"] = "blocked_okx_basis_mean_reversion_variant"
+    return recommendation
+
 def _paper_only_conditional_crypto_route_review(recommendation=None):
     recommendation = dict(recommendation or {})
     market_key = _paper_only_route_token(recommendation.get("market_key"))
