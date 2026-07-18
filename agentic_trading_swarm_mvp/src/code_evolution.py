@@ -126,6 +126,36 @@ def _recommendation_schema_error(value: Any) -> str | None:
     return None
 
 
+def _schema_complete_fallback_recommendation(error_message: str | None = None) -> dict[str, Any]:
+    recommendation = {
+        "action": "hold",
+        "priority": "medium",
+        "title": "Schema fallback for invalid cross-market output",
+        "rationale": "Use a neutral paper-only recommendation when research output is incomplete so the pipeline remains stable.",
+        "market_key": "paper_only.cross_market",
+        "evidence": {
+            "issue": "Validation failure on generated recommendation payload.",
+            "safety": "Neutral hold recommendation avoids accidental strategy drift in paper trading.",
+        },
+        "proposed_change": {
+            "paper_only": True,
+            "summary": "Return validated fallback object and log the validation error for offline review.",
+        },
+    }
+    if error_message:
+        recommendation["evidence"]["validation_error"] = error_message
+    return recommendation
+
+
+def _finalize_recommendation_payload(payload: Any, *, validation_error: str | None = None) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        schema_error = _recommendation_schema_error(payload)
+        if schema_error is None:
+            return payload
+        validation_error = validation_error or schema_error
+    return _schema_complete_fallback_recommendation(validation_error)
+
+
 def _coerce_confirm_score_min(value: Any) -> tuple[float | None, str]:
     if isinstance(value, bool):
         return None, "confirm_score_min must be a number between 0 and 1"
