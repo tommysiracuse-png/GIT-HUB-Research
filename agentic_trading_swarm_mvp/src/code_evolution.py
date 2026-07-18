@@ -89,6 +89,10 @@ STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS = (
     "code_change",
     "variant_config",
 )
+STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS = (
+    STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET
+    | set(STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS)
+)
 
 _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
 
@@ -148,6 +152,10 @@ def _validate_and_finalize_recommendation(candidate: dict[str, Any]) -> dict[str
 def _finalize_strict_recommendation_object(candidate: dict[str, Any]) -> dict[str, Any]:
     finalized = dict(candidate)
     if _contains_array_anywhere(finalized):
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(finalized):
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    if any(key not in STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS for key in finalized):
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
     try:
         encoded = _serialize_strict_recommendation(finalized)
