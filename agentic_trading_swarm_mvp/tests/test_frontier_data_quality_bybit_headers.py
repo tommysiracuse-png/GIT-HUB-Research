@@ -1,5 +1,40 @@
 import unittest
 
+from src.frontier_data_quality import paper_only_public_probe_headers
+
+
+class TestFrontierDataQualityBybitHeaders(unittest.TestCase):
+    def test_bybit_probe_headers_include_browser_fields(self):
+        url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+        headers = paper_only_public_probe_headers(url)
+
+        self.assertEqual(headers["Origin"], "https://www.bybit.com")
+        self.assertEqual(headers["Referer"], "https://www.bybit.com/")
+        self.assertEqual(headers["X-Requested-With"], "XMLHttpRequest")
+        self.assertEqual(headers["Accept-Encoding"], "identity")
+        self.assertIn("User-Agent", headers)
+
+    def test_non_bybit_probe_headers_remain_generic(self):
+        url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT"
+        headers = paper_only_public_probe_headers(url)
+
+        self.assertIn("User-Agent", headers)
+        self.assertNotIn("Origin", headers)
+        self.assertNotIn("Referer", headers)
+        self.assertNotIn("X-Requested-With", headers)
+
+    def test_extra_headers_override_defaults(self):
+        url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=ETHUSDT"
+        headers = paper_only_public_probe_headers(url, extra_headers={"Referer": "https://example.invalid/", "X-Test": "1"})
+
+        self.assertEqual(headers["Referer"], "https://example.invalid/")
+        self.assertEqual(headers["X-Test"], "1")
+
+
+if __name__ == "__main__":
+    unittest.main()
+import unittest
+
 from src.frontier_data_quality import paper_only_bybit_health_route_candidates
 
 

@@ -152,6 +152,153 @@ def paper_only_bybit_health_route_candidates(url):
     return candidates
 
 
+def paper_only_public_probe_headers(url, *, extra_headers=None):
+    """Return read-only headers for public venue-health probes."""
+
+    headers = dict(_DEFAULT_PUBLIC_HEADERS)
+    text = str(url or "").strip()
+    host = ""
+    if text:
+        try:
+            host = urllib.parse.urlsplit(text).netloc.lower()
+        except Exception:
+            host = ""
+
+    bybit_hosts = set(_BYBIT_PUBLIC_FAILOVER_HOSTS) | set(_BYBIT_PUBLIC_FAILOVER_HOSTS.values())
+    if host in bybit_hosts:
+        headers.update(_BYBIT_READ_ONLY_BROWSER_HEADERS)
+
+    if isinstance(extra_headers, dict):
+        for key, value in extra_headers.items():
+            if value is None:
+                continue
+            headers[str(key)] = str(value)
+    return headers
+
+
+def _paper_only_probe_status_text(report):
+    if not isinstance(report, dict):
+        return "unknown"
+
+    for key in ("status", "http_status", "status_code", "code"):
+        value = report.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return str(int(value))
+        except (TypeError, ValueError):
+            return str(value)
+
+    error = str(report.get("error") or report.get("reason") or "").strip()
+    if error:
+        return error
+    return "unknown"
+
+
+def _paper_only_probe_reachable(report):
+    if not isinstance(report, dict):
+        return False
+
+    for key in ("reachable", "ok", "success"):
+        if key in report:
+            return bool(report.get(key))
+
+    for key in ("status", "http_status", "status_code", "code"):
+        value = report.get(key)
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 200 <= numeric < 300:
+            return True
+
+    payload = report.get("payload")
+    return isinstance(payload, dict) and any(
+        payload.get(field) not in (None, "") for field in ("lastPrice", "bid1Price", "ask1Price")
+    )
+
+
+def paper_only_bybit_health_probe_trace(url, *, route_reports=None):
+    """Summarize public Bybit probe attempts into stable trace fields."""
+
+    requested_route = str(url or "").strip() or None
+    candidates = paper_only_bybit_health_route_candidates(requested_route)
+    reports = route_reports if isinstance(route_reports, (list, tuple)) else [route_reports] if isinstance(route_reports, dict) else []
+    status_chain = []
+    adapter_route_used = requested_route
+    reachable = False
+
+    for index, report in enumerate(reports):
+        route = ""
+        if isinstance(report, dict):
+            route = str(report.get("url") or report.get("route") or "").strip()
+        if not route and index < len(candidates):
+            route = candidates[index]
+        status = _paper_only_probe_status_text(report)
+        attempt_reachable = _paper_only_probe_reachable(report)
+        if route:
+            adapter_route_used = route
+        status_chain.append(
+            {
+                "route": route or None,
+                "status": status,
+                "reachable": attempt_reachable,
+            }
+        )
+        if attempt_reachable:
+            reachable = True
+            break
+
+    fallback_applied = any((item.get("route") or requested_route) != requested_route for item in status_chain)
+    reachable_via_fallback = bool(
+        reachable and status_chain and (status_chain[-1].get("route") or requested_route) != requested_route
+    )
+
+    downgrade_reason = None
+    if reachable_via_fallback and status_chain and status_chain[0].get("status") == "403":
+        downgrade_reason = "primary_access_denied_fallback_used"
+    elif status_chain and status_chain[0].get("status") == "403":
+        downgrade_reason = "primary_access_denied"
+    elif fallback_applied and not reachable:
+        downgrade_reason = "fallback_exhausted"
+
+    return {
+        "requested_route": requested_route,
+        "adapter_route_used": adapter_route_used,
+        "fallback_applied": fallback_applied,
+        "status_chain": status_chain,
+        "reachable_via_fallback": reachable_via_fallback,
+        "downgrade_reason": downgrade_reason,
+        "candidate_routes": candidates,
+    }
+
+
+def paper_only_enrich_venue_health_row(row, *, probe_url=None, route_reports=None):
+    """Attach deterministic Bybit fallback trace fields to a health row."""
+
+    current = dict(row) if isinstance(row, dict) else {}
+    requested_route = str(
+        probe_url or current.get("requested_route") or current.get("url") or current.get("request_url") or ""
+    ).strip()
+    venue = str(current.get("venue") or "").strip().lower()
+    host = urllib.parse.urlsplit(requested_route).netloc.lower() if requested_route else ""
+    bybit_hosts = set(_BYBIT_PUBLIC_FAILOVER_HOSTS) | set(_BYBIT_PUBLIC_FAILOVER_HOSTS.values())
+    is_bybit = venue == "bybit" or host in bybit_hosts
+    if not is_bybit:
+        return current
+
+    trace = paper_only_bybit_health_probe_trace(requested_route, route_reports=route_reports)
+    current.update(trace)
+
+    fallback_reachable = bool(trace["reachable_via_fallback"] or any(item.get("reachable") for item in trace["status_chain"]))
+    if fallback_reachable:
+        current["reachable"] = True
+        if "is_reachable" in current:
+            current["is_reachable"] = True
+
+    return current
+
+
 def _public_order_book_payload(payload=None):
     current = payload or {}
     seen = set()
