@@ -71,6 +71,23 @@ STRICT_RECOMMENDATION_FALLBACK_ACTIONS = {
     "propose_policy_update",
 }
 
+_PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
+    "action": "propose_diagnostic_hypothesis",
+    "priority": 0,
+    "title": "Return a single valid paper-only JSON recommendation",
+    "rationale": "Fallback emitted because the candidate response was not a complete schema-valid object.",
+    "market_key": "paper_system",
+    "evidence": {
+        "issue": "missing_or_invalid_recommendation_schema",
+        "impact": "Downstream paper-only consumers require exactly one valid JSON object.",
+    },
+    "proposed_change": {
+        "goal": "Guarantee exactly one valid JSON object with required keys.",
+        "validation": "Validate schema before returning and fall back to this conservative object on failure.",
+        "constraints": "Paper-only recommendations, no markdown, no commentary, no arrays.",
+    },
+}
+
 
 def _has_meaningful_value(value: Any) -> bool:
     if value is None:
@@ -152,6 +169,18 @@ def _normalize_recommendation_payload(
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
     assert candidate is not None
     return candidate
+
+
+def _finalize_recommendation_payload(
+    candidate: dict[str, Any] | None,
+    raw_text: str,
+) -> dict[str, Any]:
+    """Return exactly one schema-valid paper-only recommendation object."""
+
+    normalized = _normalize_recommendation_payload(candidate, raw_text)
+    if _recommendation_schema_error(normalized) != "invalid":
+        return normalized
+    return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
 
 _FORBIDDEN_MARKDOWN_TOKENS = (
     "```",
