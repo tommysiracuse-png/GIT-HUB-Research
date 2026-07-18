@@ -302,13 +302,19 @@ def _crypto_venue_health_gaps(items: list[dict]) -> list[dict]:
             "status": item.get("status"),
             "response_status": response_status,
             "fallback_route_id": "bybit_spot_public",
-            "fallback_endpoints": ["/v5/market/tickers?category=spot", "/v5/market/orderbook?category=spot"],
+            "fallback_endpoints": [
+                "/v5/market/tickers?category=spot&symbol=BTCUSDT",
+                "/v5/market/orderbook?category=spot&symbol=BTCUSDT",
+            ],
             "paper_only_use": "scanner_inputs_and_venue_health",
             "rationale": "Bybit linear public reads returned 403; keep paper observability alive with spot public ticker/book endpoints.",
             "adapter_fix": {
                 "method": "GET",
                 "path": "/v5/market/tickers",
-                "query": {"category": "spot"},
+                "query": {
+                    "category": "spot",
+                    "symbol": "BTCUSDT",
+                },
                 "headers": {
                     "Accept": "application/json",
                     "User-Agent": "paper-research",

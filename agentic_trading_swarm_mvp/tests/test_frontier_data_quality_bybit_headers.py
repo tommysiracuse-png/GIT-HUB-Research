@@ -3,6 +3,81 @@ import sys
 import unittest
 
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from llm_bridge import _crypto_venue_health_gaps
+from research_worker import DEFAULT_GLOBAL_DISCOVERY_SEEDS
+
+
+class BybitPublicHealthRepairTests(unittest.TestCase):
+    def test_bybit_gap_uses_explicit_spot_symbol_probe(self) -> None:
+        items = [
+            {
+                "venue": "Bybit",
+                "status": "forbidden",
+                "response_status": 403,
+                "route_id": "bybit_perp_public",
+                "asset": "BTCUSDT",
+                "url": "https://api.bybit.com/v5/market/tickers?category=linear",
+            }
+        ]
+
+        gaps = _crypto_venue_health_gaps(items)
+
+        self.assertEqual(len(gaps), 1)
+        gap = gaps[0]
+        self.assertEqual(gap["fallback_route_id"], "bybit_spot_public")
+        self.assertEqual(
+            gap["fallback_endpoints"],
+            [
+                "/v5/market/tickers?category=spot&symbol=BTCUSDT",
+                "/v5/market/orderbook?category=spot&symbol=BTCUSDT",
+            ],
+        )
+        self.assertEqual(gap["response_status"], 403)
+        self.assertEqual(gap["adapter_fix"]["query"], {"category": "spot", "symbol": "BTCUSDT"})
+        self.assertEqual(gap["adapter_fix"]["headers"]["Accept"], "application/json")
+        self.assertEqual(gap["adapter_fix"]["headers"]["User-Agent"], "paper-research")
+        self.assertEqual(gap["adapter_trace"], {"observed_url": items[0]["url"]})
+
+    def test_existing_trace_is_preserved_for_bybit_gap(self) -> None:
+        trace = {
+            "observed_url": "https://api.bybit.com/v5/market/tickers?category=linear",
+            "response_headers": {"server": "cloudflare"},
+        }
+        items = [
+            {
+                "venue": "Bybit",
+                "status": "HTTP 403",
+                "route_id": "bybit_linear_perp_public",
+                "adapter_trace": trace,
+            },
+            {"venue": "OKX", "status": "HTTP 403", "route_id": "okx_public"},
+        ]
+
+        gaps = _crypto_venue_health_gaps(items)
+
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["adapter_trace"], trace)
+
+    def test_research_worker_seed_matches_bybit_repair_shape(self) -> None:
+        bybit_seed = next(seed for seed in DEFAULT_GLOBAL_DISCOVERY_SEEDS if seed.get("venue_or_source") == "Bybit")
+        self.assertEqual(bybit_seed["adapter_route_id"], "bybit_perp_public")
+        self.assertEqual(bybit_seed["adapter_request_hint"]["query"], {"category": "spot", "symbol": "BTCUSDT"})
+        self.assertEqual(bybit_seed["adapter_request_hint"]["headers"]["Accept"], "application/json")
+        self.assertEqual(bybit_seed["adapter_request_hint"]["headers"]["User-Agent"], "paper-research")
+
+
+if __name__ == "__main__":
+    unittest.main()
+import pathlib
+import sys
+import unittest
+
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from llm_bridge import _crypto_venue_health_gaps

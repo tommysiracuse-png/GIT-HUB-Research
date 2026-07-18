@@ -52,7 +52,10 @@ DEFAULT_GLOBAL_DISCOVERY_SEEDS: list[dict[str, Any]] = [
         "adapter_request_hint": {
             "method": "GET",
             "path": "/v5/market/tickers",
-            "query": {"category": "spot"},
+            "query": {
+                "category": "spot",
+                "symbol": "BTCUSDT",
+            },
             "headers": {
                 "Accept": "application/json",
                 "User-Agent": "paper-research",
