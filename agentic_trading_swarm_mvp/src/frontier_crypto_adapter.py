@@ -90,6 +90,13 @@ DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY = {
 }
 
 
+DEFAULT_PAPER_ONLY_ROUTE_FRESHNESS_POLICY = {
+    "enabled": True,
+    "quote_stale_threshold_ms": 750.0,
+    "all_routes_stale_behavior": "suppress_fill",
+}
+
+
 def paper_only_cross_market_risk_gate(
     *,
     divergence_bps: float | None = None,
@@ -127,6 +134,49 @@ def paper_only_cross_market_risk_gate(
         "divergence_bps": divergence,
         "trigger_bps": trigger,
         "freshness_limit_ms": freshness_limit,
+    }
+
+
+def paper_only_route_freshness_gate(
+    routes: list[dict] | tuple[dict, ...] | None,
+    *,
+    quote_stale_threshold_ms: float | None = None,
+    all_routes_stale_behavior: str | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Paper-only route freshness gate for stale-quote suppression."""
+
+    threshold = float(
+        quote_stale_threshold_ms
+        if quote_stale_threshold_ms is not None
+        else DEFAULT_PAPER_ONLY_ROUTE_FRESHNESS_POLICY["quote_stale_threshold_ms"]
+    )
+    stale_behavior = (all_routes_stale_behavior or DEFAULT_PAPER_ONLY_ROUTE_FRESHNESS_POLICY["all_routes_stale_behavior"]).strip().lower()
+    candidates = [dict(route) for route in (routes or [])]
+    ranked = []
+    for route in candidates:
+        age_ms = route.get("quote_age_ms")
+        try:
+            quote_age_ms = float(age_ms)
+        except (TypeError, ValueError):
+            quote_age_ms = math.inf
+        route["quote_age_ms"] = quote_age_ms
+        route["fresh"] = quote_age_ms <= threshold
+        ranked.append(route)
+    fresh_routes = [route for route in ranked if route["fresh"]]
+    fresh_routes.sort(key=lambda item: (float(item.get("price", math.inf)), float(item.get("latency_ms", math.inf))))
+    stale_routes = [route for route in ranked if not route["fresh"]]
+    selected = fresh_routes[0] if fresh_routes else None
+    suppress_fill = bool(enabled and selected is None and stale_behavior == "suppress_fill")
+    return {
+        "enabled": bool(enabled),
+        "quote_stale_threshold_ms": threshold,
+        "all_routes_stale_behavior": stale_behavior,
+        "selected_route": selected,
+        "eligible_routes": fresh_routes,
+        "stale_routes": stale_routes,
+        "suppress_fill": suppress_fill,
+        "route_stale_no_fill": suppress_fill,
     }
 
 
