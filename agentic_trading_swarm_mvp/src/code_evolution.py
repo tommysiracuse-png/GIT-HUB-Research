@@ -178,7 +178,7 @@ def _finalize_recommendation_payload(
     """Return exactly one schema-valid paper-only recommendation object."""
 
     normalized = _normalize_recommendation_payload(candidate, raw_text)
-    if _recommendation_schema_error(normalized) != "invalid":
+    if _recommendation_schema_error(normalized) == "invalid":
         return normalized
     return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
 
