@@ -74,6 +74,7 @@ _FORBIDDEN_MARKDOWN_TOKENS = (
 )
 
 _STRICT_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_STRICT_JSON_OBJECTS_RE = re.compile(r"\{.*?\}", re.DOTALL)
 _STRICT_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n.*\n```\s*$", re.DOTALL | re.IGNORECASE)
 _OPTIONAL_RECOMMENDATION_FIELDS = {
     "code_change",
@@ -128,6 +129,9 @@ def _normalize_single_recommendation_payload(candidate: Any) -> dict[str, Any] |
     if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(candidate):
         return None
 
+    if not _contains_exactly_one_json_object(candidate):
+        return None
+
     if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
         return None
 
@@ -135,6 +139,16 @@ def _normalize_single_recommendation_payload(candidate: Any) -> dict[str, Any] |
         return None
 
     return candidate
+
+
+def _contains_exactly_one_json_object(candidate: Any) -> bool:
+    """Return True only when the payload is a single JSON object."""
+
+    if not isinstance(candidate, dict):
+        return False
+    serialized = json.dumps(candidate, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, sort_keys=True)
+    matches = _STRICT_JSON_OBJECTS_RE.findall(serialized)
+    return len(matches) == 1 and matches[0] == serialized
 
 
 def _recommendation_schema_error(candidate: dict[str, Any]) -> str | None:
