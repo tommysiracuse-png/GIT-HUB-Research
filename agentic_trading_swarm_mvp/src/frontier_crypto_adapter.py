@@ -9,14 +9,59 @@ uses credentials, private/account APIs, or order endpoints.
 from __future__ import annotations
 
 
+_LATAM_FIAT_QUOTE_ALIASES = {
+    "CLP": "CLP",
+    "CLP$": "CLP",
+    "$CLP": "CLP",
+    "XCLP": "CLP",
+    "MXN": "MXN",
+    "MXN$": "MXN",
+    "$MXN": "MXN",
+    "MX$": "MXN",
+    "MEX$": "MXN",
+}
+_LATAM_FIAT_QUOTE_REGIONS = {
+    "CLP": "cl",
+    "MXN": "mx",
+}
+_LATAM_FIAT_VENUE_REGIONS = {
+    "BUDA": "cl",
+    "BITSO": "mx",
+}
+
+
+def _normalize_latam_fiat_quote(quote_asset, venue_name=None, venue_notes=None):
+    raw_quote = (quote_asset or "").strip().upper()
+    venue = (venue_name or "").strip().upper()
+    _ = (venue_notes or "").strip().upper()
+    compact_quote = raw_quote.replace(" ", "").replace(".", "")
+    normalized_quote = (
+        _LATAM_FIAT_QUOTE_ALIASES.get(raw_quote)
+        or _LATAM_FIAT_QUOTE_ALIASES.get(compact_quote)
+        or _LATAM_FIAT_QUOTE_ALIASES.get(compact_quote.replace("$", ""))
+        or raw_quote
+    )
+    quote_region = _LATAM_FIAT_QUOTE_REGIONS.get(normalized_quote)
+    venue_region = _LATAM_FIAT_VENUE_REGIONS.get(venue)
+    return {
+        "raw_quote": raw_quote,
+        "normalized_quote": normalized_quote,
+        "alias_applied": bool(raw_quote and normalized_quote != raw_quote),
+        "quote_region": quote_region,
+        "venue_region": venue_region,
+        "venue_quote_region_match": bool(quote_region and venue_region and quote_region == venue_region),
+    }
+
+
 def classify_fiat_corridor(base_asset, quote_asset, venue_name=None, venue_notes=None):
     """
     Classify a public paper-only market into a broad liquidity corridor.
 
     This is metadata only: no routing, no execution, no trade decisions.
     """
+    regional_quote = _normalize_latam_fiat_quote(quote_asset, venue_name=venue_name, venue_notes=venue_notes)
     base = (base_asset or "").strip().upper()
-    quote = (quote_asset or "").strip().upper()
+    quote = regional_quote["normalized_quote"]
     venue = (venue_name or "").strip().upper()
     notes = (venue_notes or "").strip().upper()
 
@@ -27,10 +72,17 @@ def classify_fiat_corridor(base_asset, quote_asset, venue_name=None, venue_notes
         corridor_type = f"{quote.lower()}_cross"
         corridor_confidence = 0.88
     else:
-        if quote == "IDR" and "INDODAX" in venue:
-            corridor_confidence = 0.8
         corridor_type = "local_fiat"
         corridor_confidence = 0.72
+        if quote == "IDR" and "INDODAX" in venue:
+            corridor_confidence = 0.8
+        elif regional_quote["quote_region"]:
+            corridor_type = "latam_local_fiat"
+            corridor_confidence = 0.78
+            if regional_quote["venue_quote_region_match"]:
+                corridor_confidence = 0.82
+            if regional_quote["alias_applied"]:
+                corridor_confidence = min(0.99, corridor_confidence + 0.01)
 
     if any(token in venue for token in ("BINANCE", "COINBASE", "KRAKEN", "GATE", "KUCOIN", "MEXC", "BITGET")):
         corridor_confidence = min(0.99, corridor_confidence + 0.03)
@@ -42,6 +94,9 @@ def classify_fiat_corridor(base_asset, quote_asset, venue_name=None, venue_notes
         "corridor_quote": quote,
         "corridor_type": corridor_type,
         "corridor_confidence": round(corridor_confidence, 3),
+        "corridor_region": regional_quote["quote_region"],
+        "regional_quote_raw": regional_quote["raw_quote"],
+        "regional_quote_alias_applied": regional_quote["alias_applied"],
     }
 
 

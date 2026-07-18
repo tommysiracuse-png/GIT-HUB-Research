@@ -49,8 +49,15 @@ def _normalize_indodax_order_book_side(levels, *, reverse=False):
         return normalized
     for level in levels:
         if isinstance(level, dict):
-            price = _as_float(level.get("price") or level.get("rate"))
-            quantity = _as_float(level.get("amount") or level.get("qty") or level.get("volume"))
+            price = _as_float(
+                level.get("price") or level.get("rate") or level.get("book_rate") or level.get("bookRate") or level.get("r")
+            )
+            quantity = _as_float(
+                level.get("amount")
+                or level.get("qty")
+                or level.get("volume")
+                or level.get("size")
+                or level.get("a") or level.get("v"))
         elif isinstance(level, (list, tuple)) and len(level) >= 2:
             price = _as_float(level[0])
             quantity = _as_float(level[1])
@@ -65,15 +72,27 @@ def _normalize_indodax_order_book_side(levels, *, reverse=False):
     return normalized
 
 
-def normalize_indodax_order_book(payload=None):
-    """
-    Normalize a public INDODAX order-book payload into best bid/ask metadata.
+def _public_order_book_payload(payload=None):
+    current = payload or {}
+    seen = set()
+    while isinstance(current, dict):
+        if any(key in current for key in ("bids", "asks", "buy", "sell")):
+            return current
+        marker = id(current)
+        if marker in seen:
+            break
+        seen.add(marker)
+        for key in ("payload", "book", "order_book", "data", "result"):
+            nested = current.get(key)
+            if isinstance(nested, dict):
+                current = nested
+                break
+        else:
+            break
+    return current if isinstance(current, dict) else {}
 
-    Supports either buy/sell or bids/asks field conventions. Read-only only.
-    """
-    payload = payload or {}
-    bids = _normalize_indodax_order_book_side(payload.get("buy") or payload.get("bids"), reverse=True)
-    asks = _normalize_indodax_order_book_side(payload.get("sell") or payload.get("asks"), reverse=False)
+
+def _normalized_public_order_book_snapshot(bids, asks, *, venue_name):
     best_bid = bids[0][0] if bids else None
     best_ask = asks[0][0] if asks else None
     if best_bid is None and best_ask is None:
@@ -101,8 +120,44 @@ def normalize_indodax_order_book(payload=None):
         "level_count": len(bids) + len(asks),
         "paper_only": True,
         "read_only": True,
-        "venue_name": "INDODAX",
+        "venue_name": venue_name,
     }
+
+
+def normalize_indodax_order_book(payload=None):
+    """
+    Normalize a public INDODAX order-book payload into best bid/ask metadata.
+
+    Supports either buy/sell or bids/asks field conventions. Read-only only.
+    """
+    payload = _public_order_book_payload(payload)
+    bids = _normalize_indodax_order_book_side(payload.get("buy") or payload.get("bids"), reverse=True)
+    asks = _normalize_indodax_order_book_side(payload.get("sell") or payload.get("asks"), reverse=False)
+    return _normalized_public_order_book_snapshot(bids, asks, venue_name="INDODAX")
+
+
+def normalize_bitso_order_book(payload=None):
+    """
+    Normalize a public BITSO order-book payload into best bid/ask metadata.
+
+    Supports nested payload/result wrappers and common public level aliases.
+    """
+    payload = _public_order_book_payload(payload)
+    bids = _normalize_indodax_order_book_side(payload.get("bids") or payload.get("buy"), reverse=True)
+    asks = _normalize_indodax_order_book_side(payload.get("asks") or payload.get("sell"), reverse=False)
+    return _normalized_public_order_book_snapshot(bids, asks, venue_name="BITSO")
+
+
+def normalize_buda_order_book(payload=None):
+    """
+    Normalize a public BUDA order-book payload into best bid/ask metadata.
+
+    Supports nested order_book/data wrappers and common public level aliases.
+    """
+    payload = _public_order_book_payload(payload)
+    bids = _normalize_indodax_order_book_side(payload.get("bids") or payload.get("buy"), reverse=True)
+    asks = _normalize_indodax_order_book_side(payload.get("asks") or payload.get("sell"), reverse=False)
+    return _normalized_public_order_book_snapshot(bids, asks, venue_name="BUDA")
 
 
 def _utc_now() -> str:
