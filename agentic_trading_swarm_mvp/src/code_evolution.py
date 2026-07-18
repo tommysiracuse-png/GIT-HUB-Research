@@ -78,6 +78,13 @@ STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS = (
     "risk",
 )
 STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET = set(STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS)
+STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS = (
+    "goal",
+    "constraints",
+)
+STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET = set(
+    STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS
+)
 
 _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
 
@@ -119,6 +126,11 @@ def _normalize_strict_paper_recommendation(candidate: dict[str, Any]) -> dict[st
         return None
     if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
         return None
+    proposed_change = normalized.get("proposed_change")
+    if not isinstance(proposed_change, dict):
+        return None
+    if not STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET.issubset(proposed_change):
+        return None
     if _contains_array_anywhere(candidate):
         return None
     if not _has_meaningful_value(normalized["action"]):
@@ -134,6 +146,9 @@ def _recommendation_schema_error(candidate: dict[str, Any]) -> bool:
     if not isinstance(candidate.get("priority"), int):
         return True
     if not isinstance(candidate.get("proposed_change"), dict):
+        return True
+    proposed_change = candidate.get("proposed_change")
+    if not STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET.issubset(proposed_change):
         return True
     evidence = candidate.get("evidence")
     if not isinstance(evidence, dict):
