@@ -61,6 +61,56 @@ def _paper_only_route_value_missing(value):
     return normalized in {"", "unknown", "unspecified", "n/a", "na", "none", "null"}
 
 
+def _paper_only_route_liquidity_gate(
+    *,
+    spread_bps=None,
+    top_of_book_notional_usd=None,
+    max_spread_bps=12,
+    min_top_of_book_notional_usd=25000,
+):
+    """
+    Paper-only pre-execution gate for route quality.
+
+    Returns a small review packet that can be consumed by paper simulations and
+    route-ranking reports without touching live execution.
+    """
+    try:
+        spread_bps_value = float(spread_bps) if spread_bps is not None else None
+    except (TypeError, ValueError):
+        spread_bps_value = None
+    try:
+        depth_value = float(top_of_book_notional_usd) if top_of_book_notional_usd is not None else None
+    except (TypeError, ValueError):
+        depth_value = None
+
+    spread_limit = float(max_spread_bps or 0)
+    depth_limit = float(min_top_of_book_notional_usd or 0)
+
+    spread_pass = spread_bps_value is not None and spread_bps_value <= spread_limit
+    depth_pass = depth_value is not None and depth_value >= depth_limit
+    passed = bool(spread_pass and depth_pass)
+
+    reasons = []
+    if spread_bps_value is None:
+        reasons.append("missing_spread")
+    elif not spread_pass:
+        reasons.append("wide_spread")
+    if depth_value is None:
+        reasons.append("missing_depth")
+    elif not depth_pass:
+        reasons.append("shallow_book")
+
+    return {
+        "paper_only": True,
+        "passed": passed,
+        "spread_bps": spread_bps_value,
+        "top_of_book_notional_usd": depth_value,
+        "max_spread_bps": spread_limit,
+        "min_top_of_book_notional_usd": depth_limit,
+        "reasons": reasons,
+    }
+
+
 def _paper_only_route_instrument_family(value):
     normalized = _paper_only_route_token(value)
     if any(token in normalized for token in ("PERP", "PERPETUAL", "SWAP", "FUTURE", "FUTURES")):
