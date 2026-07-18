@@ -81,6 +81,24 @@ _OPTIONAL_RECOMMENDATION_FIELDS = {
 _REQUIRED_TOP_LEVEL_KEYS = STRICT_REQUIRED_RECOMMENDATION_FIELDS + tuple(_OPTIONAL_RECOMMENDATION_FIELDS)
 _ALLOWED_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS) | _OPTIONAL_RECOMMENDATION_FIELDS
 
+_PAPER_ONLY_RECOMMENDATION_FALLBACK = {
+    "action": "propose_code_change",
+    "priority": 0,
+    "title": "Paper-only recommendation fallback",
+    "rationale": "The primary recommendation was not a valid single JSON object, so a safe fallback was emitted.",
+    "market_key": "paper.execution_route_hunter.output_contract",
+    "evidence": {
+        "impact": "Prevents silent drops and retry loops in downstream parsers.",
+        "parser": "structured_guard",
+        "paper_only": True,
+    },
+    "proposed_change": {
+        "paper_only": True,
+        "summary": "Ensure exactly one valid JSON object is emitted for paper-only recommendation packets.",
+        "expected_result": "Downstream consumers receive a parseable object with required keys on every run.",
+    },
+}
+
 _PAPER_ONLY_VOLATILITY_GATE_DEFAULTS = {
     "paper_only": True,
     "true_range_multiple_cap": 1.8,
@@ -164,6 +182,12 @@ def _recommendation_schema_error(value: Any) -> str | None:
         ):
             return f"markdown is not allowed in {required_key}"
     return None
+
+
+def _paper_only_recommendation_fallback() -> dict[str, Any]:
+    """Return a defensive paper-only fallback recommendation payload."""
+
+    return json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
 
 
 def _strict_recommendation_json_error(text: str) -> str | None:
