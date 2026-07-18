@@ -185,6 +185,41 @@ def _strict_recommendation_json_error(text: str) -> str | None:
     return _recommendation_schema_error(payload)
 
 
+def _paper_hold_recommendation(
+    validation_error: str,
+    *,
+    market_key: str = "paper.cross_market.output_contract",
+) -> dict[str, Any]:
+    """Build a strict paper-only fallback recommendation object."""
+
+    return {
+        "action": "monitor_only",
+        "priority": 0,
+        "title": "Paper-only output contract hold",
+        "rationale": validation_error,
+        "market_key": market_key,
+        "evidence": {"validation_error": validation_error},
+        "proposed_change": {
+            "paper_only": True,
+            "schema_enforcement": "strict_single_object",
+            "validation_rule": "Reject any response that is not a single JSON object or that omits a required field.",
+        },
+    }
+
+
+def normalize_strict_recommendation_payload(
+    value: Any,
+    *,
+    market_key: str = "paper.cross_market.output_contract",
+) -> dict[str, Any]:
+    """Return a validated recommendation or a paper-only hold object."""
+
+    validation_error = _recommendation_schema_error(value)
+    if validation_error is None and isinstance(value, dict):
+        return value
+    return _paper_hold_recommendation(validation_error or "invalid recommendation payload", market_key=market_key)
+
+
 def _recommendation_or_paper_hold(value: Any, *, validation_error: str | None = None) -> dict[str, Any]:
     """Return a validated recommendation or a strict paper-only hold fallback."""
 
