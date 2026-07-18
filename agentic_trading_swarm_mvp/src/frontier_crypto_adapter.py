@@ -80,6 +80,56 @@ DEFAULT_PAPER_ONLY_FRONTIER_VENUE_DIRECTION_EXPECTANCY_REGISTRY = {
 }
 
 
+DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY = {
+    "enabled": True,
+    "min_divergence_bps": 0.0,
+    "freshness_limit_ms": 1500.0,
+    "mean_reversion_bps": 0.5,
+    "stale_penalty_multiplier": 0.0,
+    "record_multiplier": 1.0,
+}
+
+
+def paper_only_cross_market_risk_gate(
+    *,
+    divergence_bps: float | None = None,
+    trigger_bps: float | None = None,
+    source_a_freshness_ms: float | None = None,
+    source_b_freshness_ms: float | None = None,
+    freshness_limit_ms: float | None = None,
+    mean_reversion_bps: float | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Paper-only gate for cross-market divergence observation and exit logic."""
+
+    divergence = float(divergence_bps or 0.0)
+    trigger = float(trigger_bps or 0.0)
+    freshness_limit = float(freshness_limit_ms or DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY["freshness_limit_ms"])
+    mean_reversion = float(mean_reversion_bps or DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY["mean_reversion_bps"])
+    freshness_a = float(source_a_freshness_ms or 0.0)
+    freshness_b = float(source_b_freshness_ms or 0.0)
+    fresh = freshness_a <= freshness_limit and freshness_b <= freshness_limit
+    exceeds_trigger = divergence > trigger
+    mean_reverted = abs(divergence) <= mean_reversion
+    allow_record = bool(enabled and fresh and exceeds_trigger)
+    close_position = bool(enabled and (not fresh or mean_reverted))
+    score_multiplier = 1.0 if allow_record else 0.0
+    if close_position and not allow_record:
+        score_multiplier = 0.0
+    return {
+        "enabled": bool(enabled),
+        "allow_record": allow_record,
+        "close_position": close_position,
+        "fresh": fresh,
+        "exceeds_trigger": exceeds_trigger,
+        "mean_reverted": mean_reverted,
+        "score_multiplier": max(0.0, min(1.0, score_multiplier)),
+        "divergence_bps": divergence,
+        "trigger_bps": trigger,
+        "freshness_limit_ms": freshness_limit,
+    }
+
+
 def paper_only_frontier_score_adjustment(
     *,
     venue: str,
@@ -137,6 +187,15 @@ def paper_only_frontier_score_adjustment(
         low_feasibility_share=cohort_low_feasibility_share,
         enabled=enabled,
     )
+    cross_market_gate = paper_only_cross_market_risk_gate(
+        divergence_bps=stats.get("cross_market_divergence_bps"),
+        trigger_bps=stats.get("cross_market_trigger_bps"),
+        source_a_freshness_ms=stats.get("source_a_freshness_ms"),
+        source_b_freshness_ms=stats.get("source_b_freshness_ms"),
+        freshness_limit_ms=stats.get("freshness_limit_ms"),
+        mean_reversion_bps=stats.get("mean_reversion_bps"),
+        enabled=enabled,
+    )
 
     score_multiplier = 1.0
     if gate.get("allow", False):
@@ -149,10 +208,14 @@ def paper_only_frontier_score_adjustment(
     else:
         score_multiplier *= 0.0
 
+    if cross_market_gate.get("enabled", False):
+        score_multiplier *= float(cross_market_gate.get("score_multiplier", 1.0) or 1.0)
+
     return {
         "enabled": bool(enabled),
         "allow": bool(gate.get("allow", False)),
         "suppressed": bool(cohort_gate.get("suppressed", False)),
+        "cross_market_gate": cross_market_gate,
         "score_multiplier": max(0.0, min(1.0, score_multiplier)),
         "venue_direction_gate": gate,
         "long_cohort_gate": cohort_gate,
