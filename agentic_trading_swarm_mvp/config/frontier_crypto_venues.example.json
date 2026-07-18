@@ -50,6 +50,16 @@
       "preferred": "vwap_or_equivalent_intraday_trend",
       "reclaim_after_first_pullback": true,
       "invalidate_on_expanding_sell_volume_loss_of_breakout": true
+    },
+    "scout_confirmation_gate": {
+      "mode": "paper_only",
+      "require_higher_timeframe_alignment": true,
+      "require_liquidity_confirmation": true,
+      "require_spread_within_limit": true,
+      "minimum_confidence": 0.67,
+      "volatility_guard": "enabled",
+      "fallback_action": "hold",
+      "downgrade_on_weak_confirmation": true
     }
   },
   "venues": [
