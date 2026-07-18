@@ -53,6 +53,52 @@ def paper_only_cross_market_confirmation_gate(
     }
 
 
+def paper_only_radar_alert_gate(payload, minimum_confidence=0.68):
+    """Paper-only alert gate for radar recommendation payloads.
+
+    Rejects incomplete payloads and suppresses alerts unless paper_mode is true
+    and confidence meets the configured minimum.
+    """
+
+    if not isinstance(payload, dict):
+        return {"eligible": False, "reason": "invalid_payload", "missing_required_fields": ["payload"]}
+
+    required_fields = ("paper_mode", "confidence")
+    missing_required_fields = [field for field in required_fields if field not in payload]
+    if missing_required_fields:
+        return {
+            "eligible": False,
+            "reason": "missing_required_fields",
+            "missing_required_fields": missing_required_fields,
+        }
+
+    paper_mode = bool(payload.get("paper_mode", False))
+    if not paper_mode:
+        return {"eligible": False, "reason": "paper_mode_disabled"}
+
+    try:
+        confidence = float(payload.get("confidence"))
+    except (TypeError, ValueError):
+        return {"eligible": False, "reason": "invalid_confidence"}
+
+    minimum_confidence = float(minimum_confidence)
+    if confidence < minimum_confidence:
+        return {
+            "eligible": False,
+            "reason": "below_minimum_confidence",
+            "confidence": confidence,
+            "minimum_confidence": minimum_confidence,
+        }
+
+    return {
+        "eligible": True,
+        "reason": "eligible",
+        "confidence": confidence,
+        "minimum_confidence": minimum_confidence,
+        "paper_mode": True,
+    }
+
+
 def paper_only_route_toxicity_key(buy_venue, sell_venue):
     buy = (buy_venue or "").strip().upper()
     sell = (sell_venue or "").strip().upper()
