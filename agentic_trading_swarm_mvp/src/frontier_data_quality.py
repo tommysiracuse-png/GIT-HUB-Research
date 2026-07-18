@@ -160,12 +160,25 @@ def _as_float(value: object) -> float | None:
 
 
 def _response_access_metadata(response_status: object = None, exc: Exception | None = None) -> dict:
+    if exc is None and isinstance(response_status, dict):
+        endpoint_access = str(response_status.get("endpoint_access") or "reachable")
+        blocked_http_status = response_status.get("blocked_http_status")
+        blocked_reason = response_status.get("blocked_reason")
+        if _bybit_access_missing_last_price(response_status):
+            endpoint_access = "unavailable"
+            blocked_reason = blocked_reason or "missing_last_price"
+        return {
+            "endpoint_access": endpoint_access,
+            "blocked_http_status": blocked_http_status,
+            "blocked_reason": blocked_reason,
+        }
     if exc is None:
         return {
             "endpoint_access": "reachable",
             "blocked_http_status": None,
             "blocked_reason": None,
         }
+
     blocked_http_status = None
     blocked_reason = None
     endpoint_access = "unavailable"
@@ -192,6 +205,56 @@ def _is_bybit_linear_perp_canary_url(url: str) -> bool:
     return category == "linear" and symbol in _BYBIT_LINEAR_PERP_CANARY_SYMBOLS
 
 
+def _bybit_ticker_last_price(payload: object) -> float | None:
+    if isinstance(payload, dict):
+        for key in ("last_price", "lastPrice", "ticker_last_price", "markPrice", "indexPrice", "price"):
+            value = _as_float(payload.get(key))
+            if value is not None and math.isfinite(value) and value > 0.0:
+                return value
+        for key in ("payload", "response", "result", "data", "ticker"):
+            if key in payload:
+                value = _bybit_ticker_last_price(payload.get(key))
+                if value is not None:
+                    return value
+        list_payload = payload.get("list")
+        if isinstance(list_payload, (list, tuple)):
+            value = _bybit_ticker_last_price(list_payload)
+            if value is not None:
+                return value
+        return None
+
+    if isinstance(payload, (list, tuple)):
+        for item in payload:
+            value = _bybit_ticker_last_price(item)
+            if value is not None:
+                return value
+        return None
+
+    value = _as_float(payload)
+    if value is None or not math.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
+def _bybit_access_missing_last_price(access: dict | None) -> bool:
+    if not isinstance(access, dict):
+        return False
+    endpoint_access = str(access.get("endpoint_access") or "reachable").strip().lower()
+    if endpoint_access != "reachable":
+        return False
+    candidate_urls = (
+        access.get("url"),
+        access.get("requested_url"),
+        access.get("effective_url"),
+        access.get("fallback_url"),
+    )
+    if not any(_is_bybit_linear_perp_canary_url(url) for url in candidate_urls if url):
+        return False
+    if _bybit_ticker_last_price(access) is not None:
+        return False
+    return True
+
+
 def _route_health_state(
     primary_access: dict | None = None,
     fallback_access: dict | None = None,
@@ -199,6 +262,11 @@ def _route_health_state(
 ) -> str:
     primary_state = (primary_access or {}).get("endpoint_access") or "unknown"
     fallback_state = (fallback_access or {}).get("endpoint_access") or "unknown"
+    if _bybit_access_missing_last_price(primary_access):
+        primary_state = "unavailable"
+    if _bybit_access_missing_last_price(fallback_access):
+        fallback_state = "unavailable"
+
     if primary_state == "reachable":
         return "reachable"
     if fallback_attempted and fallback_state == "reachable":
