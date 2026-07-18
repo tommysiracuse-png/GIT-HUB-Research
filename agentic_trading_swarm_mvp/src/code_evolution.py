@@ -65,6 +65,11 @@ SUPPRESSION_ACTIONS = {
     "monitor_only",
     "wait_for_complete_valid_json_recommendation_with_market_context",
 }
+STRICT_RECOMMENDATION_FALLBACK_ACTIONS = {
+    "propose_code_change",
+    "propose_diagnostic_hypothesis",
+    "propose_policy_update",
+}
 
 
 def _has_meaningful_value(value: Any) -> bool:
@@ -123,6 +128,9 @@ def _recommendation_schema_error(candidate: Any) -> str:
         return f"extra:{','.join(extra)}"
     if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
         return "empty_required_field"
+    action = candidate.get("action")
+    if action not in STRICT_RECOMMENDATION_FALLBACK_ACTIONS and action not in SUPPRESSION_ACTIONS:
+        return "invalid_action"
     return "invalid"
 
 _FORBIDDEN_MARKDOWN_TOKENS = (
