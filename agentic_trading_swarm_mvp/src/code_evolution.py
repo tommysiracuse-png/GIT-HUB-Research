@@ -60,7 +60,7 @@ STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET = set(STRICT_REQUIRED_RECOMMENDATION_F
 STRICT_RECOMMENDATION_JSON_SEPARATORS = (",", ":")
 MIN_PAPER_CONFIRM_SCORE_MIN = 0.68
 PAPER_MARKET_KEY_PREFIX = "paper_"
-STRICT_RECOMMENDATION_MARKET_KEY = "paper_cross_market_default"
+STRICT_RECOMMENDATION_MARKET_KEY = "paper_cross_market"
 SUPPRESSION_ACTIONS = {
     "suppress_trade_generation_for_this_case",
     "no_trade",
@@ -142,7 +142,25 @@ def _validate_and_finalize_recommendation(candidate: dict[str, Any]) -> dict[str
     normalized = _normalize_strict_paper_recommendation(sanitized)
     if normalized is None:
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
-    return normalized
+    return _finalize_strict_recommendation_object(normalized)
+
+
+def _finalize_strict_recommendation_object(candidate: dict[str, Any]) -> dict[str, Any]:
+    finalized = dict(candidate)
+    if _contains_array_anywhere(finalized):
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    try:
+        encoded = _serialize_strict_recommendation(finalized)
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    if not isinstance(decoded, dict):
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    if not _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS.issubset(decoded):
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    if any(isinstance(value, (list, tuple)) for value in decoded.values()):
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    return decoded
 
 
 def _normalize_strict_paper_recommendation(candidate: dict[str, Any]) -> dict[str, Any] | None:
