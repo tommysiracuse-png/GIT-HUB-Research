@@ -181,6 +181,8 @@ def _recommendation_schema_error(candidate: Any) -> str:
         return f"extra:{','.join(extra)}"
     if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
         return "empty_required_field"
+    if _contains_array_anywhere(candidate):
+        return "contains_array"
     if not _is_paper_scoped_market_key(candidate.get("market_key")):
         return "market_key_out_of_scope"
     action = candidate.get("action")
