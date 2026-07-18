@@ -15,7 +15,10 @@ import json
 import pathlib
 from typing import Iterable
 
-from storage import RUNS_DIR
+try:
+    from storage import RUNS_DIR
+except ModuleNotFoundError:  # pragma: no cover - fallback for isolated test imports
+    from src.storage import RUNS_DIR
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
