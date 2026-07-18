@@ -159,7 +159,9 @@ def _recommendation_schema_error(value: Any) -> str | None:
     if array_path:
         return f"arrays are not allowed in recommendation payloads: {array_path} (use objects or strings only)"
     for required_key in ("action", "priority", "title", "rationale", "market_key"):
-        if isinstance(value.get(required_key), str) and _has_forbidden_markdown_tokens(value[required_key]):
+        if isinstance(value.get(required_key), str) and any(
+            token in value[required_key] for token in _FORBIDDEN_MARKDOWN_TOKENS
+        ):
             return f"markdown is not allowed in {required_key}"
     return None
 
