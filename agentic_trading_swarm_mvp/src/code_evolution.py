@@ -185,6 +185,40 @@ def _strict_recommendation_json_error(text: str) -> str | None:
     return _recommendation_schema_error(payload)
 
 
+def _strict_recommendation_fallback(
+    validation_error: str,
+    *,
+    market_key: str = "paper.cross_market.output_contract",
+) -> dict[str, Any]:
+    """Build a deterministic paper-only fallback recommendation object."""
+
+    return {
+        "action": "wait_for_complete_valid_json_recommendation_with_market_context",
+        "priority": 90,
+        "title": "Hold until single-object JSON recommendation is available",
+        "rationale": (
+            "The recommendation output failed strict schema validation, so the "
+            "paper-only runner should suppress trade generation and wait for a "
+            "complete single JSON object."
+        ),
+        "market_key": market_key,
+        "evidence": {
+            "constraint": "Output must remain paper-only with no live-trading instruction",
+            "validation_error": validation_error,
+        },
+        "proposed_change": {
+            "format_rule": "No markdown, no commentary, no arrays, no extra top-level keys beyond the allowed optional fields",
+            "goal": "Return exactly one schema-complete JSON object on every recommendation",
+            "required_fields": "action, priority, title, rationale, market_key, evidence, proposed_change",
+            "safety_rule": "Keep all recommendations scoped to paper trading only",
+        },
+        "variant_config": {
+            "mode": "paper_only",
+            "schema_strict": True,
+        },
+    }
+
+
 def _paper_hold_recommendation(
     validation_error: str,
     *,
