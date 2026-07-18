@@ -126,6 +126,12 @@ def _cfg(settings: dict) -> dict:
         "recovery_probe_every_reviews": 25,
         "recovery_probe_allocation_multiplier": 0.10,
         "probation_allocation_multiplier": 0.25,
+        "signal_key_probation_enabled": False,
+        "signal_key_probation_min_closed_trades": 12,
+        "signal_key_probation_expectancy_bps": -15.0,
+        "signal_key_probation_mode": "downweight",
+        "signal_key_probation_weight": 0.25,
+        "signal_key_probation_ttl_hours": 72,
         "release_min_recovery_trades": 5,
         "release_min_avg_pnl_bps": 10.0,
         "release_min_win_rate": 0.55,
@@ -136,6 +142,70 @@ def _cfg(settings: dict) -> dict:
         "stale_signal_terms": ("opportunistic", "exploit"),
     }
     return {**defaults, **settings.get("signal_safety", {})}
+
+
+def _signal_key_probation_enabled(cfg: dict) -> bool:
+    return bool(cfg.get("signal_key_probation_enabled", False))
+
+
+def _signal_key_probation_mode(cfg: dict) -> str:
+    raw = str(cfg.get("signal_key_probation_mode", "downweight") or "downweight").strip().lower()
+    return "block" if raw == "block" else "downweight"
+
+
+def _signal_key_probation_weight(cfg: dict) -> float:
+    try:
+        weight = float(cfg.get("signal_key_probation_weight", 0.25))
+    except (TypeError, ValueError):
+        return 0.25
+    return min(max(weight, 0.0), 1.0)
+
+
+def _signal_key_probation_ttl_hours(cfg: dict) -> int:
+    try:
+        hours = int(float(cfg.get("signal_key_probation_ttl_hours", 72) or 72))
+    except (TypeError, ValueError):
+        return 72
+    return min(max(hours, 1), 24 * 7)
+
+
+def _signal_key_probation(stats: dict, cfg: dict) -> tuple[str, str] | None:
+    if not _signal_key_probation_enabled(cfg):
+        return None
+    closed = int(stats.get("closed_count") or 0)
+    minimum = int(cfg.get("signal_key_probation_min_closed_trades", 12) or 0)
+    if closed < minimum:
+        return None
+    expectancy = stats.get("avg_pnl_bps")
+    if expectancy is None:
+        return None
+    threshold = float(cfg.get("signal_key_probation_expectancy_bps", -15.0))
+    if float(expectancy) > threshold:
+        return None
+    mode = "quarantine" if _signal_key_probation_mode(cfg) == "block" else "probation"
+    return mode, "signal_key_probation_expectancy"
+
+
+def _signal_key_probation_expires_at(cfg: dict) -> str:
+    hours = _signal_key_probation_ttl_hours(cfg)
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=hours)).isoformat()
+
+
+def _signal_key_probation_detail(stats: dict, cfg: dict) -> dict:
+    return {
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "expires_at": _signal_key_probation_expires_at(cfg),
+        "mode": _signal_key_probation_mode(cfg),
+        "weight": _signal_key_probation_weight(cfg),
+        "ttl_hours": _signal_key_probation_ttl_hours(cfg),
+        "trigger_closed_trades": int(stats.get("closed_count") or 0),
+        "trigger_expectancy_bps": float(stats.get("avg_pnl_bps") or 0.0),
+        "expectancy_threshold_bps": float(cfg.get("signal_key_probation_expectancy_bps", -15.0)),
+        "reason": (
+            f"closed paper trades={int(stats.get('closed_count') or 0)} "
+            f"and expectancy_bps={float(stats.get('avg_pnl_bps') or 0.0):.3f}"
+        ),
+    }
 
 
 def _classify_signal(stats: dict, recent: dict, cfg: dict) -> tuple[str, str]:
@@ -164,6 +234,10 @@ def _classify_signal(stats: dict, recent: dict, cfg: dict) -> tuple[str, str]:
     if severe_recent or severe_lifetime:
         return "quarantine", "severe_negative_expectancy"
 
+    probation_override = _signal_key_probation(stats, cfg)
+    if probation_override:
+        return probation_override
+
     demote_recent = recent_bad and (
         float(recent_avg) <= float(cfg["demote_recent_avg_bps"])
         or (recent_wr is not None and float(recent_wr) <= float(cfg["demote_win_rate"]) and float(recent_avg) < 0)
@@ -189,17 +263,31 @@ def _source_id(signal_key: str) -> str:
 def _policy_for(mode: str, reason: str, stats: dict, recent: dict, settings: dict, cfg: dict) -> dict:
     risk = settings.get("risk", {})
     scanner = settings.get("scanner", {})
+    probation_reason = reason == "signal_key_probation_expectancy"
     severe = mode == "quarantine"
+    allocation_multiplier = float(
+        cfg["recovery_probe_allocation_multiplier"] if severe else cfg["probation_allocation_multiplier"]
+    )
+    if probation_reason and not severe:
+        allocation_multiplier = _signal_key_probation_weight(cfg)
+    probation_detail = _signal_key_probation_detail(stats, cfg) if probation_reason else None
     return {
         "governor_mode": mode,
         "reason": reason,
+        "reason_detail": probation_detail["reason"] if probation_detail else reason,
         "min_score_delta": 18.0 if severe else 9.0,
         "min_net_edge_bps": max(float(risk.get("min_net_edge_bps", 2.0)) + (10.0 if severe else 4.0), 8.0 if severe else 5.0),
         "max_spread_bps": min(float(risk.get("max_spread_bps", 8.0)), 3.5 if severe else 5.0),
-        "allocation_multiplier": float(cfg["recovery_probe_allocation_multiplier"] if severe else cfg["probation_allocation_multiplier"]),
+        "allocation_multiplier": allocation_multiplier,
         "pause_entries": severe,
         "expires_after_trades": None,
+        "expires_at": probation_detail["expires_at"] if probation_detail else None,
         "allow_recovery_probes": True,
+        "paper_only": True,
+        "policy_scope": "paper_only",
+        "paper_signal_key_probation": probation_detail,
+        "trigger_closed_trades": probation_detail["trigger_closed_trades"] if probation_detail else None,
+        "trigger_expectancy_bps": probation_detail["trigger_expectancy_bps"] if probation_detail else None,
         "recovery_probe_every_n_reviews": int(cfg["recovery_probe_every_reviews"]),
         "recovery_probe_allocation_multiplier": float(cfg["recovery_probe_allocation_multiplier"]),
         "release_criteria": {
