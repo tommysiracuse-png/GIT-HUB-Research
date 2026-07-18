@@ -21,7 +21,17 @@
     "require_close_above_trigger": true,
     "require_next_interval_hold": true,
     "assumed_position_size": "reduced",
-    "require_complete_json": true
+    "require_complete_json": true,
+    "breakout_quality_filter": {
+      "mode": "paper_only",
+      "base_breakout_buffer_pct": 0.2,
+      "high_atr_pct_threshold": 4.5,
+      "high_vol_breakout_buffer_pct": 0.35,
+      "min_rel_volume": 1.8,
+      "max_spread_pct": 0.35,
+      "require_above_vwap": true,
+      "require_above_20ema": true
+    }
   },
   "venues": [
     {
