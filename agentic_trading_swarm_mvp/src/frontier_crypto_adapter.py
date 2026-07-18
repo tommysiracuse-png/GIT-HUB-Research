@@ -7,6 +7,7 @@ uses credentials, private/account APIs, or order endpoints.
 """
 
 from __future__ import annotations
+import datetime as dt
 
 
 def paper_only_liquidity_volatility_entry_gate(
@@ -274,11 +275,89 @@ def paper_only_multi_factor_entry_gate(
     }
 
 
+def _paper_only_parse_timestamp(value):
+    if value in (None, "", [], {}, ()):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                value = float(text)
+            except (TypeError, ValueError):
+                return None
+        else:
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=dt.timezone.utc)
+            return parsed.astimezone(dt.timezone.utc)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if abs(numeric) > 10_000_000_000_000:
+        numeric /= 1_000_000.0
+    elif abs(numeric) > 10_000_000_000:
+        numeric /= 1000.0
+    try:
+        return dt.datetime.fromtimestamp(numeric, tz=dt.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _paper_only_source_alignment_audit(payload, *, max_source_skew_seconds=2.0):
+    result = {
+        "eligible": False,
+        "reason": "missing_source_timestamps",
+        "source_skew_seconds": None,
+        "source_alignment_status": "unknown",
+        "max_source_skew_seconds": float(max_source_skew_seconds),
+    }
+    if not isinstance(payload, dict):
+        result["reason"] = "invalid_payload"
+        return result
+
+    try:
+        skew_seconds = float(payload.get("spot_perp_skew_seconds"))
+    except (TypeError, ValueError):
+        skew_seconds = None
+
+    if skew_seconds is None:
+        spot_timestamp = None
+        perp_timestamp = None
+        for key in ("spot_timestamp", "spot_quote_timestamp", "spot_data_timestamp"):
+            spot_timestamp = _paper_only_parse_timestamp(payload.get(key))
+            if spot_timestamp is not None:
+                break
+        for key in ("perp_timestamp", "perp_quote_timestamp", "perp_data_timestamp"):
+            perp_timestamp = _paper_only_parse_timestamp(payload.get(key))
+            if perp_timestamp is not None:
+                break
+        if spot_timestamp is not None and perp_timestamp is not None:
+            skew_seconds = abs((spot_timestamp - perp_timestamp).total_seconds())
+        elif any(key in payload for key in ("spot_timestamp", "spot_quote_timestamp", "spot_data_timestamp")) or any(
+            key in payload for key in ("perp_timestamp", "perp_quote_timestamp", "perp_data_timestamp")
+        ):
+            result["reason"] = "invalid_source_timestamps"
+            return result
+        else:
+            return result
+
+    result["source_skew_seconds"] = skew_seconds
+    result["eligible"] = skew_seconds <= float(max_source_skew_seconds)
+    result["reason"] = "eligible" if result["eligible"] else "skew_above_threshold"
+    result["source_alignment_status"] = "aligned" if result["eligible"] else "misaligned"
+    return result
+
+
 def paper_only_signal_freshness_audit(
     payload,
     *,
     max_age_seconds=300,
     freshness_buckets=(30, 120, 300),
+    max_source_skew_seconds=2.0,
     horizon_label=None,
 ):
     """Paper-only diagnostic helper for stale-data and horizon mismatch checks.
@@ -295,6 +374,10 @@ def paper_only_signal_freshness_audit(
             "freshness_bucket": "unknown",
             "horizon_label": horizon_label,
             "horizon_alignment": "unknown",
+            "source_skew_seconds": None,
+            "source_alignment_status": "unknown",
+            "source_alignment_eligible": False,
+            "max_source_skew_seconds": float(max_source_skew_seconds),
         }
 
     try:
@@ -332,6 +415,8 @@ def paper_only_signal_freshness_audit(
     if horizon_seconds is not None and data_age_seconds is not None:
         horizon_alignment = "aligned" if horizon_seconds >= data_age_seconds else "lagging"
 
+    source_alignment = _paper_only_source_alignment_audit(payload, max_source_skew_seconds=max_source_skew_seconds)
+
     return {
         "eligible": eligible,
         "reason": reason,
@@ -341,6 +426,10 @@ def paper_only_signal_freshness_audit(
         "horizon_label": horizon_label,
         "forecast_horizon_seconds": horizon_seconds,
         "horizon_alignment": horizon_alignment,
+        "source_skew_seconds": source_alignment["source_skew_seconds"],
+        "source_alignment_status": source_alignment["source_alignment_status"],
+        "source_alignment_eligible": source_alignment["eligible"],
+        "max_source_skew_seconds": source_alignment["max_source_skew_seconds"],
     }
 
 

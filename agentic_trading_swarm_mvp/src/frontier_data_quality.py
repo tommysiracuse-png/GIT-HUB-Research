@@ -160,6 +160,60 @@ def normalize_buda_order_book(payload=None):
     return _normalized_public_order_book_snapshot(bids, asks, venue_name="BUDA")
 
 
+def paper_only_timestamp_alignment_diagnostic(
+    payload=None,
+    *,
+    spot_timestamp_key="spot_timestamp",
+    perp_timestamp_key="perp_timestamp",
+    max_skew_seconds=2.0,
+):
+    """Paper-only diagnostic for spot/perp timestamp alignment quality."""
+
+    result = {
+        "eligible": False,
+        "reason": "missing_source_timestamps",
+        "spot_timestamp": None,
+        "perp_timestamp": None,
+        "skew_seconds": None,
+        "max_skew_seconds": float(max_skew_seconds),
+        "alignment_status": "unknown",
+        "paper_only": True,
+        "read_only": True,
+    }
+    if not isinstance(payload, dict):
+        result["reason"] = "invalid_payload"
+        return result
+
+    try:
+        skew_seconds = float(payload.get("spot_perp_skew_seconds"))
+    except (TypeError, ValueError):
+        skew_seconds = None
+
+    def _as_datetime(value):
+        normalized = _timestamp_to_iso(value)
+        if not normalized:
+            return None
+        return _parse_iso(normalized)
+
+    if skew_seconds is None:
+        spot_value = payload.get(spot_timestamp_key, payload.get("spot_quote_timestamp", payload.get("spot_data_timestamp")))
+        perp_value = payload.get(perp_timestamp_key, payload.get("perp_quote_timestamp", payload.get("perp_data_timestamp")))
+        spot_dt = _as_datetime(spot_value)
+        perp_dt = _as_datetime(perp_value)
+        if spot_dt is None or perp_dt is None:
+            result["reason"] = "invalid_source_timestamps" if spot_value is not None or perp_value is not None else result["reason"]
+            return result
+        result["spot_timestamp"] = spot_dt.isoformat()
+        result["perp_timestamp"] = perp_dt.isoformat()
+        skew_seconds = abs((spot_dt - perp_dt).total_seconds())
+
+    result["skew_seconds"] = skew_seconds
+    result["eligible"] = skew_seconds <= float(max_skew_seconds)
+    result["reason"] = "eligible" if result["eligible"] else "skew_above_threshold"
+    result["alignment_status"] = "aligned" if result["eligible"] else "misaligned"
+    return result
+
+
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
