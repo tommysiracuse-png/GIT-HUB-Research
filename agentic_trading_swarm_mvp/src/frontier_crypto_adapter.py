@@ -27,6 +27,8 @@ def classify_fiat_corridor(base_asset, quote_asset, venue_name=None, venue_notes
         corridor_type = f"{quote.lower()}_cross"
         corridor_confidence = 0.88
     else:
+        if quote == "IDR" and "INDODAX" in venue:
+            corridor_confidence = 0.8
         corridor_type = "local_fiat"
         corridor_confidence = 0.72
 
@@ -253,6 +255,131 @@ def validate_paper_recommendation_payload(payload=None, confidence_threshold=0.6
         }
 
     return payload
+
+
+DEFAULT_PAPER_ONLY_INDODAX_DISCOVERY_POLICY = {
+    "enabled": True,
+    "venue": "INDODAX_SPOT",
+    "quote_assets": ("IDR",),
+    "max_markets": 25,
+    "max_spread_bps_for_health": 120.0,
+}
+
+
+def _indodax_symbol_components(symbol=None):
+    normalized = str(symbol or "").strip().upper().replace("-", "_").replace("/", "_")
+    if not normalized:
+        return None, None
+    if "_" in normalized:
+        base, quote = normalized.split("_", 1)
+        return (base or None), (quote or None)
+    for quote_asset in DEFAULT_PAPER_ONLY_INDODAX_DISCOVERY_POLICY["quote_assets"]:
+        if normalized.endswith(quote_asset):
+            base_asset = normalized[:-len(quote_asset)]
+            return (base_asset or None), quote_asset
+    return normalized, None
+
+
+def _indodax_quote_turnover(snapshot=None, base_asset=None, quote_asset=None, last_price=None):
+    snapshot = snapshot or {}
+    quote_key = f"vol_{str(quote_asset or '').lower()}"
+    turnover_quote = _paper_only_float_or_none(snapshot.get(quote_key))
+    if turnover_quote is not None and turnover_quote > 0.0:
+        return turnover_quote
+    base_key = f"vol_{str(base_asset or '').lower()}"
+    turnover_base = _paper_only_float_or_none(snapshot.get(base_key))
+    if turnover_base is not None and turnover_base > 0.0 and last_price is not None and last_price > 0.0:
+        return turnover_base * last_price
+    fallback_volume = _paper_only_float_or_none(snapshot.get("vol") or snapshot.get("volume"))
+    if fallback_volume is not None and fallback_volume > 0.0 and last_price is not None and last_price > 0.0:
+        return fallback_volume * last_price
+    return None
+
+
+def paper_only_indodax_symbol_discovery(payload=None, max_markets=None, allowed_quotes=None):
+    """
+    Read-only INDODAX spot snapshot normalization for paper-only discovery.
+
+    Accepts a public ticker summary payload and returns normalized best-bid/ask
+    snapshots for liquid IDR spot pairs only. No trading or account state.
+    """
+    policy = DEFAULT_PAPER_ONLY_INDODAX_DISCOVERY_POLICY
+    allowed_quotes = tuple(
+        str(quote or "").strip().upper()
+        for quote in (allowed_quotes or policy["quote_assets"])
+        if str(quote or "").strip()
+    )
+    market_limit = int(max_markets or policy["max_markets"] or 0)
+    raw_snapshots = {}
+    if isinstance(payload, dict):
+        if isinstance(payload.get("tickers"), dict):
+            raw_snapshots = payload.get("tickers") or {}
+        elif all(isinstance(value, dict) for value in payload.values()):
+            raw_snapshots = payload
+
+    observations = []
+    for native_symbol, snapshot in raw_snapshots.items():
+        if not isinstance(snapshot, dict):
+            continue
+        base_asset, quote_asset = _indodax_symbol_components(native_symbol)
+        if not base_asset or not quote_asset:
+            continue
+        if allowed_quotes and quote_asset not in allowed_quotes:
+            continue
+        bid = _paper_only_float_or_none(snapshot.get("buy") or snapshot.get("bid"))
+        ask = _paper_only_float_or_none(snapshot.get("sell") or snapshot.get("ask"))
+        last = _paper_only_float_or_none(snapshot.get("last") or snapshot.get("close"))
+        if last is None or last <= 0.0:
+            continue
+        if bid is None:
+            bid = last
+        if ask is None:
+            ask = last
+        if bid <= 0.0 or ask <= 0.0 or ask < bid:
+            continue
+        mid = (bid + ask) / 2.0
+        spread_bps = 0.0 if mid <= 0.0 else ((ask - bid) / mid) * 10000.0
+        turnover_quote = _indodax_quote_turnover(snapshot, base_asset, quote_asset, last) or 0.0
+        observations.append(
+            {
+                "venue": policy["venue"],
+                "venue_name": "INDODAX",
+                "market_type": "spot",
+                "symbol": f"{base_asset}_{quote_asset}",
+                "native_symbol": str(native_symbol),
+                "base_asset": base_asset,
+                "quote_asset": quote_asset,
+                "best_bid": round(bid, 12),
+                "best_ask": round(ask, 12),
+                "last_price": round(last, 12),
+                "mid_price": round(mid, 12),
+                "spread_bps": round(spread_bps, 6),
+                "quote_turnover": round(turnover_quote, 6),
+                "paper_only": True,
+                "read_only": True,
+                "discovery_source": "indodax_public_tickers",
+            }
+        )
+    observations.sort(key=lambda item: (-float(item.get("quote_turnover") or 0.0), item.get("symbol") or ""))
+    if market_limit > 0:
+        observations = observations[:market_limit]
+    return observations
+
+
+def paper_only_indodax_market_health(payload=None, max_markets=None):
+    """Compact paper-only INDODAX venue health summary derived from public tickers."""
+    policy = DEFAULT_PAPER_ONLY_INDODAX_DISCOVERY_POLICY
+    observations = paper_only_indodax_symbol_discovery(payload=payload, max_markets=max_markets)
+    max_spread_bps = float(policy["max_spread_bps_for_health"])
+    healthy_count = sum(1 for item in observations if float(item.get("spread_bps") or 0.0) <= max_spread_bps)
+    return {
+        "venue": policy["venue"],
+        "market_count": len(observations),
+        "healthy_market_count": healthy_count,
+        "quotes": sorted({item.get("quote_asset") for item in observations if item.get("quote_asset")}),
+        "paper_only": True,
+        "read_only": True,
+    }
 
 import argparse
 import collections

@@ -42,6 +42,68 @@ _BYBIT_READ_ONLY_BROWSER_HEADERS = {
 _BYBIT_PUBLIC_FAILOVER_HOSTS = {"api.bybit.com": "api.bytick.com"}
 
 
+def _normalize_indodax_order_book_side(levels, *, reverse=False):
+    normalized = []
+    if not isinstance(levels, (list, tuple)):
+        return normalized
+    for level in levels:
+        if isinstance(level, dict):
+            price = _as_float(level.get("price") or level.get("rate"))
+            quantity = _as_float(level.get("amount") or level.get("qty") or level.get("volume"))
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            price = _as_float(level[0])
+            quantity = _as_float(level[1])
+        else:
+            continue
+        if price is None or quantity is None:
+            continue
+        if price <= 0.0 or quantity <= 0.0:
+            continue
+        normalized.append((price, quantity))
+    normalized.sort(key=lambda item: item[0], reverse=bool(reverse))
+    return normalized
+
+
+def normalize_indodax_order_book(payload=None):
+    """
+    Normalize a public INDODAX order-book payload into best bid/ask metadata.
+
+    Supports either buy/sell or bids/asks field conventions. Read-only only.
+    """
+    payload = payload or {}
+    bids = _normalize_indodax_order_book_side(payload.get("buy") or payload.get("bids"), reverse=True)
+    asks = _normalize_indodax_order_book_side(payload.get("sell") or payload.get("asks"), reverse=False)
+    best_bid = bids[0][0] if bids else None
+    best_ask = asks[0][0] if asks else None
+    if best_bid is None and best_ask is None:
+        book_state = "empty_book"
+    elif best_bid is None or best_ask is None:
+        book_state = "one_sided_book"
+    elif best_bid >= best_ask:
+        book_state = "crossed_book" if best_bid > best_ask else "locked_book"
+    else:
+        book_state = "ok"
+    mid_price = None
+    spread_bps = None
+    if best_bid is not None and best_ask is not None and best_ask > 0.0 and best_bid > 0.0:
+        mid_price = (best_bid + best_ask) / 2.0
+        if mid_price > 0.0:
+            spread_bps = ((best_ask - best_bid) / mid_price) * 10000.0
+    return {
+        "bids": bids,
+        "asks": asks,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "mid_price": mid_price,
+        "spread_bps": spread_bps,
+        "book_state": book_state,
+        "level_count": len(bids) + len(asks),
+        "paper_only": True,
+        "read_only": True,
+        "venue_name": "INDODAX",
+    }
+
+
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
