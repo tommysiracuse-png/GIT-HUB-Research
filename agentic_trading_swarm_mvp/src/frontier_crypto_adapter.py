@@ -58,47 +58,53 @@ def paper_only_cross_market_confirmation_gate(
     }
 
 
-def paper_only_cross_market_confirmation_gate(
+def paper_only_multi_factor_entry_gate(
+    *,
+    momentum_ok,
+    liquidity_ok,
+    spread_ok,
     confirmation_score,
     confirmation_age_seconds=None,
-    minimum_score=0.70,
-    maximum_age_seconds=120,
-    allow_neutral_alignment=False,
+    minimum_confirmation_score=0.70,
+    maximum_confirmation_age_seconds=120,
+    require_positive_confirmation=True,
 ):
-    try:
-        score = float(confirmation_score)
-    except (TypeError, ValueError):
-        score = 0.0
+    """Paper-only entry gate that combines signal quality checks.
 
-    try:
-        age_seconds = None if confirmation_age_seconds is None else float(confirmation_age_seconds)
-    except (TypeError, ValueError):
-        age_seconds = None
+    This is diagnostic-only and never changes live execution routing.
+    """
 
-    minimum_score = float(minimum_score)
-    maximum_age_seconds = float(maximum_age_seconds)
-    meets_score = score >= minimum_score
-    meets_age = age_seconds is None or age_seconds <= maximum_age_seconds
-    neutral_alignment = score == 0.0
-    eligible = bool(meets_score and meets_age and (allow_neutral_alignment or not neutral_alignment))
+    confirmation = paper_only_cross_market_confirmation_gate(
+        confirmation_score=confirmation_score,
+        confirmation_age_seconds=confirmation_age_seconds,
+        minimum_score=minimum_confirmation_score,
+        maximum_age_seconds=maximum_confirmation_age_seconds,
+        allow_neutral_alignment=not require_positive_confirmation,
+    )
 
-    if neutral_alignment and not allow_neutral_alignment:
-        reason = "neutral_alignment_disallowed"
-    elif not meets_score:
-        reason = "below_minimum_score"
-    elif not meets_age:
-        reason = "stale_confirmation"
+    momentum_ok = bool(momentum_ok)
+    liquidity_ok = bool(liquidity_ok)
+    spread_ok = bool(spread_ok)
+    eligible = bool(momentum_ok and liquidity_ok and spread_ok and confirmation["eligible"])
+
+    if not momentum_ok:
+        reason = "momentum_rejected"
+    elif not liquidity_ok:
+        reason = "liquidity_rejected"
+    elif not spread_ok:
+        reason = "spread_rejected"
+    elif not confirmation["eligible"]:
+        reason = confirmation["reason"]
     else:
         reason = "eligible"
 
     return {
         "eligible": eligible,
         "reason": reason,
-        "score": score,
-        "age_seconds": age_seconds,
-        "minimum_score": minimum_score,
-        "maximum_age_seconds": maximum_age_seconds,
-        "allow_neutral_alignment": bool(allow_neutral_alignment),
+        "momentum_ok": momentum_ok,
+        "liquidity_ok": liquidity_ok,
+        "spread_ok": spread_ok,
+        "confirmation": confirmation,
     }
 
 
