@@ -161,6 +161,16 @@ def compose_strict_paper_recommendation(candidate: Any) -> dict[str, Any]:
     return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
 
 
+def serialize_strict_paper_recommendation(candidate: Any) -> str:
+    recommendation = compose_strict_paper_recommendation(candidate)
+    return json.dumps(
+        recommendation,
+        sort_keys=True,
+        separators=STRICT_RECOMMENDATION_JSON_SEPARATORS,
+        ensure_ascii=True,
+    )
+
+
 def _render_strict_paper_recommendation(candidate: Any) -> str:
     """Return one JSON object string for paper-only recommendation handoff."""
 
@@ -170,11 +180,11 @@ def _render_strict_paper_recommendation(candidate: Any) -> str:
     else:
         validated = dict(validated)
     validated["market_key"] = STRICT_RECOMMENDATION_MARKET_KEY
-    rendered = json.dumps(validated, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, ensure_ascii=False)
+    rendered = serialize_strict_paper_recommendation(validated)
     if not _contains_exactly_one_json_object(rendered):
         fallback = dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
         fallback["market_key"] = STRICT_RECOMMENDATION_MARKET_KEY
-        rendered = json.dumps(fallback, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, ensure_ascii=False)
+        rendered = serialize_strict_paper_recommendation(fallback)
     return rendered
 
 
