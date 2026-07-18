@@ -9,6 +9,67 @@ uses credentials, private/account APIs, or order endpoints.
 from __future__ import annotations
 
 
+def paper_only_frontier_short_route_profile_gate(
+    route_profile=None,
+    *,
+    minimum_fill_quality=0.70,
+    maximum_spread_bps=25.0,
+):
+    """Paper-only gate for frontier short recommendations.
+
+    The gate fails closed when required route-profile evidence is missing,
+    stale, or below threshold. It is diagnostic-only and does not affect live
+    routing or broker behavior.
+    """
+
+    profile = route_profile if isinstance(route_profile, dict) else {}
+    fresh_profile = bool(profile.get("fresh_profile"))
+    fill_quality = profile.get("simulated_fill_quality")
+    spread_bps = profile.get("simulated_spread_bps")
+    borrow_state = profile.get("simulated_borrow_state")
+
+    try:
+        fill_quality_value = float(fill_quality)
+    except (TypeError, ValueError):
+        fill_quality_value = None
+
+    try:
+        spread_bps_value = float(spread_bps)
+    except (TypeError, ValueError):
+        spread_bps_value = None
+
+    has_required_profile = fresh_profile and fill_quality_value is not None and spread_bps_value is not None
+    meets_fill_quality = fill_quality_value is not None and fill_quality_value >= float(minimum_fill_quality)
+    meets_spread = spread_bps_value is not None and spread_bps_value <= float(maximum_spread_bps)
+    has_borrow = str(borrow_state).lower() == "available"
+
+    eligible = bool(has_required_profile and meets_fill_quality and meets_spread and has_borrow)
+
+    if not has_required_profile:
+        reason = "route_profile_incomplete"
+    elif not fresh_profile:
+        reason = "route_profile_stale"
+    elif not meets_fill_quality:
+        reason = "simulated_fill_quality_below_threshold"
+    elif not meets_spread:
+        reason = "simulated_spread_bps_above_threshold"
+    elif not has_borrow:
+        reason = "simulated_borrow_state_unavailable"
+    else:
+        reason = "eligible"
+
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "fresh_profile": fresh_profile,
+        "simulated_fill_quality": fill_quality_value,
+        "simulated_spread_bps": spread_bps_value,
+        "simulated_borrow_state": borrow_state,
+        "minimum_fill_quality": float(minimum_fill_quality),
+        "maximum_spread_bps": float(maximum_spread_bps),
+    }
+
+
 def paper_only_cross_market_confirmation_gate(
     confirmation_score,
     confirmation_age_seconds=None,
