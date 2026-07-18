@@ -157,7 +157,7 @@ def _recommendation_schema_error(value: Any) -> str | None:
             return f"{optional_key} must be omitted or contain an object"
     array_path = _find_array_path(value)
     if array_path:
-        return f"arrays are not allowed in recommendation payloads: {array_path}"
+        return f"arrays are not allowed in recommendation payloads: {array_path} (use objects or strings only)"
     for required_key in ("action", "priority", "title", "rationale", "market_key"):
         if isinstance(value.get(required_key), str) and _has_forbidden_markdown_tokens(value[required_key]):
             return f"markdown is not allowed in {required_key}"
