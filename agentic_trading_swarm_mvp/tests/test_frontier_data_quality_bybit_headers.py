@@ -1,3 +1,51 @@
+import unittest
+
+from src.frontier_data_quality import paper_only_bybit_health_route_candidates
+
+
+class BybitHealthRouteCandidatesTests(unittest.TestCase):
+    def test_linear_canary_ticker_gets_host_and_orderbook_fallback_candidates(self):
+        url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+
+        candidates = paper_only_bybit_health_route_candidates(url)
+
+        self.assertEqual(
+            candidates,
+            [
+                "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT",
+                "https://api.bytick.com/v5/market/tickers?category=linear&symbol=BTCUSDT",
+                "https://api.bybit.com/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=1",
+                "https://api.bytick.com/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=1",
+                "https://api2.bybit.com/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=1",
+            ],
+        )
+
+    def test_non_canary_symbol_only_gets_host_failover(self):
+        url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=XRPUSDT"
+
+        candidates = paper_only_bybit_health_route_candidates(url)
+
+        self.assertEqual(
+            candidates,
+            [
+                "https://api.bybit.com/v5/market/tickers?category=linear&symbol=XRPUSDT",
+                "https://api.bytick.com/v5/market/tickers?category=linear&symbol=XRPUSDT",
+            ],
+        )
+
+    def test_non_bybit_url_is_left_untouched(self):
+        url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT"
+
+        candidates = paper_only_bybit_health_route_candidates(url)
+
+        self.assertEqual(
+            candidates,
+            [url],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
 import pathlib
 import sys
 import unittest

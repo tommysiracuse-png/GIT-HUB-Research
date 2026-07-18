@@ -53,8 +53,11 @@ _BYBIT_READ_ONLY_BROWSER_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-_BYBIT_PUBLIC_FAILOVER_HOSTS = {"api.bybit.com": "api.bytick.com"}
+_BYBIT_PUBLIC_FAILOVER_HOSTS = {"api.bybit.com": "api.bytick.com", "api.bytick.com": "api2.bybit.com"}
 _BYBIT_LINEAR_PERP_CANARY_SYMBOLS = frozenset({"BTCUSDT", "ETHUSDT"})
+_BYBIT_PUBLIC_TICKER_PATH = "/v5/market/tickers"
+_BYBIT_PUBLIC_ORDERBOOK_PATH = "/v5/market/orderbook"
+_BYBIT_PUBLIC_ORDERBOOK_LIMIT = 1
 
 
 def _normalize_indodax_order_book_side(levels, *, reverse=False):
@@ -84,6 +87,69 @@ def _normalize_indodax_order_book_side(levels, *, reverse=False):
         normalized.append((price, quantity))
     normalized.sort(key=lambda item: item[0], reverse=bool(reverse))
     return normalized
+
+
+def paper_only_bybit_health_route_candidates(url):
+    """Return ordered public Bybit probe candidates for paper-only health checks.
+
+    The helper is read-only and never performs network access. It preserves the
+    original URL first, then adds host failover candidates, and finally adds a
+    shallow order-book quote route for the common linear canary tickers that
+    can still provide a public best-bid/best-ask signal when the raw ticker
+    endpoint is blocked.
+    """
+
+    text = str(url or "").strip()
+    if not text:
+        return []
+
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return [text]
+
+    candidates = []
+    seen = set()
+
+    def _append(candidate_url):
+        if not candidate_url or candidate_url in seen:
+            return
+        seen.add(candidate_url)
+        candidates.append(candidate_url)
+
+    _append(text)
+
+    host = (parsed.netloc or "").lower()
+    failover_host = _BYBIT_PUBLIC_FAILOVER_HOSTS.get(host)
+    if failover_host:
+        _append(urllib.parse.urlunsplit(parsed._replace(netloc=failover_host)))
+
+    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    symbol = str(query.get("symbol") or "").strip().upper()
+    category = str(query.get("category") or "").strip().lower()
+    is_linear_canary = (
+        host in _BYBIT_PUBLIC_FAILOVER_HOSTS or host in _BYBIT_PUBLIC_FAILOVER_HOSTS.values()
+    ) and parsed.path == _BYBIT_PUBLIC_TICKER_PATH and category == "linear" and symbol in _BYBIT_LINEAR_PERP_CANARY_SYMBOLS
+
+    if not is_linear_canary:
+        return candidates
+
+    fallback_query = urllib.parse.urlencode(
+        {
+            "category": "linear",
+            "symbol": symbol,
+            "limit": str(_BYBIT_PUBLIC_ORDERBOOK_LIMIT),
+        }
+    )
+    fallback_hosts = [host]
+    if failover_host:
+        fallback_hosts.append(failover_host)
+    chained_host = _BYBIT_PUBLIC_FAILOVER_HOSTS.get(failover_host or "")
+    if chained_host:
+        fallback_hosts.append(chained_host)
+    for fallback_host in fallback_hosts:
+        _append(urllib.parse.urlunsplit(parsed._replace(netloc=fallback_host, path=_BYBIT_PUBLIC_ORDERBOOK_PATH, query=fallback_query)))
+
+    return candidates
 
 
 def _public_order_book_payload(payload=None):
