@@ -141,11 +141,38 @@ def _as_bool(value: Any, default: bool = False) -> bool:
         return False
     return default
 
+
 def _venue(candidate: dict) -> str:
     return str(candidate.get("venue") or candidate.get("source_venue") or "").upper()
 
 
+def frontier_route_feasibility_record(candidate: dict) -> dict[str, Any]:
+    """Expose normalized paper route feasibility for scoring and reporting."""
+    try:
+        from paper_order_router import frontier_route_feasibility_record as _router_route_feasibility_record
+    except Exception:
+        status = str(candidate.get("paper_route_status") or candidate.get("route_status") or "unknown")
+        return {
+            "paper_route_status": status,
+            "execution_semantics": str(candidate.get("paper_route_type") or "unknown"),
+            "paper_fill_allowed": _as_bool(candidate.get("paper_fill_allowed_by_route"), status != "blocked"),
+            "paper_proxy_used": _as_bool(candidate.get("paper_proxy_used"), False),
+            "paper_allocation_multiplier": _as_float(candidate.get("paper_allocation_multiplier"), 1.0),
+            "route_blockers": list(candidate.get("route_blockers") or []),
+            "venue": _venue(candidate),
+        }
+
+    record = dict(_router_route_feasibility_record(candidate))
+    record.setdefault("venue", _venue(candidate))
+    return record
+
+
 def _route_status(candidate: dict) -> str:
+    route_record = frontier_route_feasibility_record(candidate)
+    normalized_status = str(route_record.get("paper_route_status") or "").strip()
+    if normalized_status and normalized_status != "unknown":
+        return normalized_status
+
     feasibility = candidate.get("execution_feasibility") or {}
     route = candidate.get("execution_route") or {}
     return str(feasibility.get("route_status") or feasibility.get("status") or route.get("route_status") or "unknown")

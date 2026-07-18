@@ -18,6 +18,15 @@ FRONTIER_MARKER = "frontier_crypto_venue_map"
 FRONTIER_SHADOW_REASON = "frontier_shadow_filtered"
 SPOT_BORROW_SHADOW_CODE = "spot_borrow_unconfirmed"
 
+_ROUTE_FLAG_KEYS = (
+    "frontier_route_feasibility_guard_enabled",
+    "paper_frontier_route_feasibility_guard_enabled",
+    "paper_route_feasibility_guard_enabled",
+)
+_ROUTE_EXECUTABLE_STATUSES = {"executable", "available", "configured", "ready", "ok", "paper_executable", "direct"}
+_ROUTE_PROXY_STATUSES = {"paper_testable_proxy", "proxy", "paper_proxy", "proxy_only"}
+_ROUTE_BLOCKED_STATUSES = {"blocked", "not_executable", "unavailable", "denied", "rejected"}
+_ROUTE_RESEARCH_ONLY_STATUSES = {"research_only", "manual_only", "live_only", "requires_live_borrow", "needs_live_borrow"}
 _FLAG_KEYS = (
     "frontier_shadow_guard_enabled",
     "frontier_paper_shadow_guard_enabled",
@@ -69,6 +78,26 @@ def frontier_paper_guard_enabled(config: Mapping[str, Any] | bool | None = None)
                 return _as_bool(scoped.get(key), True)
     return True
 
+
+def frontier_route_feasibility_guard_enabled(config: Mapping[str, Any] | bool | None = None) -> bool:
+    """Return whether frontier route-feasibility paper gating is enabled."""
+    if isinstance(config, bool):
+        return config
+    if not isinstance(config, Mapping):
+        return True
+
+    for key in _ROUTE_FLAG_KEYS:
+        if key in config:
+            return _as_bool(config.get(key), True)
+
+    for scope in _FLAG_SCOPES:
+        scoped = config.get(scope)
+        if not isinstance(scoped, Mapping):
+            continue
+        for key in _ROUTE_FLAG_KEYS:
+            if key in scoped:
+                return _as_bool(scoped.get(key), True)
+    return True
 
 def _text_contains_frontier_marker(value: Any) -> bool:
     if value is None:
@@ -161,6 +190,123 @@ def _route_blockers(candidate: Mapping[str, Any]) -> set[str]:
     return {item for item in blockers if item}
 
 
+def _normalize_route_status(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _best_route_alternative(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+    for container in (candidate, candidate.get("execution_feasibility"), candidate.get("execution_route")):
+        if not isinstance(container, Mapping):
+            continue
+        for field in ("best_route_alternative", "route_alternative", "paper_route_alternative", "best_alternative"):
+            alternative = container.get(field)
+            if isinstance(alternative, Mapping):
+                return alternative
+    return {}
+
+
+def _merged_paper_allocation_multiplier(candidate: Mapping[str, Any], proposed: float) -> float:
+    existing = _finite_float(candidate.get("paper_allocation_multiplier"))
+    if existing is not None and existing > 0.0:
+        return round(min(existing, proposed), 3)
+    return round(proposed, 3)
+
+
+def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize direct-vs-proxy paper route feasibility metadata."""
+    blockers = sorted(_route_blockers(candidate))
+    direct_status = ""
+    for container in (candidate, candidate.get("execution_feasibility"), candidate.get("execution_route")):
+        if not isinstance(container, Mapping):
+            continue
+        for field in ("paper_route_status", "route_status", "status", "execution_status"):
+            direct_status = _normalize_route_status(container.get(field))
+            if direct_status:
+                break
+        if direct_status:
+            break
+
+    alternative = _best_route_alternative(candidate)
+    alternative_status = _normalize_route_status(alternative.get("status") or alternative.get("route_status"))
+    alternative_missing = set()
+    for field in ("missing_permissions", "missing_requirements", "route_blockers"):
+        alternative_missing.update(_coerce_flags(alternative.get(field)))
+    alternative_replaces = _coerce_flags(alternative.get("replaces_blockers"))
+
+    proxy_available = alternative_status in _ROUTE_PROXY_STATUSES and not alternative_missing
+    if proxy_available:
+        execution_semantics = "proxy"
+        paper_route_status = "paper_testable_proxy"
+        paper_fill_allowed = True
+        multiplier = (
+            _finite_float(alternative.get("paper_allocation_multiplier"))
+            or _finite_float(alternative.get("allocation_multiplier"))
+            or _finite_float(candidate.get("paper_proxy_allocation_multiplier"))
+            or 0.5
+        )
+    elif direct_status in _ROUTE_RESEARCH_ONLY_STATUSES:
+        execution_semantics = "research_only"
+        paper_route_status = direct_status
+        paper_fill_allowed = False
+        multiplier = 0.0
+    elif direct_status in _ROUTE_BLOCKED_STATUSES or (
+        blockers and _is_short_frontier_spot(candidate) and not _is_confirmed_borrow(candidate)
+    ):
+        execution_semantics = "blocked"
+        paper_route_status = direct_status or "blocked"
+        paper_fill_allowed = False
+        multiplier = 0.0
+    elif direct_status in _ROUTE_EXECUTABLE_STATUSES or not blockers:
+        execution_semantics = "direct"
+        paper_route_status = direct_status or "executable"
+        paper_fill_allowed = True
+        multiplier = 1.0
+    else:
+        execution_semantics = "unknown"
+        paper_route_status = direct_status or "unknown"
+        paper_fill_allowed = True
+        multiplier = 1.0
+
+    proxy_route: dict[str, Any] | None = None
+    if proxy_available:
+        proxy_route = {
+            "status": "paper_testable_proxy",
+            "route_id": alternative.get("route_id") or alternative.get("route"),
+            "venue": alternative.get("venue"),
+            "replaces_blockers": sorted(alternative_replaces),
+            "missing_permissions": sorted(alternative_missing),
+        }
+
+    return {
+        "paper_route_status": paper_route_status,
+        "execution_semantics": execution_semantics,
+        "paper_fill_allowed": paper_fill_allowed,
+        "paper_proxy_used": proxy_available,
+        "paper_allocation_multiplier": _merged_paper_allocation_multiplier(candidate, multiplier),
+        "blocker_count": len(blockers),
+        "route_blockers": blockers,
+        "missing_requirement_ids": blockers,
+        "direct_route_status": direct_status or "unknown",
+        "alternative_status": alternative_status or None,
+        "proxy_route": proxy_route,
+    }
+
+
+def _apply_route_feasibility_metadata(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    annotated = dict(candidate)
+    record = frontier_route_feasibility_record(annotated)
+    annotated["frontier_route_feasibility"] = record
+    annotated["paper_route_status"] = record["paper_route_status"]
+    annotated["paper_route_type"] = record["execution_semantics"]
+    annotated["paper_execution_semantics"] = record["execution_semantics"]
+    annotated["paper_fill_allowed_by_route"] = record["paper_fill_allowed"]
+    annotated["paper_proxy_used"] = record["paper_proxy_used"]
+    annotated["paper_allocation_multiplier"] = record["paper_allocation_multiplier"]
+    if record.get("proxy_route"):
+        annotated["paper_proxy_route"] = record["proxy_route"]
+    return annotated
+
+
 def _is_confirmed_borrow(candidate: Mapping[str, Any]) -> bool:
     for field in ("borrow_confirmed", "spot_borrow_confirmed"):
         if _as_bool(candidate.get(field), False):
@@ -179,7 +325,7 @@ def _is_confirmed_borrow(candidate: Mapping[str, Any]) -> bool:
             continue
         if (
             alternative.get("status") == "paper_testable_proxy"
-            and "spot_borrow" in _coerce_flags(alternative.get("replaces_blockers"))
+            and "spot_borrow" in _coerce_flags(alternative.get("replaces_blockers") or alternative.get("route_blockers"))
             and not _coerce_flags(alternative.get("missing_permissions"))
         ):
             return True
@@ -270,6 +416,23 @@ def frontier_shadow_filter_reason(
                 "note": "short spot frontier paper fill requires confirmed borrow or equivalent hedge route",
             }
         )
+    if frontier_route_feasibility_guard_enabled(config) and _is_short_frontier_spot(candidate):
+        route_record = frontier_route_feasibility_record(candidate)
+        if not route_record.get("paper_fill_allowed", True):
+            checks.append(
+                {
+                    "code": "route_not_paper_testable",
+                    "field": "execution_feasibility",
+                    "value": route_record.get("paper_route_status"),
+                    "route_feasibility": {
+                        "paper_route_status": route_record.get("paper_route_status"),
+                        "execution_semantics": route_record.get("execution_semantics"),
+                        "route_blockers": route_record.get("route_blockers"),
+                        "alternative_status": route_record.get("alternative_status"),
+                    },
+                }
+            )
+
 
     if not checks:
         return None
@@ -297,7 +460,9 @@ def apply_frontier_paper_guard(
     config: Mapping[str, Any] | bool | None = None,
 ) -> dict[str, Any]:
     """Return a copy of ``candidate`` annotated as shadow-filtered when needed."""
-    guarded = dict(candidate)
+    guarded = _apply_route_feasibility_metadata(candidate) if (
+        is_frontier_crypto_candidate(candidate) and frontier_route_feasibility_guard_enabled(config)
+    ) else dict(candidate)
     reason = frontier_shadow_filter_reason(guarded, config)
     if reason is None:
         return guarded
