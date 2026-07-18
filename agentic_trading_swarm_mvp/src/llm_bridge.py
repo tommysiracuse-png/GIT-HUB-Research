@@ -297,16 +297,22 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
         "top_level_shape": "A single JSON object is required; top-level arrays are invalid.",
         "format_guardrails": "No markdown, commentary, code fences, or wrapper arrays around the recommendation object.",
         "final_serialization_guard": (
-            "Before returning, build the full recommendation object, verify every required "
-            "field is present, confirm no field value is an array, serialize the object as "
-            "valid JSON, and return only that serialized object."
+            "Before returning, build the full recommendation object, verify action, "
+            "priority, title, rationale, market_key, evidence, and proposed_change are "
+            "all present and non-empty, confirm no field value is an array, serialize the "
+            "object as valid JSON, and return only that serialized object."
         ),
-        "paper_only_default": "Recommendations must remain limited to paper-trading simulation, reports, tests, adapters, routing analysis, and code evolution.",
+        "paper_only_default": (
+            "Recommendations must remain limited to paper-trading simulation, reports, "
+            "tests, adapters, routing analysis, and code evolution. market_key must stay "
+            "paper-scoped and must not imply live execution."
+        ),
         "priority": "integer 1-100",
         "fallback_behavior": (
             "If any required field is unavailable, route construction fails validation, "
             "or the response would otherwise be partial, emit one conservative paper-only "
-            "fallback recommendation instead of partial output."
+            "fallback recommendation instead of partial output. The fallback must also be "
+            "returned as exactly one JSON object."
         ),
         "validation_policy": {
             "publish_only_single_json_object": True,
@@ -314,8 +320,10 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "reject_wrapper_arrays": True,
             "reject_array_values_anywhere": True,
             "reject_missing_required_fields": True,
+            "required_serialization_fields": required_fields,
             "required_fields": required_fields,
             "required_fields_csv": required_fields_csv,
+            "require_explicit_paper_only_scope": True,
             "paper_execution_route_hunter_fallback": "refine_or_hold_with_validation_evidence",
             "require_non_empty_market_key": True,
             "require_non_empty_rationale": True,
