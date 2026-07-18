@@ -40,6 +40,7 @@ _BYBIT_READ_ONLY_BROWSER_HEADERS = {
 }
 
 _BYBIT_PUBLIC_FAILOVER_HOSTS = {"api.bybit.com": "api.bytick.com"}
+_BYBIT_LINEAR_PERP_CANARY_SYMBOLS = frozenset({"BTCUSDT", "ETHUSDT"})
 
 
 def _normalize_indodax_order_book_side(levels, *, reverse=False):
@@ -180,6 +181,35 @@ def _response_access_metadata(response_status: object = None, exc: Exception | N
     }
 
 
+def _is_bybit_linear_perp_canary_url(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(str(url or ""))
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"api.bybit.com", "api.bytick.com"}:
+        return False
+    query = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=False)
+    category = str((query.get("category") or [None])[0] or "").strip().lower()
+    symbol = str((query.get("symbol") or [None])[0] or "").strip().upper()
+    return category == "linear" and symbol in _BYBIT_LINEAR_PERP_CANARY_SYMBOLS
+
+
+def _route_health_state(
+    primary_access: dict | None = None,
+    fallback_access: dict | None = None,
+    fallback_attempted: bool = False,
+) -> str:
+    primary_state = (primary_access or {}).get("endpoint_access") or "unknown"
+    fallback_state = (fallback_access or {}).get("endpoint_access") or "unknown"
+    if primary_state == "reachable":
+        return "reachable"
+    if fallback_attempted and fallback_state == "reachable":
+        return "reachable_via_fallback"
+    if primary_state == "restricted" and not fallback_attempted:
+        return "restricted"
+    if primary_state == "restricted" and fallback_attempted:
+        return "restricted_with_failed_fallback"
+    return primary_state
+
+
 def _route_access_report(
     requested_url: str,
     effective_url: str | None,
@@ -215,12 +245,27 @@ def _route_access_report(
         resolution = f"{primary_state}_then_{fallback_state}"
     else:
         resolution = primary_state
+    is_canary = any(
+        _is_bybit_linear_perp_canary_url(candidate)
+        for candidate in (requested_url, effective_url, fallback_url)
+        if candidate
+    )
     return {
         "requested_url": requested_url,
         "effective_url": effective_url or requested_url,
         "fallback_candidate_url": fallback_url,
         "fallback_attempted": bool(fallback_attempted),
         "resolution": resolution,
+        "route_health": {
+            "state": _route_health_state(
+                primary_access=primary_access,
+                fallback_access=fallback_access,
+                fallback_attempted=fallback_attempted,
+            ),
+            "bybit_linear_perp_canary": is_canary,
+            "paper_only": True,
+            "read_only": True,
+        },
         "primary": primary,
         "fallback": fallback,
     }
@@ -228,6 +273,8 @@ def _route_access_report(
 
 def _build_public_request(url: str, headers: dict | None = None) -> urllib.request.Request:
     request_headers = dict(_DEFAULT_PUBLIC_HEADERS)
+    if _is_bybit_linear_perp_canary_url(url):
+        request_headers.update(_BYBIT_READ_ONLY_BROWSER_HEADERS)
     if headers:
         request_headers.update(headers)
     return urllib.request.Request(url, headers=request_headers)
