@@ -26,17 +26,27 @@ CRITICAL_ANOMALIES = {
 }
 
 _DEFAULT_PUBLIC_HEADERS = {
-    "User-Agent": "Mozilla/5.0 inefficiency-radar/0.2",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
     "Accept": "application/json,text/plain,*/*",
+    "Accept-Encoding": "identity",
 }
 
 _BYBIT_READ_ONLY_BROWSER_HEADERS = {
     **_DEFAULT_PUBLIC_HEADERS,
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
+    "DNT": "1",
     "Pragma": "no-cache",
     "Origin": "https://www.bybit.com",
     "Referer": "https://www.bybit.com/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
 _BYBIT_PUBLIC_FAILOVER_HOSTS = {"api.bybit.com": "api.bytick.com"}
