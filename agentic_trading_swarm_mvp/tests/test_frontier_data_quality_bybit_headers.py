@@ -1,3 +1,69 @@
+import pathlib
+import sys
+import unittest
+
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+
+from llm_bridge import _crypto_venue_health_gaps
+from research_worker import DEFAULT_GLOBAL_DISCOVERY_SEEDS
+
+
+class BybitPublicAdapterHintsTests(unittest.TestCase):
+    def test_bybit_linear_403_gap_preserves_route_and_emits_safe_request_hints(self):
+        items = [
+            {
+                "venue": "bybit",
+                "route_id": "bybit_perp_public",
+                "asset": "BTCUSDT linear",
+                "status": "HTTP Error: Forbidden",
+                "response_status": 403,
+                "url": "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT",
+                "adapter_trace": {"request_path": "/v5/market/tickers", "query": {"category": "linear"}},
+            }
+        ]
+
+        gaps = _crypto_venue_health_gaps(items)
+
+        self.assertEqual(len(gaps), 1)
+        gap = gaps[0]
+        self.assertEqual(gap["route_id"], "bybit_perp_public")
+        self.assertEqual(gap["fallback_route_id"], "bybit_spot_public")
+        self.assertEqual(gap["response_status"], 403)
+        self.assertEqual(gap["adapter_trace"]["request_path"], "/v5/market/tickers")
+        self.assertEqual(gap["adapter_fix"]["method"], "GET")
+        self.assertEqual(gap["adapter_fix"]["path"], "/v5/market/tickers")
+        self.assertEqual(gap["adapter_fix"]["query"]["category"], "spot")
+        self.assertEqual(gap["adapter_fix"]["headers"]["Accept"], "application/json")
+        self.assertEqual(gap["adapter_fix"]["headers"]["User-Agent"], "paper-research")
+        self.assertIn("result.list[0].lastPrice", gap["adapter_fix"]["response_fields"])
+
+    def test_bybit_spot_seed_carries_public_request_shape_for_paper_adapter_specs(self):
+        bybit_seed = next(
+            item for item in DEFAULT_GLOBAL_DISCOVERY_SEEDS if str(item.get("venue_or_source") or "").lower() == "bybit"
+        )
+
+        self.assertEqual(bybit_seed["adapter_route_id"], "bybit_perp_public")
+        self.assertEqual(bybit_seed["adapter_request_hint"]["method"], "GET")
+        self.assertEqual(bybit_seed["adapter_request_hint"]["path"], "/v5/market/tickers")
+        self.assertEqual(bybit_seed["adapter_request_hint"]["query"]["category"], "spot")
+        self.assertEqual(bybit_seed["adapter_request_hint"]["headers"]["Accept"], "application/json")
+        self.assertEqual(bybit_seed["adapter_request_hint"]["headers"]["User-Agent"], "paper-research")
+        self.assertIn(
+            "result.list[0].bid1Price",
+            bybit_seed["adapter_request_hint"]["response_fields"],
+        )
+
+    def test_non_linear_or_non_bybit_rows_do_not_create_gap_hints(self):
+        items = [
+            {"venue": "okx", "status": "403", "route_id": "okx_perp_public", "url": "https://okx.example/linear"},
+            {"venue": "bybit", "status": "403", "route_id": "bybit_spot_public", "url": "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT"},
+        ]
+        self.assertEqual(_crypto_venue_health_gaps(items), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
 import importlib
 import unittest
 

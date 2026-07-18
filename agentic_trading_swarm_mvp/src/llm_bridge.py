@@ -283,25 +283,48 @@ def _crypto_venue_health_gaps(items: list[dict]) -> list[dict]:
     for item in items or []:
         venue = str(item.get("venue") or "").lower()
         status = str(item.get("status") or "")
+        response_status = item.get("response_status")
         route_id = str(item.get("route_id") or "")
         url = str(item.get("url") or "")
-        if venue != "bybit" or "403" not in status:
+        adapter_trace = item.get("adapter_trace")
+        failure_status = " ".join(part for part in (status, str(response_status or "")) if part).strip()
+        if venue != "bybit" or "403" not in failure_status:
             continue
         linear_hint = "category=linear" in url or "linear" in route_id or "perp" in route_id
         if not linear_hint:
             continue
-        gaps.append(
-            {
-                "venue": item.get("venue"),
-                "route_id": item.get("route_id"),
-                "asset": item.get("asset"),
-                "status": item.get("status"),
-                "fallback_route_id": "bybit_spot_public",
-                "fallback_endpoints": ["/v5/market/tickers?category=spot", "/v5/market/orderbook?category=spot"],
-                "paper_only_use": "scanner_inputs_and_venue_health",
-                "rationale": "Bybit linear public reads returned 403; keep paper observability alive with spot public ticker/book endpoints.",
-            }
-        )
+        if response_status is None and "403" in status:
+            response_status = 403
+        gap = {
+            "venue": item.get("venue"),
+            "route_id": item.get("route_id"),
+            "asset": item.get("asset"),
+            "status": item.get("status"),
+            "response_status": response_status,
+            "fallback_route_id": "bybit_spot_public",
+            "fallback_endpoints": ["/v5/market/tickers?category=spot", "/v5/market/orderbook?category=spot"],
+            "paper_only_use": "scanner_inputs_and_venue_health",
+            "rationale": "Bybit linear public reads returned 403; keep paper observability alive with spot public ticker/book endpoints.",
+            "adapter_fix": {
+                "method": "GET",
+                "path": "/v5/market/tickers",
+                "query": {"category": "spot"},
+                "headers": {
+                    "Accept": "application/json",
+                    "User-Agent": "paper-research",
+                },
+                "response_fields": [
+                    "result.list[0].lastPrice",
+                    "result.list[0].bid1Price",
+                    "result.list[0].ask1Price",
+                ],
+            },
+        }
+        if adapter_trace not in (None, "", [], {}):
+            gap["adapter_trace"] = adapter_trace
+        elif url:
+            gap["adapter_trace"] = {"observed_url": url}
+        gaps.append(gap)
     return gaps[:10]
 
 
