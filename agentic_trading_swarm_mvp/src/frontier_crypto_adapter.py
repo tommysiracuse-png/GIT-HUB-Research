@@ -149,6 +149,23 @@ DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_REQUIREMENTS = {
 }
 
 
+def paper_only_build_governor_fields(
+    *,
+    category: str = "paper_scoring_logic",
+    implementation_mode: str = "paper_policy",
+    paper_only: bool = True,
+    trade_effecting: bool = False,
+) -> dict:
+    """Standard paper-only build-governor metadata for report packets."""
+
+    return {
+        "category": str(category),
+        "implementation_mode": str(implementation_mode),
+        "paper_only": bool(paper_only),
+        "trade_effecting": bool(trade_effecting),
+    }
+
+
 def paper_only_cross_market_risk_gate(
     *,
     divergence_bps: float | None = None,
