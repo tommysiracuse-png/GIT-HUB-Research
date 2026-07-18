@@ -60,6 +60,53 @@ def apply_fiat_corridor_penalty(opportunity_score, corridor_type=None, liquidity
     return score
 
 
+def paper_only_adjusted_route_score(raw_edge_bps=None, estimated_slippage_bps=None,
+                                    quote_age_ms=None, stale_quote_threshold_ms=750,
+                                    top_of_book_notional_usd=None, min_top_of_book_notional_usd=25000,
+                                    max_projected_slippage_bps=6):
+    """
+    Paper-only route scoring helper.
+
+    Returns a score packet that can be used by existing paper runners to prefer
+    executable routes over nominal edge.
+    """
+    raw_edge = float(raw_edge_bps or 0.0)
+    slippage = float(estimated_slippage_bps or 0.0)
+    quote_age = None if quote_age_ms is None else float(quote_age_ms)
+    stale_threshold = float(stale_quote_threshold_ms or 0.0)
+    tob_notional = float(top_of_book_notional_usd or 0.0)
+    min_tob = float(min_top_of_book_notional_usd or 0.0)
+    max_slip = float(max_projected_slippage_bps or 0.0)
+
+    freshness_ok = quote_age is None or quote_age <= stale_threshold
+    depth_ok = tob_notional >= min_tob
+    slippage_ok = slippage <= max_slip
+
+    stale_penalty = 0.0
+    if quote_age is not None and quote_age > stale_threshold:
+        stale_penalty = min(3.0, (quote_age - stale_threshold) / max(stale_threshold, 1.0) * 1.5)
+
+    thin_depth_penalty = 0.0
+    if tob_notional < min_tob:
+        thin_depth_penalty = min(4.0, (min_tob - tob_notional) / max(min_tob, 1.0) * 2.0)
+
+    adjusted_edge_bps = raw_edge - slippage - stale_penalty - thin_depth_penalty
+    return {
+        "raw_edge_bps": round(raw_edge, 6),
+        "estimated_slippage_bps": round(slippage, 6),
+        "quote_age_ms": None if quote_age is None else round(quote_age, 6),
+        "top_of_book_notional_usd": round(tob_notional, 6),
+        "freshness_ok": freshness_ok,
+        "depth_ok": depth_ok,
+        "slippage_ok": slippage_ok,
+        "stale_quote_penalty_bps": round(stale_penalty, 6),
+        "thin_depth_penalty_bps": round(thin_depth_penalty, 6),
+        "adjusted_edge_bps": round(adjusted_edge_bps, 6),
+        "passes_route_guard": bool(freshness_ok and depth_ok and slippage_ok),
+        "paper_only": True,
+    }
+
+
 def paper_only_confirmation_gate(primary_signal=None, confirming_signals=None, liquidity_snapshot=None,
                                  min_confirming_markets=1):
     """
