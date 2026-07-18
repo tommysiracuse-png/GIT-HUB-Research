@@ -72,6 +72,12 @@ STRICT_RECOMMENDATION_FALLBACK_ACTIONS = {
     "propose_diagnostic_hypothesis",
     "propose_policy_update",
 }
+STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS = (
+    "constraint",
+    "issue",
+    "risk",
+)
+STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET = set(STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS)
 
 _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
 
@@ -98,6 +104,42 @@ def _contains_array_anywhere(value: Any) -> bool:
         return True
     if isinstance(value, dict):
         return any(_contains_array_anywhere(item) for item in value.values())
+    return False
+
+
+def _normalize_strict_paper_recommendation(candidate: dict[str, Any]) -> dict[str, Any] | None:
+    normalized: dict[str, Any] = {}
+    for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS:
+        if field not in candidate:
+            return None
+        normalized[field] = candidate[field]
+
+    evidence = normalized.get("evidence")
+    if not isinstance(evidence, dict):
+        return None
+    if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
+        return None
+    if _contains_array_anywhere(candidate):
+        return None
+    if not _has_meaningful_value(normalized["action"]):
+        return None
+    if not _is_paper_scoped_market_key(normalized["market_key"]):
+        normalized["market_key"] = STRICT_RECOMMENDATION_MARKET_KEY
+    return normalized
+
+
+def _recommendation_schema_error(candidate: dict[str, Any]) -> bool:
+    if set(candidate) != _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS:
+        return True
+    if not isinstance(candidate.get("priority"), int):
+        return True
+    if not isinstance(candidate.get("proposed_change"), dict):
+        return True
+    evidence = candidate.get("evidence")
+    if not isinstance(evidence, dict):
+        return True
+    if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
+        return True
     return False
 
 
