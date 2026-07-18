@@ -118,6 +118,18 @@ def compose_strict_paper_recommendation(candidate: Any) -> dict[str, Any]:
     return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
 
 
+def _render_strict_paper_recommendation(candidate: Any) -> str:
+    """Return one JSON object string for paper-only recommendation handoff."""
+
+    validated = validate_strict_paper_recommendation(candidate)
+    if validated is None:
+        validated = dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    rendered = json.dumps(validated, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, ensure_ascii=False)
+    if not _contains_exactly_one_json_object(rendered):
+        rendered = json.dumps(dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK), separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, ensure_ascii=False)
+    return rendered
+
+
 def _has_meaningful_value(value: Any) -> bool:
     if value is None:
         return False
@@ -149,6 +161,21 @@ def _contains_exactly_one_json_object(value: Any) -> bool:
             return False
         return True
     return False
+
+
+def _parse_strict_paper_recommendation_json(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        return validate_strict_paper_recommendation(payload)
+    if not isinstance(payload, str):
+        return None
+    text = payload.strip()
+    if not _contains_exactly_one_json_object(text):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return validate_strict_paper_recommendation(parsed)
 
 
 def _normalize_strict_paper_recommendation(candidate: dict[str, Any]) -> dict[str, Any] | None:
