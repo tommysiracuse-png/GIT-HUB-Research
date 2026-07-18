@@ -24,6 +24,7 @@
     "require_complete_json": true,
     "breakout_quality_filter": {
       "mode": "paper_only",
+      "scanner_profile": "breakout_momentum_v2",
       "base_breakout_buffer_pct": 0.2,
       "high_atr_pct_threshold": 4.5,
       "high_vol_breakout_buffer_pct": 0.35,
