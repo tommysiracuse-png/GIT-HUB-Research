@@ -95,6 +95,27 @@ _PAPER_ONLY_CROSS_MARKET_CONFIRMATION = {
 }
 
 
+def _extract_single_json_object(text: str) -> dict[str, Any] | None:
+    """Parse a single JSON object from strict model output.
+
+    Accepts only one JSON object with optional surrounding whitespace.
+    Rejects markdown fences, arrays, and trailing commentary.
+    """
+
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped or any(token in stripped for token in _FORBIDDEN_MARKDOWN_TOKENS):
+        return None
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _has_meaningful_value(value: Any) -> bool:
     if value in (None, "", {}, [], ()):
         return False
@@ -146,6 +167,8 @@ def _recommendation_schema_error(value: Any) -> str | None:
 def _recommendation_or_paper_hold(value: Any, *, validation_error: str | None = None) -> dict[str, Any]:
     """Return a validated recommendation or a strict paper-only hold fallback."""
 
+    if isinstance(value, str):
+        value = _extract_single_json_object(value) or {}
     recommendation = value if isinstance(value, dict) else {}
     error_message = validation_error or _recommendation_schema_error(recommendation)
     if error_message is None:
