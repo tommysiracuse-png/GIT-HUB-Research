@@ -60,6 +60,7 @@ STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET = set(STRICT_REQUIRED_RECOMMENDATION_F
 STRICT_RECOMMENDATION_JSON_SEPARATORS = (",", ":")
 MIN_PAPER_CONFIRM_SCORE_MIN = 0.68
 PAPER_MARKET_KEY_PREFIX = "paper_"
+STRICT_RECOMMENDATION_MARKET_KEY = "paper.execution_route_hunter"
 SUPPRESSION_ACTIONS = {
     "suppress_trade_generation_for_this_case",
     "no_trade",
@@ -124,9 +125,14 @@ def _render_strict_paper_recommendation(candidate: Any) -> str:
     validated = validate_strict_paper_recommendation(candidate)
     if validated is None:
         validated = dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    else:
+        validated = dict(validated)
+    validated["market_key"] = STRICT_RECOMMENDATION_MARKET_KEY
     rendered = json.dumps(validated, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, ensure_ascii=False)
     if not _contains_exactly_one_json_object(rendered):
-        rendered = json.dumps(dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK), separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, ensure_ascii=False)
+        fallback = dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+        fallback["market_key"] = STRICT_RECOMMENDATION_MARKET_KEY
+        rendered = json.dumps(fallback, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, ensure_ascii=False)
     return rendered
 
 
