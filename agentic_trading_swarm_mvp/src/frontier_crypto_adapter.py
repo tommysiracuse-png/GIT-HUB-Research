@@ -179,6 +179,32 @@ def validate_paper_recommendation_payload(payload=None, confidence_threshold=0.6
             "rationale": "Recommendation was incomplete or below confidence threshold; safe fallback is hold.",
         }
 
+    proxy_freshness_gate = _paper_only_proxy_signal_freshness_gate_from_payload(payload)
+    if proxy_freshness_gate and proxy_freshness_gate.get("applicable") and not proxy_freshness_gate.get("eligible", True):
+        return {
+            "action": "hold",
+            "title": "Proxy freshness gate suppressed paper recommendation",
+            "market_key": payload.get("market_key") or "paper.market_radar.signal_quality",
+            "priority": payload.get("priority", 0),
+            "evidence": {
+                "issue_type": "proxy_signal_freshness_failed",
+                "fail_closed_reason": proxy_freshness_gate.get("fail_closed_reason"),
+                "fail_closed_reasons": list(proxy_freshness_gate.get("fail_closed_reasons") or ()),
+                "proxy_bar_age_ms": proxy_freshness_gate.get("proxy_bar_age_ms"),
+                "source_timestamp_lag_ms": proxy_freshness_gate.get("source_timestamp_lag_ms"),
+                "basis_deviation_bps": proxy_freshness_gate.get("basis_deviation_bps"),
+                "mapping_confidence": proxy_freshness_gate.get("mapping_confidence"),
+                "suppressed_signal_count": int(proxy_freshness_gate.get("suppressed_signal_count", 1) or 1),
+                "paper_scope": "Paper-trading only; no live orders.",
+            },
+            "proposed_change": {
+                "default_fallback": "hold",
+                "objective": "Fail closed for stale or low-integrity proxy momentum contexts.",
+                "rule": "Emit no paper recommendation when proxy freshness, lag, basis, or mapping checks fail.",
+            },
+            "rationale": "Proxy-backed context failed paper-only freshness validation; safe fallback is hold.",
+        }
+
     return payload
 
 import argparse
@@ -275,6 +301,17 @@ DEFAULT_PAPER_ONLY_CROSS_MARKET_SIGNAL_QUALITY_POLICY = {
     "below_threshold_state": "observe_only",
 }
 
+DEFAULT_PAPER_ONLY_PROXY_SIGNAL_FRESHNESS_POLICY = {
+    "enabled": True,
+    "market_key_tokens": ("YAHOO_PROXY",),
+    "max_bar_age_ms": 180000.0,
+    "max_source_lag_ms": 90000.0,
+    "max_basis_deviation_bps": 35.0,
+    "min_mapping_confidence": 0.70,
+    "require_monotonic_updates": True,
+    "fail_closed_state": "observe_only",
+}
+
 
 DEFAULT_PAPER_ONLY_ROUTE_FRESHNESS_POLICY = {
     "enabled": True,
@@ -347,6 +384,212 @@ def paper_only_build_governor_fields(
     }
 
 
+def _paper_only_is_proxy_market_key(market_key: str | None) -> bool:
+    """Return True when the market key references a proxy-backed paper context."""
+
+    normalized = str(market_key or "").strip().upper()
+    if not normalized:
+        return False
+    return any(token in normalized for token in DEFAULT_PAPER_ONLY_PROXY_SIGNAL_FRESHNESS_POLICY["market_key_tokens"])
+
+
+def _paper_only_float_or_none(value: object) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _paper_only_timestamp_ms(value: object) -> float | None:
+    """Best-effort timestamp normalization for paper-only freshness checks."""
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, dt.datetime):
+        normalized = value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+        return normalized.timestamp() * 1000.0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            numeric = float(stripped)
+        except ValueError:
+            try:
+                parsed = dt.datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            normalized = parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+            return normalized.timestamp() * 1000.0
+    else:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+    if not math.isfinite(numeric):
+        return None
+    abs_numeric = abs(numeric)
+    if abs_numeric > 10_000_000_000_000_000:
+        numeric /= 1_000_000.0
+    elif abs_numeric > 10_000_000_000_000:
+        numeric /= 1000.0
+    elif abs_numeric < 10_000_000_000:
+        numeric *= 1000.0
+    return numeric
+
+
+def paper_only_proxy_signal_freshness_gate(
+    *,
+    market_key: str | None = None,
+    latest_bar_timestamp: object = None,
+    scheduler_timestamp: object = None,
+    source_timestamp: object = None,
+    previous_bar_timestamp: object = None,
+    basis_deviation_bps: float | None = None,
+    mapping_confidence: float | None = None,
+    max_bar_age_ms: float | None = None,
+    max_source_lag_ms: float | None = None,
+    max_basis_deviation_bps: float | None = None,
+    min_mapping_confidence: float | None = None,
+    enabled: bool | None = None,
+    require_monotonic_updates: bool | None = None,
+) -> dict:
+    """Fail-closed paper-only freshness gate for proxy-backed signal contexts."""
+
+    policy = DEFAULT_PAPER_ONLY_PROXY_SIGNAL_FRESHNESS_POLICY
+    enabled = policy["enabled"] if enabled is None else bool(enabled)
+    applicable = enabled and _paper_only_is_proxy_market_key(market_key)
+    threshold_bar_age_ms = float(
+        policy["max_bar_age_ms"] if max_bar_age_ms is None else max_bar_age_ms
+    )
+    threshold_source_lag_ms = float(
+        policy["max_source_lag_ms"] if max_source_lag_ms is None else max_source_lag_ms
+    )
+    threshold_basis_bps = float(
+        policy["max_basis_deviation_bps"] if max_basis_deviation_bps is None else max_basis_deviation_bps
+    )
+    threshold_mapping_confidence = float(
+        policy["min_mapping_confidence"] if min_mapping_confidence is None else min_mapping_confidence
+    )
+    require_monotonic = bool(
+        policy["require_monotonic_updates"] if require_monotonic_updates is None else require_monotonic_updates
+    )
+    scheduler_timestamp_ms = _paper_only_timestamp_ms(scheduler_timestamp)
+    if scheduler_timestamp_ms is None:
+        scheduler_timestamp_ms = dt.datetime.now(dt.timezone.utc).timestamp() * 1000.0
+
+    latest_bar_timestamp_ms = _paper_only_timestamp_ms(latest_bar_timestamp)
+    previous_bar_timestamp_ms = _paper_only_timestamp_ms(previous_bar_timestamp)
+    source_timestamp_ms = _paper_only_timestamp_ms(source_timestamp)
+    basis_bps = _paper_only_float_or_none(basis_deviation_bps)
+    mapping_score = _paper_only_float_or_none(mapping_confidence)
+
+    if not applicable:
+        return {
+            "enabled": enabled,
+            "applicable": False,
+            "eligible": True,
+            "emit_recommendation": True,
+            "fail_closed_reason": None,
+            "fail_closed_reasons": [],
+            "proxy_bar_age_ms": None,
+            "source_timestamp_lag_ms": None,
+            "basis_deviation_bps": basis_bps,
+            "mapping_confidence": mapping_score,
+            "suppressed_signal_count": 0,
+            "state": "eligible",
+        }
+
+    fail_closed_reasons = []
+    proxy_bar_age_ms = None
+    if latest_bar_timestamp_ms is None:
+        fail_closed_reasons.append("missing_latest_bar_timestamp")
+    else:
+        proxy_bar_age_ms = max(0.0, scheduler_timestamp_ms - latest_bar_timestamp_ms)
+        if proxy_bar_age_ms > threshold_bar_age_ms:
+            fail_closed_reasons.append("stale_proxy_bar")
+
+    source_timestamp_lag_ms = None
+    if source_timestamp_ms is None:
+        fail_closed_reasons.append("missing_source_timestamp")
+    else:
+        source_timestamp_lag_ms = max(0.0, scheduler_timestamp_ms - source_timestamp_ms)
+        if source_timestamp_lag_ms > threshold_source_lag_ms:
+            fail_closed_reasons.append("source_timestamp_lag_exceeded")
+
+    monotonic_updates = True
+    if require_monotonic and latest_bar_timestamp_ms is not None and previous_bar_timestamp_ms is not None:
+        monotonic_updates = latest_bar_timestamp_ms > previous_bar_timestamp_ms
+        if not monotonic_updates:
+            fail_closed_reasons.append("non_monotonic_proxy_update")
+
+    if basis_bps is None:
+        fail_closed_reasons.append("missing_basis_deviation_bps")
+    elif abs(basis_bps) > threshold_basis_bps:
+        fail_closed_reasons.append("basis_deviation_exceeded")
+
+    if mapping_score is None:
+        fail_closed_reasons.append("missing_mapping_confidence")
+    elif mapping_score < threshold_mapping_confidence:
+        fail_closed_reasons.append("mapping_confidence_too_low")
+
+    eligible = not fail_closed_reasons
+    return {
+        "enabled": enabled,
+        "applicable": True,
+        "market_key": str(market_key or "").strip(),
+        "eligible": eligible,
+        "emit_recommendation": eligible,
+        "fail_closed_reason": fail_closed_reasons[0] if fail_closed_reasons else None,
+        "fail_closed_reasons": fail_closed_reasons,
+        "proxy_bar_age_ms": round(proxy_bar_age_ms, 3) if proxy_bar_age_ms is not None else None,
+        "source_timestamp_lag_ms": round(source_timestamp_lag_ms, 3) if source_timestamp_lag_ms is not None else None,
+        "basis_deviation_bps": basis_bps,
+        "mapping_confidence": mapping_score,
+        "suppressed_signal_count": 0 if eligible else 1,
+        "max_bar_age_ms": threshold_bar_age_ms,
+        "max_source_lag_ms": threshold_source_lag_ms,
+        "max_basis_deviation_bps": threshold_basis_bps,
+        "min_mapping_confidence": threshold_mapping_confidence,
+        "require_monotonic_updates": require_monotonic,
+        "monotonic_updates": monotonic_updates,
+        "latest_bar_timestamp_ms": latest_bar_timestamp_ms,
+        "previous_bar_timestamp_ms": previous_bar_timestamp_ms,
+        "source_timestamp_ms": source_timestamp_ms,
+        "scheduler_timestamp_ms": scheduler_timestamp_ms,
+        "state": "eligible" if eligible else policy["fail_closed_state"],
+    }
+
+
+def _paper_only_proxy_signal_freshness_gate_from_payload(payload: dict | None) -> dict | None:
+    """Extract standardized proxy freshness telemetry from a paper payload."""
+
+    payload = payload or {}
+    if not _paper_only_is_proxy_market_key(payload.get("market_key")):
+        return None
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict):
+        evidence = {}
+    gate = (
+        evidence.get("paper_only_proxy_signal_freshness_gate")
+        or evidence.get("proxy_signal_freshness")
+        or payload.get("paper_only_proxy_signal_freshness_gate")
+    )
+    if isinstance(gate, dict):
+        normalized = dict(gate)
+        if "eligible" not in normalized:
+            normalized["eligible"] = bool(normalized.get("emit_recommendation", True))
+        if "emit_recommendation" not in normalized:
+            normalized["emit_recommendation"] = bool(normalized.get("eligible", True))
+        normalized.setdefault("applicable", True)
+        normalized.setdefault("suppressed_signal_count", 0 if normalized.get("eligible", True) else 1)
+        return normalized
+    return None
+
+
 def paper_only_cross_market_risk_gate(
     *,
     divergence_bps: float | None = None,
@@ -397,6 +640,8 @@ def paper_only_cross_market_signal_quality_gate(
     enabled: bool = True,
     min_confidence: float | None = None,
     below_threshold_state: str | None = None,
+    market_key: str | None = None,
+    proxy_signal_freshness_gate: dict | None = None,
 ) -> dict:
     """Paper-only signal ranking gate for cross-market confirmation."""
 
@@ -425,10 +670,19 @@ def paper_only_cross_market_signal_quality_gate(
         and within_window
         and score >= threshold
     )
+    proxy_freshness = dict(proxy_signal_freshness_gate or {})
+    proxy_eligible = bool(proxy_freshness.get("eligible", True))
+    proxy_applicable = bool(proxy_freshness.get("applicable", False))
+    if proxy_applicable and not proxy_eligible:
+        promote = False
     observe_only = bool(not promote)
     return {
         "enabled": bool(enabled),
         "promote": promote,
+        "market_key": str(market_key or ""),
+        "proxy_signal_freshness_gate": proxy_freshness or None,
+        "fail_closed_reason": proxy_freshness.get("fail_closed_reason") if proxy_applicable and not proxy_eligible else None,
+        "suppressed_signal_count": int(proxy_freshness.get("suppressed_signal_count", 0) or 0) if proxy_applicable and not proxy_eligible else 0,
         "observe_only": observe_only,
         "primary_trigger_present": bool(primary_trigger_present),
         "related_market_confirmed": bool(related_market_confirmed),
@@ -437,7 +691,7 @@ def paper_only_cross_market_signal_quality_gate(
         "min_confidence": threshold,
         "signal_age_ms": age_ms,
         "confirmation_window_ms": window_ms,
-        "state": "promoted" if promote else state,
+        "state": "promoted" if promote else proxy_freshness.get("state", state),
     }
 
 
