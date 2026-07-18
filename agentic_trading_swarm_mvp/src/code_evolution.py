@@ -118,6 +118,29 @@ def _contains_array_anywhere(value: Any) -> bool:
     return False
 
 
+def _is_paper_scoped_market_key(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(PAPER_MARKET_KEY_PREFIX)
+
+
+def _sanitize_recommendation_object(candidate: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(candidate)
+    if not _is_paper_scoped_market_key(sanitized.get("market_key")):
+        sanitized["market_key"] = STRICT_RECOMMENDATION_MARKET_KEY
+    return sanitized
+
+
+def _serialize_strict_recommendation(candidate: dict[str, Any]) -> str:
+    return json.dumps(candidate, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, ensure_ascii=False)
+
+
+def _validate_and_finalize_recommendation(candidate: dict[str, Any]) -> dict[str, Any]:
+    sanitized = _sanitize_recommendation_object(candidate)
+    normalized = _normalize_strict_paper_recommendation(sanitized)
+    if normalized is None:
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    return normalized
+
+
 def _normalize_strict_paper_recommendation(candidate: dict[str, Any]) -> dict[str, Any] | None:
     normalized: dict[str, Any] = {}
     for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS:
