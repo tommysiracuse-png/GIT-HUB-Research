@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import pathlib
 import sqlite3
 from typing import Any
@@ -196,6 +197,52 @@ CODE_CHANGE_OPTIONAL_DETAIL_FIELDS = (
     "validation",
 )
 
+KNOWN_QUOTE_ASSETS = (
+    "USDT",
+    "USDC",
+    "USDE",
+    "DAI",
+    "FDUSD",
+    "TUSD",
+    "BUSD",
+    "USD",
+    "EUR",
+    "GBP",
+    "JPY",
+    "AUD",
+    "CAD",
+    "CHF",
+    "BRL",
+    "MXN",
+    "ZAR",
+    "NGN",
+    "IDR",
+    "MYR",
+    "SGD",
+    "HKD",
+    "TRY",
+    "AED",
+    "INR",
+    "KRW",
+    "BTC",
+    "ETH",
+)
+
+INSTRUMENT_ID_KEYS = (
+    "instId",
+    "inst_id",
+    "instrument_id",
+    "market_symbol",
+    "perp_instId",
+    "spot_instId",
+)
+
+SYMBOL_KEYS = ("symbol", "ticker")
+
+LEG_CONTAINER_KEYS = ("legs", "leg_metadata")
+
+LEG_VALUE_KEYS = ("perp_leg", "spot_leg", "long_leg", "short_leg", "buy_leg", "sell_leg")
+
 
 def _signal_stats(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
@@ -265,6 +312,151 @@ def _as_text_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
+def _is_missing_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    return not text or text.lower() in {"unknown", "n/a", "na", "none", "null"}
+
+
+def _normalized_asset_token(value: Any) -> str | None:
+    if _is_missing_text(value):
+        return None
+    token = re.sub(r"[^A-Z0-9]", "", str(value).upper())
+    if len(token) < 2 or len(token) > 20:
+        return None
+    return token
+
+
+def _candidate_venue(item: dict[str, Any]) -> str:
+    for key in ("venue", "venue_or_source", "source", "exchange"):
+        value = item.get(key)
+        if not _is_missing_text(value):
+            return str(value).strip().lower()
+    return ""
+
+
+def _normalized_candidate_pair(
+    base_asset: Any,
+    quote_asset: Any,
+    venue: str,
+    parse_confidence: str,
+    *,
+    require_known_quote: bool,
+) -> dict[str, Any] | None:
+    base = _normalized_asset_token(base_asset)
+    quote = _normalized_asset_token(quote_asset)
+    if not base or not quote:
+        return None
+    if require_known_quote and quote not in KNOWN_QUOTE_ASSETS:
+        return None
+    symbol = f"{base}/{quote}"
+    return {
+        "base_asset": base,
+        "quote_asset": quote,
+        "normalized_instrument_id": f"{base}-{quote}",
+        "normalized_symbol": symbol,
+        "asset_key": f"{venue}:{symbol}" if venue else symbol,
+        "parse_confidence": parse_confidence,
+    }
+
+
+def _pair_from_hyphenated_symbol(value: Any, venue: str, parse_confidence: str) -> dict[str, Any] | None:
+    text = str(value or "").strip().upper()
+    if not text or not any(separator in text for separator in ("-", "/", "_", ":")):
+        return None
+    parts = [part for part in re.split(r"[-/_:]", text) if part]
+    if len(parts) < 2:
+        return None
+    return _normalized_candidate_pair(
+        parts[0],
+        parts[1],
+        venue,
+        parse_confidence,
+        require_known_quote=True,
+    )
+
+
+def _pair_from_concatenated_symbol(value: Any, venue: str, parse_confidence: str) -> dict[str, Any] | None:
+    raw = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+    if len(raw) < 5:
+        return None
+    for quote in sorted(KNOWN_QUOTE_ASSETS, key=len, reverse=True):
+        if not raw.endswith(quote) or len(raw) <= len(quote):
+            continue
+        base = raw[: -len(quote)]
+        parsed = _normalized_candidate_pair(
+            base,
+            quote,
+            venue,
+            parse_confidence,
+            require_known_quote=True,
+        )
+        if parsed:
+            return parsed
+    return None
+
+
+def _iter_candidate_legs(item: dict[str, Any]) -> list[dict[str, Any]]:
+    legs: list[dict[str, Any]] = []
+    for key in LEG_CONTAINER_KEYS:
+        value = item.get(key)
+        if isinstance(value, list):
+            legs.extend(leg for leg in value if isinstance(leg, dict))
+    for key in LEG_VALUE_KEYS:
+        value = item.get(key)
+        if isinstance(value, dict):
+            legs.append(value)
+    return legs
+
+
+def _pair_from_explicit_fields(item: dict[str, Any], venue: str, parse_confidence: str) -> dict[str, Any] | None:
+    for base_key in ("base_asset", "baseAsset", "baseCcy", "base_currency"):
+        for quote_key in ("quote_asset", "quoteAsset", "quoteCcy", "quote_currency"):
+            parsed = _normalized_candidate_pair(
+                item.get(base_key),
+                item.get(quote_key),
+                venue,
+                parse_confidence,
+                require_known_quote=False,
+            )
+            if parsed:
+                return parsed
+    return None
+
+
+def _parse_candidate_assets(item: dict[str, Any]) -> dict[str, Any] | None:
+    venue = _candidate_venue(item)
+    explicit = _pair_from_explicit_fields(item, venue, "explicit")
+    if explicit:
+        return explicit
+    for key in INSTRUMENT_ID_KEYS:
+        parsed = _pair_from_hyphenated_symbol(item.get(key), venue, "inst_id")
+        if parsed:
+            return parsed
+    for key in SYMBOL_KEYS:
+        parsed = _pair_from_hyphenated_symbol(item.get(key), venue, "symbol")
+        if parsed:
+            return parsed
+        parsed = _pair_from_concatenated_symbol(item.get(key), venue, "concatenated_symbol")
+        if parsed:
+            return parsed
+    for leg in _iter_candidate_legs(item):
+        parsed = _pair_from_explicit_fields(leg, venue, "legs")
+        if parsed:
+            return parsed
+        for key in INSTRUMENT_ID_KEYS:
+            parsed = _pair_from_hyphenated_symbol(leg.get(key), venue, "legs")
+            if parsed:
+                return parsed
+        for key in SYMBOL_KEYS:
+            parsed = _pair_from_hyphenated_symbol(leg.get(key), venue, "legs")
+            if parsed:
+                return parsed
+            parsed = _pair_from_concatenated_symbol(leg.get(key), venue, "legs")
+            if parsed:
+                return parsed
+    return None
+
+
 def _extract_candidate_rows(report: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(report, dict):
         return []
@@ -272,7 +464,37 @@ def _extract_candidate_rows(report: dict[str, Any] | None) -> list[dict[str, Any
     for key in ("candidates", "top_candidates", "normalized_candidates", "recent_candidates"):
         value = report.get(key)
         if isinstance(value, list):
-            candidates.extend(item for item in value if isinstance(item, dict))
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                enriched = dict(item)
+                parsed = _parse_candidate_assets(enriched)
+                if parsed:
+                    for field in ("base_asset", "quote_asset", "normalized_instrument_id", "normalized_symbol", "asset_key"):
+                        if _is_missing_text(enriched.get(field)):
+                            enriched[field] = parsed[field]
+                    if _is_missing_text(enriched.get("parse_confidence")):
+                        enriched["parse_confidence"] = parsed["parse_confidence"]
+                else:
+                    if _is_missing_text(enriched.get("parse_confidence")):
+                        enriched["parse_confidence"] = "unparsed"
+                normalized_existing = _normalized_candidate_pair(
+                    enriched.get("base_asset"),
+                    enriched.get("quote_asset"),
+                    _candidate_venue(enriched),
+                    str(enriched.get("parse_confidence") or "explicit"),
+                    require_known_quote=False,
+                )
+                if normalized_existing:
+                    enriched["base_asset"] = normalized_existing["base_asset"]
+                    enriched["quote_asset"] = normalized_existing["quote_asset"]
+                    if _is_missing_text(enriched.get("normalized_instrument_id")):
+                        enriched["normalized_instrument_id"] = normalized_existing["normalized_instrument_id"]
+                    if _is_missing_text(enriched.get("normalized_symbol")):
+                        enriched["normalized_symbol"] = normalized_existing["normalized_symbol"]
+                    if _is_missing_text(enriched.get("asset_key")):
+                        enriched["asset_key"] = normalized_existing["asset_key"]
+                candidates.append(enriched)
     return candidates
 
 
