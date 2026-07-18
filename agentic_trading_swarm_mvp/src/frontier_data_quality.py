@@ -25,6 +25,22 @@ CRITICAL_ANOMALIES = {
     "invalid_best_prices",
 }
 
+_DEFAULT_PUBLIC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 inefficiency-radar/0.2",
+    "Accept": "application/json,text/plain,*/*",
+}
+
+_BYBIT_READ_ONLY_BROWSER_HEADERS = {
+    **_DEFAULT_PUBLIC_HEADERS,
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Origin": "https://www.bybit.com",
+    "Referer": "https://www.bybit.com/",
+}
+
+_BYBIT_PUBLIC_FAILOVER_HOSTS = {"api.bybit.com": "api.bytick.com"}
+
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -100,30 +116,103 @@ def _response_access_metadata(response_status: object = None, exc: Exception | N
         "blocked_http_status": blocked_http_status,
         "blocked_reason": blocked_reason,
     }
+
+
+def _build_public_request(url: str, headers: dict | None = None) -> urllib.request.Request:
+    request_headers = dict(_DEFAULT_PUBLIC_HEADERS)
+    if headers:
+        request_headers.update(headers)
+    return urllib.request.Request(url, headers=request_headers)
+
+
+def _bybit_public_failover_url(url: str) -> str | None:
+    parsed = urllib.parse.urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "api.bybit.com":
+        return None
+    if not str(parsed.path or "").startswith("/v5/market/"):
+        return None
+    replacement_host = _BYBIT_PUBLIC_FAILOVER_HOSTS.get(hostname)
+    if not replacement_host:
+        return None
+    netloc = replacement_host
+    if parsed.port is not None:
+        netloc = f"{replacement_host}:{parsed.port}"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme or "https", netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
+def _open_json_request(request: urllib.request.Request, timeout: int, started: float) -> dict:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+        received_at = _utc_now()
+        return {
+            "ok": True,
+            "status": "reachable",
+            "http_status": str(response.status),
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "received_at": received_at,
+            "payload": payload,
+            **_response_access_metadata(response.status),
+        }
+
+
 def _fetch_json(url: str, timeout: int) -> dict:
     started = time.perf_counter()
     received_at = _utc_now()
     try:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 inefficiency-radar/0.2",
-                "Accept": "application/json,text/plain,*/*",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            received_at = _utc_now()
-            return {
-                "ok": True,
-                "status": "reachable",
-                "http_status": str(response.status),
-                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
-                "received_at": received_at,
-                "payload": payload,
-                **_response_access_metadata(response.status),
+        result = _open_json_request(_build_public_request(url), timeout, started)
+        result.update(
+            {
+                "source_url": url,
+                "fallback_used": False,
+                "fallback_status": None,
+                "primary_http_status": None,
             }
+        )
+        return result
     except Exception as exc:  # noqa: BLE001
+        fallback_url = None
+        if isinstance(exc, urllib.error.HTTPError) and exc.code == 403:
+            fallback_url = _bybit_public_failover_url(url)
+        if fallback_url:
+            try:
+                result = _open_json_request(
+                    _build_public_request(fallback_url, _BYBIT_READ_ONLY_BROWSER_HEADERS),
+                    timeout,
+                    started,
+                )
+                result.update(
+                    {
+                        "source_url": fallback_url,
+                        "fallback_used": True,
+                        "fallback_status": "fallback_success",
+                        "primary_http_status": str(exc.code),
+                    }
+                )
+                return result
+            except Exception as fallback_exc:  # noqa: BLE001
+                status = (
+                    "blocked"
+                    if isinstance(fallback_exc, urllib.error.HTTPError) and fallback_exc.code in {401, 403, 451}
+                    else "unavailable"
+                )
+                received_at = _utc_now()
+                return {
+                    "ok": False,
+                    "status": status,
+                    "http_status": str(fallback_exc)[:300],
+                    "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                    "received_at": received_at,
+                    "payload": None,
+                    "source_url": fallback_url,
+                    "fallback_used": True,
+                    "fallback_status": "blocked_403" if getattr(fallback_exc, "code", None) == 403 else "fallback_failed",
+                    "primary_http_status": str(exc.code),
+                    **_response_access_metadata(exc=fallback_exc),
+                }
+            received_at = _utc_now()
         status = "blocked" if isinstance(exc, urllib.error.HTTPError) and exc.code in {401, 403, 451} else "unavailable"
         return {
             "ok": False,
@@ -131,6 +220,10 @@ def _fetch_json(url: str, timeout: int) -> dict:
             "http_status": str(exc)[:300],
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             "received_at": received_at,
+            "source_url": url,
+            "fallback_used": False,
+            "fallback_status": "blocked_403" if getattr(exc, "code", None) == 403 and _bybit_public_failover_url(url) else None,
+            "primary_http_status": str(exc.code) if isinstance(exc, urllib.error.HTTPError) else None,
             "payload": None,
             **_response_access_metadata(exc=exc),
         }
