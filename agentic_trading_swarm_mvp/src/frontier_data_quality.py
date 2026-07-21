@@ -58,6 +58,12 @@ _BYBIT_LINEAR_PERP_CANARY_SYMBOLS = frozenset({"BTCUSDT", "ETHUSDT"})
 _BYBIT_PUBLIC_TICKER_PATH = "/v5/market/tickers"
 _BYBIT_PUBLIC_ORDERBOOK_PATH = "/v5/market/orderbook"
 _BYBIT_PUBLIC_ORDERBOOK_LIMIT = 1
+_VALR_PUBLIC_BASE_URL = "https://api.valr.com"
+_VALR_SUPPORTED_SYMBOLS = {
+    "BTCZAR": {"base": "BTC", "quote": "ZAR"},
+    "ETHZAR": {"base": "ETH", "quote": "ZAR"},
+    "USDTZAR": {"base": "USDT", "quote": "ZAR"},
+}
 
 
 def _normalize_indodax_order_book_side(levels, *, reverse=False):
@@ -174,6 +180,65 @@ def paper_only_public_probe_headers(url, *, extra_headers=None):
                 continue
             headers[str(key)] = str(value)
     return headers
+
+
+def _normalize_valr_symbol(symbol):
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return None
+    for separator in ("/", "-", "_", " "):
+        text = text.replace(separator, "")
+    return text if text in _VALR_SUPPORTED_SYMBOLS else None
+
+
+def paper_only_valr_public_request_plan(symbols=None, *, trade_limit=50, base_url=_VALR_PUBLIC_BASE_URL):
+    """Return a read-only VALR request plan for paper frontier scanning."""
+
+    if symbols is None:
+        requested_symbols = tuple(_VALR_SUPPORTED_SYMBOLS)
+    elif isinstance(symbols, (list, tuple, set, frozenset)):
+        requested_symbols = tuple(symbols)
+    else:
+        requested_symbols = (symbols,)
+
+    normalized_base_url = str(base_url or _VALR_PUBLIC_BASE_URL).strip().rstrip("/") or _VALR_PUBLIC_BASE_URL
+    requests = []
+    health_urls = []
+    seen = set()
+    for symbol in requested_symbols:
+        venue_symbol = _normalize_valr_symbol(symbol)
+        if not venue_symbol or venue_symbol in seen:
+            continue
+        seen.add(venue_symbol)
+        spec = _VALR_SUPPORTED_SYMBOLS[venue_symbol]
+        display_symbol = f"{spec['base']}/{spec['quote']}"
+        pair_base_url = f"{normalized_base_url}/v1/public/{venue_symbol}"
+        endpoints = {
+            "ticker": f"{pair_base_url}/marketsummary",
+            "top_of_book": f"{pair_base_url}/orderbook",
+            "recent_trades": f"{pair_base_url}/tradehistory?limit={max(1, int(trade_limit))}",
+        }
+        requests.append(
+            {
+                "venue": "VALR",
+                "paper_only": True,
+                "symbol": display_symbol,
+                "venue_symbol": venue_symbol,
+                "base_asset": spec["base"],
+                "quote_asset": spec["quote"],
+                "endpoints": endpoints,
+            }
+        )
+        health_urls.extend([endpoints["ticker"], endpoints["top_of_book"], endpoints["recent_trades"]])
+
+    return {
+        "venue": "VALR",
+        "paper_only": True,
+        "request_type": "public_market_data",
+        "symbols": [item["symbol"] for item in requests],
+        "requests": requests,
+        "health_urls": health_urls,
+    }
 
 
 def _paper_only_probe_status_text(report):

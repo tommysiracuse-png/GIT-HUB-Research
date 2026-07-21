@@ -10,6 +10,212 @@ from __future__ import annotations
 import datetime as dt
 
 
+_VALR_PAPER_PUBLIC_BASE_URL = "https://api.valr.com"
+_VALR_PAPER_SUPPORTED_SYMBOLS = {
+    "BTCZAR": {"base": "BTC", "quote": "ZAR"},
+    "ETHZAR": {"base": "ETH", "quote": "ZAR"},
+    "USDTZAR": {"base": "USDT", "quote": "ZAR"},
+}
+
+
+def _paper_only_valr_float_or_none(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _paper_only_valr_pick_first(payload, *keys):
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, "", [], {}, ()):
+            return value
+    return None
+
+
+def _paper_only_valr_order_book_top(levels, *, reverse=False):
+    if not isinstance(levels, (list, tuple)):
+        return (None, None)
+
+    normalized = []
+    for level in levels:
+        if isinstance(level, dict):
+            price = _paper_only_valr_float_or_none(
+                level.get("price") or level.get("rate") or level.get("bidPrice") or level.get("askPrice")
+            )
+            quantity = _paper_only_valr_float_or_none(
+                level.get("quantity") or level.get("qty") or level.get("volume") or level.get("size")
+            )
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            price = _paper_only_valr_float_or_none(level[0])
+            quantity = _paper_only_valr_float_or_none(level[1])
+        else:
+            continue
+        if price is None or quantity is None or price <= 0.0 or quantity <= 0.0:
+            continue
+        normalized.append((price, quantity))
+
+    if not normalized:
+        return (None, None)
+
+    normalized.sort(key=lambda item: item[0], reverse=bool(reverse))
+    return normalized[0]
+
+
+def paper_only_valr_normalize_symbol(symbol):
+    """Normalize supported VALR spot symbols into the venue's compact form."""
+
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return None
+    for separator in ("/", "-", "_", " "):
+        text = text.replace(separator, "")
+    return text if text in _VALR_PAPER_SUPPORTED_SYMBOLS else None
+
+
+def paper_only_valr_market_catalog(symbols=None):
+    """Return a read-only paper market catalog for VALR spot coverage."""
+
+    if symbols is None:
+        requested_symbols = tuple(_VALR_PAPER_SUPPORTED_SYMBOLS)
+    elif isinstance(symbols, (list, tuple, set, frozenset)):
+        requested_symbols = tuple(symbols)
+    else:
+        requested_symbols = (symbols,)
+
+    catalog = []
+    seen = set()
+    for symbol in requested_symbols:
+        venue_symbol = paper_only_valr_normalize_symbol(symbol)
+        if not venue_symbol or venue_symbol in seen:
+            continue
+        seen.add(venue_symbol)
+        spec = _VALR_PAPER_SUPPORTED_SYMBOLS[venue_symbol]
+        display_symbol = f"{spec['base']}/{spec['quote']}"
+        base_path = f"{_VALR_PAPER_PUBLIC_BASE_URL}/v1/public/{venue_symbol}"
+        catalog.append(
+            {
+                "venue": "VALR",
+                "market": f"VALR:{display_symbol}",
+                "symbol": display_symbol,
+                "venue_symbol": venue_symbol,
+                "base_asset": spec["base"],
+                "quote_asset": spec["quote"],
+                "paper_only": True,
+                "frontier_tags": ["frontier_crypto_venue_map", "zar_fiat_quote", "public_read_only"],
+                "endpoints": {
+                    "ticker": f"{base_path}/marketsummary",
+                    "top_of_book": f"{base_path}/orderbook",
+                    "recent_trades": f"{base_path}/tradehistory?limit=50",
+                },
+            }
+        )
+    return catalog
+
+
+def paper_only_valr_observation_from_public_payloads(
+    symbol,
+    *,
+    ticker_payload=None,
+    orderbook_payload=None,
+    trades_payload=None,
+    as_of=None,
+):
+    """Build a paper-only normalized spot observation from public VALR payloads."""
+
+    venue_symbol = paper_only_valr_normalize_symbol(symbol)
+    if not venue_symbol:
+        return None
+
+    spec = _VALR_PAPER_SUPPORTED_SYMBOLS[venue_symbol]
+    display_symbol = f"{spec['base']}/{spec['quote']}"
+    ticker = ticker_payload if isinstance(ticker_payload, dict) else {}
+    orderbook = orderbook_payload if isinstance(orderbook_payload, dict) else {}
+
+    trade_items = []
+    if isinstance(trades_payload, list):
+        trade_items = list(trades_payload)
+    elif isinstance(trades_payload, dict):
+        nested_trades = trades_payload.get("trades") or trades_payload.get("data") or trades_payload.get("items")
+        if isinstance(nested_trades, list):
+            trade_items = list(nested_trades)
+
+    best_bid = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(ticker, "bidPrice", "bestBidPrice", "bid", "bid_price")
+    )
+    best_ask = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(ticker, "askPrice", "bestAskPrice", "ask", "ask_price")
+    )
+
+    bid_book, bid_size = _paper_only_valr_order_book_top(orderbook.get("bids") or orderbook.get("Bids"), reverse=True)
+    ask_book, ask_size = _paper_only_valr_order_book_top(orderbook.get("asks") or orderbook.get("Asks"), reverse=False)
+
+    if best_bid is None:
+        best_bid = bid_book
+    if best_ask is None:
+        best_ask = ask_book
+
+    last_price = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(ticker, "lastTradedPrice", "lastPrice", "price", "last_trade_price")
+    )
+    quote_volume = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(ticker, "quoteVolume", "quote_volume", "volumeQuote", "rolling24HourQuoteVolume")
+    )
+    base_volume = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(ticker, "baseVolume", "base_volume", "volumeBase", "rolling24HourVolume")
+    )
+
+    recent_trade = next((item for item in trade_items if isinstance(item, dict)), None)
+    recent_trade_price = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(recent_trade or {}, "price", "tradedPrice", "lastTradedPrice")
+    )
+    recent_trade_quantity = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(recent_trade or {}, "quantity", "qty", "volume", "size")
+    )
+    recent_trade_timestamp = _paper_only_parse_timestamp(
+        _paper_only_valr_pick_first(recent_trade or {}, "tradedAt", "timestamp", "createdAt", "time")
+    )
+
+    if last_price is None:
+        last_price = recent_trade_price
+
+    mid_price = None
+    spread_bps = None
+    if best_bid is not None and best_ask is not None and best_bid > 0.0 and best_ask > 0.0:
+        mid_price = (best_bid + best_ask) / 2.0
+        if mid_price > 0.0 and best_ask >= best_bid:
+            spread_bps = ((best_ask - best_bid) / mid_price) * 10_000.0
+
+    observed_at = _paper_only_parse_timestamp(as_of)
+
+    return {
+        "venue": "VALR",
+        "market": f"VALR:{display_symbol}",
+        "symbol": display_symbol,
+        "venue_symbol": venue_symbol,
+        "base_asset": spec["base"],
+        "quote_asset": spec["quote"],
+        "paper_only": True,
+        "observation_type": "spot",
+        "last_price": last_price,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "mid_price": mid_price,
+        "spread_bps": spread_bps,
+        "bid_size": bid_size,
+        "ask_size": ask_size,
+        "base_volume_24h": base_volume,
+        "quote_volume_24h": quote_volume,
+        "recent_trade_count": len(trade_items),
+        "recent_trade_price": recent_trade_price,
+        "recent_trade_quantity": recent_trade_quantity,
+        "recent_trade_timestamp": recent_trade_timestamp.isoformat() if recent_trade_timestamp is not None else None,
+        "observed_at": observed_at.isoformat() if observed_at is not None else None,
+    }
+
+
 def paper_only_entry_confirmation_gate(
     *,
     entry_confidence=None,
