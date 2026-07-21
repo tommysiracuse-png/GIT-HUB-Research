@@ -48,6 +48,7 @@ from self_improvement_open_pack import build_open_pack_report, write_open_pack_r
 from signal_safety import run_signal_safety_governor
 from signal_redesign import run_frontier_redesign
 from settings import load_settings
+from strategy_lab import evaluate_strategy_lab, generate_strategy_lab_candidates, write_strategy_lab_reports
 from strategy_reliability import apply_strategy_reliability
 from storage import (
     RUNS_DIR,
@@ -232,6 +233,15 @@ def run_once(settings: dict) -> dict:
             if FRONTIER_CRYPTO_REPORT_JSON.exists():
                 frontier_crypto_venues = json.loads(FRONTIER_CRYPTO_REPORT_JSON.read_text(encoding="utf-8"))
         price_observations = merge_observations(batches)
+        strategy_lab_candidates, strategy_lab_generation = generate_strategy_lab_candidates(
+            conn,
+            settings,
+            candidates,
+            price_observations,
+        )
+        if strategy_lab_candidates:
+            candidates.extend(strategy_lab_candidates)
+            candidates.sort(key=lambda row: row["score"], reverse=True)
         candidates = enrich_candidates(candidates, settings)
         candidates, strategy_reliability = apply_strategy_reliability(candidates, settings, conn=conn)
         route_resolver_report = write_route_resolver_report(candidates, settings)
@@ -257,6 +267,8 @@ def run_once(settings: dict) -> dict:
             settings=settings,
         )
         stats = update_signal_stats(conn, settings) if settings["learning"]["enabled"] else {}
+        strategy_lab_evaluation = evaluate_strategy_lab(conn, settings)
+        strategy_lab_report = write_strategy_lab_reports(conn, strategy_lab_generation, strategy_lab_evaluation)
         adjustments = load_adjustments(conn)
         llm_recommendations_ingested = ingest_llm_recommendations(conn, settings)
         auto_improvement = run_auto_improvement(conn, settings, include_code_changes=False)
@@ -321,6 +333,7 @@ def run_once(settings: dict) -> dict:
                     "effective_route_id": review.get("effective_route_id"),
                     "route_status": review.get("route_status"),
                     "route_alternative_used": review.get("route_alternative_used"),
+                    "strategy_lab_id": candidate.get("strategy_lab_id"),
                 }
             )
 
@@ -330,6 +343,7 @@ def run_once(settings: dict) -> dict:
         auto_improvement["signal_redesign"] = signal_redesign
         auto_improvement["okx_signal_research"] = okx_signal_research
         auto_improvement["strategy_reliability"] = strategy_reliability
+        auto_improvement["strategy_lab"] = strategy_lab_report.get("summary", {})
         auto_improvement["expansion_map"] = expansion_map
         auto_improvement["self_improvement_open_pack"] = self_improvement_open_pack
         auto_improvement = write_self_improvement_reports(conn, auto_improvement)
@@ -345,6 +359,7 @@ def run_once(settings: dict) -> dict:
             "signal_redesign": signal_redesign,
             "okx_signal_research": okx_signal_research,
             "strategy_reliability": strategy_reliability,
+            "strategy_lab": strategy_lab_report.get("summary", {}),
             "opened": opened,
             "summary": summary,
             "execution_summary": execution_summary(conn),
@@ -365,6 +380,7 @@ def run_once(settings: dict) -> dict:
                     "missing_requirements": item["review"].get("missing_requirements", []),
                     "hunter_bucket": item["candidate"].get("_hunter_bucket"),
                     "hunter_allocation_reason": item["candidate"].get("_hunter_allocation_reason"),
+                    "strategy_lab_id": item["candidate"].get("strategy_lab_id"),
                 }
                 for item in reviewed[:10]
             ],

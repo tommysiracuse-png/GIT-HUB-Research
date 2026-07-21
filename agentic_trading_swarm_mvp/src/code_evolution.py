@@ -1297,6 +1297,7 @@ ALLOWED_CATEGORIES = {
     "read_only_route_intelligence",
     "tests_fixtures",
     "dependency_management",
+    "strategy_lab_promotion",
 }
 
 IMPLEMENTATION_MODES = {
@@ -1321,6 +1322,7 @@ CATEGORY_DEFAULT_IMPLEMENTATION_MODE = {
     "read_only_route_intelligence": "report_only",
     "tests_fixtures": "report_only",
     "dependency_management": "runtime_active",
+    "strategy_lab_promotion": "runtime_active",
 }
 
 MARKET_EXPANSION_CATEGORIES = {
@@ -1383,6 +1385,9 @@ CATEGORY_ALIASES = {
     "dependency": "dependency_management",
     "dependency_management": "dependency_management",
     "python_dependencies": "dependency_management",
+    "strategy_lab_promotion": "strategy_lab_promotion",
+    "strategy_lab": "strategy_lab_promotion",
+    "promote_strategy_lab": "strategy_lab_promotion",
 }
 
 DEFAULT_ALLOWED_PATH_PREFIXES = [
@@ -1482,6 +1487,12 @@ DEFAULT_CATEGORY_FILES = {
         "requirements-llm.txt",
         "tests/test_code_evolution.py",
     ],
+    "strategy_lab_promotion": [
+        "src/strategy_lab.py",
+        "src/radar_loop.py",
+        "src/llm_bridge.py",
+        "tests/test_strategy_lab.py",
+    ],
 }
 
 DEPENDENCY_MANIFESTS = {
@@ -1510,6 +1521,7 @@ RUNTIME_INTEGRATION_PATHS = {
     "src/contextual_failure_filters.py",
     "src/okx_signal_research.py",
     "src/okx_carry_economics.py",
+    "src/strategy_lab.py",
 }
 
 RUNTIME_INTEGRATED_CATEGORIES = {
@@ -1525,6 +1537,7 @@ RUNTIME_INTEGRATED_CATEGORIES = {
     "llm_prompt_state_packet",
     "quality_scoring",
     "read_only_route_intelligence",
+    "strategy_lab_promotion",
 }
 
 PATH_ALIASES = {
@@ -1537,6 +1550,7 @@ PATH_ALIASES = {
     "llm_swarm_packet.py": "src/llm_state_packet.py",
     "llm_recommendation_ingestion.py": "src/llm_recommendation_ingestion.py",
     "llm_recommendation_parser.py": "src/llm_recommendation_parser.py",
+    "strategy_lab.py": "src/strategy_lab.py",
     "frontier_crypto_venues.py": "src/frontier_crypto_adapter.py",
     "src/radar/frontier_crypto_venues.py": "src/frontier_crypto_adapter.py",
     "src/radar/frontier_crypto_adapter.py": "src/frontier_crypto_adapter.py",

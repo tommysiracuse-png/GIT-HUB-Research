@@ -169,6 +169,27 @@
     "min_shadow_trial_quality_score": 35.0,
     "exclude_shadow_trials_with_critical_anomalies": true
   },
+  "strategy_lab": {
+    "enabled": true,
+    "max_candidates_per_loop": 25,
+    "max_candidates_per_experiment": 5,
+    "candidate_score_bonus": 1.0,
+    "max_candidate_score_bonus": 5.0,
+    "evaluation_horizon_minutes": 60,
+    "expand_min_labels": 12,
+    "expand_min_avg_pnl_bps": 6.0,
+    "expand_min_win_rate": 0.52,
+    "promote_min_labels": 30,
+    "promote_min_active_hours": 48.0,
+    "promote_min_avg_pnl_bps": 10.0,
+    "promote_min_win_rate": 0.53,
+    "promote_min_valid_label_rate": 0.90,
+    "promote_worst_decile_floor_bps": -45.0,
+    "retire_min_labels": 20,
+    "retire_max_avg_pnl_bps": -8.0,
+    "retire_max_win_rate": 0.43,
+    "consecutive_passes_to_promote": 2
+  },
   "okx_signal_research": {
     "enabled": true
   },
@@ -208,6 +229,7 @@
       "request_red_team",
       "propose_signal_variant",
       "propose_diagnostic_hypothesis",
+      "propose_strategy_lab_experiment",
       "propose_code_change"
     ]
   },

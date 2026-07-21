@@ -59,6 +59,14 @@ AGENTS = [
         "frontier_escalation_reason": "Cross-market causal inference is a high-value frontier reasoning task.",
     },
     {
+        "name": "strategy_lab",
+        "role": "Invent new paper-testable strategy hypotheses that can become tracked Strategy Lab experiments.",
+        "default_action": "propose_strategy_lab_experiment",
+        "base_tier": "standard",
+        "standard_escalation_reason": "Inventing new strategy hypotheses needs stronger reasoning than routine classification.",
+        "frontier_escalation_reason": "Novel strategy invention from live market evidence is a high-value frontier reasoning task.",
+    },
+    {
         "name": "red_team",
         "role": "Diagnose losing or decaying signal families using reliable horizon labels and propose testable causal hypotheses.",
         "default_action": "propose_diagnostic_hypothesis",
@@ -111,6 +119,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "signal_redesign": packet.get("signal_redesign", {}),
         "okx_signal_research": packet.get("okx_signal_research", {}),
         "strategy_reliability": packet.get("strategy_reliability", {}),
+        "strategy_lab": packet.get("strategy_lab", {}),
         "self_improvement": packet.get("self_improvement", {}),
         "code_evolution": packet.get("code_evolution", {}),
         "recent_memory": memory[:20],
@@ -154,8 +163,18 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "\"frontier_escalation_reason\": required if a frontier model is used, "
         "\"proposed_change\": concrete bounded proposal, "
         "\"variant_config\": optional bounded config for propose_signal_variant, "
+        "\"strategy_lab_experiment\": optional object for propose_strategy_lab_experiment, "
         "\"code_change\": optional object for propose_code_change"
         "}\n"
+        "For propose_strategy_lab_experiment, emit a strategy_lab_experiment object with: "
+        "strategy_lab_id, hypothesis, strategy_logic, data_requirements, risk_gates, and "
+        "promotion_rules. V1 runtime supports strategy_logic.type='candidate_filter' over "
+        "existing candidate fields: venues, trade_types, directions, regions, asset_classes, "
+        "min_edge_bps, min_score, min_liquidity_score, max_spread_bps, min_quality_score, "
+        "max_stale_minutes, required_fields, max_candidates_per_loop, score_bonus, and "
+        "edge_bonus_bps. Use this to create diverse sub-strategies that can be paper-tested "
+        "before hard-coding. If the idea needs new data or a new formula outside this "
+        "contract, ask for a code change or adapter instead of pretending it can run now.\n"
         "For propose_signal_variant, variant_config must contain exactly: "
         "reference_grouping, estimator='median', leave_one_out, min_unique_venues, "
         "min_dislocation_bps, max_spread_bps, min_liquidity_score, direction_mode, "
@@ -531,12 +550,14 @@ def _schema_retry_prompt(agent: dict, original_text: str) -> str:
 
 def _dedupe_key(rec: dict) -> tuple:
     code_change = rec.get("code_change") if isinstance(rec.get("code_change"), dict) else {}
+    lab = rec.get("strategy_lab_experiment") if isinstance(rec.get("strategy_lab_experiment"), dict) else {}
     files = tuple(sorted(str(path) for path in code_change.get("expected_files", []) or rec.get("expected_files", []) or []))
     title = re.sub(r"\s+", " ", str(rec.get("title") or "").strip().lower())
     return (
         str(rec.get("action") or ""),
         str(rec.get("market_key") or ""),
         str(rec.get("signal_key") or ""),
+        str(lab.get("strategy_lab_id") or ""),
         files,
         title,
     )

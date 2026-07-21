@@ -287,7 +287,7 @@ class FrontierModelPolicyTests(unittest.TestCase):
             recs = llm_swarm_runner.run_sequential({"allowed_recommendation_actions": ["propose_hunter_directive"]}, [])
 
         self.assertEqual(len(recs), len(llm_swarm_runner.AGENTS))
-        self.assertEqual(seen_counts, [0, 1, 2, 3, 4])
+        self.assertEqual(seen_counts, list(range(len(llm_swarm_runner.AGENTS))))
         self.assertEqual(llm_swarm_runner.LAST_SWARM_STATE["collaboration_mode"], llm_swarm_runner.FALLBACK_COLLABORATION_MODE)
 
     def test_langgraph_swarm_builds_ranked_action_package(self) -> None:
@@ -387,6 +387,7 @@ class FrontierModelPolicyTests(unittest.TestCase):
         sequence = [
             scout,
             {**scout, "agent_name": "cross_market_researcher", "market_key": "OTHER"},
+            {**scout, "agent_name": "strategy_lab", "market_key": "LAB"},
             red_team,
             {**scout, "agent_name": "execution_route_hunter", "market_key": "ROUTE"},
             {**scout, "agent_name": "build_planner", "market_key": "BUILD"},

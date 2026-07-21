@@ -126,6 +126,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "opportunities", "strategy_lab_id", "text")
+    _ensure_column(conn, "opportunities", "strategy_lab_version", "integer")
     _ensure_column(conn, "paper_trades", "execution_order_id", "integer")
     _ensure_column(conn, "paper_trades", "route_id", "text")
     _ensure_column(conn, "paper_trades", "entry_fee_bps", "real default 0")
@@ -139,6 +141,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "paper_trades", "close_price_source", "text")
     _ensure_column(conn, "paper_trades", "selected_hold_minutes", "integer")
     _ensure_column(conn, "paper_trades", "hold_decision_json", "text")
+    _ensure_column(conn, "paper_trades", "strategy_lab_id", "text")
+    _ensure_column(conn, "paper_trades", "strategy_lab_version", "integer")
     conn.execute(
         """
         create table if not exists execution_orders (
@@ -196,6 +200,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "execution_orders", "strategy_lab_id", "text")
+    _ensure_column(conn, "execution_orders", "strategy_lab_version", "integer")
     _migrate_paper_trade_outcomes(conn)
     conn.execute(
         """
@@ -515,6 +521,30 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists strategy_lab_experiments (
+            strategy_lab_id text primary key,
+            version integer not null,
+            parent_strategy_lab_id text,
+            status text not null,
+            hypothesis text not null,
+            strategy_logic_json text not null,
+            data_requirements_json text not null,
+            risk_gates_json text not null,
+            promotion_rules_json text not null,
+            source_agent text,
+            source_recommendation_id text,
+            created_at text not null,
+            updated_at text not null,
+            last_evaluated_at text,
+            evaluation_json text not null default '{}',
+            consecutive_passes integer not null default 0,
+            promoted_proposal_id text,
+            unique(strategy_lab_id, version)
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists frontier_quality_snapshots (
             id integer primary key autoincrement,
             bucket_at text not null,
@@ -564,6 +594,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_self_improvement_status on self_improvement_experiments(status)")
     conn.execute("create index if not exists idx_code_evolution_status on code_evolution_proposals(status, updated_at)")
     conn.execute("create index if not exists idx_signal_variants_status on signal_variants(signal_family, status)")
+    conn.execute("create index if not exists idx_strategy_lab_status on strategy_lab_experiments(status, updated_at)")
+    conn.execute("create index if not exists idx_paper_strategy_lab on paper_trades(strategy_lab_id, status)")
     conn.execute("create index if not exists idx_signal_trials_variant on signal_trials(variant_id, created_at)")
     conn.execute("create index if not exists idx_signal_trial_outcomes_due on signal_trial_outcomes(trial_id, horizon_minutes)")
     conn.execute(
@@ -672,6 +704,16 @@ def _migrate_paper_trade_outcomes(conn: sqlite3.Connection) -> None:
 
 def signal_key(candidate: dict) -> str:
     status = candidate.get("execution_feasibility", {}).get("status", "unknown")
+    if candidate.get("strategy_lab_id"):
+        return "|".join(
+            [
+                "STRATEGY_LAB",
+                str(candidate.get("strategy_lab_id")),
+                candidate.get("venue", "unknown"),
+                candidate.get("direction", "unknown"),
+                status,
+            ]
+        )
     return "|".join(
         [
             candidate.get("venue", "unknown"),
@@ -687,8 +729,8 @@ def save_opportunity(conn: sqlite3.Connection, candidate: dict, review: dict) ->
         """
         insert into opportunities (
             seen_at, venue, inst_id, direction, trade_type, base_score, learned_score,
-            decision, candidate_json, review_json
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            decision, candidate_json, review_json, strategy_lab_id, strategy_lab_version
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             candidate.get("seen_at") or utc_now(),
@@ -701,6 +743,8 @@ def save_opportunity(conn: sqlite3.Connection, candidate: dict, review: dict) ->
             review["decision"],
             json.dumps(candidate, sort_keys=True),
             json.dumps(review, sort_keys=True),
+            candidate.get("strategy_lab_id"),
+            int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
         ),
     )
     conn.commit()
@@ -761,6 +805,8 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "trade_type": candidate.get("trade_type"),
         "direction": candidate.get("direction"),
         "signal_variant_id": candidate.get("signal_variant_id"),
+        "strategy_lab_id": candidate.get("strategy_lab_id"),
+        "strategy_lab_version": candidate.get("strategy_lab_version"),
         "region": candidate.get("region"),
         "asset_class": candidate.get("asset_class"),
         "route_id": (review or {}).get("route_id") or candidate.get("route_id") or route.get("route_id"),
@@ -824,8 +870,9 @@ def open_paper_trade(
             opened_at, venue, inst_id, direction, trade_type, signal_key, base_score,
             learned_score, entry, status, thesis, candidate_json, review_json,
             execution_order_id, route_id, entry_fee_bps, entry_slippage_bps, context_json,
-            signal_variant_id, selected_hold_minutes, hold_decision_json
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            signal_variant_id, selected_hold_minutes, hold_decision_json,
+            strategy_lab_id, strategy_lab_version
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utc_now(),
@@ -848,6 +895,8 @@ def open_paper_trade(
             candidate.get("signal_variant_id"),
             selected_hold_minutes,
             json.dumps(hold_decision, sort_keys=True),
+            candidate.get("strategy_lab_id"),
+            int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
         ),
     )
     conn.commit()
@@ -1778,6 +1827,7 @@ def llm_recommendations_for_auto_execution(
         "request_red_team",
         "propose_signal_variant",
         "propose_diagnostic_hypothesis",
+        "propose_strategy_lab_experiment",
     }
     if include_code_changes:
         allowed.add("propose_code_change")
@@ -1791,7 +1841,32 @@ def llm_recommendations_for_auto_execution(
         except json.JSONDecodeError:
             item["payload"] = {}
         output.append(item)
-    output.sort(key=lambda item: int(item["payload"].get("priority", 50)), reverse=True)
+    def priority_value(item: dict) -> int:
+        raw = item.get("payload", {}).get("priority", 50)
+        if isinstance(raw, bool):
+            return 50
+        if isinstance(raw, (int, float)):
+            return max(1, min(100, int(raw)))
+        labels = {
+            "critical": 100,
+            "urgent": 95,
+            "highest": 95,
+            "high": 90,
+            "medium_high": 80,
+            "medium-high": 80,
+            "medium": 60,
+            "normal": 50,
+            "low": 35,
+        }
+        text = str(raw or "").strip().lower()
+        if text in labels:
+            return labels[text]
+        try:
+            return max(1, min(100, int(float(text))))
+        except (TypeError, ValueError):
+            return 50
+
+    output.sort(key=priority_value, reverse=True)
     return output[:limit]
 
 
@@ -2321,8 +2396,9 @@ def save_execution_order(conn: sqlite3.Connection, order: dict, candidate: dict,
         """
         insert into execution_orders (
             created_at, mode, route_id, venue, inst_id, direction, trade_type,
-            status, notional_usd, order_json, candidate_json, review_json
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            status, notional_usd, order_json, candidate_json, review_json,
+            strategy_lab_id, strategy_lab_version
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utc_now(),
@@ -2337,6 +2413,8 @@ def save_execution_order(conn: sqlite3.Connection, order: dict, candidate: dict,
             json.dumps(order, sort_keys=True),
             json.dumps(candidate, sort_keys=True),
             json.dumps(review, sort_keys=True),
+            candidate.get("strategy_lab_id"),
+            int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
         ),
     )
     conn.commit()

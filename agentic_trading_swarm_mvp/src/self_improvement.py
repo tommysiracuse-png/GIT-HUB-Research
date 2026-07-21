@@ -33,6 +33,7 @@ from storage import (
     update_llm_recommendation_status,
 )
 from signal_redesign import create_proposed_variant
+from strategy_lab import ingest_strategy_lab_recommendation, strategy_lab_summary
 from code_evolution import (
     code_evolution_summary,
     evaluate_code_evolution,
@@ -462,6 +463,8 @@ def classify_recommendation(payload: dict) -> str:
     action = str(payload.get("action") or "")
     if action == "propose_code_change":
         return "code_change"
+    if action == "propose_strategy_lab_experiment":
+        return "strategy_lab_experiment"
     if action == "propose_signal_variant":
         return "signal_variant"
     if _looks_like_runtime_implementation(payload):
@@ -1714,6 +1717,10 @@ def _execute_diagnostic_hypothesis(conn: sqlite3.Connection, rec: dict) -> list[
     return [{"action_status": "created", "signal_key": signal}]
 
 
+def _execute_strategy_lab_experiment(conn: sqlite3.Connection, rec: dict) -> list[dict]:
+    return ingest_strategy_lab_recommendation(conn, rec)
+
+
 def evaluate_active_experiments(conn: sqlite3.Connection, settings: dict) -> list[dict]:
     cfg = settings.get("self_improvement", {})
     min_trades = int(cfg.get("min_eval_closed_trades", 10))
@@ -1794,6 +1801,8 @@ def run_auto_improvement(
             created = _execute_signal_variant(conn, rec)
         elif task_type == "diagnostic_hypothesis":
             created = _execute_diagnostic_hypothesis(conn, rec)
+        elif task_type == "strategy_lab_experiment":
+            created = _execute_strategy_lab_experiment(conn, rec)
         elif task_type == "code_change":
             created = process_code_change_recommendation(conn, _normalize_code_change_recommendation(rec), settings)
 
@@ -1876,6 +1885,7 @@ def write_reports(conn: sqlite3.Connection, report: dict | None = None, settings
     report["adapter_specs"] = open_adapter_specs(conn, limit=50)
     report["progress_summary"] = _progress_summary(conn, settings)
     report["code_evolution"] = report.get("code_evolution") or write_code_evolution_reports(conn, settings)
+    report["strategy_lab"] = report.get("strategy_lab") or strategy_lab_summary(conn)
     ACTIVE_POLICIES_JSON.write_text(json.dumps(report.get("active_policies", []), indent=2), encoding="utf-8")
     REPORT_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
     REPORT_MD.write_text(_report_markdown(report), encoding="utf-8")
@@ -2067,6 +2077,22 @@ def _report_markdown(report: dict) -> str:
                 f"- `{item.get('signal_key')}` `{item.get('direction')}` "
                 f"action=`{item.get('action')}` allocation=`{item.get('allocation_multiplier')}` "
                 f"reasons={item.get('reasons')}"
+            )
+
+    lab = report.get("strategy_lab") or {}
+    if lab:
+        lines.extend(["", "## Strategy Lab", ""])
+        lines.append(f"- Total experiments: `{lab.get('total_experiments', 0)}`")
+        lines.append(f"- Status counts: `{lab.get('status_counts', {})}`")
+        lines.append(f"- Generated last cycle: `{lab.get('generated_candidates_last_cycle', 0)}`")
+        lines.append(f"- Report: `{lab.get('report')}`")
+        for item in lab.get("recent", [])[:8]:
+            evaluation = item.get("evaluation") or {}
+            metrics = ((evaluation.get("outcomes") or {}).get("metrics") or {})
+            lines.append(
+                f"- `{item.get('strategy_lab_id')}` status=`{item.get('status')}` "
+                f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
+                f"hypothesis={item.get('hypothesis')}"
             )
 
     expansion = report.get("expansion_map") or {}

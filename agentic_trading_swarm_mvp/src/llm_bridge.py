@@ -31,6 +31,7 @@ from storage import (
 from code_evolution import code_evolution_summary, default_paper_recommendation
 from self_improvement_open_pack import IMPLEMENTED_STATUS as OPEN_PACK_IMPLEMENTED_STATUS
 from self_improvement_open_pack import is_duplicate_open_pack_text
+from strategy_lab import strategy_lab_summary
 
 
 STATE_JSON = RUNS_DIR / "llm_state_packet.json"
@@ -839,6 +840,24 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "or non-JSON, emit a conservative hold/refine recommendation instead of suggesting a paper allocation change."
         ),
         "variant_config": "required only for propose_signal_variant; bounded frontier variant object",
+        "strategy_lab_experiment": {
+            "required_only_for": "propose_strategy_lab_experiment",
+            "purpose": "Invent a new paper-only strategy idea that can be tested through the existing candidate/review/paper engine.",
+            "required_fields": [
+                "strategy_lab_id",
+                "hypothesis",
+                "strategy_logic",
+                "data_requirements",
+                "risk_gates",
+                "promotion_rules",
+            ],
+            "strategy_logic_contract": (
+                "Use type='candidate_filter' for v1. Supported filters include venues, trade_types, "
+                "directions, regions, asset_classes, min_edge_bps, min_score, min_liquidity_score, "
+                "max_spread_bps, min_quality_score, max_stale_minutes, and required_fields."
+            ),
+            "paper_only_rule": "This creates experimental paper candidates only; deterministic outcomes decide promotion.",
+        },
         "code_change": {
             "required_only_for": "propose_code_change",
             "required_actionable_fields": list(CODE_CHANGE_ACTIONABLE_FIELDS),
@@ -936,6 +955,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "signal_redesign": _compact_signal_redesign(payload.get("signal_redesign", {})),
         "okx_signal_research": _compact_okx_signal_research(payload.get("okx_signal_research", {})),
         "strategy_reliability": _compact_strategy_reliability(payload.get("strategy_reliability", {})),
+        "strategy_lab": payload.get("strategy_lab") or strategy_lab_summary(conn),
         "autonomous_builder": payload.get("autonomous_builder", {}),
         "self_improvement_open_pack": _compact_self_improvement_open_pack(
             payload.get("self_improvement_open_pack")
@@ -1353,6 +1373,7 @@ def _packet_to_markdown(packet: dict) -> str:
         f"- Signal redesign: `{packet.get('signal_redesign', {})}`",
         f"- OKX signal research: `{packet.get('okx_signal_research', {})}`",
         f"- Strategy reliability: `{packet.get('strategy_reliability', {})}`",
+        f"- Strategy Lab: `{packet.get('strategy_lab', {})}`",
         f"- Self-improvement open pack: `{packet.get('self_improvement_open_pack', {})}`",
         f"- Code evolution: `{packet.get('code_evolution', {})}`",
         f"- Contextual failure filters: `{packet.get('contextual_failure_filters', {})}`",
@@ -1415,7 +1436,20 @@ def ingest_llm_recommendations(conn: sqlite3.Connection, settings: dict) -> list
             continue
         title = str(item.get("title") or action)[:180]
         rationale = str(item.get("rationale") or item.get("proposed_change") or "")[:2000]
-        priority = int(item.get("priority", 50))
+        try:
+            priority = int(float(item.get("priority", 50)))
+        except (TypeError, ValueError):
+            priority = {
+                "critical": 100,
+                "urgent": 95,
+                "highest": 95,
+                "high": 90,
+                "medium_high": 80,
+                "medium-high": 80,
+                "medium": 60,
+                "normal": 50,
+                "low": 35,
+            }.get(str(item.get("priority") or "").strip().lower(), 50)
         priority = max(1, min(100, priority))
         rec_id = hashlib.sha256(json.dumps(item, sort_keys=True).encode("utf-8")).hexdigest()
         if not add_llm_recommendation(conn, rec_id, action, title, rationale, item):
