@@ -36,6 +36,109 @@ _PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS = {
     "min_recent_trade_count": 20,
 }
 
+_PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG = "paper_route_guard_short_frontier_spot_v1"
+
+
+def _paper_only_route_review_text(value):
+    text = str(value or "").strip()
+    return text or None
+
+
+def _paper_only_route_review_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enabled", "allow", "allowed", "supported"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disabled", "deny", "denied", "blocked", "unsupported"}:
+        return False
+    return None
+
+
+def _paper_only_route_guard_short_frontier_spot_enabled(config):
+    if not isinstance(config, dict):
+        return False
+    direct_value = config.get(_PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG)
+    direct_flag = _paper_only_route_review_bool(direct_value)
+    if direct_flag is not None:
+        return direct_flag
+    feature_flags = config.get("feature_flags")
+    if isinstance(feature_flags, dict):
+        nested_flag = _paper_only_route_review_bool(feature_flags.get(_PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG))
+        if nested_flag is not None:
+            return nested_flag
+    return False
+
+
+def _paper_only_route_status_text(route_status):
+    if isinstance(route_status, dict):
+        return _paper_only_route_review_text(route_status.get("route_status") or route_status.get("status"))
+    return _paper_only_route_review_text(route_status)
+
+
+def _paper_only_short_route_review(route_status, *, config=None):
+    review = {
+        "route_status": _paper_only_route_status_text(route_status),
+        "short_support_source": None,
+        "borrow_support_flag": None,
+        "margin_mode_flag": None,
+        "block_reason": None,
+        "route_blocked": False,
+    }
+    if not isinstance(route_status, dict):
+        return review
+
+    review["short_support_source"] = _paper_only_route_review_text(
+        route_status.get("short_support_source")
+        or route_status.get("route_source")
+        or route_status.get("capability_source")
+    )
+    review["borrow_support_flag"] = _paper_only_route_review_bool(
+        route_status.get("borrow_support_flag")
+        or route_status.get("borrow_supported")
+        or route_status.get("short_supported")
+        or route_status.get("short_route_supported")
+    )
+    review["margin_mode_flag"] = _paper_only_route_review_text(
+        route_status.get("margin_mode_flag") or route_status.get("margin_mode")
+    )
+    review["block_reason"] = _paper_only_route_review_text(
+        route_status.get("block_reason") or route_status.get("blocking_reason")
+    )
+
+    if not _paper_only_route_guard_short_frontier_spot_enabled(config):
+        return review
+
+    strategy_family = _paper_only_route_review_text(
+        route_status.get("strategy_family") or route_status.get("candidate_family") or route_status.get("strategy")
+    )
+    if str(strategy_family or "").strip().lower() != "short_frontier_spot":
+        return review
+
+    explicit_supported = _paper_only_route_review_bool(route_status.get("route_supported"))
+    if explicit_supported is None:
+        explicit_supported = _paper_only_route_review_bool(route_status.get("paper_eligible"))
+
+    margin_mode_key = str(review["margin_mode_flag"] or "").strip().lower()
+    margin_confirms_short = margin_mode_key in {"cross", "isolated", "margin", "spot_margin", "portfolio_margin"}
+    short_confirmed = explicit_supported is True or review["borrow_support_flag"] is True or margin_confirms_short
+    short_explicitly_blocked = (
+        explicit_supported is False
+        or review["borrow_support_flag"] is False
+        or margin_mode_key in {"none", "cash_only", "spot_only", "unsupported", "disabled"}
+    )
+    if short_confirmed:
+        review["route_status"] = review["route_status"] or "eligible"
+        return review
+
+    review["route_blocked"] = True
+    review["route_status"] = "blocked_route"
+    if review["block_reason"] is None:
+        review["block_reason"] = "short_route_unsupported" if short_explicitly_blocked else "short_route_support_unconfirmed"
+    return review
+
 
 def _paper_only_build_governor_fields(*, source="frontier_crypto_adapter", paper_only=True):
     """Return lightweight governance metadata for paper-only packets."""
@@ -349,6 +452,9 @@ def paper_only_mercado_bitcoin_observation_from_public_payloads(
         quote_timestamp or _paper_only_valr_pick_first(ticker, "date", "timestamp", "time") or as_of
     )
     evaluation_at = _paper_only_parse_timestamp(evaluation_timestamp or as_of)
+    route_review = _paper_only_short_route_review(route_status, config=route_quality_config)
+    if route_review.get("route_status") is not None:
+        route_status = route_review["route_status"]
 
     route_quality = None
     if callable(paper_only_route_quality_record):
@@ -366,9 +472,30 @@ def paper_only_mercado_bitcoin_observation_from_public_payloads(
             route_status=route_status,
             config=route_quality_config,
         )
-    paper_ineligible = bool(route_quality.get("paper_ineligible")) if isinstance(route_quality, dict) else False
+    if isinstance(route_quality, dict) or route_review.get("short_support_source") is not None or route_review.get(
+        "borrow_support_flag"
+    ) is not None or route_review.get("margin_mode_flag") is not None or route_review.get("block_reason") is not None or route_review.get("route_blocked"):
+        route_quality = dict(route_quality or {})
+        route_quality["route_status"] = route_status
+        route_quality["short_support_source"] = route_review.get("short_support_source")
+        route_quality["borrow_support_flag"] = route_review.get("borrow_support_flag")
+        route_quality["margin_mode_flag"] = route_review.get("margin_mode_flag")
+        route_quality["block_reason"] = route_review.get("block_reason")
+        if route_review.get("route_blocked"):
+            route_quality["paper_ineligible"] = True
+            route_quality["blocking_reason"] = route_review.get("block_reason") or route_quality.get("blocking_reason")
+            route_quality["simulated_slippage_tier"] = "blocked"
+
+    paper_ineligible = bool(route_quality.get("paper_ineligible")) if isinstance(route_quality, dict) else bool(
+        route_review.get("route_blocked")
+    )
     paper_ineligible_reason = route_quality.get("blocking_reason") if isinstance(route_quality, dict) else None
+    if paper_ineligible_reason is None:
+        paper_ineligible_reason = route_review.get("block_reason")
     simulated_slippage_tier = route_quality.get("simulated_slippage_tier") if isinstance(route_quality, dict) else None
+    if simulated_slippage_tier is None and route_review.get("route_blocked"):
+        simulated_slippage_tier = "blocked"
+
     depth_liquidity_score = _paper_only_depth_liquidity_score(
         best_bid=best_bid,
         best_ask=best_ask,
@@ -400,6 +527,10 @@ def paper_only_mercado_bitcoin_observation_from_public_payloads(
         "observed_at": observed_at.isoformat() if observed_at is not None else None,
         "freshness_timestamp": observed_at.isoformat() if observed_at is not None else None,
         "route_status": route_status,
+        "short_support_source": route_review.get("short_support_source"),
+        "borrow_support_flag": route_review.get("borrow_support_flag"),
+        "margin_mode_flag": route_review.get("margin_mode_flag"),
+        "block_reason": paper_ineligible_reason,
         "route_quality": route_quality,
         "depth_liquidity_score": depth_liquidity_score,
         "liquidity_score": depth_liquidity_score,
@@ -410,6 +541,10 @@ def paper_only_mercado_bitcoin_observation_from_public_payloads(
             "simulated_slippage_tier": simulated_slippage_tier,
             "quote_age_ms": route_quality.get("quote_age_ms") if isinstance(route_quality, dict) else None,
             "depth_to_size_ratio": route_quality.get("depth_to_size_ratio") if isinstance(route_quality, dict) else None,
+            "short_support_source": route_review.get("short_support_source"),
+            "borrow_support_flag": route_review.get("borrow_support_flag"),
+            "margin_mode_flag": route_review.get("margin_mode_flag"),
+            "block_reason": paper_ineligible_reason,
             "spread_to_baseline_ratio": route_quality.get("spread_to_baseline_ratio") if isinstance(route_quality, dict) else None,
         },
         "paper_ineligible": paper_ineligible,

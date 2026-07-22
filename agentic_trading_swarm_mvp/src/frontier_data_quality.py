@@ -104,7 +104,10 @@ def _paper_only_quality_as_datetime(value):
 
 
 def _paper_only_route_status_key(value):
+    if isinstance(value, dict):
+        value = value.get("route_status") or value.get("status") or value.get("route")
     return str(value or "").strip().lower()
+
 
 
 def paper_only_route_quality_record(
