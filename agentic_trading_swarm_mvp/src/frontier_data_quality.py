@@ -76,6 +76,18 @@ PAPER_ONLY_ROUTE_BLOCK_STATUSES = frozenset(
     {"blocked", "down", "error", "halted", "maintenance", "offline", "unavailable"}
 )
 PAPER_ONLY_ROUTE_WARN_STATUSES = frozenset({"degraded", "limited", "stale"})
+PAPER_ONLY_ROUTE_STATUS_ALIASES = {
+    "blocked_route": "blocked",
+    "route_blocked": "blocked",
+    "paper_ineligible": "blocked",
+    "temporarily_unavailable": "unavailable",
+    "rate_limited": "limited",
+    "rate-limited": "limited",
+    "quote_stale": "stale",
+    "stale_quote": "stale",
+    "degraded_route": "degraded",
+    "route_degraded": "degraded",
+}
 
 
 def _paper_only_quality_as_datetime(value):
@@ -107,6 +119,14 @@ def _paper_only_route_status_key(value):
     if isinstance(value, dict):
         value = value.get("route_status") or value.get("status") or value.get("route")
     return str(value or "").strip().lower()
+
+
+def _paper_only_normalize_route_status_key(value):
+    key = _paper_only_route_status_key(value)
+    if not key:
+        return key
+    key = key.replace(" ", "_")
+    return PAPER_ONLY_ROUTE_STATUS_ALIASES.get(key, key)
 
 
 
@@ -178,7 +198,7 @@ def paper_only_route_quality_record(
     if observed_dt is not None and evaluated_dt is not None:
         quote_age_ms = max(0.0, (evaluated_dt - observed_dt).total_seconds() * 1000.0)
 
-    route_status_key = _paper_only_route_status_key(route_status)
+    route_status_key = _paper_only_normalize_route_status_key(route_status)
     hard_blockers = []
     warnings = []
 
