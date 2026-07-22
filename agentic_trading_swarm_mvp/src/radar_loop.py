@@ -91,11 +91,40 @@ def _auxiliary_runtime_policy(settings: dict) -> dict:
     }
 
 
+def _strategy_lab_runtime_summary(strategy_lab_generation: dict | None) -> dict:
+    generation = strategy_lab_generation or {}
+    accepted = generation.get("accepted_candidates")
+    rejected = generation.get("rejected_candidates")
+    summary = {
+        "enabled": bool(generation.get("enabled", True)),
+        "generated_count": int(generation.get("generated_count", 0) or 0),
+        "accepted_count": (
+            len(accepted)
+            if isinstance(accepted, list)
+            else int(generation.get("accepted_count", 0) or 0)
+        ),
+        "rejected_count": (
+            len(rejected)
+            if isinstance(rejected, list)
+            else int(generation.get("rejected_count", 0) or 0)
+        ),
+        "report": str(RUNS_DIR / "strategy_lab_report.md"),
+    }
+    generated_at = generation.get("generated_at")
+    if generated_at:
+        summary["generated_at"] = generated_at
+    selection_mode = generation.get("selection_mode")
+    if selection_mode:
+        summary["selection_mode"] = selection_mode
+    return summary
+
+
 def _build_expansion_map(
     frontier_crypto_venues: dict,
     route_resolver_report: dict,
     prediction_summary: dict,
     global_market_discovery_scan: dict | None = None,
+    strategy_lab_generation: dict | None = None,
 ) -> dict:
     frontier_summary = (frontier_crypto_venues or {}).get("summary", {})
     frontier_expansion = frontier_summary.get("expansion_map", {})
@@ -126,6 +155,7 @@ def _build_expansion_map(
             "potentially_executable_soon_count": route_intelligence.get("potentially_executable_soon_count", 0),
             "report": str(RUNS_DIR / "route_intelligence_report.md"),
         },
+        "strategy_lab": _strategy_lab_runtime_summary(strategy_lab_generation),
         "reports": {
             "frontier": str(RUNS_DIR / "frontier_crypto_venues_report.md"),
             "global_market_discovery_scan": str(RUNS_DIR / "global_market_discovery_scan_report.md"),
@@ -250,6 +280,7 @@ def run_once(settings: dict) -> dict:
             route_resolver_report,
             prediction_summary,
             global_market_discovery_scan,
+            strategy_lab_generation,
         )
         self_improvement_open_pack = build_open_pack_report(
             conn,
