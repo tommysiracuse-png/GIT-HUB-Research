@@ -141,6 +141,45 @@ def _has_meaningful_value(value: Any) -> bool:
     return value is not None and (not isinstance(value, str) or value.strip() != "")
 
 
+def _contains_list(value: Any) -> bool:
+    if isinstance(value, list):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_list(item) for item in value.values())
+    if isinstance(value, tuple):
+        return any(_contains_list(item) for item in value)
+    return False
+
+
+def _strict_recommendation_fallback() -> dict[str, Any]:
+    return json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
+
+
+def _strict_recommendation_is_valid(candidate: Any) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(candidate):
+        return False
+    if not isinstance(candidate.get("evidence"), dict):
+        return False
+    if not isinstance(candidate.get("proposed_change"), dict):
+        return False
+    if candidate.get("market_key") is None or not str(candidate["market_key"]).startswith(
+        _STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX
+    ):
+        return False
+    if _contains_list(candidate):
+        return False
+    return True
+
+
+def finalize_paper_only_recommendation(candidate: Any) -> dict[str, Any]:
+    """Return a schema-safe paper-only recommendation object."""
+    if _strict_recommendation_is_valid(candidate):
+        return candidate
+    return _strict_recommendation_fallback()
+
+
 def _contains_array_anywhere(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return True
