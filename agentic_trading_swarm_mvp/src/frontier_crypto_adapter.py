@@ -23,6 +23,11 @@ _VALR_PAPER_SUPPORTED_SYMBOLS = {
     "ETHZAR": {"base": "ETH", "quote": "ZAR"},
     "USDTZAR": {"base": "USDT", "quote": "ZAR"},
 }
+_MERCADO_BITCOIN_PAPER_PUBLIC_BASE_URL = "https://www.mercadobitcoin.net/api"
+_MERCADO_BITCOIN_PAPER_SUPPORTED_SYMBOLS = {
+    "BTCBRL": {"base": "BTC", "quote": "BRL", "api_symbol": "BTC"},
+    "ETHBRL": {"base": "ETH", "quote": "BRL", "api_symbol": "ETH"},
+}
 
 _PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS = {
     "min_premarket_dollar_volume_usd": 1500000.0,
@@ -178,6 +183,239 @@ def paper_only_valr_market_catalog(symbols=None):
             }
         )
     return catalog
+
+
+def _paper_only_depth_liquidity_score(
+    *,
+    best_bid=None,
+    best_ask=None,
+    bid_size=None,
+    ask_size=None,
+    spread_bps=None,
+    intended_paper_notional_usd=None,
+    route_quality=None,
+):
+    visible_depth_candidates = []
+    bid_price = _paper_only_valr_float_or_none(best_bid)
+    ask_price = _paper_only_valr_float_or_none(best_ask)
+    bid_quantity = _paper_only_valr_float_or_none(bid_size)
+    ask_quantity = _paper_only_valr_float_or_none(ask_size)
+
+    if bid_price is not None and bid_quantity is not None and bid_price > 0.0 and bid_quantity > 0.0:
+        visible_depth_candidates.append(bid_price * bid_quantity)
+    if ask_price is not None and ask_quantity is not None and ask_price > 0.0 and ask_quantity > 0.0:
+        visible_depth_candidates.append(ask_price * ask_quantity)
+
+    visible_top_of_book_notional = min(visible_depth_candidates) if visible_depth_candidates else None
+    target_notional = _paper_only_valr_float_or_none(intended_paper_notional_usd)
+    if target_notional is not None:
+        target_notional = abs(target_notional)
+        if target_notional == 0.0:
+            target_notional = None
+
+    if visible_top_of_book_notional is None:
+        return None
+
+    if target_notional is not None:
+        score = min(1.0, visible_top_of_book_notional / target_notional)
+    else:
+        score = min(1.0, visible_top_of_book_notional / 5000.0)
+
+    spread_value = _paper_only_valr_float_or_none(spread_bps)
+    if spread_value is not None and spread_value > 0.0:
+        score *= max(0.0, min(1.0, 40.0 / max(40.0, spread_value)))
+
+    if isinstance(route_quality, dict):
+        quote_age_ms = _paper_only_valr_float_or_none(route_quality.get("quote_age_ms"))
+        if quote_age_ms is not None and quote_age_ms > 0.0:
+            score *= max(0.0, min(1.0, 15000.0 / max(15000.0, quote_age_ms)))
+        if route_quality.get("paper_ineligible"):
+            score *= 0.5
+
+    return round(max(0.0, min(1.0, score)), 6)
+
+
+def paper_only_mercado_bitcoin_normalize_symbol(symbol):
+    """Normalize supported Mercado Bitcoin spot symbols into compact BRL form."""
+
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return None
+    for separator in ("/", "-", "_", " "):
+        text = text.replace(separator, "")
+    if text in _MERCADO_BITCOIN_PAPER_SUPPORTED_SYMBOLS:
+        return text
+    if text in {"BTC", "ETH"}:
+        return f"{text}BRL"
+    return None
+
+
+def paper_only_mercado_bitcoin_market_catalog(symbols=None):
+    """Return a read-only paper market catalog for Mercado Bitcoin spot coverage."""
+
+    if symbols is None:
+        requested_symbols = tuple(_MERCADO_BITCOIN_PAPER_SUPPORTED_SYMBOLS)
+    elif isinstance(symbols, (list, tuple, set, frozenset)):
+        requested_symbols = tuple(symbols)
+    else:
+        requested_symbols = (symbols,)
+
+    catalog = []
+    seen = set()
+    for symbol in requested_symbols:
+        venue_symbol = paper_only_mercado_bitcoin_normalize_symbol(symbol)
+        if not venue_symbol or venue_symbol in seen:
+            continue
+        seen.add(venue_symbol)
+        spec = _MERCADO_BITCOIN_PAPER_SUPPORTED_SYMBOLS[venue_symbol]
+        display_symbol = f"{spec['base']}/{spec['quote']}"
+        base_path = f"{_MERCADO_BITCOIN_PAPER_PUBLIC_BASE_URL}/{spec['api_symbol']}"
+        catalog.append(
+            {
+                "venue": "MERCADO_BITCOIN",
+                "market": f"MERCADO_BITCOIN:{display_symbol}",
+                "symbol": display_symbol,
+                "venue_symbol": venue_symbol,
+                "base_asset": spec["base"],
+                "quote_asset": spec["quote"],
+                "paper_only": True,
+                "build_governor_fields": _paper_only_build_governor_fields(),
+                "frontier_tags": ["frontier_crypto_venue_map", "latam_fiat_quote", "brl_fiat_quote", "public_read_only"],
+                "endpoints": {
+                    "ticker": f"{base_path}/ticker/",
+                    "top_of_book": f"{base_path}/orderbook/",
+                },
+            }
+        )
+    return catalog
+
+
+def paper_only_mercado_bitcoin_observation_from_public_payloads(
+    symbol,
+    *,
+    ticker_payload=None,
+    orderbook_payload=None,
+    quote_timestamp=None,
+    evaluation_timestamp=None,
+    route_status=None,
+    intended_paper_notional_usd=None,
+    venue_spread_baseline_bps=None,
+    route_quality_config=None,
+    as_of=None,
+):
+    """Build a paper-only normalized spot observation from Mercado Bitcoin payloads."""
+
+    venue_symbol = paper_only_mercado_bitcoin_normalize_symbol(symbol)
+    if not venue_symbol:
+        return None
+
+    spec = _MERCADO_BITCOIN_PAPER_SUPPORTED_SYMBOLS[venue_symbol]
+    display_symbol = f"{spec['base']}/{spec['quote']}"
+    raw_ticker = ticker_payload if isinstance(ticker_payload, dict) else {}
+    ticker = raw_ticker.get("ticker") if isinstance(raw_ticker.get("ticker"), dict) else raw_ticker
+    orderbook = orderbook_payload if isinstance(orderbook_payload, dict) else {}
+
+    best_bid = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(ticker, "buy", "bid", "bestBid", "best_bid")
+    )
+    best_ask = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(ticker, "sell", "ask", "bestAsk", "best_ask")
+    )
+
+    bid_book, bid_size = _paper_only_valr_order_book_top(orderbook.get("bids") or orderbook.get("Bids"), reverse=True)
+    ask_book, ask_size = _paper_only_valr_order_book_top(orderbook.get("asks") or orderbook.get("Asks"), reverse=False)
+
+    if best_bid is None:
+        best_bid = bid_book
+    if best_ask is None:
+        best_ask = ask_book
+
+    last_price = _paper_only_valr_float_or_none(_paper_only_valr_pick_first(ticker, "last", "lastPrice", "price"))
+    base_volume = _paper_only_valr_float_or_none(_paper_only_valr_pick_first(ticker, "vol", "volume", "baseVolume"))
+    quote_volume = _paper_only_valr_float_or_none(
+        _paper_only_valr_pick_first(ticker, "quoteVolume", "quote_volume", "volumeQuote")
+    )
+    if quote_volume is None and last_price is not None and base_volume is not None:
+        quote_volume = last_price * base_volume
+
+    mid_price = None
+    spread_bps = None
+    if best_bid is not None and best_ask is not None and best_bid > 0.0 and best_ask > 0.0:
+        mid_price = (best_bid + best_ask) / 2.0
+        if mid_price > 0.0 and best_ask >= best_bid:
+            spread_bps = ((best_ask - best_bid) / mid_price) * 10_000.0
+
+    observed_at = _paper_only_parse_timestamp(
+        quote_timestamp or _paper_only_valr_pick_first(ticker, "date", "timestamp", "time") or as_of
+    )
+    evaluation_at = _paper_only_parse_timestamp(evaluation_timestamp or as_of)
+
+    route_quality = None
+    if callable(paper_only_route_quality_record):
+        route_quality = paper_only_route_quality_record(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            mid_price=mid_price,
+            spread_bps=spread_bps,
+            observed_at=observed_at,
+            as_of=evaluation_at,
+            intended_paper_notional_usd=intended_paper_notional_usd,
+            venue_spread_baseline_bps=venue_spread_baseline_bps,
+            route_status=route_status,
+            config=route_quality_config,
+        )
+    paper_ineligible = bool(route_quality.get("paper_ineligible")) if isinstance(route_quality, dict) else False
+    paper_ineligible_reason = route_quality.get("blocking_reason") if isinstance(route_quality, dict) else None
+    simulated_slippage_tier = route_quality.get("simulated_slippage_tier") if isinstance(route_quality, dict) else None
+    depth_liquidity_score = _paper_only_depth_liquidity_score(
+        best_bid=best_bid,
+        best_ask=best_ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        spread_bps=spread_bps,
+        intended_paper_notional_usd=intended_paper_notional_usd,
+        route_quality=route_quality,
+    )
+
+    return {
+        "venue": "MERCADO_BITCOIN",
+        "market": f"MERCADO_BITCOIN:{display_symbol}",
+        "symbol": display_symbol,
+        "venue_symbol": venue_symbol,
+        "base_asset": spec["base"],
+        "quote_asset": spec["quote"],
+        "paper_only": True,
+        "observation_type": "spot",
+        "last_price": last_price,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "mid_price": mid_price,
+        "spread_bps": spread_bps,
+        "bid_size": bid_size,
+        "ask_size": ask_size,
+        "base_volume_24h": base_volume,
+        "quote_volume_24h": quote_volume,
+        "observed_at": observed_at.isoformat() if observed_at is not None else None,
+        "freshness_timestamp": observed_at.isoformat() if observed_at is not None else None,
+        "route_status": route_status,
+        "route_quality": route_quality,
+        "depth_liquidity_score": depth_liquidity_score,
+        "liquidity_score": depth_liquidity_score,
+        "venue_quality": {
+            "route_status": route_status,
+            "paper_ineligible": paper_ineligible,
+            "blocking_reason": paper_ineligible_reason,
+            "simulated_slippage_tier": simulated_slippage_tier,
+            "quote_age_ms": route_quality.get("quote_age_ms") if isinstance(route_quality, dict) else None,
+            "depth_to_size_ratio": route_quality.get("depth_to_size_ratio") if isinstance(route_quality, dict) else None,
+            "spread_to_baseline_ratio": route_quality.get("spread_to_baseline_ratio") if isinstance(route_quality, dict) else None,
+        },
+        "paper_ineligible": paper_ineligible,
+        "paper_ineligible_reason": paper_ineligible_reason,
+        "simulated_slippage_tier": simulated_slippage_tier,
+    }
 
 
 def paper_only_valr_observation_from_public_payloads(
