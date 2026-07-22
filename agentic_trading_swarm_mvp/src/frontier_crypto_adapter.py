@@ -30,8 +30,8 @@ _MERCADO_BITCOIN_PAPER_SUPPORTED_SYMBOLS = {
 }
 
 _PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS = {
-    "min_premarket_dollar_volume_usd": 1500000.0,
-    "max_spread_pct": 0.75,
+    "min_premarket_dollar_volume_usd": 2500000.0,
+    "max_spread_pct": 0.5,
     "min_recent_prints_window_minutes": 5,
     "min_recent_trade_count": 20,
 }
