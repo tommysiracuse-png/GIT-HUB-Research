@@ -415,11 +415,191 @@ def paper_only_volatility_liquidity_entry_gate(
     }
 
 
+def _paper_only_route_profile_value(profile, *keys):
+    if not isinstance(profile, dict):
+        return None
+
+    for key in keys:
+        if isinstance(key, (list, tuple)):
+            value = profile
+            for part in key:
+                if not isinstance(value, dict):
+                    value = None
+                    break
+                value = value.get(part)
+        else:
+            value = profile.get(key)
+        if value not in (None, "", [], {}, ()):
+            return value
+    return None
+
+
+def _paper_only_route_truthy(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    return text in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+        "ok",
+        "available",
+        "supported",
+        "enabled",
+        "present",
+        "modeled",
+        "modelled",
+    }
+
+
+def _paper_only_route_has_assumption(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        return _paper_only_route_truthy(value)
+    if isinstance(value, dict):
+        return bool(value)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return bool(value)
+    return value is not None
+
+
+def _paper_only_route_supports_open_hold_cover(value):
+    if isinstance(value, dict):
+        if all(_paper_only_route_truthy(value.get(part)) for part in ("open", "hold", "cover")):
+            return True
+        nested = _paper_only_route_profile_value(value, "mode", "lifecycle", "state", "name")
+        if nested is not None:
+            return _paper_only_route_supports_open_hold_cover(nested)
+        return _paper_only_route_truthy(value.get("open_hold_cover"))
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        normalized = {
+            str(item or "").strip().lower().replace("-", "_").replace(" ", "_")
+            for item in value
+        }
+        if "open_hold_cover" in normalized:
+            return True
+        return {"open", "hold", "cover"}.issubset(normalized)
+
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return text in {"open_hold_cover", "open_hold_cover_close", "openholdcover"}
+
+
+def paper_only_crypto_conditional_spot_short_feasibility_gate(route_profile=None, *, enabled=True):
+    """Paper-only feasibility gate for crypto conditional spot shorts."""
+
+    profile = route_profile if isinstance(route_profile, dict) else {}
+    gate_flag = _paper_only_route_profile_value(
+        profile,
+        "paper_conditional_spot_short_feasibility_gate",
+        ("paper_policy", "conditional_spot_short_feasibility_gate"),
+    )
+    if gate_flag is not None:
+        enabled = _paper_only_route_truthy(gate_flag)
+
+    asset_class = str(_paper_only_route_profile_value(profile, "asset_class", ("instrument", "asset_class")) or "").strip().lower()
+    market_type = str(_paper_only_route_profile_value(profile, "market_type", ("instrument", "market_type")) or "").strip().lower()
+    side = str(_paper_only_route_profile_value(profile, "side", "direction") or "").strip().lower()
+    trigger_type = str(_paper_only_route_profile_value(profile, "trigger_type", ("trigger", "type")) or "").strip().lower()
+    applies = bool(enabled and asset_class == "crypto" and market_type == "spot" and side == "short" and trigger_type == "conditional")
+
+    if not applies:
+        return {
+            "enabled": bool(enabled),
+            "applies": False,
+            "eligible": True,
+            "reason": "disabled" if not enabled else "not_applicable",
+            "asset_class": asset_class,
+            "market_type": market_type,
+            "side": side,
+            "trigger_type": trigger_type,
+        }
+
+    venue_shorting_supported = _paper_only_route_truthy(
+        _paper_only_route_profile_value(profile, "venue_shorting_supported", ("venue", "shorting_supported"))
+    )
+    margin_shortable = _paper_only_route_truthy(
+        _paper_only_route_profile_value(profile, "instrument_margin_shortable", "margin_shortable", ("instrument", "margin_shortable"))
+    )
+    borrow_model_available = _paper_only_route_truthy(
+        _paper_only_route_profile_value(profile, "borrow_model_available", ("borrow", "model_available"))
+    )
+    lifecycle_supported = _paper_only_route_supports_open_hold_cover(
+        _paper_only_route_profile_value(
+            profile,
+            "route_lifecycle",
+            "supported_lifecycle",
+            ("route", "lifecycle"),
+            ("route", "supported_lifecycle"),
+        )
+    )
+    fee_assumptions_present = _paper_only_route_has_assumption(
+        _paper_only_route_profile_value(
+            profile,
+            "estimated_fee_bps",
+            "estimated_fees",
+            "fee_model_available",
+            ("fees", "estimated_bps"),
+            ("fees", "assumptions_present"),
+        )
+    )
+    borrow_assumptions_present = _paper_only_route_has_assumption(
+        _paper_only_route_profile_value(
+            profile,
+            "estimated_borrow_bps",
+            "borrow_rate_bps",
+            "borrow_assumption_present",
+            ("borrow", "estimated_bps"),
+            ("borrow", "assumptions_present"),
+        )
+    )
+    instrument_shortable = bool(margin_shortable or borrow_model_available)
+
+    failed_checks = []
+    if not venue_shorting_supported:
+        failed_checks.append("venue_shorting_supported")
+    if not instrument_shortable:
+        failed_checks.append("instrument_shortable_or_borrow_model")
+    if not lifecycle_supported:
+        failed_checks.append("open_hold_cover_lifecycle")
+    if not fee_assumptions_present:
+        failed_checks.append("estimated_fees_present")
+    if not borrow_assumptions_present:
+        failed_checks.append("borrow_assumptions_present")
+
+    return {
+        "enabled": bool(enabled),
+        "applies": True,
+        "eligible": not failed_checks,
+        "reason": "eligible" if not failed_checks else "paper_short_route_infeasible",
+        "asset_class": asset_class,
+        "market_type": market_type,
+        "side": side,
+        "trigger_type": trigger_type,
+        "venue_shorting_supported": venue_shorting_supported,
+        "instrument_margin_shortable": margin_shortable,
+        "borrow_model_available": borrow_model_available,
+        "route_lifecycle_supports_open_hold_cover": lifecycle_supported,
+        "fee_assumptions_present": fee_assumptions_present,
+        "borrow_assumptions_present": borrow_assumptions_present,
+        "failed_checks": failed_checks,
+    }
+
+
 def paper_only_frontier_short_route_profile_gate(
     route_profile=None,
     *,
     minimum_fill_quality=0.70,
     maximum_spread_bps=25.0,
+    enforce_conditional_spot_short_feasibility=True,
 ):
     """Paper-only gate for frontier short recommendations.
 
@@ -434,6 +614,10 @@ def paper_only_frontier_short_route_profile_gate(
     spread_bps = profile.get("simulated_spread_bps")
     borrow_state = profile.get("simulated_borrow_state")
 
+    feasibility = paper_only_crypto_conditional_spot_short_feasibility_gate(
+        profile,
+        enabled=enforce_conditional_spot_short_feasibility,
+    )
     try:
         fill_quality_value = float(fill_quality)
     except (TypeError, ValueError):
@@ -449,9 +633,13 @@ def paper_only_frontier_short_route_profile_gate(
     meets_spread = spread_bps_value is not None and spread_bps_value <= float(maximum_spread_bps)
     has_borrow = str(borrow_state).lower() == "available"
 
-    eligible = bool(has_required_profile and meets_fill_quality and meets_spread and has_borrow)
+    eligible = bool(
+        has_required_profile and meets_fill_quality and meets_spread and has_borrow and feasibility["eligible"]
+    )
 
-    if not has_required_profile:
+    if feasibility["applies"] and not feasibility["eligible"]:
+        reason = feasibility["reason"]
+    elif not has_required_profile:
         reason = "route_profile_incomplete"
     elif not fresh_profile:
         reason = "route_profile_stale"
@@ -473,6 +661,8 @@ def paper_only_frontier_short_route_profile_gate(
         "simulated_borrow_state": borrow_state,
         "minimum_fill_quality": float(minimum_fill_quality),
         "maximum_spread_bps": float(maximum_spread_bps),
+        "conditional_spot_short_feasibility": feasibility,
+        "feasibility_gate_applied": bool(feasibility["applies"]),
     }
 
 
