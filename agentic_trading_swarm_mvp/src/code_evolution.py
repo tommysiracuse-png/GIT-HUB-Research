@@ -105,6 +105,15 @@ STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS = (
 STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS_SET = set(
     STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS
 )
+STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS = (
+    "fallback_policy",
+    "live_trading",
+    "route_selection_mode",
+    "validation_rule",
+)
+STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS_SET = set(
+    STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS
+)
 STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS = (
     STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET
     | set(STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS)
@@ -118,24 +127,24 @@ _STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX = "paper"
 _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
     "action": "propose_code_change",
     "priority": 90,
-    "title": "Restore schema-complete paper recommendation output",
-    "rationale": "Generated output failed schema validation; emitting one safe paper-only recommendation object for downstream ingestion.",
-    "market_key": "paper.execution_route_hunter",
+    "title": "Tighten paper-only execution routing fallback validation",
+    "rationale": "Generated output failed schema validation or was truncated; emit one safe paper-only recommendation object with explicit fallback and fail-closed routing contract.",
+    "market_key": "paper.execution_route_hunter.default",
     "evidence": {
-        "constraint": "Recommendation must remain simulation-only with no live execution changes.",
-        "issue": "Generated output failed strict single-object schema validation.",
-        "risk": "Downstream paper orchestration cannot safely ingest or evaluate an incomplete recommendation.",
+        "issue_observed": "Previous execution_route_hunter output was truncated or structurally incomplete and therefore could not be consumed as a valid recommendation object.",
+        "risk_if_unchanged": "Invalid recommendation formatting can cause downstream paper-routing logic to skip validation, miss fallback paths, or fail closed without generating a usable simulation result.",
+        "scope": "Paper trading only; no live orders, no brokerage connectivity changes, and no production routing activation.",
     },
     "proposed_change": {
-        "goal": "Emit exactly one schema-complete paper-only recommendation object.",
-        "constraints": "Keep market_key paper-scoped, include required evidence and proposed_change fields, and avoid live execution wording.",
+        "expected_effect": "More reliable simulated execution decisions, clearer auditability, and lower chance of malformed routing recommendations entering the paper-trading pipeline.",
+        "paper_mode": "enforced",
+        "summary": "Require a single-object recommendation contract with explicit route confidence, fallback route, and fail-closed behavior when required fields are missing.",
     },
     "variant_config": {
-        "mode": "paper",
-        "allow_live_execution": "false",
-        "routing_preference": "higher_fill_probability_over_micro_price_improvement",
-        "max_order_notional": "1000",
-        "slippage_bps_cap": "5",
+        "fallback_policy": "fail_closed_if_primary_route_invalid_then_use_named_paper_fallback_if_present",
+        "live_trading": "disabled",
+        "route_selection_mode": "paper_only_best_effort",
+        "validation_rule": "require action priority title rationale market_key evidence proposed_change",
     },
 }
 
@@ -152,6 +161,46 @@ def _contains_list(value: Any) -> bool:
     if isinstance(value, tuple):
         return any(_contains_list(item) for item in value)
     return False
+
+
+def _is_paper_only_variant_config(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if not STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS_SET.issubset(value.keys()):
+        return False
+    live_trading = str(value.get("live_trading", "")).strip().lower()
+    if live_trading not in {"disabled", "false", "off", "0"}:
+        return False
+    route_selection_mode = str(value.get("route_selection_mode", "")).strip().lower()
+    if not route_selection_mode.startswith("paper_only"):
+        return False
+    fallback_policy = str(value.get("fallback_policy", "")).strip().lower()
+    if "fail_closed" not in fallback_policy and "paper_fallback" not in fallback_policy:
+        return False
+    validation_rule = str(value.get("validation_rule", "")).strip()
+    return validation_rule != ""
+
+
+def _ensure_recommendation_contract(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(payload.keys()):
+        return False
+    if payload.get("market_key") != "paper.execution_route_hunter.default":
+        return False
+    if payload.get("action") != "propose_code_change":
+        return False
+    if not _is_paper_only_variant_config(payload.get("variant_config")):
+        return False
+    evidence = payload.get("evidence")
+    proposed_change = payload.get("proposed_change")
+    if not isinstance(evidence, dict) or not isinstance(proposed_change, dict):
+        return False
+    if not {"issue_observed", "risk_if_unchanged", "scope"}.issubset(evidence.keys()):
+        return False
+    if not {"expected_effect", "paper_mode", "summary"}.issubset(proposed_change.keys()):
+        return False
+    return True
 
 
 def _contains_array_like(value: Any) -> bool:
