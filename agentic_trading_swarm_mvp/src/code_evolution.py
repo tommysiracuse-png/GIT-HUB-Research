@@ -156,6 +156,42 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
 }
 
 
+def validate_strict_recommendation_json_text(text: str) -> tuple[bool, dict[str, Any] | None, str]:
+    """Validate that model output is exactly one strict paper-only JSON object."""
+
+    if not isinstance(text, str) or not text.strip():
+        return False, None, "empty_output"
+    stripped = text.strip()
+    if stripped.startswith("```") or stripped.startswith("["):
+        return False, None, "markdown_or_array_not_allowed"
+    if stripped.count("{") < 1 or stripped.count("}") < 1:
+        return False, None, "missing_json_object"
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False, None, "invalid_json"
+    if not isinstance(payload, dict):
+        return False, None, "top_level_object_required"
+    if set(payload) - _STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_KEYS:
+        return False, None, "unexpected_top_level_fields"
+    missing_required = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in payload]
+    if missing_required:
+        return False, None, "missing_required_fields"
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict) or not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
+        return False, None, "invalid_evidence_block"
+    proposed_change = payload.get("proposed_change")
+    if not isinstance(proposed_change, dict) or not STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET.issubset(
+        proposed_change
+    ):
+        return False, None, "invalid_proposed_change_block"
+    if "code_change" in payload and not isinstance(payload["code_change"], dict):
+        return False, None, "invalid_code_change_block"
+    if "variant_config" in payload and not isinstance(payload["variant_config"], dict):
+        return False, None, "invalid_variant_config_block"
+    return True, payload, "ok"
+
+
 def _paper_only_schema_validation_fallback() -> dict[str, Any]:
     """Return a defensive copy of the paper-only validation fallback."""
 
