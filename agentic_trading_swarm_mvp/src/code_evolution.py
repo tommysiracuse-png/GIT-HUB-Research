@@ -169,14 +169,6 @@ def _parse_single_json_object_recommendation(raw_text: Any) -> dict[str, Any] | 
     return candidate
 
 
-def _contains_array_anywhere(value: Any) -> bool:
-    if isinstance(value, list):
-        return True
-    if isinstance(value, dict):
-        return any(_contains_array_anywhere(item) for item in value.values())
-    return False
-
-
 def _validate_strict_recommendation_object(candidate: Any) -> dict[str, Any] | None:
     if not isinstance(candidate, dict):
         return None
