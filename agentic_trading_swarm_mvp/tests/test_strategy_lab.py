@@ -121,6 +121,66 @@ class StrategyLabTest(unittest.TestCase):
             self.assertGreater(generated[0]["score"], 70.0)
             self.assertTrue(signal_key(generated[0]).startswith("STRATEGY_LAB|okx_spot_survivor_lab_v1|"))
 
+    def test_misplaced_direction_in_trade_types_is_repaired(self):
+        bad_rec = lab_rec()
+        experiment = bad_rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "frontier_bad_field_repaired"
+        experiment["strategy_logic"] = {
+            "type": "candidate_filter",
+            "venues": ["okx_spot"],
+            "trade_types": ["long_frontier_spot"],
+            "directions": ["long"],
+            "min_edge_bps": 10,
+            "min_liquidity_score": 0.35,
+            "max_spread_bps": 8,
+        }
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, bad_rec)
+            row = conn.execute(
+                "select strategy_logic_json from strategy_lab_experiments where strategy_lab_id = ?",
+                ("frontier_bad_field_repaired",),
+            ).fetchone()
+            logic = json.loads(row["strategy_logic_json"])
+
+            generated, report = generate_strategy_lab_candidates(conn, base_settings(), [candidate()])
+
+        self.assertEqual(["frontier_crypto_venue_map"], logic["trade_types"])
+        self.assertIn("long_frontier_spot", logic["directions"])
+        self.assertIn("moved_trade_type_direction:long_frontier_spot", logic["normalization_notes"])
+        self.assertEqual(1, len(generated))
+        self.assertEqual(1, report["generated_candidates"])
+
+    def test_generic_direction_can_match_specific_direction(self):
+        generic_rec = lab_rec()
+        experiment = generic_rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "generic_long_direction_lab"
+        experiment["strategy_logic"] = {
+            "type": "candidate_filter",
+            "venues": ["OKX_SPOT"],
+            "trade_types": ["frontier_crypto_venue_map"],
+            "directions": ["long"],
+            "min_edge_bps": 10,
+            "min_liquidity_score": 0.35,
+            "max_spread_bps": 8,
+        }
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, generic_rec)
+            generated, report = generate_strategy_lab_candidates(conn, base_settings(), [candidate()])
+
+        self.assertEqual(1, len(generated))
+        self.assertEqual(1, report["generated_candidates"])
+
+    def test_strategy_lab_prompt_explains_trade_type_direction_split(self):
+        prompt = llm_swarm_runner.agent_prompt(
+            next(agent for agent in llm_swarm_runner.AGENTS if agent["name"] == "strategy_lab"),
+            {"allowed_recommendation_actions": ["propose_strategy_lab_experiment"]},
+            [],
+        )
+        self.assertIn("trade_types are scanner families", prompt)
+        self.assertIn("Do not put a direction in trade_types", prompt)
+
     def test_lab_id_persists_through_opportunity_and_paper_trade(self):
         settings = base_settings()
         with memory_db() as conn:
@@ -202,4 +262,3 @@ class StrategyLabTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

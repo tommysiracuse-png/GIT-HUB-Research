@@ -38,6 +38,44 @@ TRACKED_STATUSES = {
     "rejected_invalid",
 }
 SUPPORTED_LOGIC_TYPES = {"candidate_filter", "candidate_selector", "candidate_transform"}
+KNOWN_TRADE_TYPES = {
+    "frontier_crypto_venue_map",
+    "perp_funding_basis",
+    "global_market_discovery_proxy",
+    "global_proxy_momentum",
+    "prediction_market_probability",
+}
+KNOWN_DIRECTIONS = {
+    "long_frontier_spot",
+    "short_frontier_spot",
+    "long_frontier_perp",
+    "short_frontier_perp",
+    "long_proxy",
+    "short_proxy",
+    "funding_capture_long_perp",
+    "funding_capture_short_perp",
+    "long_perp_short_spot",
+    "short_perp_long_spot",
+    "basis_mean_reversion_long_perp",
+    "basis_mean_reversion_short_perp",
+    "yes",
+    "no",
+}
+GENERIC_DIRECTIONS = {"long", "short"}
+DIRECTION_TRADE_TYPE_HINTS = {
+    "long_frontier_spot": "frontier_crypto_venue_map",
+    "short_frontier_spot": "frontier_crypto_venue_map",
+    "long_frontier_perp": "frontier_crypto_venue_map",
+    "short_frontier_perp": "frontier_crypto_venue_map",
+    "funding_capture_long_perp": "perp_funding_basis",
+    "funding_capture_short_perp": "perp_funding_basis",
+    "long_perp_short_spot": "perp_funding_basis",
+    "short_perp_long_spot": "perp_funding_basis",
+    "basis_mean_reversion_long_perp": "perp_funding_basis",
+    "basis_mean_reversion_short_perp": "perp_funding_basis",
+    "yes": "prediction_market_probability",
+    "no": "prediction_market_probability",
+}
 
 
 def _json_loads(value: str | None, default: Any) -> Any:
@@ -88,6 +126,72 @@ def _as_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item) for item in value if str(item).strip()]
     return []
+
+
+def _unique(values: list[str]) -> list[str]:
+    seen = set()
+    output = []
+    for value in values:
+        if value not in seen:
+            output.append(value)
+            seen.add(value)
+    return output
+
+
+def _normalize_strategy_logic(logic: dict) -> dict:
+    normalized = dict(logic)
+    notes = _as_list(normalized.get("normalization_notes"))
+
+    trade_types = _as_list(normalized.get("trade_types") or normalized.get("source_trade_types") or normalized.get("trade_type"))
+    directions = _as_list(normalized.get("directions") or normalized.get("allowed_directions") or normalized.get("direction"))
+
+    cleaned_trade_types: list[str] = []
+    repaired_directions = list(directions)
+    for item in trade_types:
+        token = item.strip()
+        lowered = token.lower()
+        if lowered in KNOWN_DIRECTIONS:
+            repaired_directions.append(lowered)
+            notes.append(f"moved_trade_type_direction:{lowered}")
+            continue
+        if lowered in GENERIC_DIRECTIONS:
+            repaired_directions.append(lowered)
+            notes.append(f"moved_trade_type_generic_direction:{lowered}")
+            continue
+        cleaned_trade_types.append(lowered if lowered in KNOWN_TRADE_TYPES else token)
+
+    normalized_directions: list[str] = []
+    for item in repaired_directions:
+        token = item.strip()
+        lowered = token.lower()
+        if lowered in KNOWN_DIRECTIONS or lowered in GENERIC_DIRECTIONS:
+            normalized_directions.append(lowered)
+        else:
+            normalized_directions.append(token)
+
+    inferred_trade_types = [
+        DIRECTION_TRADE_TYPE_HINTS[direction]
+        for direction in normalized_directions
+        if direction in DIRECTION_TRADE_TYPE_HINTS
+    ]
+    if not cleaned_trade_types and inferred_trade_types:
+        cleaned_trade_types.extend(inferred_trade_types)
+        notes.append("inferred_trade_type_from_direction")
+
+    venues = _as_list(normalized.get("venues") or normalized.get("allowed_venues"))
+    if venues:
+        normalized["venues"] = _unique([venue.strip().upper() for venue in venues if venue.strip()])
+    if cleaned_trade_types:
+        normalized["trade_types"] = _unique(cleaned_trade_types)
+    elif "trade_types" in normalized:
+        normalized["trade_types"] = []
+    if normalized_directions:
+        normalized["directions"] = _unique(normalized_directions)
+    elif "directions" in normalized:
+        normalized["directions"] = []
+    if notes:
+        normalized["normalization_notes"] = _unique(notes)
+    return normalized
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -155,6 +259,7 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
     else:
         status = "active_testing"
     logic["type"] = logic_type
+    logic = _normalize_strategy_logic(logic)
 
     strategy_lab_id = str(contract.get("strategy_lab_id") or "").strip()
     if not strategy_lab_id:
@@ -280,6 +385,7 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
     for row in rows:
         item = dict(row)
         item["strategy_logic"] = _json_loads(item.pop("strategy_logic_json"), {})
+        item["strategy_logic"] = _normalize_strategy_logic(item["strategy_logic"])
         item["data_requirements"] = _json_loads(item.pop("data_requirements_json"), {})
         item["risk_gates"] = _json_loads(item.pop("risk_gates_json"), {})
         item["promotion_rules"] = _json_loads(item.pop("promotion_rules_json"), {})
@@ -290,6 +396,26 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
 
 def _allowed(value: Any, allowed: list[str]) -> bool:
     return not allowed or str(value) in set(allowed)
+
+
+def _direction_polarity(direction: Any) -> str | None:
+    text = str(direction or "").lower()
+    if text.startswith("long") or "_long_" in text or text.endswith("_long"):
+        return "long"
+    if text.startswith("short") or "_short_" in text or text.endswith("_short"):
+        return "short"
+    return None
+
+
+def _direction_allowed(value: Any, allowed: list[str]) -> bool:
+    if not allowed:
+        return True
+    value_text = str(value)
+    allowed_set = set(allowed)
+    if value_text in allowed_set:
+        return True
+    polarity = _direction_polarity(value_text)
+    return bool(polarity and polarity in allowed_set)
 
 
 def _candidate_edge(candidate: dict) -> float:
@@ -313,7 +439,7 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
         reasons.append("trade_type_not_allowed")
     if not _allowed(candidate.get("venue"), allowed_venues):
         reasons.append("venue_not_allowed")
-    if not _allowed(candidate.get("direction"), allowed_directions):
+    if not _direction_allowed(candidate.get("direction"), allowed_directions):
         reasons.append("direction_not_allowed")
     if not _allowed(candidate.get("region"), allowed_regions):
         reasons.append("region_not_allowed")
@@ -830,4 +956,3 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         )
     REPORT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report
-
