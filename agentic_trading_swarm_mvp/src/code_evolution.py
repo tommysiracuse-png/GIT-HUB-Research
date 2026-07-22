@@ -189,24 +189,6 @@ def normalize_strict_recommendation_payload(candidate: Any) -> dict[str, Any]:
         merged.setdefault(key, value)
 
     return json.loads(json.dumps(_strip_array_structures(merged)))
-STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS = (
-    "execution_constraint",
-    "next_step",
-    "paper_mode",
-    "position_change",
-)
-STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS_SET = set(
-    STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS
-)
-STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS = (
-    "fallback_policy",
-    "live_trading",
-    "route_selection_mode",
-    "validation_rule",
-)
-STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS_SET = set(
-    STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS
-)
 STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS = (
     STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET
     | set(STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS)
