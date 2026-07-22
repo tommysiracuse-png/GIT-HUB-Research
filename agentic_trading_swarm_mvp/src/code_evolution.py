@@ -153,10 +153,23 @@ def _is_paper_scoped_market_key(value: Any) -> bool:
     return isinstance(value, str) and value.startswith(PAPER_MARKET_KEY_PREFIX)
 
 
+def _normalize_paper_variant_config(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    normalized = dict(value)
+    normalized["mode"] = "paper"
+    normalized["allow_live_execution"] = "false"
+    normalized.setdefault("routing_preference", "higher_fill_probability_over_micro_price_improvement")
+    normalized.setdefault("max_order_notional", "1000")
+    normalized.setdefault("slippage_bps_cap", "5")
+    return normalized
+
+
 def _sanitize_recommendation_object(candidate: dict[str, Any]) -> dict[str, Any]:
     sanitized = dict(candidate)
     if not _is_paper_scoped_market_key(sanitized.get("market_key")):
         sanitized["market_key"] = STRICT_RECOMMENDATION_MARKET_KEY
+    sanitized["variant_config"] = _normalize_paper_variant_config(sanitized.get("variant_config"))
     return sanitized
 
 
