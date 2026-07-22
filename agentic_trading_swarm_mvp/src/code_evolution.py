@@ -189,6 +189,30 @@ def normalize_strict_recommendation_payload(candidate: Any) -> dict[str, Any]:
         merged.setdefault(key, value)
 
     return json.loads(json.dumps(_strip_array_structures(merged)))
+
+
+def _strict_recommendation_has_required_fields(payload: Any) -> bool:
+    """Check only the schema fields needed for strict paper-only routing."""
+
+    if not isinstance(payload, dict):
+        return False
+    if not all(field in payload for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
+        return False
+    if not isinstance(payload.get("evidence"), dict):
+        return False
+    if not isinstance(payload.get("proposed_change"), dict):
+        return False
+    return True
+
+
+def build_strict_recommendation_packet(candidate: Any) -> dict[str, Any]:
+    """Normalize a proposal into the paper-only JSON packet used by runtime."""
+
+    payload = normalize_strict_recommendation_payload(candidate)
+    if not _strict_recommendation_has_required_fields(payload):
+        return json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
+    payload["market_key"] = str(payload.get("market_key") or STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY)
+    return payload
 STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS = (
     STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET
     | set(STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS)
