@@ -152,8 +152,66 @@ def _serialize_strict_recommendation(candidate: dict[str, Any]) -> str:
     return json.dumps(candidate, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, ensure_ascii=False)
 
 
+def _parse_single_json_object_recommendation(raw_text: Any) -> dict[str, Any] | None:
+    if not isinstance(raw_text, str):
+        return None
+    stripped = raw_text.strip()
+    if not stripped or stripped[0] != "{" or stripped[-1] != "}":
+        return None
+    try:
+        candidate, end_index = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(candidate, dict):
+        return None
+    if stripped[end_index:].strip():
+        return None
+    return candidate
+
+
+def _contains_array_anywhere(value: Any) -> bool:
+    if isinstance(value, list):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_array_anywhere(item) for item in value.values())
+    return False
+
+
+def _validate_strict_recommendation_object(candidate: Any) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+    if _contains_array_anywhere(candidate):
+        return None
+    if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(candidate):
+        return None
+    if any(key not in _STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_KEYS for key in candidate):
+        return None
+    if not _is_paper_scoped_market_key(candidate.get("market_key")):
+        return None
+    evidence = candidate.get("evidence")
+    proposed_change = candidate.get("proposed_change")
+    if not isinstance(evidence, dict) or not isinstance(proposed_change, dict):
+        return None
+    if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
+        return None
+    if not STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET.issubset(proposed_change):
+        return None
+    code_change = candidate.get("code_change")
+    if code_change is not None and not isinstance(code_change, dict):
+        return None
+    variant_config = candidate.get("variant_config")
+    if variant_config is not None and not isinstance(variant_config, dict):
+        return None
+    return candidate
+
+
 def _validate_and_finalize_recommendation(candidate: dict[str, Any]) -> dict[str, Any]:
-    sanitized = _sanitize_recommendation_object(candidate)
+    if isinstance(candidate, str):
+        candidate = _parse_single_json_object_recommendation(candidate)
+    validated = _validate_strict_recommendation_object(candidate)
+    if validated is None:
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    sanitized = _sanitize_recommendation_object(validated)
     normalized = _normalize_strict_paper_recommendation(sanitized)
     if normalized is None:
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
