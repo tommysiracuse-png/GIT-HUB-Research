@@ -1,6 +1,5 @@
 """Targeted public order-book enrichment for frontier crypto observations."""
 
-from __future__ import annotations
 
 import collections
 import concurrent.futures
