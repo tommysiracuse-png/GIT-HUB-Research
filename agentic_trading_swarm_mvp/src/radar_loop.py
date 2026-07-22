@@ -91,7 +91,7 @@ def _auxiliary_runtime_policy(settings: dict) -> dict:
     }
 
 
-def _strategy_lab_runtime_summary(strategy_lab_generation: dict | None) -> dict:
+def _strategy_lab_runtime_summary(strategy_lab_generation: dict | None, runtime_selection: dict | None = None) -> dict:
     generation = strategy_lab_generation or {}
     accepted = generation.get("accepted_candidates")
     rejected = generation.get("rejected_candidates")
@@ -116,6 +116,18 @@ def _strategy_lab_runtime_summary(strategy_lab_generation: dict | None) -> dict:
     selection_mode = generation.get("selection_mode")
     if selection_mode:
         summary["selection_mode"] = selection_mode
+    runtime = runtime_selection or {}
+    for key in (
+        "runtime_candidate_filters_enabled",
+        "available_candidate_filter_count",
+        "selected_count",
+        "skipped_non_candidate_filter_count",
+    ):
+        if key in runtime:
+            summary[key] = runtime[key]
+    runtime_selection_mode = runtime.get("selection_mode")
+    if runtime_selection_mode:
+        summary["runtime_selection_mode"] = runtime_selection_mode
     return summary
 
 
@@ -125,6 +137,7 @@ def _build_expansion_map(
     prediction_summary: dict,
     global_market_discovery_scan: dict | None = None,
     strategy_lab_generation: dict | None = None,
+    strategy_lab_runtime: dict | None = None,
 ) -> dict:
     frontier_summary = (frontier_crypto_venues or {}).get("summary", {})
     frontier_expansion = frontier_summary.get("expansion_map", {})
@@ -155,7 +168,7 @@ def _build_expansion_map(
             "potentially_executable_soon_count": route_intelligence.get("potentially_executable_soon_count", 0),
             "report": str(RUNS_DIR / "route_intelligence_report.md"),
         },
-        "strategy_lab": _strategy_lab_runtime_summary(strategy_lab_generation),
+        "strategy_lab": _strategy_lab_runtime_summary(strategy_lab_generation, strategy_lab_runtime),
         "reports": {
             "frontier": str(RUNS_DIR / "frontier_crypto_venues_report.md"),
             "global_market_discovery_scan": str(RUNS_DIR / "global_market_discovery_scan_report.md"),
@@ -269,8 +282,12 @@ def run_once(settings: dict) -> dict:
             candidates,
             price_observations,
         )
-        if strategy_lab_candidates:
-            candidates.extend(strategy_lab_candidates)
+        selected_strategy_lab_candidates, strategy_lab_runtime = _select_runtime_strategy_lab_candidates(
+            strategy_lab_candidates,
+            settings,
+        )
+        if selected_strategy_lab_candidates:
+            candidates.extend(selected_strategy_lab_candidates)
             candidates.sort(key=lambda row: row["score"], reverse=True)
         candidates = enrich_candidates(candidates, settings)
         candidates, strategy_reliability = apply_strategy_reliability(candidates, settings, conn=conn)
@@ -281,6 +298,7 @@ def run_once(settings: dict) -> dict:
             prediction_summary,
             global_market_discovery_scan,
             strategy_lab_generation,
+            strategy_lab_runtime,
         )
         self_improvement_open_pack = build_open_pack_report(
             conn,
