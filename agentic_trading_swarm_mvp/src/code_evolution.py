@@ -125,6 +125,14 @@ STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS = (
     STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET
     | set(STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS)
 )
+STRICT_RECOMMENDATION_REQUIRED_EXECUTION_MODE_VALUES = {
+    "paper_only",
+    "paper",
+    "simulated",
+    "simulation",
+    "research_only",
+    "dry_run",
+}
 
 _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
 _STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_KEYS = set(STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS)
@@ -170,6 +178,37 @@ def validate_strict_recommendation_json_text(text: str) -> tuple[bool, dict[str,
         payload = json.loads(stripped)
     except json.JSONDecodeError:
         return False, None, "invalid_json"
+    ok, reason = validate_paper_only_recommendation_payload(payload)
+    if not ok:
+        return False, None, reason
+
+
+def validate_paper_only_recommendation_payload(payload: Any) -> tuple[bool, str]:
+    """Fail closed on recommendations that are not explicitly paper-only."""
+
+    if not isinstance(payload, dict):
+        return False, "payload_not_object"
+    missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in payload]
+    if missing:
+        return False, "missing_required_fields"
+    market_key = payload.get("market_key")
+    if not isinstance(market_key, str) or not market_key.strip():
+        return False, "invalid_market_key"
+    normalized_market_key = market_key.strip().lower()
+    if not normalized_market_key.startswith(PAPER_MARKET_KEY_PREFIX):
+        return False, "market_key_not_paper_scoped"
+    execution_mode = payload.get("paper_only")
+    if execution_mode is None:
+        execution_mode = payload.get("execution_mode")
+    if execution_mode is None:
+        return False, "missing_execution_mode"
+    if isinstance(execution_mode, bool):
+        if not execution_mode:
+            return False, "non_simulated_execution_mode"
+    else:
+        if str(execution_mode).strip().lower() not in STRICT_RECOMMENDATION_REQUIRED_EXECUTION_MODE_VALUES:
+            return False, "non_simulated_execution_mode"
+    return True, "ok"
     if not isinstance(payload, dict):
         return False, None, "top_level_object_required"
     if set(payload) - _STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_KEYS:
