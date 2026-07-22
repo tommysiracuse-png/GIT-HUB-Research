@@ -89,6 +89,10 @@ STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS = (
     "code_change",
     "variant_config",
 )
+STRICT_RECOMMENDATION_OPTIONAL_NESTED_FIELDS = (
+    "details",
+    "metadata",
+)
 STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS = (
     "execution_constraint",
     "next_step",
@@ -178,11 +182,14 @@ def _validate_strict_recommendation_object(candidate: Any) -> dict[str, Any] | N
         return None
     if any(key not in _STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_KEYS for key in candidate):
         return None
-    if not _is_paper_scoped_market_key(candidate.get("market_key")):
+    market_key = candidate.get("market_key")
+    if not _is_paper_scoped_market_key(market_key):
         return None
     evidence = candidate.get("evidence")
     proposed_change = candidate.get("proposed_change")
     if not isinstance(evidence, dict) or not isinstance(proposed_change, dict):
+        return None
+    if any(key not in STRICT_RECOMMENDATION_OPTIONAL_NESTED_FIELDS for key in evidence.keys() if key not in STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET):
         return None
     if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
         return None
