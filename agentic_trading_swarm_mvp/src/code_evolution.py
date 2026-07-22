@@ -93,6 +93,9 @@ STRICT_RECOMMENDATION_OPTIONAL_NESTED_FIELDS = (
     "details",
     "metadata",
 )
+STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS_SET = set(
+    STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS
+)
 STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS = (
     "execution_constraint",
     "next_step",
@@ -151,12 +154,18 @@ def _contains_list(value: Any) -> bool:
     return False
 
 
+def _contains_array_like(value: Any) -> bool:
+    return _contains_list(value)
+
+
 def _strict_recommendation_fallback() -> dict[str, Any]:
     return json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
 
 
 def _strict_recommendation_is_valid(candidate: Any) -> bool:
     if not isinstance(candidate, dict):
+        return False
+    if set(candidate) != _STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_KEYS:
         return False
     if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(candidate):
         return False
@@ -168,9 +177,12 @@ def _strict_recommendation_is_valid(candidate: Any) -> bool:
         _STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX
     ):
         return False
-    if _contains_list(candidate):
+    if _contains_array_like(candidate):
         return False
-    return True
+    return (
+        set(candidate["evidence"]) >= STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET
+        and set(candidate["proposed_change"]) >= STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET
+    )
 
 
 def finalize_paper_only_recommendation(candidate: Any) -> dict[str, Any]:
