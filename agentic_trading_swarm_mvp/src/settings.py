@@ -9,6 +9,7 @@ import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_SETTINGS_PATH = ROOT / "config" / "settings.example.json"
+LOCAL_SETTINGS_PATH = ROOT / "config" / "settings.local.json"
 
 
 DEFAULT_SETTINGS = {
@@ -392,7 +393,12 @@ def load_settings(path: str | pathlib.Path | None = None) -> dict:
         path = DEFAULT_SETTINGS_PATH
     config_path = pathlib.Path(path)
     if not config_path.exists():
-        return copy.deepcopy(DEFAULT_SETTINGS)
-    loaded = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    return deep_merge(DEFAULT_SETTINGS, loaded)
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+    else:
+        loaded = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        settings = deep_merge(DEFAULT_SETTINGS, loaded)
+    if path == DEFAULT_SETTINGS_PATH and LOCAL_SETTINGS_PATH.exists():
+        local_loaded = json.loads(LOCAL_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
+        settings = deep_merge(settings, local_loaded)
+    return settings
 

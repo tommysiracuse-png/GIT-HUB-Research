@@ -7,3 +7,4 @@ runs/
 *.sqlite
 *.sqlite-*
 *.db
+config/settings.local.json
