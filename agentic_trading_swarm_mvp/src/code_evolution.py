@@ -89,6 +89,15 @@ STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS = (
     "code_change",
     "variant_config",
 )
+STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS = (
+    "execution_constraint",
+    "next_step",
+    "paper_mode",
+    "position_change",
+)
+STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS_SET = set(
+    STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS
+)
 STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS = (
     STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET
     | set(STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS)
@@ -159,6 +168,14 @@ def _finalize_strict_recommendation_object(candidate: dict[str, Any]) -> dict[st
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
     if any(key not in _STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_KEYS for key in finalized):
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    code_change = finalized.get("code_change")
+    if code_change is not None:
+        if not isinstance(code_change, dict):
+            return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+        if not STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS_SET.issubset(code_change):
+            return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+        if any(not _has_meaningful_value(code_change.get(field)) for field in STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS):
+            return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
     market_key = finalized.get("market_key")
     if not isinstance(market_key, str) or not market_key.startswith(_STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX):
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
