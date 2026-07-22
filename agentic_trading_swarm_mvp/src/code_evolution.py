@@ -131,14 +131,14 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
     "rationale": "Generated output failed schema validation or was truncated; emit one safe paper-only recommendation object with explicit fallback and fail-closed routing contract.",
     "market_key": "paper.execution_route_hunter.default",
     "evidence": {
-        "issue_observed": "Previous execution_route_hunter output was truncated or structurally incomplete and therefore could not be consumed as a valid recommendation object.",
-        "risk_if_unchanged": "Invalid recommendation formatting can cause downstream paper-routing logic to skip validation, miss fallback paths, or fail closed without generating a usable simulation result.",
-        "scope": "Paper trading only; no live orders, no brokerage connectivity changes, and no production routing activation.",
+        "issue": "missing_required_fields_or_truncated_json",
+        "risk": "avoid malformed recommendations entering any live trading path",
+        "constraint": "paper_only_fail_closed",
     },
     "proposed_change": {
-        "expected_effect": "More reliable simulated execution decisions, clearer auditability, and lower chance of malformed routing recommendations entering the paper-trading pipeline.",
+        "goal": "Keep recommendation handling deterministic, auditable, and paper-only.",
+        "constraints": "Never enable live trading, broker writes, credentials, startup changes, or destructive actions.",
         "paper_mode": "enforced",
-        "summary": "Require a single-object recommendation contract with explicit route confidence, fallback route, and fail-closed behavior when required fields are missing.",
     },
     "variant_config": {
         "fallback_policy": "fail_closed_if_primary_route_invalid_then_use_named_paper_fallback_if_present",
