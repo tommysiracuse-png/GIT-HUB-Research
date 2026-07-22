@@ -10,11 +10,37 @@ from __future__ import annotations
 import datetime as dt
 
 try:
-    from src.frontier_data_quality import paper_only_route_quality_record
+    from src.frontier_data_quality import _paper_only_parse_timestamp, paper_only_route_quality_record
 except ImportError:  # pragma: no cover - fallback for direct module execution
     try:
-        from frontier_data_quality import paper_only_route_quality_record
+        from frontier_data_quality import _paper_only_parse_timestamp, paper_only_route_quality_record
     except ImportError:  # pragma: no cover - route-quality enrichment becomes optional
+        def _paper_only_parse_timestamp(value):
+            if value is None:
+                return None
+            if isinstance(value, dt.datetime):
+                return value if value.tzinfo is not None else value.replace(tzinfo=dt.timezone.utc)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                numeric = None
+            if numeric is not None:
+                try:
+                    if abs(numeric) >= 1_000_000_000_000:
+                        numeric /= 1000.0
+                    parsed = dt.datetime.fromtimestamp(numeric, tz=dt.timezone.utc)
+                except (OverflowError, OSError, ValueError):
+                    return None
+                return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)
+            text = str(value).strip()
+            if not text:
+                return None
+            try:
+                parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)
+
         paper_only_route_quality_record = None
 
 _VALR_PAPER_PUBLIC_BASE_URL = "https://api.valr.com"
