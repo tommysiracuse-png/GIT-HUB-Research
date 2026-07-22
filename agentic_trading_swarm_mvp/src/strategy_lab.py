@@ -38,14 +38,14 @@ TRACKED_STATUSES = {
     "rejected_invalid",
 }
 SUPPORTED_LOGIC_TYPES = {"candidate_filter", "candidate_selector", "candidate_transform"}
-KNOWN_TRADE_TYPES = {
+FALLBACK_TRADE_TYPE_EXAMPLES = {
     "frontier_crypto_venue_map",
     "perp_funding_basis",
     "global_market_discovery_proxy",
     "global_proxy_momentum",
     "prediction_market_probability",
 }
-KNOWN_DIRECTIONS = {
+FALLBACK_DIRECTION_EXAMPLES = {
     "long_frontier_spot",
     "short_frontier_spot",
     "long_frontier_perp",
@@ -62,7 +62,7 @@ KNOWN_DIRECTIONS = {
     "no",
 }
 GENERIC_DIRECTIONS = {"long", "short"}
-DIRECTION_TRADE_TYPE_HINTS = {
+FALLBACK_DIRECTION_TRADE_TYPE_HINTS = {
     "long_frontier_spot": "frontier_crypto_venue_map",
     "short_frontier_spot": "frontier_crypto_venue_map",
     "long_frontier_perp": "frontier_crypto_venue_map",
@@ -138,9 +138,53 @@ def _unique(values: list[str]) -> list[str]:
     return output
 
 
-def _normalize_strategy_logic(logic: dict) -> dict:
+def _runtime_strategy_vocabulary(candidates: list[dict]) -> dict:
+    direction_trade_types: dict[str, Counter] = defaultdict(Counter)
+    trade_types = set()
+    directions = set()
+    for candidate in candidates:
+        trade_type = str(candidate.get("trade_type") or "").strip()
+        direction = str(candidate.get("direction") or "").strip()
+        if trade_type:
+            trade_types.add(trade_type)
+        if direction:
+            directions.add(direction)
+        if trade_type and direction:
+            direction_trade_types[direction][trade_type] += 1
+    return {
+        "trade_types": trade_types,
+        "directions": directions,
+        "direction_trade_type_hints": {
+            direction: counter.most_common(1)[0][0]
+            for direction, counter in direction_trade_types.items()
+            if counter
+        },
+    }
+
+
+def _match_observed_token(token: str, observed: set[str]) -> str | None:
+    lowered = token.lower()
+    for item in observed:
+        if item.lower() == lowered:
+            return item
+    return None
+
+
+def _normalize_strategy_logic(logic: dict, vocabulary: dict | None = None) -> dict:
     normalized = dict(logic)
     notes = _as_list(normalized.get("normalization_notes"))
+    vocabulary = vocabulary or {}
+    observed_trade_types = set(vocabulary.get("trade_types") or set())
+    observed_directions = set(vocabulary.get("directions") or set())
+    direction_trade_type_hints = dict(vocabulary.get("direction_trade_type_hints") or {})
+    direction_trade_type_hints.update(
+        {
+            direction: direction_trade_type_hints.get(direction, trade_type)
+            for direction, trade_type in FALLBACK_DIRECTION_TRADE_TYPE_HINTS.items()
+        }
+    )
+    known_trade_types_lower = {item.lower() for item in observed_trade_types | FALLBACK_TRADE_TYPE_EXAMPLES}
+    known_directions_lower = {item.lower() for item in observed_directions | FALLBACK_DIRECTION_EXAMPLES | GENERIC_DIRECTIONS}
 
     trade_types = _as_list(normalized.get("trade_types") or normalized.get("source_trade_types") or normalized.get("trade_type"))
     directions = _as_list(normalized.get("directions") or normalized.get("allowed_directions") or normalized.get("direction"))
@@ -150,29 +194,30 @@ def _normalize_strategy_logic(logic: dict) -> dict:
     for item in trade_types:
         token = item.strip()
         lowered = token.lower()
-        if lowered in KNOWN_DIRECTIONS:
-            repaired_directions.append(lowered)
-            notes.append(f"moved_trade_type_direction:{lowered}")
+        observed_direction = _match_observed_token(token, observed_directions)
+        if observed_direction or lowered in known_directions_lower:
+            repaired = observed_direction or lowered
+            repaired_directions.append(repaired)
+            notes.append(f"moved_trade_type_direction:{repaired}")
             continue
         if lowered in GENERIC_DIRECTIONS:
             repaired_directions.append(lowered)
             notes.append(f"moved_trade_type_generic_direction:{lowered}")
             continue
-        cleaned_trade_types.append(lowered if lowered in KNOWN_TRADE_TYPES else token)
+        observed_trade_type = _match_observed_token(token, observed_trade_types)
+        cleaned_trade_types.append(observed_trade_type or (lowered if lowered in known_trade_types_lower else token))
 
     normalized_directions: list[str] = []
     for item in repaired_directions:
         token = item.strip()
         lowered = token.lower()
-        if lowered in KNOWN_DIRECTIONS or lowered in GENERIC_DIRECTIONS:
-            normalized_directions.append(lowered)
-        else:
-            normalized_directions.append(token)
+        observed_direction = _match_observed_token(token, observed_directions)
+        normalized_directions.append(observed_direction or (lowered if lowered in known_directions_lower else token))
 
     inferred_trade_types = [
-        DIRECTION_TRADE_TYPE_HINTS[direction]
+        direction_trade_type_hints[direction]
         for direction in normalized_directions
-        if direction in DIRECTION_TRADE_TYPE_HINTS
+        if direction in direction_trade_type_hints
     ]
     if not cleaned_trade_types and inferred_trade_types:
         cleaned_trade_types.extend(inferred_trade_types)
@@ -499,10 +544,11 @@ def generate_strategy_lab_candidates(
     rejects: dict[str, Counter] = defaultdict(Counter)
 
     pool = sorted(candidates, key=lambda row: _as_float(row.get("score")), reverse=True)
+    runtime_vocabulary = _runtime_strategy_vocabulary(pool)
     for experiment in experiments:
         if len(generated) >= max_total:
             break
-        logic = experiment.get("strategy_logic") or {}
+        logic = _normalize_strategy_logic(experiment.get("strategy_logic") or {}, runtime_vocabulary)
         risk_gates = experiment.get("risk_gates") or {}
         bonus = max(0.0, min(max_bonus, _as_float(logic.get("score_bonus"), default_bonus)))
         edge_bonus = max(0.0, min(max_bonus, _as_float(logic.get("edge_bonus_bps"), 0.0)))

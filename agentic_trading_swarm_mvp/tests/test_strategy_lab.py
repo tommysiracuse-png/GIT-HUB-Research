@@ -172,6 +172,34 @@ class StrategyLabTest(unittest.TestCase):
         self.assertEqual(1, len(generated))
         self.assertEqual(1, report["generated_candidates"])
 
+    def test_runtime_vocabulary_allows_new_strategy_surfaces(self):
+        dynamic_rec = lab_rec()
+        experiment = dynamic_rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "dynamic_surface_lab"
+        experiment["strategy_logic"] = {
+            "type": "candidate_filter",
+            "venues": ["NEW_VENUE"],
+            "trade_types": ["buy_local_sell_reference"],
+            "min_edge_bps": 10,
+            "min_liquidity_score": 0.35,
+            "max_spread_bps": 8,
+        }
+        new_candidate = candidate(
+            venue="NEW_VENUE",
+            inst_id="NEW_VENUE:ABC",
+            trade_type="regional_cross_reference_spread",
+            direction="buy_local_sell_reference",
+        )
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, dynamic_rec)
+            generated, report = generate_strategy_lab_candidates(conn, base_settings(), [new_candidate])
+
+        self.assertEqual(1, len(generated))
+        self.assertEqual("regional_cross_reference_spread", generated[0]["trade_type"])
+        self.assertEqual("buy_local_sell_reference", generated[0]["direction"])
+        self.assertEqual(1, report["generated_candidates"])
+
     def test_strategy_lab_prompt_explains_trade_type_direction_split(self):
         prompt = llm_swarm_runner.agent_prompt(
             next(agent for agent in llm_swarm_runner.AGENTS if agent["name"] == "strategy_lab"),
