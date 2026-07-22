@@ -113,18 +113,26 @@ _STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY = "paper.execution_route_hunter"
 _STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX = "paper"
 
 _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
-    "action": "modify",
+    "action": "propose_code_change",
     "priority": 90,
-    "title": "Fallback schema recovery",
-    "rationale": "Generated output failed schema validation; emitting a safe paper-only recommendation.",
-    "market_key": _STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY,
+    "title": "Restore schema-complete paper recommendation output",
+    "rationale": "Generated output failed schema validation; emitting one safe paper-only recommendation object for downstream ingestion.",
+    "market_key": "paper.execution_route_hunter",
     "evidence": {
-        "observed_issue": "schema_validation_failed",
-        "execution_safety": "paper_only",
+        "constraint": "Recommendation must remain simulation-only with no live execution changes.",
+        "issue": "Generated output failed strict single-object schema validation.",
+        "risk": "Downstream paper orchestration cannot safely ingest or evaluate an incomplete recommendation.",
     },
     "proposed_change": {
-        "summary": "Retry with strict single-object schema enforcement.",
-        "validation_rule": "single object, required keys present, no live execution terms",
+        "goal": "Emit exactly one schema-complete paper-only recommendation object.",
+        "constraints": "Keep market_key paper-scoped, include required evidence and proposed_change fields, and avoid live execution wording.",
+    },
+    "variant_config": {
+        "mode": "paper",
+        "allow_live_execution": "false",
+        "routing_preference": "higher_fill_probability_over_micro_price_improvement",
+        "max_order_notional": "1000",
+        "slippage_bps_cap": "5",
     },
 }
 
@@ -376,18 +384,16 @@ def _contains_exactly_one_json_object(value: Any) -> bool:
 
     if isinstance(value, dict):
         return True
-    if isinstance(value, str):
-        text = value.strip()
-        if not (text.startswith("{") and text.endswith("}")):
-            return False
-        if text.count("{") != 1 or text.count("}") != 1:
-            return False
-        if text.startswith("[") or text.endswith("]"):
-            return False
-        if "\n{" in text or "}\n" in text:
-            return False
-        return True
-    return False
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text or text[0] != "{" or text[-1] != "}":
+        return False
+    try:
+        parsed, end_index = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and not text[end_index:].strip()
 
 
 def _parse_strict_paper_recommendation_json(payload: Any) -> dict[str, Any] | None:
@@ -444,13 +450,13 @@ def _extract_single_json_object(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _recommendation_schema_error(candidate: Any) -> str:
+def _recommendation_schema_error(candidate: Any) -> str | None:
     if not isinstance(candidate, dict):
         return "not_object"
     missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in candidate]
     if missing:
         return f"missing:{','.join(missing)}"
-    extra = sorted(set(candidate) - _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS)
+    extra = sorted(set(candidate) - _ALLOWED_TOP_LEVEL_KEYS)
     if extra:
         return f"extra:{','.join(extra)}"
     if any(not _has_meaningful_value(candidate.get(field)) for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS):
@@ -459,12 +465,30 @@ def _recommendation_schema_error(candidate: Any) -> str:
         return "contains_array"
     if not _is_paper_scoped_market_key(candidate.get("market_key")):
         return "market_key_out_of_scope"
+    evidence = candidate.get("evidence")
+    if not isinstance(evidence, dict):
+        return "evidence_not_object"
+    if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
+        return "missing_evidence_fields"
+    proposed_change = candidate.get("proposed_change")
+    if not isinstance(proposed_change, dict):
+        return "proposed_change_not_object"
+    if not STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET.issubset(proposed_change):
+        return "missing_proposed_change_fields"
     action = candidate.get("action")
-    if action not in STRICT_RECOMMENDATION_FALLBACK_ACTIONS and action not in SUPPRESSION_ACTIONS:
+    if action not in STRICT_RECOMMENDATION_FALLBACK_ACTIONS and action not in SUPPRESSION_ACTIONS and action != "propose_code_change":
         return "invalid_action"
     if action in SUPPRESSION_ACTIONS and action != "monitor_only":
         return "hold_only"
-    return "invalid"
+    variant_config = candidate.get("variant_config")
+    if variant_config is not None:
+        if not isinstance(variant_config, dict):
+            return "variant_config_not_object"
+        if str(variant_config.get("mode") or "").strip().lower() not in {"", "paper"}:
+            return "variant_config_not_paper"
+        if str(variant_config.get("allow_live_execution") or "").strip().lower() not in {"", "false", "0", "no"}:
+            return "variant_config_live_not_allowed"
+    return None
 
 
 def _recommendation_needs_regeneration(candidate: dict[str, Any] | None, raw_text: str) -> bool:
