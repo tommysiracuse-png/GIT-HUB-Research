@@ -71,6 +71,7 @@ STRICT_RECOMMENDATION_FALLBACK_ACTIONS = {
     "propose_code_change",
     "propose_diagnostic_hypothesis",
     "propose_policy_update",
+    "hold",
 }
 STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS = (
     "constraint",
@@ -125,11 +126,11 @@ _STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY = "paper.execution_route_hunter"
 _STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX = "paper"
 
 _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
-    "action": "propose_code_change",
+    "action": "hold",
     "priority": 90,
-    "title": "Tighten paper-only execution routing fallback validation",
-    "rationale": "Generated output failed schema validation or was truncated; emit one safe paper-only recommendation object with explicit fallback and fail-closed routing contract.",
-    "market_key": "paper.execution_route_hunter.default",
+    "title": "Schema validation fallback",
+    "rationale": "Generated output failed schema validation or was truncated; emit one conservative paper-only hold recommendation with the required fields.",
+    "market_key": "paper.execution_route_hunter.schema_guard",
     "evidence": {
         "issue": "missing_required_fields_or_truncated_json",
         "risk": "avoid malformed recommendations entering any live trading path",
@@ -141,12 +142,40 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
         "paper_mode": "enforced",
     },
     "variant_config": {
-        "fallback_policy": "fail_closed_if_primary_route_invalid_then_use_named_paper_fallback_if_present",
+        "fallback_policy": "emit_hold_recommendation_on_validation_error",
         "live_trading": "disabled",
         "route_selection_mode": "paper_only_best_effort",
         "validation_rule": "require action priority title rationale market_key evidence proposed_change",
     },
 }
+
+
+def _paper_only_schema_validation_fallback() -> dict[str, Any]:
+    """Return a defensive copy of the paper-only validation fallback."""
+
+    fallback = json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
+    fallback.setdefault("proposed_change", {})
+    fallback["proposed_change"].setdefault("fallback_action", "hold")
+    fallback["proposed_change"].setdefault(
+        "fallback_rationale",
+        "If generation fails validation, emit a conservative paper-only hold recommendation with the same required fields.",
+    )
+    fallback["proposed_change"].setdefault("fallback_title", "Schema validation fallback")
+    fallback["proposed_change"].setdefault("mode", "paper_only")
+    fallback["proposed_change"].setdefault(
+        "response_contract",
+        "Return exactly one JSON object with action, priority, title, rationale, market_key, evidence, proposed_change, and optional code_change or variant_config.",
+    )
+    fallback["variant_config"] = {
+        **fallback.get("variant_config", {}),
+        "paper_only": "true",
+        "live_trading_enabled": "false",
+        "require_single_json_object": "true",
+        "disallow_arrays": "true",
+        "schema_guard": "strict",
+        "on_validation_error": "emit_hold_recommendation",
+    }
+    return fallback
 
 
 def _has_meaningful_value(value: Any) -> bool:
