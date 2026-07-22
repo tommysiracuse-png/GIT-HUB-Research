@@ -86,6 +86,14 @@ STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS = (
 STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET = set(
     STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS
 )
+STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY = "paper.execution_route_hunter"
+STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX = "paper"
+
+_STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY = STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY
+_STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX = (
+    STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX
+)
+
 STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS = (
     "code_change",
     "variant_config",
@@ -143,8 +151,8 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
     "action": "hold",
     "priority": 90,
     "title": "Schema validation fallback",
-    "rationale": "Generated output failed schema validation or was truncated; emit one conservative paper-only hold recommendation with the required fields.",
-    "market_key": "paper.execution_route_hunter.schema_guard",
+    "rationale": "Generated output failed schema validation or was truncated; emit one conservative paper-only recommendation with the required fields.",
+    "market_key": "paper.execution_route_hunter",
     "evidence": {
         "issue": "missing_required_fields_or_truncated_json",
         "risk": "avoid malformed recommendations entering any live trading path",
