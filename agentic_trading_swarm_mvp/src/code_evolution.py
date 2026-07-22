@@ -93,6 +93,12 @@ STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS = (
 STRICT_RECOMMENDATION_OPTIONAL_NESTED_FIELDS = (
     "details",
     "metadata",
+    "fallback_rationale",
+    "fallback_title",
+    "mode",
+    "response_contract",
+    "missing_fields",
+    "validation_status",
 )
 STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS_SET = set(
     STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS
@@ -154,7 +160,6 @@ def _paper_only_schema_validation_fallback() -> dict[str, Any]:
     """Return a defensive copy of the paper-only validation fallback."""
 
     fallback = json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
-    fallback.setdefault("proposed_change", {})
     fallback["proposed_change"].setdefault("fallback_action", "hold")
     fallback["proposed_change"].setdefault(
         "fallback_rationale",
@@ -175,7 +180,61 @@ def _paper_only_schema_validation_fallback() -> dict[str, Any]:
         "schema_guard": "strict",
         "on_validation_error": "emit_hold_recommendation",
     }
-    return fallback
+    return _paper_only_schema_final_gate(fallback)
+
+
+def _paper_only_schema_final_gate(value: Any) -> dict[str, Any]:
+    """Require the final paper-only recommendation schema before returning."""
+
+    if not isinstance(value, dict):
+        return _paper_only_schema_validation_failure(
+            ["action", "priority", "title", "rationale", "market_key", "evidence", "proposed_change"]
+        )
+
+    missing = [
+        field
+        for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS
+        if field not in value or not _has_meaningful_value(value.get(field))
+    ]
+    if missing:
+        return _paper_only_schema_validation_failure(missing)
+
+    return value
+
+
+def _paper_only_schema_validation_failure(missing_fields: list[str]) -> dict[str, Any]:
+    """Emit a paper-only hold recommendation when required fields are missing."""
+
+    missing_reason = ", ".join(missing_fields) if missing_fields else "unknown"
+    return {
+        "action": "hold",
+        "priority": 100,
+        "title": "Paper-only schema validation hold",
+        "rationale": "Required recommendation fields were missing, so the system must fail closed in paper-only mode.",
+        "market_key": _STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY,
+        "evidence": {
+            "issue": "missing_required_fields",
+            "risk": "Malformed recommendations must not continue past the final schema gate.",
+            "constraint": "paper_only_fail_closed",
+            "missing_fields": missing_fields,
+            "reason": f"missing_required_fields: {missing_reason}",
+        },
+        "proposed_change": {
+            "goal": "Keep recommendation emission deterministic and paper-only.",
+            "constraints": "Never enable live trading, broker writes, credentials, startup changes, or destructive actions.",
+            "paper_mode": "enforced",
+            "fallback_action": "hold",
+            "validation_status": "failed",
+        },
+        "variant_config": {
+            "fallback_policy": "emit_hold_recommendation_on_validation_error",
+            "live_trading": "disabled",
+            "route_selection_mode": "paper_only_best_effort",
+            "validation_rule": "require action priority title rationale market_key evidence proposed_change",
+            "paper_only": "true",
+            "require_single_json_object": "true",
+        },
+    }
 
 
 def _has_meaningful_value(value: Any) -> bool:
