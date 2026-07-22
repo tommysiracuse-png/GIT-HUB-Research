@@ -65,6 +65,202 @@ _VALR_SUPPORTED_SYMBOLS = {
     "USDTZAR": {"base": "USDT", "quote": "ZAR"},
 }
 
+PAPER_ONLY_ROUTE_QUALITY_DEFAULTS = {
+    "max_quote_age_ms": 15000.0,
+    "warning_quote_age_fraction": 0.75,
+    "max_spread_to_baseline_ratio": 2.5,
+    "warning_spread_to_baseline_ratio": 1.75,
+    "min_depth_to_size_ratio": 0.75,
+    "warning_depth_to_size_ratio": 1.25,
+}
+PAPER_ONLY_ROUTE_BLOCK_STATUSES = frozenset(
+    {"blocked", "down", "error", "halted", "maintenance", "offline", "unavailable"}
+)
+PAPER_ONLY_ROUTE_WARN_STATUSES = frozenset({"degraded", "limited", "stale"})
+
+
+def _paper_only_quality_as_datetime(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, dt.datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        try:
+            parsed = dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
+        except (OverflowError, OSError, TypeError, ValueError):
+            return None
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = dt.datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def _paper_only_route_status_key(value):
+    return str(value or "").strip().lower()
+
+
+def paper_only_route_quality_record(
+    *,
+    best_bid=None,
+    best_ask=None,
+    bid_size=None,
+    ask_size=None,
+    mid_price=None,
+    spread_bps=None,
+    observed_at=None,
+    as_of=None,
+    intended_paper_notional_usd=None,
+    venue_spread_baseline_bps=None,
+    route_status=None,
+    config=None,
+):
+    """Compute a paper-only route-quality record for simulated execution review."""
+
+    thresholds = dict(PAPER_ONLY_ROUTE_QUALITY_DEFAULTS)
+    if isinstance(config, dict):
+        for key in thresholds:
+            if config.get(key) is not None:
+                thresholds[key] = config.get(key)
+
+    bid_price = _as_float(best_bid)
+    ask_price = _as_float(best_ask)
+    bid_quantity = _as_float(bid_size)
+    ask_quantity = _as_float(ask_size)
+    mid_value = _as_float(mid_price)
+    spread_value = _as_float(spread_bps)
+    if spread_value is None and bid_price is not None and ask_price is not None and bid_price > 0.0 and ask_price > 0.0:
+        if mid_value is None:
+            mid_value = (bid_price + ask_price) / 2.0
+        if mid_value and ask_price >= bid_price:
+            spread_value = ((ask_price - bid_price) / mid_value) * 10_000.0
+
+    baseline_spread_bps = _as_float(venue_spread_baseline_bps)
+    if baseline_spread_bps is not None and baseline_spread_bps <= 0.0:
+        baseline_spread_bps = None
+    spread_to_baseline_ratio = (
+        spread_value / baseline_spread_bps
+        if spread_value is not None and baseline_spread_bps is not None
+        else None
+    )
+
+    intended_notional_usd = _as_float(intended_paper_notional_usd)
+    if intended_notional_usd is not None:
+        intended_notional_usd = abs(intended_notional_usd)
+        if intended_notional_usd == 0.0:
+            intended_notional_usd = None
+
+    visible_depth_candidates = []
+    if bid_price is not None and bid_quantity is not None and bid_price > 0.0 and bid_quantity > 0.0:
+        visible_depth_candidates.append(bid_price * bid_quantity)
+    if ask_price is not None and ask_quantity is not None and ask_price > 0.0 and ask_quantity > 0.0:
+        visible_depth_candidates.append(ask_price * ask_quantity)
+    visible_top_of_book_notional_usd = min(visible_depth_candidates) if visible_depth_candidates else None
+    depth_to_size_ratio = (
+        visible_top_of_book_notional_usd / intended_notional_usd
+        if visible_top_of_book_notional_usd is not None and intended_notional_usd is not None
+        else None
+    )
+
+    observed_dt = _paper_only_quality_as_datetime(observed_at)
+    evaluated_dt = _paper_only_quality_as_datetime(as_of) or observed_dt
+    quote_age_ms = None
+    if observed_dt is not None and evaluated_dt is not None:
+        quote_age_ms = max(0.0, (evaluated_dt - observed_dt).total_seconds() * 1000.0)
+
+    route_status_key = _paper_only_route_status_key(route_status)
+    hard_blockers = []
+    warnings = []
+
+    if route_status_key in PAPER_ONLY_ROUTE_BLOCK_STATUSES:
+        hard_blockers.append("route_unavailable")
+    elif route_status_key in PAPER_ONLY_ROUTE_WARN_STATUSES:
+        warnings.append("route_status_marginal")
+
+    if quote_age_ms is not None:
+        if quote_age_ms > float(thresholds["max_quote_age_ms"]):
+            hard_blockers.append("stale_quote")
+        elif quote_age_ms > float(thresholds["max_quote_age_ms"]) * float(thresholds["warning_quote_age_fraction"]):
+            warnings.append("quote_aging")
+
+    if spread_to_baseline_ratio is not None:
+        if spread_to_baseline_ratio > float(thresholds["max_spread_to_baseline_ratio"]):
+            hard_blockers.append("spread_above_baseline")
+        elif spread_to_baseline_ratio > float(thresholds["warning_spread_to_baseline_ratio"]):
+            warnings.append("spread_elevated")
+
+    if depth_to_size_ratio is not None:
+        if depth_to_size_ratio < float(thresholds["min_depth_to_size_ratio"]):
+            hard_blockers.append("insufficient_top_of_book_depth")
+        elif depth_to_size_ratio < float(thresholds["warning_depth_to_size_ratio"]):
+            warnings.append("thin_top_of_book_depth")
+
+    status_score = 1.0
+    if route_status_key in PAPER_ONLY_ROUTE_BLOCK_STATUSES:
+        status_score = 0.0
+    elif route_status_key in PAPER_ONLY_ROUTE_WARN_STATUSES:
+        status_score = 0.5
+
+    component_scores = [status_score]
+    if quote_age_ms is not None and float(thresholds["max_quote_age_ms"]) > 0.0:
+        component_scores.append(max(0.0, min(1.0, 1.0 - (quote_age_ms / float(thresholds["max_quote_age_ms"])))))
+    if spread_to_baseline_ratio is not None and float(thresholds["max_spread_to_baseline_ratio"]) > 0.0:
+        component_scores.append(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    1.0 - ((max(0.0, spread_to_baseline_ratio - 1.0)) / float(thresholds["max_spread_to_baseline_ratio"])),
+                ),
+            )
+        )
+    if depth_to_size_ratio is not None and float(thresholds["warning_depth_to_size_ratio"]) > 0.0:
+        component_scores.append(
+            max(0.0, min(1.0, depth_to_size_ratio / float(thresholds["warning_depth_to_size_ratio"])))
+        )
+
+    route_quality_score = round(sum(component_scores) / len(component_scores), 6) if component_scores else None
+    paper_ineligible = bool(hard_blockers)
+    paper_decision = "blocked" if paper_ineligible else ("degraded" if warnings else "eligible")
+    if paper_ineligible:
+        simulated_slippage_tier = "blocked"
+        simulated_size_factor = 0.0
+    elif warnings:
+        simulated_slippage_tier = "elevated"
+        simulated_size_factor = 0.5
+    else:
+        simulated_slippage_tier = "normal"
+        simulated_size_factor = 1.0
+
+    return {
+        "paper_only": True,
+        "route_status": route_status_key or None,
+        "quote_age_ms": quote_age_ms,
+        "effective_spread_bps": spread_value,
+        "venue_spread_baseline_bps": baseline_spread_bps,
+        "spread_to_baseline_ratio": spread_to_baseline_ratio,
+        "visible_top_of_book_notional_usd": visible_top_of_book_notional_usd,
+        "intended_paper_notional_usd": intended_notional_usd,
+        "depth_to_size_ratio": depth_to_size_ratio,
+        "paper_ineligible": paper_ineligible,
+        "blocking_reason": hard_blockers[0] if hard_blockers else None,
+        "blocking_reasons": hard_blockers,
+        "warnings": warnings,
+        "paper_decision": paper_decision,
+        "simulated_slippage_tier": simulated_slippage_tier,
+        "simulated_size_factor": simulated_size_factor,
+        "route_quality_score": route_quality_score,
+        "thresholds": thresholds,
+    }
+
 
 def _normalize_indodax_order_book_side(levels, *, reverse=False):
     normalized = []

@@ -9,6 +9,13 @@ uses credentials, private/account APIs, or order endpoints.
 from __future__ import annotations
 import datetime as dt
 
+try:
+    from src.frontier_data_quality import paper_only_route_quality_record
+except ImportError:  # pragma: no cover - fallback for direct module execution
+    try:
+        from frontier_data_quality import paper_only_route_quality_record
+    except ImportError:  # pragma: no cover - route-quality enrichment becomes optional
+        paper_only_route_quality_record = None
 
 _VALR_PAPER_PUBLIC_BASE_URL = "https://api.valr.com"
 _VALR_PAPER_SUPPORTED_SYMBOLS = {
@@ -179,6 +186,12 @@ def paper_only_valr_observation_from_public_payloads(
     ticker_payload=None,
     orderbook_payload=None,
     trades_payload=None,
+    quote_timestamp=None,
+    evaluation_timestamp=None,
+    route_status=None,
+    intended_paper_notional_usd=None,
+    venue_spread_baseline_bps=None,
+    route_quality_config=None,
     as_of=None,
 ):
     """Build a paper-only normalized spot observation from public VALR payloads."""
@@ -246,7 +259,28 @@ def paper_only_valr_observation_from_public_payloads(
         if mid_price > 0.0 and best_ask >= best_bid:
             spread_bps = ((best_ask - best_bid) / mid_price) * 10_000.0
 
-    observed_at = _paper_only_parse_timestamp(as_of)
+    observed_at = _paper_only_parse_timestamp(quote_timestamp or as_of)
+    evaluation_at = _paper_only_parse_timestamp(evaluation_timestamp or as_of)
+
+    route_quality = None
+    if callable(paper_only_route_quality_record):
+        route_quality = paper_only_route_quality_record(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            mid_price=mid_price,
+            spread_bps=spread_bps,
+            observed_at=observed_at,
+            as_of=evaluation_at,
+            intended_paper_notional_usd=intended_paper_notional_usd,
+            venue_spread_baseline_bps=venue_spread_baseline_bps,
+            route_status=route_status,
+            config=route_quality_config,
+        )
+    paper_ineligible = bool(route_quality.get("paper_ineligible")) if isinstance(route_quality, dict) else False
+    paper_ineligible_reason = route_quality.get("blocking_reason") if isinstance(route_quality, dict) else None
+    simulated_slippage_tier = route_quality.get("simulated_slippage_tier") if isinstance(route_quality, dict) else None
 
     return {
         "venue": "VALR",
@@ -271,6 +305,10 @@ def paper_only_valr_observation_from_public_payloads(
         "recent_trade_quantity": recent_trade_quantity,
         "recent_trade_timestamp": recent_trade_timestamp.isoformat() if recent_trade_timestamp is not None else None,
         "observed_at": observed_at.isoformat() if observed_at is not None else None,
+        "route_quality": route_quality,
+        "paper_ineligible": paper_ineligible,
+        "paper_ineligible_reason": paper_ineligible_reason,
+        "simulated_slippage_tier": simulated_slippage_tier,
     }
 
 
