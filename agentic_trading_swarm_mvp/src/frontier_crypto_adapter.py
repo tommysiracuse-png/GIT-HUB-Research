@@ -25,6 +25,17 @@ _PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS = {
 }
 
 
+def _paper_only_build_governor_fields(*, source="frontier_crypto_adapter", paper_only=True):
+    """Return lightweight governance metadata for paper-only packets."""
+
+    return {
+        "source_module": source,
+        "paper_only": bool(paper_only),
+        "execution_mode": "paper",
+        "trade_effect": "none",
+    }
+
+
 def paper_only_premarket_liquidity_gate(
     *,
     dollar_volume_usd=None,
@@ -150,6 +161,7 @@ def paper_only_valr_market_catalog(symbols=None):
                 "base_asset": spec["base"],
                 "quote_asset": spec["quote"],
                 "paper_only": True,
+                "build_governor_fields": _paper_only_build_governor_fields(),
                 "frontier_tags": ["frontier_crypto_venue_map", "zar_fiat_quote", "public_read_only"],
                 "endpoints": {
                     "ticker": f"{base_path}/marketsummary",
