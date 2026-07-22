@@ -1,3 +1,61 @@
+import datetime as dt
+
+
+def _paper_only_freshness_now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _paper_only_parse_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=dt.timezone.utc)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def paper_only_quote_age_seconds(observation, *, now=None):
+    if not isinstance(observation, dict):
+        return None
+    timestamp = (
+        observation.get("quote_timestamp")
+        or observation.get("bar_timestamp")
+        or observation.get("timestamp")
+        or observation.get("last_timestamp")
+        or observation.get("updated_at")
+    )
+    parsed = _paper_only_parse_timestamp(timestamp)
+    if parsed is None:
+        return None
+    current = now if isinstance(now, dt.datetime) else _paper_only_freshness_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, (current - parsed).total_seconds())
+
+
+def paper_only_data_freshness_review(observation, *, threshold_seconds=90, now=None):
+    age_seconds = paper_only_quote_age_seconds(observation, now=now)
+    review = {
+        "stale_data": False,
+        "stale_age_seconds": age_seconds,
+        "freshness_threshold_seconds": float(threshold_seconds),
+        "freshness_reason": None,
+        "eligible": True,
+    }
+    if age_seconds is None:
+        review["freshness_reason"] = "missing_timestamp"
+        return review
+    if age_seconds > float(threshold_seconds):
+        review["stale_data"] = True
+        review["eligible"] = False
+        review["freshness_reason"] = "stale_quote_or_bar"
+    return review
 """Targeted public order-book enrichment for frontier crypto observations."""
 
 
