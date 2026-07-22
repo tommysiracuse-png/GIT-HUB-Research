@@ -95,7 +95,9 @@ STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS = (
 )
 
 _STRICT_RECOMMENDATION_TOP_LEVEL_KEYS = set(STRICT_REQUIRED_RECOMMENDATION_FIELDS)
+_STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_KEYS = set(STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS)
 _STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY = "paper.execution_route_hunter"
+_STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX = "paper"
 
 _PAPER_ONLY_RECOMMENDATION_FALLBACK: dict[str, Any] = {
     "action": "modify",
@@ -155,7 +157,10 @@ def _finalize_strict_recommendation_object(candidate: dict[str, Any]) -> dict[st
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
     if not STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET.issubset(finalized):
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
-    if any(key not in STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS for key in finalized):
+    if any(key not in _STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_KEYS for key in finalized):
+        return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
+    market_key = finalized.get("market_key")
+    if not isinstance(market_key, str) or not market_key.startswith(_STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX):
         return dict(_PAPER_ONLY_RECOMMENDATION_FALLBACK)
     try:
         encoded = _serialize_strict_recommendation(finalized)
