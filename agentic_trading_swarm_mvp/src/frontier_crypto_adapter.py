@@ -17,6 +17,52 @@ _VALR_PAPER_SUPPORTED_SYMBOLS = {
     "USDTZAR": {"base": "USDT", "quote": "ZAR"},
 }
 
+_PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS = {
+    "min_premarket_dollar_volume_usd": 1500000.0,
+    "max_spread_pct": 0.75,
+    "min_recent_prints_window_minutes": 5,
+    "min_recent_trade_count": 20,
+}
+
+
+def paper_only_premarket_liquidity_gate(
+    *,
+    dollar_volume_usd=None,
+    spread_pct=None,
+    recent_trade_count=None,
+    recent_print_window_minutes=None,
+    config=None,
+):
+    """Return whether a paper-only premarket gap candidate is liquid enough."""
+
+    thresholds = dict(_PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS)
+    if isinstance(config, dict):
+        for key in thresholds:
+            value = config.get(key)
+            if value is not None:
+                thresholds[key] = value
+
+    def _as_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    dollar_volume = _as_float(dollar_volume_usd)
+    spread = _as_float(spread_pct)
+    trade_count = _as_float(recent_trade_count)
+    print_window = _as_float(recent_print_window_minutes)
+
+    if dollar_volume is None or dollar_volume < float(thresholds["min_premarket_dollar_volume_usd"]):
+        return False
+    if spread is None or spread > float(thresholds["max_spread_pct"]):
+        return False
+    if trade_count is None or trade_count < float(thresholds["min_recent_trade_count"]):
+        return False
+    if print_window is None or print_window < float(thresholds["min_recent_prints_window_minutes"]):
+        return False
+    return True
+
 
 def _paper_only_valr_float_or_none(value):
     try:
