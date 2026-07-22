@@ -360,6 +360,117 @@ def paper_only_liquidity_volatility_entry_gate(
     }
 
 
+def paper_only_crypto_conditional_spot_short_feasibility_gate(
+    route_context=None,
+    *,
+    enabled=None,
+    required_lifecycle="open_hold_cover",
+):
+    """Paper-only feasibility gate for conditional crypto spot shorts."""
+
+    context = route_context if isinstance(route_context, dict) else {}
+
+    def _lower_text(value):
+        return str(value or "").strip().lower()
+
+    def _truthy(value):
+        if isinstance(value, bool):
+            return value
+        text = _lower_text(value)
+        if text in {"1", "true", "yes", "y", "on", "supported", "available"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "unsupported", "unavailable"}:
+            return False
+        return bool(value)
+
+    def _numeric_present(value):
+        try:
+            return float(value) == float(value)
+        except (TypeError, ValueError):
+            return False
+
+    def _lifecycle_supported(value):
+        target = _lower_text(required_lifecycle)
+        if isinstance(value, str):
+            return _lower_text(value) == target
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return any(_lower_text(item) == target for item in value)
+        if isinstance(value, dict):
+            if target in value:
+                return _truthy(value.get(target))
+            return any(_lower_text(item) == target for item in value.values())
+        return False
+
+    asset_class = _lower_text(context.get("asset_class") or context.get("instrument_type"))
+    market_type = _lower_text(context.get("market_type") or context.get("observation_type"))
+    side = _lower_text(context.get("side") or context.get("direction"))
+    trigger_type = _lower_text(context.get("trigger_type") or context.get("entry_trigger_type"))
+    paper_only = _truthy(context.get("paper_only"))
+
+    applies = bool(
+        paper_only
+        and asset_class == "crypto"
+        and market_type == "spot"
+        and side == "short"
+        and trigger_type == "conditional"
+    )
+
+    if not applies:
+        return {
+            "eligible": True,
+            "reason": "not_applicable",
+            "applies": False,
+            "feasible": True,
+            "asset_class": asset_class,
+            "market_type": market_type,
+            "side": side,
+            "trigger_type": trigger_type,
+        }
+
+    venue_shorting_supported = _truthy(context.get("venue_shorting_supported"))
+    instrument_margin_shortable = _truthy(context.get("instrument_margin_shortable"))
+    borrow_model_available = _truthy(context.get("borrow_model_available"))
+    lifecycle_supported = _lifecycle_supported(
+        context.get("route_lifecycle")
+        or context.get("lifecycle")
+        or context.get("supported_lifecycles")
+        or context.get("route_lifecycle_state")
+    )
+    fee_assumptions_present = any(
+        _numeric_present(context.get(key))
+        for key in ("estimated_fee_bps", "estimated_fees_bps", "taker_fee_bps", "maker_fee_bps", "estimated_fee_rate")
+    )
+    borrow_assumptions_present = borrow_model_available or any(
+        _numeric_present(context.get(key))
+        for key in ("estimated_borrow_bps", "estimated_borrow_fee_bps", "assumed_borrow_bps", "borrow_rate", "borrow_apr")
+    )
+
+    blockers = []
+    if not venue_shorting_supported:
+        blockers.append("venue_shorting_unsupported")
+    if not (instrument_margin_shortable or borrow_model_available):
+        blockers.append("short_mechanism_unavailable")
+    if not lifecycle_supported:
+        blockers.append("route_lifecycle_missing_open_hold_cover")
+    if not fee_assumptions_present:
+        blockers.append("fee_assumptions_missing")
+    if not borrow_assumptions_present:
+        blockers.append("borrow_assumptions_missing")
+
+    return {
+        "eligible": not blockers,
+        "reason": "paper_short_route_infeasible" if blockers else "paper_short_route_feasible",
+        "applies": True,
+        "feasible": not blockers,
+        "blockers": blockers,
+        "enabled": enabled,
+        "asset_class": asset_class,
+        "market_type": market_type,
+        "side": side,
+        "trigger_type": trigger_type,
+    }
+
+
 def paper_only_volatility_liquidity_entry_gate(
     *,
     spread_bps,
