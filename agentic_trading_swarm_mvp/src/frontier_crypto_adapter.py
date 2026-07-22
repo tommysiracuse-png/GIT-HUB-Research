@@ -36,6 +36,7 @@ _PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS = {
     "min_recent_trade_count": 20,
 }
 
+_PAPER_ONLY_ROUTE_GUARD_MIN_LIQUIDITY_FLAG = "paper_route_guard_min_liquidity_v1"
 _PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG = "paper_route_guard_short_frontier_spot_v1"
 
 
@@ -67,6 +68,21 @@ def _paper_only_route_guard_short_frontier_spot_enabled(config):
     feature_flags = config.get("feature_flags")
     if isinstance(feature_flags, dict):
         nested_flag = _paper_only_route_review_bool(feature_flags.get(_PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG))
+        if nested_flag is not None:
+            return nested_flag
+    return False
+
+
+def _paper_only_route_guard_min_liquidity_enabled(config):
+    if not isinstance(config, dict):
+        return False
+    direct_value = config.get(_PAPER_ONLY_ROUTE_GUARD_MIN_LIQUIDITY_FLAG)
+    direct_flag = _paper_only_route_review_bool(direct_value)
+    if direct_flag is not None:
+        return direct_flag
+    feature_flags = config.get("feature_flags")
+    if isinstance(feature_flags, dict):
+        nested_flag = _paper_only_route_review_bool(feature_flags.get(_PAPER_ONLY_ROUTE_GUARD_MIN_LIQUIDITY_FLAG))
         if nested_flag is not None:
             return nested_flag
     return False
