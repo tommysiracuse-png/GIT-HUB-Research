@@ -141,14 +141,39 @@ def _strip_array_structures(value: Any) -> Any:
     return value
 
 
+def _parse_single_json_object(candidate: Any) -> dict[str, Any] | None:
+    """Parse exactly one JSON object from text, rejecting extra content."""
+
+    if isinstance(candidate, dict):
+        return candidate
+    if not isinstance(candidate, str):
+        return None
+
+    text = candidate.strip()
+    if not text:
+        return None
+
+    decoder = json.JSONDecoder()
+    try:
+        parsed, end = decoder.raw_decode(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if text[end:].strip():
+        return None
+    return parsed
+
+
 def normalize_strict_recommendation_payload(candidate: Any) -> dict[str, Any]:
     """Return exactly one schema-shaped paper recommendation object."""
 
     fallback = json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
-    if not isinstance(candidate, dict):
+    normalized = _parse_single_json_object(candidate)
+    if not isinstance(normalized, dict):
         return fallback
 
-    normalized = _strip_array_structures(candidate)
+    normalized = _strip_array_structures(normalized)
     if not isinstance(normalized, dict):
         return fallback
 
