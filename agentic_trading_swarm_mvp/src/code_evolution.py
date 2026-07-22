@@ -129,6 +129,59 @@ STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS = (
 STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS_SET = set(
     STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS
 )
+
+
+def _strip_array_structures(value: Any) -> Any:
+    """Return a paper-safe tree with array-like values removed."""
+
+    if isinstance(value, dict):
+        return {key: _strip_array_structures(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return None
+    return value
+
+
+def normalize_strict_recommendation_payload(candidate: Any) -> dict[str, Any]:
+    """Return exactly one schema-shaped paper recommendation object."""
+
+    fallback = json.loads(json.dumps(_PAPER_ONLY_RECOMMENDATION_FALLBACK))
+    if not isinstance(candidate, dict):
+        return fallback
+
+    normalized = _strip_array_structures(candidate)
+    if not isinstance(normalized, dict):
+        return fallback
+
+    merged: dict[str, Any] = {}
+    for key in STRICT_REQUIRED_RECOMMENDATION_FIELDS:
+        merged[key] = _strip_array_structures(normalized.get(key, fallback[key]))
+
+    for key in STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS:
+        if key in normalized:
+            merged[key] = _strip_array_structures(normalized[key])
+
+    for key, value in fallback.items():
+        merged.setdefault(key, value)
+
+    return json.loads(json.dumps(_strip_array_structures(merged)))
+STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS = (
+    "execution_constraint",
+    "next_step",
+    "paper_mode",
+    "position_change",
+)
+STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS_SET = set(
+    STRICT_RECOMMENDATION_REQUIRED_CODE_CHANGE_FIELDS
+)
+STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS = (
+    "fallback_policy",
+    "live_trading",
+    "route_selection_mode",
+    "validation_rule",
+)
+STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS_SET = set(
+    STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS
+)
 STRICT_RECOMMENDATION_ALLOWED_TOP_LEVEL_FIELDS = (
     STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET
     | set(STRICT_RECOMMENDATION_OPTIONAL_TOP_LEVEL_FIELDS)
