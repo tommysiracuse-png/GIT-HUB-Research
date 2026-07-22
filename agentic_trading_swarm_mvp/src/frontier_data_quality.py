@@ -128,7 +128,123 @@ def _paper_only_normalize_route_status_key(value):
     key = key.replace(" ", "_")
     return PAPER_ONLY_ROUTE_STATUS_ALIASES.get(key, key)
 
+PAPER_ONLY_CROSS_ASSET_REGIME_MARKET_KEY = "paper_us_cross_asset_risk_regime"
+PAPER_ONLY_CROSS_ASSET_REGIME_DEFAULTS = {
+    "minimum_signal_alignment": 2,
+    "review_window": "next_5_trading_days",
+    "mode": "paper_only",
+    "execution_policy": "no_live_orders",
+    "confirmation_requirement": "require at least two cross-asset signals to align before raising priority",
+    "warning_key": "cross_asset_risk_off_divergence_watch",
+}
 
+def _paper_only_cross_asset_regime_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disabled"}:
+        return False
+    return None
+
+
+def _paper_only_cross_asset_regime_watch_payload(config):
+    if not isinstance(config, dict):
+        return None
+    direct = config.get(PAPER_ONLY_CROSS_ASSET_REGIME_MARKET_KEY)
+    if isinstance(direct, dict):
+        return direct
+    alias = config.get("cross_asset_regime_watch")
+    if isinstance(alias, dict):
+        return alias
+    return None
+
+
+def _paper_only_cross_asset_regime_lookup(key, *sources):
+    for source in sources:
+        if isinstance(source, dict) and key in source:
+            return source.get(key)
+    return None
+
+
+def _paper_only_cross_asset_regime_watch_record(config=None):
+    watch_config = _paper_only_cross_asset_regime_watch_payload(config)
+    signals = watch_config.get("signals") if isinstance(watch_config, dict) and isinstance(watch_config.get("signals"), dict) else {}
+
+    enabled = False
+    if isinstance(watch_config, dict):
+        enabled_flag = _paper_only_cross_asset_regime_bool(watch_config.get("enabled"))
+        enabled = True if enabled_flag is None else enabled_flag
+    elif isinstance(config, dict):
+        enabled_flag = _paper_only_cross_asset_regime_bool(config.get(PAPER_ONLY_CROSS_ASSET_REGIME_MARKET_KEY))
+        if enabled_flag is None:
+            feature_flags = config.get("feature_flags")
+            if isinstance(feature_flags, dict):
+                enabled_flag = _paper_only_cross_asset_regime_bool(feature_flags.get(PAPER_ONLY_CROSS_ASSET_REGIME_MARKET_KEY))
+        enabled = bool(enabled_flag)
+
+    minimum_alignment = _as_float(
+        _paper_only_cross_asset_regime_lookup("minimum_signal_alignment", signals, watch_config, config)
+    )
+    if minimum_alignment is None:
+        minimum_alignment = PAPER_ONLY_CROSS_ASSET_REGIME_DEFAULTS["minimum_signal_alignment"]
+    minimum_alignment = max(2, min(3, int(round(float(minimum_alignment)))))
+
+    equity_momentum_weakened = any(
+        _paper_only_cross_asset_regime_bool(
+            _paper_only_cross_asset_regime_lookup(key, signals, watch_config, config)
+        )
+        is True
+        for key in ("equity_momentum_weakened", "broad_index_lower_highs", "intraday_breadth_weaker")
+    )
+    rates_or_dollar_strength_persistent = any(
+        _paper_only_cross_asset_regime_bool(
+            _paper_only_cross_asset_regime_lookup(key, signals, watch_config, config)
+        )
+        is True
+        for key in ("rates_or_dollar_strength_persistent", "front_end_yields_rising", "dollar_strength_persistent")
+    )
+    crypto_confirms_risk_appetite = _paper_only_cross_asset_regime_bool(
+        _paper_only_cross_asset_regime_lookup("crypto_confirms_risk_appetite", signals, watch_config, config)
+    )
+    crypto_fails_to_confirm_risk_appetite = crypto_confirms_risk_appetite is False or any(
+        _paper_only_cross_asset_regime_bool(
+            _paper_only_cross_asset_regime_lookup(key, signals, watch_config, config)
+        )
+        is True
+        for key in ("crypto_fails_to_confirm_risk_appetite", "bitcoin_underperforming_equities", "ether_underperforming_equities")
+    )
+
+    aligned_signal_count = sum(
+        1
+        for value in (equity_momentum_weakened, rates_or_dollar_strength_persistent, crypto_fails_to_confirm_risk_appetite)
+        if value
+    )
+    triggered = bool(enabled and equity_momentum_weakened and aligned_signal_count >= minimum_alignment)
+    priority = "high" if triggered and aligned_signal_count >= 3 else ("moderate" if triggered else None)
+    warning_key = PAPER_ONLY_CROSS_ASSET_REGIME_DEFAULTS["warning_key"]
+    return {
+        "market_key": PAPER_ONLY_CROSS_ASSET_REGIME_MARKET_KEY,
+        "enabled": enabled,
+        "mode": PAPER_ONLY_CROSS_ASSET_REGIME_DEFAULTS["mode"],
+        "review_window": PAPER_ONLY_CROSS_ASSET_REGIME_DEFAULTS["review_window"],
+        "execution_policy": PAPER_ONLY_CROSS_ASSET_REGIME_DEFAULTS["execution_policy"],
+        "confirmation_requirement": PAPER_ONLY_CROSS_ASSET_REGIME_DEFAULTS["confirmation_requirement"],
+        "minimum_signal_alignment": minimum_alignment,
+        "aligned_signal_count": aligned_signal_count,
+        "triggered": triggered,
+        "priority": priority,
+        "warning_key": warning_key,
+        "monitoring_flags": [warning_key] if triggered else [],
+        "signals": {
+            "equity_momentum_weakened": equity_momentum_weakened,
+            "rates_or_dollar_strength_persistent": rates_or_dollar_strength_persistent,
+            "crypto_fails_to_confirm_risk_appetite": crypto_fails_to_confirm_risk_appetite,
+        },
+    }
 
 def paper_only_route_quality_record(
     *,
@@ -261,6 +377,7 @@ def paper_only_route_quality_record(
     else:
         simulated_slippage_tier = "normal"
         simulated_size_factor = 1.0
+    cross_asset_regime_watch = _paper_only_cross_asset_regime_watch_record(config=config)
 
     return {
         "paper_only": True,
@@ -280,6 +397,8 @@ def paper_only_route_quality_record(
         "simulated_slippage_tier": simulated_slippage_tier,
         "simulated_size_factor": simulated_size_factor,
         "route_quality_score": route_quality_score,
+        "cross_asset_regime_watch": cross_asset_regime_watch,
+        "monitoring_flags": list(cross_asset_regime_watch.get("monitoring_flags") or []),
         "thresholds": thresholds,
     }
 
