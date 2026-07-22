@@ -17,6 +17,7 @@ import json
 import pathlib
 import sys
 import time
+from types import SimpleNamespace
 
 from agent_review import review_candidate
 from autonomous_builder import run_autonomous_builder
@@ -129,6 +130,78 @@ def _strategy_lab_runtime_summary(strategy_lab_generation: dict | None, runtime_
     if runtime_selection_mode:
         summary["runtime_selection_mode"] = runtime_selection_mode
     return summary
+
+
+def _is_strategy_lab_candidate_filter(item: dict) -> bool:
+    tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    logic_type = item.get("strategy_lab_logic_type") or item.get("strategy_lab_type")
+    return bool(
+        logic_type == "candidate_filter"
+        or "candidate-filter" in tags
+        or metadata.get("artifact_type") == "filter"
+    )
+
+
+def _strategy_lab_runtime_selection_summary(
+    candidates: list[dict],
+    *,
+    runtime_selection_mode: str = "disabled",
+    generated_count: int = 0,
+    accepted_count: int = 0,
+    skipped_non_candidate_filter_count: int | None = None,
+) -> dict:
+    summary = {
+        "generated_count": int(generated_count or 0),
+        "accepted_count": int(accepted_count or 0),
+        "runtime_selection_mode": runtime_selection_mode,
+    }
+    if runtime_selection_mode != "disabled":
+        summary["selection_mode"] = runtime_selection_mode
+    if skipped_non_candidate_filter_count is not None:
+        summary["skipped_non_candidate_filter_count"] = int(skipped_non_candidate_filter_count)
+        summary["available_candidate_filter_count"] = sum(
+            1 for item in candidates if _is_strategy_lab_candidate_filter(item)
+        )
+        summary["selected_count"] = int(accepted_count or 0)
+    return summary
+
+
+strategy_lab_runtime = SimpleNamespace(
+    is_candidate_filter=_is_strategy_lab_candidate_filter,
+    build_runtime_summary=_strategy_lab_runtime_selection_summary,
+)
+
+
+def _select_runtime_strategy_lab_candidates(candidates: list[dict], settings: dict) -> tuple[list[dict], dict]:
+    cfg = settings.get("strategy_lab", {})
+    enabled = bool(cfg.get("runtime_candidate_filters_enabled", True))
+    if not enabled:
+        return [], _strategy_lab_runtime_selection_summary(candidates)
+
+    max_selected = int(cfg.get("runtime_max_candidates_per_loop", cfg.get("max_candidates_per_loop", 25)))
+    selected = []
+    skipped = 0
+    for candidate in candidates:
+        if not _is_strategy_lab_candidate_filter(candidate):
+            skipped += 1
+            continue
+        if candidate.get("enabled") is False:
+            skipped += 1
+            continue
+        selected.append(candidate)
+        if len(selected) >= max_selected:
+            break
+
+    summary = _strategy_lab_runtime_selection_summary(
+        candidates,
+        runtime_selection_mode="lab_generation",
+        generated_count=len(candidates),
+        accepted_count=len(selected),
+        skipped_non_candidate_filter_count=skipped,
+    )
+    summary["runtime_candidate_filters_enabled"] = True
+    return selected, summary
 
 
 def _build_expansion_map(
