@@ -64,6 +64,7 @@ _PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS = {
 
 _PAPER_ONLY_ROUTE_GUARD_MIN_LIQUIDITY_FLAG = "paper_route_guard_min_liquidity_v1"
 _PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG = "paper_route_guard_short_frontier_spot_v1"
+_PAPER_ONLY_ENFORCED_ROUTE_RESOLUTION_FLAG = "paper_only_enforced_route_resolution_v1"
 
 
 def _paper_only_route_review_text(value):
@@ -114,6 +115,59 @@ def _paper_only_route_guard_min_liquidity_enabled(config):
     return False
 
 
+def _paper_only_enforced_route_resolution_enabled(config):
+    if not isinstance(config, dict):
+        return False
+    direct_value = config.get(_PAPER_ONLY_ENFORCED_ROUTE_RESOLUTION_FLAG)
+    direct_flag = _paper_only_route_review_bool(direct_value)
+    if direct_flag is not None:
+        return direct_flag
+    feature_flags = config.get("feature_flags")
+    if isinstance(feature_flags, dict):
+        nested_flag = _paper_only_route_review_bool(feature_flags.get(_PAPER_ONLY_ENFORCED_ROUTE_RESOLUTION_FLAG))
+        if nested_flag is not None:
+            return nested_flag
+    return False
+
+
+def _paper_only_route_review_lookup(route_status, *keys):
+    if not isinstance(route_status, dict):
+        return None
+    for key in keys:
+        value = route_status.get(key)
+        if value not in (None, "", [], {}, ()):
+            return value
+    return None
+
+
+def _paper_only_route_mode_enabled(value):
+    flag = _paper_only_route_review_bool(value)
+    if flag is not None:
+        return flag
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in {"paper", "paper_only", "sim", "simulation", "simulated", "enforced"}:
+        return True
+    if text in {"live", "real", "production", "prod"}:
+        return False
+    return None
+
+
+def _paper_only_route_has_explicit_paper_mode(route_status, *, config=None):
+    for value in (
+        _paper_only_route_review_lookup(route_status, "paper_mode", "paper_only", "execution_mode", "mode"),
+        config.get("paper_mode") if isinstance(config, dict) else None,
+    ):
+        flag = _paper_only_route_mode_enabled(value)
+        if flag is not None:
+            return flag
+    return False
+
+
+def _paper_only_safe_route_tag(text):
+    normalized = str(text or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized if normalized else None
+
+
 def _paper_only_route_status_text(route_status):
     if isinstance(route_status, dict):
         return _paper_only_route_review_text(route_status.get("route_status") or route_status.get("status"))
@@ -121,15 +175,90 @@ def _paper_only_route_status_text(route_status):
 
 
 def _paper_only_short_route_review(route_status, *, config=None):
+    def _fallback_review(reason, base_review=None):
+        review = dict(base_review or {})
+        review.update(
+            {
+                "route_status": "eligible",
+                "short_support_source": review.get("short_support_source") or "paper_policy_fallback",
+                "route_blocked": False,
+                "paper_mode": True,
+                "execution_mode": "paper",
+                "transport": "no_send",
+                "simulated_venue_tag": "paper_sim_only",
+                "fill_model": "synthetic_best_effort",
+                "deny_live_transmit": True,
+                "route_resolution_policy": "simulate_on_ambiguity",
+                "paper_eligible": True,
+                "route_supported": True,
+                "fallback_applied": True,
+                "fallback_reason": reason,
+                "trade_effect": "none",
+            }
+        )
+        return review
+
+    def _has_simulated_venue_tag(value):
+        if not isinstance(value, dict):
+            return False
+        governor = value.get("build_governor_fields")
+        candidates = [
+            _paper_only_route_review_lookup(
+                value,
+                "simulated_venue_tag",
+                "venue_tag",
+                "route_transport",
+                "transport",
+                "execution_mode",
+                "fill_model",
+                "venue_allowlist",
+                "audit_tag",
+                "venue",
+                "execution_venue",
+                "route_destination",
+            )
+        ]
+        if isinstance(governor, dict):
+            candidates.extend(
+                [
+                    governor.get("paper_mode"),
+                    governor.get("transport"),
+                    governor.get("fill_model"),
+                    governor.get("venue_allowlist"),
+                    governor.get("audit_tag"),
+                ]
+            )
+        for candidate in candidates:
+            text = _paper_only_safe_route_tag(candidate)
+            if not text:
+                continue
+            if any(token in text for token in ("paper", "sim", "sandbox", "synthetic", "no_send")):
+                return True
+        return False
+
     review = {
         "route_status": _paper_only_route_status_text(route_status),
         "short_support_source": None,
         "borrow_support_flag": None,
         "margin_mode_flag": None,
         "block_reason": None,
+        "paper_mode": None,
+        "execution_mode": None,
+        "transport": None,
+        "simulated_venue_tag": None,
+        "fill_model": None,
+        "deny_live_transmit": None,
+        "route_resolution_policy": None,
+        "paper_eligible": None,
+        "route_supported": None,
         "route_blocked": False,
+        "fallback_applied": False,
+        "fallback_reason": None,
+        "trade_effect": None,
     }
     if not isinstance(route_status, dict):
+        if _paper_only_enforced_route_resolution_enabled(config):
+            return _fallback_review("missing_route_metadata", review)
         return review
 
     review["short_support_source"] = _paper_only_route_review_text(
@@ -149,9 +278,40 @@ def _paper_only_short_route_review(route_status, *, config=None):
     review["block_reason"] = _paper_only_route_review_text(
         route_status.get("block_reason") or route_status.get("blocking_reason")
     )
+    review["paper_mode"] = _paper_only_route_mode_enabled(
+        _paper_only_route_review_lookup(route_status, "paper_mode", "paper_only", "execution_mode", "mode")
+    )
+    review["execution_mode"] = _paper_only_route_review_text(route_status.get("execution_mode"))
+    review["transport"] = _paper_only_route_review_text(
+        _paper_only_route_review_lookup(route_status, "route_transport", "transport")
+    )
+    review["simulated_venue_tag"] = _paper_only_route_review_text(
+        _paper_only_route_review_lookup(route_status, "simulated_venue_tag", "venue_tag")
+    )
+    review["fill_model"] = _paper_only_route_review_text(route_status.get("fill_model"))
+    review["deny_live_transmit"] = _paper_only_route_review_bool(
+        route_status.get("deny_live_transmit") or route_status.get("transport_guard")
+    )
+    review["route_resolution_policy"] = _paper_only_route_review_text(route_status.get("route_resolution_policy"))
+    review["paper_eligible"] = _paper_only_route_review_bool(route_status.get("paper_eligible"))
+    review["route_supported"] = _paper_only_route_review_bool(route_status.get("route_supported"))
+    review["trade_effect"] = _paper_only_route_review_text(route_status.get("trade_effect"))
 
     if not _paper_only_route_guard_short_frontier_spot_enabled(config):
+        if _paper_only_enforced_route_resolution_enabled(config):
+            if not _paper_only_route_has_explicit_paper_mode(route_status, config=config):
+                return _fallback_review("paper_mode_required", review)
+            if not _has_simulated_venue_tag(route_status):
+                return _fallback_review("missing_simulated_venue_tag", review)
+            if review["route_status"] is None:
+                return _fallback_review("unresolved_route_status", review)
         return review
+
+    if _paper_only_enforced_route_resolution_enabled(config):
+        if not _paper_only_route_has_explicit_paper_mode(route_status, config=config):
+            return _fallback_review("paper_mode_required", review)
+        if not _has_simulated_venue_tag(route_status):
+            return _fallback_review("missing_simulated_venue_tag", review)
 
     strategy_family = _paper_only_route_review_text(
         route_status.get("strategy_family") or route_status.get("candidate_family") or route_status.get("strategy")
@@ -176,7 +336,9 @@ def _paper_only_short_route_review(route_status, *, config=None):
         return review
 
     review["route_blocked"] = True
-    review["route_status"] = "blocked_route"
+    if review["route_status"] is None:
+        review["route_status"] = "blocked_route"
+
     if review["block_reason"] is None:
         review["block_reason"] = "short_route_unsupported" if short_explicitly_blocked else "short_route_support_unconfirmed"
     return review
@@ -189,8 +351,17 @@ def _paper_only_build_governor_fields(*, source="frontier_crypto_adapter", paper
         "source_module": source,
         "paper_only": bool(paper_only),
         "execution_mode": "paper",
+        "paper_mode": "enforced" if paper_only else "disabled",
+        "transport": "no_send" if paper_only else "none",
+        "fill_model": "synthetic_best_effort" if paper_only else "none",
+        "route_resolution_policy": "simulate_on_ambiguity" if paper_only else "none",
+        "venue_allowlist": "paper_sim_only" if paper_only else "none",
+        "deny_live_transmit": bool(paper_only),
+        "audit_tag": "execution_route_hunter_paper_only" if paper_only else "non_paper_context",
         "trade_effect": "none",
     }
+
+
 
 
 def paper_only_premarket_liquidity_gate(
