@@ -200,7 +200,19 @@ def _strict_recommendation_has_required_fields(payload: Any) -> bool:
         return False
     if not isinstance(payload.get("evidence"), dict):
         return False
+    if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(
+        payload["evidence"]
+    ):
+        return False
     if not isinstance(payload.get("proposed_change"), dict):
+        return False
+    if not STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET.issubset(
+        payload["proposed_change"]
+    ):
+        return False
+    if not str(payload.get("market_key") or "").startswith(
+        STRICT_RECOMMENDATION_REQUIRED_MARKET_KEY_PREFIX
+    ):
         return False
     return True
 
