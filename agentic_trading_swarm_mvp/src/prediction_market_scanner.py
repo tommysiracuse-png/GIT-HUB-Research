@@ -140,6 +140,46 @@ def _prediction_risk_flags(end_date: object, spread_bps: float, liquidity: float
     return flags
 
 
+def _days_to_end(end_date: object) -> float | None:
+    if not end_date:
+        return None
+    try:
+        end = dt.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    now = dt.datetime.now(dt.timezone.utc)
+    return (end - now).total_seconds() / 86400.0
+
+
+def _polymarket_paper_gate(candidate: dict, row: dict, settings: dict) -> tuple[bool, list[str]]:
+    config = settings.get("prediction_market_scanner", {}) or {}
+    if not config.get("polymarket_paper_gate_enabled", True):
+        return True, []
+    metadata = candidate.get("data_source") or {}
+    reasons = []
+    days_to_end = _days_to_end(row.get("endDate") or metadata.get("endDate"))
+    max_days = as_float(config.get("polymarket_max_days_to_resolution"), 30.0)
+    min_liquidity = as_float(config.get("polymarket_min_liquidity_usd"), 1_000.0)
+    max_spread_bps = as_float(config.get("polymarket_max_spread_bps"), 300.0)
+    if days_to_end is None:
+        reasons.append("missing_outcome_timestamp")
+    elif days_to_end < 0:
+        reasons.append("expired_or_resolution_pending")
+    elif max_days > 0 and days_to_end > max_days:
+        reasons.append("too_far_from_resolution")
+    if config.get("polymarket_require_visible_book", True):
+        if metadata.get("orderbook_status") != "verified":
+            reasons.append("missing_verified_orderbook")
+        if as_float(metadata.get("orderbook_best_bid")) <= 0 or as_float(metadata.get("orderbook_best_ask")) <= 0:
+            reasons.append("missing_visible_bid_ask")
+    if max_spread_bps > 0 and as_float(candidate.get("spread_bps")) > max_spread_bps:
+        reasons.append("paper_spread_too_wide")
+    liquidity_proxy = max(candidate.get("quote_volume_24h"), as_float(row.get("liquidityNum") or row.get("liquidity")), as_float(metadata.get("orderbook_depth_usd")))
+    if min_liquidity > 0 and liquidity_proxy < min_liquidity:
+        reasons.append("paper_liquidity_too_thin")
+    return not reasons, reasons
+
+
 def _book_depth_from_levels(levels: list, *, price_scale: float = 1.0) -> float:
     total = 0.0
     for level in levels[:20]:
@@ -286,13 +326,17 @@ def _polymarket_candidate_from_row(row: dict, settings: dict, orderbook: dict) -
     no = max(0.01, min(0.99, 1.0 - yes))
     one_week = as_float(row.get("oneWeekPriceChange"), 0.0) * 10_000.0
     direction = "buy_yes_event" if one_week >= 0 else "buy_no_event"
+    token_ids = _json_list(row.get("clobTokenIds") or row.get("clobTokenIDs"))
     price = yes if direction == "buy_yes_event" else no
     spread_bps = as_float(row.get("spread"), 0.03) * 10_000.0
     tag_details = _event_tag_details(row)
     metadata = {
         "provider": "Polymarket Gamma API",
         "slug": row.get("slug"),
+        "market_id": row.get("id"),
         "endDate": row.get("endDate"),
+        "outcome_timestamp_present": bool(row.get("endDate")),
+        "has_orderbook_token": bool(token_ids),
         "event_tags": tag_details["tags"],
         "event_tag_confidence": tag_details["confidence"],
         **orderbook,
@@ -320,6 +364,8 @@ def _polymarket_candidates(settings: dict, limit: int) -> tuple[list[dict], dict
     preliminary = []
     expired_filtered = 0
     enrich_top = int(settings.get("prediction_market_scanner", {}).get("orderbook_enrichment_top", 10))
+    paper_gate_filtered = 0
+    paper_gate_reasons = collections.Counter()
     row_by_id = {}
     for row in rows:
         if _end_date_bucket(row.get("endDate")) == "expired_or_resolution_pending":
@@ -347,13 +393,25 @@ def _polymarket_candidates(settings: dict, limit: int) -> tuple[list[dict], dict
             orderbook = _polymarket_orderbook(token_ids[0] if token_ids else None)
         rebuilt = _polymarket_candidate_from_row(row, settings, orderbook)
         if rebuilt:
-            candidates.append(rebuilt)
+            allowed, reasons = _polymarket_paper_gate(rebuilt, row, settings)
+            rebuilt_source = rebuilt.get("data_source") or {}
+            rebuilt_source["paper_gate_status"] = "pass" if allowed else "filtered"
+            rebuilt_source["paper_gate_reasons"] = reasons
+            rebuilt["data_source"] = rebuilt_source
+            if allowed:
+                candidates.append(rebuilt)
+            else:
+                paper_gate_filtered += 1
+                paper_gate_reasons.update(reasons or ["filtered_unspecified"])
     return candidates, {
         "provider": "POLYMARKET",
         "fetched_count": len(rows),
         "expired_filtered_count": expired_filtered,
         "candidate_count": len(candidates),
         "orderbook_enrichment_top": enrich_top,
+        "paper_gate_enabled": bool((settings.get("prediction_market_scanner", {}) or {}).get("polymarket_paper_gate_enabled", True)),
+        "paper_gate_filtered_count": paper_gate_filtered,
+        "paper_gate_reason_counts": dict(paper_gate_reasons),
     }
 
 
