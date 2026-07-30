@@ -139,6 +139,7 @@ class RecommendationRegistryTests(unittest.TestCase):
         result = reconcile_deployed_artifacts(self.conn)
 
         self.assertEqual(1, result["closed_count"])
+        self.assertEqual(1, result["reconciled_total_count"])
         self.assertEqual(
             "superseded_by_implemented_typed_recommendation_contract",
             self.conn.execute("select status from improvement_tasks where id = ?", (matching,)).fetchone()[0],
@@ -160,6 +161,7 @@ class RecommendationRegistryTests(unittest.TestCase):
         result = reconcile_deployed_artifacts(self.conn)
 
         self.assertEqual(0, result["closed_count"])
+        self.assertEqual(0, result["reconciled_total_count"])
         self.assertEqual(
             "open",
             self.conn.execute("select status from improvement_tasks where id = ?", (task_id,)).fetchone()[0],

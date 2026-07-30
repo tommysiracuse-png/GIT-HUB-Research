@@ -2007,7 +2007,8 @@ def _report_markdown(report: dict) -> str:
     if reconciliation:
         lines.append(
             f"- Already-deployed artifacts closed this loop: `{reconciliation.get('closed_count', 0)}` "
-            f"across `{reconciliation.get('closed_by_category', {})}`"
+            f"across `{reconciliation.get('closed_by_category', {})}`; "
+            f"reconciled total `{reconciliation.get('reconciled_total_count', 0)}`"
         )
     lines.extend(
         [

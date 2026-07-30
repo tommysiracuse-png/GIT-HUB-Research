@@ -375,10 +375,35 @@ def _matches_deployed_capability(payload: Mapping[str, Any], category: str) -> b
     table = str(payload.get("_artifact_table") or "")
     title = _normalized(payload.get("title") or payload.get("hypothesis"))
     if category == "typed_recommendation_contract":
+        contract_subject = any(
+            term in title
+            for term in (
+                "recommendation", "market_scout", "execution_route_hunter",
+                "build_planner", "planner output", "scout output", "scout payload",
+            )
+        )
+        contract_behavior = any(
+            term in title
+            for term in (
+                "json", "schema", "single object", "single-object", "output",
+                "payload", "structured fields", "validity", "validation",
+                "incomplete", "complete", "fail-closed recommendation ingestion",
+            )
+        )
+        strategy_behavior = any(
+            term in title
+            for term in ("entry gate", "entry filter", "momentum", "breakout", "liquidity", "spread", "signal scoring")
+        )
+        route_behavior = (
+            any(term in title for term in ("route selection", "fallback routing", "paper-route validation"))
+            and not any(term in title for term in ("json", "schema", "output", "payload", "structured", "recommendation object"))
+        )
         return (
             table in {"improvement_tasks", "growth_experiments"}
-            and any(term in title for term in ("json", "schema", "single object", "single-object", "recommendation payload", "valid paper-only format"))
-            and any(term in title for term in ("recommendation", "output", "payload", "schema", "market_scout", "execution_route_hunter", "build_planner"))
+            and contract_subject
+            and contract_behavior
+            and not strategy_behavior
+            and not route_behavior
         )
     if category == "route_conditioned_paper_gating":
         return (
@@ -392,7 +417,7 @@ def _matches_deployed_capability(payload: Mapping[str, Any], category: str) -> b
     if category == "active_paper_market_admission":
         return (
             table == "improvement_tasks"
-            and any(term in title for term in ("stale quote", "closed session", "market session"))
+            and any(term in title for term in ("stale quote", "stale-quote", "closed session", "market session"))
             and any(term in title for term in ("guard", "suppress", "admission", "before paper signal"))
         )
     if category == "bitso_public_depth":
@@ -444,6 +469,13 @@ def reconcile_deployed_artifacts(conn: sqlite3.Connection) -> dict[str, Any]:
                     implemented_category=category,
                 )
             closed.append({"table": table, "id": row["id"], "category": category, "status": status})
+    reconciled_total_by_category: dict[str, int] = {}
+    for category in sorted(available):
+        status = f"superseded_by_implemented_{category}"
+        reconciled_total_by_category[category] = sum(
+            int(conn.execute(f"select count(*) from {table} where status = ?", (status,)).fetchone()[0])
+            for table in ARTIFACT_QUERIES
+        )
     return {
         "available_categories": sorted(available),
         "closed_count": len(closed),
@@ -451,6 +483,8 @@ def reconcile_deployed_artifacts(conn: sqlite3.Connection) -> dict[str, Any]:
             category: sum(item["category"] == category for item in closed)
             for category in sorted({item["category"] for item in closed})
         },
+        "reconciled_total_count": sum(reconciled_total_by_category.values()),
+        "reconciled_total_by_category": reconciled_total_by_category,
         "closed": closed,
     }
 
