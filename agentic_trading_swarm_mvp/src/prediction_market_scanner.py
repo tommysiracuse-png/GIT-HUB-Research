@@ -17,6 +17,7 @@ import urllib.parse
 import urllib.request
 
 from scan_batch import ScanBatch, observation_from_candidate
+from strict_json_object import coerce_single_json_object
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -123,6 +124,7 @@ def _resolution_risk_status(end_date: object) -> str:
 
 
 def _prediction_risk_flags(end_date: object, spread_bps: float, liquidity: float, metadata: dict) -> list[str]:
+    metadata = coerce_single_json_object(metadata, default={})
     flags = []
     bucket = _end_date_bucket(end_date)
     if bucket in {"unknown", "expired_or_resolution_pending"}:
@@ -155,7 +157,7 @@ def _polymarket_paper_gate(candidate: dict, row: dict, settings: dict) -> tuple[
     config = settings.get("prediction_market_scanner", {}) or {}
     if not config.get("polymarket_paper_gate_enabled", True):
         return True, []
-    metadata = candidate.get("data_source") or {}
+    metadata = coerce_single_json_object(candidate.get("data_source"), default={})
     reasons = []
     days_to_end = _days_to_end(row.get("endDate") or metadata.get("endDate"))
     max_days = as_float(config.get("polymarket_max_days_to_resolution"), 30.0)
