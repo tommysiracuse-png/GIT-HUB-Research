@@ -2871,16 +2871,6 @@ def preflight_proposal(payload: dict, settings: dict, root: pathlib.Path = ROOT)
         invalid_targets = [raw for raw in invalid_targets if raw not in repairable_invalid]
         path_repairs.append({"from": repairable_invalid, "to": resolved, "resolver": "repo_capability_map"})
     if not target_files:
-        resolved = [
-            path
-            for path in [*repo_resolution.get("source_files", []), *repo_resolution.get("test_files", [])]
-            if not _path_blocked(path, cfg)
-        ]
-        if resolved:
-            used_default_targets = True
-            target_files = resolved
-            path_repairs.append({"from": "repo_capability_map", "to": resolved})
-    if not target_files:
         semantic_defaults = _semantic_target_files("", category, payload)
         if semantic_defaults:
             used_default_targets = True
@@ -2891,13 +2881,23 @@ def preflight_proposal(payload: dict, settings: dict, root: pathlib.Path = ROOT)
             ][:8]
             if target_files:
                 path_repairs.append({"from": "repo_aware_preflight", "to": target_files})
-        if not target_files:
+    if not target_files:
+        resolved = [
+            path
+            for path in [*repo_resolution.get("source_files", []), *repo_resolution.get("test_files", [])]
+            if not _path_blocked(path, cfg)
+        ]
+        if resolved:
             used_default_targets = True
-            target_files = [
-                rel
-                for rel in DEFAULT_CATEGORY_FILES.get(category, [])
-                if not _path_blocked(rel, cfg) and (root / rel).exists()
-            ][:8]
+            target_files = resolved
+            path_repairs.append({"from": "repo_capability_map", "to": resolved})
+    if not target_files:
+        used_default_targets = True
+        target_files = [
+            rel
+            for rel in DEFAULT_CATEGORY_FILES.get(category, [])
+            if not _path_blocked(rel, cfg) and (root / rel).exists()
+        ][:8]
     test_issues = []
     test_repairs = []
     parsed_tests = []
