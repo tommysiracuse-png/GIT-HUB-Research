@@ -13,6 +13,7 @@ try:
     from src.frontier_data_quality import (
         _paper_only_context_evidence_review,
         _paper_only_parse_timestamp,
+        paper_only_shadow_direction_inversion_review,
         paper_only_route_quality_record,
     )
 except ImportError:  # pragma: no cover - fallback for direct module execution
@@ -20,6 +21,7 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
         from frontier_data_quality import (
             _paper_only_context_evidence_review,
             _paper_only_parse_timestamp,
+            paper_only_shadow_direction_inversion_review,
             paper_only_route_quality_record,
         )
     except ImportError:  # pragma: no cover - route-quality enrichment becomes optional
@@ -64,6 +66,20 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "variant_state": "guard_disabled",
                 "activation_mode": "guard_disabled",
                 "reason": "guard_disabled",
+            }
+
+        def paper_only_shadow_direction_inversion_review(record, config=None):
+            return {
+                "enabled": False,
+                "applies": False,
+                "scope_matched": False,
+                "market_key": None,
+                "family": None,
+                "baseline_direction": None,
+                "shadow_direction": None,
+                "variant": None,
+                "reason": "guard_disabled",
+                "activation_mode": "guard_disabled",
             }
 
         paper_only_route_quality_record = None
@@ -564,6 +580,20 @@ def _paper_only_apply_context_inheritance_review(review, route_status, *, config
         review["variant_state"] = context_review.get("variant_state")
         review["recommendation_eligible"] = bool(context_review.get("eligible"))
         review["context_guard_reason"] = context_review.get("reason")
+    shadow_review = paper_only_shadow_direction_inversion_review(route_status, config=config)
+    if isinstance(shadow_review, dict) and shadow_review.get("enabled"):
+        review["shadow_direction_inversion_enabled"] = True
+        review["shadow_direction_inversion_applies"] = bool(shadow_review.get("applies"))
+        review["shadow_direction_inversion_reason"] = shadow_review.get("reason")
+        review["shadow_direction_activation_mode"] = shadow_review.get("activation_mode")
+        review["shadow_direction_market_key"] = shadow_review.get("market_key")
+        review["shadow_direction_family"] = shadow_review.get("family")
+        review["shadow_direction_baseline"] = shadow_review.get("baseline_direction")
+        review["shadow_direction_candidate"] = shadow_review.get("shadow_direction")
+        review["shadow_direction_variant"] = shadow_review.get("variant")
+        review["shadow_direction_scope_matched"] = bool(shadow_review.get("scope_matched"))
+        if shadow_review.get("signal_key"):
+            review["shadow_direction_signal_key"] = shadow_review.get("signal_key")
     if context_review.get("enabled") and not context_review.get("eligible"):
         if review.get("route_status") in (None, "", "eligible"):
             review["route_status"] = "paper_shadow_only"

@@ -56,6 +56,121 @@ def paper_only_data_freshness_review(observation, *, threshold_seconds=90, now=N
         review["eligible"] = False
         review["freshness_reason"] = "stale_quote_or_bar"
     return review
+
+
+PAPER_ONLY_SHADOW_DIRECTION_INVERSION_FLAG = "paper_only_shadow_direction_inversion_v1"
+PAPER_ONLY_SHADOW_DIRECTION_INVERSION_SCOPE = ("yahoo_proxy", "global_proxy_momentum")
+
+
+def _paper_only_shadow_direction_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disabled"}:
+        return False
+    return None
+
+
+def _paper_only_shadow_direction_text(value):
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized or None
+
+
+def _paper_only_shadow_direction_lookup(record, *keys):
+    if not isinstance(record, dict):
+        return None
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, "", [], {}, ()):
+            return value
+    return None
+
+
+def _paper_only_shadow_direction_enabled(config):
+    if not isinstance(config, dict):
+        return False
+    for container in (config, config.get("feature_flags")):
+        if not isinstance(container, dict):
+            continue
+        flag = _paper_only_shadow_direction_bool(container.get(PAPER_ONLY_SHADOW_DIRECTION_INVERSION_FLAG))
+        if flag is not None:
+            return flag
+    return False
+
+
+def paper_only_shadow_direction_inversion_review(record, *, config=None):
+    review = {
+        "enabled": _paper_only_shadow_direction_enabled(config),
+        "applies": False,
+        "scope_matched": False,
+        "market_key": None,
+        "family": None,
+        "baseline_direction": None,
+        "shadow_direction": None,
+        "variant": None,
+        "signal_key": None,
+        "reason": "feature_disabled",
+        "activation_mode": "parallel_shadow_only",
+    }
+    if not review["enabled"]:
+        return review
+    if not isinstance(record, dict):
+        review["reason"] = "missing_record"
+        return review
+
+    signal_key = _paper_only_shadow_direction_text(
+        _paper_only_shadow_direction_lookup(record, "signal_key", "strategy_key", "candidate_key")
+    )
+    signal_parts = tuple(part for part in str(signal_key or "").split("|") if part)
+    market_key = _paper_only_shadow_direction_text(
+        _paper_only_shadow_direction_lookup(record, "market_key", "source_market_key", "market")
+    ) or (signal_parts[0] if len(signal_parts) >= 1 else None)
+    family = _paper_only_shadow_direction_text(
+        _paper_only_shadow_direction_lookup(
+            record,
+            "family",
+            "strategy_family",
+            "candidate_family",
+            "directional_template",
+            "alpha_family",
+        )
+    ) or (signal_parts[1] if len(signal_parts) >= 2 else None)
+    baseline_direction = _paper_only_shadow_direction_text(
+        _paper_only_shadow_direction_lookup(record, "direction", "side", "candidate_direction", "signal_direction")
+    ) or (signal_parts[2] if len(signal_parts) >= 3 else None)
+    variant = _paper_only_shadow_direction_text(
+        _paper_only_shadow_direction_lookup(record, "variant", "variant_id", "entry_variant", "policy_variant")
+    ) or (signal_parts[3] if len(signal_parts) >= 4 else None)
+
+    review.update(
+        {
+            "market_key": market_key,
+            "family": family,
+            "baseline_direction": baseline_direction,
+            "variant": variant,
+            "signal_key": signal_key,
+        }
+    )
+    review["scope_matched"] = (market_key, family) == PAPER_ONLY_SHADOW_DIRECTION_INVERSION_SCOPE
+    if not review["scope_matched"]:
+        review["reason"] = "scope_mismatch"
+        return review
+
+    if baseline_direction in {"long", "long_proxy", "buy", "bullish"}:
+        review["shadow_direction"] = "short_proxy"
+    elif baseline_direction in {"short", "short_proxy", "sell", "bearish"}:
+        review["shadow_direction"] = "long_proxy"
+    else:
+        review["reason"] = "direction_unavailable"
+        return review
+
+    review["applies"] = True
+    review["reason"] = "shadow_direction_inversion"
+    return review
 """Targeted public order-book enrichment for frontier crypto observations."""
 
 
