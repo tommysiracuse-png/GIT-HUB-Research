@@ -49,6 +49,12 @@ POLICY_DIMENSIONS = [
     "instrument",
 ]
 
+EXACT_MARKET_TUPLE_REPORT_DIMENSIONS = [
+    "trade_type",
+    "direction",
+    "market_context_key",
+]
+
 REPORT_DIMENSIONS = [
     *POLICY_DIMENSIONS,
     "route_id",
@@ -56,6 +62,10 @@ REPORT_DIMENSIONS = [
     "feasibility_status",
     "policy_state",
 ]
+
+
+def _report_dimensions() -> list[str]:
+    return [*REPORT_DIMENSIONS, *EXACT_MARKET_TUPLE_REPORT_DIMENSIONS]
 
 
 def _utc_now() -> str:
@@ -163,12 +173,22 @@ def build_context_features(
         or feasibility.get("status")
         or "unknown"
     )
+    venue = str(candidate.get("venue") or "unknown")
+    direction = str(candidate.get("direction") or "unknown")
+    trade_type = str(
+        candidate.get("trade_type")
+        or review.get("trade_type")
+        or feasibility.get("trade_type")
+        or route.get("trade_type")
+        or "unknown"
+    )
     route_id = review.get("route_id") or feasibility.get("route_id") or route.get("route_id") or candidate.get("route_id")
     route_blocker = _first_route_blocker(feasibility, route, review)
     return {
         "venue": str(candidate.get("venue") or "unknown"),
         "instrument": str(candidate.get("inst_id") or "unknown"),
         "direction": str(candidate.get("direction") or "unknown"),
+        "trade_type": trade_type,
         "base_asset": str(candidate.get("base") or candidate.get("comparison_key") or "unknown"),
         "quote_asset": str(candidate.get("quote") or "unknown"),
         "data_status": str(candidate.get("data_status") or "unknown"),
@@ -210,6 +230,7 @@ def build_context_features(
         ),
         "hour_utc": _hour_utc(candidate, fallback=fallback_time),
         "policy_state": policy_state,
+        "market_context_key": f"{venue}|{trade_type}|{direction}",
     }
 
 
@@ -365,14 +386,16 @@ def _build_groups(trades: list[dict], settings: dict) -> list[dict]:
         signal = trade["signal_key"]
         grouped[(signal, "signal_family", "all")].append(trade)
         features = trade["features"]
-        for dim in REPORT_DIMENSIONS:
+        for dim in _report_dimensions():
             value = features.get(dim, "unknown")
             grouped[(signal, dim, str(value))].append(trade)
     output = []
     for (signal, dimension, value), items in grouped.items():
         metrics = _metrics(items)
         status = _classify(metrics, settings, dimension)
-        context_filter = {} if dimension == "signal_family" else {dimension: value}
+        context_filter = {}
+        if dimension in POLICY_DIMENSIONS:
+            context_filter = {dimension: value}
         output.append(
             {
                 "signal_key": signal,
@@ -411,7 +434,7 @@ def _augment_counts(conn: sqlite3.Connection, groups: list[dict]) -> None:
         signal = _signal_key_for(candidate, review)
         features = build_context_features(candidate, review, fallback_time=row["seen_at"])
         filtered = any(item.get("filtered") for item in review.get("applied_policies", []) if isinstance(item, dict))
-        for dim in REPORT_DIMENSIONS:
+        for dim in _report_dimensions():
             key = (signal, dim, str(features.get(dim, "unknown")))
             if key not in index:
                 continue
@@ -430,7 +453,7 @@ def _augment_counts(conn: sqlite3.Connection, groups: list[dict]) -> None:
         review = _parse_json(row["review_json"], {})
         signal = row["signal_key"] or _signal_key_for(candidate, review)
         features = build_context_features(candidate, review, fallback_time=row["opened_at"])
-        for dim in REPORT_DIMENSIONS:
+        for dim in _report_dimensions():
             key = (signal, dim, str(features.get(dim, "unknown")))
             if key in index:
                 index[key]["paper_entries_opened"] += 1
@@ -440,6 +463,8 @@ def _upsert_contextual_stats(conn: sqlite3.Connection, groups: Iterable[dict]) -
     now = _utc_now()
     for item in groups:
         if item.get("closed_count", 0) <= 0:
+            continue
+        if item.get("dimension") not in POLICY_DIMENSIONS and item.get("dimension") != "signal_family":
             continue
         key = f"{item['signal_key']}|{item['dimension']}={item['value']}"
         conn.execute(
