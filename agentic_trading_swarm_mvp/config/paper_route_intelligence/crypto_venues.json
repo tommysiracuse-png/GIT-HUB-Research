@@ -1,0 +1,92 @@
+{
+  "OKX_SPOT": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 10,
+    "estimated_maker_fee_bps": 2,
+    "api_execution_confidence": 0.92
+  },
+  "BYBIT_SPOT": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 10,
+    "estimated_maker_fee_bps": 2,
+    "api_execution_confidence": 0.90
+  },
+  "KRAKEN": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 12,
+    "estimated_maker_fee_bps": 4,
+    "api_execution_confidence": 0.88
+  },
+  "BITGET": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 10,
+    "estimated_maker_fee_bps": 2,
+    "api_execution_confidence": 0.86
+  },
+  "MEXC": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 10,
+    "estimated_maker_fee_bps": 2,
+    "api_execution_confidence": 0.84
+  },
+  "BINANCE_US": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 10,
+    "estimated_maker_fee_bps": 2,
+    "api_execution_confidence": 0.87
+  },
+  "GATE": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 10,
+    "estimated_maker_fee_bps": 2,
+    "api_execution_confidence": 0.85
+  },
+  "LUNO": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 15,
+    "estimated_maker_fee_bps": 5,
+    "api_execution_confidence": 0.78
+  },
+  "BUDA": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 15,
+    "estimated_maker_fee_bps": 5,
+    "api_execution_confidence": 0.76
+  },
+  "OKX": {
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": 10,
+    "estimated_maker_fee_bps": 2,
+    "api_execution_confidence": 0.91
+  }
+}
