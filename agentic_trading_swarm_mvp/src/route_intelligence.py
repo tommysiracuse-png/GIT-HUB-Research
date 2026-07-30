@@ -150,6 +150,22 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
     }
 
 
+def build_build_governor_fields(opportunities: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Return read-only Build Governor fields for paper-route diagnostics.
+
+    The output is informational only and is safe for paper/reporting use.
+    """
+
+    opportunities = list(opportunities)
+    return {
+        "paper_only": True,
+        "opportunity_count": len(opportunities),
+        "route_count": len(build_route_requirements_matrix(opportunities)),
+        "quality_gate": build_conditional_paper_quality_gate(opportunities),
+        "report_summary": build_route_playbook_summary(opportunities),
+    }
+
+
 def route_requirements_json(opportunities: Iterable[dict[str, Any]]) -> str:
     """Return an optional JSON sidecar payload without writing files."""
 
