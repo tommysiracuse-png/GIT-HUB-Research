@@ -222,8 +222,6 @@ def normalize_strict_recommendation_payload(candidate: Any) -> dict[str, Any]:
     merged["variant_config"] = _strip_array_structures(
         merged.get("variant_config")
     ) or fallback["variant_config"]
-    return merged
-
     return json.loads(json.dumps(_strip_array_structures(merged)))
 
 
