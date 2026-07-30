@@ -11,7 +11,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from recommendation_registry import backfill_open_artifacts, bind_artifact, claim_topic, registry_summary
+from recommendation_registry import (
+    backfill_open_artifacts,
+    bind_artifact,
+    claim_topic,
+    reconcile_deployed_artifacts,
+    registry_summary,
+)
 from storage import init_db
 
 
@@ -110,6 +116,54 @@ class RecommendationRegistryTests(unittest.TestCase):
         result = backfill_open_artifacts(self.conn)
         self.assertEqual(2, result["registered"] + result["superseded"])
         self.assertEqual(2, self.conn.execute("select count(*) from recommendation_topic_sources").fetchone()[0])
+
+    def test_reconcile_closes_only_narrow_deployed_capability_matches(self) -> None:
+        self.conn.execute(
+            "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 1, 'marker', '', 'implemented_typed_recommendation_contract')"
+        )
+        matching = self.conn.execute(
+            "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 90, ?, ?, 'open') returning id",
+            (
+                "Enforce complete JSON recommendation output for execution_route_hunter",
+                "Validate one schema-complete recommendation object.",
+            ),
+        ).fetchone()[0]
+        distinct = self.conn.execute(
+            "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 90, ?, ?, 'open') returning id",
+            (
+                "Improve execution route reasoning",
+                "Compare venue latency and fee evidence before ranking routes.",
+            ),
+        ).fetchone()[0]
+
+        result = reconcile_deployed_artifacts(self.conn)
+
+        self.assertEqual(1, result["closed_count"])
+        self.assertEqual(
+            "superseded_by_implemented_typed_recommendation_contract",
+            self.conn.execute("select status from improvement_tasks where id = ?", (matching,)).fetchone()[0],
+        )
+        self.assertEqual(
+            "open",
+            self.conn.execute("select status from improvement_tasks where id = ?", (distinct,)).fetchone()[0],
+        )
+
+    def test_reconcile_requires_an_existing_implemented_marker(self) -> None:
+        task_id = self.conn.execute(
+            "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 90, ?, ?, 'open') returning id",
+            (
+                "Enforce complete JSON recommendation output for execution_route_hunter",
+                "Validate one schema-complete recommendation object.",
+            ),
+        ).fetchone()[0]
+
+        result = reconcile_deployed_artifacts(self.conn)
+
+        self.assertEqual(0, result["closed_count"])
+        self.assertEqual(
+            "open",
+            self.conn.execute("select status from improvement_tasks where id = ?", (task_id,)).fetchone()[0],
+        )
 
 
 if __name__ == "__main__":

@@ -339,6 +339,122 @@ ARTIFACT_QUERIES = {
 }
 
 
+DEPLOYED_CAPABILITIES = {
+    "typed_recommendation_contract": (
+        "implemented_typed_recommendation_contract",
+        ("improvement_tasks",),
+    ),
+    "route_conditioned_paper_gating": (
+        "implemented_route_conditioned_paper_gating",
+        ("improvement_tasks",),
+    ),
+    "paper_family_quarantine": (
+        "implemented_paper_family_quarantine",
+        ("improvement_tasks",),
+    ),
+    "active_paper_market_admission": (
+        "implemented_active_paper_market_admission",
+        ("improvement_tasks",),
+    ),
+    "bitso_public_depth": (
+        "implemented_global_market_discovery_scan",
+        ("adapter_specs", "growth_experiments", "route_probe_tasks", "market_hunter_directives"),
+    ),
+}
+
+
+def _deployed_capability_exists(conn: sqlite3.Connection, category: str) -> bool:
+    status, tables = DEPLOYED_CAPABILITIES[category]
+    return any(
+        conn.execute(f"select 1 from {table} where status = ? limit 1", (status,)).fetchone()
+        for table in tables
+    )
+
+
+def _matches_deployed_capability(payload: Mapping[str, Any], category: str) -> bool:
+    table = str(payload.get("_artifact_table") or "")
+    title = _normalized(payload.get("title") or payload.get("hypothesis"))
+    if category == "typed_recommendation_contract":
+        return (
+            table in {"improvement_tasks", "growth_experiments"}
+            and any(term in title for term in ("json", "schema", "single object", "single-object", "recommendation payload", "valid paper-only format"))
+            and any(term in title for term in ("recommendation", "output", "payload", "schema", "market_scout", "execution_route_hunter", "build_planner"))
+        )
+    if category == "route_conditioned_paper_gating":
+        return (
+            table == "improvement_tasks"
+            and "route" in title
+            and any(term in title for term in ("borrow", "spot short", "conditional", "intelligence", "profile", "requirement", "feasibility"))
+            and any(term in title for term in ("gate", "block", "safeguard", "intelligence", "registry"))
+        )
+    if category == "paper_family_quarantine":
+        return table == "improvement_tasks" and "yahoo" in title and "proxy" in title and "quarantine" in title
+    if category == "active_paper_market_admission":
+        return (
+            table == "improvement_tasks"
+            and any(term in title for term in ("stale quote", "closed session", "market session"))
+            and any(term in title for term in ("guard", "suppress", "admission", "before paper signal"))
+        )
+    if category == "bitso_public_depth":
+        return (
+            table in {"improvement_tasks", "adapter_specs"}
+            and "bitso" in title
+            and any(term in title for term in ("depth", "order book", "public book"))
+            and any(term in title for term in ("wire", "activate", "adapter", "enrichment", "data gap"))
+        )
+    return False
+
+
+def reconcile_deployed_artifacts(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Close artifacts already satisfied by a deployed, DB-recorded capability."""
+    available = {
+        category for category in DEPLOYED_CAPABILITIES
+        if _deployed_capability_exists(conn, category)
+    }
+    closed: list[dict[str, Any]] = []
+    for table, (query, payload_builder) in ARTIFACT_QUERIES.items():
+        for row in conn.execute(query).fetchall():
+            payload = {**payload_builder(row), "_artifact_table": table}
+            category = next(
+                (
+                    candidate for candidate in sorted(available)
+                    if _matches_deployed_capability(payload, candidate)
+                ),
+                None,
+            )
+            if not category:
+                continue
+            status = f"superseded_by_implemented_{category}"
+            changed = conn.execute(
+                f"update {table} set status = ? where id = ? and status = 'open'",
+                (status, row["id"]),
+            ).rowcount
+            if not changed:
+                continue
+            source_ref = f"{table}:{row['id']}"
+            topic = conn.execute(
+                "select topic_key from recommendation_topic_sources where source_ref = ?",
+                (source_ref,),
+            ).fetchone()
+            if topic:
+                set_topic_status(
+                    conn,
+                    str(topic["topic_key"]),
+                    status,
+                    implemented_category=category,
+                )
+            closed.append({"table": table, "id": row["id"], "category": category, "status": status})
+    return {
+        "available_categories": sorted(available),
+        "closed_count": len(closed),
+        "closed_by_category": {
+            category: sum(item["category"] == category for item in closed)
+            for category in sorted({item["category"] for item in closed})
+        },
+        "closed": closed,
+    }
+
+
 def backfill_open_artifacts(conn: sqlite3.Connection, limit: int = 2000) -> dict[str, int]:
     """Register open legacy artifacts and supersede semantic duplicates without deletion."""
     counters = {"scanned": 0, "registered": 0, "superseded": 0, "already_registered": 0}

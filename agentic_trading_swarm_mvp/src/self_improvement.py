@@ -42,7 +42,13 @@ from code_evolution import (
 )
 from self_improvement_open_pack import IMPLEMENTED_STATUS as OPEN_PACK_IMPLEMENTED_STATUS
 from self_improvement_open_pack import is_duplicate_open_pack_text
-from recommendation_registry import backfill_open_artifacts, bind_artifact, claim_topic, registry_summary
+from recommendation_registry import (
+    backfill_open_artifacts,
+    bind_artifact,
+    claim_topic,
+    reconcile_deployed_artifacts,
+    registry_summary,
+)
 
 
 ACTIVE_POLICIES_JSON = RUNS_DIR / "active_signal_policies.json"
@@ -1783,6 +1789,7 @@ def run_auto_improvement(
     evaluated = evaluate_active_experiments(conn, settings)
     code_evolution_evaluated = evaluate_code_evolution(conn, settings)
     registry_backfill = backfill_open_artifacts(conn)
+    deployed_reconciliation = reconcile_deployed_artifacts(conn)
     consumed = []
     max_tasks = int(cfg.get("max_tasks_per_loop", 5))
     for rec in llm_recommendations_for_auto_execution(
@@ -1892,6 +1899,7 @@ def run_auto_improvement(
         "code_evolution": write_code_evolution_reports(conn, settings),
         "recommendation_registry": registry_summary(conn),
         "recommendation_registry_backfill": registry_backfill,
+        "deployed_artifact_reconciliation": deployed_reconciliation,
     }
     return write_reports(conn, report, settings=settings)
 
@@ -1994,6 +2002,12 @@ def _report_markdown(report: dict) -> str:
             f"- Recommendation topics: `{registry.get('topics', 0)}` canonical; "
             f"duplicates suppressed `{registry.get('duplicates_suppressed', 0)}`; "
             f"reopened from new evidence `{registry.get('reopened', 0)}`"
+        )
+    reconciliation = report.get("deployed_artifact_reconciliation") or {}
+    if reconciliation:
+        lines.append(
+            f"- Already-deployed artifacts closed this loop: `{reconciliation.get('closed_count', 0)}` "
+            f"across `{reconciliation.get('closed_by_category', {})}`"
         )
     lines.extend(
         [
