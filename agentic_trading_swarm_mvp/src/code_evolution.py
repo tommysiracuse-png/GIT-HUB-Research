@@ -129,6 +129,28 @@ STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS = (
 STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS_SET = set(
     STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS
 )
+_PAPER_ONLY_RECOMMENDATION_FALLBACK = {
+    "action": "hold",
+    "priority": 0,
+    "title": "Paper-only recommendation fallback",
+    "rationale": "Fallback used when recommendation payloads are malformed or incomplete.",
+    "market_key": STRICT_RECOMMENDATION_FALLBACK_MARKET_KEY,
+    "evidence": {
+        "constraint": "paper_only",
+        "issue": "invalid_recommendation_payload",
+        "risk": "schema_parse_failure",
+    },
+    "proposed_change": {
+        "goal": "preserve paper-only parsing",
+        "constraints": "single top-level JSON object only",
+    },
+    "variant_config": {
+        "fallback_policy": "hold",
+        "live_trading": "disabled",
+        "route_selection_mode": "strict_single_object",
+        "validation_rule": "paper_only",
+    },
+}
 
 
 def _strip_array_structures(value: Any) -> Any:
@@ -187,6 +209,20 @@ def normalize_strict_recommendation_payload(candidate: Any) -> dict[str, Any]:
 
     for key, value in fallback.items():
         merged.setdefault(key, value)
+
+    merged["action"] = merged.get("action") or fallback["action"]
+    merged["priority"] = merged.get("priority", fallback["priority"])
+    merged["title"] = merged.get("title") or fallback["title"]
+    merged["rationale"] = merged.get("rationale") or fallback["rationale"]
+    merged["market_key"] = merged.get("market_key") or fallback["market_key"]
+    merged["evidence"] = _strip_array_structures(merged.get("evidence")) or fallback["evidence"]
+    merged["proposed_change"] = _strip_array_structures(
+        merged.get("proposed_change")
+    ) or fallback["proposed_change"]
+    merged["variant_config"] = _strip_array_structures(
+        merged.get("variant_config")
+    ) or fallback["variant_config"]
+    return merged
 
     return json.loads(json.dumps(_strip_array_structures(merged)))
 
