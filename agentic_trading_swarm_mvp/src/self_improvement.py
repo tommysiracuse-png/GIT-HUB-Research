@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
 import sqlite3
 
 from storage import (
@@ -579,17 +580,46 @@ def _infer_code_category(payload: dict) -> str:
     return "runtime_pipeline_integration"
 
 
+def _normalize_expected_file_path(path: object) -> str:
+    normalized = str(path or "").strip()
+    if not normalized:
+        return ""
+    normalized = re.sub(r"^(?:[-*•]\s+|\d+\.\s+)", "", normalized).strip()
+    normalized = normalized.strip(" \t\r\n,;")
+    while len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"`", "'", '"'}:
+        normalized = normalized[1:-1].strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.replace("\\", "/").strip()
+
+
 def _explicit_expected_files(payload: dict, code_change: dict) -> list[str]:
     for value in (code_change.get("expected_files"), payload.get("expected_files"), payload.get("files_expected_to_change")):
         if isinstance(value, str) and value.strip():
-            return [value.strip()]
+            raw_items = [line for line in value.splitlines() if line.strip()]
+            if not raw_items:
+                raw_items = [value]
+        elif isinstance(value, list):
+            raw_items = [str(item) for item in value if str(item).strip()]
+        else:
+            continue
+        normalized_items: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            normalized = _normalize_expected_file_path(item)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            normalized_items.append(normalized)
+        if normalized_items:
+            return normalized_items
         if isinstance(value, list):
-            return [str(item) for item in value if str(item).strip()]
+            return []
     return []
 
 
 def _allowed_expected_file(path: str) -> bool:
-    normalized = str(path or "").strip().replace("\\", "/")
+    normalized = _normalize_expected_file_path(path)
     if not normalized:
         return False
     if normalized in RECOMMENDATION_ALLOWED_FILES:
