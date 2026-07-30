@@ -90,6 +90,7 @@ _PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS = {
 _PAPER_ONLY_ROUTE_GUARD_MIN_LIQUIDITY_FLAG = "paper_route_guard_min_liquidity_v1"
 _PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG = "paper_route_guard_short_frontier_spot_v1"
 _PAPER_ONLY_ENFORCED_ROUTE_RESOLUTION_FLAG = "paper_only_enforced_route_resolution_v1"
+_PAPER_ONLY_STRATEGY_LAB_EXACT_CONTEXT_PROMOTION_FLAG = "paper_only_strategy_lab_exact_context_promotion_v1"
 _PAPER_ONLY_SPREAD_VOLATILITY_GATE_FLAG = "paper_only_spread_volatility_gate_v1"
 
 
@@ -173,6 +174,116 @@ def _paper_only_route_guard_short_frontier_spot_enabled(config):
     return False
 
 
+def _paper_only_strategy_lab_exact_context_guard_enabled(config, *, context_review=None):
+    direct_flag = None
+    if isinstance(config, dict):
+        direct_flag = _paper_only_route_review_bool(config.get(_PAPER_ONLY_STRATEGY_LAB_EXACT_CONTEXT_PROMOTION_FLAG))
+        if direct_flag is None:
+            feature_flags = config.get("feature_flags")
+            if isinstance(feature_flags, dict):
+                direct_flag = _paper_only_route_review_bool(
+                    feature_flags.get(_PAPER_ONLY_STRATEGY_LAB_EXACT_CONTEXT_PROMOTION_FLAG)
+                )
+    if direct_flag is not None:
+        return bool(direct_flag)
+    return bool(isinstance(context_review, dict) and context_review.get("enabled"))
+
+
+def _paper_only_route_context_value(route_status, direct_keys, *, nested_keys=()):
+    if not isinstance(route_status, dict):
+        return None
+    for key in direct_keys:
+        value = route_status.get(key)
+        if value not in (None, "", [], {}, ()):
+            return value
+    for nested_key in nested_keys:
+        nested = route_status.get(nested_key)
+        if not isinstance(nested, dict):
+            continue
+        for key in direct_keys:
+            value = nested.get(key)
+            if value not in (None, "", [], {}, ()):
+                return value
+    return None
+
+
+def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_review=None, config=None):
+    review = {
+        "enabled": False,
+        "applies": False,
+        "exact_context_required": False,
+        "match": True,
+        "block_promotion": False,
+        "reason": None,
+        "mismatch_fields": [],
+        "source_context": {},
+        "target_context": {},
+    }
+    if not isinstance(route_status, dict):
+        return review
+
+    review["enabled"] = _paper_only_strategy_lab_exact_context_guard_enabled(config, context_review=context_review)
+    origin_tokens = []
+    for value in (
+        _paper_only_route_context_value(
+            route_status,
+            ("recommendation_source", "promotion_source", "source_agent", "origin", "strategy_source"),
+            nested_keys=("recommendation_metadata", "strategy_metadata", "promotion_context", "strategy_lab_context"),
+        ),
+        route_status.get("experiment_id"),
+        route_status.get("variant_id"),
+        route_status.get("strategy_lab_variant"),
+    ):
+        text = _paper_only_safe_route_tag(value)
+        if text:
+            origin_tokens.append(text)
+
+    review["applies"] = any("strategy_lab" in token for token in origin_tokens)
+    review["exact_context_required"] = bool(review["enabled"] and review["applies"])
+    if not review["exact_context_required"]:
+        return review
+
+    field_aliases = {
+        "venue_family": {
+            "source": ("source_venue_family", "recommendation_venue_family", "promotion_venue_family", "venue_family"),
+            "target": ("target_venue_family", "venue_family", "execution_venue_family", "venue", "execution_venue"),
+        },
+        "execution_surface": {
+            "source": ("source_execution_surface", "recommendation_execution_surface", "promotion_execution_surface"),
+            "target": ("target_execution_surface", "execution_surface", "surface", "market_surface", "market_type"),
+        },
+        "directional_template": {
+            "source": (
+                "source_directional_template",
+                "recommendation_directional_template",
+                "promotion_directional_template",
+                "source_strategy_family",
+            ),
+            "target": ("target_directional_template", "directional_template", "strategy_family", "candidate_family", "strategy"),
+        },
+        "market_regime_tag": {
+            "source": ("source_market_regime_tag", "recommendation_market_regime_tag", "promotion_market_regime_tag"),
+            "target": ("target_market_regime_tag", "market_regime_tag", "regime_tag", "market_regime"),
+        },
+    }
+    nested_source_keys = ("strategy_lab_context", "source_context", "promotion_context", "recommendation_context", "recommendation_metadata")
+    nested_target_keys = ("target_context", "recommendation_context", "recommendation_metadata", "strategy_metadata")
+
+    for field_name, aliases in field_aliases.items():
+        source_value = _paper_only_route_context_value(route_status, aliases["source"], nested_keys=nested_source_keys)
+        target_value = _paper_only_route_context_value(route_status, aliases["target"], nested_keys=nested_target_keys)
+        source_text = _paper_only_safe_route_tag(source_value)
+        target_text = _paper_only_safe_route_tag(target_value)
+        review["source_context"][field_name] = source_text
+        review["target_context"][field_name] = target_text
+        if source_text and target_text and source_text != target_text:
+            review["match"] = False
+            review["mismatch_fields"].append(field_name)
+
+    if not review["match"]:
+        review["block_promotion"] = True
+        review["reason"] = "strategy_lab_exact_context_mismatch"
+    return review
 def _paper_only_route_guard_min_liquidity_enabled(config):
     if not isinstance(config, dict):
         return False
