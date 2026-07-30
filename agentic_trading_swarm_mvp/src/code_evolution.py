@@ -153,6 +153,41 @@ _PAPER_ONLY_RECOMMENDATION_FALLBACK = {
 }
 
 
+def is_strict_recommendation_schema_valid(candidate: Any) -> bool:
+    """Return True only for paper-safe recommendations with required fields."""
+
+    normalized = _parse_single_json_object(candidate)
+    if not isinstance(normalized, dict):
+        return False
+
+    required_top_level = STRICT_REQUIRED_RECOMMENDATION_FIELDS_SET
+    if not required_top_level.issubset(normalized):
+        return False
+
+    evidence = normalized.get("evidence")
+    proposed_change = normalized.get("proposed_change")
+    variant_config = normalized.get("variant_config")
+
+    if not isinstance(evidence, dict) or not isinstance(proposed_change, dict):
+        return False
+    if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(evidence):
+        return False
+    if not STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET.issubset(
+        proposed_change
+    ):
+        return False
+
+    if variant_config is not None:
+        if not isinstance(variant_config, dict):
+            return False
+        if not STRICT_RECOMMENDATION_REQUIRED_VARIANT_CONFIG_FIELDS_SET.issubset(
+            variant_config
+        ):
+            return False
+
+    return True
+
+
 def _strip_array_structures(value: Any) -> Any:
     """Return a paper-safe tree with array-like values removed."""
 
