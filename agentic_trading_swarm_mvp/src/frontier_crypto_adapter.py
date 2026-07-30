@@ -92,6 +92,7 @@ _PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG = "paper_route_guard_short_frontier_
 _PAPER_ONLY_ENFORCED_ROUTE_RESOLUTION_FLAG = "paper_only_enforced_route_resolution_v1"
 _PAPER_ONLY_STRATEGY_LAB_EXACT_CONTEXT_PROMOTION_FLAG = "paper_only_strategy_lab_exact_context_promotion_v1"
 _PAPER_ONLY_SPREAD_VOLATILITY_GATE_FLAG = "paper_only_spread_volatility_gate_v1"
+_PAPER_ONLY_SHADOW_DIRECTION_INVERSION_FLAG = "paper_only_shadow_direction_inversion_v1"
 
 
 def _paper_only_route_review_text(value):
@@ -358,6 +359,195 @@ def _paper_only_route_status_text(route_status):
     return _paper_only_route_review_text(route_status)
 
 
+def _paper_only_shadow_direction_inversion_enabled(config):
+    if not isinstance(config, dict):
+        return False
+    direct_flag = _paper_only_route_review_bool(config.get(_PAPER_ONLY_SHADOW_DIRECTION_INVERSION_FLAG))
+    if direct_flag is not None:
+        return direct_flag
+    feature_flags = config.get("feature_flags")
+    if isinstance(feature_flags, dict):
+        nested_flag = _paper_only_route_review_bool(feature_flags.get(_PAPER_ONLY_SHADOW_DIRECTION_INVERSION_FLAG))
+        if nested_flag is not None:
+            return nested_flag
+    return False
+
+
+def _paper_only_shadow_direction_inversion_scope(route_status, *, context_review=None):
+    tokens = []
+
+    def _append_token(value):
+        text = _paper_only_safe_route_tag(value)
+        if text:
+            tokens.append(text)
+
+    if isinstance(context_review, dict):
+        for key in ("context_signature_key", "context_signature", "reason"):
+            _append_token(context_review.get(key))
+    if isinstance(route_status, dict):
+        candidate_keys = (
+            "market_key",
+            "signal_key",
+            "family",
+            "strategy",
+            "strategy_family",
+            "candidate_family",
+            "directional_template",
+            "variant_id",
+            "experiment_id",
+            "signal_family",
+        )
+        nested_keys = (
+            "recommendation_metadata",
+            "strategy_metadata",
+            "promotion_context",
+            "strategy_lab_context",
+            "recommendation_context",
+        )
+        for key in candidate_keys:
+            _append_token(route_status.get(key))
+        for nested_key in nested_keys:
+            nested = route_status.get(nested_key)
+            if not isinstance(nested, dict):
+                continue
+            for key in candidate_keys:
+                _append_token(nested.get(key))
+
+    joined = " ".join(tokens)
+    in_scope = "yahoo_proxy" in joined and "global_proxy_momentum" in joined
+    return {
+        "in_scope": bool(in_scope),
+        "market_key": "YAHOO_PROXY" if "yahoo_proxy" in joined else None,
+        "signal_family": "global_proxy_momentum" if "global_proxy_momentum" in joined else None,
+    }
+
+
+def _paper_only_shadow_direction_inversion_baseline(route_status, *, context_review=None):
+    candidates = []
+    if isinstance(route_status, dict):
+        direct_keys = (
+            "direction",
+            "side",
+            "signal_side",
+            "candidate_direction",
+            "recommended_side",
+            "position_side",
+            "position_direction",
+            "signal_key",
+            "variant_id",
+            "strategy_family",
+            "candidate_family",
+        )
+        nested_keys = (
+            "recommendation_metadata",
+            "strategy_metadata",
+            "promotion_context",
+            "strategy_lab_context",
+            "recommendation_context",
+        )
+        for key in direct_keys:
+            candidates.append(route_status.get(key))
+        for nested_key in nested_keys:
+            nested = route_status.get(nested_key)
+            if not isinstance(nested, dict):
+                continue
+            for key in direct_keys:
+                candidates.append(nested.get(key))
+    if isinstance(context_review, dict):
+        candidates.extend(
+            [
+                context_review.get("context_signature_key"),
+                context_review.get("context_signature"),
+            ]
+        )
+
+    for candidate in candidates:
+        text = _paper_only_safe_route_tag(candidate)
+        if not text:
+            continue
+        if (
+            text in {"buy", "long", "long_only"}
+            or "long_proxy" in text
+            or text.startswith("long_")
+            or text.endswith("_long")
+        ):
+            return "long"
+        if (
+            text in {"sell", "short", "short_only"}
+            or "short_proxy" in text
+            or text.startswith("short_")
+            or text.endswith("_short")
+        ):
+            return "short"
+    return None
+
+
+def _paper_only_shadow_direction_inversion_review(route_status, *, context_review=None, config=None):
+    review = {
+        "enabled": False,
+        "eligible": False,
+        "paper_only": True,
+        "preserve_baseline": True,
+        "activation_mode": "paper_shadow_parallel",
+        "variant": "shadow_direction_inversion",
+        "market_key": None,
+        "signal_family": None,
+        "baseline_direction": None,
+        "shadow_direction": None,
+        "sample_size": None,
+        "min_sample_size": 20.0,
+        "expectancy_bps": None,
+        "publish_shadow_candidate": False,
+        "reason": "guard_disabled",
+    }
+    review["enabled"] = _paper_only_shadow_direction_inversion_enabled(config)
+    if not review["enabled"]:
+        return review
+
+    scope = _paper_only_shadow_direction_inversion_scope(route_status, context_review=context_review)
+    review["market_key"] = scope.get("market_key")
+    review["signal_family"] = scope.get("signal_family")
+    if not scope.get("in_scope"):
+        review["reason"] = "out_of_scope_family"
+        return review
+
+    if isinstance(context_review, dict):
+        review["sample_size"] = _paper_only_route_review_float(context_review.get("sample_size"))
+        min_sample_size = _paper_only_route_review_float(context_review.get("min_sample_size"))
+        if min_sample_size is not None:
+            review["min_sample_size"] = float(min_sample_size)
+        review["expectancy_bps"] = _paper_only_route_review_float(context_review.get("expectancy_bps"))
+    if review["sample_size"] is None:
+        review["reason"] = "missing_sample_size"
+        return review
+    if float(review["sample_size"]) < float(review["min_sample_size"]):
+        review["reason"] = "insufficient_sample_size"
+        return review
+    if review["expectancy_bps"] is None:
+        review["reason"] = "missing_expectancy"
+        return review
+    if float(review["expectancy_bps"]) >= 0.0:
+        review["reason"] = "non_negative_expectancy"
+        return review
+
+    review["baseline_direction"] = _paper_only_shadow_direction_inversion_baseline(
+        route_status,
+        context_review=context_review,
+    )
+    if review["baseline_direction"] == "long":
+        review["shadow_direction"] = "short"
+    elif review["baseline_direction"] == "short":
+        review["shadow_direction"] = "long"
+    else:
+        review["reason"] = "direction_unresolved"
+        return review
+
+    review["eligible"] = True
+    review["publish_shadow_candidate"] = True
+    review["reason"] = "negative_expectancy_shadow_inverse"
+    return review
+
+
 def _paper_only_apply_context_inheritance_review(review, route_status, *, config=None):
     if not isinstance(review, dict):
         return review
@@ -379,6 +569,18 @@ def _paper_only_apply_context_inheritance_review(review, route_status, *, config
             review["route_status"] = "paper_shadow_only"
         review["paper_eligible"] = False
         review["trade_effect"] = review.get("trade_effect") or "none"
+    shadow_review = _paper_only_shadow_direction_inversion_review(
+        route_status,
+        context_review=context_review,
+        config=config,
+    )
+    review["shadow_direction_inversion"] = shadow_review
+    if shadow_review.get("enabled"):
+        review["shadow_activation_mode"] = shadow_review.get("activation_mode")
+        review["shadow_publish"] = bool(shadow_review.get("publish_shadow_candidate"))
+        review["shadow_reason"] = shadow_review.get("reason")
+        review["shadow_variant"] = shadow_review.get("variant")
+        review["shadow_direction"] = shadow_review.get("shadow_direction")
     return review
 
 
