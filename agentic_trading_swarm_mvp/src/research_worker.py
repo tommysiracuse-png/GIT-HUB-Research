@@ -71,6 +71,51 @@ DISCOVERY_SURFACES = (
 
 PROHIBITED_RESEARCH_TERMS = ("stolen data", "hacked data", "private leak", "inside information")
 
+NGX_DIRECT_DISCOVERY_SEED: dict[str, Any] = {
+    "surface_type_raw": "cash equity benchmark and top-liquid constituent public market data",
+    "venue_or_source": "Nigerian Exchange Group",
+    "country": "Nigeria",
+    "region": "West Africa",
+    "asset_or_event": "NGX All-Share context via top-liquid Nigeria names such as DANGCEM, GTCO, and SEPLAT",
+    "data_access_type": "public_no_key",
+    "tradability_guess": "watch_only",
+    "public_docs_url": "https://ngxgroup.com/",
+    "source_urls": [
+        "https://ngxgroup.com/",
+        "https://ngxgroup.com/exchange/",
+        "https://ngxgroup.com/exchange/data/market-report/",
+    ],
+    "adapter_route_id": "ngx_cash_public_shadow",
+    "adapter_request_hint": {
+        "method": "GET",
+        "path": "/paper/ngx/quotes",
+        "provider_mode": "public_web_quote_or_delayed_feed",
+        "paper_only": True,
+        "headers": {
+            "Accept": "application/json",
+            "User-Agent": "paper-research",
+        },
+        "response_fields": [
+            "symbol",
+            "last_price",
+            "percent_change",
+            "quote_timestamp",
+            "data_freshness_minutes",
+            "session_status",
+            "spread_bps_proxy",
+            "turnover_proxy",
+            "currency",
+            "source_venue",
+        ],
+    },
+    "why_interesting": "Nigeria is missing from frontier-Africa proxy coverage while adjacent regional equity discovery has shown positive paper-only signal potential.",
+    "inefficiency_hypothesis": "Venue-native Nigeria benchmark and top-liquid names may surface regional momentum, liquidity, and currency-sensitive repricing earlier than broad international proxy baskets.",
+    "latency_sensitivity": "low",
+    "liquidity_hint": "benchmark_or_top_liquid_names_only",
+    "route_blockers": ["venue_native_symbol_map", "quote_delay_allowed", "freshness_validation", "spread_proxy_estimation"],
+    "recommended_next_action": "adapter_spec",
+}
+
 JSE_DIRECT_DISCOVERY_SEED: dict[str, Any] = {
     "surface_type_raw": "cash equity benchmark and top-liquid constituent public market data",
     "venue_or_source": "Johannesburg Stock Exchange",
