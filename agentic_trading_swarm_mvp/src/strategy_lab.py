@@ -37,6 +37,14 @@ TRACKED_STATUSES = {
     "retired_no_activity",
     "rejected_invalid",
 }
+EXPERIMENT_TYPES = {
+    "market_strategy",
+    "risk_filter",
+    "execution_filter",
+    "system_repair",
+    "reporting_quality",
+}
+DEFAULT_EXPERIMENT_TYPE = "market_strategy"
 SUPPORTED_LOGIC_TYPES = {"candidate_filter", "candidate_selector", "candidate_transform"}
 FALLBACK_TRADE_TYPE_EXAMPLES = {
     "frontier_crypto_venue_map",
@@ -264,6 +272,143 @@ def _first_dict(*values: Any) -> dict:
     return {}
 
 
+def _normalize_experiment_type(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    return text if text in EXPERIMENT_TYPES else None
+
+
+def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in text for token in tokens)
+
+
+def _text_blob(*values: Any) -> str:
+    pieces: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (dict, list, tuple)):
+            pieces.append(json.dumps(value, sort_keys=True, default=str))
+        else:
+            pieces.append(str(value))
+    return " ".join(pieces).lower()
+
+
+def _classify_experiment_type(contract: dict, payload: dict, logic: dict) -> str:
+    explicit = (
+        _normalize_experiment_type(contract.get("experiment_type"))
+        or _normalize_experiment_type(contract.get("strategy_lab_experiment_type"))
+        or _normalize_experiment_type(payload.get("experiment_type"))
+        or _normalize_experiment_type(payload.get("strategy_lab_experiment_type"))
+    )
+    if explicit:
+        return explicit
+
+    text = _text_blob(
+        contract.get("strategy_lab_id"),
+        contract.get("hypothesis"),
+        payload.get("title"),
+        payload.get("rationale"),
+        payload.get("market_key"),
+        payload.get("signal_key"),
+        logic,
+    )
+    has_surface = bool(_as_list(logic.get("trade_types")) or _as_list(logic.get("directions")))
+    alpha_terms = (
+        "capture",
+        "carry",
+        "arbitrage",
+        "mean reversion",
+        "mean-reversion",
+        "momentum",
+        "dislocation",
+        "reversal",
+        "continuation",
+        "spread trade",
+        "basis",
+        "funding",
+        "regional",
+        "proxy",
+        "prediction",
+        "event",
+        "odds",
+        "frontier",
+    )
+    repair_terms = (
+        "malformed",
+        "schema",
+        "json",
+        "parse",
+        "parser",
+        "recommendation output",
+        "proposal format",
+        "serialization",
+        "code evolution",
+        "patch",
+        "invalid path",
+        "test command",
+    )
+    reporting_terms = ("report", "dashboard", "packet", "visibility", "summary", "markdown")
+    filter_terms = (
+        "filter",
+        "gate",
+        "tighten",
+        "demote",
+        "cooldown",
+        "quarantine",
+        "block",
+        "cap",
+        "false positive",
+        "decay",
+        "risk",
+        "weak",
+        "failing",
+    )
+    execution_terms = (
+        "route",
+        "borrow",
+        "slippage",
+        "spread",
+        "liquidity",
+        "order book",
+        "order-book",
+        "freshness",
+        "quality gate",
+        "execution",
+    )
+
+    if _contains_any(text, repair_terms) and not has_surface:
+        return "system_repair"
+    if _contains_any(text, reporting_terms) and not has_surface:
+        return "reporting_quality"
+    if _contains_any(text, filter_terms) and not has_surface:
+        return "risk_filter"
+    if has_surface and _contains_any(text, alpha_terms):
+        return "market_strategy"
+    if _contains_any(text, execution_terms) and _contains_any(text, filter_terms):
+        return "execution_filter"
+    if _contains_any(text, filter_terms):
+        return "risk_filter"
+    if has_surface or _contains_any(text, alpha_terms):
+        return "market_strategy"
+    if _contains_any(text, repair_terms):
+        return "system_repair"
+    if _contains_any(text, reporting_terms):
+        return "reporting_quality"
+    return DEFAULT_EXPERIMENT_TYPE
+
+
+def _resolved_experiment_type(stored: Any, item: dict, logic: dict) -> str:
+    stored_type = _normalize_experiment_type(stored)
+    if stored_type and stored_type != DEFAULT_EXPERIMENT_TYPE:
+        return stored_type
+    infer_item = dict(item)
+    infer_item.pop("experiment_type", None)
+    inferred = _classify_experiment_type(infer_item, infer_item, logic)
+    if inferred != DEFAULT_EXPERIMENT_TYPE:
+        return inferred
+    return stored_type or inferred
+
+
 def _contract_from_payload(payload: dict) -> dict:
     proposed = payload.get("proposed_change")
     contract = _first_dict(
@@ -305,6 +450,7 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
         status = "active_testing"
     logic["type"] = logic_type
     logic = _normalize_strategy_logic(logic)
+    experiment_type = _classify_experiment_type(contract, payload, logic)
 
     strategy_lab_id = str(contract.get("strategy_lab_id") or "").strip()
     if not strategy_lab_id:
@@ -323,6 +469,7 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
         "strategy_lab_id": strategy_lab_id,
         "version": version,
         "parent_strategy_lab_id": str(parent).strip() if parent else None,
+        "experiment_type": experiment_type,
         "status": status,
         "hypothesis": hypothesis,
         "strategy_logic": logic,
@@ -349,6 +496,7 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
         contract["strategy_lab_id"],
         contract["version"],
         contract["parent_strategy_lab_id"],
+        contract["experiment_type"],
         contract["status"],
         contract["hypothesis"],
         json.dumps(contract["strategy_logic"], sort_keys=True),
@@ -364,11 +512,11 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
         conn.execute(
             """
             insert into strategy_lab_experiments (
-                strategy_lab_id, version, parent_strategy_lab_id, status, hypothesis,
+                strategy_lab_id, version, parent_strategy_lab_id, experiment_type, status, hypothesis,
                 strategy_logic_json, data_requirements_json, risk_gates_json,
                 promotion_rules_json, source_agent, source_recommendation_id,
                 created_at, updated_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -383,6 +531,7 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
                     else ?
                 end,
                 hypothesis = ?,
+                experiment_type = ?,
                 strategy_logic_json = ?,
                 data_requirements_json = ?,
                 risk_gates_json = ?,
@@ -394,6 +543,7 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
                 now,
                 contract["status"],
                 contract["hypothesis"],
+                contract["experiment_type"],
                 json.dumps(contract["strategy_logic"], sort_keys=True),
                 json.dumps(contract["data_requirements"], sort_keys=True),
                 json.dumps(contract["risk_gates"], sort_keys=True),
@@ -410,6 +560,7 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
             "action_status": "created",
             "artifact": "strategy_lab_experiment",
             "strategy_lab_id": contract["strategy_lab_id"],
+            "experiment_type": contract["experiment_type"],
             "status": contract["status"],
             "created": created,
         }
@@ -431,6 +582,11 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
         item = dict(row)
         item["strategy_logic"] = _json_loads(item.pop("strategy_logic_json"), {})
         item["strategy_logic"] = _normalize_strategy_logic(item["strategy_logic"])
+        item["experiment_type"] = _resolved_experiment_type(
+            item.get("experiment_type"),
+            item,
+            item["strategy_logic"],
+        )
         item["data_requirements"] = _json_loads(item.pop("data_requirements_json"), {})
         item["risk_gates"] = _json_loads(item.pop("risk_gates_json"), {})
         item["promotion_rules"] = _json_loads(item.pop("promotion_rules_json"), {})
@@ -564,6 +720,7 @@ def generate_strategy_lab_candidates(
             lab_candidate = dict(candidate)
             lab_candidate["strategy_lab_id"] = experiment["strategy_lab_id"]
             lab_candidate["strategy_lab_version"] = int(experiment["version"])
+            lab_candidate["strategy_lab_experiment_type"] = experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE)
             lab_candidate["strategy_lab_hypothesis"] = experiment["hypothesis"]
             lab_candidate["strategy_lab_logic_type"] = logic.get("type", "candidate_filter")
             lab_candidate["strategy_lab_source_trade_type"] = candidate.get("trade_type")
@@ -585,6 +742,9 @@ def generate_strategy_lab_candidates(
         "price_observation_count": len(price_observations or []),
         "generated_candidates": len(generated),
         "generated_by_experiment": dict(per_experiment),
+        "generated_by_experiment_type": dict(
+            Counter(item.get("strategy_lab_experiment_type", DEFAULT_EXPERIMENT_TYPE) for item in generated)
+        ),
         "reject_reasons_by_experiment": {key: dict(value) for key, value in rejects.items()},
     }
     return generated, report
@@ -702,6 +862,7 @@ def _queue_promotion(conn: sqlite3.Connection, experiment: dict, evaluation: dic
         "signal_key": f"STRATEGY_LAB|{experiment['strategy_lab_id']}",
         "evidence": {
             "strategy_lab_id": experiment["strategy_lab_id"],
+            "experiment_type": experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE),
             "evaluation": evaluation,
             "promotion_rules": rules,
         },
@@ -710,6 +871,7 @@ def _queue_promotion(conn: sqlite3.Connection, experiment: dict, evaluation: dic
             "strategy_contract": {
                 "strategy_lab_id": experiment["strategy_lab_id"],
                 "version": experiment["version"],
+                "experiment_type": experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE),
                 "hypothesis": experiment["hypothesis"],
                 "strategy_logic": experiment.get("strategy_logic", {}),
                 "risk_gates": experiment.get("risk_gates", {}),
@@ -741,6 +903,7 @@ def _queue_promotion(conn: sqlite3.Connection, experiment: dict, evaluation: dic
             "rollback_criteria": "Revert if promoted strategy candidates fail validation, reports stop refreshing, or paper-only safety checks fail.",
             "evidence": {
                 "strategy_lab_id": experiment["strategy_lab_id"],
+                "experiment_type": experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE),
                 "evaluation": evaluation,
             },
         },
@@ -784,16 +947,17 @@ def _maybe_split_children(conn: sqlite3.Connection, experiment: dict, outcomes: 
             conn.execute(
                 """
                 insert into strategy_lab_experiments (
-                    strategy_lab_id, version, parent_strategy_lab_id, status, hypothesis,
+                    strategy_lab_id, version, parent_strategy_lab_id, experiment_type, status, hypothesis,
                     strategy_logic_json, data_requirements_json, risk_gates_json,
                     promotion_rules_json, source_agent, source_recommendation_id,
                     created_at, updated_at
-                ) values (?, ?, ?, 'active_testing', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) values (?, ?, ?, ?, 'active_testing', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     child_id,
                     1,
                     experiment["strategy_lab_id"],
+                    experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE),
                     f"{experiment['hypothesis']} narrowed to region {region}",
                     json.dumps(child_logic, sort_keys=True),
                     json.dumps(experiment.get("data_requirements") or {}, sort_keys=True),
@@ -922,6 +1086,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
         evaluations.append(
             {
                 "strategy_lab_id": experiment["strategy_lab_id"],
+                "experiment_type": experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE),
                 "status": status,
                 "decision": decision,
                 "metrics": metrics,
@@ -936,7 +1101,7 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
     rows = conn.execute(
         """
         select strategy_lab_id, version, parent_strategy_lab_id, status, hypothesis,
-               created_at, updated_at, last_evaluated_at, evaluation_json,
+               experiment_type, strategy_logic_json, created_at, updated_at, last_evaluated_at, evaluation_json,
                consecutive_passes, promoted_proposal_id
         from strategy_lab_experiments
         order by updated_at desc
@@ -946,10 +1111,14 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
     ).fetchall()
     items = []
     status_counts: Counter = Counter()
+    type_counts: Counter = Counter()
     for row in rows:
         item = dict(row)
+        logic = _json_loads(item.pop("strategy_logic_json"), {})
+        item["experiment_type"] = _resolved_experiment_type(item.get("experiment_type"), item, logic)
         item["evaluation"] = _json_loads(item.pop("evaluation_json"), {})
         status_counts[item["status"]] += 1
+        type_counts[item["experiment_type"]] += 1
         items.append(item)
     total = conn.execute("select count(*) as n from strategy_lab_experiments").fetchone()
     generated_candidates = 0
@@ -960,7 +1129,14 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         "enabled": True,
         "total_experiments": int(total["n"] if total else 0),
         "status_counts": dict(status_counts),
+        "by_experiment_type": dict(type_counts),
         "recent": items,
+        "recent_market_strategies": [
+            item for item in items if item.get("experiment_type") == "market_strategy"
+        ],
+        "recent_non_market_experiments": [
+            item for item in items if item.get("experiment_type") != "market_strategy"
+        ],
         "generated_candidates_last_cycle": generated_candidates,
         "report": str(REPORT_MD),
     }
@@ -984,19 +1160,34 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         f"- Generated: `{report['generated_at']}`",
         f"- Total experiments: `{summary.get('total_experiments', 0)}`",
         f"- Status counts: `{summary.get('status_counts', {})}`",
+        f"- Experiment types: `{summary.get('by_experiment_type', {})}`",
         f"- Candidates generated this loop: `{(generation or {}).get('generated_candidates', 0)}`",
         "",
-        "## Recent Experiments",
+        "## Market Strategy Experiments",
         "",
     ]
-    if not summary.get("recent"):
-        lines.append("No Strategy Lab experiments yet.")
-    for item in summary.get("recent", [])[:20]:
+    if not summary.get("recent_market_strategies"):
+        lines.append("No market-strategy experiments yet.")
+    for item in summary.get("recent_market_strategies", [])[:20]:
         latest = item.get("evaluation", {})
         decision = latest.get("decision")
         metrics = ((latest.get("outcomes") or {}).get("metrics") or {})
         lines.append(
-            f"- `{item['strategy_lab_id']}` status=`{item['status']}` decision=`{decision}` "
+            f"- `{item['strategy_lab_id']}` type=`{item.get('experiment_type')}` "
+            f"status=`{item['status']}` decision=`{decision}` "
+            f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
+            f"win=`{metrics.get('win_rate')}` hypothesis={item.get('hypothesis')}"
+        )
+    lines.extend(["", "## Non-Market Experiments", ""])
+    if not summary.get("recent_non_market_experiments"):
+        lines.append("No recent risk/system/reporting experiments.")
+    for item in summary.get("recent_non_market_experiments", [])[:20]:
+        latest = item.get("evaluation", {})
+        decision = latest.get("decision")
+        metrics = ((latest.get("outcomes") or {}).get("metrics") or {})
+        lines.append(
+            f"- `{item['strategy_lab_id']}` type=`{item.get('experiment_type')}` "
+            f"status=`{item['status']}` decision=`{decision}` "
             f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
             f"win=`{metrics.get('win_rate')}` hypothesis={item.get('hypothesis')}"
         )

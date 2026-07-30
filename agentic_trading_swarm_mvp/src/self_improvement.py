@@ -2084,13 +2084,34 @@ def _report_markdown(report: dict) -> str:
         lines.extend(["", "## Strategy Lab", ""])
         lines.append(f"- Total experiments: `{lab.get('total_experiments', 0)}`")
         lines.append(f"- Status counts: `{lab.get('status_counts', {})}`")
+        lines.append(f"- Experiment types: `{lab.get('by_experiment_type', {})}`")
         lines.append(f"- Generated last cycle: `{lab.get('generated_candidates_last_cycle', 0)}`")
         lines.append(f"- Report: `{lab.get('report')}`")
-        for item in lab.get("recent", [])[:8]:
+        market_items = lab.get("recent_market_strategies") or [
+            item for item in lab.get("recent", []) if item.get("experiment_type", "market_strategy") == "market_strategy"
+        ]
+        non_market_items = lab.get("recent_non_market_experiments") or [
+            item for item in lab.get("recent", []) if item.get("experiment_type", "market_strategy") != "market_strategy"
+        ]
+        if market_items:
+            lines.append("- Recent market strategies:")
+        for item in market_items[:8]:
             evaluation = item.get("evaluation") or {}
             metrics = ((evaluation.get("outcomes") or {}).get("metrics") or {})
             lines.append(
-                f"- `{item.get('strategy_lab_id')}` status=`{item.get('status')}` "
+                f"  - `{item.get('strategy_lab_id')}` type=`{item.get('experiment_type', 'market_strategy')}` "
+                f"status=`{item.get('status')}` "
+                f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
+                f"hypothesis={item.get('hypothesis')}"
+            )
+        if non_market_items:
+            lines.append("- Recent risk/system experiments:")
+        for item in non_market_items[:8]:
+            evaluation = item.get("evaluation") or {}
+            metrics = ((evaluation.get("outcomes") or {}).get("metrics") or {})
+            lines.append(
+                f"  - `{item.get('strategy_lab_id')}` type=`{item.get('experiment_type')}` "
+                f"status=`{item.get('status')}` "
                 f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
                 f"hypothesis={item.get('hypothesis')}"
             )

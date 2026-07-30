@@ -3,8 +3,10 @@ import datetime as dt
 import json
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +22,7 @@ from strategy_lab import (
     generate_strategy_lab_candidates,
     ingest_strategy_lab_recommendation,
     strategy_lab_summary,
+    write_strategy_lab_reports,
 )
 
 
@@ -101,11 +104,58 @@ class StrategyLabTest(unittest.TestCase):
             self.assertEqual("created", result[0]["action_status"])
 
             row = conn.execute(
-                "select strategy_lab_id, status, hypothesis from strategy_lab_experiments"
+                "select strategy_lab_id, experiment_type, status, hypothesis from strategy_lab_experiments"
             ).fetchone()
             self.assertEqual("okx_spot_survivor_lab_v1", row["strategy_lab_id"])
+            self.assertEqual("market_strategy", row["experiment_type"])
             self.assertEqual("active_testing", row["status"])
             self.assertIn("OKX spot", row["hypothesis"])
+
+    def test_ingests_explicit_experiment_type(self):
+        rec = lab_rec()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "route_filter_lab_v1"
+        experiment["experiment_type"] = "execution_filter"
+        experiment["hypothesis"] = "Require route quality gates before frontier long entries."
+
+        with memory_db() as conn:
+            result = ingest_strategy_lab_recommendation(conn, rec)
+            row = conn.execute(
+                "select experiment_type from strategy_lab_experiments where strategy_lab_id = ?",
+                ("route_filter_lab_v1",),
+            ).fetchone()
+
+        self.assertEqual("execution_filter", result[0]["experiment_type"])
+        self.assertEqual("execution_filter", row["experiment_type"])
+
+    def test_infers_non_market_experiment_types(self):
+        repair_rec = {
+            "recommendation_id": "rec_repair",
+            "payload": {
+                "action": "propose_strategy_lab_experiment",
+                "title": "Repair malformed JSON recommendation output",
+                "rationale": "Schema parser failures are creating fake strategy tasks.",
+            },
+        }
+        risk_rec = {
+            "recommendation_id": "rec_risk",
+            "payload": {
+                "action": "propose_strategy_lab_experiment",
+                "title": "Cooldown weak Yahoo proxy short false positives",
+                "rationale": "Reduce failing entries after repeated decay and weak win rate.",
+            },
+        }
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, repair_rec)
+            ingest_strategy_lab_recommendation(conn, risk_rec)
+            rows = conn.execute(
+                "select strategy_lab_id, experiment_type from strategy_lab_experiments"
+            ).fetchall()
+            by_id = {row["strategy_lab_id"]: row["experiment_type"] for row in rows}
+
+        self.assertIn("system_repair", set(by_id.values()))
+        self.assertIn("risk_filter", set(by_id.values()))
 
     def test_candidate_generation_emits_standard_candidate_with_lab_id(self):
         settings = base_settings()
@@ -116,6 +166,7 @@ class StrategyLabTest(unittest.TestCase):
             self.assertEqual(1, len(generated))
             self.assertEqual(1, report["generated_candidates"])
             self.assertEqual("okx_spot_survivor_lab_v1", generated[0]["strategy_lab_id"])
+            self.assertEqual("market_strategy", generated[0]["strategy_lab_experiment_type"])
             self.assertEqual("frontier_crypto_venue_map", generated[0]["trade_type"])
             self.assertEqual("long_frontier_spot", generated[0]["direction"])
             self.assertGreater(generated[0]["score"], 70.0)
@@ -208,6 +259,7 @@ class StrategyLabTest(unittest.TestCase):
         )
         self.assertIn("trade_types are scanner families", prompt)
         self.assertIn("Do not put a direction in trade_types", prompt)
+        self.assertIn("experiment_type must be one of", prompt)
 
     def test_lab_id_persists_through_opportunity_and_paper_trade(self):
         settings = base_settings()
@@ -283,9 +335,39 @@ class StrategyLabTest(unittest.TestCase):
     def test_summary_reports_recent_experiments(self):
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, lab_rec())
+            risk_rec = lab_rec()
+            risk_rec["recommendation_id"] = "rec_risk_filter"
+            risk_rec["payload"]["strategy_lab_experiment"]["strategy_lab_id"] = "risk_filter_lab"
+            risk_rec["payload"]["strategy_lab_experiment"]["experiment_type"] = "risk_filter"
+            risk_rec["payload"]["strategy_lab_experiment"]["hypothesis"] = "Cooldown weak entries after repeated decay."
+            ingest_strategy_lab_recommendation(conn, risk_rec)
             summary = strategy_lab_summary(conn)
-            self.assertEqual(1, summary["total_experiments"])
-            self.assertEqual("okx_spot_survivor_lab_v1", summary["recent"][0]["strategy_lab_id"])
+            self.assertEqual(2, summary["total_experiments"])
+            self.assertEqual(1, len(summary["recent_market_strategies"]))
+            self.assertEqual(1, len(summary["recent_non_market_experiments"]))
+            self.assertEqual("market_strategy", summary["recent_market_strategies"][0]["experiment_type"])
+
+    def test_report_splits_market_and_non_market_experiments(self):
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            repair_rec = {
+                "recommendation_id": "rec_report_repair",
+                "payload": {
+                    "action": "propose_strategy_lab_experiment",
+                    "title": "Repair malformed JSON recommendation output",
+                    "rationale": "Parser failures should not appear as strategies.",
+                },
+            }
+            ingest_strategy_lab_recommendation(conn, repair_rec)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_path = Path(tmpdir)
+                with mock.patch("strategy_lab.REPORT_JSON", tmp_path / "strategy_lab_report.json"), (
+                    mock.patch("strategy_lab.REPORT_MD", tmp_path / "strategy_lab_report.md")
+                ):
+                    report = write_strategy_lab_reports(conn)
+
+        self.assertEqual(1, len(report["summary"]["recent_market_strategies"]))
+        self.assertEqual(1, len(report["summary"]["recent_non_market_experiments"]))
 
 
 if __name__ == "__main__":

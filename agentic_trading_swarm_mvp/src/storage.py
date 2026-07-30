@@ -525,6 +525,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             strategy_lab_id text primary key,
             version integer not null,
             parent_strategy_lab_id text,
+            experiment_type text not null default 'market_strategy',
             status text not null,
             hypothesis text not null,
             strategy_logic_json text not null,
@@ -543,6 +544,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "strategy_lab_experiments", "experiment_type", "text not null default 'market_strategy'")
     conn.execute(
         """
         create table if not exists frontier_quality_snapshots (
