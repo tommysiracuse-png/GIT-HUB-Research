@@ -360,6 +360,10 @@ DEPLOYED_CAPABILITIES = {
         "implemented_global_market_discovery_scan",
         ("adapter_specs", "growth_experiments", "route_probe_tasks", "market_hunter_directives"),
     ),
+    "regional_fx_normalization": (
+        "implemented_regional_fx_frontier_prediction_pack",
+        ("improvement_tasks", "adapter_specs", "route_probe_tasks"),
+    ),
 }
 
 
@@ -426,6 +430,12 @@ def _matches_deployed_capability(payload: Mapping[str, Any], category: str) -> b
             and "bitso" in title
             and any(term in title for term in ("depth", "order book", "public book"))
             and any(term in title for term in ("wire", "activate", "adapter", "enrichment", "data gap"))
+        )
+    if category == "regional_fx_normalization":
+        return (
+            table == "improvement_tasks"
+            and any(term in title for term in ("fx-normalization", "fx normalization"))
+            and any(term in title for term in ("frontier fiat", "fiat-quoted crypto", "regional fiat"))
         )
     return False
 

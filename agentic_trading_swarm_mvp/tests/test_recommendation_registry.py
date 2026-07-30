@@ -167,6 +167,23 @@ class RecommendationRegistryTests(unittest.TestCase):
             self.conn.execute("select status from improvement_tasks where id = ?", (task_id,)).fetchone()[0],
         )
 
+    def test_reconcile_closes_deployed_regional_fx_normalization(self) -> None:
+        self.conn.execute(
+            "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 1, 'marker', '', 'implemented_regional_fx_frontier_prediction_pack')"
+        )
+        task_id = self.conn.execute(
+            "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 91, ?, '', 'open') returning id",
+            ("LLM: Paper FX-normalization adapter for frontier fiat-quoted crypto",),
+        ).fetchone()[0]
+
+        result = reconcile_deployed_artifacts(self.conn)
+
+        self.assertEqual(1, result["closed_count"])
+        self.assertEqual(
+            "superseded_by_implemented_regional_fx_normalization",
+            self.conn.execute("select status from improvement_tasks where id = ?", (task_id,)).fetchone()[0],
+        )
+
     def test_reconcile_closes_task_with_exact_promoted_code_title(self) -> None:
         task_id = self.conn.execute(
             "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 93, ?, '', 'open') returning id",
