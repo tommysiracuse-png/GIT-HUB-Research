@@ -204,6 +204,22 @@ class StrategyLabTest(unittest.TestCase):
         reasons = report["reject_reasons_by_experiment"]["okx_spot_survivor_lab_v1"]
         self.assertIn("watch_only_not_paper_testable", reasons)
 
+    def test_candidate_generation_prefers_standard_paper_route(self):
+        settings = base_settings()
+        settings["strategy_lab"]["max_candidates_per_experiment"] = 1
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            generated, _report = generate_strategy_lab_candidates(
+                conn,
+                settings,
+                [
+                    candidate(inst_id="CONDITIONAL", score=100.0, route_status="conditional"),
+                    candidate(inst_id="STANDARD", score=70.0, route_status="standard"),
+                ],
+            )
+
+        self.assertEqual("STANDARD", generated[0]["inst_id"])
+
     def test_zero_output_is_truthfully_diagnosed_and_can_recover(self):
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, lab_rec())

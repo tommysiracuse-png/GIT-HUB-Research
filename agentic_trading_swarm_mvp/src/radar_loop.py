@@ -175,13 +175,43 @@ def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: di
     limit = min(max(0, int(total_slots)), requested)
     selected: list[dict] = []
     selected_experiments: set[str] = set()
-    for candidate in sorted(candidates, key=lambda row: float(row.get("score") or 0.0), reverse=True):
+    selected_sources: set[tuple[str, str, str, str]] = set()
+
+    def route_rank(row: dict) -> int:
+        status = str(
+            row.get("route_status")
+            or (row.get("execution_route") or {}).get("route_status")
+            or (row.get("execution_feasibility") or {}).get("status")
+            or "unknown"
+        ).lower()
+        return {"standard": 0, "feasible": 0, "paper_proxy": 1, "conditional": 2}.get(status, 3)
+
+    by_experiment: dict[str, list[dict]] = {}
+    for candidate in candidates:
         strategy_lab_id = str(candidate.get("strategy_lab_id") or "").strip()
-        if not strategy_lab_id or strategy_lab_id in selected_experiments:
+        if not strategy_lab_id:
             continue
         if str(candidate.get("direction") or "").lower() == "watch_only":
             continue
         if not _is_strategy_lab_candidate_filter(candidate):
+            continue
+        by_experiment.setdefault(strategy_lab_id, []).append(candidate)
+
+    for strategy_lab_id, experiment_candidates in by_experiment.items():
+        candidate = None
+        source_key = None
+        for option in sorted(experiment_candidates, key=lambda row: (route_rank(row), -float(row.get("score") or 0.0))):
+            option_key = (
+                str(option.get("venue") or ""),
+                str(option.get("inst_id") or ""),
+                str(option.get("direction") or ""),
+                str(option.get("trade_type") or ""),
+            )
+            if option_key not in selected_sources:
+                candidate = option
+                source_key = option_key
+                break
+        if candidate is None or source_key is None:
             continue
         row = dict(candidate)
         row["_hunter_bucket"] = "explore"
@@ -189,12 +219,14 @@ def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: di
         row["_hunter_allocation_reason"] = "strategy_lab_distinct_experiment_reserve"
         selected.append(row)
         selected_experiments.add(strategy_lab_id)
+        selected_sources.add(source_key)
         if len(selected) >= limit:
             break
     return selected, {
         "configured_slots": requested,
         "reserved_count": len(selected),
         "strategy_lab_ids": sorted(selected_experiments),
+        "distinct_source_count": len(selected_sources),
     }
 
 

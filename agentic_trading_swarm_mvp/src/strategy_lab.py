@@ -627,6 +627,24 @@ def _candidate_edge(candidate: dict) -> float:
     return funding + basis
 
 
+def _candidate_route_status(candidate: dict) -> str:
+    return str(
+        candidate.get("route_status")
+        or (candidate.get("execution_route") or {}).get("route_status")
+        or (candidate.get("execution_feasibility") or {}).get("status")
+        or "unknown"
+    ).lower()
+
+
+def _paper_route_rank(candidate: dict) -> int:
+    return {
+        "standard": 0,
+        "feasible": 0,
+        "paper_proxy": 1,
+        "conditional": 2,
+    }.get(_candidate_route_status(candidate), 3)
+
+
 def _candidate_field_value(candidate: dict, field: str) -> Any:
     if candidate.get(field) is not None:
         return candidate.get(field)
@@ -738,7 +756,7 @@ def generate_strategy_lab_candidates(
     nearest_candidates: dict[str, list[dict]] = defaultdict(list)
     status_by_experiment: dict[str, str] = {}
 
-    pool = sorted(candidates, key=lambda row: _as_float(row.get("score")), reverse=True)
+    pool = sorted(candidates, key=lambda row: (_paper_route_rank(row), -_as_float(row.get("score"))))
     runtime_vocabulary = _runtime_strategy_vocabulary(pool)
     for experiment in experiments:
         if len(generated) >= max_total:

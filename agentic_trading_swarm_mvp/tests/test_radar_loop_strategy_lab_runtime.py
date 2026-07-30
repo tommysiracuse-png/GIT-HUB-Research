@@ -80,10 +80,10 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
 
     def test_review_reserve_selects_distinct_lab_experiments(self):
         candidates = [
-            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "direction": "long_proxy", "score": 99},
-            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "direction": "long_proxy", "score": 98},
-            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "direction": "long_proxy", "score": 80},
-            {"strategy_lab_id": "lab_c", "strategy_lab_logic_type": "candidate_filter", "direction": "long_proxy", "score": 70},
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "inst_id": "A", "direction": "long_proxy", "score": 99},
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "inst_id": "A2", "direction": "long_proxy", "score": 98},
+            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "inst_id": "B", "direction": "long_proxy", "score": 80},
+            {"strategy_lab_id": "lab_c", "strategy_lab_logic_type": "candidate_filter", "inst_id": "C", "direction": "long_proxy", "score": 70},
         ]
 
         selected, summary = self.reserve_review_candidates(
@@ -105,6 +105,23 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
 
         self.assertEqual([], selected)
         self.assertEqual(0, summary["reserved_count"])
+
+    def test_review_reserve_prefers_standard_routes_and_distinct_sources(self):
+        candidates = [
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "venue": "OKX", "inst_id": "LA-SWAP", "direction": "long_perp_short_spot", "trade_type": "basis", "route_status": "conditional", "score": 100},
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "venue": "OKX_SPOT", "inst_id": "BTC-USDT", "direction": "long_frontier_spot", "trade_type": "spot", "route_status": "standard", "score": 80},
+            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "venue": "OKX_SPOT", "inst_id": "BTC-USDT", "direction": "long_frontier_spot", "trade_type": "spot", "route_status": "standard", "score": 90},
+            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "venue": "KRAKEN", "inst_id": "ETHUSD", "direction": "long_frontier_spot", "trade_type": "spot", "route_status": "standard", "score": 70},
+        ]
+
+        selected, summary = self.reserve_review_candidates(
+            candidates,
+            {"strategy_lab": {"runtime_review_reserved_slots": 2}},
+            total_slots=25,
+        )
+
+        self.assertEqual({"BTC-USDT", "ETHUSD"}, {row["inst_id"] for row in selected})
+        self.assertEqual(2, summary["distinct_source_count"])
 
 
 if __name__ == "__main__":  # pragma: no cover
