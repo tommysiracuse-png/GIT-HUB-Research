@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Five-agent cost-aware LLM swarm.
+"""Collaborative six-agent cost-aware LLM swarm.
 
 Uses LangGraph when installed. If it is absent, runs the same five agent nodes
 sequentially. All model calls go through cost_router, which defaults to a
@@ -13,16 +13,24 @@ import argparse
 import ast
 import datetime as dt
 import json
+import operator
 import pathlib
 import re
+import sqlite3
 import sys
 import time
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from cost_router import complete
 from evolution.builder_context import resolve_repo_targets
 from llm_bridge import INBOX, STATE_JSON
-from memory_graph import query_memory
+from memory_graph import (
+    build_swarm_memory,
+    query_memory,
+    reflect_swarm,
+    sync_graphiti,
+    write_memory_exports,
+)
 from settings import load_settings
 from storage import RUNS_DIR, connect
 
@@ -36,12 +44,17 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class SwarmState(TypedDict, total=False):
     packet: dict
     memory: list[dict]
-    agent_outputs: list[dict]
-    critiques: list[dict]
+    role_memory: dict[str, list[dict]]
+    cycle_id: str
+    agent_outputs: Annotated[list[dict], operator.add]
+    critiques: Annotated[list[dict], operator.add]
+    node_rejections: Annotated[list[dict], operator.add]
     ranked_actions: list[dict]
     rejected_actions: list[dict]
-    graph_trace: list[dict]
+    graph_trace: Annotated[list[dict], operator.add]
     collaboration_mode: str
+    checkpoint: dict
+    memory_reflection: dict
 
 
 AGENTS = [
@@ -125,7 +138,8 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "strategy_lab": packet.get("strategy_lab", {}),
         "self_improvement": packet.get("self_improvement", {}),
         "code_evolution": packet.get("code_evolution", {}),
-        "recent_memory": memory[:20],
+        "agent_memory": packet.get("agent_memory", {}),
+        "relevant_long_term_memory": memory,
         "allowed_actions": packet.get("allowed_recommendation_actions", []),
         "current_cycle_agent_outputs": packet.get("current_cycle_agent_outputs", [])[:10],
         "current_cycle_critiques": packet.get("current_cycle_critiques", [])[:10],
@@ -725,20 +739,54 @@ def _repository_grounding(state: SwarmState) -> dict:
     }
 
 
-def _initial_state(packet: dict, memory: list[dict], mode: str) -> SwarmState:
+ADDITIVE_STATE_FIELDS = {"agent_outputs", "critiques", "node_rejections", "graph_trace"}
+
+
+def _coerce_role_memory(memory: list[dict] | dict[str, list[dict]]) -> dict[str, list[dict]]:
+    if isinstance(memory, dict):
+        return {name: list(memory.get(name) or []) for name in [agent["name"] for agent in AGENTS]}
+    return {agent["name"]: list(memory or []) for agent in AGENTS}
+
+
+def _initial_state(
+    packet: dict,
+    memory: list[dict] | dict[str, list[dict]],
+    mode: str,
+    cycle_id: str | None = None,
+) -> SwarmState:
     return {
         "packet": packet,
-        "memory": memory,
+        "memory": list(memory) if isinstance(memory, list) else [],
+        "role_memory": _coerce_role_memory(memory),
+        "cycle_id": cycle_id or f"swarm:{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
         "agent_outputs": [],
         "critiques": [],
+        "node_rejections": [],
         "ranked_actions": [],
         "rejected_actions": [],
         "graph_trace": [],
         "collaboration_mode": mode,
+        "checkpoint": {},
+        "memory_reflection": {},
     }
 
 
-def _record_agent_result(state: SwarmState, agent: dict, rec: dict, elapsed_ms: int) -> SwarmState:
+def _merge_state(state: SwarmState, update: SwarmState) -> SwarmState:
+    merged = dict(state)
+    for key, value in update.items():
+        if key in ADDITIVE_STATE_FIELDS:
+            merged[key] = [*(merged.get(key) or []), *(value or [])]
+        else:
+            merged[key] = value
+    return merged  # type: ignore[return-value]
+
+
+def _record_agent_result(
+    agent: dict,
+    rec: dict,
+    elapsed_ms: int,
+    memory: list[dict],
+) -> SwarmState:
     model = rec.get("model") if isinstance(rec.get("model"), dict) else {}
     output = {
         "agent_name": agent["name"],
@@ -746,10 +794,11 @@ def _record_agent_result(state: SwarmState, agent: dict, rec: dict, elapsed_ms: 
         "parse_status": rec.get("parse_status", "native_valid"),
         "recommendation": rec,
         "model": model,
+        "memory_ids": [item.get("memory_id") or item.get("id") for item in memory if item.get("memory_id") or item.get("id")],
     }
-    state.setdefault("agent_outputs", []).append(output)
+    rejected: list[dict] = []
     if _is_rejected(rec):
-        state.setdefault("rejected_actions", []).append(
+        rejected.append(
             {
                 "agent_name": agent["name"],
                 "title": rec.get("title"),
@@ -759,20 +808,24 @@ def _record_agent_result(state: SwarmState, agent: dict, rec: dict, elapsed_ms: 
             }
         )
     critique = _critique_from_recommendation(agent, rec)
-    if critique:
-        state.setdefault("critiques", []).append(critique)
-    state.setdefault("graph_trace", []).append(
-        {
-            "node": agent["name"],
-            "elapsed_ms": elapsed_ms,
-            "accepted": not _is_rejected(rec),
-            "parse_status": rec.get("parse_status", "native_valid"),
-            "model_status": model.get("status"),
-            "model_tier": model.get("tier"),
-            "estimated_cost_usd": model.get("estimated_cost_usd"),
-        }
-    )
-    return state
+    return {
+        "agent_outputs": [output],
+        "critiques": [critique] if critique else [],
+        "node_rejections": rejected,
+        "graph_trace": [
+            {
+                "node": agent["name"],
+                "elapsed_ms": elapsed_ms,
+                "accepted": not _is_rejected(rec),
+                "parse_status": rec.get("parse_status", "native_valid"),
+                "model_status": model.get("status"),
+                "model_tier": model.get("tier"),
+                "estimated_cost_usd": model.get("estimated_cost_usd"),
+                "memory_count": len(memory),
+                "memory_ids": output["memory_ids"],
+            }
+        ],
+    }
 
 
 def _run_agent_node(agent: dict, state: SwarmState) -> SwarmState:
@@ -784,14 +837,15 @@ def _run_agent_node(agent: dict, state: SwarmState) -> SwarmState:
     agent_packet["current_cycle_ranked_actions"] = state.get("ranked_actions", [])
     if agent["name"] == "build_planner":
         agent_packet["repository_grounding"] = _repository_grounding(state)
-    rec = run_agent(agent, agent_packet, state["memory"])
-    return _record_agent_result(state, agent, rec, int((time.perf_counter() - started) * 1000))
+    memory = list((state.get("role_memory") or {}).get(agent["name"]) or state.get("memory") or [])
+    rec = run_agent(agent, agent_packet, memory)
+    return _record_agent_result(agent, rec, int((time.perf_counter() - started) * 1000), memory)
 
 
 def rank_action_package(state: SwarmState, max_items: int | None = None) -> SwarmState:
     seen: set[tuple] = set()
     ranked: list[dict] = []
-    rejected = list(state.get("rejected_actions", []))
+    rejected = [*state.get("node_rejections", []), *state.get("rejected_actions", [])]
     for rec in _accepted_outputs(state):
         if _is_fallback_recommendation(rec):
             rejected.append({"agent_name": rec.get("agent_name"), "title": rec.get("title"), "reason": "fallback_suppressed", "recommendation": rec})
@@ -814,35 +868,100 @@ def rank_action_package(state: SwarmState, max_items: int | None = None) -> Swar
         ranked = ranked[:max_items]
         for rec in overflow:
             rejected.append({"agent_name": rec.get("agent_name"), "title": rec.get("title"), "reason": "ranked_below_limit", "recommendation": rec})
-    state["ranked_actions"] = ranked
-    state["rejected_actions"] = rejected
-    state.setdefault("graph_trace", []).append(
-        {
-            "node": "ranker",
-            "accepted_count": len(ranked),
-            "rejected_count": len(rejected),
-            "collaboration_mode": state.get("collaboration_mode"),
-        }
-    )
-    return state
+    return {
+        "ranked_actions": ranked,
+        "rejected_actions": rejected,
+        "graph_trace": [
+            {
+                "node": "ranker",
+                "accepted_count": len(ranked),
+                "rejected_count": len(rejected),
+                "collaboration_mode": state.get("collaboration_mode"),
+            }
+        ],
+    }
 
 
-def run_sequential(packet: dict, memory: list[dict]) -> list[dict]:
+def run_sequential(
+    packet: dict,
+    memory: list[dict] | dict[str, list[dict]],
+    settings: dict | None = None,
+    cycle_id: str | None = None,
+) -> list[dict]:
     global LAST_SWARM_STATE
-    state = _initial_state(packet, memory, FALLBACK_COLLABORATION_MODE)
+    state = _initial_state(packet, memory, FALLBACK_COLLABORATION_MODE, cycle_id)
     for agent in AGENTS:
-        state = _run_agent_node(agent, state)
-    state = rank_action_package(state)
+        state = _merge_state(state, _run_agent_node(agent, state))
+    state = _merge_state(state, rank_action_package(state))
+    state["checkpoint"] = {"status": "not_used", "reason": "sequential_fallback"}
     LAST_SWARM_STATE = dict(state)
     return list(state["ranked_actions"])
 
 
-def run_langgraph_if_available(packet: dict, memory: list[dict]) -> list[dict]:
-    global LAST_SWARM_STATE
+def _checkpoint_path(settings: dict) -> pathlib.Path:
+    configured = pathlib.Path(str(settings.get("agent_memory", {}).get("checkpoint_path", "runs/langgraph_checkpoints.sqlite")))
+    return configured if configured.is_absolute() else ROOT / configured
+
+
+def _prune_checkpoint_threads(saver: Any, conn: sqlite3.Connection, retain: int) -> int:
+    retain = max(10, int(retain))
+    saver.setup()
+    rows = conn.execute(
+        "select thread_id, max(rowid) as latest_row from checkpoints "
+        "where thread_id like 'swarm:%' group by thread_id order by latest_row desc"
+    ).fetchall()
+    removed = 0
+    for thread_id, _latest_row in rows[retain:]:
+        saver.delete_thread(str(thread_id))
+        removed += 1
+    return removed
+
+
+def _invoke_graph(graph: Any, initial: SwarmState, settings: dict) -> tuple[SwarmState, dict]:
+    cfg = settings.get("agent_memory", {})
+    if not cfg.get("checkpoint_enabled", True):
+        app = graph.compile()
+        return app.invoke(initial), {"status": "disabled_by_policy"}
     try:
-        from langgraph.graph import END, StateGraph  # type: ignore
+        from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
+    except Exception as exc:
+        app = graph.compile()
+        return app.invoke(initial), {"status": "package_missing", "error": str(exc)[:240]}
+
+    path = _checkpoint_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_conn = sqlite3.connect(path, check_same_thread=False)
+    try:
+        saver = SqliteSaver(checkpoint_conn)
+        app = graph.compile(checkpointer=saver)
+        output = app.invoke(initial, config={"configurable": {"thread_id": initial["cycle_id"]}})
+        pruned = _prune_checkpoint_threads(
+            saver,
+            checkpoint_conn,
+            int(cfg.get("checkpoint_retention_cycles", 250)),
+        )
+    finally:
+        checkpoint_conn.close()
+    return output, {
+        "status": "saved",
+        "path": str(path),
+        "thread_id": initial["cycle_id"],
+        "pruned_threads": pruned,
+    }
+
+
+def run_langgraph_if_available(
+    packet: dict,
+    memory: list[dict] | dict[str, list[dict]],
+    settings: dict | None = None,
+    cycle_id: str | None = None,
+) -> list[dict]:
+    global LAST_SWARM_STATE
+    settings = settings or load_settings()
+    try:
+        from langgraph.graph import END, START, StateGraph  # type: ignore
     except Exception:
-        return run_sequential(packet, memory)
+        return run_sequential(packet, memory, settings, cycle_id)
 
     def make_node(agent: dict):
         def node(state: SwarmState) -> SwarmState:
@@ -853,20 +972,34 @@ def run_langgraph_if_available(packet: dict, memory: list[dict]) -> list[dict]:
     def ranker_node(state: SwarmState) -> SwarmState:
         return rank_action_package(state)
 
+    def phase_node(name: str):
+        def node(_state: SwarmState) -> SwarmState:
+            return {"graph_trace": [{"node": name, "status": "joined"}]}
+
+        return node
+
     graph = StateGraph(SwarmState)
-    previous = None
     for agent in AGENTS:
         graph.add_node(agent["name"], make_node(agent))
-        if previous is None:
-            graph.set_entry_point(agent["name"])
-        else:
-            graph.add_edge(previous, agent["name"])
-        previous = agent["name"]
+    graph.add_node("research_join", phase_node("research_join"))
+    graph.add_node("critique_join", phase_node("critique_join"))
     graph.add_node("ranker", ranker_node)
-    graph.add_edge(previous, "ranker")
-    graph.add_edge("ranker", END)
-    app = graph.compile()
-    output = app.invoke(_initial_state(packet, memory, COLLABORATION_MODE))
+    graph.add_node("memory_checkpoint", phase_node("memory_checkpoint"))
+
+    graph.add_edge(START, "market_scout")
+    graph.add_edge(START, "cross_market_researcher")
+    graph.add_edge(["market_scout", "cross_market_researcher"], "research_join")
+    graph.add_edge("research_join", "strategy_lab")
+    graph.add_edge("strategy_lab", "red_team")
+    graph.add_edge("strategy_lab", "execution_route_hunter")
+    graph.add_edge(["red_team", "execution_route_hunter"], "critique_join")
+    graph.add_edge("critique_join", "build_planner")
+    graph.add_edge("build_planner", "ranker")
+    graph.add_edge("ranker", "memory_checkpoint")
+    graph.add_edge("memory_checkpoint", END)
+    initial = _initial_state(packet, memory, COLLABORATION_MODE, cycle_id)
+    output, checkpoint = _invoke_graph(graph, initial, settings)
+    output["checkpoint"] = checkpoint
     LAST_SWARM_STATE = dict(output)
     return list(output.get("ranked_actions", []))
 
@@ -959,6 +1092,12 @@ def write_recommendations(
                 "ranked_actions": selected,
                 "rejected_actions": [*state_rejected, *suppressed],
                 "action_package": action_package,
+                "checkpoint": state.get("checkpoint", {}),
+                "memory_reflection": state.get("memory_reflection", {}),
+                "memory_context_counts": {
+                    name: len(items)
+                    for name, items in (state.get("role_memory") or {}).items()
+                },
             },
             indent=2,
         ),
@@ -990,13 +1129,29 @@ def mark_auto_run() -> None:
 
 
 def run_once(settings: dict | None = None, force: bool = False) -> list[dict]:
+    global LAST_SWARM_STATE
     settings = settings or load_settings()
     if not force and not should_auto_run(settings):
         return []
     packet = load_state_packet()
     with connect() as conn:
-        memory = query_memory(conn, limit=40)
-    recommendations = run_langgraph_if_available(packet, memory)
+        try:
+            memory, cycle_id = build_swarm_memory(
+                conn,
+                packet,
+                settings,
+                [agent["name"] for agent in AGENTS],
+            )
+        except Exception:
+            fallback = query_memory(conn, limit=40)
+            memory = _coerce_role_memory(fallback)
+            cycle_id = f"swarm:{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+    recommendations = run_langgraph_if_available(packet, memory, settings, cycle_id)
+    with connect() as conn:
+        reflection = reflect_swarm(conn, LAST_SWARM_STATE, cycle_id, settings)
+        graphiti = sync_graphiti(conn, settings)
+        write_memory_exports(conn, settings)
+    LAST_SWARM_STATE["memory_reflection"] = {**reflection, "graphiti": graphiti}
     write_recommendations(
         recommendations,
         int(settings.get("llm_swarm", {}).get("max_recommendations_per_run", 10)),
@@ -1008,7 +1163,7 @@ def run_once(settings: dict | None = None, force: bool = False) -> list[dict]:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Run the 5-agent cost-aware LLM swarm once.")
+    parser = argparse.ArgumentParser(description="Run the collaborative six-agent LLM swarm once.")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     recs = run_once(force=args.force)

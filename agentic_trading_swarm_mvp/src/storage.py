@@ -319,6 +319,105 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists temporal_memories (
+            memory_id text primary key,
+            identity_key text not null,
+            version integer not null,
+            namespace text not null,
+            memory_type text not null,
+            fact_type text not null,
+            subject text not null,
+            predicate text not null,
+            object text not null,
+            summary text not null,
+            confidence real not null,
+            importance real not null,
+            outcome_score real not null default 0,
+            utility_score real not null default 0,
+            success_count integer not null default 0,
+            failure_count integer not null default 0,
+            last_validated_at text,
+            status text not null,
+            valid_from text not null,
+            valid_to text,
+            first_seen_at text not null,
+            last_seen_at text not null,
+            last_accessed_at text,
+            observation_count integer not null default 1,
+            access_count integer not null default 0,
+            source text not null,
+            source_id text,
+            content_hash text not null,
+            metadata_json text not null,
+            provenance_json text not null,
+            outcome_json text not null,
+            tags_json text not null,
+            created_at text not null,
+            updated_at text not null,
+            unique(identity_key, version)
+        )
+        """
+    )
+    _ensure_column(conn, "temporal_memories", "utility_score", "real not null default 0")
+    _ensure_column(conn, "temporal_memories", "success_count", "integer not null default 0")
+    _ensure_column(conn, "temporal_memories", "failure_count", "integer not null default 0")
+    _ensure_column(conn, "temporal_memories", "last_validated_at", "text")
+    conn.execute(
+        """
+        create table if not exists temporal_memory_links (
+            id integer primary key autoincrement,
+            source_type text not null,
+            source_id text not null,
+            relation text not null,
+            target_type text not null,
+            target_id text not null,
+            first_seen_at text not null,
+            last_seen_at text not null,
+            confidence real not null,
+            evidence_json text not null,
+            unique(source_type, source_id, relation, target_type, target_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists memory_retrieval_events (
+            id integer primary key autoincrement,
+            created_at text not null,
+            cycle_id text not null,
+            agent_name text not null,
+            query_text text not null,
+            memory_ids_json text not null,
+            scores_json text not null,
+            selected_count integer not null,
+            namespace_counts_json text not null
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists memory_system_state (
+            state_key text primary key,
+            state_value_json text not null,
+            updated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists graphiti_memory_sync (
+            memory_id text primary key,
+            content_hash text not null,
+            status text not null,
+            attempts integer not null default 0,
+            last_attempt_at text,
+            synced_at text,
+            error text
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists signal_stats (
             signal_key text primary key,
             closed_count integer not null,
@@ -653,6 +752,30 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_outcomes_trade on paper_trade_outcomes(trade_id)")
     conn.execute("create index if not exists idx_paper_hold_policies_group on paper_hold_policies(group_name, group_value)")
     conn.execute("create index if not exists idx_memory_subject on memory_facts(subject)")
+    conn.execute(
+        "create index if not exists idx_temporal_memory_active "
+        "on temporal_memories(status, namespace, fact_type, last_seen_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_temporal_memory_identity "
+        "on temporal_memories(identity_key, version desc)"
+    )
+    conn.execute(
+        "create index if not exists idx_temporal_memory_subject "
+        "on temporal_memories(subject, predicate, status)"
+    )
+    conn.execute(
+        "create index if not exists idx_memory_links_source "
+        "on temporal_memory_links(source_type, source_id, relation)"
+    )
+    conn.execute(
+        "create index if not exists idx_memory_links_target "
+        "on temporal_memory_links(target_type, target_id, relation)"
+    )
+    conn.execute(
+        "create index if not exists idx_memory_retrieval_agent_time "
+        "on memory_retrieval_events(agent_name, created_at)"
+    )
     conn.execute("create index if not exists idx_signal_policies_active on signal_policies(status, signal_key)")
     conn.execute("create index if not exists idx_self_improvement_status on self_improvement_experiments(status)")
     conn.execute("create index if not exists idx_code_evolution_status on code_evolution_proposals(status, updated_at)")
@@ -1712,32 +1835,33 @@ def add_memory_fact(
     source: str,
     metadata: dict,
 ) -> None:
-    conn.execute(
-        """
-        insert into memory_facts (
-            created_at, fact_type, subject, predicate, object, confidence, source, metadata_json
-        ) values (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            utc_now(),
-            fact_type,
-            subject,
-            predicate,
-            object_value,
-            float(confidence),
-            source,
-            json.dumps(metadata, sort_keys=True),
-        ),
+    # Keep the legacy table as an immutable audit archive. New facts go through
+    # the temporal upsert layer so repeated radar cycles reinforce one memory
+    # instead of appending thousands of duplicate rows.
+    from temporal_memory import upsert_memory_fact
+
+    upsert_memory_fact(
+        conn,
+        fact_type,
+        subject,
+        predicate,
+        object_value,
+        confidence,
+        source,
+        metadata,
     )
-    conn.commit()
 
 
 def recent_memory_facts(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
     rows = conn.execute(
         """
-        select id, created_at, fact_type, subject, predicate, object, confidence, source, metadata_json
-        from memory_facts
-        order by id desc
+        select memory_id as id, created_at, fact_type, subject, predicate, object,
+               confidence, source, metadata_json, namespace, memory_type,
+               importance, outcome_score, valid_from, valid_to, last_seen_at,
+               observation_count, access_count, status
+        from temporal_memories
+        where status in ('active', 'provisional')
+        order by importance desc, abs(outcome_score) desc, last_seen_at desc
         limit ?
         """,
         (limit,),

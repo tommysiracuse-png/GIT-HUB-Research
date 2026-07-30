@@ -450,14 +450,17 @@ class FrontierModelPolicyTests(unittest.TestCase):
         with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=fake_run_agent):
             recs = llm_swarm_runner.run_langgraph_if_available(packet, [])
 
-        self.assertEqual(calls, [agent["name"] for agent in llm_swarm_runner.AGENTS])
+        self.assertCountEqual(calls, [agent["name"] for agent in llm_swarm_runner.AGENTS])
         self.assertEqual(llm_swarm_runner.LAST_SWARM_STATE["collaboration_mode"], llm_swarm_runner.COLLABORATION_MODE)
-        self.assertEqual(llm_swarm_runner.LAST_SWARM_STATE["graph_trace"][-1]["node"], "ranker")
+        trace_nodes = [item["node"] for item in llm_swarm_runner.LAST_SWARM_STATE["graph_trace"]]
+        self.assertLess(trace_nodes.index("research_join"), trace_nodes.index("strategy_lab"))
+        self.assertLess(trace_nodes.index("critique_join"), trace_nodes.index("build_planner"))
+        self.assertLess(trace_nodes.index("ranker"), trace_nodes.index("memory_checkpoint"))
         self.assertEqual(recs[0]["title"], "build_planner")
 
     def test_langgraph_ranker_coerces_label_priorities(self) -> None:
-        sequence = [
-            {
+        by_agent = {
+            "market_scout": {
                 "action": "propose_hunter_directive",
                 "priority": "high",
                 "title": "High label",
@@ -467,7 +470,7 @@ class FrontierModelPolicyTests(unittest.TestCase):
                 "proposed_change": "Probe",
                 "agent_name": "market_scout",
             },
-            {
+            "cross_market_researcher": {
                 "action": "propose_hunter_directive",
                 "priority": 70,
                 "title": "Numeric",
@@ -477,9 +480,10 @@ class FrontierModelPolicyTests(unittest.TestCase):
                 "proposed_change": "Probe",
                 "agent_name": "cross_market_researcher",
             },
-        ]
-        sequence.extend(
+        }
+        by_agent.update(
             {
+                agent["name"]: {
                 "action": "propose_hunter_directive",
                 "priority": 40,
                 "title": f"low {idx}",
@@ -490,9 +494,14 @@ class FrontierModelPolicyTests(unittest.TestCase):
                 "agent_name": agent["name"],
             }
             for idx, agent in enumerate(llm_swarm_runner.AGENTS[2:], start=1)
+            }
         )
 
-        with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=sequence):
+        with mock.patch.object(
+            llm_swarm_runner,
+            "run_agent",
+            side_effect=lambda agent, _packet, _memory: by_agent[agent["name"]],
+        ):
             recs = llm_swarm_runner.run_langgraph_if_available(
                 {"allowed_recommendation_actions": ["propose_hunter_directive"]},
                 [],
@@ -523,16 +532,20 @@ class FrontierModelPolicyTests(unittest.TestCase):
             "proposed_change": "Reject",
             "agent_name": "red_team",
         }
-        sequence = [
-            scout,
-            {**scout, "agent_name": "cross_market_researcher", "market_key": "OTHER"},
-            {**scout, "agent_name": "strategy_lab", "market_key": "LAB"},
-            red_team,
-            {**scout, "agent_name": "execution_route_hunter", "market_key": "ROUTE"},
-            {**scout, "agent_name": "build_planner", "market_key": "BUILD"},
-        ]
+        by_agent = {
+            "market_scout": scout,
+            "cross_market_researcher": {**scout, "agent_name": "cross_market_researcher", "market_key": "OTHER"},
+            "strategy_lab": {**scout, "agent_name": "strategy_lab", "market_key": "LAB"},
+            "red_team": red_team,
+            "execution_route_hunter": {**scout, "agent_name": "execution_route_hunter", "market_key": "ROUTE"},
+            "build_planner": {**scout, "agent_name": "build_planner", "market_key": "BUILD"},
+        }
 
-        with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=sequence):
+        with mock.patch.object(
+            llm_swarm_runner,
+            "run_agent",
+            side_effect=lambda agent, _packet, _memory: by_agent[agent["name"]],
+        ):
             recs = llm_swarm_runner.run_langgraph_if_available(packet, [])
 
         self.assertNotIn("BAD_MARKET", {rec["market_key"] for rec in recs})

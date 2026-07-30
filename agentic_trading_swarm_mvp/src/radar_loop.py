@@ -35,7 +35,7 @@ from market_admission import run_market_admission_monitor
 from market_admission_bridge import run_market_admission_bridge
 from llm_swarm_runner import run_once as run_llm_swarm_once
 from market_hunter import run_market_hunter
-from memory_graph import ingest_radar_memory
+from memory_graph import ingest_radar_memory, memory_summary
 from okx_perp_scanner import build_scan_batch as build_okx_scan_batch
 from okx_signal_research import run_okx_signal_research
 from prediction_market_scanner import build_scan_batch as build_prediction_market_scan_batch
@@ -619,7 +619,11 @@ def run_once(settings: dict) -> dict:
         payload["market_hunter_directives"] = run_market_hunter(conn, settings)
         payload["llm_recommendations_ingested"] = llm_recommendations_ingested
         payload["llm_inbox"] = llm_inbox_summary()
-        payload["memory_facts_added"] = len(ingest_radar_memory(conn, payload))
+        memory_changes = ingest_radar_memory(conn, payload, settings)
+        payload["memory_facts_added"] = sum(item.get("operation") == "inserted" for item in memory_changes)
+        payload["memory_facts_reinforced"] = sum(item.get("operation") == "reinforced" for item in memory_changes)
+        payload["memory_profiles_updated"] = sum(item.get("operation") == "updated_profile" for item in memory_changes)
+        payload["agent_memory"] = memory_summary(conn, settings)
         payload["llm_cost_summary"] = llm_cost_summary(conn)
         write_llm_state_packet(conn, payload, settings)
         if auxiliary_policy["llm_swarm_in_radar"]:
