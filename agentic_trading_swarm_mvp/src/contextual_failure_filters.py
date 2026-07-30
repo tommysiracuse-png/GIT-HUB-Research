@@ -380,6 +380,52 @@ def _classify(metrics: dict, settings: dict, dimension: str = "") -> str:
     return "mixed"
 
 
+def _is_strategy_lab_signal(signal_key: str) -> bool:
+    return str(signal_key or "").startswith("STRATEGY_LAB|")
+
+
+def _segment_promotion_guard_enabled(settings: dict) -> bool:
+    cfg = settings.get("contextual_failure_filters", {})
+    return bool(cfg.get("strategy_lab_exact_market_promotion_guard", True))
+
+
+def _has_sufficient_segment_evidence(metrics: dict, settings: dict) -> bool:
+    cfg = settings.get("contextual_failure_filters", {})
+    min_closed = int(cfg.get("promotion_min_closed", cfg.get("min_closed_for_filter", 5)))
+    min_win_rate = float(cfg.get("promotion_min_win_rate", 0.5))
+    min_avg_pnl_bps = float(cfg.get("promotion_min_avg_pnl_bps", 0.0))
+    count = int(metrics.get("closed_count") or 0)
+    avg = float(metrics.get("avg_pnl_bps") or 0.0)
+    win_rate = float(metrics.get("win_rate") or 0.0)
+    return count >= min_closed and avg >= min_avg_pnl_bps and win_rate >= min_win_rate
+
+
+def _annotate_strategy_lab_promotion_guards(groups: list[dict], settings: dict) -> None:
+    if not _segment_promotion_guard_enabled(settings):
+        return
+    by_signal: dict[str, list[dict]] = collections.defaultdict(list)
+    for item in groups:
+        by_signal[str(item.get("signal_key") or "unknown")].append(item)
+    for signal_key, items in by_signal.items():
+        if not _is_strategy_lab_signal(signal_key):
+            continue
+        promotable_market_context_keys = sorted(
+            str(item.get("value") or "unknown")
+            for item in items
+            if item.get("dimension") == "market_context_key" and _has_sufficient_segment_evidence(item, settings)
+        )
+        promotable_keys = set(promotable_market_context_keys)
+        for item in items:
+            if item.get("dimension") == "signal_family":
+                item["promotion_scope"] = "segment_matched_only"
+                item["promotion_guard"] = "segment_matched_only" if promotable_market_context_keys else "blocked_pending_segment_evidence"
+                item["promotable_market_context_keys"] = promotable_market_context_keys
+            elif item.get("dimension") == "market_context_key":
+                item["promotion_scope"] = "exact_market_context_only"
+                item["promotion_guard"] = "eligible_exact_market_context" if str(item.get("value") or "unknown") in promotable_keys else "blocked_pending_segment_evidence"
+                item["promotable_market_context_keys"] = promotable_market_context_keys
+
+
 def _build_groups(trades: list[dict], settings: dict) -> list[dict]:
     grouped: dict[tuple[str, str, str], list[dict]] = collections.defaultdict(list)
     for trade in trades:
@@ -409,6 +455,7 @@ def _build_groups(trades: list[dict], settings: dict) -> list[dict]:
                 **metrics,
             }
         )
+    _annotate_strategy_lab_promotion_guards(output, settings)
     output.sort(key=lambda item: (item["failure_score"], item["closed_count"]), reverse=True)
     return output
 
