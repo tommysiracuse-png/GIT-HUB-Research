@@ -358,6 +358,21 @@ def _candidate_reference(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return reference
 
 
+def _paper_family_quarantine_reason(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    try:
+        from strategy_reliability import paper_family_quarantine_record as _paper_family_quarantine_record
+    except Exception:
+        return None
+
+    try:
+        return _paper_family_quarantine_record(candidate, config=config)
+    except Exception:
+        return None
+
+
 def frontier_shadow_filter_reason(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -455,6 +470,31 @@ def should_shadow_filter_frontier_candidate(
     return frontier_shadow_filter_reason(candidate, config) is not None
 
 
+def _annotate_shadow_filtered_candidate(
+    guarded: dict[str, Any],
+    reason: Mapping[str, Any],
+    detail_field: str,
+) -> dict[str, Any]:
+    guarded["shadow_filtered"] = True
+    guarded["paper_fill_allowed"] = False
+    guarded["paper_action"] = "shadow_filtered"
+    guarded["paper_status"] = "shadow_filtered"
+    guarded["paper_fill_status"] = "shadow_filtered"
+    guarded["paper_order_status"] = "shadow_filtered"
+    guarded["router_action"] = "shadow_filtered"
+    guarded["candidate_reject_reason"] = guarded.get("candidate_reject_reason") or reason.get("reason") or FRONTIER_SHADOW_REASON
+    guarded["candidate_reject_detail"] = dict(reason)
+    guarded[detail_field] = dict(reason)
+
+    for boolean_field in ("paper_filled", "filled"):
+        if guarded.get(boolean_field) is True:
+            guarded[boolean_field] = False
+    for status_field in ("status", "order_status", "fill_status"):
+        if str(guarded.get(status_field) or "").lower() == "paper_filled":
+            guarded[status_field] = "shadow_filtered"
+    return guarded
+
+
 def apply_frontier_paper_guard(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -463,29 +503,15 @@ def apply_frontier_paper_guard(
     guarded = _apply_route_feasibility_metadata(candidate) if (
         is_frontier_crypto_candidate(candidate) and frontier_route_feasibility_guard_enabled(config)
     ) else dict(candidate)
+    quarantine_reason = _paper_family_quarantine_reason(guarded, config)
+    if quarantine_reason is not None:
+        return _annotate_shadow_filtered_candidate(guarded, quarantine_reason, "paper_strategy_quarantine")
+
     reason = frontier_shadow_filter_reason(guarded, config)
     if reason is None:
         return guarded
 
-    guarded["shadow_filtered"] = True
-    guarded["paper_fill_allowed"] = False
-    guarded["paper_action"] = "shadow_filtered"
-    guarded["paper_status"] = "shadow_filtered"
-    guarded["paper_fill_status"] = "shadow_filtered"
-    guarded["paper_order_status"] = "shadow_filtered"
-    guarded["router_action"] = "shadow_filtered"
-    guarded["candidate_reject_reason"] = guarded.get("candidate_reject_reason") or FRONTIER_SHADOW_REASON
-    guarded["candidate_reject_detail"] = reason
-    guarded["frontier_paper_guard"] = reason
-
-    for boolean_field in ("paper_filled", "filled"):
-        if guarded.get(boolean_field) is True:
-            guarded[boolean_field] = False
-    for status_field in ("status", "order_status", "fill_status"):
-        if str(guarded.get(status_field) or "").lower() == "paper_filled":
-            guarded[status_field] = "shadow_filtered"
-
-    return guarded
+    return _annotate_shadow_filtered_candidate(guarded, reason, "frontier_paper_guard")
 
 
 def filter_frontier_paper_candidates(
