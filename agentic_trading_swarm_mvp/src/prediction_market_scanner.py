@@ -139,6 +139,13 @@ def _prediction_risk_flags(end_date: object, spread_bps: float, liquidity: float
         flags.append("needs_llm_event_classification")
     if metadata.get("resolution_risk_status") in {"expired_or_resolution_pending", "unclear_resolution_date"}:
         flags.append(str(metadata["resolution_risk_status"]))
+    if metadata.get("researcher_recommendation_status") == "rejected_incomplete":
+        flags.append("incomplete_researcher_recommendation_rejected")
+        flags.extend(
+            str(item)
+            for item in metadata.get("researcher_recommendation_errors", [])
+            if isinstance(item, str) and item
+        )
     return flags
 
 
@@ -151,6 +158,46 @@ def _days_to_end(end_date: object) -> float | None:
         return None
     now = dt.datetime.now(dt.timezone.utc)
     return (end - now).total_seconds() / 86400.0
+
+
+def _has_required_research_value(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _validate_researcher_recommendation(payload: object) -> tuple[dict | None, list[str]]:
+    recommendation = coerce_single_json_object(payload, default=None)
+    if not isinstance(recommendation, dict) or not recommendation:
+        return None, ["researcher_recommendation_not_single_json_object"]
+    missing = [
+        field
+        for field in ("market_id", "recommended_action", "confidence", "thesis", "rationale")
+        if not _has_required_research_value(recommendation.get(field))
+    ]
+    if missing:
+        return None, [f"researcher_recommendation_missing_{field}" for field in missing]
+    return recommendation, []
+
+
+def _normalize_researcher_recommendation_metadata(metadata: object) -> dict:
+    normalized = coerce_single_json_object(metadata, default={})
+    if "researcher_recommendation" not in normalized:
+        return normalized
+    recommendation, errors = _validate_researcher_recommendation(normalized.get("researcher_recommendation"))
+    if recommendation is None:
+        normalized["researcher_recommendation_status"] = "rejected_incomplete"
+        normalized["researcher_recommendation_errors"] = errors
+        normalized.pop("researcher_recommendation_applied", None)
+        return normalized
+    normalized["researcher_recommendation"] = recommendation
+    normalized["researcher_recommendation_status"] = "accepted"
+    normalized["researcher_recommendation_errors"] = []
+    return normalized
 
 
 def _polymarket_paper_gate(candidate: dict, row: dict, settings: dict) -> tuple[bool, list[str]]:
@@ -268,6 +315,7 @@ def _candidate(
     settings: dict,
     metadata: dict,
 ) -> dict:
+    metadata = _normalize_researcher_recommendation_metadata(metadata)
     liq = liquidity_score(max(liquidity, volume_24h))
     if metadata.get("orderbook_spread_bps") is not None:
         spread_bps = min(spread_bps, float(metadata["orderbook_spread_bps"]))
