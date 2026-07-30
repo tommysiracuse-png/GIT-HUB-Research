@@ -10,10 +10,18 @@ from __future__ import annotations
 import datetime as dt
 
 try:
-    from src.frontier_data_quality import _paper_only_parse_timestamp, paper_only_route_quality_record
+    from src.frontier_data_quality import (
+        _paper_only_context_evidence_review,
+        _paper_only_parse_timestamp,
+        paper_only_route_quality_record,
+    )
 except ImportError:  # pragma: no cover - fallback for direct module execution
     try:
-        from frontier_data_quality import _paper_only_parse_timestamp, paper_only_route_quality_record
+        from frontier_data_quality import (
+            _paper_only_context_evidence_review,
+            _paper_only_parse_timestamp,
+            paper_only_route_quality_record,
+        )
     except ImportError:  # pragma: no cover - route-quality enrichment becomes optional
         def _paper_only_parse_timestamp(value):
             if value is None:
@@ -40,6 +48,23 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
             except ValueError:
                 return None
             return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)
+
+        def _paper_only_context_evidence_review(record, config=None):
+            return {
+                "enabled": False,
+                "context_signature": None,
+                "context_signature_key": None,
+                "matched": False,
+                "eligible": True,
+                "sample_size": None,
+                "min_sample_size": 20.0,
+                "expectancy_bps": None,
+                "min_expectancy_bps": 0.0,
+                "inherited_confidence": None,
+                "variant_state": "guard_disabled",
+                "activation_mode": "guard_disabled",
+                "reason": "guard_disabled",
+            }
 
         paper_only_route_quality_record = None
 
@@ -222,6 +247,30 @@ def _paper_only_route_status_text(route_status):
     return _paper_only_route_review_text(route_status)
 
 
+def _paper_only_apply_context_inheritance_review(review, route_status, *, config=None):
+    if not isinstance(review, dict):
+        return review
+    context_review = _paper_only_context_evidence_review(route_status, config=config)
+    if not isinstance(context_review, dict):
+        return review
+    if context_review.get("enabled") or context_review.get("context_signature_key"):
+        review["context_signature"] = context_review.get("context_signature")
+        review["context_signature_key"] = context_review.get("context_signature_key")
+        review["context_match_found"] = bool(context_review.get("matched"))
+        review["context_sample_size"] = context_review.get("sample_size")
+        review["context_expectancy_bps"] = context_review.get("expectancy_bps")
+        review["inherited_confidence"] = context_review.get("inherited_confidence")
+        review["variant_state"] = context_review.get("variant_state")
+        review["recommendation_eligible"] = bool(context_review.get("eligible"))
+        review["context_guard_reason"] = context_review.get("reason")
+    if context_review.get("enabled") and not context_review.get("eligible"):
+        if review.get("route_status") in (None, "", "eligible"):
+            review["route_status"] = "paper_shadow_only"
+        review["paper_eligible"] = False
+        review["trade_effect"] = review.get("trade_effect") or "none"
+    return review
+
+
 def _paper_only_short_route_review(route_status, *, config=None):
     def _fallback_review(reason, base_review=None):
         review = dict(base_review or {})
@@ -353,7 +402,7 @@ def _paper_only_short_route_review(route_status, *, config=None):
                 return _fallback_review("missing_simulated_venue_tag", review)
             if review["route_status"] is None:
                 return _fallback_review("unresolved_route_status", review)
-        return review
+        return _paper_only_apply_context_inheritance_review(review, route_status, config=config)
 
     if _paper_only_enforced_route_resolution_enabled(config):
         if not _paper_only_route_has_explicit_paper_mode(route_status, config=config):
@@ -365,7 +414,7 @@ def _paper_only_short_route_review(route_status, *, config=None):
         route_status.get("strategy_family") or route_status.get("candidate_family") or route_status.get("strategy")
     )
     if str(strategy_family or "").strip().lower() != "short_frontier_spot":
-        return review
+        return _paper_only_apply_context_inheritance_review(review, route_status, config=config)
 
     explicit_supported = _paper_only_route_review_bool(route_status.get("route_supported"))
     if explicit_supported is None:
@@ -381,7 +430,7 @@ def _paper_only_short_route_review(route_status, *, config=None):
     )
     if short_confirmed:
         review["route_status"] = review["route_status"] or "eligible"
-        return review
+        return _paper_only_apply_context_inheritance_review(review, route_status, config=config)
 
     review["route_blocked"] = True
     if review["route_status"] is None:
@@ -389,7 +438,7 @@ def _paper_only_short_route_review(route_status, *, config=None):
 
     if review["block_reason"] is None:
         review["block_reason"] = "short_route_unsupported" if short_explicitly_blocked else "short_route_support_unconfirmed"
-    return review
+    return _paper_only_apply_context_inheritance_review(review, route_status, config=config)
 
 
 def _paper_only_build_governor_fields(*, source="frontier_crypto_adapter", paper_only=True):

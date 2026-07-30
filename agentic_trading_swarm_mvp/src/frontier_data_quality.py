@@ -146,6 +146,9 @@ PAPER_ONLY_ROUTE_STATUS_ALIASES = {
     "degraded_route": "degraded",
     "route_degraded": "degraded",
 }
+PAPER_ONLY_CONTEXT_INHERITANCE_GUARD_FLAG = "paper_only_context_inheritance_guard_v1"
+PAPER_ONLY_CONTEXT_MIN_SAMPLE_SIZE_DEFAULT = 20.0
+PAPER_ONLY_CONTEXT_MIN_EXPECTANCY_BPS_DEFAULT = 0.0
 
 
 def _paper_only_quality_as_datetime(value):
@@ -185,6 +188,299 @@ def _paper_only_normalize_route_status_key(value):
         return key
     key = key.replace(" ", "_")
     return PAPER_ONLY_ROUTE_STATUS_ALIASES.get(key, key)
+
+
+def _paper_only_context_guard_enabled(config):
+    if not isinstance(config, dict):
+        return False
+    direct_flag = _paper_only_cross_asset_regime_bool(config.get(PAPER_ONLY_CONTEXT_INHERITANCE_GUARD_FLAG))
+    if direct_flag is not None:
+        return direct_flag
+    feature_flags = config.get("feature_flags")
+    if isinstance(feature_flags, dict):
+        nested_flag = _paper_only_cross_asset_regime_bool(feature_flags.get(PAPER_ONLY_CONTEXT_INHERITANCE_GUARD_FLAG))
+        if nested_flag is not None:
+            return nested_flag
+    return False
+
+
+def _paper_only_context_lookup(source, *keys):
+    if not isinstance(source, dict):
+        return None
+    for key in keys:
+        if key in source:
+            value = source.get(key)
+            if value not in (None, "", [], {}, ()):
+                return value
+    return None
+
+
+def _paper_only_context_as_float(value):
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _paper_only_context_tag(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return normalized or None
+
+
+def _paper_only_context_side(value):
+    tag = _paper_only_context_tag(value)
+    if tag in {"buy", "long"}:
+        return "long"
+    if tag in {"sell", "short"}:
+        return "short"
+    return tag
+
+
+def _paper_only_context_market_type(value):
+    tag = _paper_only_context_tag(value)
+    if not tag:
+        return None
+    if "spot" in tag:
+        return "spot"
+    if any(token in tag for token in ("perp", "perpetual", "swap")):
+        return "perp"
+    if "future" in tag:
+        return "futures"
+    return tag
+
+
+def _paper_only_context_leg_structure(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        leg_count = int(value)
+        if leg_count > 0:
+            return "single_leg" if leg_count == 1 else f"{leg_count}_leg"
+    tag = _paper_only_context_tag(value)
+    if tag in {"1", "one", "single", "single_leg", "outright"}:
+        return "single_leg"
+    if tag in {"2", "two", "double", "two_leg", "double_leg", "basis"}:
+        return "two_leg"
+    return tag
+
+
+def _paper_only_context_carry_bucket(value):
+    tag = _paper_only_context_tag(value)
+    if tag in {"positive", "positive_carry", "carry_positive", "funding_positive"}:
+        return "positive_carry"
+    if tag in {"negative", "negative_carry", "carry_negative", "funding_negative"}:
+        return "negative_carry"
+    if tag in {"flat", "neutral", "none", "zero"}:
+        return "neutral"
+    return tag
+
+
+def _paper_only_context_signature(record):
+    if not isinstance(record, dict):
+        return None
+    strategy_family = _paper_only_context_tag(
+        _paper_only_context_lookup(record, "strategy_family", "candidate_family", "strategy")
+    )
+    leg_structure = _paper_only_context_leg_structure(
+        _paper_only_context_lookup(record, "leg_structure", "execution_legs", "structure", "leg_count", "legs")
+    )
+    if leg_structure is None and strategy_family and "basis" in strategy_family:
+        leg_structure = "two_leg"
+    return {
+        "venue": _paper_only_context_tag(
+            _paper_only_context_lookup(record, "venue", "venue_id", "exchange", "execution_venue", "route_destination")
+        ),
+        "market_type": _paper_only_context_market_type(
+            _paper_only_context_lookup(record, "market_type", "instrument_type", "product_type", "market", "contract_type")
+        ),
+        "side": _paper_only_context_side(
+            _paper_only_context_lookup(record, "side", "direction", "trade_side", "signal_side")
+        ),
+        "leg_structure": leg_structure,
+        "carry_bucket": _paper_only_context_carry_bucket(
+            _paper_only_context_lookup(record, "carry_bucket", "carry_regime", "funding_regime", "basis_regime", "carry")
+        ),
+    }
+
+
+def _paper_only_context_signature_key(signature):
+    if not isinstance(signature, dict):
+        return None
+    parts = []
+    for key in ("venue", "market_type", "side", "leg_structure", "carry_bucket"):
+        parts.append(f"{key}={signature.get(key) or 'unknown'}")
+    return "|".join(parts)
+
+
+def _paper_only_context_evidence_payload(config):
+    if not isinstance(config, dict):
+        return None
+    direct = _paper_only_context_lookup(
+        config,
+        "paper_variant_context_evidence",
+        "paper_context_inheritance_evidence",
+        "variant_context_evidence",
+    )
+    if direct is not None:
+        return direct
+    feature_flags = config.get("feature_flags")
+    if isinstance(feature_flags, dict):
+        return _paper_only_context_lookup(
+            feature_flags,
+            "paper_variant_context_evidence",
+            "paper_context_inheritance_evidence",
+            "variant_context_evidence",
+        )
+    return None
+
+
+def _paper_only_context_threshold(config, *keys, default=None):
+    if not isinstance(config, dict):
+        return default
+    direct = _paper_only_context_as_float(_paper_only_context_lookup(config, *keys))
+    if direct is not None:
+        return direct
+    feature_flags = config.get("feature_flags")
+    if isinstance(feature_flags, dict):
+        nested = _paper_only_context_as_float(_paper_only_context_lookup(feature_flags, *keys))
+        if nested is not None:
+            return nested
+    return default
+
+
+def _paper_only_context_evidence_entries(payload):
+    if isinstance(payload, dict):
+        contexts = payload.get("contexts")
+        if isinstance(contexts, dict):
+            for key, value in contexts.items():
+                if isinstance(value, dict):
+                    entry = dict(value)
+                    entry.setdefault("context_signature_key", key)
+                    yield entry
+            return
+        if isinstance(contexts, (list, tuple)):
+            for entry in contexts:
+                if isinstance(entry, dict):
+                    yield entry
+            return
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                entry = dict(value)
+                entry.setdefault("context_signature_key", key)
+                yield entry
+        return
+    if isinstance(payload, (list, tuple)):
+        for entry in payload:
+            if isinstance(entry, dict):
+                yield entry
+
+
+def _paper_only_context_evidence_match(signature, payload):
+    if not isinstance(signature, dict):
+        return None
+    signature_key = _paper_only_context_signature_key(signature)
+    for entry in _paper_only_context_evidence_entries(payload):
+        entry_key = entry.get("context_signature_key") or entry.get("signature_key") or entry.get("key")
+        if entry_key is not None and str(entry_key).strip() == str(signature_key):
+            return entry
+        entry_signature = entry.get("context_signature") if isinstance(entry.get("context_signature"), dict) else entry
+        if _paper_only_context_signature(entry_signature) == signature:
+            return entry
+    return None
+
+
+def _paper_only_context_evidence_review(record, config=None):
+    signature = _paper_only_context_signature(record)
+    review = {
+        "enabled": False,
+        "context_signature": signature,
+        "context_signature_key": _paper_only_context_signature_key(signature) if isinstance(signature, dict) else None,
+        "matched": False,
+        "eligible": True,
+        "sample_size": None,
+        "min_sample_size": PAPER_ONLY_CONTEXT_MIN_SAMPLE_SIZE_DEFAULT,
+        "expectancy_bps": None,
+        "min_expectancy_bps": PAPER_ONLY_CONTEXT_MIN_EXPECTANCY_BPS_DEFAULT,
+        "inherited_confidence": None,
+        "variant_state": "guard_disabled",
+        "activation_mode": "guard_disabled",
+        "reason": "guard_disabled",
+    }
+    enabled = _paper_only_context_guard_enabled(config)
+    if not enabled:
+        return review
+
+    review["enabled"] = True
+    review["min_sample_size"] = _paper_only_context_threshold(
+        config,
+        "paper_context_min_sample_size",
+        "paper_variant_min_sample_size",
+        "minimum_paper_sample_size",
+        default=PAPER_ONLY_CONTEXT_MIN_SAMPLE_SIZE_DEFAULT,
+    )
+    review["min_expectancy_bps"] = _paper_only_context_threshold(
+        config,
+        "paper_context_min_expectancy_bps",
+        "paper_variant_min_expectancy_bps",
+        "minimum_expectancy_bps",
+        default=PAPER_ONLY_CONTEXT_MIN_EXPECTANCY_BPS_DEFAULT,
+    )
+    review["eligible"] = False
+    review["variant_state"] = "paper_shadow_only"
+    review["activation_mode"] = "paper_shadow_only"
+    review["inherited_confidence"] = 0.0
+
+    if not isinstance(signature, dict) or not any(signature.values()):
+        review["reason"] = "missing_context_signature"
+        return review
+
+    payload = _paper_only_context_evidence_payload(config)
+    matched_entry = _paper_only_context_evidence_match(signature, payload)
+    if not isinstance(matched_entry, dict):
+        review["reason"] = "missing_context_match"
+        return review
+
+    review["matched"] = True
+    review["sample_size"] = _paper_only_context_as_float(
+        _paper_only_context_lookup(matched_entry, "sample_size", "paper_sample_size", "trade_count", "trades")
+    )
+    review["expectancy_bps"] = _paper_only_context_as_float(
+        _paper_only_context_lookup(matched_entry, "expectancy_bps", "paper_expectancy_bps", "edge_bps", "avg_bps")
+    )
+
+    approved_flag = _paper_only_cross_asset_regime_bool(
+        _paper_only_context_lookup(
+            matched_entry,
+            "approved",
+            "allow_inheritance",
+            "recommendation_eligible",
+            "paper_recommendation_eligible",
+        )
+    )
+    if approved_flag is False:
+        review["reason"] = "context_explicitly_disallowed"
+        return review
+    if review["sample_size"] is None or review["sample_size"] < float(review["min_sample_size"]):
+        review["reason"] = "sample_below_minimum"
+        return review
+    if review["expectancy_bps"] is None or review["expectancy_bps"] <= float(review["min_expectancy_bps"]):
+        review["reason"] = "expectancy_not_positive"
+        return review
+
+    review["eligible"] = True
+    review["inherited_confidence"] = 1.0
+    review["variant_state"] = "eligible"
+    review["activation_mode"] = "recommendation"
+    review["reason"] = "approved_context_match"
+    return review
 
 PAPER_ONLY_CROSS_ASSET_REGIME_MARKET_KEY = "paper_us_cross_asset_risk_regime"
 PAPER_ONLY_CROSS_ASSET_REGIME_DEFAULTS = {
