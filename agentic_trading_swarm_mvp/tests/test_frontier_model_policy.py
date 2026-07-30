@@ -211,6 +211,21 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(rec["parse_status"], "recovered_valid")
         self.assertEqual(rec["priority"], 81)
 
+    def test_truncated_outer_object_does_not_recover_nested_evidence(self) -> None:
+        packet = {"allowed_recommendation_actions": ["propose_strategy_lab_experiment", "no_action"]}
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "strategy_lab")
+        raw = (
+            '{"action":"propose_strategy_lab_experiment","priority":92,'
+            '"title":"OKX funding quality","evidence":{"avg_pnl_bps":119.8},'
+            '"strategy_lab_experiment":{"strategy_lab_id":"okx_quality"'
+        )
+
+        rec = llm_swarm_runner.parse_recommendation(raw, agent, packet)
+
+        self.assertTrue(rec["_rejected"])
+        self.assertEqual(rec["parse_status"], "truncated_json")
+        self.assertEqual(rec["terminal_failure_reason"], "truncated_json")
+
     def test_build_planner_malformed_code_change_is_downgraded(self) -> None:
         packet = {
             "allowed_recommendation_actions": [

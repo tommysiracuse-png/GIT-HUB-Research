@@ -570,11 +570,13 @@ def _parse_json_recommendation(text: str) -> tuple[dict | None, str, str | None]
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
+        # A truncated top-level object can contain complete nested objects. Recovering
+        # one of those would misclassify evidence/config as the recommendation itself.
+        if _appears_truncated_json(raw):
+            return None, "truncated_json", "truncated_json"
         embedded = _json_objects(raw)
         if embedded:
             return embedded[0], "recovered_valid", None
-        if _appears_truncated_json(raw):
-            return None, "truncated_json", "truncated_json"
         return None, "invalid_json", "no_complete_json_object"
     if not isinstance(parsed, dict):
         return None, "invalid_schema", "top_level_json_not_object"
