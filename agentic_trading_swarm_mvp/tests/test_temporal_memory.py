@@ -24,6 +24,7 @@ from temporal_memory import (  # noqa: E402
     graphiti_status,
     record_swarm_reflection,
     refresh_evidence_memories,
+    refresh_memory_prose,
     retrieve_role_memories,
     upsert_memory_fact,
 )
@@ -515,6 +516,47 @@ class TemporalMemoryTests(unittest.TestCase):
         self.assertIn("No downstream code proposal has been recorded yet", recommendation_text)
         self.assertIn("spot borrow: 27", route_text)
         self.assertIn("feasibility, not strategy profitability", route_text)
+
+    def test_rich_prose_backfill_updates_old_active_rows_once(self) -> None:
+        evidence = {
+            "venue": "OKX",
+            "trade_type": "perp_funding_basis",
+            "direction": "funding_capture_short_perp",
+            "valid_labels": 40,
+            "avg_pnl_bps": 18.2,
+            "win_rate": 0.55,
+            "worst_decile_bps": -24.0,
+            "best_bps": 90.0,
+            "worst_bps": -50.0,
+        }
+        result = upsert_memory_fact(
+            self.conn,
+            "signal_performance",
+            "OKX|perp_funding_basis|funding_capture_short_perp|standard",
+            "has_reliable_60m_outcomes",
+            json.dumps(evidence),
+            0.95,
+            "paper_outcome_engine",
+            evidence,
+            namespace="outcomes",
+            outcome=evidence,
+        )
+        self.conn.execute(
+            "update temporal_memories set summary='signal_performance: old terse text' where memory_id=?",
+            (result["memory_id"],),
+        )
+        self.conn.commit()
+
+        first = refresh_memory_prose(self.conn)
+        second = refresh_memory_prose(self.conn)
+        row = self.conn.execute(
+            "select summary from temporal_memories where memory_id=?", (result["memory_id"],)
+        ).fetchone()
+
+        self.assertEqual(first["updated"], 1)
+        self.assertEqual(second["status"], "already_complete")
+        self.assertIn("40 valid labels", row["summary"])
+        self.assertIn("average net outcome was +18.20 bps", row["summary"])
 
 
 class LangGraphMemoryTests(unittest.TestCase):
