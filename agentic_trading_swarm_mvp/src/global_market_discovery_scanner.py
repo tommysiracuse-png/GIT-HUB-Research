@@ -165,6 +165,31 @@ DEFAULT_PROXY_MAP: dict[str, list[dict[str, Any]]] = {
 }
 
 
+ACTIVE_PAPER_COHORT: tuple[dict[str, str], ...] = (
+    {"venue": "Cboe Global Markets", "symbol": "VIXY", "surface": "volatility_long", "region": "United States"},
+    {"venue": "Cboe Global Markets", "symbol": "VXX", "surface": "volatility_long", "region": "United States"},
+    {"venue": "Cboe Global Markets", "symbol": "UVXY", "surface": "volatility_long", "region": "United States"},
+    {"venue": "Cboe Global Markets", "symbol": "SVXY", "surface": "volatility_short", "region": "United States"},
+    {"venue": "Korea Exchange", "symbol": "EWY", "surface": "country_etf", "region": "South Korea"},
+    {"venue": "Korea Exchange", "symbol": "PKX", "surface": "adr", "region": "South Korea"},
+    {"venue": "Taiwan Stock Exchange", "symbol": "EWT", "surface": "country_etf", "region": "Taiwan"},
+    {"venue": "Taiwan Stock Exchange", "symbol": "TSM", "surface": "adr", "region": "Taiwan"},
+    {"venue": "Taiwan Stock Exchange", "symbol": "UMC", "surface": "adr", "region": "Taiwan"},
+    {"venue": "B3", "symbol": "EWZ", "surface": "country_etf", "region": "Brazil"},
+    {"venue": "B3", "symbol": "NU", "surface": "adr", "region": "Brazil"},
+    {"venue": "TMX Group", "symbol": "SHOP", "surface": "adr", "region": "Canada"},
+    {"venue": "TMX Group", "symbol": "TD", "surface": "adr", "region": "Canada"},
+    {"venue": "TMX Group", "symbol": "RY", "surface": "adr", "region": "Canada"},
+    {"venue": "CME Group", "symbol": "GLD", "surface": "precious_metal_proxy", "region": "Global"},
+    {"venue": "London Metal Exchange", "symbol": "SLV", "surface": "precious_metal_proxy", "region": "Global"},
+    {"venue": "CME Group", "symbol": "SPY", "surface": "equity_index_proxy", "region": "United States"},
+    {"venue": "Japan Exchange Group", "symbol": "EWJ", "surface": "country_etf", "region": "Japan"},
+    {"venue": "Australian Securities Exchange", "symbol": "BHP", "surface": "adr", "region": "Australia"},
+)
+ACTIVE_PAPER_SYMBOLS = {item["symbol"] for item in ACTIVE_PAPER_COHORT}
+_CHART_CACHE: dict[tuple[int, str], dict[str, Any]] = {}
+
+
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -300,6 +325,50 @@ def _build_targets(
             targets.append((discovery, proxy))
             seen_inst_ids.add(inst_id)
 
+    for cohort in ACTIVE_PAPER_COHORT if bool(cfg.get("active_paper_cohort_enabled", False)) else ():
+        venue = cohort["venue"]
+        symbol = cohort["symbol"]
+        inst_id = f"{_venue_key(venue)}:{symbol}"
+        if inst_id in seen_inst_ids:
+            for index, (discovery, proxy) in enumerate(targets):
+                if f"{_venue_key(str(discovery.get('venue_or_source') or 'unknown'))}:{proxy.get('symbol')}" == inst_id:
+                    targets[index] = (discovery, {**proxy, "active_paper_cohort": True, "cohort_surface": cohort["surface"]})
+                    break
+            continue
+        discovery = normalize_market_candidate(
+            {
+                "surface_type_raw": f"active paper {cohort['surface']}",
+                "surface_type_classified": cohort["surface"],
+                "venue_or_source": venue,
+                "country": cohort["region"],
+                "region": cohort["region"],
+                "asset_or_event": symbol,
+                "data_access_type": "public_no_key",
+                "tradability_guess": "directly_tradable",
+                "why_interesting": "High-priority active-paper cohort selected from system market-expansion evidence.",
+                "inefficiency_hypothesis": "Surface-aware momentum and relative confirmation may identify short-horizon paper opportunities.",
+                "latency_sensitivity": "medium",
+                "liquidity_hint": "listed proxy or ADR",
+                "route_blockers": [],
+                "recommended_next_action": "growth_experiment",
+                "priority": 95,
+                "confidence": 0.8,
+            }
+        )
+        targets.append(
+            (
+                discovery,
+                {
+                    "symbol": symbol,
+                    "label": f"{symbol} active-paper cohort",
+                    "surface": cohort["surface"],
+                    "cohort_surface": cohort["surface"],
+                    "active_paper_cohort": True,
+                },
+            )
+        )
+        seen_inst_ids.add(inst_id)
+
     for inst_id in sorted(required_inst_ids or set()):
         target = _required_target(inst_id)
         if target and inst_id not in seen_inst_ids:
@@ -329,9 +398,131 @@ def _chart_last_time(chart: dict[str, Any]) -> dt.datetime:
     return dt.datetime.fromtimestamp(int(time.time()), tz=dt.timezone.utc)
 
 
+def _cached_chart(symbol: str) -> dict[str, Any]:
+    key = (id(fetch_chart), symbol)
+    if key not in _CHART_CACHE:
+        if len(_CHART_CACHE) >= 256:
+            _CHART_CACHE.clear()
+        _CHART_CACHE[key] = fetch_chart(symbol)
+    return _CHART_CACHE[key]
+
+
+def _chart_returns(chart: dict[str, Any]) -> tuple[float, float]:
+    quote = chart.get("indicators", {}).get("quote", [{}])[0]
+    pairs = valid_pairs(quote.get("close") or [], quote.get("volume") or [])
+    if len(pairs) < 12:
+        raise ValueError("insufficient_chart_history")
+    last = pairs[-1][0]
+    ref_1d = pairs[-27][0] if len(pairs) >= 27 else pairs[0][0]
+    ref_short = pairs[-5][0] if len(pairs) >= 5 else pairs[0][0]
+    return bps_change(last, ref_1d), bps_change(last, ref_short)
+
+
+def _market_session(meta: dict[str, Any], last_seen: dt.datetime) -> str:
+    market_state = str(meta.get("marketState") or "").lower()
+    if market_state in {"regular", "open"}:
+        return "open"
+    if market_state in {"closed", "post", "pre", "postpost"}:
+        return "closed"
+    regular = ((meta.get("currentTradingPeriod") or {}).get("regular") or {})
+    now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
+    try:
+        start = float(regular.get("start"))
+        end = float(regular.get("end"))
+    except (TypeError, ValueError):
+        start = end = 0.0
+    if start > 0 and end > start:
+        return "open" if start <= now_ts <= end else "closed"
+    weekday = dt.datetime.now(dt.timezone.utc).weekday()
+    if weekday >= 5 or _stale_minutes(last_seen) > 180.0:
+        return "closed"
+    return "unknown"
+
+
+def _surface_signal(
+    symbol: str,
+    surface: str,
+    ret_1d_bps: float,
+    ret_short_bps: float,
+) -> dict[str, Any]:
+    if symbol == "SPY":
+        aligned = ret_1d_bps * ret_short_bps > 0
+        direction = "long_proxy" if ret_short_bps > 0 else "short_proxy"
+        return {
+            "direction": direction if aligned else "watch_only",
+            "strength_bps": abs(ret_1d_bps) * 0.08 + abs(ret_short_bps) * 0.18,
+            "variant": "spy_aligned_trend_v1",
+            "reason": None if aligned else "short_and_daily_trend_not_aligned",
+            "benchmark": {},
+        }
+
+    spy_1d, spy_short = _chart_returns(_cached_chart("SPY"))
+    relative_1d = ret_1d_bps - spy_1d
+    relative_short = ret_short_bps - spy_short
+    direction = "watch_only"
+    reason = "surface_confirmation_missing"
+    variant = "country_adr_relative_momentum_v1"
+    aligned_up = ret_1d_bps > 0 and ret_short_bps > 0
+    aligned_down = ret_1d_bps < 0 and ret_short_bps < 0
+    if surface == "volatility_long":
+        variant = "long_vol_spy_shock_confirmation_v1"
+        if aligned_up and spy_short < 0:
+            direction, reason = "long_proxy", None
+        elif aligned_down and spy_short > 0:
+            direction, reason = "short_proxy", None
+    elif surface == "volatility_short":
+        variant = "short_vol_spy_regime_confirmation_v1"
+        if aligned_up and spy_short >= 0:
+            direction, reason = "long_proxy", None
+        elif aligned_down and spy_short < 0:
+            direction, reason = "short_proxy", None
+    elif surface == "precious_metal_proxy":
+        variant = "precious_metal_relative_momentum_v1"
+        if aligned_up and relative_short > 0:
+            direction, reason = "long_proxy", None
+        elif aligned_down and relative_short < 0:
+            direction, reason = "short_proxy", None
+        try:
+            uup_1d, uup_short = _chart_returns(_cached_chart("UUP"))
+        except Exception:  # noqa: BLE001 - dollar confirmation is additive, not a hard dependency.
+            uup_1d = uup_short = None
+        benchmark = {
+            "spy_return_1d_bps": round(spy_1d, 3),
+            "spy_return_short_bps": round(spy_short, 3),
+            "relative_1d_bps": round(relative_1d, 3),
+            "relative_short_bps": round(relative_short, 3),
+            "uup_return_1d_bps": round(uup_1d, 3) if uup_1d is not None else None,
+            "uup_return_short_bps": round(uup_short, 3) if uup_short is not None else None,
+        }
+        return {
+            "direction": direction,
+            "strength_bps": abs(ret_short_bps) * 0.14 + abs(relative_short) * 0.12,
+            "variant": variant,
+            "reason": reason,
+            "benchmark": benchmark,
+        }
+    else:
+        if aligned_up and relative_short > 0:
+            direction, reason = "long_proxy", None
+        elif aligned_down and relative_short < 0:
+            direction, reason = "short_proxy", None
+    return {
+        "direction": direction,
+        "strength_bps": abs(ret_short_bps) * 0.14 + abs(relative_short) * 0.10 + abs(ret_1d_bps) * 0.05,
+        "variant": variant,
+        "reason": reason,
+        "benchmark": {
+            "spy_return_1d_bps": round(spy_1d, 3),
+            "spy_return_short_bps": round(spy_short, 3),
+            "relative_1d_bps": round(relative_1d, 3),
+            "relative_short_bps": round(relative_short, 3),
+        },
+    }
+
+
 def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], settings: dict | None = None) -> dict[str, Any] | None:
     symbol = str(proxy["symbol"])
-    chart = fetch_chart(symbol)
+    chart = _cached_chart(symbol)
     meta = chart.get("meta", {})
     quote = chart.get("indicators", {}).get("quote", [{}])[0]
     pairs = valid_pairs(quote.get("close") or [], quote.get("volume") or [])
@@ -348,13 +539,31 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
     spread = estimated_spread_bps(liq)
     last_seen = _chart_last_time(chart)
     stale_minutes = _stale_minutes(last_seen)
-    direction = "long_proxy" if ret_1d_bps >= 0 else "short_proxy"
-    if stale_minutes > float(_cfg(settings).get("watch_only_stale_minutes", 180)):
+    session_status = _market_session(meta, last_seen)
+    active_cohort = bool(proxy.get("active_paper_cohort"))
+    if active_cohort:
+        surface_signal = _surface_signal(symbol, str(proxy.get("cohort_surface") or proxy.get("surface") or "proxy"), ret_1d_bps, ret_short_bps)
+        direction = str(surface_signal["direction"])
+        signal_strength = float(surface_signal["strength_bps"])
+        strategy_variant = str(surface_signal["variant"])
+        reject_reason = surface_signal.get("reason")
+        benchmark_context = surface_signal.get("benchmark") or {}
+    else:
+        direction = "long_proxy" if ret_1d_bps >= 0 else "short_proxy"
+        signal_strength = abs(ret_1d_bps) * 0.10 + abs(ret_short_bps) * 0.14
+        strategy_variant = "legacy_global_discovery_momentum_v1"
+        reject_reason = None
+        benchmark_context = {}
+    if session_status == "closed":
         direction = "watch_only"
+        reject_reason = "market_closed"
+    elif stale_minutes > float(_cfg(settings).get("watch_only_stale_minutes", 180)):
+        direction = "watch_only"
+        reject_reason = "stale_market_data"
 
     surface_priority = float(discovery.get("priority") or 50.0)
     confidence = float(discovery.get("confidence") or 0.5)
-    abs_signal = abs(ret_1d_bps) * 0.10 + abs(ret_short_bps) * 0.14
+    abs_signal = signal_strength
     edge_bps = round(max(0.0, min(abs_signal, 55.0) - spread), 3)
     discovery_boost = max(0.0, (surface_priority - 70.0) * 0.45) + confidence * 8.0
     score = round(
@@ -383,6 +592,9 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
         "proxy_symbol": symbol,
         "proxy_label": proxy.get("label") or symbol,
         "proxy_surface": proxy.get("surface") or "global_proxy",
+        "active_paper_cohort": active_cohort,
+        "strategy_variant": strategy_variant,
+        "signal_lineage_key": f"GLOBAL_ACTIVE|{proxy.get('cohort_surface') or proxy.get('surface') or 'proxy'}|{strategy_variant}",
         "name": f"{venue} via {proxy.get('label') or symbol}",
         "region": discovery.get("region", "Global"),
         "country": discovery.get("country", "unknown"),
@@ -390,6 +602,7 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
         "market_surface": "global_market_discovery",
         "trade_type": "global_market_discovery_proxy",
         "direction": direction,
+        "candidate_reject_reason": reject_reason,
         "thesis": discovery.get("inefficiency_hypothesis") or discovery.get("why_interesting") or "global market discovery proxy signal",
         "last": round(last, 8),
         "funding_bps": 0.0,
@@ -402,6 +615,10 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
         "spread_bps": round(spread, 3),
         "last_bar_utc": last_seen.isoformat(),
         "stale_minutes": round(stale_minutes, 1),
+        "session_status": session_status,
+        "max_entry_stale_minutes": 90.0,
+        "proxy_quality_status": "verified_proxy" if session_status in {"open", "unknown"} and stale_minutes <= 90.0 else "unavailable",
+        "benchmark_context": benchmark_context,
         "score": score,
         "market_key": f"global_discovery|{_venue_key(venue)}",
         "discovery_candidate_id": discovery.get("candidate_id"),
@@ -494,6 +711,20 @@ def _summarize(candidates: list[dict[str, Any]], selected: list[dict[str, Any]],
         "by_venue": by_venue,
         "by_region": by_region,
         "by_direction": by_direction,
+        "active_paper_cohort": [
+            {
+                "symbol": item.get("proxy_symbol"),
+                "inst_id": item.get("inst_id"),
+                "surface": item.get("proxy_surface"),
+                "strategy_variant": item.get("strategy_variant"),
+                "session_status": item.get("session_status"),
+                "direction": item.get("direction"),
+                "reject_reason": item.get("candidate_reject_reason"),
+                "edge_bps_estimate": item.get("edge_bps_estimate"),
+            }
+            for item in candidates
+            if item.get("active_paper_cohort")
+        ],
         "top_candidates": [
             {
                 "inst_id": item.get("inst_id"),
@@ -598,12 +829,24 @@ def build_scan_batch(
             continue
         candidates.append(_watch_only_candidate(discovery))
 
-    candidates.sort(key=lambda row: (row.get("direction") != "watch_only", float(row.get("score") or 0.0)), reverse=True)
-    selected = candidates[:limit] if limit else candidates
+    candidates.sort(
+        key=lambda row: (
+            bool(row.get("active_paper_cohort")),
+            row.get("direction") != "watch_only",
+            float(row.get("score") or 0.0),
+        ),
+        reverse=True,
+    )
+    if limit:
+        cohort = [row for row in candidates if row.get("active_paper_cohort")]
+        others = [row for row in candidates if not row.get("active_paper_cohort")]
+        selected = [*cohort, *others[: max(0, int(limit) - len(cohort))]]
+    else:
+        selected = candidates
     observations = [
         observation_from_candidate(candidate, source="global_market_discovery_scanner")
         for candidate in candidates
-        if candidate.get("direction") != "watch_only"
+        if candidate.get("proxy_symbol") and float(candidate.get("last") or 0.0) > 0.0
     ]
     summary = _summarize(candidates, selected, failures)
     _write_report(summary, candidates)

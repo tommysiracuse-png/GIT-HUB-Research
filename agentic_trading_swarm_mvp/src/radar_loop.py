@@ -31,6 +31,7 @@ from global_proxy_scanner import build_scan_batch as build_global_proxy_scan_bat
 from hunter_allocation import allocate_candidate_review, write_hunter_allocation_report
 from learning import load_adjustments, stats_snapshot, update_signal_stats
 from llm_bridge import ingest_llm_recommendations, write_llm_state_packet
+from market_admission import run_market_admission_monitor
 from llm_swarm_runner import run_once as run_llm_swarm_once
 from market_hunter import run_market_hunter
 from memory_graph import ingest_radar_memory
@@ -248,6 +249,7 @@ def _build_expansion_map(
             "regional_fx_reference": str(fx_path),
             "prediction_markets": str(RUNS_DIR / "prediction_markets_latest.json"),
             "route_intelligence": str(RUNS_DIR / "route_intelligence_report.md"),
+            "market_admission": str(RUNS_DIR / "market_admission_report.md"),
         },
     }
 
@@ -264,6 +266,7 @@ def run_once(settings: dict) -> dict:
         required_okx = set(required.get("perp_funding_basis", set()))
         required_okx.update(open_signal_trial_instruments(conn, "OKX|perp_funding_basis"))
         batches = []
+        admission_observations = []
         okx_batch = build_okx_scan_batch(
             scan_cfg["scan_universe"],
             allow_short_spot=allow_short_spot,
@@ -303,6 +306,7 @@ def run_once(settings: dict) -> dict:
             candidates.extend(global_discovery_batch.candidates)
             candidates.sort(key=lambda row: row["score"], reverse=True)
             global_market_discovery_scan = global_discovery_batch.metadata.get("global_market_discovery_scan", {})
+            admission_observations.extend(global_discovery_batch.candidates)
         if scan_cfg.get("enable_prediction_market_scan", False):
             prediction_batch = build_prediction_market_scan_batch(
                 settings,
@@ -348,6 +352,7 @@ def run_once(settings: dict) -> dict:
             candidates.sort(key=lambda row: row["score"], reverse=True)
             if FRONTIER_CRYPTO_REPORT_JSON.exists():
                 frontier_crypto_venues = json.loads(FRONTIER_CRYPTO_REPORT_JSON.read_text(encoding="utf-8"))
+            admission_observations.extend(frontier_batch.metadata.get("selected_observations", []))
         price_observations = merge_observations(batches)
         strategy_lab_candidates, strategy_lab_generation = generate_strategy_lab_candidates(
             conn,
@@ -460,12 +465,21 @@ def run_once(settings: dict) -> dict:
             )
 
         signal_safety_governor = run_signal_safety_governor(conn, settings)
+        market_admission = run_market_admission_monitor(
+            conn,
+            settings,
+            candidates,
+            reviewed,
+            admission_observations,
+        )
+        expansion_map["market_admission"] = market_admission.get("summary", {})
         auto_improvement["signal_safety_governor"] = signal_safety_governor
         auto_improvement["contextual_failure_filters"] = contextual_failure_filters
         auto_improvement["signal_redesign"] = signal_redesign
         auto_improvement["okx_signal_research"] = okx_signal_research
         auto_improvement["strategy_reliability"] = strategy_reliability
         auto_improvement["strategy_lab"] = strategy_lab_report.get("summary", {})
+        auto_improvement["market_admission"] = market_admission.get("summary", {})
         auto_improvement["expansion_map"] = expansion_map
         auto_improvement["self_improvement_open_pack"] = self_improvement_open_pack
         auto_improvement = write_self_improvement_reports(conn, auto_improvement)
@@ -482,6 +496,7 @@ def run_once(settings: dict) -> dict:
             "okx_signal_research": okx_signal_research,
             "strategy_reliability": strategy_reliability,
             "strategy_lab": strategy_lab_report.get("summary", {}),
+            "market_admission": market_admission,
             "opened": opened,
             "summary": summary,
             "execution_summary": execution_summary(conn),

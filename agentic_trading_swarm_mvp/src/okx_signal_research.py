@@ -486,6 +486,21 @@ def _aligned(candidate: dict) -> bool:
 
 
 def _basis_regime_ok(candidate: dict) -> bool:
+    context_status = candidate.get("basis_context_status")
+    if context_status is None:
+        from okx_perp_scanner import instrument_asset_context
+
+        context_status = instrument_asset_context(str(candidate.get("inst_id") or ""))["basis_context_status"]
+    if context_status != "asset_specific":
+        return False
+    persistence = candidate.get("basis_persistence_status", "same_asset_persistent")
+    if persistence != "same_asset_persistent":
+        return False
+    cooling = candidate.get("basis_momentum_cooling")
+    if cooling is None:
+        cooling = abs(float(candidate.get("change_24h_pct") or 0.0)) <= 20.0
+    if not bool(cooling):
+        return False
     funding = float(candidate.get("funding_bps") or 0.0)
     basis = float(candidate.get("basis_bps") or 0.0)
     change = abs(float(candidate.get("change_24h_pct") or 0.0))
@@ -495,6 +510,41 @@ def _basis_regime_ok(candidate: dict) -> bool:
     if direction == "basis_mean_reversion_long_perp":
         return basis < 0 and funding >= -3.0 and change <= 20.0
     return False
+
+
+def _asset_context_summary(candidates_by_variant: dict[str, list[dict]]) -> dict:
+    rows = [row for candidates in candidates_by_variant.values() for row in candidates]
+    by_asset: dict[str, dict] = {}
+    for row in rows:
+        asset = str(row.get("base_asset") or "unresolved")
+        item = by_asset.setdefault(
+            asset,
+            {
+                "candidate_count": 0,
+                "families": set(),
+                "directions": collections.Counter(),
+                "basis_regime_ready_count": 0,
+            },
+        )
+        item["candidate_count"] += 1
+        if row.get("instrument_family"):
+            item["families"].add(str(row["instrument_family"]))
+        item["directions"][str(row.get("direction") or "unknown")] += 1
+        if _basis_regime_ok(row):
+            item["basis_regime_ready_count"] += 1
+    return {
+        "resolved_count": sum(row.get("basis_context_status") == "asset_specific" for row in rows),
+        "unresolved_count": sum(row.get("basis_context_status") != "asset_specific" for row in rows),
+        "by_base_asset": {
+            asset: {
+                **item,
+                "families": sorted(item["families"]),
+                "directions": dict(item["directions"]),
+            }
+            for asset, item in sorted(by_asset.items())
+        },
+        "normalization_scope": "base_asset_and_instrument_family_only",
+    }
 
 
 def build_variant_candidates(base_candidates: list[dict], settings: dict, variant: dict) -> list[dict]:
@@ -1198,6 +1248,7 @@ def write_report(
     diagnostics = _diagnostic_groups(conn)
     trial_quality = _trial_label_quality(conn, 60)
     carry_report = _carry_economics_report(candidates_by_variant, settings)
+    asset_context = _asset_context_summary(candidates_by_variant)
     active_variant = next((item["variant_id"] for item in variants if item["status"] == "active"), None)
     variant_summaries = {}
     for variant_id, candidates in candidates_by_variant.items():
@@ -1226,6 +1277,7 @@ def write_report(
             "trial_valid_delay_p95_seconds": trial_quality["valid_delay_p95_seconds"],
             "variant_summaries": variant_summaries,
             "carry_economics": carry_report["summary"],
+            "asset_context": asset_context,
         },
         "variants": variants,
         "trial_activity": trial_activity,
@@ -1237,6 +1289,7 @@ def write_report(
             "cost_eroded_or_blocked": carry_report.get("cost_eroded_or_blocked", [])[:15],
             "report": str(CARRY_REPORT_MD),
         },
+        "asset_context": asset_context,
         "promotion_gates": {
             "min_paired_trials": settings.get("signal_redesign", {}).get("min_paired_trials", 30),
             "min_observation_hours": settings.get("signal_redesign", {}).get("min_observation_hours", 48),
@@ -1270,6 +1323,7 @@ def _markdown(report: dict) -> str:
         f"- Reliable 60m paper metrics: `{summary.get('reliable_60m_paper_metrics')}`",
         f"- Reliable 60m trial metrics: `{summary.get('reliable_60m_trial_metrics')}`",
         f"- Carry economics: `{summary.get('carry_economics')}`",
+        f"- Asset context: `{summary.get('asset_context')}`",
         f"- Label status counts: `{summary.get('label_status_counts')}`",
         f"- Trial label status counts: `{summary.get('trial_label_status_counts')}`",
         f"- Valid outcome delay P95: `{summary.get('valid_delay_p95_seconds')}` seconds",

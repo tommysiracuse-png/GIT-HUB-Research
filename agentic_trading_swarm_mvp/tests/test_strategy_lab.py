@@ -172,6 +172,28 @@ class StrategyLabTest(unittest.TestCase):
             self.assertGreater(generated[0]["score"], 70.0)
             self.assertTrue(signal_key(generated[0]).startswith("STRATEGY_LAB|okx_spot_survivor_lab_v1|"))
 
+    def test_zero_output_is_truthfully_diagnosed_and_can_recover(self):
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                base_settings(),
+                [candidate(venue="OTHER_VENUE")],
+            )
+            self.assertEqual([], generated)
+            self.assertEqual("needs_data", report["status_by_experiment"]["okx_spot_survivor_lab_v1"])
+            row = conn.execute(
+                "select status, evaluation_json from strategy_lab_experiments where strategy_lab_id = ?",
+                ("okx_spot_survivor_lab_v1",),
+            ).fetchone()
+            self.assertEqual("needs_data", row["status"])
+            diagnostic = json.loads(row["evaluation_json"])["generation_diagnostic"]
+            self.assertTrue(diagnostic["nearest_candidates"])
+
+            generated, report = generate_strategy_lab_candidates(conn, base_settings(), [candidate()])
+            self.assertEqual(1, len(generated))
+            self.assertEqual("active_testing", report["status_by_experiment"]["okx_spot_survivor_lab_v1"])
+
     def test_misplaced_direction_in_trade_types_is_repaired(self):
         bad_rec = lab_rec()
         experiment = bad_rec["payload"]["strategy_lab_experiment"]

@@ -1338,9 +1338,9 @@ def _format_symbol(venue: str, symbol: str) -> str:
     if venue == "VALR":
         return symbol.replace("-", "").replace("_", "").replace("/", "").upper()
     if venue == "BITKUB":
-        parts = [part for part in symbol.lower().split("_") if part]
+        parts = [part for part in symbol.upper().split("_") if part]
         if len(parts) == 2:
-            return f"{parts[1]}_{parts[0]}"
+            return f"{parts[0]}_{parts[1]}"
     return symbol
 
 

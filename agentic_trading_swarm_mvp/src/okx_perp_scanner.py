@@ -141,6 +141,32 @@ def score_candidate(row: dict) -> float:
     return round(max(0.0, score), 2)
 
 
+def instrument_asset_context(inst_id: str, instrument: dict | None = None) -> dict:
+    instrument = instrument or {}
+    normalized_inst_id = str(inst_id or "").split(":")[-1]
+    parts = [part for part in normalized_inst_id.upper().split("-") if part]
+    base_asset = str(instrument.get("baseCcy") or (parts[0] if parts else "")).upper()
+    quote_asset = str(
+        instrument.get("quoteCcy")
+        or instrument.get("settleCcy")
+        or (parts[1] if len(parts) > 1 else "")
+    ).upper()
+    instrument_family = str(
+        instrument.get("instFamily")
+        or instrument.get("uly")
+        or (f"{base_asset}-{quote_asset}" if base_asset and quote_asset else "")
+    ).upper()
+    index_id = f"{base_asset}-{quote_asset}" if base_asset and quote_asset else normalized_inst_id.replace("-SWAP", "")
+    return {
+        "base_asset": base_asset or None,
+        "quote_asset": quote_asset or None,
+        "instrument_family": instrument_family or None,
+        "index_id": index_id,
+        "basis_context_key": f"OKX|{instrument_family or index_id}",
+        "basis_context_status": "asset_specific" if base_asset and quote_asset and instrument_family else "unresolved",
+    }
+
+
 def get_funding(inst_id: str) -> dict:
     data = fetch_json("/api/v5/public/funding-rate", {"instId": inst_id})
     return data["data"][0] if data.get("data") else {}
@@ -225,7 +251,10 @@ def build_scan_batch(
         "/api/v5/public/instruments",
         {"instType": "SWAP"},
         "instId",
-        ("ctVal", "ctValCcy", "settleCcy", "state", "tickSz", "lotSz", "minSz"),
+        (
+            "ctVal", "ctValCcy", "settleCcy", "state", "tickSz", "lotSz", "minSz",
+            "baseCcy", "quoteCcy", "instFamily", "uly", "ctType",
+        ),
     )
 
     usdt_swaps = []
@@ -274,7 +303,9 @@ def build_scan_batch(
     direction_counts: collections.Counter[str] = collections.Counter()
     for row in selected:
         inst_id = row["instId"]
-        index_id = inst_id.replace("-SWAP", "")
+        inst = instrument_by_inst.get(inst_id, {})
+        asset_context = instrument_asset_context(inst_id, inst)
+        index_id = str(asset_context["index_id"])
         idx_px = index_by_id.get(index_id, 0.0)
         last = as_float(row.get("last"))
         mark_row = mark_by_inst.get(inst_id, {})
@@ -297,8 +328,10 @@ def build_scan_batch(
         direction, thesis = classify_direction(funding_bps, basis_bps)
         feasibility = execution_feasibility(direction, allow_short_spot)
         oi = open_interest_by_inst.get(inst_id, {})
-        inst = instrument_by_inst.get(inst_id, {})
         history = history_by_inst.get(inst_id, {"funding_history_count": 0})
+        basis_same_sign = basis_bps == 0.0 or mark_basis_bps == 0.0 or basis_bps * mark_basis_bps > 0.0
+        basis_momentum_cooling = basis_same_sign and abs(mark_basis_bps) < abs(basis_bps)
+        basis_persistence_status = "same_asset_persistent" if basis_same_sign else "mark_last_conflict"
 
         candidate = {
             "seen_at": seen_at,
@@ -314,6 +347,10 @@ def build_scan_batch(
             "basis_bps": round(basis_bps, 3),
             "mark_basis_bps": round(mark_basis_bps, 3),
             "basis_bucket": _basis_bucket(basis_bps),
+            **asset_context,
+            "basis_persistence_status": basis_persistence_status,
+            "basis_momentum_cooling": basis_momentum_cooling,
+            "basis_mark_last_delta_bps": round(basis_bps - mark_basis_bps, 3),
             "funding_rate": funding_rate,
             "funding_bps": round(funding_bps, 3),
             "funding_interval_hours": funding_interval_hours,
@@ -327,6 +364,7 @@ def build_scan_batch(
             "contract_value_ccy": inst.get("ctValCcy"),
             "settle_ccy": inst.get("settleCcy"),
             "instrument_state": inst.get("state"),
+            "contract_type": inst.get("ctType"),
             **history,
             "liquidity_score": round(liquidity_score(quote_volume), 3),
             "spread_bps": round(spread_bps, 3),

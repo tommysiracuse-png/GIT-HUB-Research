@@ -2153,6 +2153,19 @@ def _report_markdown(report: dict) -> str:
             f"potentially executable soon `{route.get('potentially_executable_soon_count', 0)}`"
         )
 
+    admission = report.get("market_admission") or expansion.get("market_admission") or {}
+    if admission:
+        lines.extend(["", "## Market Admission", ""])
+        lines.append(f"- States: `{admission.get('state_count', 0)}`")
+        lines.append(f"- By stage: `{admission.get('by_stage', {})}`")
+        lines.append(f"- By health: `{admission.get('by_health', {})}`")
+        lines.append(f"- Exact blockers: `{admission.get('by_blocker', {})}`")
+        lines.append(
+            f"- Requested symbols observed: `{admission.get('requested_symbols_observed', 0)}`/"
+            f"`{admission.get('requested_symbol_count', 0)}`"
+        )
+        lines.append(f"- Report: `{RUNS_DIR / 'market_admission_report.md'}`")
+
     research_path = RUNS_DIR / "research_worker_latest.json"
     if research_path.exists():
         try:

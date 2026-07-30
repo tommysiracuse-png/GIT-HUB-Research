@@ -42,6 +42,7 @@ DEFAULT_SETTINGS = {
     },
     "global_market_discovery_scanner": {
         "enabled": True,
+        "active_paper_cohort_enabled": True,
         "min_discovery_priority": 70,
         "max_surfaces_per_cycle": 28,
         "max_proxy_symbols_per_surface": 4,
@@ -70,6 +71,7 @@ DEFAULT_SETTINGS = {
         "enabled": True,
         "timeout_seconds": 8,
         "min_dislocation_bps": 12.0,
+        "bybit_region_blocked_probe_interval_seconds": 300,
     },
     "frontier_data_quality": {
         "enabled": True,
@@ -104,6 +106,7 @@ DEFAULT_SETTINGS = {
             "BUDA",
             "MERCADO_BITCOIN",
             "INDODAX",
+            "BITKUB",
         ],
         "starved_venue_min_depth_per_cycle": 4,
         "venue_depth_minimums": {
@@ -122,6 +125,7 @@ DEFAULT_SETTINGS = {
             "INDODAX": 16,
             "MERCADO_BITCOIN": 8,
             "BUDA": 8,
+            "BITKUB": 8,
         },
         "depth_levels": 50,
         "workers": 16,
@@ -142,6 +146,16 @@ DEFAULT_SETTINGS = {
         "max_reference_age_hours": 30,
         "timeout_seconds": 10,
         "quotes": ["ARS", "BRL", "CLP", "COP", "GHS", "IDR", "KES", "MXN", "MYR", "NGN", "PEN", "PHP", "SGD", "THB", "ZAR"],
+    },
+    "market_admission": {
+        "enabled": True,
+        "consecutive_failures_degraded": 5,
+        "diagnostic_after_eligible_scans": 30,
+        "implementation_task_after_eligible_scans": 120,
+        "requested_symbols": [
+            "VIXY", "VXX", "UVXY", "SVXY", "EWY", "PKX", "EWT", "TSM", "UMC",
+            "EWZ", "NU", "SHOP", "TD", "RY", "GLD", "SLV", "SPY", "EWJ", "BHP",
+        ],
     },
     "risk": {
         "min_liquidity_score": 0.35,

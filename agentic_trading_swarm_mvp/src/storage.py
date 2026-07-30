@@ -547,6 +547,34 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "strategy_lab_experiments", "experiment_type", "text not null default 'market_strategy'")
     conn.execute(
         """
+        create table if not exists market_admission_states (
+            admission_key text primary key,
+            venue text not null,
+            inst_id text not null,
+            data_source text not null,
+            market_surface text not null,
+            strategy_lineage text not null,
+            current_stage text not null,
+            highest_stage text not null,
+            health_status text not null,
+            blocker_code text,
+            session_status text not null,
+            attempts integer not null default 0,
+            eligible_scans integer not null default 0,
+            stalled_eligible_scans integer not null default 0,
+            consecutive_failures integer not null default 0,
+            first_seen_at text not null,
+            last_seen_at text not null,
+            last_advanced_at text not null,
+            details_json text not null default '{}'
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_market_admission_stage on market_admission_states(current_stage, health_status)"
+    )
+    conn.execute(
+        """
         create table if not exists frontier_quality_snapshots (
             id integer primary key autoincrement,
             bucket_at text not null,
@@ -711,6 +739,15 @@ def signal_key(candidate: dict) -> str:
             [
                 "STRATEGY_LAB",
                 str(candidate.get("strategy_lab_id")),
+                candidate.get("venue", "unknown"),
+                candidate.get("direction", "unknown"),
+                status,
+            ]
+        )
+    if candidate.get("signal_lineage_key"):
+        return "|".join(
+            [
+                str(candidate.get("signal_lineage_key")),
                 candidate.get("venue", "unknown"),
                 candidate.get("direction", "unknown"),
                 status,

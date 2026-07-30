@@ -5795,31 +5795,75 @@ def _parse_indodax_ticker_all(target: dict, result: dict) -> list[dict]:
 
 
 def _parse_bitkub_ticker(target: dict, result: dict) -> list[dict]:
-    payload = result.get("payload") or {}
-    data = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    payload = result.get("payload") or []
+    if isinstance(payload, dict) and isinstance(payload.get("result"), (dict, list)):
+        payload = payload["result"]
+    current_v3_list = isinstance(payload, list)
+    if current_v3_list:
+        rows = [
+            (str(item.get("symbol") or "").upper(), item)
+            for item in payload
+            if isinstance(item, dict) and item.get("symbol")
+        ]
+    elif isinstance(payload, dict):
+        rows = [(str(symbol).upper(), item) for symbol, item in payload.items() if isinstance(item, dict)]
+    else:
+        rows = []
     observations = []
-    for symbol, row_data in data.items():
-        if not isinstance(row_data, dict):
-            continue
+    for symbol, row_data in rows:
         parts = [part for part in str(symbol).upper().split("_") if part]
         row = _base_observation(target, result, str(symbol).upper())
         if len(parts) == 2:
-            row["quote"] = parts[0]
-            row["base"] = _canonical_asset(parts[1])
+            if current_v3_list:
+                row["base"] = _canonical_asset(parts[0])
+                row["quote"] = parts[1]
+            else:
+                row["quote"] = parts[0]
+                row["base"] = _canonical_asset(parts[1])
             row["comparison_key"] = row["base"]
         last = as_float(row_data.get("last"))
         row.update(
             {
-                "bid": as_float(row_data.get("highestBid") or row_data.get("bid")),
-                "ask": as_float(row_data.get("lowestAsk") or row_data.get("ask")),
+                "bid": as_float(row_data.get("highest_bid") or row_data.get("highestBid") or row_data.get("bid")),
+                "ask": as_float(row_data.get("lowest_ask") or row_data.get("lowestAsk") or row_data.get("ask")),
                 "last": last,
-                "quote_volume_24h": as_float(row_data.get("quoteVolume")),
+                "quote_volume_24h": as_float(row_data.get("quote_volume") or row_data.get("quoteVolume")),
             }
         )
         if row.get("quote_volume_24h") is None:
-            row["quote_volume_24h"] = (as_float(row_data.get("baseVolume") or row_data.get("volume"), 0.0) or 0.0) * float(last or 0.0)
+            row["quote_volume_24h"] = (
+                as_float(row_data.get("base_volume") or row_data.get("baseVolume") or row_data.get("volume"), 0.0)
+                or 0.0
+            ) * float(last or 0.0)
         observations.append(_finalize_observation(row))
     return observations
+
+
+def _bybit_direct_probe_due(conn, interval_seconds: int) -> bool:
+    if conn is None:
+        return True
+    try:
+        row = conn.execute(
+            """
+            select last_seen_at, blocker_code
+            from market_admission_states
+            where venue = 'BYBIT_SPOT'
+              and blocker_code = 'network_region_blocked'
+            order by last_seen_at desc
+            limit 1
+            """
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - table may not exist during first migration/test setup.
+        return True
+    if not row or not row["last_seen_at"]:
+        return True
+    try:
+        checked = dt.datetime.fromisoformat(str(row["last_seen_at"]).replace("Z", "+00:00"))
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return True
+    return (dt.datetime.now(dt.timezone.utc) - checked).total_seconds() >= max(1, interval_seconds)
 
 
 def _parse_bitso_available_books(target: dict, result: dict) -> list[dict]:
@@ -6119,7 +6163,21 @@ def scan_venues(
             parsed[0]["notes"].append(str(target.get("notes") or "Watch-only research target."))
             observations.extend(_finalize_observation(row) for row in parsed)
             continue
-        result = fetch_json(target["url"], timeout=timeout)
+        venue = str(target.get("venue") or "").upper()
+        if venue == "BYBIT_SPOT" and not _bybit_direct_probe_due(
+            conn,
+            int(cfg.get("bybit_region_blocked_probe_interval_seconds", 300)),
+        ):
+            result = {
+                "ok": False,
+                "data_status": "blocked",
+                "received_at": _utc_now(),
+                "http_status": "probe_deferred_after_network_region_blocked",
+                "latency_ms": 0.0,
+                "payload": None,
+            }
+        else:
+            result = fetch_json(target["url"], timeout=timeout)
         if result["ok"]:
             parser = PARSERS[target["parser"]]
             try:
@@ -6131,7 +6189,18 @@ def scan_venues(
         else:
             parsed = [_base_observation(target, result, target.get("symbol"))]
             if parsed[0]["data_status"] == "blocked":
-                parsed[0]["notes"].append("Public endpoint blocked from this machine; captured as access evidence.")
+                if venue == "BYBIT_SPOT" and (
+                    "403" in str(result.get("http_status") or "")
+                    or "451" in str(result.get("http_status") or "")
+                    or "network_region_blocked" in str(result.get("http_status") or "")
+                    or "probe_deferred" in str(result.get("http_status") or "")
+                ):
+                    parsed[0]["access_blocker_code"] = "network_region_blocked"
+                    parsed[0]["notes"].append(
+                        "Direct public BYBIT access is region/IP blocked while the VPN is off; this is not an adapter, route, or strategy failure."
+                    )
+                else:
+                    parsed[0]["notes"].append("Public endpoint blocked from this machine; captured as access evidence.")
         observations.extend(_finalize_observation(row) for row in parsed)
     fx_references = get_regional_fx_references(conn, settings or {})
     observations = _normalize_regional_quotes(observations, fx_references=fx_references)

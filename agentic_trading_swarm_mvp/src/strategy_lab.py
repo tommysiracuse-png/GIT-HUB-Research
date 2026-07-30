@@ -572,7 +572,7 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
         """
         select *
         from strategy_lab_experiments
-        where status in ('active_testing')
+        where status in ('active_testing', 'needs_data', 'needs_route', 'needs_more_evidence')
         order by updated_at desc
         limit 100
         """
@@ -672,6 +672,15 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
         reasons.append("quality_below_gate")
     if max_stale is not None and _as_float(candidate.get("stale_minutes"), 0.0) > _as_float(max_stale):
         reasons.append("stale_above_gate")
+    if bool(risk_gates.get("require_route_feasible") or logic.get("require_route_feasible")):
+        route_status = str(
+            candidate.get("route_status")
+            or (candidate.get("execution_route") or {}).get("route_status")
+            or (candidate.get("execution_feasibility") or {}).get("status")
+            or "unknown"
+        ).lower()
+        if route_status not in {"standard", "conditional", "feasible", "paper_proxy"}:
+            reasons.append(f"route_not_feasible:{route_status}")
 
     required_fields = _as_list(logic.get("required_fields") or risk_gates.get("required_fields"))
     missing = [field for field in required_fields if candidate.get(field) is None]
@@ -698,6 +707,8 @@ def generate_strategy_lab_candidates(
     generated = []
     per_experiment: dict[str, int] = Counter()
     rejects: dict[str, Counter] = defaultdict(Counter)
+    nearest_candidates: dict[str, list[dict]] = defaultdict(list)
+    status_by_experiment: dict[str, str] = {}
 
     pool = sorted(candidates, key=lambda row: _as_float(row.get("score")), reverse=True)
     runtime_vocabulary = _runtime_strategy_vocabulary(pool)
@@ -716,6 +727,17 @@ def generate_strategy_lab_candidates(
             if not ok:
                 for reason in reasons[:3]:
                     rejects[experiment["strategy_lab_id"]][reason] += 1
+                nearest_candidates[experiment["strategy_lab_id"]].append(
+                    {
+                        "inst_id": candidate.get("inst_id"),
+                        "venue": candidate.get("venue"),
+                        "trade_type": candidate.get("trade_type"),
+                        "direction": candidate.get("direction"),
+                        "score": candidate.get("score"),
+                        "failed_gate_count": len(reasons),
+                        "failed_gates": reasons[:5],
+                    }
+                )
                 continue
             lab_candidate = dict(candidate)
             lab_candidate["strategy_lab_id"] = experiment["strategy_lab_id"]
@@ -734,6 +756,64 @@ def generate_strategy_lab_candidates(
             generated.append(lab_candidate)
             per_experiment[experiment["strategy_lab_id"]] += 1
 
+        experiment_id = experiment["strategy_lab_id"]
+        reason_counts = rejects.get(experiment_id, Counter())
+        if per_experiment[experiment_id] > 0:
+            diagnostic_status = "active_testing"
+        elif not pool:
+            diagnostic_status = "needs_data"
+        elif any(str(reason).startswith("route_not_feasible") for reason in reason_counts):
+            diagnostic_status = "needs_route"
+        elif reason_counts and all(
+            str(reason).startswith(
+                (
+                    "trade_type_not_allowed",
+                    "venue_not_allowed",
+                    "direction_not_allowed",
+                    "region_not_allowed",
+                    "asset_class_not_allowed",
+                    "missing_required_fields",
+                )
+            )
+            for reason in reason_counts
+        ):
+            diagnostic_status = "needs_data"
+        else:
+            diagnostic_status = "needs_more_evidence"
+        status_by_experiment[experiment_id] = diagnostic_status
+        nearest = sorted(
+            nearest_candidates.get(experiment_id, []),
+            key=lambda row: (int(row.get("failed_gate_count") or 999), -_as_float(row.get("score"))),
+        )[:5]
+        generation_diagnostic = {
+            "checked_at": _utc(),
+            "status": diagnostic_status,
+            "source_candidate_count": len(pool),
+            "generated_candidate_count": int(per_experiment[experiment_id]),
+            "dominant_reject_reasons": dict(reason_counts.most_common(8)),
+            "nearest_candidates": nearest,
+            "runtime_vocabulary": {
+                "trade_types": sorted(runtime_vocabulary.get("trade_types") or []),
+                "directions": sorted(runtime_vocabulary.get("directions") or []),
+            },
+        }
+        prior_evaluation = experiment.get("evaluation") or {}
+        conn.execute(
+            """
+            update strategy_lab_experiments
+            set status = ?, updated_at = ?, last_evaluated_at = ?, evaluation_json = ?
+            where strategy_lab_id = ?
+            """,
+            (
+                diagnostic_status,
+                _utc(),
+                _utc(),
+                json.dumps({**prior_evaluation, "generation_diagnostic": generation_diagnostic}, sort_keys=True),
+                experiment_id,
+            ),
+        )
+    conn.commit()
+
     report = {
         "enabled": True,
         "generated_at": _utc(),
@@ -746,6 +826,14 @@ def generate_strategy_lab_candidates(
             Counter(item.get("strategy_lab_experiment_type", DEFAULT_EXPERIMENT_TYPE) for item in generated)
         ),
         "reject_reasons_by_experiment": {key: dict(value) for key, value in rejects.items()},
+        "status_by_experiment": status_by_experiment,
+        "nearest_candidates_by_experiment": {
+            key: sorted(
+                rows,
+                key=lambda row: (int(row.get("failed_gate_count") or 999), -_as_float(row.get("score"))),
+            )[:5]
+            for key, rows in nearest_candidates.items()
+        },
     }
     return generated, report
 
@@ -1001,8 +1089,10 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
         worst_decile = metrics.get("worst_decile_pnl_bps")
         active_hours = _age_hours(experiment.get("created_at"))
         blocked_routes = int(outcomes.get("route_status_counts", {}).get("blocked", 0))
-        decision = "needs_more_evidence"
-        status = "active_testing"
+        generation_diagnostic = (experiment.get("evaluation") or {}).get("generation_diagnostic") or {}
+        diagnostic_status = str(generation_diagnostic.get("status") or experiment.get("status") or "active_testing")
+        decision = diagnostic_status if diagnostic_status in {"needs_data", "needs_route", "needs_more_evidence"} else "needs_more_evidence"
+        status = diagnostic_status if diagnostic_status in {"needs_data", "needs_route", "needs_more_evidence"} else "active_testing"
         passes = int(experiment.get("consecutive_passes") or 0)
         promotion_id = None
         children = []
@@ -1063,6 +1153,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             "consecutive_passes": passes,
             "promotion_recommendation_id": promotion_id,
             "child_strategy_lab_ids": children,
+            "generation_diagnostic": generation_diagnostic,
         }
         conn.execute(
             """
