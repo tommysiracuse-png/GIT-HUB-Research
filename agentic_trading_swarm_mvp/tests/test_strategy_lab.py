@@ -204,6 +204,42 @@ class StrategyLabTest(unittest.TestCase):
         reasons = report["reject_reasons_by_experiment"]["okx_spot_survivor_lab_v1"]
         self.assertIn("watch_only_not_paper_testable", reasons)
 
+    def test_unscoped_strategy_contract_cannot_generate_paper_candidates(self):
+        rec = lab_rec()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "unscoped_lab_v1"
+        experiment["strategy_logic"] = {"type": "candidate_filter"}
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            stored = conn.execute(
+                "select status from strategy_lab_experiments where strategy_lab_id = ?",
+                ("unscoped_lab_v1",),
+            ).fetchone()
+            generated, report = generate_strategy_lab_candidates(conn, base_settings(), [candidate()])
+
+        self.assertEqual("needs_data", stored["status"])
+        self.assertEqual([], generated)
+        reasons = report["reject_reasons_by_experiment"]["unscoped_lab_v1"]
+        self.assertIn("missing_strategy_scope", reasons)
+
+    def test_explicit_cross_surface_contract_can_generate_candidates(self):
+        rec = lab_rec()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "cross_surface_lab_v1"
+        experiment["strategy_logic"] = {
+            "type": "candidate_filter",
+            "allow_any_surface": True,
+            "min_edge_bps": 10,
+            "min_liquidity_score": 0.35,
+        }
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            generated, _report = generate_strategy_lab_candidates(conn, base_settings(), [candidate()])
+
+        self.assertEqual(1, len(generated))
+
     def test_candidate_generation_prefers_standard_paper_route(self):
         settings = base_settings()
         settings["strategy_lab"]["max_candidates_per_experiment"] = 1

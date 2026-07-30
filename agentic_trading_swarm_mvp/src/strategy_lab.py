@@ -247,6 +247,26 @@ def _normalize_strategy_logic(logic: dict, vocabulary: dict | None = None) -> di
     return normalized
 
 
+def _has_strategy_scope(logic: dict) -> bool:
+    if bool(logic.get("allow_any_surface")):
+        return True
+    return any(
+        _as_list(logic.get(key))
+        for key in (
+            "trade_types",
+            "source_trade_types",
+            "venues",
+            "allowed_venues",
+            "directions",
+            "allowed_directions",
+            "regions",
+            "allowed_regions",
+            "asset_classes",
+            "allowed_asset_classes",
+        )
+    )
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -450,6 +470,8 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
         status = "active_testing"
     logic["type"] = logic_type
     logic = _normalize_strategy_logic(logic)
+    if not _has_strategy_scope(logic):
+        status = "needs_data"
     experiment_type = _classify_experiment_type(contract, payload, logic)
 
     strategy_lab_id = str(contract.get("strategy_lab_id") or "").strip()
@@ -678,6 +700,8 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
     allowed_directions = _as_list(logic.get("directions") or logic.get("allowed_directions"))
     allowed_regions = _as_list(logic.get("regions") or logic.get("allowed_regions"))
     allowed_asset_classes = _as_list(logic.get("asset_classes") or logic.get("allowed_asset_classes"))
+    if not _has_strategy_scope(logic):
+        reasons.append("missing_strategy_scope")
     if str(candidate.get("direction") or "").lower() == "watch_only" and not (
         bool(logic.get("allow_watch_only")) or "watch_only" in set(allowed_directions)
     ):
