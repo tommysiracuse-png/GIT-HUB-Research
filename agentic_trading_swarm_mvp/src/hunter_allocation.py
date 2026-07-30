@@ -231,6 +231,7 @@ def write_hunter_allocation_report(
                 "direction": row.get("direction"),
                 "trade_type": row.get("trade_type"),
                 "signal_key": row.get("signal_key"),
+                "strategy_lab_id": row.get("strategy_lab_id"),
                 "reason": row.get("_hunter_allocation_reason"),
             }
         )
@@ -244,6 +245,7 @@ def write_hunter_allocation_report(
         "directive_counts": allocation.get("directive_counts", {}),
         "selected_by_bucket": by_bucket_candidates,
         "minimum_exploration_floor": allocation.get("minimum_exploration_floor", 0),
+        "strategy_lab_review_reserve": allocation.get("strategy_lab_review_reserve", {}),
         "fallback_count": by_bucket_candidates.get("fallback", 0),
         "global_discovery": _global_discovery_counts(),
         "selected_markets": selected_markets[:100],
@@ -270,6 +272,7 @@ def _report_markdown(report: dict[str, Any]) -> str:
         f"- Selected for review: `{report.get('selected_count')}`",
         f"- Slot targets: `{report.get('slot_targets', {})}`",
         f"- Selected by bucket: `{report.get('selected_by_bucket', {})}`",
+        f"- Strategy Lab reserve: `{report.get('strategy_lab_review_reserve', {})}`",
         f"- Global discoveries: `{report.get('global_discovery', {})}`",
         "",
         "## Selected Markets",

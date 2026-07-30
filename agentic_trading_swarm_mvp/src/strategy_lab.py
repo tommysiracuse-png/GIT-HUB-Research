@@ -627,6 +627,30 @@ def _candidate_edge(candidate: dict) -> float:
     return funding + basis
 
 
+def _candidate_field_value(candidate: dict, field: str) -> Any:
+    if candidate.get(field) is not None:
+        return candidate.get(field)
+    aliases = {
+        "edge_bps": ("edge_bps_estimate", "net_edge_bps_estimate", "gross_edge_bps_estimate"),
+        "edge_bps_estimate": ("net_edge_bps_estimate", "edge_bps", "gross_edge_bps_estimate"),
+        "quality": ("quality_score",),
+        "liquidity": ("liquidity_score",),
+        "spread": ("spread_bps",),
+        "as_of": ("seen_at", "observed_at", "detected_at"),
+        "detected_at": ("seen_at", "observed_at", "as_of"),
+        "observed_at": ("seen_at", "detected_at", "as_of"),
+        "seen_at": ("observed_at", "detected_at", "as_of"),
+    }
+    for alias in aliases.get(field, ()):
+        if candidate.get(alias) is not None:
+            return candidate.get(alias)
+    if field == "stale_minutes" and candidate.get("freshness_age_seconds") is not None:
+        return _as_float(candidate.get("freshness_age_seconds")) / 60.0
+    if field == "freshness_age_seconds" and candidate.get("stale_minutes") is not None:
+        return _as_float(candidate.get("stale_minutes")) * 60.0
+    return None
+
+
 def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dict) -> tuple[bool, list[str]]:
     if candidate.get("strategy_lab_id"):
         return False, ["already_strategy_lab_candidate"]
@@ -670,7 +694,7 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
         reasons.append("spread_above_gate")
     if min_quality is not None and _as_float(candidate.get("quality_score"), 0.0) < _as_float(min_quality):
         reasons.append("quality_below_gate")
-    if max_stale is not None and _as_float(candidate.get("stale_minutes"), 0.0) > _as_float(max_stale):
+    if max_stale is not None and _as_float(_candidate_field_value(candidate, "stale_minutes"), 0.0) > _as_float(max_stale):
         reasons.append("stale_above_gate")
     if bool(risk_gates.get("require_route_feasible") or logic.get("require_route_feasible")):
         route_status = str(
@@ -683,7 +707,7 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
             reasons.append(f"route_not_feasible:{route_status}")
 
     required_fields = _as_list(logic.get("required_fields") or risk_gates.get("required_fields"))
-    missing = [field for field in required_fields if candidate.get(field) is None]
+    missing = [field for field in required_fields if _candidate_field_value(candidate, field) is None]
     if missing:
         reasons.append("missing_required_fields:" + ",".join(missing[:5]))
     return not reasons, reasons

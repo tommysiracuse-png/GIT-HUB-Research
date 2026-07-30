@@ -188,6 +188,7 @@
     "enabled": true,
     "max_candidates_per_loop": 25,
     "max_candidates_per_experiment": 5,
+    "runtime_review_reserved_slots": 5,
     "candidate_score_bonus": 1.0,
     "max_candidate_score_bonus": 5.0,
     "evaluation_horizon_minutes": 60,

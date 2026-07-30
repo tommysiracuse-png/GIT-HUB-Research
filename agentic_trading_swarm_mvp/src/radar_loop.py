@@ -169,9 +169,37 @@ def _strategy_lab_runtime_selection_summary(
     return summary
 
 
+def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: dict, total_slots: int) -> tuple[list[dict], dict]:
+    cfg = settings.get("strategy_lab", {})
+    requested = max(0, int(cfg.get("runtime_review_reserved_slots", 5)))
+    limit = min(max(0, int(total_slots)), requested)
+    selected: list[dict] = []
+    selected_experiments: set[str] = set()
+    for candidate in sorted(candidates, key=lambda row: float(row.get("score") or 0.0), reverse=True):
+        strategy_lab_id = str(candidate.get("strategy_lab_id") or "").strip()
+        if not strategy_lab_id or strategy_lab_id in selected_experiments:
+            continue
+        if not _is_strategy_lab_candidate_filter(candidate):
+            continue
+        row = dict(candidate)
+        row["_hunter_bucket"] = "explore"
+        row["_hunter_directive_id"] = None
+        row["_hunter_allocation_reason"] = "strategy_lab_distinct_experiment_reserve"
+        selected.append(row)
+        selected_experiments.add(strategy_lab_id)
+        if len(selected) >= limit:
+            break
+    return selected, {
+        "configured_slots": requested,
+        "reserved_count": len(selected),
+        "strategy_lab_ids": sorted(selected_experiments),
+    }
+
+
 strategy_lab_runtime = SimpleNamespace(
     is_candidate_filter=_is_strategy_lab_candidate_filter,
     build_runtime_summary=_strategy_lab_runtime_selection_summary,
+    reserve_review_candidates=_reserve_strategy_lab_review_candidates,
 )
 
 
@@ -403,24 +431,38 @@ def run_once(settings: dict) -> dict:
         signal_safety_governor = run_signal_safety_governor(conn, settings)
         contextual_failure_filters = run_contextual_failure_filters(conn, settings)
         policies = active_signal_policies(conn)
+        review_limit = int(scan_cfg["review_top"])
+        reserved_lab_candidates, strategy_lab_review_reserve = _reserve_strategy_lab_review_candidates(
+            candidates,
+            settings,
+            review_limit,
+        )
+        non_lab_candidates = [candidate for candidate in candidates if not candidate.get("strategy_lab_id")]
+        hunter_review_slots = max(0, review_limit - len(reserved_lab_candidates))
         hunter_cfg = settings.get("hunter_allocation", {})
         if hunter_cfg.get("enabled", True) and hunter_cfg.get("apply_to_candidate_review", True):
-            review_candidates, hunter_allocation = allocate_candidate_review(
-                candidates,
+            hunter_review_candidates, hunter_allocation = allocate_candidate_review(
+                non_lab_candidates,
                 open_hunter_directives(conn),
-                int(scan_cfg["review_top"]),
+                hunter_review_slots,
                 buckets=hunter_cfg.get("buckets"),
             )
         else:
-            review_candidates = [dict(candidate, _hunter_bucket="disabled") for candidate in candidates[: int(scan_cfg["review_top"])]]
+            hunter_review_candidates = [
+                dict(candidate, _hunter_bucket="disabled")
+                for candidate in non_lab_candidates[:hunter_review_slots]
+            ]
             hunter_allocation = {
                 "enabled": False,
-                "selected_count": len(review_candidates),
-                "selected_by_bucket": {"disabled": len(review_candidates)},
+                "selected_count": len(hunter_review_candidates),
+                "selected_by_bucket": {"disabled": len(hunter_review_candidates)},
                 "slot_targets": {},
                 "directive_counts": {},
                 "minimum_exploration_floor": 0,
             }
+        review_candidates = reserved_lab_candidates + hunter_review_candidates
+        hunter_allocation["selected_count"] = len(review_candidates)
+        hunter_allocation["strategy_lab_review_reserve"] = strategy_lab_review_reserve
         hunter_allocation = write_hunter_allocation_report(hunter_allocation, review_candidates, candidates, settings)
 
         reviewed = []

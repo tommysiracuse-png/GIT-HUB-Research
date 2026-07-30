@@ -172,6 +172,25 @@ class StrategyLabTest(unittest.TestCase):
             self.assertGreater(generated[0]["score"], 70.0)
             self.assertTrue(signal_key(generated[0]).startswith("STRATEGY_LAB|okx_spot_survivor_lab_v1|"))
 
+    def test_candidate_generation_resolves_equivalent_runtime_field_names(self):
+        rec = lab_rec()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "field_alias_lab_v1"
+        experiment["strategy_logic"]["required_fields"] = ["edge_bps", "stale_minutes", "detected_at"]
+        experiment["strategy_logic"]["max_stale_minutes"] = 1.0
+        source = candidate(
+            edge_bps_estimate=18.0,
+            freshness_age_seconds=30.0,
+            seen_at="2026-07-30T00:00:00+00:00",
+        )
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            generated, report = generate_strategy_lab_candidates(conn, base_settings(), [source])
+
+        self.assertEqual(1, len(generated), report)
+        self.assertEqual("field_alias_lab_v1", generated[0]["strategy_lab_id"])
+
     def test_zero_output_is_truthfully_diagnosed_and_can_recover(self):
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, lab_rec())
