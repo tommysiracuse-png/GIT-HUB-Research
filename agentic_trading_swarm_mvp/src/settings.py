@@ -149,6 +149,7 @@ DEFAULT_SETTINGS = {
     },
     "market_admission": {
         "enabled": True,
+        "bridge_max_actions_per_loop": 50,
         "consecutive_failures_degraded": 5,
         "diagnostic_after_eligible_scans": 30,
         "implementation_task_after_eligible_scans": 120,

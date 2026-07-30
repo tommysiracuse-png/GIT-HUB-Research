@@ -43,7 +43,66 @@ def _evidence(state: dict[str, Any]) -> dict[str, Any]:
         "quality_status": details.get("quality_status"),
         "route_status": details.get("route_status"),
         "valid_labels": details.get("valid_labels", 0),
+        "instrument_count": details.get("instrument_count", 1),
+        "sample_instruments": details.get("sample_instruments", [state.get("inst_id")]),
     }
+
+
+def _group_actionable_states(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+    for state in states:
+        stage = str(state.get("current_stage") or "")
+        if stage not in {"priceable", "quality_verified", "strategy_candidate", "route_feasible"}:
+            continue
+        if str(state.get("session_status") or "") == "closed":
+            continue
+        lineage = str(state.get("strategy_lineage") or "")
+        if stage == "quality_verified" and lineage != "adapter_observation":
+            continue
+        key = (
+            stage,
+            str(state.get("venue") or "unknown"),
+            str(state.get("market_surface") or "unknown"),
+            str(state.get("blocker_code") or "none"),
+            lineage,
+        )
+        groups.setdefault(key, []).append(state)
+    output: list[dict[str, Any]] = []
+    for key, members in groups.items():
+        stage, venue, surface, blocker, lineage = key
+        stable_identity = "|".join((venue, surface, lineage))
+        digest = hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()[:20]
+        representative = dict(members[0])
+        representative.update(
+            {
+                "admission_key": f"group-{digest}",
+                "inst_id": f"{venue}:{surface}:GROUP",
+                "venue": venue,
+                "market_surface": surface,
+                "strategy_lineage": lineage,
+                "current_stage": stage,
+                "blocker_code": None if blocker == "none" else blocker,
+            }
+        )
+        details = dict(representative.get("details") or {})
+        details.update(
+            {
+                "instrument_count": len(members),
+                "sample_instruments": [str(item.get("inst_id")) for item in members[:20]],
+                "member_admission_keys": [str(item.get("admission_key")) for item in members[:100]],
+            }
+        )
+        representative["details"] = details
+        output.append(representative)
+    stage_priority = {"strategy_candidate": 0, "route_feasible": 1, "quality_verified": 2, "priceable": 3}
+    return sorted(
+        output,
+        key=lambda item: (
+            stage_priority.get(str(item.get("current_stage")), 9),
+            -int((item.get("details") or {}).get("instrument_count") or 0),
+            str(item.get("venue")),
+        ),
+    )
 
 
 def _claim(conn: sqlite3.Connection, state: dict[str, Any], action: str, priority: int):
@@ -218,11 +277,14 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
         return {"summary": {"enabled": False}, "actions": []}
     actions: list[dict[str, Any]] = []
     resolved_topics = 0
-    for state in admission_report.get("states") or []:
+    states = list(admission_report.get("states") or [])
+    for state in states:
+        resolved_topics += _resolve_prior_stage_topics(conn, state)
+    grouped_states = _group_actionable_states(states)
+    max_actions = int(settings.get("market_admission", {}).get("bridge_max_actions_per_loop", 50))
+    for state in grouped_states[:max_actions]:
         resolved_topics += _resolve_prior_stage_topics(conn, state)
         stage = str(state.get("current_stage") or "")
-        if str(state.get("session_status") or "") == "closed":
-            continue
         if stage == "priceable":
             actions.append(_create_enrichment(conn, state))
         elif stage == "quality_verified" and str(state.get("strategy_lineage") or "") == "adapter_observation":
@@ -235,6 +297,8 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
     summary = {
         "enabled": True,
         "states_considered": len(admission_report.get("states") or []),
+        "action_groups_considered": len(grouped_states),
+        "action_groups_deferred": max(0, len(grouped_states) - max_actions),
         "actions_created": sum(item.get("status") == "created" for item in actions),
         "actions_updated": sum(item.get("status") == "updated" for item in actions),
         "duplicates_suppressed": sum(item.get("status") == "deduplicated" for item in actions),
