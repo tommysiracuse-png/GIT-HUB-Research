@@ -10,6 +10,7 @@ mini-first with earned standard/frontier escalation.
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
 import json
 import pathlib
@@ -19,6 +20,7 @@ import time
 from typing import Any, TypedDict
 
 from cost_router import complete
+from evolution.builder_context import resolve_repo_targets
 from llm_bridge import INBOX, STATE_JSON
 from memory_graph import query_memory
 from settings import load_settings
@@ -28,6 +30,7 @@ from storage import RUNS_DIR, connect
 COLLABORATION_MODE = "langgraph_typed_action_package"
 FALLBACK_COLLABORATION_MODE = "sequential_typed_action_package"
 LAST_SWARM_STATE: dict[str, Any] = {}
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class SwarmState(TypedDict, total=False):
@@ -127,6 +130,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "current_cycle_agent_outputs": packet.get("current_cycle_agent_outputs", [])[:10],
         "current_cycle_critiques": packet.get("current_cycle_critiques", [])[:10],
         "current_cycle_ranked_actions": packet.get("current_cycle_ranked_actions", [])[:10],
+        "repository_grounding": packet.get("repository_grounding", {}),
     }
     build_planner_instruction = ""
     if agent["name"] == "build_planner":
@@ -145,6 +149,12 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
             "Use memory and reporting to keep the evolution legible: every autonomous change should leave an "
             "auditable report/state-packet trace of what changed and why. "
             "Expected files must be concrete repo paths under src/, tests/, config/, or docs files. "
+            "Use repository_grounding to select exact existing files and symbols. For every propose_code_change, "
+            "code_change.runtime_integration must name an existing entrypoint_file, an existing entrypoint_symbol, "
+            "how the new behavior is invoked, and a behavioral_test that proves the running consumer uses it. "
+            "A test that only imports a new module or checks that a constant/function exists is not sufficient. "
+            "Cite the prior agent outputs used in evidence.used_agent_outputs. If you cannot ground the change in "
+            "an existing runtime consumer, return action='no_action'; do not invent directories or emit a thin build task. "
             "If a prior generated patch was blocked for malformed diff or test failure, propose a narrower "
             "code change that fixes the failure or makes the previous generated work actually usable.\n"
         )
@@ -201,7 +211,9 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "Make code proposals narrow enough to pass tests, but substantial enough to affect the running "
         "paper system rather than creating unused helper files.\n"
         "For propose_code_change, include change_category, expected_files, tests_to_run, "
-        "rollback_criteria, evidence, implementation_mode, and optionally unified_diff. Allowed categories are "
+        "rollback_criteria, evidence, implementation_mode, runtime_integration, and optionally unified_diff. "
+        "runtime_integration requires entrypoint_file, entrypoint_symbol, invocation_path, test_file, and "
+        "behavioral_test. Allowed categories are "
         "runtime_pipeline_integration, public_data_adapter, parser_improvement, scanner_expansion, "
         "paper_signal_variant, paper_scoring_logic, self_improvement_policy, evolution_loop_improvement, "
         "report_dashboard, llm_prompt_state_packet, quality_scoring, "
@@ -212,7 +224,9 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "change startup/system tasks, or request unrestricted code mutation.\n"
         "When current-cycle outputs are present, explicitly cite which earlier agent output you used, "
         "refined, or rejected. Red-team weak ideas instead of repeating them.\n"
-        f"If uncertain, use action {agent['default_action']}.\n\n"
+        "A hold, no-change conclusion, malformed-input warning, or request to rerun an agent is not an actionable "
+        "recommendation. Return action='no_action' for those cases. Only use your default action when you have a "
+        "concrete, evidence-backed next step.\n\n"
         f"STATE:\n{json.dumps(compact, sort_keys=True)}"
     )
 
@@ -223,25 +237,40 @@ def parse_recommendation(text: str, agent: dict, packet: dict) -> dict:
     if rec is None:
         return _reject_recommendation(agent, text, parse_status, reason)
     rec["parse_status"] = parse_status
+    if rec.get("action") == "no_action":
+        return _reject_recommendation(
+            agent,
+            str(rec.get("rationale") or rec.get("title") or "Agent selected no action."),
+            parse_status,
+            "agent_no_action",
+        )
     if rec.get("action") not in allowed:
-        rec["action"] = agent["default_action"]
+        return _reject_recommendation(agent, text, "invalid_action", "action_not_allowed")
+    if _describes_no_change(rec):
+        return _reject_recommendation(
+            agent,
+            str(rec.get("rationale") or rec.get("proposed_change") or "Recommendation describes no change."),
+            parse_status,
+            "non_actionable_hold_or_rerun",
+        )
     if rec.get("action") == "propose_code_change":
-        shaped = _shape_actionable_code_change(rec, agent)
+        if agent["name"] != "build_planner":
+            rec["action"] = agent["default_action"]
+            rec.setdefault("evidence", {})["build_planner_required"] = True
+            rec["evidence"]["original_action"] = "propose_code_change"
+            rec.pop("code_change", None)
+            shaped = rec
+        else:
+            shaped = _shape_actionable_code_change(rec, agent, packet)
         if shaped:
             rec = shaped
         else:
-            rec = {
-                **rec,
-                "action": "propose_build_task",
-                "title": rec.get("title") or f"{agent['name']} code idea needs shaping",
-                "rationale": rec.get("rationale") or rec.get("proposed_change") or "Code proposal lacked required Build Governor fields.",
-                "evidence": {
-                    **(rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}),
-                    "downgraded_from_code_change": True,
-                    "downgrade_reason": "missing_actionable_code_change_fields",
-                    "parser": "structured_guard",
-                },
-            }
+            return _reject_recommendation(
+                agent,
+                str(rec.get("rationale") or rec.get("proposed_change") or "Ungrounded code proposal."),
+                parse_status,
+                "ungrounded_code_change",
+            )
     rec["priority"] = _coerce_priority(rec.get("priority"), default=50)
     rec.setdefault("title", f"{agent['name']} recommendation")
     rec.setdefault("rationale", "Generated by LLM swarm.")
@@ -256,56 +285,87 @@ def parse_recommendation(text: str, agent: dict, packet: dict) -> dict:
     return rec
 
 
-def _shape_actionable_code_change(rec: dict, agent: dict) -> dict | None:
-    """Repair obvious market-growth code ideas into bounded Build Governor proposals."""
+def _shape_actionable_code_change(rec: dict, agent: dict, packet: dict) -> dict | None:
+    """Validate a Build Planner proposal without inventing implementation details."""
     code_change = rec.get("code_change") if isinstance(rec.get("code_change"), dict) else {}
     category = code_change.get("change_category") or rec.get("change_category") or rec.get("category")
     expected_files = code_change.get("expected_files") or rec.get("expected_files") or []
-    proposed = str(rec.get("proposed_change") or rec.get("rationale") or "")
-    title = str(rec.get("title") or "")
-    haystack = f"{title}\n{proposed}\n{json.dumps(rec.get('evidence') or {}, sort_keys=True)}".lower()
+    integration = code_change.get("runtime_integration")
+    evidence = rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}
+    used_outputs = evidence.get("used_agent_outputs")
+    if not category or not isinstance(expected_files, list) or not expected_files:
+        return None
+    if not isinstance(used_outputs, list) or not used_outputs:
+        return None
+    if not isinstance(integration, dict):
+        return None
+    required = ("entrypoint_file", "entrypoint_symbol", "invocation_path", "test_file", "behavioral_test")
+    if any(not str(integration.get(field) or "").strip() for field in required):
+        return None
+    entrypoint_file = _normalize_repo_path(integration["entrypoint_file"])
+    test_file = _normalize_repo_path(integration["test_file"])
+    expected_files = [_normalize_repo_path(path) for path in expected_files]
+    if entrypoint_file not in expected_files or test_file not in expected_files:
+        return None
+    if not _existing_symbol(entrypoint_file, str(integration["entrypoint_symbol"])):
+        return None
+    grounding = packet.get("repository_grounding") if isinstance(packet.get("repository_grounding"), dict) else {}
+    grounded_paths = {
+        str(item.get("path") or "")
+        for key in ("source_files", "test_files")
+        for item in grounding.get(key, [])
+        if isinstance(item, dict)
+    }
+    if grounded_paths and entrypoint_file not in grounded_paths:
+        return None
+    code_change["change_category"] = category
+    code_change["expected_files"] = expected_files
+    code_change["runtime_integration"] = {**integration, "entrypoint_file": entrypoint_file, "test_file": test_file}
+    code_change.setdefault("evidence", evidence)
+    result = {**rec, "code_change": code_change}
+    result["recommendation_quality"] = {
+        "grounded": True,
+        "entrypoint_file": entrypoint_file,
+        "entrypoint_symbol": integration["entrypoint_symbol"],
+        "behavioral_test": integration["behavioral_test"],
+    }
+    return result
 
-    if category and expected_files:
-        code_change.setdefault("change_category", category)
-        code_change.setdefault("expected_files", expected_files)
-        code_change.setdefault("implementation_mode", rec.get("implementation_mode") or "runtime_active")
-        code_change.setdefault("tests_to_run", rec.get("tests_to_run") or [])
-        code_change.setdefault("rollback_criteria", rec.get("rollback_criteria") or "Revert if tests fail, reports stop refreshing, or paper-only safety checks fail.")
-        code_change.setdefault("evidence", rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {})
-        return {**rec, "code_change": code_change}
 
-    market_growth_terms = (
-        "market expansion",
-        "depth enrichment",
-        "quality coverage",
-        "starved venue",
-        "candidate cap",
-        "frontier venue",
-        "new markets tested",
-        "public adapter",
+def _normalize_repo_path(value: object) -> str:
+    return str(value or "").strip().replace("\\", "/").lstrip("./")
+
+
+def _existing_symbol(relative_path: str, symbol: str) -> bool:
+    path = ROOT / relative_path
+    if not path.is_file() or path.suffix != ".py":
+        return False
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return False
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol
+        for node in ast.walk(tree)
     )
-    if agent["name"] == "build_planner" and any(term in haystack for term in market_growth_terms):
-        repaired = dict(rec)
-        repaired["code_change"] = {
-            "change_category": "scanner_expansion",
-            "implementation_mode": "runtime_active",
-            "expected_files": [
-                "src/frontier_crypto_adapter.py",
-                "src/frontier_data_quality.py",
-                "tests/test_frontier_crypto_adapter.py",
-                "tests/test_frontier_data_quality.py",
-            ],
-            "tests_to_run": [
-                "python -m unittest tests/test_frontier_crypto_adapter.py tests/test_frontier_data_quality.py"
-            ],
-            "rollback_criteria": "Revert if depth-selection caps are exceeded, report generation fails, or paper-only safety checks fail.",
-            "evidence": rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {},
-        }
-        repaired.setdefault("priority", 75)
-        repaired.setdefault("proposed_change", proposed or title)
-        return repaired
 
-    return None
+
+def _describes_no_change(rec: dict) -> bool:
+    text = " ".join(
+        str(rec.get(field) or "")
+        for field in ("title", "rationale", "proposed_change")
+    ).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "no trade change",
+            "no portfolio change",
+            "keep current settings unchanged",
+            "re-run the researcher",
+            "rerun the researcher",
+            "code idea needs shaping",
+        )
+    )
 
 
 def _coerce_priority(value: Any, default: int = 50) -> int:
@@ -617,6 +677,52 @@ def _accepted_outputs(state: SwarmState) -> list[dict]:
     return accepted
 
 
+def _repository_grounding(state: SwarmState) -> dict:
+    """Resolve current-cycle ideas to the real repo before Build Planner runs."""
+    accepted = _accepted_outputs(state)
+    if not accepted:
+        return {"source_files": [], "test_files": [], "resolved_from": []}
+    conceptual_paths: list[str] = []
+    for rec in accepted:
+        code_change = rec.get("code_change") if isinstance(rec.get("code_change"), dict) else {}
+        conceptual_paths.extend(str(path) for path in code_change.get("expected_files", []) or [])
+    proposal = {
+        "title": " | ".join(str(rec.get("title") or "") for rec in accepted),
+        "rationale": " | ".join(str(rec.get("rationale") or "") for rec in accepted),
+        "proposed_change": " | ".join(str(rec.get("proposed_change") or "") for rec in accepted),
+        "market_key": " | ".join(str(rec.get("market_key") or "") for rec in accepted),
+        "signal_key": " | ".join(str(rec.get("signal_key") or "") for rec in accepted),
+    }
+    resolved = resolve_repo_targets(ROOT, proposal, conceptual_paths=conceptual_paths)
+    ranked = {str(item.get("path") or ""): item for item in resolved.get("ranked", [])}
+
+    def entries(paths: list[str]) -> list[dict]:
+        return [
+            {
+                "path": path,
+                "symbols": list((ranked.get(path) or {}).get("symbols") or [])[:12],
+            }
+            for path in paths
+        ]
+
+    return {
+        "source_files": entries(resolved.get("source_files", [])),
+        "test_files": entries(resolved.get("test_files", [])),
+        "resolved_from": [
+            {
+                "agent_name": rec.get("agent_name"),
+                "title": rec.get("title"),
+                "action": rec.get("action"),
+            }
+            for rec in accepted
+        ],
+        "rule": (
+            "Select an existing source entrypoint and symbol from this map. A new file is allowed only when an "
+            "existing entrypoint calls it and a behavioral test proves that call path."
+        ),
+    }
+
+
 def _initial_state(packet: dict, memory: list[dict], mode: str) -> SwarmState:
     return {
         "packet": packet,
@@ -674,6 +780,8 @@ def _run_agent_node(agent: dict, state: SwarmState) -> SwarmState:
     agent_packet["current_cycle_agent_outputs"] = state.get("agent_outputs", [])
     agent_packet["current_cycle_critiques"] = state.get("critiques", [])
     agent_packet["current_cycle_ranked_actions"] = state.get("ranked_actions", [])
+    if agent["name"] == "build_planner":
+        agent_packet["repository_grounding"] = _repository_grounding(state)
     rec = run_agent(agent, agent_packet, state["memory"])
     return _record_agent_result(state, agent, rec, int((time.perf_counter() - started) * 1000))
 

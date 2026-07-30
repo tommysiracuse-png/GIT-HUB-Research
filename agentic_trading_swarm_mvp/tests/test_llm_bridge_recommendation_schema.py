@@ -33,3 +33,10 @@ class RecommendationSchemaTests(unittest.TestCase):
         self.assertEqual(fallback["market_key"], "paper_system.integrity.market_scout")
         self.assertEqual(fallback["evidence"], {"issue": "schema_validation_failed"})
         self.assertEqual(fallback["proposed_change"], {"goal": "preserve parser compatibility"})
+
+    def test_schema_directs_incomplete_outputs_to_no_action(self) -> None:
+        schema = llm_bridge._recommendation_schema(["propose_code_change", "no_action"])
+
+        self.assertIn("action='no_action'", schema["fallback_behavior"])
+        self.assertIn("behavioral_test", schema["code_change"]["runtime_integration"])
+        self.assertIn("Import/existence-only tests are insufficient", schema["code_change"]["runtime_integration"])

@@ -1184,6 +1184,73 @@ new file mode 100644
             "changed_source_without_runtime_wiring",
         )
 
+    def test_grounded_contract_rejects_existence_only_test(self) -> None:
+        diff = """diff --git a/src/llm_swarm_runner.py b/src/llm_swarm_runner.py
+--- a/src/llm_swarm_runner.py
++++ b/src/llm_swarm_runner.py
+@@ -1 +1,2 @@
+ # swarm
++# recommendation quality gate
+diff --git a/tests/test_frontier_model_policy.py b/tests/test_frontier_model_policy.py
+--- a/tests/test_frontier_model_policy.py
++++ b/tests/test_frontier_model_policy.py
+@@ -1 +1,2 @@
+ # tests
++assert True
+"""
+        payload = proposal(
+            diff,
+            change_category="llm_prompt_state_packet",
+            expected_files=["src/llm_swarm_runner.py", "tests/test_frontier_model_policy.py"],
+            code_change={
+                "runtime_integration": {
+                    "entrypoint_file": "src/llm_swarm_runner.py",
+                    "entrypoint_symbol": "run_sequential",
+                    "invocation_path": "normal swarm execution",
+                    "test_file": "tests/test_frontier_model_policy.py",
+                    "behavioral_test": "assert normal execution applies recommendation quality filtering",
+                }
+            },
+        )
+
+        safety = code_evolution.validate_and_scan(payload, diff, settings())
+
+        self.assertFalse(safety["allowed"])
+        self.assertIn("behavioral_test_does_not_exercise_entrypoint", safety["reasons"])
+
+    def test_grounded_contract_accepts_test_that_exercises_entrypoint(self) -> None:
+        diff = """diff --git a/src/llm_swarm_runner.py b/src/llm_swarm_runner.py
+--- a/src/llm_swarm_runner.py
++++ b/src/llm_swarm_runner.py
+@@ -1 +1,2 @@
+ # swarm
++# recommendation quality gate
+diff --git a/tests/test_frontier_model_policy.py b/tests/test_frontier_model_policy.py
+--- a/tests/test_frontier_model_policy.py
++++ b/tests/test_frontier_model_policy.py
+@@ -1 +1,2 @@
+ # tests
++run_sequential(packet, memory)
+"""
+        payload = proposal(
+            diff,
+            change_category="llm_prompt_state_packet",
+            expected_files=["src/llm_swarm_runner.py", "tests/test_frontier_model_policy.py"],
+            code_change={
+                "runtime_integration": {
+                    "entrypoint_file": "src/llm_swarm_runner.py",
+                    "entrypoint_symbol": "run_sequential",
+                    "invocation_path": "normal swarm execution",
+                    "test_file": "tests/test_frontier_model_policy.py",
+                    "behavioral_test": "assert normal execution applies recommendation quality filtering",
+                }
+            },
+        )
+
+        safety = code_evolution.validate_and_scan(payload, diff, settings())
+
+        self.assertTrue(safety["allowed"], safety)
+
     def test_patch_generation_timeout_is_classified(self) -> None:
         safety = code_evolution.validate_and_scan(
             proposal("", expected_files=["src/llm_bridge.py"], change_category="llm_prompt_state_packet"),

@@ -23,6 +23,7 @@ class ResearchWorkerNigeriaSeedTests(unittest.TestCase):
         hint = seed["adapter_request_hint"]
         self.assertTrue(hint["paper_only"])
         self.assertEqual(hint["provider_mode"], "public_web_quote_or_delayed_feed")
+        self.assertIn(seed, research_worker.DEFAULT_GLOBAL_DISCOVERY_SEEDS)
 
     def test_ngx_seed_captures_quality_and_freshness_fields(self) -> None:
         seed = research_worker.NGX_DIRECT_DISCOVERY_SEED

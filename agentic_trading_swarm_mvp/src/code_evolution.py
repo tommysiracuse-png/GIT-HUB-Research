@@ -3077,6 +3077,40 @@ def _actual_runtime_integration_status(payload: dict, category: str, changed_fil
     return status
 
 
+def _behavioral_integration_contract_reasons(payload: dict, diff_text: str, changed_files: list[str]) -> list[str]:
+    """Verify grounded swarm proposals change and exercise their declared consumer."""
+    integration = _code_change(payload).get("runtime_integration")
+    if not isinstance(integration, dict):
+        return []
+    entrypoint_file = _canonical_path(str(integration.get("entrypoint_file") or ""))
+    test_file = _canonical_path(str(integration.get("test_file") or ""))
+    entrypoint_symbol = str(integration.get("entrypoint_symbol") or "").strip()
+    behavioral_test = str(integration.get("behavioral_test") or "").strip()
+    reasons: list[str] = []
+    if not entrypoint_file or entrypoint_file not in changed_files:
+        reasons.append("behavioral_contract_entrypoint_not_changed")
+    if not test_file or test_file not in changed_files:
+        reasons.append("behavioral_contract_test_not_changed")
+    if not entrypoint_symbol or not behavioral_test:
+        reasons.append("behavioral_contract_incomplete")
+        return reasons
+    files, error = _parse_unified_diff(diff_text)
+    if error:
+        return reasons
+    test_patch = next((item for item in files if item.get("path") == test_file), None)
+    if not test_patch:
+        return reasons
+    added_test_text = "\n".join(
+        text
+        for hunk in test_patch.get("hunks", [])
+        for marker, text in hunk.get("lines", [])
+        if marker in {"+", " "}
+    )
+    if entrypoint_symbol not in added_test_text:
+        reasons.append("behavioral_test_does_not_exercise_entrypoint")
+    return reasons
+
+
 def _expected_behavior_change(payload: dict, runtime_status: str) -> str:
     proposed = str(_field(payload, "proposed_change", "expected_paper_only_impact") or payload.get("rationale") or "").strip()
     if runtime_status == "integrated":
@@ -3318,6 +3352,8 @@ def validate_and_scan(
         and actual_runtime_status == "changed_source_without_runtime_wiring"
     ):
         reasons.append("no_runtime_integration_target")
+
+    reasons.extend(_behavioral_integration_contract_reasons(payload, diff_text, changed_files))
 
     for path in changed_files:
         if _path_blocked(path, cfg):

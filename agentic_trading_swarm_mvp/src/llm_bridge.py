@@ -946,9 +946,9 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
         "priority": "integer 1-100",
         "fallback_behavior": (
             "If any required field is unavailable, route construction fails validation, "
-            "or the response would otherwise be partial, emit one conservative paper-only "
-            "fallback recommendation instead of partial output. The fallback must also be "
-            "returned as exactly one JSON object."
+            "or the response would otherwise be partial, emit action='no_action' instead of "
+            "inventing a hold/refine/build recommendation. The no-action response must still "
+            "be returned as exactly one JSON object with the failure captured in evidence."
         ),
         "validation_policy": {
             "publish_only_single_json_object": True,
@@ -1007,6 +1007,11 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "expected_files": "list of repo-relative files expected to change",
             "tests_to_run": "safe unittest commands or empty list for full regression",
             "rollback_criteria": "when the governor should revert/demote",
+            "runtime_integration": (
+                "For runtime-active Build Planner proposals: exact existing entrypoint_file and "
+                "entrypoint_symbol, invocation_path, test_file, and a behavioral_test proving the "
+                "running consumer uses the change. Import/existence-only tests are insufficient."
+            ),
             "unified_diff": "optional patch; if missing, GPT-5.5 Build Planner may generate one",
             "detail_fields_to_prefer": list(CODE_CHANGE_OPTIONAL_DETAIL_FIELDS),
             "field_quality_gate": (
@@ -1072,7 +1077,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
     buckets = _bucketize(stats, directives)
     global_market_discovery = _compact_global_market_discovery(payload.get("research_worker"))
     hunter_allocation = payload.get("hunter_allocation", {})
-    allowed_actions = settings.get("llm_bridge", {}).get("allowed_actions", [])
+    allowed_actions = list(dict.fromkeys([*settings.get("llm_bridge", {}).get("allowed_actions", []), "no_action"]))
     crypto_venue_health = payload.get("crypto_venue_health", [])
     packet = {
         "purpose": "Read-only state packet for LLM agents. Recommend actions through llm_recommendations_inbox.jsonl only.",

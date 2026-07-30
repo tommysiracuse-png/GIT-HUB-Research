@@ -179,6 +179,7 @@ JSE_DIRECT_DISCOVERY_SEED: dict[str, Any] = {
 }
 
 DEFAULT_GLOBAL_DISCOVERY_SEEDS: list[dict[str, Any]] = [
+    NGX_DIRECT_DISCOVERY_SEED,
     {
         "surface_type_raw": "crypto global spot public market data",
         "venue_or_source": "Bybit",

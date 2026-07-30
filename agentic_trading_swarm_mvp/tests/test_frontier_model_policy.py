@@ -235,10 +235,11 @@ class FrontierModelPolicyTests(unittest.TestCase):
             packet,
         )
 
-        self.assertEqual(rec["action"], "propose_build_task")
-        self.assertEqual(rec["evidence"]["downgrade_reason"], "missing_actionable_code_change_fields")
+        self.assertTrue(rec["_rejected"])
+        self.assertEqual(rec["action"], "no_action")
+        self.assertEqual(rec["terminal_failure_reason"], "ungrounded_code_change")
 
-    def test_build_planner_shapes_market_growth_code_change(self) -> None:
+    def test_build_planner_does_not_infer_market_growth_implementation(self) -> None:
         packet = {
             "allowed_recommendation_actions": [
                 "propose_code_change",
@@ -262,10 +263,106 @@ class FrontierModelPolicyTests(unittest.TestCase):
             packet,
         )
 
+        self.assertTrue(rec["_rejected"])
+        self.assertEqual(rec["terminal_failure_reason"], "ungrounded_code_change")
+
+    def test_build_planner_accepts_repo_grounded_behavioral_code_contract(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": ["propose_code_change", "no_action"],
+            "repository_grounding": {
+                "source_files": [
+                    {
+                        "path": "src/frontier_crypto_adapter.py",
+                        "symbols": ["paper_only_premarket_liquidity_gate"],
+                    }
+                ],
+                "test_files": [{"path": "tests/test_frontier_crypto_adapter.py", "symbols": []}],
+            },
+        }
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "build_planner")
+        rec = llm_swarm_runner.parse_recommendation(
+            json.dumps(
+                {
+                    "action": "propose_code_change",
+                    "priority": 82,
+                    "title": "Apply measured liquidity gate",
+                    "rationale": "Current candidates include low-liquidity entries.",
+                    "market_key": "frontier_crypto",
+                    "evidence": {"used_agent_outputs": ["red_team:liquidity-failures"]},
+                    "proposed_change": "Wire the measured liquidity gate into frontier candidate admission.",
+                    "code_change": {
+                        "change_category": "paper_scoring_logic",
+                        "implementation_mode": "runtime_active",
+                        "expected_files": [
+                            "src/frontier_crypto_adapter.py",
+                            "tests/test_frontier_crypto_adapter.py",
+                        ],
+                        "tests_to_run": ["python -m unittest tests/test_frontier_crypto_adapter.py"],
+                        "rollback_criteria": "Revert if frontier candidate generation fails.",
+                        "runtime_integration": {
+                            "entrypoint_file": "src/frontier_crypto_adapter.py",
+                            "entrypoint_symbol": "paper_only_premarket_liquidity_gate",
+                            "invocation_path": "frontier candidate admission calls the gate before review",
+                            "test_file": "tests/test_frontier_crypto_adapter.py",
+                            "behavioral_test": "assert a low-liquidity candidate is rejected by normal frontier candidate admission",
+                        },
+                    },
+                }
+            ),
+            agent,
+            packet,
+        )
+
         self.assertEqual(rec["action"], "propose_code_change")
-        self.assertEqual(rec["code_change"]["change_category"], "scanner_expansion")
-        self.assertEqual(rec["code_change"]["implementation_mode"], "runtime_active")
-        self.assertIn("src/frontier_crypto_adapter.py", rec["code_change"]["expected_files"])
+        self.assertTrue(rec["recommendation_quality"]["grounded"])
+        self.assertEqual(rec["recommendation_quality"]["entrypoint_symbol"], "paper_only_premarket_liquidity_gate")
+
+    def test_explicit_no_action_is_not_rewritten_to_agent_default(self) -> None:
+        packet = {"allowed_recommendation_actions": ["propose_code_change", "no_action"]}
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "build_planner")
+
+        rec = llm_swarm_runner.parse_recommendation(
+            json.dumps(
+                {
+                    "action": "no_action",
+                    "priority": 0,
+                    "title": "No grounded implementation",
+                    "rationale": "The current evidence does not identify an existing consumer.",
+                    "market_key": "system",
+                    "evidence": {"reason": "missing_runtime_consumer"},
+                    "proposed_change": "",
+                }
+            ),
+            agent,
+            packet,
+        )
+
+        self.assertTrue(rec["_rejected"])
+        self.assertEqual(rec["action"], "no_action")
+        self.assertEqual(rec["terminal_failure_reason"], "agent_no_action")
+
+    def test_hold_recommendation_is_not_ranked_as_code_work(self) -> None:
+        packet = {"allowed_recommendation_actions": ["propose_diagnostic_hypothesis", "no_action"]}
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "cross_market_researcher")
+
+        rec = llm_swarm_runner.parse_recommendation(
+            json.dumps(
+                {
+                    "action": "propose_diagnostic_hypothesis",
+                    "priority": 80,
+                    "title": "No trade change until schema recovers",
+                    "rationale": "Re-run the researcher before changing paper behavior.",
+                    "market_key": "system",
+                    "evidence": {"parse_failure": True},
+                    "proposed_change": {"decision": "no portfolio change"},
+                }
+            ),
+            agent,
+            packet,
+        )
+
+        self.assertTrue(rec["_rejected"])
+        self.assertEqual(rec["terminal_failure_reason"], "non_actionable_hold_or_rerun")
 
     def test_sequential_swarm_passes_prior_outputs_to_later_agents(self) -> None:
         seen_counts: list[int] = []
@@ -289,6 +386,33 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(len(recs), len(llm_swarm_runner.AGENTS))
         self.assertEqual(seen_counts, list(range(len(llm_swarm_runner.AGENTS))))
         self.assertEqual(llm_swarm_runner.LAST_SWARM_STATE["collaboration_mode"], llm_swarm_runner.FALLBACK_COLLABORATION_MODE)
+
+    def test_build_planner_receives_repo_grounding_from_prior_outputs(self) -> None:
+        planner_grounding: dict = {}
+
+        def fake_run_agent(agent: dict, packet: dict, _memory: list[dict]) -> dict:
+            if agent["name"] == "build_planner":
+                planner_grounding.update(packet.get("repository_grounding") or {})
+            return {
+                "action": "propose_hunter_directive",
+                "priority": 60,
+                "title": f"Inspect frontier quality in {agent['name']}",
+                "rationale": "Use frontier candidate evidence and the existing scanner.",
+                "market_key": "frontier_crypto",
+                "evidence": {},
+                "proposed_change": "Inspect frontier quality coverage.",
+                "agent_name": agent["name"],
+            }
+
+        with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=fake_run_agent):
+            llm_swarm_runner.run_sequential(
+                {"allowed_recommendation_actions": ["propose_hunter_directive", "no_action"]},
+                [],
+            )
+
+        self.assertTrue(planner_grounding["source_files"])
+        self.assertTrue(any(row["path"].startswith("src/") for row in planner_grounding["source_files"]))
+        self.assertEqual(len(planner_grounding["resolved_from"]), len(llm_swarm_runner.AGENTS) - 1)
 
     def test_langgraph_swarm_builds_ranked_action_package(self) -> None:
         calls: list[str] = []

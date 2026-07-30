@@ -170,7 +170,12 @@ def resolve_repo_targets(
         "source_files": source,
         "test_files": tests,
         "ranked": [
-            {"path": entry["path"], "score": score, "kind": entry["kind"]}
+            {
+                "path": entry["path"],
+                "score": score,
+                "kind": entry["kind"],
+                "symbols": entry.get("symbols", [])[:20],
+            }
             for score, entry in scored[:12]
         ],
     }
