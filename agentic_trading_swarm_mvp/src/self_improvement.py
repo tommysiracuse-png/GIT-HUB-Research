@@ -2220,6 +2220,14 @@ def _report_markdown(report: dict) -> str:
             f"- Requested symbols observed: `{admission.get('requested_symbols_observed', 0)}`/"
             f"`{admission.get('requested_symbol_count', 0)}`"
         )
+    admission_bridge = report.get("market_admission_bridge") or expansion.get("market_admission_bridge") or {}
+    if admission_bridge:
+        lines.extend(["", "## Admission-To-Strategy Bridge", ""])
+        lines.append(f"- Actions created: `{admission_bridge.get('actions_created', 0)}`")
+        lines.append(f"- Duplicate actions suppressed: `{admission_bridge.get('duplicates_suppressed', 0)}`")
+        lines.append(f"- Prior-stage topics resolved: `{admission_bridge.get('prior_stage_topics_resolved', 0)}`")
+        lines.append(f"- User capability constraints honored: `{admission_bridge.get('user_constraints_suppressed', 0)}`")
+        lines.append(f"- By action: `{admission_bridge.get('by_action', {})}`")
         lines.append(f"- Report: `{RUNS_DIR / 'market_admission_report.md'}`")
 
     research_path = RUNS_DIR / "research_worker_latest.json"

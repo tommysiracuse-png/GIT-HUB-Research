@@ -1066,6 +1066,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "okx_signal_research": _compact_okx_signal_research(payload.get("okx_signal_research", {})),
         "strategy_reliability": _compact_strategy_reliability(payload.get("strategy_reliability", {})),
         "strategy_lab": payload.get("strategy_lab") or strategy_lab_summary(conn),
+        "market_admission_bridge": payload.get("market_admission_bridge", {}),
         "autonomous_builder": payload.get("autonomous_builder", {}),
         "recommendation_registry": registry_summary(conn),
         "self_improvement_open_pack": _compact_self_improvement_open_pack(

@@ -269,6 +269,26 @@ def bind_artifact(conn: sqlite3.Connection, topic_key_value: str, table: str, ro
     )
 
 
+def set_topic_status(
+    conn: sqlite3.Connection,
+    topic_key_value: str,
+    status: str,
+    *,
+    implemented_category: str | None = None,
+    implementation_commit: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        update recommendation_topics
+        set status = ?, updated_at = ?,
+            implemented_category = coalesce(?, implemented_category),
+            implementation_commit = coalesce(?, implementation_commit)
+        where topic_key = ?
+        """,
+        (status, utc_now(), implemented_category, implementation_commit, topic_key_value),
+    )
+
+
 def registry_summary(conn: sqlite3.Connection) -> dict[str, Any]:
     row = conn.execute(
         """
