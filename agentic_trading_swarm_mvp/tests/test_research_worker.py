@@ -92,7 +92,7 @@ class ResearchWorkerTests(unittest.TestCase):
                 research_worker.CANDIDATES_JSONL = old_candidates
                 research_worker.RUNS_DIR = old_runs
 
-    def test_implemented_global_discovery_artifacts_are_not_recreated(self) -> None:
+    def test_discovery_scan_does_not_falsely_complete_adapter_lifecycle(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         storage.init_db(conn)
@@ -122,9 +122,10 @@ class ResearchWorkerTests(unittest.TestCase):
             {"research_worker": {"suppress_implemented_global_discovery_artifacts": True}},
         )
 
-        self.assertEqual(created[0]["skip_reason"], "global_market_discovery_scan_already_implemented")
+        self.assertEqual(created[0]["type"], "growth_experiment")
+        self.assertTrue(created[0]["inserted"])
         open_rows = conn.execute("select * from growth_experiments where status='open'").fetchall()
-        self.assertEqual(open_rows, [])
+        self.assertEqual(len(open_rows), 1)
         conn.close()
 
     def test_new_global_discovery_artifact_still_gets_created(self) -> None:
@@ -162,6 +163,103 @@ class ResearchWorkerTests(unittest.TestCase):
         open_rows = conn.execute("select hypothesis from growth_experiments where status='open'").fetchall()
         self.assertEqual(len(open_rows), 1)
         self.assertIn("Nairobi Coffee Exchange", open_rows[0]["hypothesis"])
+        conn.close()
+
+    def test_continuous_discovery_rotates_themes_and_requires_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_runs = research_worker.RUNS_DIR
+            research_worker.RUNS_DIR = pathlib.Path(tmp)
+            calls = []
+
+            def fake_complete(*args, **kwargs):
+                calls.append(kwargs)
+                return research_worker.ModelResult(
+                    text=json.dumps(
+                        {
+                            "discoveries": [
+                                {
+                                    "surface_type_raw": "regulated electricity spot auction",
+                                    "venue_or_source": "Example Power Pool",
+                                    "country": "Exampleland",
+                                    "region": "East Africa",
+                                    "asset_or_event": "day-ahead electricity settlement prices",
+                                    "data_access_type": "public_no_key",
+                                    "tradability_guess": "watch_only",
+                                    "source_urls": ["https://power.example.org/market-data"],
+                                    "why_interesting": "Public settlement prices expose a new market surface.",
+                                    "inefficiency_hypothesis": "Power shocks may lead listed utility proxies.",
+                                    "priority": 82,
+                                    "confidence": 0.76,
+                                },
+                                {
+                                    "venue_or_source": "Missing Source Venue",
+                                    "asset_or_event": "unknown contract",
+                                    "priority": 80,
+                                },
+                            ],
+                            "follow_up_queries": ["Find public power derivatives linked to the discovered pool"],
+                        }
+                    ),
+                    model_name="openai/test-search",
+                    model_tier="fast",
+                    prompt_tokens=100,
+                    completion_tokens=100,
+                    estimated_cost_usd=0.01,
+                    status="model_call:responses",
+                )
+
+            try:
+                settings = {
+                    "research_worker": {
+                        "web_research_enabled": True,
+                        "search_themes_per_cycle": 2,
+                        "search_theme_cooldown_hours": 168,
+                        "max_web_discoveries_per_cycle": 5,
+                    }
+                }
+                first = research_worker.run_continuous_web_discovery(settings, [], model_complete=fake_complete)
+                second = research_worker.run_continuous_web_discovery(settings, first["candidates"], model_complete=fake_complete)
+
+                self.assertEqual(first["status"], "ok")
+                self.assertEqual(len(first["candidates"]), 1)
+                self.assertEqual(first["rejected"][0]["reason"], "missing_public_source_url")
+                self.assertEqual(calls[0]["tools"], [{"type": "web_search"}])
+                self.assertNotEqual(
+                    {item["theme_id"] for item in first["selected_themes"]},
+                    {item["theme_id"] for item in second["selected_themes"]},
+                )
+                self.assertTrue((pathlib.Path(tmp) / "research_discovery_frontier.json").exists())
+                self.assertTrue((pathlib.Path(tmp) / "research_discovery_journal.jsonl").exists())
+            finally:
+                research_worker.RUNS_DIR = old_runs
+
+    def test_adapter_and_route_artifacts_have_independent_lifecycles(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        candidate = research_worker.normalize_market_candidate(
+            {
+                "surface_type_raw": "public commodity exchange",
+                "venue_or_source": "Example Commodity Exchange",
+                "asset_or_event": "coffee futures",
+                "data_access_type": "public_no_key",
+                "tradability_guess": "route_needed",
+                "source_urls": ["https://commodities.example.org/docs"],
+                "route_blockers": ["futures_account"],
+                "priority": 90,
+            }
+        )
+
+        created = research_worker.create_downstream_artifacts(conn, [candidate], {"research_worker": {}})
+
+        self.assertEqual({item["type"] for item in created}, {"adapter_spec", "route_probe_task"})
+        conn.execute(
+            "update route_probe_tasks set status='implemented_global_market_discovery_scan' where market_key like 'global_discovery|%'"
+        )
+        conn.commit()
+        reconciled = research_worker.reconcile_discovery_route_lifecycle(conn)
+        self.assertEqual(reconciled["reopened_legacy_route_probes"], 1)
+        self.assertEqual(reconciled["open_global_route_probes"], 1)
         conn.close()
 
 

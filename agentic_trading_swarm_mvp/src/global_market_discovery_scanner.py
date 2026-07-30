@@ -227,15 +227,15 @@ def _merge_default_discoveries(candidates: list[dict[str, Any]], settings: dict 
 
 
 def load_discovery_candidates(settings: dict | None = None) -> list[dict[str, Any]]:
-    """Load the most recent research-worker discoveries, falling back to seeds."""
+    """Load the durable discovery ledger plus the latest research-worker results."""
 
     cfg = _cfg(settings)
     candidates: list[dict[str, Any]] = []
     report = _read_json(RESEARCH_REPORT_JSON) if RESEARCH_REPORT_JSON.exists() else {}
     for item in report.get("candidates", []) or []:
         candidates.append(dict(item))
-    if not candidates and DISCOVERY_JSONL.exists():
-        seen: set[str] = set()
+    seen: set[str] = {_discovery_identity(item) for item in candidates}
+    if DISCOVERY_JSONL.exists():
         for line in DISCOVERY_JSONL.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -243,7 +243,7 @@ def load_discovery_candidates(settings: dict | None = None) -> list[dict[str, An
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            candidate_id = str(item.get("candidate_id") or "")
+            candidate_id = _discovery_identity(item)
             if candidate_id and candidate_id in seen:
                 continue
             seen.add(candidate_id)
@@ -256,7 +256,16 @@ def load_discovery_candidates(settings: dict | None = None) -> list[dict[str, An
     min_priority = int(cfg.get("min_discovery_priority", 70))
     filtered = [item for item in candidates if int(item.get("priority") or 0) >= min_priority]
     filtered.sort(key=lambda row: (int(row.get("priority") or 0), float(row.get("confidence") or 0.0)), reverse=True)
-    return filtered[: int(cfg.get("max_surfaces_per_cycle", 10))]
+    limit = int(cfg.get("max_surfaces_per_cycle", 10))
+    rotation_slots = min(limit, max(0, int(cfg.get("recent_discovery_rotation_slots", 8))))
+    recent = sorted(
+        [item for item in filtered if item.get("discovered_by") == "openai_responses_web_search"],
+        key=lambda row: str(row.get("created_at") or ""),
+        reverse=True,
+    )[:rotation_slots]
+    selected_ids = {_discovery_identity(item) for item in recent}
+    remaining = [item for item in filtered if _discovery_identity(item) not in selected_ids]
+    return [*recent, *remaining[: max(0, limit - len(recent))]]
 
 
 def _proxy_map(settings: dict | None = None) -> dict[str, list[dict[str, Any]]]:

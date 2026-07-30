@@ -258,6 +258,7 @@ def complete(
     structured_json: bool | None = None,
     max_output_tokens_override: int | None = None,
     timeout_seconds_override: float | None = None,
+    tools: list[dict] | None = None,
 ) -> ModelResult:
     cfg = load_llm_config()
     agent_cfg = cfg.get("agents", {}).get(agent_name, {"tier": "fast"})
@@ -372,6 +373,7 @@ def complete(
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
                 timeout_seconds=timeout_seconds,
+                tools=tools,
             )
             prompt_tokens = actual_prompt_tokens or prompt_tokens
         else:
@@ -442,6 +444,7 @@ def _complete_openai_responses(
     prompt_cache_key: str | None,
     prompt_cache_retention: str | None,
     timeout_seconds: float | None,
+    tools: list[dict] | None = None,
 ) -> tuple[str, int | None, int]:
     from openai import OpenAI
 
@@ -473,6 +476,8 @@ def _complete_openai_responses(
         kwargs["prompt_cache_key"] = prompt_cache_key
     if prompt_cache_retention:
         kwargs["prompt_cache_retention"] = prompt_cache_retention
+    if tools:
+        kwargs["tools"] = tools
 
     response = client.responses.create(**kwargs)
     text = getattr(response, "output_text", None) or _extract_response_text(response)

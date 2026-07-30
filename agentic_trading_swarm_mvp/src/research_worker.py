@@ -12,9 +12,12 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import pathlib
 import sqlite3
-from typing import Any, Iterable
+import urllib.parse
+from typing import Any, Callable, Iterable
 
+from cost_router import ModelResult, complete
 from storage import (
     RUNS_DIR,
     add_adapter_spec,
@@ -33,6 +36,40 @@ IMPLEMENTED_GLOBAL_DISCOVERY_STATUS = "implemented_global_market_discovery_scan"
 DATA_ACCESS_TYPES = {"public_no_key", "public_key_required", "broker_account", "paid_data", "unknown"}
 TRADABILITY_GUESSES = {"directly_tradable", "route_needed", "watch_only", "unknown"}
 NEXT_ACTIONS = {"adapter_spec", "route_probe", "growth_experiment", "hunter_directive", "watchlist", "ignore"}
+
+DISCOVERY_REGIONS = (
+    "West Africa",
+    "East Africa",
+    "Southern Africa",
+    "North Africa",
+    "Andean Latin America",
+    "Southern Cone Latin America",
+    "Central America and the Caribbean",
+    "Southeast Asia",
+    "South Asia",
+    "East Asia",
+    "Middle East",
+    "Eastern Europe and Central Asia",
+    "Nordics and Baltics",
+    "Oceania and Pacific islands",
+)
+
+DISCOVERY_SURFACES = (
+    "local securities exchanges with public price or delayed quote access",
+    "listed derivatives, options, volatility, futures, and clearing venues",
+    "regional fiat, stablecoin, FX, remittance, and cross-border price rails",
+    "government bond auctions, rates, credit, and fixed-income price surfaces",
+    "commodity auctions, warehouse receipts, agricultural exchanges, and cash markets",
+    "power, carbon, renewable certificate, and environmental markets",
+    "shipping, freight, insurance, and logistics price benchmarks",
+    "sports, prediction, event, and regulated wagering exchanges",
+    "public lending, invoice, receivables, and marketplace price feeds",
+    "crypto spot, perpetual, options, OTC indication, and local-fiat venues",
+    "country ETFs, ADRs, depositary receipts, and cross-listed equity relationships",
+    "fund, index, volatility, and alternative-data products with observable prices",
+)
+
+PROHIBITED_RESEARCH_TERMS = ("stolen data", "hacked data", "private leak", "inside information")
 
 JSE_DIRECT_DISCOVERY_SEED: dict[str, Any] = {
     "surface_type_raw": "cash equity benchmark and top-liquid constituent public market data",
@@ -802,6 +839,345 @@ DEFAULT_GLOBAL_DISCOVERY_SEEDS: list[dict[str, Any]] = [
 ]
 
 
+def _frontier_path() -> pathlib.Path:
+    return RUNS_DIR / "research_discovery_frontier.json"
+
+
+def _journal_path() -> pathlib.Path:
+    return RUNS_DIR / "research_discovery_journal.jsonl"
+
+
+def _theme_id(query: str) -> str:
+    return "theme_" + hashlib.sha256(query.strip().lower().encode("utf-8")).hexdigest()[:16]
+
+
+def discovery_theme_catalog() -> list[dict[str, str]]:
+    themes: list[dict[str, str]] = []
+    for region in DISCOVERY_REGIONS:
+        for surface in DISCOVERY_SURFACES:
+            query = (
+                f"Research {surface} in {region}. Find public, source-backed venues, assets, "
+                "instruments, or price feeds that are absent from the current market map."
+            )
+            themes.append({"theme_id": _theme_id(query), "region": region, "surface": surface, "query": query})
+    return themes
+
+
+def _read_json(path: pathlib.Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _load_frontier_state() -> dict[str, Any]:
+    payload = _read_json(_frontier_path(), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("version", 1)
+    payload.setdefault("themes", {})
+    payload.setdefault("follow_up_queries", [])
+    payload.setdefault("total_search_cycles", 0)
+    payload.setdefault("total_new_candidates", 0)
+    return payload
+
+
+def _save_frontier_state(state: dict[str, Any]) -> None:
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    state["updated_at"] = _utc_now()
+    _frontier_path().write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _parse_time(value: object) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _select_discovery_themes(state: dict[str, Any], cfg: dict[str, Any]) -> list[dict[str, str]]:
+    limit = max(1, int(cfg.get("search_themes_per_cycle", 2)))
+    cooldown = dt.timedelta(hours=max(0.0, float(cfg.get("search_theme_cooldown_hours", 168))))
+    now = dt.datetime.now(dt.timezone.utc)
+    theme_state = state.setdefault("themes", {})
+    pool: list[dict[str, str]] = []
+
+    for follow_up in state.get("follow_up_queries", []):
+        if not isinstance(follow_up, dict) or not str(follow_up.get("query") or "").strip():
+            continue
+        pool.append(
+            {
+                "theme_id": str(follow_up.get("theme_id") or _theme_id(str(follow_up["query"]))),
+                "region": str(follow_up.get("region") or "Global follow-up"),
+                "surface": str(follow_up.get("surface") or "model-suggested follow-up"),
+                "query": str(follow_up["query"]).strip(),
+            }
+        )
+    pool.extend(discovery_theme_catalog())
+
+    eligible: list[tuple[int, dt.datetime, dict[str, str]]] = []
+    cooling: list[tuple[dt.datetime, dict[str, str]]] = []
+    earliest = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    for theme in pool:
+        saved = theme_state.get(theme["theme_id"], {})
+        last_at = _parse_time(saved.get("last_searched_at")) or earliest
+        attempts = int(saved.get("attempts") or 0)
+        if last_at == earliest or now - last_at >= cooldown:
+            eligible.append((attempts, last_at, theme))
+        else:
+            cooling.append((last_at, theme))
+    eligible.sort(key=lambda item: (item[0], item[1], item[2]["theme_id"]))
+    selected = [item[2] for item in eligible[:limit]]
+    if len(selected) < limit:
+        cooling.sort(key=lambda item: item[0])
+        selected.extend(item[1] for item in cooling[: limit - len(selected)])
+    return selected
+
+
+def _candidate_ledger_rows(path: pathlib.Path | None = None) -> list[dict[str, Any]]:
+    path = path or CANDIDATES_JSONL
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
+
+
+def _public_source_urls(item: dict[str, Any]) -> list[str]:
+    raw_urls = item.get("source_urls") or ([item.get("public_docs_url")] if item.get("public_docs_url") else [])
+    urls: list[str] = []
+    for raw in raw_urls:
+        value = str(raw or "").strip()
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme in {"http", "https"} and parsed.netloc and value not in urls:
+            urls.append(value)
+    return urls
+
+
+def _validate_discovered_item(item: object, cfg: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(item, dict):
+        return None, "not_an_object"
+    if not str(item.get("venue_or_source") or "").strip():
+        return None, "missing_venue_or_source"
+    if not str(item.get("asset_or_event") or "").strip():
+        return None, "missing_asset_or_event"
+    searchable_text = json.dumps(item, sort_keys=True).lower()
+    if any(term in searchable_text for term in PROHIBITED_RESEARCH_TERMS):
+        return None, "non_public_or_prohibited_source"
+    urls = _public_source_urls(item)
+    if bool(cfg.get("require_public_source_urls", True)) and not urls:
+        return None, "missing_public_source_url"
+    output = dict(item)
+    output["source_urls"] = urls
+    output["public_docs_url"] = str(output.get("public_docs_url") or (urls[0] if urls else ""))
+    output["source_validation_status"] = "public_url_present" if urls else "source_unverified"
+    output["discovered_by"] = "openai_responses_web_search"
+    return output, None
+
+
+def _research_prompt(themes: list[dict[str, str]], known: list[dict[str, Any]], max_results: int) -> str:
+    known_venues = sorted({str(item.get("venue_or_source") or "").strip() for item in known if item.get("venue_or_source")})
+    known_urls = sorted({url for item in known for url in _public_source_urls(item)})
+    schema = {
+        "discoveries": [
+            {
+                "surface_type_raw": "free-form market type",
+                "venue_or_source": "official venue/source name",
+                "country": "country",
+                "region": "region",
+                "asset_or_event": "specific new assets, instruments, or events",
+                "data_access_type": "public_no_key|public_key_required|broker_account|paid_data|unknown",
+                "tradability_guess": "directly_tradable|route_needed|watch_only|unknown",
+                "public_docs_url": "https://official-or-authoritative-source",
+                "source_urls": ["https://source"],
+                "why_interesting": "evidence-based reason",
+                "inefficiency_hypothesis": "paper-testable hypothesis",
+                "latency_sensitivity": "low|medium|high|unknown",
+                "liquidity_hint": "what the source indicates",
+                "route_blockers": ["unknown or documented blockers"],
+                "priority": 1,
+                "confidence": 0.0,
+            }
+        ],
+        "follow_up_queries": ["new research direction grounded in a source found this run"],
+        "search_notes": "brief description of searches performed",
+    }
+    return (
+        "Use web search to discover genuinely new public market surfaces. Do not repeat the known catalog, "
+        "do not merely rewrite the assigned themes, and do not rely on memory without a source. Search official "
+        "venue/exchange/API pages first; authoritative public registries or notices are acceptable when official "
+        "API docs do not exist. Unknown market types are welcome. Every discovery must name specific assets or "
+        "instruments and include at least one public HTTP source URL. Return no more than "
+        f"{max_results} discoveries as exactly one JSON object matching this shape:\n{json.dumps(schema, sort_keys=True)}\n\n"
+        f"Research themes for this cycle:\n{json.dumps(themes, sort_keys=True)}\n\n"
+        f"Known venues/sources to avoid repeating:\n{json.dumps(known_venues[-250:], sort_keys=True)}\n\n"
+        f"Known source URLs to avoid repeating:\n{json.dumps(known_urls[-250:], sort_keys=True)}"
+    )
+
+
+def _append_research_journal(entry: dict[str, Any]) -> None:
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    with _journal_path().open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def _decode_research_json(text: str) -> dict[str, Any] | None:
+    value = str(text or "").strip()
+    if value.startswith("```json") and value.endswith("```"):
+        value = value[7:-3].strip()
+    elif value.startswith("```") and value.endswith("```"):
+        value = value[3:-3].strip()
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        parsed = None
+        for index, char in enumerate(value):
+            if char != "{":
+                continue
+            try:
+                candidate, _end = decoder.raw_decode(value[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                parsed = candidate
+                break
+    return parsed if isinstance(parsed, dict) else None
+
+
+def run_continuous_web_discovery(
+    settings: dict[str, Any],
+    known_candidates: list[dict[str, Any]],
+    *,
+    model_complete: Callable[..., ModelResult] = complete,
+) -> dict[str, Any]:
+    cfg = settings.get("research_worker", {})
+    if not bool(cfg.get("web_research_enabled", False)):
+        return {"status": "disabled", "candidates": [], "selected_themes": [], "rejected": []}
+
+    state = _load_frontier_state()
+    themes = _select_discovery_themes(state, cfg)
+    max_results = max(1, int(cfg.get("max_web_discoveries_per_cycle", 8)))
+    prompt = _research_prompt(themes, known_candidates, max_results)
+    result = model_complete(
+        "global_research_worker",
+        prompt,
+        system=(
+            "You are a global market-discovery researcher. Search broadly across countries and asset classes. "
+            "Evidence and novelty matter more than familiarity. Return exactly one JSON object."
+        ),
+        tier_override=str(cfg.get("model_tier") or "fast"),
+        operation="global_market_discovery_web_search",
+        reasoning_effort_override=str(cfg.get("reasoning_effort") or "low"),
+        structured_json=False,
+        max_output_tokens_override=int(cfg.get("max_output_tokens", 5000)),
+        timeout_seconds_override=float(cfg.get("timeout_seconds", 120)),
+        tools=[{"type": "web_search"}],
+    )
+    now = _utc_now()
+    status = "ok" if str(result.status).startswith("model_call:") else str(result.status)
+    payload: dict[str, Any] = {}
+    if status == "ok":
+        decoded = _decode_research_json(result.text)
+        if decoded is None:
+            status = "invalid_model_json"
+        else:
+            payload = decoded
+
+    known_ids = {str(item.get("candidate_id") or _candidate_id(item)) for item in known_candidates}
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    if status == "ok":
+        for raw in payload.get("discoveries", [])[:max_results]:
+            validated, reason = _validate_discovered_item(raw, cfg)
+            if validated is None:
+                rejected.append({"reason": reason, "item": raw})
+                continue
+            validated["research_query_ids"] = [theme["theme_id"] for theme in themes]
+            candidate = normalize_market_candidate(validated, created_at=now)
+            if candidate["candidate_id"] in known_ids:
+                rejected.append({"reason": "known_candidate", "candidate_id": candidate["candidate_id"]})
+                continue
+            accepted.append(candidate)
+            known_ids.add(candidate["candidate_id"])
+
+    theme_state = state.setdefault("themes", {})
+    for theme in themes:
+        saved = theme_state.setdefault(theme["theme_id"], {})
+        saved.update(
+            {
+                "query": theme["query"],
+                "region": theme["region"],
+                "surface": theme["surface"],
+                "last_searched_at": now,
+                "attempts": int(saved.get("attempts") or 0) + 1,
+                "last_status": status,
+                "last_new_candidates": len(accepted),
+            }
+        )
+    existing_followups = {
+        str(item.get("theme_id") or ""): item
+        for item in state.get("follow_up_queries", [])
+        if isinstance(item, dict)
+    }
+    for query in payload.get("follow_up_queries", [])[:12] if isinstance(payload, dict) else []:
+        query_text = str(query or "").strip()
+        if not query_text:
+            continue
+        followup_id = _theme_id(query_text)
+        existing_followups.setdefault(
+            followup_id,
+            {"theme_id": followup_id, "query": query_text, "created_at": now, "region": "Global follow-up"},
+        )
+    state["follow_up_queries"] = list(existing_followups.values())[-250:]
+    state["total_search_cycles"] = int(state.get("total_search_cycles") or 0) + 1
+    state["total_new_candidates"] = int(state.get("total_new_candidates") or 0) + len(accepted)
+    _save_frontier_state(state)
+
+    journal = {
+        "searched_at": now,
+        "status": status,
+        "themes": themes,
+        "new_candidate_ids": [item["candidate_id"] for item in accepted],
+        "rejected_counts": {
+            reason: sum(1 for item in rejected if item.get("reason") == reason)
+            for reason in sorted({str(item.get("reason")) for item in rejected})
+        },
+        "follow_up_query_count": len(payload.get("follow_up_queries", [])) if isinstance(payload, dict) else 0,
+        "model": result.model_name,
+        "model_tier": result.model_tier,
+        "model_status": result.status,
+        "estimated_cost_usd": result.estimated_cost_usd,
+    }
+    _append_research_journal(journal)
+    return {
+        "status": status,
+        "candidates": accepted,
+        "selected_themes": themes,
+        "rejected": rejected,
+        "follow_up_queries": payload.get("follow_up_queries", []) if isinstance(payload, dict) else [],
+        "model": result.model_name,
+        "model_tier": result.model_tier,
+        "model_status": result.status,
+        "estimated_cost_usd": result.estimated_cost_usd,
+        "journal": str(_journal_path()),
+        "frontier": str(_frontier_path()),
+    }
+
+
 def evidence_bundle(source_url: str, claim: str, market_relevance: str, suggested_validation: str) -> dict[str, Any]:
     return {
         "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -847,18 +1223,33 @@ def _classify_surface(raw: str) -> str:
 
 
 def _normalize_next_action(item: dict[str, Any]) -> str:
+    return _normalize_next_actions(item)[0]
+
+
+def _normalize_next_actions(item: dict[str, Any]) -> list[str]:
+    actions: list[str] = []
+    configured_many = item.get("recommended_next_actions")
+    if isinstance(configured_many, list):
+        actions.extend(str(action).strip() for action in configured_many if str(action).strip() in NEXT_ACTIONS)
     configured = str(item.get("recommended_next_action") or "").strip()
-    if configured in NEXT_ACTIONS:
-        return configured
+    if configured in NEXT_ACTIONS and configured not in actions:
+        actions.append(configured)
     data_access = str(item.get("data_access_type") or "unknown")
     tradability = str(item.get("tradability_guess") or "unknown")
-    if data_access == "public_no_key" and tradability in {"directly_tradable", "route_needed"}:
-        return "adapter_spec"
-    if data_access in {"broker_account", "public_key_required", "paid_data"} or tradability == "route_needed":
-        return "route_probe"
-    if int(item.get("priority") or 0) >= 70:
-        return "growth_experiment"
-    return "watchlist"
+    route_blockers = item.get("route_blockers") or []
+    if data_access in {"public_no_key", "public_key_required"} and "adapter_spec" not in actions:
+        actions.append("adapter_spec")
+    if (
+        data_access in {"broker_account", "public_key_required", "paid_data"}
+        or tradability == "route_needed"
+        or bool(route_blockers)
+    ) and "route_probe" not in actions:
+        actions.append("route_probe")
+    if int(item.get("priority") or 0) >= 70 and not actions:
+        actions.append("growth_experiment")
+    if not actions:
+        actions.append("watchlist")
+    return actions
 
 
 def normalize_market_candidate(seed: dict[str, Any], *, created_at: str | None = None) -> dict[str, Any]:
@@ -882,15 +1273,20 @@ def normalize_market_candidate(seed: dict[str, Any], *, created_at: str | None =
         "liquidity_hint": str(seed.get("liquidity_hint") or "unknown"),
         "route_blockers": [str(item) for item in seed.get("route_blockers", [])],
         "recommended_next_action": str(seed.get("recommended_next_action") or ""),
+        "recommended_next_actions": list(seed.get("recommended_next_actions") or []),
         "priority": max(1, min(100, int(seed.get("priority") or 50))),
         "confidence": round(max(0.0, min(1.0, float(seed.get("confidence") or 0.5))), 3),
+        "source_validation_status": str(seed.get("source_validation_status") or "seed_or_configured_source"),
+        "discovered_by": str(seed.get("discovered_by") or "configured_seed"),
+        "research_query_ids": [str(item) for item in seed.get("research_query_ids", [])],
         "created_at": created,
     }
     if candidate["data_access_type"] not in DATA_ACCESS_TYPES:
         candidate["data_access_type"] = "unknown"
     if candidate["tradability_guess"] not in TRADABILITY_GUESSES:
         candidate["tradability_guess"] = "unknown"
-    candidate["recommended_next_action"] = _normalize_next_action(candidate)
+    candidate["recommended_next_actions"] = _normalize_next_actions(candidate)
+    candidate["recommended_next_action"] = candidate["recommended_next_actions"][0]
     candidate["candidate_id"] = _candidate_id(candidate)
     return candidate
 
@@ -901,12 +1297,18 @@ def _settings_seeds(settings: dict[str, Any]) -> list[dict[str, Any]]:
     return seeds if isinstance(seeds, list) else []
 
 
-def discover_market_candidates(settings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def discover_market_candidates(
+    settings: dict[str, Any] | None = None,
+    *,
+    discovered_candidates: list[dict[str, Any]] | None = None,
+    include_bootstrap: bool = True,
+) -> list[dict[str, Any]]:
     settings = settings or {}
     cfg = settings.get("research_worker", {})
     if not cfg.get("global_market_discovery", True):
         return []
-    seeds = [*DEFAULT_GLOBAL_DISCOVERY_SEEDS, *_settings_seeds(settings)]
+    seeds = [*DEFAULT_GLOBAL_DISCOVERY_SEEDS, *_settings_seeds(settings)] if include_bootstrap else []
+    seeds.extend(discovered_candidates or [])
     created_at = _utc_now()
     candidates = [normalize_market_candidate(seed, created_at=created_at) for seed in seeds]
     candidates.sort(key=lambda row: (int(row.get("priority") or 0), float(row.get("confidence") or 0)), reverse=True)
@@ -929,10 +1331,11 @@ def _existing_candidate_ids(path: pathlib.Path) -> set[str]:
     return ids
 
 
-def _append_new_candidates(candidates: Iterable[dict[str, Any]]) -> dict[str, int]:
+def _append_new_candidates(candidates: Iterable[dict[str, Any]]) -> dict[str, Any]:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     existing = _existing_candidate_ids(CANDIDATES_JSONL)
     appended = 0
+    new_candidate_ids: list[str] = []
     with CANDIDATES_JSONL.open("a", encoding="utf-8") as handle:
         for candidate in candidates:
             if candidate["candidate_id"] in existing:
@@ -940,7 +1343,8 @@ def _append_new_candidates(candidates: Iterable[dict[str, Any]]) -> dict[str, in
             handle.write(json.dumps(candidate, sort_keys=True) + "\n")
             existing.add(candidate["candidate_id"])
             appended += 1
-    return {"total_known": len(existing), "new_appended": appended}
+            new_candidate_ids.append(str(candidate["candidate_id"]))
+    return {"total_known": len(existing), "new_appended": appended, "new_candidate_ids": new_candidate_ids}
 
 
 def _source_evidence(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -958,147 +1362,119 @@ def _source_evidence(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _implemented_global_discovery_markers(conn: sqlite3.Connection) -> dict[str, set[str]]:
-    markers = {
-        "market_keys": set(),
-        "text": set(),
-        "default_venues": {
-            str(seed.get("venue_or_source") or "").strip().lower()
-            for seed in DEFAULT_GLOBAL_DISCOVERY_SEEDS
-            if str(seed.get("venue_or_source") or "").strip()
-        },
-        "scan_implemented": set(),
-    }
-    for table in ("adapter_specs", "route_probe_tasks", "market_hunter_directives"):
-        try:
-            rows = conn.execute(
-                f"select market_key from {table} where status = ? and market_key like 'global_discovery|%'",
-                (IMPLEMENTED_GLOBAL_DISCOVERY_STATUS,),
-            ).fetchall()
-        except sqlite3.Error:
-            rows = []
-        markers["market_keys"].update(str(row["market_key"]).lower() for row in rows if row["market_key"])
-    try:
-        rows = conn.execute(
-            """
-            select hypothesis
-            from growth_experiments
-            where status = ?
-              and signal_key like 'global_discovery|%'
-            """,
-            (IMPLEMENTED_GLOBAL_DISCOVERY_STATUS,),
-        ).fetchall()
-    except sqlite3.Error:
-        rows = []
-    markers["text"].update(str(row["hypothesis"]).lower() for row in rows if row["hypothesis"])
-    if markers["market_keys"] or markers["text"]:
-        markers["scan_implemented"].add("true")
-    return markers
-
-
-def _global_discovery_candidate_implemented(candidate: dict[str, Any], markers: dict[str, set[str]]) -> bool:
-    venue = str(candidate.get("venue_or_source") or "").strip()
-    if not venue:
-        return False
-    market_key = f"global_discovery|{venue}".lower()
-    if market_key in markers["market_keys"]:
-        return True
-    venue_text = venue.lower()
-    if markers.get("scan_implemented") and venue_text in markers.get("default_venues", set()):
-        return True
-    return any(venue_text and venue_text in text for text in markers["text"])
-
-
 def create_downstream_artifacts(conn: sqlite3.Connection, candidates: list[dict[str, Any]], settings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     cfg = (settings or {}).get("research_worker", {})
     priority_floor = int(cfg.get("artifact_priority_floor", 70))
     max_artifacts = int(cfg.get("max_artifacts_per_run", 20))
-    suppress_implemented = bool(cfg.get("suppress_implemented_global_discovery_artifacts", True))
-    implemented_markers = _implemented_global_discovery_markers(conn) if suppress_implemented else {"market_keys": set(), "text": set()}
     created: list[dict[str, Any]] = []
     for candidate in candidates:
         if len(created) >= max_artifacts:
             break
         if int(candidate.get("priority") or 0) < priority_floor:
             continue
-        action = candidate.get("recommended_next_action")
         market_key = f"global_discovery|{candidate['venue_or_source']}"
         source_id = f"research:{candidate['candidate_id']}"
         evidence = _source_evidence(candidate)
-        created_item: dict[str, Any] | None = None
-        if suppress_implemented and _global_discovery_candidate_implemented(candidate, implemented_markers):
-            created.append(
-                {
-                    "type": action,
-                    "inserted": False,
-                    "skipped": True,
-                    "skip_reason": "global_market_discovery_scan_already_implemented",
-                    "candidate_id": candidate["candidate_id"],
-                    "venue_or_source": candidate["venue_or_source"],
-                    "recommended_next_action": action,
+        actions = _normalize_next_actions(candidate)
+        for action in actions:
+            if len(created) >= max_artifacts:
+                break
+            created_item: dict[str, Any] | None = None
+            if action == "adapter_spec":
+                inserted = add_adapter_spec(
+                    conn,
+                    source_id,
+                    market_key,
+                    int(candidate["priority"]),
+                    f"Global discovery adapter: {candidate['venue_or_source']} - {candidate['asset_or_event']}",
+                    {
+                        "candidate": candidate,
+                        "paper_only": True,
+                        "lifecycle": "data_adapter_only",
+                        "runtime_activation_requires": "sandbox tests, scanner integration, and observed data health",
+                    },
+                    evidence,
+                )
+                created_item = {"type": "adapter_spec", "inserted": inserted}
+            elif action == "route_probe":
+                route_evidence = {
+                    **evidence,
+                    "lifecycle": "route_verification_independent_of_adapter",
+                    "resolution_rule": "Remain open until route requirements are confirmed, rejected, or explicitly waived.",
                 }
-            )
-            continue
-        if action == "adapter_spec":
-            inserted = add_adapter_spec(
-                conn,
-                source_id,
-                market_key,
-                int(candidate["priority"]),
-                f"Global discovery adapter: {candidate['venue_or_source']}",
-                {
-                    "candidate": candidate,
-                    "paper_only": True,
-                    "runtime_activation_requires": "sandbox tests and scanner integration",
-                },
-                evidence,
-            )
-            created_item = {"type": "adapter_spec", "inserted": inserted}
-        elif action == "route_probe":
-            inserted = add_route_probe_task(
-                conn,
-                source_id,
-                market_key,
-                f"route|{candidate['venue_or_source']}",
-                int(candidate["priority"]),
-                "global_market_route_feasibility",
-                f"Determine tradability and route requirements for {candidate['venue_or_source']}.",
-                evidence,
-            )
-            created_item = {"type": "route_probe_task", "inserted": inserted}
-        elif action == "growth_experiment":
-            add_growth_experiment(
-                conn,
-                int(candidate["priority"]),
-                f"global_discovery|{candidate['surface_type_classified']}",
-                f"Explore {candidate['venue_or_source']} {candidate['asset_or_event']}",
-                "Rank public data quality, route feasibility, and paper-testable proxy edges.",
-                evidence,
-            )
-            created_item = {"type": "growth_experiment", "inserted": True}
-        elif action in {"hunter_directive", "watchlist"}:
-            add_hunter_directive(
-                conn,
-                market_key,
-                "global_market_discovery",
-                int(candidate["priority"]),
-                candidate.get("why_interesting") or "Global discovery candidate needs exploration slots.",
-                evidence,
-            )
-            created_item = {"type": "market_hunter_directive", "inserted": True}
-        if created_item:
-            created.append(
-                {
-                    **created_item,
-                    "candidate_id": candidate["candidate_id"],
-                    "venue_or_source": candidate["venue_or_source"],
-                    "recommended_next_action": action,
-                }
-            )
+                inserted = add_route_probe_task(
+                    conn,
+                    source_id,
+                    market_key,
+                    f"route|{candidate['venue_or_source']}|{candidate['asset_or_event']}",
+                    int(candidate["priority"]),
+                    "global_market_route_feasibility",
+                    f"Verify tradability and route requirements for {candidate['venue_or_source']} {candidate['asset_or_event']}.",
+                    route_evidence,
+                )
+                created_item = {"type": "route_probe_task", "inserted": inserted}
+            elif action == "growth_experiment":
+                before = conn.total_changes
+                add_growth_experiment(
+                    conn,
+                    int(candidate["priority"]),
+                    f"global_discovery|{candidate['surface_type_classified']}",
+                    f"Explore {candidate['venue_or_source']} {candidate['asset_or_event']}",
+                    "Rank public data quality, route feasibility, and paper-testable edges without treating discovery as route approval.",
+                    evidence,
+                )
+                created_item = {"type": "growth_experiment", "inserted": conn.total_changes > before}
+            elif action in {"hunter_directive", "watchlist"}:
+                before = conn.total_changes
+                add_hunter_directive(
+                    conn,
+                    market_key,
+                    "global_market_discovery",
+                    int(candidate["priority"]),
+                    candidate.get("why_interesting") or "Global discovery candidate needs exploration slots.",
+                    evidence,
+                )
+                created_item = {"type": "market_hunter_directive", "inserted": conn.total_changes > before}
+            if created_item:
+                created.append(
+                    {
+                        **created_item,
+                        "candidate_id": candidate["candidate_id"],
+                        "venue_or_source": candidate["venue_or_source"],
+                        "recommended_next_action": action,
+                        "recommended_next_actions": actions,
+                    }
+                )
     return created
 
 
-def _summary(candidates: list[dict[str, Any]], artifacts: list[dict[str, Any]], ledger: dict[str, int]) -> dict[str, Any]:
+def reconcile_discovery_route_lifecycle(conn: sqlite3.Connection) -> dict[str, int]:
+    """Undo legacy route completion caused only by discovering a market surface."""
+
+    reopened = conn.execute(
+        """
+        update route_probe_tasks
+        set status = 'open'
+        where status = ?
+          and (source_recommendation_id like 'research:%' or market_key like 'global_discovery|%')
+        """,
+        (IMPLEMENTED_GLOBAL_DISCOVERY_STATUS,),
+    ).rowcount
+    conn.commit()
+    open_count = int(
+        conn.execute(
+            "select count(*) from route_probe_tasks where status = 'open' and market_key like 'global_discovery|%'"
+        ).fetchone()[0]
+    )
+    return {"reopened_legacy_route_probes": int(reopened), "open_global_route_probes": open_count}
+
+
+def _summary(
+    candidates: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+    ledger: dict[str, Any],
+    web_discovery: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     by_surface: dict[str, int] = {}
     by_region: dict[str, int] = {}
     by_action: dict[str, int] = {}
@@ -1106,7 +1482,8 @@ def _summary(candidates: list[dict[str, Any]], artifacts: list[dict[str, Any]], 
     for candidate in candidates:
         by_surface[candidate["surface_type_classified"]] = by_surface.get(candidate["surface_type_classified"], 0) + 1
         by_region[candidate["region"]] = by_region.get(candidate["region"], 0) + 1
-        by_action[candidate["recommended_next_action"]] = by_action.get(candidate["recommended_next_action"], 0) + 1
+        for action in candidate.get("recommended_next_actions", [candidate["recommended_next_action"]]):
+            by_action[action] = by_action.get(action, 0) + 1
         by_data_access[candidate["data_access_type"]] = by_data_access.get(candidate["data_access_type"], 0) + 1
     artifact_counts: dict[str, int] = {}
     inserted_counts: dict[str, int] = {}
@@ -1124,6 +1501,14 @@ def _summary(candidates: list[dict[str, Any]], artifacts: list[dict[str, Any]], 
         "by_data_access_type": by_data_access,
         "artifact_counts": artifact_counts,
         "inserted_artifact_counts": inserted_counts,
+        "discovery_status": (web_discovery or {}).get("status", "not_run"),
+        "search_themes_run": len((web_discovery or {}).get("selected_themes", [])),
+        "rejected_discovery_count": len((web_discovery or {}).get("rejected", [])),
+        "novelty_rate": round(
+            ledger.get("new_appended", 0)
+            / max(1, ledger.get("new_appended", 0) + len((web_discovery or {}).get("rejected", []))),
+            4,
+        ),
         "top_candidates": [
             {
                 "candidate_id": item["candidate_id"],
@@ -1132,6 +1517,7 @@ def _summary(candidates: list[dict[str, Any]], artifacts: list[dict[str, Any]], 
                 "region": item["region"],
                 "priority": item["priority"],
                 "recommended_next_action": item["recommended_next_action"],
+                "recommended_next_actions": item.get("recommended_next_actions", [item["recommended_next_action"]]),
             }
             for item in candidates[:10]
         ],
@@ -1150,7 +1536,11 @@ def _report_markdown(report: dict[str, Any]) -> str:
         f"- Candidates this run: `{summary.get('candidate_count', 0)}`",
         f"- New candidates appended: `{summary.get('new_candidate_count', 0)}`",
         f"- Total known candidates: `{summary.get('total_known_candidate_count', 0)}`",
+        f"- Continuous discovery status: `{summary.get('discovery_status', 'not_run')}`",
+        f"- Search themes run: `{summary.get('search_themes_run', 0)}`",
+        f"- Source-backed novelty rate: `{summary.get('novelty_rate', 0.0)}`",
         f"- Artifact inserts: `{summary.get('inserted_artifact_counts', {})}`",
+        f"- Route lifecycle: `{report.get('route_lifecycle', {})}`",
         "",
         "## Coverage",
         "",
@@ -1166,8 +1556,15 @@ def _report_markdown(report: dict[str, Any]) -> str:
         lines.append(
             f"- P{item.get('priority')} `{item.get('venue_or_source')}` "
             f"`{item.get('surface_type_classified')}` `{item.get('region')}` "
-            f"-> `{item.get('recommended_next_action')}`"
+            f"-> `{item.get('recommended_next_actions', [item.get('recommended_next_action')])}`"
         )
+    selected_themes = (report.get("continuous_discovery") or {}).get("selected_themes", [])
+    lines.extend(["", "## Research Frontier", ""])
+    if selected_themes:
+        for theme in selected_themes:
+            lines.append(f"- `{theme.get('region')}` / `{theme.get('surface')}`")
+    else:
+        lines.append("- No web-search theme completed this cycle; see discovery status above.")
     lines.extend(
         [
             "",
@@ -1182,7 +1579,12 @@ def _report_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_once(settings: dict[str, Any] | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+def run_once(
+    settings: dict[str, Any] | None = None,
+    conn: sqlite3.Connection | None = None,
+    *,
+    model_complete: Callable[..., ModelResult] = complete,
+) -> dict[str, Any]:
     settings = settings or {}
     cfg = settings.get("research_worker", {})
     if not cfg.get("enabled", True):
@@ -1200,14 +1602,28 @@ def run_once(settings: dict[str, Any] | None = None, conn: sqlite3.Connection | 
         REPORT_MD.write_text(_report_markdown(report), encoding="utf-8")
         return report
 
-    candidates = discover_market_candidates(settings)
+    known_candidates = _candidate_ledger_rows()
+    web_discovery = run_continuous_web_discovery(
+        settings,
+        known_candidates,
+        model_complete=model_complete,
+    )
+    include_bootstrap = bool(cfg.get("bootstrap_seed_catalog_once", True)) and not known_candidates
+    candidates = discover_market_candidates(
+        settings,
+        discovered_candidates=web_discovery.get("candidates", []),
+        include_bootstrap=include_bootstrap,
+    )
     ledger = _append_new_candidates(candidates)
+    new_ids = set(ledger.get("new_candidate_ids", []))
+    artifact_candidates = [candidate for candidate in candidates if candidate.get("candidate_id") in new_ids]
     owns_conn = conn is None
     if owns_conn:
         conn = connect()
     assert conn is not None
     try:
-        created_artifacts = create_downstream_artifacts(conn, candidates, settings)
+        route_lifecycle = reconcile_discovery_route_lifecycle(conn)
+        created_artifacts = create_downstream_artifacts(conn, artifact_candidates, settings)
     finally:
         if owns_conn:
             conn.close()
@@ -1216,12 +1632,16 @@ def run_once(settings: dict[str, Any] | None = None, conn: sqlite3.Connection | 
         "generated_at": _utc_now(),
         "status": "ok",
         "global_market_discovery": bool(cfg.get("global_market_discovery", True)),
-        "web_research_enabled": bool(cfg.get("web_research_enabled", True)),
-        "tools": ["global_seed_discovery", "official_docs", "public_market_data_portals", "public_news_or_rss_when_configured"],
+        "web_research_enabled": bool(cfg.get("web_research_enabled", False)),
+        "tools": ["openai_responses_web_search", "official_docs", "public_market_data_portals", "public_news_or_rss"],
         "candidate_ledger": str(CANDIDATES_JSONL),
+        "discovery_frontier": str(_frontier_path()),
+        "discovery_journal": str(_journal_path()),
+        "continuous_discovery": web_discovery,
+        "route_lifecycle": route_lifecycle,
         "candidates": candidates,
         "created_artifacts": created_artifacts,
-        "summary": _summary(candidates, created_artifacts, ledger),
+        "summary": _summary(candidates, created_artifacts, ledger, web_discovery),
         "hard_rule": "No discovered market activates live trading, credentials, broker writes, account changes, or real notional.",
     }
     RUNS_DIR.mkdir(parents=True, exist_ok=True)

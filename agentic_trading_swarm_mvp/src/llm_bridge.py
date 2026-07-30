@@ -1483,9 +1483,16 @@ def _compact_global_market_discovery(report: dict | None = None) -> dict:
         "by_region": summary.get("by_region", {}),
         "by_recommended_next_action": summary.get("by_recommended_next_action", {}),
         "inserted_artifact_counts": summary.get("inserted_artifact_counts", {}),
+        "discovery_status": summary.get("discovery_status"),
+        "search_themes_run": summary.get("search_themes_run", 0),
+        "novelty_rate": summary.get("novelty_rate", 0.0),
+        "selected_themes": (report.get("continuous_discovery") or {}).get("selected_themes", [])[:5],
+        "route_lifecycle": report.get("route_lifecycle", {}),
         "top_candidates": summary.get("top_candidates", [])[:10],
         "report": str(RUNS_DIR / "research_worker_report.md"),
         "candidate_ledger": str(RUNS_DIR / "market_discovery_candidates.jsonl"),
+        "discovery_frontier": str(RUNS_DIR / "research_discovery_frontier.json"),
+        "discovery_journal": str(RUNS_DIR / "research_discovery_journal.jsonl"),
     }
 
 

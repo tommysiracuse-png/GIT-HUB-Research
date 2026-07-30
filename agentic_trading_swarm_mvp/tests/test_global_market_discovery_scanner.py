@@ -47,6 +47,49 @@ def fake_chart(symbol: str, *args: object, **kwargs: object) -> dict:
 
 
 class GlobalMarketDiscoveryScannerTests(unittest.TestCase):
+    def test_latest_report_does_not_hide_durable_discovery_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_report = scanner.RESEARCH_REPORT_JSON
+            old_ledger = scanner.DISCOVERY_JSONL
+            try:
+                scanner.RESEARCH_REPORT_JSON = pathlib.Path(tmp) / "research_worker_latest.json"
+                scanner.DISCOVERY_JSONL = pathlib.Path(tmp) / "market_discovery_candidates.jsonl"
+                recent = scanner.normalize_market_candidate(
+                    {
+                        "surface_type_raw": "new exchange",
+                        "venue_or_source": "Recent Exchange",
+                        "asset_or_event": "recent asset",
+                        "priority": 90,
+                        "discovered_by": "openai_responses_web_search",
+                    }
+                )
+                older = scanner.normalize_market_candidate(
+                    {
+                        "surface_type_raw": "older exchange",
+                        "venue_or_source": "Older Exchange",
+                        "asset_or_event": "older asset",
+                        "priority": 88,
+                    }
+                )
+                scanner.RESEARCH_REPORT_JSON.write_text(json.dumps({"candidates": [recent]}), encoding="utf-8")
+                scanner.DISCOVERY_JSONL.write_text(json.dumps(older) + "\n", encoding="utf-8")
+
+                loaded = scanner.load_discovery_candidates(
+                    {
+                        "global_market_discovery_scanner": {
+                            "merge_default_seeds": False,
+                            "min_discovery_priority": 1,
+                            "max_surfaces_per_cycle": 10,
+                            "recent_discovery_rotation_slots": 2,
+                        }
+                    }
+                )
+
+                self.assertEqual({item["venue_or_source"] for item in loaded}, {"Recent Exchange", "Older Exchange"})
+            finally:
+                scanner.RESEARCH_REPORT_JSON = old_report
+                scanner.DISCOVERY_JSONL = old_ledger
+
     def test_default_proxy_map_covers_broader_global_surfaces(self) -> None:
         expected = {
             "London Stock Exchange",
