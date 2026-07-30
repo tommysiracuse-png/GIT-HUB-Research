@@ -109,7 +109,7 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
                 "inst_id": str(opportunity.get("inst_id") or opportunity.get("instrument") or UNKNOWN),
                 "venue": _venue(opportunity),
                 "direction": str(opportunity.get("direction") or UNKNOWN),
-                "route_status": str(opportunity.get("route_status") or UNKNOWN),
+                "route_status": _paper_route_status(opportunity),
                 "route_blockers": _route_blockers(opportunity),
                 "quality_action": str(opportunity.get("quality_action") or UNKNOWN),
                 "edge_bps_estimate": _first_known(
@@ -294,21 +294,21 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
     blockers = _route_blockers(opportunity)
     venue = _venue(opportunity)
     inst_id = str(opportunity.get("inst_id") or UNKNOWN)
-    borrow_required = "spot_borrow" in blockers
-    account_requirements = _account_requirements(blockers)
+    requirement_flags = list(blockers)
+    if _requires_frontier_spot_short_route(opportunity) and "spot_borrow" not in requirement_flags:
+        requirement_flags.append("spot_borrow")
+    borrow_required = "spot_borrow" in requirement_flags
+    account_requirements = _account_requirements(requirement_flags)
+    route_status = _paper_route_status(opportunity, blockers=blockers)
 
     return {
         "venue": venue,
         "inst_id": inst_id,
         "direction": str(opportunity.get("direction") or UNKNOWN),
-        "route_status": (
-            "blocked_until_requirements_confirmed"
-            if blockers
-            else "paper_observation_only"
-        ),
+        "route_status": route_status,
         "route_blockers": blockers,
         "required_account_type": "; ".join(account_requirements) if account_requirements else UNKNOWN,
-        "required_permissions": _required_permissions(blockers),
+        "required_permissions": _required_permissions(requirement_flags),
         "borrow_required": borrow_required,
         "borrow_asset": _borrow_asset(inst_id) if borrow_required else "not_applicable",
         "borrow_fee_bps_estimate_or_unknown": _first_known(
@@ -346,16 +346,121 @@ def _route_priority_key(row: dict[str, Any]) -> tuple[int, int, str]:
     return (3, 0, inst_id)
 
 
+def _paper_route_status(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+) -> str:
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    if _unconfirmed_frontier_spot_short_route(opportunity):
+        return "unsupported_or_unknown"
+    if blockers:
+        return "blocked_until_requirements_confirmed"
+    return "paper_observation_only"
+
+
+def _unconfirmed_frontier_spot_short_route(opportunity: dict[str, Any]) -> bool:
+    if not _requires_frontier_spot_short_route(opportunity):
+        return False
+    return not _frontier_spot_short_capability_confirmed(opportunity)
+
+
+def _requires_frontier_spot_short_route(opportunity: dict[str, Any]) -> bool:
+    market_key = str(
+        _first_known(
+            opportunity,
+            "market_key",
+            "scanner_key",
+            "strategy_profile",
+            "profile",
+            "route_family",
+            "thesis_type",
+        )
+        or ""
+    ).lower()
+    if "frontier" not in market_key:
+        return False
+    direction = str(_first_known(opportunity, "direction", "side") or "").lower()
+    profile = str(
+        _first_known(
+            opportunity,
+            "strategy_profile",
+            "profile",
+            "route_profile",
+            "execution_route",
+        )
+        or ""
+    ).lower()
+    requires_short = (
+        direction.startswith("short")
+        or "spot_short" in profile
+        or "conditional_spot_short" in profile
+    )
+    if not requires_short:
+        return False
+    instrument_type = str(
+        _first_known(
+            opportunity,
+            "instrument_type",
+            "market_type",
+            "product_type",
+            "contract_type",
+        )
+        or ""
+    ).lower()
+    if any(tag in instrument_type for tag in ("perp", "perpetual", "swap", "future", "option", "inverse")):
+        return False
+    return True
+
+
+def _frontier_spot_short_capability_confirmed(opportunity: dict[str, Any]) -> bool:
+    combined = _bool_flag(
+        _first_known(
+            opportunity,
+            "margin_plus_borrow_supported",
+            "spot_short_supported",
+            "conditional_spot_short_supported",
+        )
+    )
+    if combined is True:
+        return True
+    margin_supported = _bool_flag(_first_known(opportunity, "margin_supported", "spot_margin_supported", "route_margin_supported"))
+    borrow_supported = _bool_flag(_first_known(opportunity, "borrow_supported", "spot_borrow_supported", "route_borrow_supported"))
+    return margin_supported is True and borrow_supported is True
+
+
+def _bool_flag(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if not text or text == UNKNOWN:
+        return None
+    if text in {"1", "true", "yes", "y", "supported", "confirmed"}:
+        return True
+    if text in {"0", "false", "no", "n", "unsupported", "blocked"}:
+        return False
+    return None
+
+
 def _route_blockers(opportunity: dict[str, Any]) -> list[str]:
     blockers = opportunity.get("route_blockers") or []
     if isinstance(blockers, str):
         blockers = [blockers]
-    return list(dict.fromkeys(str(blocker) for blocker in blockers if blocker))
+    normalized = list(dict.fromkeys(str(blocker) for blocker in blockers if blocker))
+    if _unconfirmed_frontier_spot_short_route(opportunity) and "spot_borrow" not in normalized:
+        normalized.append("spot_borrow")
+    return normalized
 
 
 def _conditional_paper_policy_action(opportunity: dict[str, Any]) -> str:
     guard = _conditional_decay_flip_guard(opportunity)
     if not guard:
+        if _unconfirmed_frontier_spot_short_route(opportunity):
+            if str(opportunity.get("route_status") or "").lower() in {"blocked", "unsupported_or_unknown"}:
+                return "reject_candidate_paper_only"
+            return "apply_severe_ranking_penalty_paper_only"
         return "none"
     return str(guard.get("policy_action") or "none")
 
@@ -457,6 +562,8 @@ def _conditional_gate_reasons(opportunity: dict[str, Any]) -> list[str]:
         anomalies = [anomalies]
     anomaly_set = {str(item) for item in anomalies}
     reasons: list[str] = []
+    if _unconfirmed_frontier_spot_short_route(opportunity):
+        reasons.append("unsupported_or_unknown_frontier_spot_short_route")
     if route_status == "conditional" and ("spot_borrow" in blockers or direction.startswith("short")):
         reasons.append("unconfirmed_short_or_borrow_route")
     if quality_action == "shadow_only" or anomaly_set.intersection({"empty_book", "crossed_book", "one_sided_book"}):
