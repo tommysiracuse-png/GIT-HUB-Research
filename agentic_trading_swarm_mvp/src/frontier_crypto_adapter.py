@@ -65,6 +65,7 @@ _PAPER_ONLY_PREMARKET_LIQUIDITY_DEFAULTS = {
 _PAPER_ONLY_ROUTE_GUARD_MIN_LIQUIDITY_FLAG = "paper_route_guard_min_liquidity_v1"
 _PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG = "paper_route_guard_short_frontier_spot_v1"
 _PAPER_ONLY_ENFORCED_ROUTE_RESOLUTION_FLAG = "paper_only_enforced_route_resolution_v1"
+_PAPER_ONLY_SPREAD_VOLATILITY_GATE_FLAG = "paper_only_spread_volatility_gate_v1"
 
 
 def _paper_only_route_review_text(value):
@@ -83,6 +84,53 @@ def _paper_only_route_review_bool(value):
     if text in {"0", "false", "no", "n", "off", "disabled", "deny", "denied", "blocked", "unsupported"}:
         return False
     return None
+
+
+def _paper_only_route_review_float(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _paper_only_spread_volatility_gate(config, spread_bps=None, volatility_pct=None):
+    """Paper-only gate that requires both spread and volatility to be acceptable."""
+    if not isinstance(config, dict):
+        return {"enabled": False, "spread_pass": True, "volatility_pass": True, "pass": True}
+    enabled = _paper_only_route_guard_short_frontier_spot_enabled(config)
+    direct_flag = _paper_only_route_review_bool(config.get(_PAPER_ONLY_SPREAD_VOLATILITY_GATE_FLAG))
+    if direct_flag is not None:
+        enabled = direct_flag
+    feature_flags = config.get("feature_flags")
+    if isinstance(feature_flags, dict):
+        nested_flag = _paper_only_route_review_bool(feature_flags.get(_PAPER_ONLY_SPREAD_VOLATILITY_GATE_FLAG))
+        if nested_flag is not None:
+            enabled = nested_flag
+    spread_cap = _paper_only_route_review_float(config.get("spread_bps_max"))
+    if spread_cap is None and isinstance(feature_flags, dict):
+        spread_cap = _paper_only_route_review_float(feature_flags.get("spread_bps_max"))
+    volatility_cap = _paper_only_route_review_float(config.get("volatility_pct_max"))
+    if volatility_cap is None and isinstance(feature_flags, dict):
+        volatility_cap = _paper_only_route_review_float(feature_flags.get("volatility_pct_max"))
+    spread_pass = True if spread_bps is None or spread_cap is None else float(spread_bps) <= float(spread_cap)
+    volatility_pass = True if volatility_pct is None or volatility_cap is None else float(volatility_pct) <= float(volatility_cap)
+    return {
+        "enabled": bool(enabled),
+        "spread_pass": bool(spread_pass),
+        "volatility_pass": bool(volatility_pass),
+        "pass": bool((not enabled) or (spread_pass and volatility_pass)),
+        "spread_bps_max": spread_cap,
+        "volatility_pct_max": volatility_cap,
+    }
 
 
 def _paper_only_route_guard_short_frontier_spot_enabled(config):
