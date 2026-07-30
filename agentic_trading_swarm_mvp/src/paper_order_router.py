@@ -304,6 +304,10 @@ def _apply_route_feasibility_metadata(candidate: Mapping[str, Any]) -> dict[str,
     annotated["paper_allocation_multiplier"] = record["paper_allocation_multiplier"]
     if record.get("proxy_route"):
         annotated["paper_proxy_route"] = record["proxy_route"]
+    cell = _paper_signal_cell(annotated)
+    if cell:
+        annotated["paper_signal_cell"] = cell
+        annotated["paper_signal_cell_key"] = cell.get("cell_key")
     return annotated
 
 
@@ -355,6 +359,10 @@ def _candidate_reference(candidate: Mapping[str, Any]) -> dict[str, Any]:
     for field in ("inst_id", "instrument_id", "symbol", "venue", "signal_key", "trade_type", "market_surface"):
         if candidate.get(field) not in (None, ""):
             reference[field] = candidate.get(field)
+    cell = _paper_signal_cell(candidate)
+    if cell:
+        reference["paper_signal_cell_key"] = cell.get("cell_key")
+        reference["paper_signal_cell"] = cell
     return reference
 
 
@@ -371,6 +379,21 @@ def _paper_family_quarantine_reason(
         return _paper_family_quarantine_record(candidate, config=config)
     except Exception:
         return None
+
+
+def _paper_signal_cell(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    try:
+        from strategy_reliability import paper_signal_cell as _paper_signal_cell_record
+    except Exception:
+        return None
+
+    try:
+        record = _paper_signal_cell_record(candidate)
+    except Exception:
+        return None
+    if isinstance(record, Mapping):
+        return dict(record)
+    return None
 
 
 def frontier_shadow_filter_reason(
@@ -458,6 +481,7 @@ def frontier_shadow_filter_reason(
         "paper_fill_allowed": False,
         "guard": "frontier_cost_or_quality_shadow_guard",
         "candidate": _candidate_reference(candidate),
+        "cell": _paper_signal_cell(candidate),
         "checks": checks,
     }
 

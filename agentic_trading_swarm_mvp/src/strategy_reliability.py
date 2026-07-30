@@ -130,6 +130,169 @@ COVERED_GROWTH_EXPERIMENT_IDS = [
     463,
 ]
 
+PAPER_CELL_SCOPE_FLAG_KEYS = (
+    "paper_cell_policy",
+    "paper_only_cell_policy",
+    "strategy_reliability_cell_policy",
+)
+PAPER_CELL_SCOPE_SCOPES = (
+    "paper",
+    "paper_policy",
+    "strategy_reliability",
+)
+
+
+def _paper_cell_text(value: Any, default: str = "unknown") -> str:
+    text = str(value or "").strip()
+    return text or default
+
+
+def _paper_cell_direction(candidate: dict[str, Any]) -> str:
+    direct = _paper_cell_text(candidate.get("direction"), default="")
+    if direct:
+        return direct.lower()
+    haystack = " ".join(
+        str(candidate.get(field) or "")
+        for field in ("signal_key", "trade_type", "strategy", "variant", "context_key")
+    ).lower()
+    if " short" in f" {haystack} " or haystack.endswith("_short") or "|short|" in haystack:
+        return "short"
+    if " long" in f" {haystack} " or haystack.endswith("_long") or "|long|" in haystack:
+        return "long"
+    return "unknown"
+
+
+def _paper_cell_route_status(candidate: dict[str, Any]) -> str:
+    for container in (
+        candidate,
+        candidate.get("frontier_route_feasibility"),
+        candidate.get("execution_feasibility"),
+        candidate.get("execution_route"),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for field in ("paper_route_status", "route_status", "status", "execution_status"):
+            text = _paper_cell_text(container.get(field), default="")
+            if text:
+                return text.lower().replace("-", "_").replace(" ", "_")
+    return "unknown"
+
+
+def paper_signal_cell(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return a canonical paper-only execution cell for a candidate or trade record."""
+    signal_identity = _paper_cell_text(candidate.get("signal_key"), default="")
+    if not signal_identity:
+        try:
+            signal_identity = _paper_cell_text(signal_key(candidate), default="")
+        except Exception:
+            signal_identity = ""
+
+    strategy = _paper_cell_text(candidate.get("strategy") or candidate.get("strategy_id"))
+    variant = _paper_cell_text(candidate.get("variant") or candidate.get("variant_id"))
+    venue = _paper_cell_text(candidate.get("venue")).upper()
+    direction = _paper_cell_direction(candidate)
+    route_status = _paper_cell_route_status(candidate)
+    signal_family = _paper_cell_text(
+        candidate.get("signal_family") or candidate.get("market_surface") or candidate.get("trade_type") or strategy
+    )
+    if not signal_identity:
+        signal_identity = "|".join((signal_family, strategy, variant))
+
+    cell_key = "|".join(
+        (
+            signal_identity,
+            venue,
+            direction,
+            route_status,
+        )
+    )
+    return {
+        "scope": "paper_signal_cell_v1",
+        "signal_family": signal_family,
+        "signal_key": signal_identity,
+        "strategy": strategy,
+        "variant": variant,
+        "venue": venue,
+        "direction": direction,
+        "paper_route_status": route_status,
+        "cell_key": cell_key,
+    }
+
+
+def paper_signal_cell_key(candidate: dict[str, Any]) -> str:
+    return str(paper_signal_cell(candidate).get("cell_key") or "")
+
+
+def evaluate_paper_cell_policy(
+    record: dict[str, Any],
+    config: dict[str, Any] | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Evaluate a paper-only promotion/probation/rollback decision for one cell."""
+    settings: dict[str, Any] = {}
+    if isinstance(config, dict):
+        for key in PAPER_CELL_SCOPE_FLAG_KEYS:
+            value = config.get(key)
+            if isinstance(value, dict):
+                settings.update(value)
+        for scope in PAPER_CELL_SCOPE_SCOPES:
+            scoped = config.get(scope)
+            if not isinstance(scoped, dict):
+                continue
+            for key in PAPER_CELL_SCOPE_FLAG_KEYS:
+                value = scoped.get(key)
+                if isinstance(value, dict):
+                    settings.update(value)
+
+    closed_count = _as_int(record.get("closed_count", record.get("closed_trades", record.get("trades", 0))))
+    avg_pnl_bps = _as_float(record.get("avg_pnl_bps", record.get("pnl_bps", 0.0)))
+    win_rate_raw = record.get("win_rate")
+    win_rate = _as_float(win_rate_raw, default=-1.0) if win_rate_raw is not None else None
+    min_closed_trades = max(1, _as_int(settings.get("min_closed_trades"), 3))
+    probation_ttl_days = max(1, _as_int(settings.get("probation_ttl_days"), 7))
+    promote_min_avg_pnl_bps = _as_float(settings.get("promote_min_avg_pnl_bps"), 1.0)
+    promote_min_win_rate = _as_float(settings.get("promote_min_win_rate"), 0.5)
+    revert_avg_pnl_bps = _as_float(settings.get("revert_avg_pnl_bps"), -5.0)
+    prior_state = _paper_cell_text(record.get("prior_state") or record.get("state"), default="new").lower()
+    probation_started_at = record.get("probation_started_at") or record.get("first_reviewed_at") or record.get("reviewed_at")
+    current_now = dt.datetime.fromisoformat(now) if now else dt.datetime.now(dt.timezone.utc)
+    probation_expired = False
+    if probation_started_at:
+        try:
+            probation_started = dt.datetime.fromisoformat(str(probation_started_at))
+            probation_expired = (current_now - probation_started).days >= probation_ttl_days
+        except (TypeError, ValueError):
+            probation_expired = False
+
+    if closed_count >= min_closed_trades and avg_pnl_bps <= revert_avg_pnl_bps:
+        decision = "reverted"
+        action = "rollback_cell"
+    elif closed_count >= min_closed_trades and avg_pnl_bps >= promote_min_avg_pnl_bps and (win_rate is None or win_rate >= promote_min_win_rate):
+        decision = "promoted"
+        action = "promote_cell"
+    elif probation_expired and avg_pnl_bps < 0.0 and prior_state in {"probation", "new"}:
+        decision = "reverted"
+        action = "rollback_cell"
+    else:
+        decision = "probation"
+        action = "retain_cell_probation"
+
+    cell = paper_signal_cell(record)
+    return {
+        "scope": "paper_signal_cell_policy_v1",
+        "cell": cell,
+        "cell_key": cell.get("cell_key"),
+        "decision": decision,
+        "action": action,
+        "closed_count": closed_count,
+        "avg_pnl_bps": avg_pnl_bps,
+        "win_rate": None if win_rate is None or win_rate < 0.0 else win_rate,
+        "prior_state": prior_state,
+        "probation_ttl_days": probation_ttl_days,
+        "probation_expired": probation_expired,
+        "reviewed_at": current_now.isoformat(),
+    }
+
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
