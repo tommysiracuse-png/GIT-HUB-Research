@@ -11,7 +11,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from evolution.builder_context import build_builder_context, render_builder_context  # noqa: E402
+from evolution.builder_context import build_builder_context, render_builder_context, resolve_repo_targets  # noqa: E402
 
 
 class BuilderContextTests(unittest.TestCase):
@@ -47,8 +47,31 @@ class BuilderContextTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             context = build_builder_context(pathlib.Path(tmp), ["src/missing.py"], max_chars=100)
 
-        self.assertFalse(context["files"][0]["exists"])
-        self.assertEqual(context["files"][0]["text"], "<missing file>")
+            self.assertFalse(context["files"][0]["exists"])
+            self.assertEqual(context["files"][0]["text"], "<missing file>")
+
+    def test_repo_capability_map_resolves_conceptual_path_from_real_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "market_admission.py").write_text(
+                "def advance_market_admission():\n    return 'paper'\n", encoding="utf-8"
+            )
+            (root / "tests" / "test_market_admission.py").write_text(
+                "def test_advance_market_admission():\n    assert True\n", encoding="utf-8"
+            )
+            resolved = resolve_repo_targets(
+                root,
+                {
+                    "title": "Advance market admission",
+                    "proposed_change": "Wire admission progress into paper evaluation.",
+                    "change_category": "runtime_pipeline_integration",
+                },
+                conceptual_paths=["src/runtime/market_admission_pipeline.py"],
+            )
+            self.assertEqual(["src/market_admission.py"], resolved["source_files"])
+            self.assertEqual(["tests/test_market_admission.py"], resolved["test_files"])
 
 
 if __name__ == "__main__":

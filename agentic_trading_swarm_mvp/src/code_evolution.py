@@ -23,7 +23,7 @@ from typing import Any
 
 from cost_router import complete, completion_preflight_status
 from evolution.archive import write_candidate_archive
-from evolution.builder_context import build_builder_context, render_builder_context
+from evolution.builder_context import build_builder_context, render_builder_context, resolve_repo_targets
 from evolution.canary import run_radar_canary, skip_canary
 from evolution.evaluator import (
     benchmark_builder_change,
@@ -2074,6 +2074,10 @@ RUNTIME_INTEGRATION_PATHS = {
     "src/okx_signal_research.py",
     "src/okx_carry_economics.py",
     "src/strategy_lab.py",
+    "src/market_admission.py",
+    "src/research_worker.py",
+    "src/global_market_discovery_scanner.py",
+    "src/global_proxy_scanner.py",
 }
 
 RUNTIME_INTEGRATED_CATEGORIES = {
@@ -2851,6 +2855,31 @@ def preflight_proposal(payload: dict, settings: dict, root: pathlib.Path = ROOT)
                 invalid_targets.append(raw)
                 continue
         target_files.append(canonical)
+    repairable_invalid = [
+        raw
+        for raw in invalid_targets
+        if _normalize_path(raw) and not _path_blocked(_normalize_path(raw), cfg)
+    ]
+    repo_resolution = resolve_repo_targets(root, payload, conceptual_paths=repairable_invalid or _target_files(payload))
+    if repairable_invalid and repo_resolution.get("source_files"):
+        resolved = [
+            path
+            for path in [*repo_resolution["source_files"], *repo_resolution.get("test_files", [])]
+            if not _path_blocked(path, cfg)
+        ]
+        target_files.extend(resolved)
+        invalid_targets = [raw for raw in invalid_targets if raw not in repairable_invalid]
+        path_repairs.append({"from": repairable_invalid, "to": resolved, "resolver": "repo_capability_map"})
+    if not target_files:
+        resolved = [
+            path
+            for path in [*repo_resolution.get("source_files", []), *repo_resolution.get("test_files", [])]
+            if not _path_blocked(path, cfg)
+        ]
+        if resolved:
+            used_default_targets = True
+            target_files = resolved
+            path_repairs.append({"from": "repo_capability_map", "to": resolved})
     if not target_files:
         semantic_defaults = _semantic_target_files("", category, payload)
         if semantic_defaults:
@@ -2916,6 +2945,7 @@ def preflight_proposal(payload: dict, settings: dict, root: pathlib.Path = ROOT)
         "test_repairs": test_repairs,
         "parsed_tests": parsed_tests,
         "quality_scorecard": quality_scorecard,
+        "repo_resolution": repo_resolution,
         "checked_at": _utc_now(),
     }
 
@@ -4872,8 +4902,59 @@ def evaluate_code_evolution(conn: Any, settings: dict, root: pathlib.Path = ROOT
     return evaluated
 
 
-def normalize_code_evolution_statuses(conn: Any) -> dict:
+def _git_commit_is_ancestor(commit: str, root: pathlib.Path = ROOT) -> bool:
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", str(commit or "")):
+        return False
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", str(commit), "HEAD"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def reconcile_code_evolution_git_statuses(conn: Any, root: pathlib.Path = ROOT) -> dict[str, int]:
+    """Make Git ancestry authoritative when persisted proposal status drifted."""
     updated: dict[str, int] = {}
+    rows = conn.execute(
+        """
+        select proposal_id, status, candidate_commit, evaluation_json
+        from code_evolution_proposals
+        where candidate_commit is not null and status not in ('promoted', 'reverted')
+        order by updated_at desc
+        limit 2000
+        """
+    ).fetchall()
+    for row in rows:
+        candidate = str(row["candidate_commit"] or "")
+        if not _git_commit_is_ancestor(candidate, root=root):
+            continue
+        evaluation = json.loads(row["evaluation_json"] or "{}")
+        evaluation["git_reconciliation"] = {
+            "checked_at": _utc_now(),
+            "candidate_commit": candidate,
+            "previous_status": row["status"],
+            "is_ancestor_of_head": True,
+        }
+        update_code_evolution_proposal(
+            conn,
+            row["proposal_id"],
+            status="promoted",
+            evaluation=evaluation,
+            promotion_reason="Reconciled from candidate commit present in current Git ancestry.",
+            applied_at=_utc_now(),
+        )
+        updated["promoted_from_git_ancestry"] = updated.get("promoted_from_git_ancestry", 0) + 1
+    return updated
+
+
+def normalize_code_evolution_statuses(conn: Any, root: pathlib.Path = ROOT) -> dict:
+    updated: dict[str, int] = {}
+    for key, count in reconcile_code_evolution_git_statuses(conn, root=root).items():
+        updated[key] = updated.get(key, 0) + count
     for row in code_evolution_by_status(conn, ["blocked_human_review"], limit=1000):
         safety = row.get("safety") or {}
         reasons = safety.get("reasons") or []

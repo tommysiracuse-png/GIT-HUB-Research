@@ -16,6 +16,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import uuid
 from typing import Any
 
 from code_evolution import process_code_change_recommendation, write_code_evolution_reports
@@ -109,14 +110,56 @@ def should_auto_run(settings: dict, force: bool = False) -> bool:
 def _lock_active(settings: dict) -> bool:
     if not LOCK.exists():
         return False
-    parsed = _parse_iso(LOCK.read_text(encoding="utf-8").strip().splitlines()[0])
-    if not parsed:
-        return True
-    age_minutes = (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds() / 60.0
+    try:
+        raw = LOCK.read_text(encoding="utf-8").strip()
+        payload = json.loads(raw)
+    except (OSError, TypeError, ValueError):
+        # Legacy timestamp locks remain readable during rollout.
+        try:
+            parsed = _parse_iso(raw.splitlines()[0])
+        except (NameError, IndexError):
+            parsed = None
+        if not parsed:
+            return False
+        age_minutes = (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds() / 60.0
+        return age_minutes < float(_cfg(settings).get("lock_stale_minutes", 180))
+    pid = int(payload.get("pid") or 0)
+    if pid <= 0 or not _pid_alive(pid):
+        return False
+    expected_start = str(payload.get("process_start_time") or "")
+    actual_start = _process_start_time(pid)
+    if expected_start and actual_start and expected_start != actual_start:
+        return False
+    heartbeat = _parse_iso(str(payload.get("heartbeat_at") or payload.get("acquired_at") or ""))
+    if not heartbeat:
+        return False
+    age_minutes = (dt.datetime.now(dt.timezone.utc) - heartbeat).total_seconds() / 60.0
     return age_minutes < float(_cfg(settings).get("lock_stale_minutes", 180))
 
 
-def _acquire_lock(settings: dict) -> bool:
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _process_start_time(pid: int) -> str | None:
+    try:
+        import psutil  # type: ignore
+
+        return f"{psutil.Process(pid).create_time():.6f}"
+    except (ImportError, OSError, ValueError):
+        if pid == os.getpid():
+            return str(getattr(_process_start_time, "_self_token", None) or "") or None
+        return None
+
+
+_process_start_time._self_token = _utc_now()  # type: ignore[attr-defined]
+
+
+def _acquire_lock(settings: dict) -> str | None:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     if LOCK.exists() and not _lock_active(settings):
         try:
@@ -126,14 +169,41 @@ def _acquire_lock(settings: dict) -> bool:
     try:
         fd = os.open(str(LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        return False
+        return None
+    run_id = uuid.uuid4().hex
+    now = _utc_now()
+    payload = {
+        "run_id": run_id,
+        "pid": os.getpid(),
+        "process_start_time": _process_start_time(os.getpid()),
+        "acquired_at": now,
+        "heartbeat_at": now,
+        "repo_root": str(ROOT),
+    }
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(f"{_utc_now()}\n")
-    return True
+        json.dump(payload, fh, sort_keys=True)
+    return run_id
 
 
-def _release_lock() -> None:
+def _refresh_lock(run_id: str) -> None:
     try:
+        payload = json.loads(LOCK.read_text(encoding="utf-8"))
+        if payload.get("run_id") != run_id:
+            return
+        payload["heartbeat_at"] = _utc_now()
+        temporary = LOCK.with_suffix(".lock.tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, LOCK)
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return
+
+
+def _release_lock(run_id: str | None = None) -> None:
+    try:
+        if run_id:
+            payload = json.loads(LOCK.read_text(encoding="utf-8"))
+            if payload.get("run_id") != run_id:
+                return
         LOCK.unlink()
     except FileNotFoundError:
         pass
@@ -508,21 +578,24 @@ def _run_with_conn(conn: Any, settings: dict, *, force: bool = False) -> dict:
         return _write_report({"generated_at": _utc_now(), "status": "already_running"})
     if not should_auto_run(settings, force=force):
         return _write_report({"generated_at": _utc_now(), "status": "not_due"})
-    if not _acquire_lock(settings):
+    run_id = _acquire_lock(settings)
+    if not run_id:
         return _write_report({"generated_at": _utc_now(), "status": "already_running"})
     try:
-        return _run_with_conn_locked(conn, settings)
+        return _run_with_conn_locked(conn, settings, lock_run_id=run_id)
     finally:
-        _release_lock()
+        _release_lock(run_id)
 
 
-def _run_with_conn_locked(conn: Any, settings: dict) -> dict:
+def _run_with_conn_locked(conn: Any, settings: dict, *, lock_run_id: str | None = None) -> dict:
     cfg = _cfg(settings)
     plan_context = _collect_context(
         settings,
         include_code=False,
         max_context_chars=int(cfg.get("plan_max_context_chars", 35000)),
     )
+    if lock_run_id:
+        _refresh_lock(lock_run_id)
     plan_result = _complete_with_hard_timeout(
         "autonomous_builder",
         _build_plan_prompt(plan_context),
@@ -546,6 +619,8 @@ def _run_with_conn_locked(conn: Any, settings: dict) -> dict:
         "reasoning_effort": plan_result.reasoning_effort,
         "reasoning_mode": plan_result.reasoning_mode,
     }
+    if lock_run_id:
+        _refresh_lock(lock_run_id)
     _mark_run()
     if not plan_result.status.startswith("model_call:"):
         return _write_report(
@@ -605,6 +680,8 @@ def _run_with_conn_locked(conn: Any, settings: dict) -> dict:
             "payload": payload,
         }
         created = process_code_change_recommendation(conn, rec, settings)
+        if lock_run_id:
+            _refresh_lock(lock_run_id)
         write_code_evolution_reports(conn, settings)
         return _write_report(
             {

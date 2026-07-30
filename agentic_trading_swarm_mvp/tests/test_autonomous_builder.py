@@ -209,6 +209,30 @@ class AutonomousBuilderTests(unittest.TestCase):
             finally:
                 self._restore_report_paths(old_paths)
 
+    def test_dead_owner_lock_is_not_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_paths = self._patch_report_paths(tmp)
+            try:
+                autonomous_builder.LOCK.write_text(
+                    json.dumps(
+                        {
+                            "run_id": "dead",
+                            "pid": 99999999,
+                            "process_start_time": "old",
+                            "acquired_at": autonomous_builder._utc_now(),
+                            "heartbeat_at": autonomous_builder._utc_now(),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertFalse(autonomous_builder._lock_active({}))
+                run_id = autonomous_builder._acquire_lock({})
+                self.assertTrue(run_id)
+                autonomous_builder._release_lock(run_id)
+                self.assertFalse(autonomous_builder.LOCK.exists())
+            finally:
+                self._restore_report_paths(old_paths)
+
 
 if __name__ == "__main__":
     unittest.main()
