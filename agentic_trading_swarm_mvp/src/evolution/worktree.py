@@ -7,6 +7,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import time
 from typing import Any
 
 from .contracts import CandidateRelease
@@ -116,22 +117,71 @@ def _safe_branch_suffix(proposal_id: str) -> str:
     return suffix[:60] or "candidate"
 
 
+def _remove_stale_worktree(root: pathlib.Path, worktree: pathlib.Path, *, timeout: int) -> dict[str, Any]:
+    remove = run_git(["worktree", "remove", "--force", str(worktree)], root, timeout=timeout)
+    prune = run_git(["worktree", "prune"], root, timeout=timeout)
+    errors: list[str] = []
+    for delay in (0.0, 0.1, 0.25, 0.5):
+        if not worktree.exists():
+            break
+        if delay:
+            time.sleep(delay)
+        try:
+            shutil.rmtree(worktree)
+        except OSError as exc:
+            errors.append(str(exc))
+    return {
+        "ok": not worktree.exists(),
+        "remove": remove,
+        "prune": prune,
+        "filesystem_errors": errors[-4:],
+    }
+
+
+def _available_candidate_location(root: pathlib.Path, base_dir: pathlib.Path, suffix: str, *, timeout: int) -> tuple[str, pathlib.Path, dict[str, Any]]:
+    branch = f"evolution/{suffix}"
+    worktree = base_dir / suffix
+    cleanup: dict[str, Any] = {"ok": True, "required": False}
+    if worktree.exists():
+        cleanup = {"required": True, **_remove_stale_worktree(root, worktree, timeout=timeout)}
+
+    branch_check = run_git(["rev-parse", "--verify", branch], root, timeout=timeout)
+    branch_deleted = None
+    if branch_check["returncode"] == 0:
+        branch_deleted = run_git(["branch", "-D", branch], root, timeout=timeout)
+
+    if not worktree.exists() and (branch_deleted is None or branch_deleted["returncode"] == 0):
+        return branch, worktree, {**cleanup, "fallback_used": False, "branch_delete": branch_deleted}
+
+    # A Windows process can briefly retain a test or bytecode handle after a
+    # candidate exits. Do not let that stale path abort the evolution cycle.
+    for attempt in range(1, 100):
+        candidate_branch = f"{branch}-retry-{attempt}"
+        candidate_worktree = base_dir / f"{suffix}-retry-{attempt}"
+        candidate_check = run_git(["rev-parse", "--verify", candidate_branch], root, timeout=timeout)
+        if candidate_check["returncode"] != 0 and not candidate_worktree.exists():
+            return candidate_branch, candidate_worktree, {
+                **cleanup,
+                "fallback_used": True,
+                "branch_delete": branch_deleted,
+                "fallback_attempt": attempt,
+            }
+    return branch, worktree, {**cleanup, "fallback_used": False, "exhausted": True, "branch_delete": branch_deleted}
+
+
 def create_candidate_worktree(app_root: pathlib.Path, proposal_id: str, *, base_dir: pathlib.Path, timeout: int = 120) -> tuple[CandidateRelease | None, dict[str, Any]]:
     preflight = release_preflight(app_root)
     if not preflight.get("ok"):
         return None, preflight
     root = pathlib.Path(preflight["repo_root"])
     app_relative = preflight["app_relative_root"]
-    branch = f"evolution/{_safe_branch_suffix(proposal_id)}"
-    worktree = base_dir / _safe_branch_suffix(proposal_id)
-    if worktree.exists():
-        shutil.rmtree(worktree)
-    branch_check = run_git(["rev-parse", "--verify", branch], root, timeout=timeout)
-    if branch_check["returncode"] == 0:
-        run_git(["branch", "-D", branch], root, timeout=timeout)
+    suffix = _safe_branch_suffix(proposal_id)
+    branch, worktree, cleanup = _available_candidate_location(root, base_dir, suffix, timeout=timeout)
+    if cleanup.get("exhausted"):
+        return None, {**preflight, "ok": False, "reason": "worktree_location_unavailable", "cleanup": cleanup}
     add = run_git(["worktree", "add", "-b", branch, str(worktree), preflight["parent_commit"]], root, timeout=timeout)
     if add["returncode"] != 0:
-        return None, {**preflight, "ok": False, "reason": "worktree_create_failed", "command": add}
+        return None, {**preflight, "ok": False, "reason": "worktree_create_failed", "command": add, "cleanup": cleanup}
     release = CandidateRelease(
         proposal_id=proposal_id,
         parent_commit=preflight["parent_commit"],
@@ -139,7 +189,7 @@ def create_candidate_worktree(app_root: pathlib.Path, proposal_id: str, *, base_
         worktree_path=str(worktree),
         app_worktree_path=str(worktree / app_relative),
     )
-    return release, {**preflight, "ok": True, "branch_name": branch, "worktree_path": str(worktree)}
+    return release, {**preflight, "ok": True, "branch_name": branch, "worktree_path": str(worktree), "cleanup": cleanup}
 
 
 def commit_candidate(release: CandidateRelease, message: str, *, timeout: int = 120) -> tuple[CandidateRelease, dict[str, Any]]:

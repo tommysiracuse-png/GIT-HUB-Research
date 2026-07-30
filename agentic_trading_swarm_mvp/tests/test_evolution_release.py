@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -76,6 +77,25 @@ class EvolutionReleaseTests(unittest.TestCase):
             self.assertTrue(cleanup["ok"], cleanup)
             branch_check = run_git(["rev-parse", "--verify", release.branch_name], app)
             self.assertEqual(branch_check["returncode"], 0)
+
+    def test_locked_stale_worktree_uses_retry_location_instead_of_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, app = self._repo(tmp)
+            base_dir = pathlib.Path(tmp) / "worktrees"
+            stale = base_dir / "locked"
+            stale.mkdir(parents=True)
+            (stale / "locked.py").write_text("LOCKED = True\n", encoding="utf-8")
+
+            with mock.patch("evolution.worktree.shutil.rmtree", side_effect=PermissionError("file is in use")):
+                release, created = create_candidate_worktree(app, "proposal:locked", base_dir=base_dir)
+
+            self.assertIsNotNone(release, created)
+            assert release is not None
+            self.assertTrue(created["cleanup"]["fallback_used"])
+            self.assertIn("-retry-1", release.worktree_path)
+            self.assertTrue(pathlib.Path(release.worktree_path).exists())
+            cleanup = cleanup_worktree(release, app)
+            self.assertTrue(cleanup["ok"], cleanup)
 
 
 if __name__ == "__main__":
