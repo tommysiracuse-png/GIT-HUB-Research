@@ -14,6 +14,7 @@ try:
         _paper_only_context_evidence_review,
         _paper_only_parse_timestamp,
         paper_only_shadow_direction_inversion_review,
+        paper_only_route_requirement_profile,
         paper_only_route_quality_record,
     )
 except ImportError:  # pragma: no cover - fallback for direct module execution
@@ -22,6 +23,7 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
             _paper_only_context_evidence_review,
             _paper_only_parse_timestamp,
             paper_only_shadow_direction_inversion_review,
+            paper_only_route_requirement_profile,
             paper_only_route_quality_record,
         )
     except ImportError:  # pragma: no cover - route-quality enrichment becomes optional
@@ -81,6 +83,9 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "reason": "guard_disabled",
                 "activation_mode": "guard_disabled",
             }
+
+        def paper_only_route_requirement_profile(record):
+            return {}
 
         paper_only_route_quality_record = None
 
@@ -143,6 +148,40 @@ def _paper_only_route_review_float(value):
         return float(text)
     except (TypeError, ValueError):
         return None
+
+
+def _paper_only_annotate_route_intelligence(route_status):
+    if not isinstance(route_status, dict):
+        return route_status
+    profile = paper_only_route_requirement_profile(route_status)
+    if not isinstance(profile, dict) or not profile:
+        return route_status
+    existing = route_status.get("route_requirements")
+    if isinstance(existing, dict):
+        merged = dict(profile)
+        merged.update(existing)
+        route_status["route_requirements"] = merged
+    else:
+        route_status["route_requirements"] = profile
+    summary = _paper_only_route_review_text(
+        route_status.get("route_requirement_summary") or profile.get("summary")
+    )
+    if summary:
+        route_status["route_requirement_summary"] = summary
+    requirement_status = _paper_only_route_review_text(
+        route_status.get("route_requirement_status") or profile.get("route_requirement_status")
+    )
+    if requirement_status:
+        route_status["route_requirement_status"] = requirement_status
+    broker_surface = _paper_only_route_review_text(route_status.get("route_broker_surface") or profile.get("broker_surface"))
+    if broker_surface:
+        route_status["route_broker_surface"] = broker_surface
+    api_surface = _paper_only_route_review_text(route_status.get("api_surface") or profile.get("api_surface"))
+    if api_surface:
+        route_status["api_surface"] = api_surface
+    if route_status.get("required_permissions") in (None, "", [], {}, ()):
+        route_status["required_permissions"] = list(profile.get("required_permissions") or [])
+    return route_status
 
 
 def _paper_only_spread_volatility_gate(config, spread_bps=None, volatility_pct=None):
@@ -209,6 +248,7 @@ def _paper_only_strategy_lab_exact_context_guard_enabled(config, *, context_revi
 def _paper_only_route_context_value(route_status, direct_keys, *, nested_keys=()):
     if not isinstance(route_status, dict):
         return None
+    _paper_only_annotate_route_intelligence(route_status)
     for key in direct_keys:
         value = route_status.get(key)
         if value not in (None, "", [], {}, ()):
@@ -394,6 +434,7 @@ def _paper_only_enforced_route_resolution_enabled(config):
 def _paper_only_route_review_lookup(route_status, *keys):
     if not isinstance(route_status, dict):
         return None
+    _paper_only_annotate_route_intelligence(route_status)
     for key in keys:
         value = route_status.get(key)
         if value not in (None, "", [], {}, ()):
@@ -431,6 +472,7 @@ def _paper_only_safe_route_tag(text):
 
 def _paper_only_route_status_text(route_status):
     if isinstance(route_status, dict):
+        _paper_only_annotate_route_intelligence(route_status)
         return _paper_only_route_review_text(route_status.get("route_status") or route_status.get("status"))
     return _paper_only_route_review_text(route_status)
 

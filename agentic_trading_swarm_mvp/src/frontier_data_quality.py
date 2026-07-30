@@ -20,6 +20,197 @@ def _paper_only_parse_timestamp(value):
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)
 
 
+def _paper_only_route_intelligence_text(value):
+    text = str(value or "").strip()
+    return text or None
+
+
+def _paper_only_route_intelligence_tag(value):
+    text = _paper_only_route_intelligence_text(value)
+    if not text:
+        return None
+    return text.lower().replace("-", "_").replace(" ", "_")
+
+
+def _paper_only_route_intelligence_first(record, keys):
+    if not isinstance(record, dict):
+        return None
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, "", [], {}, ()):
+            return value
+    return None
+
+
+def _paper_only_route_intelligence_surface(record, tokens):
+    direct = _paper_only_route_intelligence_tag(
+        _paper_only_route_intelligence_first(
+            record,
+            ("market_surface", "execution_surface", "market_type", "surface", "product_type"),
+        )
+    )
+    if direct in {"spot", "cash"}:
+        return "spot"
+    if direct in {"perp", "perpetual", "swap", "futures"}:
+        return "perp"
+    if any(token in tokens for token in ("_spot", "|spot|", "short_frontier_spot", "okx_spot")):
+        return "spot"
+    if any(token in tokens for token in ("perp", "perpetual", "swap", "funding_capture", "perp_funding_basis")):
+        return "perp"
+    return None
+
+
+def _paper_only_route_intelligence_direction(record, tokens):
+    direct = _paper_only_route_intelligence_tag(
+        _paper_only_route_intelligence_first(
+            record,
+            ("direction", "side", "signal_side", "candidate_direction", "position_side"),
+        )
+    )
+    if direct in {"short", "sell"}:
+        return "short"
+    if direct in {"long", "buy"}:
+        return "long"
+    if "short" in tokens:
+        return "short"
+    if "long" in tokens:
+        return "long"
+    return None
+
+
+def _paper_only_route_intelligence_venue(record, surface, tokens):
+    direct = _paper_only_route_intelligence_tag(
+        _paper_only_route_intelligence_first(
+            record,
+            ("venue", "execution_venue", "exchange", "broker", "venue_key", "market_key"),
+        )
+    )
+    if direct:
+        if direct == "okx_spot":
+            return "okx"
+        if direct == "mercadobitcoin":
+            return "mercado_bitcoin"
+        return direct
+    if "okx_spot" in tokens or ("okx" in tokens and surface == "spot"):
+        return "okx"
+    for venue in (
+        "okx",
+        "bitget",
+        "binance_us",
+        "valr",
+        "gate",
+        "bybit",
+        "indodax",
+        "bitso",
+        "mercado_bitcoin",
+        "mercadobitcoin",
+    ):
+        if venue in tokens:
+            return "mercado_bitcoin" if venue == "mercadobitcoin" else venue
+    return None
+
+
+def _paper_only_route_intelligence_permissions(surface, *, spot_short=False, funding_capture=False, basis_trade=False):
+    ordered = []
+    for permission in (
+        "spot_market_data" if surface == "spot" or basis_trade else None,
+        "perpetuals_enabled" if surface == "perp" or funding_capture or basis_trade else None,
+        "margin_enabled" if spot_short else None,
+        "borrow_inventory_access" if spot_short else None,
+        "collateral_transfer_capability" if funding_capture or basis_trade else None,
+    ):
+        if permission and permission not in ordered:
+            ordered.append(permission)
+    return ordered
+
+
+def paper_only_route_requirement_profile(record):
+    if not isinstance(record, dict):
+        return {}
+    text_values = []
+    for key in (
+        "route_id",
+        "signal_key",
+        "venue",
+        "execution_venue",
+        "exchange",
+        "broker",
+        "market_key",
+        "market_surface",
+        "execution_surface",
+        "market_type",
+        "surface",
+        "direction",
+        "side",
+        "variant",
+        "signal_variant",
+        "strategy",
+        "strategy_family",
+        "directional_template",
+        "candidate_family",
+        "route_status",
+        "status",
+    ):
+        value = _paper_only_route_intelligence_text(record.get(key))
+        if value:
+            text_values.append(value.lower())
+    tokens = " | ".join(text_values)
+    surface = _paper_only_route_intelligence_surface(record, tokens)
+    direction = _paper_only_route_intelligence_direction(record, tokens)
+    venue = _paper_only_route_intelligence_venue(record, surface, tokens)
+    conditional = "conditional" in tokens
+    funding_capture = any(token in tokens for token in ("funding_capture", "perp_funding_basis"))
+    basis_trade = any(token in tokens for token in ("long_perp_short_spot", "short_perp_long_spot"))
+    spot_short = bool(
+        surface == "spot"
+        and (direction == "short" or "short_frontier_spot" in tokens or "short_spot" in tokens)
+    )
+    required_permissions = _paper_only_route_intelligence_permissions(
+        surface,
+        spot_short=spot_short,
+        funding_capture=funding_capture,
+        basis_trade=basis_trade,
+    )
+    broker_surface = ":".join(part for part in (venue, surface) if part) or None
+    if spot_short:
+        route_requirement_status = "supported_with_margin_and_borrow_requirements"
+    elif funding_capture or basis_trade or surface == "perp":
+        route_requirement_status = "supported_with_perp_and_collateral_requirements"
+    elif broker_surface:
+        route_requirement_status = "paper_public_market_data_route"
+    else:
+        route_requirement_status = "unknown_route_profile"
+    public_fee_assumptions = "public_spot_taker_fee_or_default_estimate"
+    if funding_capture or basis_trade or surface == "perp":
+        public_fee_assumptions = "public_perp_taker_fee_and_funding_rate_estimate"
+    summary_parts = [route_requirement_status]
+    if broker_surface:
+        summary_parts.append(broker_surface)
+    if conditional:
+        summary_parts.append("conditional")
+    if spot_short:
+        summary_parts.append("spot_short_requires_margin_and_borrow")
+    if funding_capture:
+        summary_parts.append("funding_capture_requires_perp_access")
+    if basis_trade:
+        summary_parts.append("basis_trade_requires_collateral_transfer")
+    return {
+        "broker_surface": broker_surface,
+        "venue": venue,
+        "market_surface": surface,
+        "direction": direction,
+        "conditional": conditional,
+        "api_surface": "public_market_data_only",
+        "required_permissions": required_permissions,
+        "spot_short_requires_margin_and_borrow": spot_short,
+        "funding_capture_requires_perp_access": bool(funding_capture or surface == "perp"),
+        "collateral_transfer_required": bool(funding_capture or basis_trade),
+        "public_fee_assumptions": public_fee_assumptions,
+        "route_requirement_status": route_requirement_status,
+        "summary": "; ".join(summary_parts),
+    }
+
+
 def paper_only_quote_age_seconds(observation, *, now=None):
     if not isinstance(observation, dict):
         return None
