@@ -256,6 +256,14 @@ CANONICAL_MARKET_ID_KEYS = (
     "instrument_type",
     "tenor",
     "expiry",
+    "context_key",
+    "context_key_alias",
+    "venue_family",
+    "market_family",
+    "scanner_family",
+    "direction_family",
+    "carry_profile",
+    "execution_family",
     "canonical_market_identity",
 )
 
@@ -280,7 +288,19 @@ def _contextual_stats(conn: sqlite3.Connection) -> list[dict]:
         limit 50
         """
     ).fetchall()
-    return [dict(row) for row in rows]
+    stats: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["context_key_alias"] = _normalized_context_key(item.get("context_key"))
+        item.update(
+            _bounded_context_prior(
+                item.get("closed_count"),
+                item.get("win_rate"),
+                item.get("avg_pnl_bps"),
+            )
+        )
+        stats.append(item)
+    return stats
 
 
 def _crypto_venue_health_gaps(items: list[dict]) -> list[dict]:
@@ -347,6 +367,68 @@ def _safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
 
+
+def _normalized_context_fragment(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return text[:48] if text else "unknown"
+
+
+def _joined_context_text(item: dict[str, Any], *keys: str) -> str:
+    values: list[str] = []
+    for source in _identity_sources(item):
+        for key in keys:
+            value = source.get(key)
+            if _is_missing_text(value):
+                continue
+            values.append(str(value).strip().lower())
+    return " | ".join(dict.fromkeys(values))
+
+
+def _normalized_venue_family(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "unknown"
+    if "okx" in text:
+        return "okx"
+    if "binance" in text:
+        return "binance"
+    if "bybit" in text:
+        return "bybit"
+    if "coinbase" in text:
+        return "coinbase"
+    if "kraken" in text:
+        return "kraken"
+    return _normalized_context_fragment(text)
+
+
+def _normalized_context_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "unknown"
+    parts = [part.strip() for part in re.split(r"[|/,:]+", text) if part.strip()]
+    if len(parts) >= 6:
+        return "|".join(
+            [
+                _normalized_context_fragment(parts[0]),
+                _normalized_venue_family(parts[1]),
+                _normalized_context_fragment(parts[2]),
+                _normalized_context_fragment(parts[3]),
+                _normalized_context_fragment(parts[4]),
+                _normalized_context_fragment(parts[5]),
+            ]
+        )
+    return _normalized_context_fragment(text)
+
+
+def _bounded_context_prior(closed_count: Any, win_rate: Any, avg_pnl_bps: Any) -> dict[str, Any]:
+    count = _safe_float(closed_count) or 0.0
+    if count < 5:
+        return {"prior_score": 0.0, "prior_confidence": 0.0}
+    wr = max(0.0, min(1.0, _safe_float(win_rate) or 0.0))
+    pnl = _safe_float(avg_pnl_bps) or 0.0
+    score = max(-1.0, min(1.0, ((wr - 0.5) * 2.0) + (pnl / 500.0)))
+    confidence = max(0.0, min(1.0, count / (count + 10.0)))
+    return {"prior_score": score, "prior_confidence": confidence}
 
 def _as_text_list(value: Any) -> list[str]:
     if value is None:
