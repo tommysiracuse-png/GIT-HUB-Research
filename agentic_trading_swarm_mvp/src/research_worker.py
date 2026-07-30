@@ -34,6 +34,68 @@ DATA_ACCESS_TYPES = {"public_no_key", "public_key_required", "broker_account", "
 TRADABILITY_GUESSES = {"directly_tradable", "route_needed", "watch_only", "unknown"}
 NEXT_ACTIONS = {"adapter_spec", "route_probe", "growth_experiment", "hunter_directive", "watchlist", "ignore"}
 
+JSE_DIRECT_DISCOVERY_SEED: dict[str, Any] = {
+    "surface_type_raw": "cash equity benchmark and top-liquid constituent public market data",
+    "venue_or_source": "Johannesburg Stock Exchange",
+    "country": "South Africa",
+    "region": "Africa",
+    "asset_or_event": "FTSE/JSE Top 40 leaders and liquid local ETFs such as NPN, PRX, SOL, SBK, and STX40",
+    "data_access_type": "public_no_key",
+    "tradability_guess": "watch_only",
+    "public_docs_url": "https://www.jse.co.za/",
+    "source_urls": [
+        "https://www.jse.co.za/",
+        "https://www.jse.co.za/indices",
+    ],
+    "adapter_route_id": "jse_cash_public_shadow",
+    "adapter_request_hint": {
+        "method": "GET",
+        "path": "/paper/jse/quotes",
+        "provider_mode": "public_web_quote_or_delayed_feed",
+        "paper_only": True,
+        "headers": {
+            "Accept": "application/json",
+            "User-Agent": "paper-research",
+        },
+        "response_fields": [
+            "symbol",
+            "last_price",
+            "percent_change",
+            "quote_timestamp",
+            "spread_bps_proxy",
+            "currency",
+            "source_venue",
+        ],
+    },
+    "why_interesting": "Direct JSE cash coverage is underrepresented while prior paper evidence for Johannesburg long discovery has been positive.",
+    "inefficiency_hypothesis": "Venue-native South African equity and ETF quotes may surface fresher local momentum and liquidity context than broad Yahoo proxy mapping.",
+    "latency_sensitivity": "low",
+    "liquidity_hint": "benchmark_or_top_liquid_names_only",
+    "route_blockers": ["venue_native_symbol_map", "quote_delay_allowed", "spread_proxy_estimation"],
+    "recommended_next_action": "adapter_spec",
+    "priority": 90,
+    "confidence": 0.79,
+    "paper_only": True,
+    "paper_discovery_only": True,
+    "scoring_policy": "paper_only_direct_cash_discovery",
+    "quality_gates": {
+        "freshness_minutes": 60,
+        "maximum_freshness_minutes": 60,
+        "spread_bps": "proxy_if_available",
+        "max_spread_bps": 150,
+        "liquidity_gate": "benchmark_or_top_liquid_names_only",
+        "quote_delay_allowed": True,
+        "requires_quality_gate_pass": True,
+        "shadow_compare_days": 5,
+    },
+    "venue_quality_metadata": {
+        "currency": "ZAR",
+        "session_timezone": "Africa/Johannesburg",
+        "instrument_scope": "ftse_jse_top_40_and_liquid_local_etfs",
+        "price_mode": "venue-native",
+    },
+}
+
 DEFAULT_GLOBAL_DISCOVERY_SEEDS: list[dict[str, Any]] = [
     {
         "surface_type_raw": "crypto global spot public market data",
