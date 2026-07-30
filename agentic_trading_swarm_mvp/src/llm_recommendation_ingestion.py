@@ -265,8 +265,76 @@ def _repair_execution_route_hunter_payload(value: Any) -> Optional[Dict[str, Any
     return repaired
 
 
+def _repair_cross_market_researcher_payload(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    source_agent = _clean_role(_first(value, ("source_agent", "agent_name", "agent"), ""))
+    market_key = str(_first(value, ("market_key", "market"), "") or "").strip()
+    if source_agent != "cross_market_researcher" and market_key != "paper_global_macro":
+        return None
+
+    proposed_change = _first(value, ("proposed_change", "proposed change", "change"))
+    evidence = value.get("evidence")
+    if not _nonempty(proposed_change) and not _nonempty(evidence) and not _nonempty(value.get("rationale")):
+        return None
+
+    repaired: Dict[str, Any] = dict(value)
+    action = _clean_action(_first(repaired, ("action", "proposed_action"), "code_change"))
+    if action not in ALLOWED_ACTIONS:
+        action = "code_change"
+    repaired["action"] = action
+
+    try:
+        priority = int(repaired.get("priority"))
+    except (TypeError, ValueError):
+        priority = 90
+    repaired["priority"] = max(1, min(100, priority))
+
+    if not _nonempty(repaired.get("title")):
+        repaired["title"] = "Return a single complete paper-trading recommendation object"
+    if not _nonempty(repaired.get("rationale")):
+        repaired["rationale"] = (
+            "Preserve parser compatibility by requiring cross_market_researcher to emit "
+            "exactly one schema-complete paper-only recommendation object."
+        )
+    if not _nonempty(repaired.get("market_key")):
+        repaired["market_key"] = "paper_global_macro"
+
+    default_evidence: Dict[str, Any] = {
+        "issue": "Incomplete cross_market_researcher recommendation object prevented strict downstream parsing.",
+        "impact": "No actionable paper-trading recommendation reached the paper-only decision flow.",
+        "constraint": "Output must remain paper-only and contain exactly one JSON object.",
+    }
+    current_evidence = repaired.get("evidence")
+    if not _nonempty(current_evidence):
+        repaired["evidence"] = default_evidence
+    elif isinstance(current_evidence, Mapping):
+        repaired["evidence"] = {**default_evidence, **dict(current_evidence)}
+
+    default_proposed_change: Dict[str, Any] = {
+        "format_rule": "No markdown, no commentary, no arrays, valid JSON only.",
+        "goal": "Enforce a strict single-object schema for all cross_market_researcher responses.",
+        "required_fields": "action, priority, title, rationale, market_key, evidence, proposed_change",
+        "safety_rule": "Paper-trading only; do not imply live execution.",
+    }
+    current_proposed_change = repaired.get("proposed_change")
+    if not _nonempty(current_proposed_change):
+        repaired["proposed_change"] = default_proposed_change
+    elif isinstance(current_proposed_change, Mapping):
+        repaired["proposed_change"] = {**default_proposed_change, **dict(current_proposed_change)}
+    return repaired
+
+
+def _repair_known_recommendation_payload(value: Any) -> Optional[Dict[str, Any]]:
+    for repair in (_repair_execution_route_hunter_payload, _repair_cross_market_researcher_payload):
+        repaired = repair(value)
+        if repaired is not None:
+            return repaired
+    return None
+
+
 def _looks_like_recommendation(value: Any) -> bool:
-    repaired = _repair_execution_route_hunter_payload(value)
+    repaired = _repair_known_recommendation_payload(value)
     if repaired is not None:
         return True
     if not isinstance(value, Mapping):
@@ -288,28 +356,28 @@ def _native_payload(response: Any) -> Optional[Mapping[str, Any]]:
     parser = str(response.get("parser", "")).strip().lower()
     if parser == "fallback":
         return None
-
-    repaired = _repair_execution_route_hunter_payload(response)
+    repaired = _repair_known_recommendation_payload(response)
     if repaired is not None:
         return repaired
 
     for key in ("output_parsed", "parsed", "structured_output"):
         candidate = response.get(key)
-        repaired = _repair_execution_route_hunter_payload(candidate)
+        repaired = _repair_known_recommendation_payload(candidate)
         if repaired is not None:
             return repaired
         if _looks_like_recommendation(candidate):
             return candidate
         if isinstance(candidate, Mapping):
             nested = candidate.get("recommendation")
-            repaired = _repair_execution_route_hunter_payload(nested)
+            repaired = _repair_known_recommendation_payload(nested)
             if repaired is not None:
                 return repaired
+
             if _looks_like_recommendation(nested):
                 return nested
 
     candidate = response.get("recommendation")
-    repaired = _repair_execution_route_hunter_payload(candidate)
+    repaired = _repair_known_recommendation_payload(candidate)
     if repaired is not None:
         return repaired
     if _looks_like_recommendation(candidate):
@@ -391,11 +459,11 @@ def _json_objects(text: str) -> Iterable[Mapping[str, Any]]:
             return
         if end != len(strict_object) or not isinstance(value, Mapping):
             return
-        repaired = _repair_execution_route_hunter_payload(value)
+        repaired = _repair_known_recommendation_payload(value)
         yield repaired or value
         nested = value.get("recommendation")
         if isinstance(nested, Mapping):
-            repaired_nested = _repair_execution_route_hunter_payload(nested)
+            repaired_nested = _repair_known_recommendation_payload(nested)
             yield repaired_nested or nested
         return
 
@@ -413,11 +481,11 @@ def _json_objects(text: str) -> Iterable[Mapping[str, Any]]:
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
         if isinstance(value, Mapping):
-            repaired = _repair_execution_route_hunter_payload(value)
+            repaired = _repair_known_recommendation_payload(value)
             yield repaired or value
             nested = value.get("recommendation")
             if isinstance(nested, Mapping):
-                repaired_nested = _repair_execution_route_hunter_payload(nested)
+                repaired_nested = _repair_known_recommendation_payload(nested)
                 yield repaired_nested or nested
 
 
