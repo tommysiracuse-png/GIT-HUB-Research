@@ -1677,6 +1677,11 @@ def run_once(
     try:
         route_lifecycle = reconcile_discovery_route_lifecycle(conn)
         created_artifacts = create_downstream_artifacts(conn, artifact_candidates, settings)
+        route_lifecycle["open_global_route_probes"] = int(
+            conn.execute(
+                "select count(*) from route_probe_tasks where status = 'open' and market_key like 'global_discovery|%'"
+            ).fetchone()[0]
+        )
     finally:
         if owns_conn:
             conn.close()

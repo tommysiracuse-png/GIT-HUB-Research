@@ -80,6 +80,10 @@ class ResearchWorkerTests(unittest.TestCase):
                 self.assertGreater(report["summary"]["candidate_count"], 0)
                 self.assertGreater(report["summary"]["new_candidate_count"], 0)
                 self.assertTrue(report["created_artifacts"])
+                current_open_routes = conn.execute(
+                    "select count(*) from route_probe_tasks where status='open' and market_key like 'global_discovery|%'"
+                ).fetchone()[0]
+                self.assertEqual(report["route_lifecycle"]["open_global_route_probes"], current_open_routes)
                 self.assertTrue(research_worker.REPORT_JSON.exists())
                 self.assertTrue(research_worker.CANDIDATES_JSONL.exists())
                 saved = json.loads(research_worker.REPORT_JSON.read_text(encoding="utf-8"))
