@@ -42,6 +42,7 @@ from code_evolution import (
 )
 from self_improvement_open_pack import IMPLEMENTED_STATUS as OPEN_PACK_IMPLEMENTED_STATUS
 from self_improvement_open_pack import is_duplicate_open_pack_text
+from recommendation_registry import backfill_open_artifacts, bind_artifact, claim_topic, registry_summary
 
 
 ACTIVE_POLICIES_JSON = RUNS_DIR / "active_signal_policies.json"
@@ -1781,6 +1782,7 @@ def run_auto_improvement(
     expired = expire_signal_policies(conn)
     evaluated = evaluate_active_experiments(conn, settings)
     code_evolution_evaluated = evaluate_code_evolution(conn, settings)
+    registry_backfill = backfill_open_artifacts(conn)
     consumed = []
     max_tasks = int(cfg.get("max_tasks_per_loop", 5))
     for rec in llm_recommendations_for_auto_execution(
@@ -1790,6 +1792,27 @@ def run_auto_improvement(
     ):
         payload = rec["payload"]
         task_type = classify_recommendation(payload)
+        topic = claim_topic(
+            conn,
+            payload=payload,
+            topic_type=task_type,
+            priority=int(payload.get("priority", rec.get("priority", 50)) or 50),
+            evidence=payload.get("evidence"),
+            source_ref=f"llm_recommendations:{rec['recommendation_id']}",
+        )
+        if topic.duplicate and topic.canonical_row_id:
+            update_llm_recommendation_status(conn, rec["recommendation_id"], "auto_deduplicated")
+            consumed.append(
+                {
+                    "recommendation_id": rec["recommendation_id"],
+                    "task_type": task_type,
+                    "title": rec["title"],
+                    "status": "auto_deduplicated",
+                    "topic_key": topic.topic_key,
+                    "canonical_artifact": f"{topic.canonical_table}:{topic.canonical_row_id}",
+                }
+            )
+            continue
         created: list[dict] = []
         if task_type == "failure_filter":
             created = _execute_failure_filter(conn, rec, settings)
@@ -1808,6 +1831,29 @@ def run_auto_improvement(
 
         created_artifacts = [item for item in created if item.get("action_status", "created") == "created"]
         if created_artifacts:
+            artifact = created_artifacts[0]
+            artifact_table = artifact.get("artifact_table") or {
+                "failure_filter": "self_improvement_experiments",
+                "route_resolver": "route_probe_tasks",
+                "market_adapter": "adapter_specs",
+                "signal_variant": "signal_variants",
+                "diagnostic_hypothesis": "growth_experiments",
+                "strategy_lab_experiment": "strategy_lab_experiments",
+                "code_change": "code_evolution_proposals",
+            }.get(task_type)
+            artifact_id = next(
+                (
+                    artifact.get(key)
+                    for key in (
+                        "id", "experiment_id", "task_id", "spec_id", "variant_id",
+                        "strategy_lab_id", "proposal_id",
+                    )
+                    if artifact.get(key) is not None
+                ),
+                rec["recommendation_id"],
+            )
+            if artifact_table:
+                bind_artifact(conn, topic.topic_key, artifact_table, artifact_id)
             update_llm_recommendation_status(conn, rec["recommendation_id"], "auto_executed")
             consumed.append(
                 {
@@ -1844,6 +1890,8 @@ def run_auto_improvement(
         "route_probe_tasks": open_route_probe_tasks(conn, limit=50),
         "adapter_specs": open_adapter_specs(conn, limit=50),
         "code_evolution": write_code_evolution_reports(conn, settings),
+        "recommendation_registry": registry_summary(conn),
+        "recommendation_registry_backfill": registry_backfill,
     }
     return write_reports(conn, report, settings=settings)
 
@@ -1886,6 +1934,7 @@ def write_reports(conn: sqlite3.Connection, report: dict | None = None, settings
     report["progress_summary"] = _progress_summary(conn, settings)
     report["code_evolution"] = report.get("code_evolution") or write_code_evolution_reports(conn, settings)
     report["strategy_lab"] = report.get("strategy_lab") or strategy_lab_summary(conn)
+    report["recommendation_registry"] = registry_summary(conn)
     ACTIVE_POLICIES_JSON.write_text(json.dumps(report.get("active_policies", []), indent=2), encoding="utf-8")
     REPORT_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
     REPORT_MD.write_text(_report_markdown(report), encoding="utf-8")
@@ -1939,6 +1988,13 @@ def _report_markdown(report: dict) -> str:
     if code_evolution:
         evo_summary = code_evolution.get("summary", {})
         lines.append(f"- Code evolution status: `{evo_summary.get('status_counts', {})}`")
+    registry = report.get("recommendation_registry") or {}
+    if registry:
+        lines.append(
+            f"- Recommendation topics: `{registry.get('topics', 0)}` canonical; "
+            f"duplicates suppressed `{registry.get('duplicates_suppressed', 0)}`; "
+            f"reopened from new evidence `{registry.get('reopened', 0)}`"
+        )
     lines.extend(
         [
             "",

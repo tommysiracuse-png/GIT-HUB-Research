@@ -575,6 +575,39 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists recommendation_topics (
+            topic_key text primary key,
+            created_at text not null,
+            updated_at text not null,
+            topic_type text not null,
+            status text not null,
+            priority integer not null,
+            descriptor_json text not null,
+            evidence_digest text not null,
+            evidence_json text not null,
+            source_refs_json text not null default '[]',
+            occurrence_count integer not null default 1,
+            reopen_count integer not null default 0,
+            canonical_table text,
+            canonical_row_id text,
+            implemented_category text,
+            implementation_commit text
+        )
+        """
+    )
+    conn.execute("create index if not exists idx_recommendation_topics_status on recommendation_topics(status, priority, updated_at)")
+    conn.execute(
+        """
+        create table if not exists recommendation_topic_sources (
+            source_ref text primary key,
+            topic_key text not null,
+            created_at text not null,
+            foreign key(topic_key) references recommendation_topics(topic_key)
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists frontier_quality_snapshots (
             id integer primary key autoincrement,
             bucket_at text not null,

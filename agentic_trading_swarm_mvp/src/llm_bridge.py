@@ -31,6 +31,7 @@ from storage import (
 from code_evolution import code_evolution_summary, default_paper_recommendation
 from self_improvement_open_pack import IMPLEMENTED_STATUS as OPEN_PACK_IMPLEMENTED_STATUS
 from self_improvement_open_pack import is_duplicate_open_pack_text
+from recommendation_registry import registry_summary
 from strategy_lab import strategy_lab_summary
 
 
@@ -1066,6 +1067,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "strategy_reliability": _compact_strategy_reliability(payload.get("strategy_reliability", {})),
         "strategy_lab": payload.get("strategy_lab") or strategy_lab_summary(conn),
         "autonomous_builder": payload.get("autonomous_builder", {}),
+        "recommendation_registry": registry_summary(conn),
         "self_improvement_open_pack": _compact_self_improvement_open_pack(
             payload.get("self_improvement_open_pack")
             or (payload.get("self_improvement", {}) or {}).get("self_improvement_open_pack", {})
