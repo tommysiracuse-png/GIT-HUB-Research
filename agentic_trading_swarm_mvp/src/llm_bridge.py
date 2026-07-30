@@ -35,6 +35,26 @@ from recommendation_registry import registry_summary
 from strategy_lab import strategy_lab_summary
 
 
+_strategy_lab_summary_original = strategy_lab_summary
+
+
+def strategy_lab_summary(*args: Any, **kwargs: Any) -> Any:
+    summary = _strategy_lab_summary_original(*args, **kwargs)
+    if not isinstance(summary, dict):
+        return summary
+
+    enriched = dict(summary)
+    build_governor = dict(enriched.get("build_governor") or {})
+    build_governor.setdefault("paper_only", True)
+    build_governor.setdefault("implementation_mode", "runtime_active")
+    build_governor.setdefault("tests_to_run", [])
+    build_governor.setdefault("rollback_criteria", "Revert if tests fail or paper-only safety checks fail.")
+    build_governor.setdefault("consumer_validation", {})
+    enriched["build_governor"] = build_governor
+    enriched.setdefault("build_governor_fields", sorted(build_governor.keys()))
+    return enriched
+
+
 STATE_JSON = RUNS_DIR / "llm_state_packet.json"
 STATE_MD = RUNS_DIR / "llm_state_packet.md"
 INBOX = RUNS_DIR / "llm_recommendations_inbox.jsonl"
