@@ -929,6 +929,21 @@ def retrieve_role_memories(
         item = _row_to_memory(row)
         candidate_rows.setdefault(item["memory_id"], item)
 
+    per_namespace_limit = max(8, int(math.ceil(pool_limit / max(1, len(policy["namespaces"])))))
+    for namespace in policy["namespaces"]:
+        namespace_rows = conn.execute(
+            """
+            select *, null as fts_rank from temporal_memories
+            where status in ('active', 'provisional') and importance >= ? and namespace = ?
+            order by importance desc, abs(outcome_score) desc, utility_score desc, last_seen_at desc
+            limit ?
+            """,
+            (minimum_importance, namespace, per_namespace_limit),
+        ).fetchall()
+        for row in namespace_rows:
+            item = _row_to_memory(row)
+            candidate_rows.setdefault(item["memory_id"], item)
+
     candidate_ids = list(candidate_rows)[:pool_limit]
     linked_recommendations: set[str] = set()
     if candidate_ids:

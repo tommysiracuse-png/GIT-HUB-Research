@@ -179,7 +179,7 @@ class TemporalMemoryTests(unittest.TestCase):
         self.assertTrue(all(len(item["summary"]) <= 800 for item in scout + builder))
 
     def test_role_namespace_reservations_prevent_high_score_crowding(self) -> None:
-        for index in range(30):
+        for index in range(200):
             upsert_memory_fact(
                 self.conn,
                 "strategy_lab_evaluation",
@@ -226,7 +226,7 @@ class TemporalMemoryTests(unittest.TestCase):
             "agent_memory": {
                 "enabled": True,
                 "retrieval_limit_per_agent": 12,
-                "retrieval_candidate_pool": 80,
+                "retrieval_candidate_pool": 40,
                 "preferred_namespace_fraction": 0.67,
             }
         }
