@@ -170,16 +170,345 @@ def _default_importance(fact_type: str, predicate: str) -> float:
     return 0.5
 
 
+def _summary_text(value: Any, limit: int = 260) -> str:
+    if value is None:
+        return ""
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text if len(text) <= limit else text[: max(1, limit - 3)].rstrip() + "..."
+
+
+def _summary_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _summary_bps(value: Any) -> str | None:
+    number = _summary_number(value)
+    return f"{number:+.2f} bps" if number is not None else None
+
+
+def _summary_percent(value: Any) -> str | None:
+    number = _summary_number(value)
+    if number is None:
+        return None
+    if abs(number) <= 1.0:
+        number *= 100.0
+    return f"{number:.1f}%"
+
+
+def _summary_list(values: Any, limit: int = 5) -> str:
+    if not isinstance(values, (list, tuple, set)):
+        return ""
+    items = [_summary_text(value, 120) for value in values if _summary_text(value, 120)]
+    if not items:
+        return ""
+    suffix = f" and {len(items) - limit} more" if len(items) > limit else ""
+    return ", ".join(items[:limit]) + suffix
+
+
+def _summary_groups(groups: Any, limit: int = 3) -> str:
+    if not isinstance(groups, dict):
+        return ""
+    ranked: list[tuple[int, str]] = []
+    for name, raw in groups.items():
+        if not isinstance(raw, dict):
+            continue
+        count = int(_summary_number(raw.get("count")) or 0)
+        avg = _summary_bps(raw.get("avg_pnl_bps"))
+        win_rate = _summary_percent(raw.get("win_rate"))
+        detail = f"{name}: {avg or 'average unavailable'}"
+        if count:
+            detail += f" across {count} labels"
+        if win_rate:
+            detail += f", {win_rate} profitable"
+        ranked.append((count, detail))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return "; ".join(item[1] for item in ranked[:limit])
+
+
+def _summary_mapping(data: Any, limit: int = 7) -> str:
+    if not isinstance(data, dict):
+        return _summary_text(data, 400)
+    details: list[str] = []
+    for key, value in data.items():
+        if value in (None, "", [], {}):
+            continue
+        label = str(key).replace("_", " ")
+        if isinstance(value, dict):
+            compact = ", ".join(
+                f"{child_key}={child_value}"
+                for child_key, child_value in list(value.items())[:4]
+                if not isinstance(child_value, (dict, list))
+            )
+            if compact:
+                details.append(f"{label}: {compact}")
+        elif isinstance(value, (list, tuple, set)):
+            compact = _summary_list(value, 4)
+            if compact:
+                details.append(f"{label}: {compact}")
+        else:
+            details.append(f"{label}: {_summary_text(value, 120)}")
+        if len(details) >= limit:
+            break
+    return "; ".join(details)
+
+
+def _signal_performance_summary(subject: str, data: dict) -> str:
+    count = int(_summary_number(data.get("valid_labels")) or 0)
+    venue = _summary_text(data.get("venue") or "unknown venue", 80)
+    trade_type = _summary_text(data.get("trade_type") or "unknown strategy family", 100)
+    direction = _summary_text(data.get("direction") or "unknown direction", 100)
+    avg = _summary_bps(data.get("avg_pnl_bps")) or "an unavailable average"
+    win_rate = _summary_percent(data.get("win_rate")) or "an unavailable win rate"
+    tail = _summary_bps(data.get("worst_decile_bps")) or "unavailable"
+    worst = _summary_bps(data.get("worst_bps")) or "unavailable"
+    best = _summary_bps(data.get("best_bps")) or "unavailable"
+    route_status = subject.rsplit("|", 1)[-1] if "|" in subject else "not encoded"
+    return (
+        f"Reliable 60-minute paper evidence for the exact signal lineage {subject}. "
+        f"It represents {direction} trades from {venue} under {trade_type}, with route status "
+        f"{route_status}. Across {count} valid labels, the average net outcome was {avg} and "
+        f"{win_rate} of labels were profitable. The worst decile was {tail}; individual outcomes "
+        f"ranged from {worst} to {best}. This is aggregate lineage evidence, so instrument, session, "
+        f"liquidity, and regime slices should be checked before changing the whole family."
+    )
+
+
+def _strategy_lab_summary(subject: str, data: dict) -> str:
+    evaluation = data.get("evaluation") if isinstance(data.get("evaluation"), dict) else {}
+    evidence = evaluation.get("outcomes") if isinstance(evaluation.get("outcomes"), dict) else evaluation
+    metrics = evidence.get("metrics") if isinstance(evidence.get("metrics"), dict) else evidence
+    hypothesis = _summary_text(data.get("hypothesis") or "No hypothesis text was recorded.", 300)
+    status = _summary_text(data.get("status") or evaluation.get("decision") or "unknown", 80)
+    valid_count = int(
+        _summary_number(evidence.get("valid_count"))
+        or _summary_number(metrics.get("count"))
+        or 0
+    )
+    trade_count = int(_summary_number(evidence.get("trade_count")) or valid_count)
+    avg = _summary_bps(metrics.get("avg_pnl_bps")) or "unavailable"
+    win_rate = _summary_percent(metrics.get("win_rate")) or "unavailable"
+    tail = _summary_bps(metrics.get("worst_decile_pnl_bps") or metrics.get("worst_decile_bps")) or "unavailable"
+    active_hours = _summary_number(evaluation.get("active_hours"))
+    venue_detail = _summary_groups(evidence.get("by_venue"), 3)
+    route_counts = _summary_mapping(evidence.get("route_status_counts"), 4)
+    raw_strategy_logic = data.get("strategy_logic") if isinstance(data.get("strategy_logic"), dict) else {}
+    strategy_logic = _summary_mapping(raw_strategy_logic, 8)
+    data_requirements = _summary_mapping(data.get("data_requirements"), 5)
+    risk_gates = _summary_mapping(data.get("risk_gates"), 5)
+    diagnostic = evaluation.get("generation_diagnostic") if isinstance(evaluation.get("generation_diagnostic"), dict) else {}
+    source_candidates = int(_summary_number(diagnostic.get("source_candidate_count")) or 0)
+    generated_candidates = int(_summary_number(diagnostic.get("generated_candidate_count")) or 0)
+    reject_reasons = _summary_mapping(diagnostic.get("dominant_reject_reasons"), 5)
+    generic_hypothesis = hypothesis.lower().rstrip(".") in {
+        "generated by llm swarm", "generated by strategy lab", "strategy lab experiment"
+    }
+    parts = [f"Strategy Lab experiment {subject} recorded this hypothesis: {hypothesis}"]
+    if generic_hypothesis:
+        parts.append(
+            "That hypothesis text is underspecified and does not identify a reusable market rule on its own."
+        )
+    if strategy_logic and set(raw_strategy_logic) - {"type"}:
+        parts.append(f"Its executable strategy contract was {strategy_logic}.")
+    elif strategy_logic:
+        parts.append(
+            f"Its executable contract recorded only {strategy_logic}, with no market, direction, or feature gates."
+        )
+    else:
+        parts.append("No executable strategy logic was persisted, so the hypothesis cannot yet be reproduced.")
+    if data_requirements:
+        parts.append(f"Required data: {data_requirements}.")
+    if risk_gates:
+        parts.append(f"Paper risk gates: {risk_gates}.")
+    parts.append(
+        f"Its current decision is {status}. It has {valid_count} valid reliable outcomes from "
+        f"{trade_count} tracked paper trades, averaging {avg}, with {win_rate} profitable and a "
+        f"worst-decile outcome of {tail}."
+    )
+    if diagnostic:
+        parts.append(
+            f"The latest generator examined {source_candidates} source candidates and emitted "
+            f"{generated_candidates}; dominant rejection evidence was {reject_reasons or 'not recorded'}."
+        )
+    if active_hours is not None:
+        parts.append(f"The evaluation covers approximately {active_hours:.1f} active hours.")
+    if venue_detail:
+        parts.append(f"The largest venue samples were {venue_detail}.")
+    if route_counts:
+        parts.append(f"Route evidence was {route_counts}.")
+    return " ".join(parts)
+
+
+def _code_evolution_summary(subject: str, data: dict) -> str:
+    status = _summary_text(data.get("status") or "unknown", 80)
+    title = _summary_text(data.get("title") or subject, 220)
+    category = _summary_text(data.get("category") or "uncategorized", 100)
+    agent = _summary_text(data.get("source_agent") or "unknown agent", 100)
+    files = _summary_list(data.get("changed_files"), 6) or "no changed files were recorded"
+    commit = _summary_text(data.get("candidate_commit") or "none", 50)
+    reason = _summary_text(data.get("promotion_reason"), 280)
+    tests = data.get("tests") if isinstance(data.get("tests"), dict) else {}
+    stages = _summary_list(list(tests.keys()), 6) or "no test-stage summary"
+    summary = (
+        f"Code-evolution proposal {subject}, titled '{title}', was produced by {agent} for category "
+        f"{category}. Final status: {status}. It targeted {files}. Candidate commit: {commit}. "
+        f"Recorded validation stages: {stages}."
+    )
+    if reason:
+        summary += f" Promotion or disposition reason: {reason}."
+    return summary
+
+
+def _recommendation_summary(subject: str, data: dict) -> str:
+    agent = _summary_text(data.get("agent_name") or "unknown agent", 100)
+    action = _summary_text(data.get("action") or "unspecified action", 100)
+    title = _summary_text(data.get("title") or subject, 220)
+    status = _summary_text(data.get("status") or "unknown", 80)
+    rationale = _summary_text(data.get("rationale"), 330)
+    proposed = _summary_text(data.get("proposed_change"), 330)
+    target = _summary_text(data.get("signal_key") or data.get("market_key"), 180)
+    downstream = data.get("downstream_code") if isinstance(data.get("downstream_code"), list) else []
+    downstream_text = ", ".join(
+        f"{item.get('proposal_id')}={item.get('status')}"
+        for item in downstream[:4]
+        if isinstance(item, dict)
+    )
+    summary = (
+        f"Agent recommendation {subject} came from {agent} as action {action}. It proposed "
+        f"'{title}' and currently has pipeline status {status}."
+    )
+    if target:
+        summary += f" The targeted market or signal was {target}."
+    if rationale:
+        summary += f" Reasoning: {rationale}"
+    if proposed:
+        summary += f" Intended implementation: {proposed}"
+    if downstream_text:
+        summary += f" Downstream code results: {downstream_text}."
+    elif status in {"accepted", "pending"}:
+        summary += " No downstream code proposal has been recorded yet."
+    return summary
+
+
+def _self_improvement_summary(subject: str, data: dict) -> str:
+    hypothesis = _summary_text(data.get("hypothesis") or "No hypothesis text was recorded.", 320)
+    signal_key = _summary_text(data.get("signal_key") or "unknown signal", 180)
+    task_type = _summary_text(data.get("task_type") or "unknown task type", 100)
+    status = _summary_text(data.get("status") or "unknown", 80)
+    decision = _summary_text(data.get("decision") or "not decided", 100)
+    reflection = _summary_text(data.get("reflection"), 300)
+    evaluation = data.get("evaluation") if isinstance(data.get("evaluation"), dict) else {}
+    evaluation_text = _summary_mapping(evaluation, 5)
+    summary = (
+        f"Self-improvement experiment {subject} tested {task_type} against {signal_key}. "
+        f"Hypothesis: {hypothesis} Current status: {status}; decision: {decision}."
+    )
+    if evaluation_text:
+        summary += f" Measured evaluation: {evaluation_text}."
+    if reflection:
+        summary += f" Recorded reflection: {reflection}"
+    return summary
+
+
+def _market_health_summary(fact_type: str, subject: str, predicate: str, data: dict, detail: str) -> str:
+    status = _summary_text(data.get("data_status") or data.get("status") or detail or predicate, 180)
+    symbol = _summary_text(data.get("symbol") or data.get("inst_id"), 100)
+    source_url = _summary_text(data.get("source_url") or data.get("url"), 180)
+    latency = _summary_number(data.get("latency_ms"))
+    quality = _summary_number(data.get("quality_score"))
+    spread = _summary_bps(data.get("spread_bps"))
+    freshness = _summary_number(data.get("data_age_seconds") or data.get("age_seconds"))
+    parts = [f"Market-data memory for {subject}: {predicate}. Latest observed status: {status}."]
+    if symbol:
+        parts.append(f"The observation concerned {symbol}.")
+    measures: list[str] = []
+    if latency is not None:
+        measures.append(f"latency {latency:.0f} ms")
+    if quality is not None:
+        measures.append(f"quality score {quality:.1f}/100")
+    if spread:
+        measures.append(f"spread {spread}")
+    if freshness is not None:
+        measures.append(f"data age {freshness:.1f} seconds")
+    if measures:
+        parts.append("Measured data context: " + ", ".join(measures) + ".")
+    if source_url:
+        parts.append(f"Evidence source: {source_url}.")
+    if fact_type == "venue_health" and predicate == "is_unreachable":
+        parts.append("This is a data-access condition, not evidence that a trading strategy lost money.")
+    return " ".join(parts)
+
+
+def _route_summary(data: dict) -> str:
+    statuses = data.get("by_route_status") if isinstance(data.get("by_route_status"), dict) else data
+    status_text = _summary_mapping(statuses, 6) or "no route-status counts were available"
+    blockers = data.get("by_missing_requirement") if isinstance(data.get("by_missing_requirement"), dict) else {}
+    blocker_text = _summary_mapping(blockers, 6)
+    actions = data.get("top_manual_actions") if isinstance(data.get("top_manual_actions"), list) else []
+    action_text = "; ".join(
+        f"{item.get('requirement_id')} affects {item.get('count')} opportunities and suggests "
+        f"{_summary_text(item.get('suggested_action'), 170)}"
+        for item in actions[:3]
+        if isinstance(item, dict)
+    )
+    summary = f"Execution-route state across the current candidate set: {status_text}."
+    if blocker_text:
+        summary += f" The leading unresolved requirements are {blocker_text}."
+    if action_text:
+        summary += f" Highest-unlock actions: {action_text}."
+    summary += " Conditional and blocked counts describe feasibility, not strategy profitability."
+    return summary
+
+
 def _memory_summary(fact_type: str, subject: str, predicate: str, object_value: str, metadata: dict) -> str:
     provided = metadata.get("memory_summary") or metadata.get("summary_text")
     if provided:
-        return str(provided)[:1800]
-    detail = str(object_value or "")
-    if detail.startswith("{") or detail.startswith("["):
-        decoded = _decode(detail, None)
-        if decoded is not None:
-            detail = _json(decoded)
-    return f"{fact_type}: {subject} {predicate} {detail}"[:1800]
+        return _summary_text(provided, 1800)
+    decoded = _decode(object_value, None)
+    data: dict = {}
+    if isinstance(decoded, dict):
+        data.update(decoded)
+    if isinstance(metadata, dict):
+        data.update(metadata)
+
+    if fact_type == "signal_performance":
+        return _signal_performance_summary(subject, data)[:1800]
+    if fact_type == "strategy_lab_evaluation":
+        return _strategy_lab_summary(subject, data)[:1800]
+    if fact_type == "code_evolution_outcome":
+        return _code_evolution_summary(subject, data)[:1800]
+    if fact_type in {"recommendation_outcome", "agent_recommendation", "hunter_directive"}:
+        return _recommendation_summary(subject, data)[:1800]
+    if fact_type in {"self_improvement_outcome", "self_improvement_evaluation"}:
+        return _self_improvement_summary(subject, data)[:1800]
+    if fact_type in {"venue_health", "frontier_crypto_venue", "market_admission"}:
+        return _market_health_summary(fact_type, subject, predicate, data, object_value)[:1800]
+    if fact_type == "route_resolver":
+        return _route_summary(data)[:1800]
+    if fact_type in {"signal_stat", "contextual_failure", "performance_summary"}:
+        context = _summary_mapping(data, 9)
+        return (
+            f"Measured {fact_type.replace('_', ' ')} for {subject}: {predicate}. "
+            f"The current evidence says {context or _summary_text(object_value, 700)}. "
+            "Treat this as measured context for the named lineage, not as a universal market rule."
+        )[:1800]
+    if fact_type in {"self_improvement_policy", "contextual_failure_policy"}:
+        context = _summary_mapping(data, 8)
+        return (
+            f"Paper-policy memory for {subject}: {predicate}. {context or _summary_text(object_value, 700)}. "
+            "This records a bounded paper behavior change and does not enable live trading."
+        )[:1800]
+
+    context = _summary_mapping(data, 8)
+    detail = context or _summary_text(object_value, 900)
+    return (
+        f"{fact_type.replace('_', ' ').title()} concerning {subject}: {predicate}. "
+        f"Relevant recorded context: {detail}."
+    )[:1800]
 
 
 def ensure_temporal_schema(conn: sqlite3.Connection) -> dict:
@@ -556,6 +885,11 @@ def _refresh_strategy_lab(conn: sqlite3.Connection, cfg: dict) -> int:
             "version": row.get("version"),
             "status": row.get("status"),
             "hypothesis": row.get("hypothesis"),
+            "experiment_type": row.get("experiment_type"),
+            "strategy_logic": _decode(row.get("strategy_logic_json"), {}),
+            "data_requirements": _decode(row.get("data_requirements_json"), {}),
+            "risk_gates": _decode(row.get("risk_gates_json"), {}),
+            "promotion_rules": _decode(row.get("promotion_rules_json"), {}),
             "source_agent": row.get("source_agent"),
             "source_recommendation_id": row.get("source_recommendation_id"),
             "evaluation": evaluation,
@@ -653,6 +987,10 @@ def _refresh_recommendations(conn: sqlite3.Connection, cfg: dict) -> int:
             "agent_name": payload_data.get("agent_name"),
             "market_key": payload_data.get("market_key"),
             "signal_key": payload_data.get("signal_key"),
+            "rationale": row.get("rationale") or payload_data.get("rationale"),
+            "proposed_change": payload_data.get("proposed_change"),
+            "evidence": payload_data.get("evidence"),
+            "frontier_escalation_reason": payload_data.get("frontier_escalation_reason"),
             "downstream_code": downstream_items,
         }
         promoted = any(item.get("status") in {"promoted", "kept"} for item in downstream_items)
@@ -1166,6 +1504,9 @@ def record_swarm_reflection(conn: sqlite3.Connection, state: dict, cycle_id: str
             "market_key": rec.get("market_key"),
             "signal_key": rec.get("signal_key"),
             "rationale": rec.get("rationale"),
+            "proposed_change": rec.get("proposed_change"),
+            "evidence": rec.get("evidence"),
+            "frontier_escalation_reason": rec.get("frontier_escalation_reason"),
         }
         upsert_memory_fact(
             conn,

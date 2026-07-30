@@ -337,6 +337,185 @@ class TemporalMemoryTests(unittest.TestCase):
             status = graphiti_status({"agent_memory": {"graphiti": {"mode": "auto"}}})
         self.assertEqual(status["status"], "waiting_for_graph_backend")
 
+    def test_signal_performance_memory_is_descriptive_prose(self) -> None:
+        evidence = {
+            "venue": "OKX",
+            "trade_type": "perp_funding_basis",
+            "direction": "funding_capture_long_perp",
+            "horizon_minutes": 60,
+            "valid_labels": 57,
+            "avg_pnl_bps": 31.1,
+            "win_rate": 0.571,
+            "worst_decile_bps": -38.4,
+            "best_bps": 181.2,
+            "worst_bps": -74.8,
+        }
+        upsert_memory_fact(
+            self.conn,
+            "signal_performance",
+            "OKX|perp_funding_basis|funding_capture_long_perp|standard",
+            "has_reliable_60m_outcomes",
+            json.dumps(evidence),
+            0.95,
+            "paper_outcome_engine",
+            evidence,
+            namespace="outcomes",
+            outcome=evidence,
+        )
+
+        memory = retrieve_role_memories(
+            self.conn,
+            {"signal_stats": [{"signal_key": "OKX|perp_funding_basis"}]},
+            "cross_market_researcher",
+            {"agent_memory": {"retrieval_limit_per_agent": 1}},
+            cycle_id="descriptive-signal",
+        )[0]
+
+        self.assertIn("57 valid labels", memory["summary"])
+        self.assertIn("average net outcome was +31.10 bps", memory["summary"])
+        self.assertIn("57.1% of labels were profitable", memory["summary"])
+        self.assertIn("instrument, session, liquidity, and regime slices", memory["summary"])
+        self.assertNotIn('{"avg_pnl_bps"', memory["summary"])
+
+    def test_strategy_and_code_memories_explain_evidence_and_result(self) -> None:
+        strategy_payload = {
+            "strategy_lab_id": "lab-regional-reversal",
+            "status": "retired_bad_evidence",
+            "hypothesis": "Buy verified regional dislocations only when local FX and depth agree.",
+            "strategy_logic": {
+                "type": "candidate_filter",
+                "allowed_regions": ["Africa", "LATAM"],
+                "min_quality_score": 75,
+            },
+            "data_requirements": {"requires_verified_depth": True, "requires_fresh_fx": True},
+            "risk_gates": {"max_spread_bps": 12, "paper_only": True},
+            "evaluation": {
+                "active_hours": 52,
+                "outcomes": {
+                    "trade_count": 34,
+                    "valid_count": 31,
+                    "metrics": {
+                        "count": 31,
+                        "avg_pnl_bps": -12.5,
+                        "win_rate": 0.419,
+                        "worst_decile_pnl_bps": -61.2,
+                    },
+                    "by_venue": {
+                        "LUNO": {"count": 20, "avg_pnl_bps": -18.0, "win_rate": 0.35},
+                        "VALR": {"count": 11, "avg_pnl_bps": -2.5, "win_rate": 0.545},
+                    },
+                    "route_status_counts": {"standard": 22, "conditional": 12},
+                },
+            },
+        }
+        upsert_memory_fact(
+            self.conn,
+            "strategy_lab_evaluation",
+            "lab-regional-reversal",
+            "retired_bad_evidence",
+            json.dumps(strategy_payload),
+            0.94,
+            "strategy_lab",
+            strategy_payload,
+            namespace="strategies",
+        )
+        code_payload = {
+            "proposal_id": "proposal-42",
+            "title": "Wire regional depth quality into paper scoring",
+            "source_agent": "build_planner",
+            "category": "paper_scoring_logic",
+            "status": "promoted",
+            "changed_files": ["src/frontier_data_quality.py", "tests/test_frontier_data_quality.py"],
+            "candidate_commit": "abc123",
+            "tests": {"focused": {"passed": True}, "full_regression": {"passed": True}},
+            "promotion_reason": "Candidate passed sandbox gates.",
+        }
+        upsert_memory_fact(
+            self.conn,
+            "code_evolution_outcome",
+            "proposal-42",
+            "promoted",
+            json.dumps(code_payload),
+            0.98,
+            "code_evolution",
+            code_payload,
+            namespace="code",
+        )
+
+        rows = {
+            row["namespace"]: row["summary"]
+            for row in self.conn.execute(
+                "select namespace, summary from temporal_memories where subject in (?, ?)",
+                ("lab-regional-reversal", "proposal-42"),
+            )
+        }
+        self.assertIn("recorded this hypothesis", rows["strategies"])
+        self.assertIn("executable strategy contract", rows["strategies"])
+        self.assertIn("min quality score: 75", rows["strategies"])
+        self.assertIn("requires verified depth: True", rows["strategies"])
+        self.assertIn("31 valid reliable outcomes", rows["strategies"])
+        self.assertIn("LUNO: -18.00 bps across 20 labels", rows["strategies"])
+        self.assertIn("Wire regional depth quality", rows["code"])
+        self.assertIn("src/frontier_data_quality.py", rows["code"])
+        self.assertIn("focused, full_regression", rows["code"])
+
+    def test_recommendation_and_route_memories_are_actionable_text(self) -> None:
+        recommendation = {
+            "agent_name": "market_scout",
+            "action": "request_market_adapter",
+            "title": "Add public price discovery for a regional exchange",
+            "status": "accepted",
+            "market_key": "regional_equities",
+            "rationale": "The exchange publishes no-key quotes and the current map lacks this country.",
+            "proposed_change": "Create a read-only adapter and feed normalized observations into paper review.",
+            "downstream_code": [],
+        }
+        upsert_memory_fact(
+            self.conn,
+            "recommendation_outcome",
+            "recommendation-7",
+            "accepted",
+            json.dumps(recommendation),
+            0.9,
+            "llm_recommendation_pipeline",
+            recommendation,
+            namespace="recommendations",
+        )
+        route = {
+            "by_route_status": {"standard": 42, "conditional": 29, "blocked": 179},
+            "by_missing_requirement": {"spot_borrow": 27, "prediction_markets_account": 2},
+            "top_manual_actions": [
+                {
+                    "requirement_id": "spot_borrow",
+                    "count": 27,
+                    "suggested_action": "Confirm borrow support or retain the paper proxy.",
+                }
+            ],
+        }
+        upsert_memory_fact(
+            self.conn,
+            "route_resolver",
+            "execution_routes",
+            "has_route_summary",
+            json.dumps(route["by_route_status"]),
+            0.9,
+            "route_resolver",
+            route,
+            namespace="routes",
+        )
+
+        recommendation_text = self.conn.execute(
+            "select summary from temporal_memories where subject='recommendation-7'"
+        ).fetchone()["summary"]
+        route_text = self.conn.execute(
+            "select summary from temporal_memories where subject='execution_routes'"
+        ).fetchone()["summary"]
+        self.assertIn("The exchange publishes no-key quotes", recommendation_text)
+        self.assertIn("Create a read-only adapter", recommendation_text)
+        self.assertIn("No downstream code proposal has been recorded yet", recommendation_text)
+        self.assertIn("spot borrow: 27", route_text)
+        self.assertIn("feasibility, not strategy profitability", route_text)
+
 
 class LangGraphMemoryTests(unittest.TestCase):
     def test_role_specific_memory_reaches_each_agent_and_checkpoint_is_explicit(self) -> None:
