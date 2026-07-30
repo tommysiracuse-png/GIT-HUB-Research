@@ -280,6 +280,72 @@ def _proxy_map(settings: dict | None = None) -> dict[str, list[dict[str, Any]]]:
     return DEFAULT_PROXY_MAP
 
 
+def _paper_scope_instrument_family(execution_surface: str) -> str:
+    surface = str(execution_surface or "").strip().lower()
+    if not surface:
+        return "unknown"
+    if "adr" in surface:
+        return "adr"
+    if "proxy" in surface:
+        return "proxy"
+    if "equity" in surface:
+        return "equity"
+    if "volatility" in surface:
+        return "volatility"
+    if "metal" in surface or "commodity" in surface:
+        return "commodity"
+    if "credit" in surface:
+        return "credit"
+    if "fx" in surface:
+        return "fx"
+    return surface.replace(" ", "_")
+
+
+def _paper_scope_direction_family(discovery: dict[str, Any], proxy: dict[str, Any], execution_surface: str) -> str:
+    explicit = str(proxy.get("direction_family") or discovery.get("direction_family") or "").strip().lower()
+    if explicit:
+        return explicit.replace(" ", "_")
+    surface = str(execution_surface or "").strip().lower()
+    if "short" in surface and "long" not in surface:
+        return "short_only"
+    if "long" in surface and "short" not in surface:
+        return "long_only"
+    return "undirected"
+
+
+def _paper_strategy_surface_scope(discovery: dict[str, Any], proxy: dict[str, Any]) -> dict[str, Any]:
+    execution_surface = str(proxy.get("cohort_surface") or proxy.get("surface") or discovery.get("surface_type_classified") or "unknown")
+    direction_family = _paper_scope_direction_family(discovery, proxy, execution_surface)
+    scope = {
+        "venue": _venue_key(str(discovery.get("venue_or_source") or "unknown")),
+        "instrument_family": _paper_scope_instrument_family(execution_surface),
+        "direction_family": direction_family,
+        "execution_surface": execution_surface,
+        "exact_match_required": True,
+        "paper_only": True,
+        "replay_policy": "exact_declared_surface_only",
+        "scope_mismatch_action": "refuse_reuse",
+        "validation_status": "paper_invalid_until_fresh_target_surface_validation",
+    }
+    scope["scope_key"] = "|".join(
+        [
+            scope["venue"],
+            scope["instrument_family"],
+            scope["direction_family"],
+            scope["execution_surface"],
+        ]
+    )
+    return scope
+
+
+def _decorate_target_surface_scope(discovery: dict[str, Any], proxy: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    scope = _paper_strategy_surface_scope(discovery, proxy)
+    return (
+        {**discovery, "paper_strategy_surface_scope": scope, "paper_strategy_surface_scope_key": scope["scope_key"]},
+        {**proxy, "paper_strategy_surface_scope": scope, "paper_strategy_surface_scope_key": scope["scope_key"]},
+    )
+
+
 def _required_target(inst_id: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
     if ":" not in inst_id:
         return None
@@ -308,7 +374,10 @@ def _required_target(inst_id: str) -> tuple[dict[str, Any], dict[str, Any]] | No
             "confidence": 1.0,
         }
     )
-    return discovery, {"symbol": symbol, "label": f"required open instrument {symbol}", "surface": "required_open_trade"}
+    return _decorate_target_surface_scope(
+        discovery,
+        {"symbol": symbol, "label": f"required open instrument {symbol}", "surface": "required_open_trade"},
+    )
 
 
 def _build_targets(
@@ -332,7 +401,7 @@ def _build_targets(
             inst_id = f"{_venue_key(venue)}:{symbol}"
             if inst_id in seen_inst_ids:
                 continue
-            targets.append((discovery, proxy))
+            targets.append(_decorate_target_surface_scope(discovery, proxy))
             seen_inst_ids.add(inst_id)
 
     for cohort in ACTIVE_PAPER_COHORT if bool(cfg.get("active_paper_cohort_enabled", False)) else ():
@@ -342,7 +411,16 @@ def _build_targets(
         if inst_id in seen_inst_ids:
             for index, (discovery, proxy) in enumerate(targets):
                 if f"{_venue_key(str(discovery.get('venue_or_source') or 'unknown'))}:{proxy.get('symbol')}" == inst_id:
-                    targets[index] = (discovery, {**proxy, "active_paper_cohort": True, "cohort_surface": cohort["surface"]})
+                    targets[index] = _decorate_target_surface_scope(
+                        discovery,
+                        {
+                            **proxy,
+                            "active_paper_cohort": True,
+                            "cohort_surface": cohort["surface"],
+                        },
+                    )
+                    break
+            else:
                     break
             continue
         discovery = normalize_market_candidate(
@@ -366,7 +444,7 @@ def _build_targets(
             }
         )
         targets.append(
-            (
+            _decorate_target_surface_scope(
                 discovery,
                 {
                     "symbol": symbol,
