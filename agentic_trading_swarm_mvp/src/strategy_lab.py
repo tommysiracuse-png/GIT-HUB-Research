@@ -660,6 +660,10 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
     allowed_directions = _as_list(logic.get("directions") or logic.get("allowed_directions"))
     allowed_regions = _as_list(logic.get("regions") or logic.get("allowed_regions"))
     allowed_asset_classes = _as_list(logic.get("asset_classes") or logic.get("allowed_asset_classes"))
+    if str(candidate.get("direction") or "").lower() == "watch_only" and not (
+        bool(logic.get("allow_watch_only")) or "watch_only" in set(allowed_directions)
+    ):
+        reasons.append("watch_only_not_paper_testable")
     if not _allowed(candidate.get("trade_type"), allowed_trade_types):
         reasons.append("trade_type_not_allowed")
     if not _allowed(candidate.get("venue"), allowed_venues):

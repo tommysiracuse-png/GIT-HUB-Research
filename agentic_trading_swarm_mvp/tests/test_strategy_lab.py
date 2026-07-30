@@ -191,6 +191,19 @@ class StrategyLabTest(unittest.TestCase):
         self.assertEqual(1, len(generated), report)
         self.assertEqual("field_alias_lab_v1", generated[0]["strategy_lab_id"])
 
+    def test_candidate_generation_does_not_treat_watch_only_as_paper_testable(self):
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                base_settings(),
+                [candidate(direction="watch_only", score=100.0)],
+            )
+
+        self.assertEqual([], generated)
+        reasons = report["reject_reasons_by_experiment"]["okx_spot_survivor_lab_v1"]
+        self.assertIn("watch_only_not_paper_testable", reasons)
+
     def test_zero_output_is_truthfully_diagnosed_and_can_recover(self):
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, lab_rec())

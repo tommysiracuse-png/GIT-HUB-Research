@@ -80,10 +80,10 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
 
     def test_review_reserve_selects_distinct_lab_experiments(self):
         candidates = [
-            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "score": 99},
-            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "score": 98},
-            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "score": 80},
-            {"strategy_lab_id": "lab_c", "strategy_lab_logic_type": "candidate_filter", "score": 70},
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "direction": "long_proxy", "score": 99},
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "direction": "long_proxy", "score": 98},
+            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "direction": "long_proxy", "score": 80},
+            {"strategy_lab_id": "lab_c", "strategy_lab_logic_type": "candidate_filter", "direction": "long_proxy", "score": 70},
         ]
 
         selected, summary = self.reserve_review_candidates(
@@ -95,6 +95,16 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
         self.assertEqual(["lab_a", "lab_b"], [row["strategy_lab_id"] for row in selected])
         self.assertEqual(2, summary["reserved_count"])
         self.assertTrue(all(row["_hunter_allocation_reason"] == "strategy_lab_distinct_experiment_reserve" for row in selected))
+
+    def test_review_reserve_excludes_watch_only_candidates(self):
+        selected, summary = self.reserve_review_candidates(
+            [{"strategy_lab_id": "lab_watch", "strategy_lab_logic_type": "candidate_filter", "direction": "watch_only", "score": 100}],
+            {"strategy_lab": {"runtime_review_reserved_slots": 5}},
+            total_slots=25,
+        )
+
+        self.assertEqual([], selected)
+        self.assertEqual(0, summary["reserved_count"])
 
 
 if __name__ == "__main__":  # pragma: no cover

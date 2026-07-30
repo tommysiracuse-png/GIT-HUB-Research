@@ -179,6 +179,8 @@ def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: di
         strategy_lab_id = str(candidate.get("strategy_lab_id") or "").strip()
         if not strategy_lab_id or strategy_lab_id in selected_experiments:
             continue
+        if str(candidate.get("direction") or "").lower() == "watch_only":
+            continue
         if not _is_strategy_lab_candidate_filter(candidate):
             continue
         row = dict(candidate)
