@@ -235,10 +235,18 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
         "mismatch_fields": [],
         "source_context": {},
         "target_context": {},
+        "required_fields": ["venue_class", "market_surface", "direction", "data_source_class"],
+        "missing_fields": [],
+        "evidence_eligible": True,
+        "sample_size": None,
+        "min_sample_size": None,
+        "sample_guard_passed": True,
+        "promotion_delta_scale": 1.0,
     }
     if not isinstance(route_status, dict):
         return review
 
+    required_fields = set(review["required_fields"])
     review["enabled"] = _paper_only_strategy_lab_exact_context_guard_enabled(config, context_review=context_review)
     origin_tokens = []
     for value in (
@@ -259,11 +267,31 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
     review["exact_context_required"] = bool(review["enabled"] and review["applies"])
     if not review["exact_context_required"]:
         return review
+    if not isinstance(context_review, dict) or not context_review.get("enabled"):
+        review["match"] = False
+        review["block_promotion"] = True
+        review["reason"] = "strategy_lab_context_evidence_missing"
+        review["promotion_delta_scale"] = 0.0
+        return review
+
+    review["evidence_eligible"] = bool(context_review.get("eligible", True))
+    review["sample_size"] = _paper_only_route_review_float(context_review.get("sample_size"))
+    review["min_sample_size"] = _paper_only_route_review_float(context_review.get("min_sample_size"))
+    if review["sample_size"] is not None and review["min_sample_size"] is not None:
+        review["sample_guard_passed"] = review["sample_size"] >= review["min_sample_size"]
 
     field_aliases = {
+        "venue_class": {
+            "source": ("source_venue_class", "recommendation_venue_class", "promotion_venue_class", "venue_class"),
+            "target": ("target_venue_class", "venue_class", "execution_venue_class"),
+        },
         "venue_family": {
             "source": ("source_venue_family", "recommendation_venue_family", "promotion_venue_family", "venue_family"),
             "target": ("target_venue_family", "venue_family", "execution_venue_family", "venue", "execution_venue"),
+        },
+        "market_surface": {
+            "source": ("source_market_surface", "recommendation_market_surface", "promotion_market_surface", "source_execution_surface", "recommendation_execution_surface", "promotion_execution_surface"),
+            "target": ("target_market_surface", "market_surface", "execution_surface", "surface", "market_surface", "market_type"),
         },
         "execution_surface": {
             "source": ("source_execution_surface", "recommendation_execution_surface", "promotion_execution_surface"),
@@ -277,6 +305,14 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
                 "source_strategy_family",
             ),
             "target": ("target_directional_template", "directional_template", "strategy_family", "candidate_family", "strategy"),
+        },
+        "direction": {
+            "source": ("source_direction", "recommendation_direction", "promotion_direction", "source_side", "recommendation_side", "promotion_side"),
+            "target": ("target_direction", "direction", "side", "signal_side", "candidate_direction", "recommended_side", "position_side", "position_direction"),
+        },
+        "data_source_class": {
+            "source": ("source_data_source_class", "recommendation_data_source_class", "promotion_data_source_class", "data_source_class", "source_data_source", "data_source"),
+            "target": ("target_data_source_class", "data_source_class", "market_data_source_class", "market_data_source", "quote_source", "data_source"),
         },
         "market_regime_tag": {
             "source": ("source_market_regime_tag", "recommendation_market_regime_tag", "promotion_market_regime_tag"),
@@ -293,13 +329,37 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
         target_text = _paper_only_safe_route_tag(target_value)
         review["source_context"][field_name] = source_text
         review["target_context"][field_name] = target_text
+        if field_name in required_fields:
+            if not source_text:
+                review["missing_fields"].append(f"source:{field_name}")
+            if not target_text:
+                review["missing_fields"].append(f"target:{field_name}")
         if source_text and target_text and source_text != target_text:
             review["match"] = False
             review["mismatch_fields"].append(field_name)
 
+    if review["missing_fields"]:
+        review["block_promotion"] = True
+        review["reason"] = "strategy_lab_exact_context_incomplete"
+        review["promotion_delta_scale"] = 0.0
+        return review
+
     if not review["match"]:
         review["block_promotion"] = True
         review["reason"] = "strategy_lab_exact_context_mismatch"
+        review["promotion_delta_scale"] = 0.0
+        return review
+
+    if context_review.get("matched") is False or not review["evidence_eligible"]:
+        review["block_promotion"] = True
+        review["reason"] = "strategy_lab_context_evidence_ineligible"
+        review["promotion_delta_scale"] = 0.0
+        return review
+
+    if not review["sample_guard_passed"]:
+        review["block_promotion"] = True
+        review["reason"] = "strategy_lab_context_evidence_sample_guard"
+        review["promotion_delta_scale"] = 0.0
     return review
 def _paper_only_route_guard_min_liquidity_enabled(config):
     if not isinstance(config, dict):
