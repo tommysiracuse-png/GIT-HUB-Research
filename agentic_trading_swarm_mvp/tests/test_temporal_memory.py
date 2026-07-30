@@ -178,6 +178,65 @@ class TemporalMemoryTests(unittest.TestCase):
         self.assertTrue(any(item["temporal_relation"] == "previous_version" for item in scout + builder))
         self.assertTrue(all(len(item["summary"]) <= 800 for item in scout + builder))
 
+    def test_role_namespace_reservations_prevent_high_score_crowding(self) -> None:
+        for index in range(30):
+            upsert_memory_fact(
+                self.conn,
+                "strategy_lab_evaluation",
+                f"STRATEGY_{index}",
+                "promote_candidate",
+                "high scoring strategy evidence",
+                0.99,
+                "strategy_lab",
+                {},
+                namespace="strategies",
+                importance=1.0,
+                outcome_score=1.0,
+                commit=False,
+            )
+        for index in range(8):
+            upsert_memory_fact(
+                self.conn,
+                "venue_health",
+                f"VENUE_{index}",
+                "is_reachable",
+                "public venue market adapter",
+                0.8,
+                "market_discovery",
+                {},
+                namespace="markets",
+                importance=0.45,
+                commit=False,
+            )
+        upsert_memory_fact(
+            self.conn,
+            "route_resolver",
+            "execution_routes",
+            "has_route_summary",
+            "route requirements",
+            0.8,
+            "route_resolver",
+            {},
+            namespace="routes",
+            importance=0.45,
+            commit=False,
+        )
+        self.conn.commit()
+        settings = {
+            "agent_memory": {
+                "enabled": True,
+                "retrieval_limit_per_agent": 12,
+                "retrieval_candidate_pool": 80,
+                "preferred_namespace_fraction": 0.67,
+            }
+        }
+        scout = retrieve_role_memories(self.conn, {}, "market_scout", settings, cycle_id="scout")
+        route = retrieve_role_memories(self.conn, {}, "execution_route_hunter", settings, cycle_id="route")
+
+        self.assertGreaterEqual(sum(item["namespace"] == "markets" for item in scout), 4)
+        self.assertTrue(any(item["namespace"] == "routes" for item in route))
+        self.assertGreaterEqual(sum(item["namespace"] == "markets" for item in route), 3)
+
     def test_reflection_links_memory_and_outcomes_update_utility(self) -> None:
         memory = upsert_memory_fact(
             self.conn,

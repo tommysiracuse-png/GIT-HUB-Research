@@ -1006,22 +1006,51 @@ def retrieve_role_memories(
     scored.sort(key=lambda item: item["relevance_score"], reverse=True)
 
     selected: list[dict] = []
+    selected_ids: set[str] = set()
     namespace_counts: Counter[str] = Counter()
     fact_counts: Counter[str] = Counter()
     max_per_namespace = max(4, int(math.ceil(limit * 0.42)))
     max_per_fact = max(3, int(math.ceil(limit * 0.30)))
+    preferred_target = min(
+        limit,
+        max(1, int(math.ceil(limit * float(cfg.get("preferred_namespace_fraction", 0.67))))),
+    )
+    preferred_queues = {
+        namespace: [item for item in scored if item["namespace"] == namespace]
+        for namespace in policy["namespaces"]
+    }
+    while len(selected) < preferred_target:
+        added = False
+        for namespace in policy["namespaces"]:
+            queue = preferred_queues[namespace]
+            while queue and queue[0]["memory_id"] in selected_ids:
+                queue.pop(0)
+            if not queue:
+                continue
+            item = queue.pop(0)
+            selected.append(item)
+            selected_ids.add(item["memory_id"])
+            namespace_counts[item["namespace"]] += 1
+            fact_counts[item["fact_type"]] += 1
+            added = True
+            if len(selected) >= preferred_target:
+                break
+        if not added:
+            break
     for item in scored:
+        if item["memory_id"] in selected_ids:
+            continue
         if namespace_counts[item["namespace"]] >= max_per_namespace:
             continue
         if fact_counts[item["fact_type"]] >= max_per_fact:
             continue
         selected.append(item)
+        selected_ids.add(item["memory_id"])
         namespace_counts[item["namespace"]] += 1
         fact_counts[item["fact_type"]] += 1
         if len(selected) >= limit:
             break
     if len(selected) < limit:
-        selected_ids = {item["memory_id"] for item in selected}
         for item in scored:
             if item["memory_id"] in selected_ids:
                 continue
