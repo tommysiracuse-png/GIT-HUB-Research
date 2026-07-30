@@ -147,7 +147,29 @@ DEFAULT_GLOBAL_DISCOVERY_SEEDS: list[dict[str, Any]] = [
             "shadow_mode": {
                 "enabled": True,
                 "baseline": "proxy_generated_jse_candidates",
+                "baseline_signal_key": "JOHANNESBURG_STOCK_EXCHANGE|global_market_discovery_proxy|long_proxy|standard",
+                "shadow_compare_days": 14,
                 "comparison_goal": "compare venue-native JSE discovery candidates against current proxy-generated JSE ideas before any broader frontier-equity rollout",
+            },
+            "quality_gates": {
+                "maximum_freshness_minutes": 20,
+                "max_spread_bps": 250.0,
+                "liquidity_gate": {
+                    "require_any": ["turnover_proxy", "volume_proxy"],
+                    "min_present_fields": 1,
+                },
+                "quote_delay_allowed": True,
+                "required_fields": ["session_timestamp", "freshness_minutes"],
+            },
+            "scoring_policy": {
+                "paper_only": True,
+                "channel": "paper_discovery_only",
+                "use_for_live_trades": False,
+                "requires_quality_gate_pass": True,
+            },
+            "expansion_policy": {
+                "broader_africa_venue_expansion_blocked": True,
+                "requires_quality_gate_pass": True,
             },
             "scope_limit": "benchmark_or_top_liquid_names_only",
             "normalized_fields": [
