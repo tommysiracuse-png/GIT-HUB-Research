@@ -282,6 +282,8 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
         "min_sample_size": None,
         "sample_guard_passed": True,
         "promotion_delta_scale": 1.0,
+        "cross_context_tag": False,
+        "cross_context_validated": False,
     }
     if not isinstance(route_status, dict):
         return review
@@ -308,6 +310,12 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
     if not review["exact_context_required"]:
         return review
     if not isinstance(context_review, dict) or not context_review.get("enabled"):
+        cross_context_tag_value = _paper_only_route_context_value(
+            route_status,
+            ("cross_context_tag", "allow_cross_context", "allow_cross_context_inheritance", "paper_cross_context_tag", "paper_only_cross_context_tag"),
+            nested_keys=("promotion_context", "recommendation_context", "recommendation_metadata", "strategy_lab_context", "strategy_metadata"),
+        )
+        review["cross_context_tag"] = bool(_paper_only_route_review_bool(cross_context_tag_value))
         review["match"] = False
         review["block_promotion"] = True
         review["reason"] = "strategy_lab_context_evidence_missing"
@@ -318,6 +326,11 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
     review["sample_size"] = _paper_only_route_review_float(context_review.get("sample_size"))
     review["min_sample_size"] = _paper_only_route_review_float(context_review.get("min_sample_size"))
     if review["sample_size"] is not None and review["min_sample_size"] is not None:
+        cross_context_tag_value = _paper_only_route_context_value(
+            route_status,
+            ("cross_context_tag", "allow_cross_context", "allow_cross_context_inheritance", "paper_cross_context_tag", "paper_only_cross_context_tag"),
+            nested_keys=("promotion_context", "recommendation_context", "recommendation_metadata", "strategy_lab_context", "strategy_metadata"),
+        )
         review["sample_guard_passed"] = review["sample_size"] >= review["min_sample_size"]
 
     field_aliases = {
@@ -360,6 +373,7 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
         },
     }
     nested_source_keys = ("strategy_lab_context", "source_context", "promotion_context", "recommendation_context", "recommendation_metadata")
+    review["cross_context_tag"] = bool(_paper_only_route_review_bool(cross_context_tag_value))
     nested_target_keys = ("target_context", "recommendation_context", "recommendation_metadata", "strategy_metadata")
 
     for field_name, aliases in field_aliases.items():
@@ -385,9 +399,23 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
         return review
 
     if not review["match"]:
-        review["block_promotion"] = True
-        review["reason"] = "strategy_lab_exact_context_mismatch"
-        review["promotion_delta_scale"] = 0.0
+        if not review["cross_context_tag"]:
+            review["block_promotion"] = True
+            review["reason"] = "strategy_lab_exact_context_mismatch"
+            review["promotion_delta_scale"] = 0.0
+            return review
+        if context_review.get("matched") is False or not review["evidence_eligible"]:
+            review["block_promotion"] = True
+            review["reason"] = "strategy_lab_cross_context_evidence_ineligible"
+            review["promotion_delta_scale"] = 0.0
+            return review
+        if not review["sample_guard_passed"]:
+            review["block_promotion"] = True
+            review["reason"] = "strategy_lab_cross_context_sample_guard"
+            review["promotion_delta_scale"] = 0.0
+            return review
+        review["cross_context_validated"] = True
+        review["reason"] = "strategy_lab_cross_context_validated"
         return review
 
     if context_review.get("matched") is False or not review["evidence_eligible"]:
@@ -401,6 +429,8 @@ def _paper_only_strategy_lab_context_transfer_review(route_status, *, context_re
         review["reason"] = "strategy_lab_context_evidence_sample_guard"
         review["promotion_delta_scale"] = 0.0
     return review
+
+
 def _paper_only_route_guard_min_liquidity_enabled(config):
     if not isinstance(config, dict):
         return False
