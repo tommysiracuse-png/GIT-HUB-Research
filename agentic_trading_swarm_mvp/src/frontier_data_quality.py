@@ -1,5 +1,32 @@
 import datetime as dt
 
+_PAPER_ONLY_ROUTE_INTELLIGENCE = {
+    "OKX": {
+        "broker_surface": "okx",
+        "api_surface": "public_market_data",
+        "spot_short_support": "paper_shadow_only",
+        "perp_support": "supported",
+        "basis_support": "supported",
+        "fee_reference": "public_taker_fee_schedule",
+    },
+    "OKX_SPOT": {
+        "broker_surface": "okx_spot",
+        "api_surface": "public_market_data",
+        "spot_short_support": "paper_shadow_only",
+        "perp_support": "unsupported",
+        "basis_support": "unsupported",
+        "fee_reference": "public_spot_taker_fee_schedule",
+    },
+    "GATE": {
+        "broker_surface": "gate",
+        "api_surface": "public_market_data",
+        "spot_short_support": "paper_shadow_only",
+        "perp_support": "unknown",
+        "basis_support": "unknown",
+        "fee_reference": "public_fee_schedule",
+    },
+}
+
 
 def _paper_only_freshness_now():
     return dt.datetime.now(dt.timezone.utc)
