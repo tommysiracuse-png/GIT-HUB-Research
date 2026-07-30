@@ -365,9 +365,13 @@ class StrategyLabTest(unittest.TestCase):
                     mock.patch("strategy_lab.REPORT_MD", tmp_path / "strategy_lab_report.md")
                 ):
                     report = write_strategy_lab_reports(conn)
+            repair_row = conn.execute(
+                "select experiment_type from strategy_lab_experiments where strategy_lab_id like 'repair_malformed%'"
+            ).fetchone()
 
         self.assertEqual(1, len(report["summary"]["recent_market_strategies"]))
         self.assertEqual(1, len(report["summary"]["recent_non_market_experiments"]))
+        self.assertEqual("system_repair", repair_row["experiment_type"])
 
 
 if __name__ == "__main__":

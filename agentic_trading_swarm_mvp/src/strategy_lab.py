@@ -1098,6 +1098,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
 
 
 def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
+    _backfill_experiment_types(conn)
     rows = conn.execute(
         """
         select strategy_lab_id, version, parent_strategy_lab_id, status, hypothesis,
@@ -1110,17 +1111,37 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         (int(limit),),
     ).fetchall()
     items = []
-    status_counts: Counter = Counter()
-    type_counts: Counter = Counter()
+    recent_status_counts: Counter = Counter()
     for row in rows:
         item = dict(row)
         logic = _json_loads(item.pop("strategy_logic_json"), {})
         item["experiment_type"] = _resolved_experiment_type(item.get("experiment_type"), item, logic)
         item["evaluation"] = _json_loads(item.pop("evaluation_json"), {})
-        status_counts[item["status"]] += 1
-        type_counts[item["experiment_type"]] += 1
+        recent_status_counts[item["status"]] += 1
         items.append(item)
     total = conn.execute("select count(*) as n from strategy_lab_experiments").fetchone()
+    status_counts = {
+        row["status"]: int(row["n"])
+        for row in conn.execute(
+            """
+            select status, count(*) as n
+            from strategy_lab_experiments
+            group by status
+            order by n desc
+            """
+        ).fetchall()
+    }
+    type_counts = {
+        (row["experiment_type"] or DEFAULT_EXPERIMENT_TYPE): int(row["n"])
+        for row in conn.execute(
+            """
+            select experiment_type, count(*) as n
+            from strategy_lab_experiments
+            group by experiment_type
+            order by n desc
+            """
+        ).fetchall()
+    }
     generated_candidates = 0
     if REPORT_JSON.exists():
         latest = _json_loads(REPORT_JSON.read_text(encoding="utf-8"), {})
@@ -1129,6 +1150,7 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         "enabled": True,
         "total_experiments": int(total["n"] if total else 0),
         "status_counts": dict(status_counts),
+        "recent_status_counts": dict(recent_status_counts),
         "by_experiment_type": dict(type_counts),
         "recent": items,
         "recent_market_strategies": [
@@ -1142,14 +1164,43 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
     }
 
 
+def _backfill_experiment_types(conn: sqlite3.Connection) -> int:
+    rows = conn.execute(
+        """
+        select strategy_lab_id, experiment_type, status, hypothesis, strategy_logic_json
+        from strategy_lab_experiments
+        """
+    ).fetchall()
+    updates: list[tuple[str, str]] = []
+    for row in rows:
+        item = dict(row)
+        logic = _json_loads(item.pop("strategy_logic_json"), {})
+        resolved = _resolved_experiment_type(item.get("experiment_type"), item, logic)
+        if resolved != _normalize_experiment_type(item.get("experiment_type")):
+            updates.append((resolved, item["strategy_lab_id"]))
+    if updates:
+        conn.executemany(
+            """
+            update strategy_lab_experiments
+            set experiment_type = ?
+            where strategy_lab_id = ?
+            """,
+            updates,
+        )
+        conn.commit()
+    return len(updates)
+
+
 def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None = None, evaluation: dict | None = None) -> dict:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    backfilled_experiment_type_count = _backfill_experiment_types(conn)
     summary = strategy_lab_summary(conn)
     report = {
         "generated_at": _utc(),
         "summary": summary,
         "generation": generation or {},
         "evaluation": evaluation or {},
+        "backfilled_experiment_type_count": backfilled_experiment_type_count,
     }
     REPORT_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
     lines = [
