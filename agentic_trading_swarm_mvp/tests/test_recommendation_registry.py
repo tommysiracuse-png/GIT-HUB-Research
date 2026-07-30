@@ -167,6 +167,57 @@ class RecommendationRegistryTests(unittest.TestCase):
             self.conn.execute("select status from improvement_tasks where id = ?", (task_id,)).fetchone()[0],
         )
 
+    def test_reconcile_closes_task_with_exact_promoted_code_title(self) -> None:
+        task_id = self.conn.execute(
+            "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 93, ?, '', 'open') returning id",
+            ("LLM: Add context-inheritance guard for Strategy Lab variants",),
+        ).fetchone()[0]
+        self.conn.execute(
+            """
+            insert into code_evolution_proposals (
+                proposal_id, created_at, updated_at, title, category, priority, status,
+                payload_json, evidence_json, changed_files_json, safety_json, tests_json,
+                evaluation_json, candidate_commit
+            ) values ('code_evolution:test', 'now', 'now', ?, 'paper_scoring_logic', 93,
+                      'promoted', '{}', '{}', '[]', '{}', '{}', '{}', 'abc123')
+            """,
+            ("Add context-inheritance guard for Strategy Lab variants",),
+        )
+
+        result = reconcile_deployed_artifacts(self.conn)
+
+        self.assertEqual(1, result["closed_count"])
+        self.assertEqual(
+            "implemented_by_promoted_code_evolution",
+            self.conn.execute("select status from improvement_tasks where id = ?", (task_id,)).fetchone()[0],
+        )
+        self.assertEqual("abc123", result["closed"][0]["implementation_commit"])
+
+    def test_reconcile_does_not_close_paraphrase_without_exact_promoted_title(self) -> None:
+        task_id = self.conn.execute(
+            "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 93, ?, '', 'open') returning id",
+            ("Add broader context inheritance to Strategy Lab",),
+        ).fetchone()[0]
+        self.conn.execute(
+            """
+            insert into code_evolution_proposals (
+                proposal_id, created_at, updated_at, title, category, priority, status,
+                payload_json, evidence_json, changed_files_json, safety_json, tests_json,
+                evaluation_json, candidate_commit
+            ) values ('code_evolution:test', 'now', 'now', ?, 'paper_scoring_logic', 93,
+                      'promoted', '{}', '{}', '[]', '{}', '{}', '{}', 'abc123')
+            """,
+            ("Add context-inheritance guard for Strategy Lab variants",),
+        )
+
+        result = reconcile_deployed_artifacts(self.conn)
+
+        self.assertEqual(0, result["closed_count"])
+        self.assertEqual(
+            "open",
+            self.conn.execute("select status from improvement_tasks where id = ?", (task_id,)).fetchone()[0],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

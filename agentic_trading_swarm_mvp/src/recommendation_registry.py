@@ -430,26 +430,48 @@ def _matches_deployed_capability(payload: Mapping[str, Any], category: str) -> b
     return False
 
 
+def _normalized_artifact_title(value: Any) -> str:
+    title = _normalized(value)
+    return re.sub(r"^llm\s*:\s*", "", title).strip()
+
+
+def _promoted_code_titles(conn: sqlite3.Connection) -> dict[str, dict[str, str]]:
+    promoted: dict[str, dict[str, str]] = {}
+    for row in conn.execute(
+        """
+        select proposal_id, title, candidate_commit
+        from code_evolution_proposals
+        where status = 'promoted' and candidate_commit is not null
+        """
+    ).fetchall():
+        title = _normalized_artifact_title(row["title"])
+        if title:
+            promoted[title] = {
+                "proposal_id": str(row["proposal_id"]),
+                "candidate_commit": str(row["candidate_commit"]),
+            }
+    return promoted
+
+
 def reconcile_deployed_artifacts(conn: sqlite3.Connection) -> dict[str, Any]:
     """Close artifacts already satisfied by a deployed, DB-recorded capability."""
     available = {
         category for category in DEPLOYED_CAPABILITIES
         if _deployed_capability_exists(conn, category)
     }
+    promoted_titles = _promoted_code_titles(conn)
     closed: list[dict[str, Any]] = []
     for table, (query, payload_builder) in ARTIFACT_QUERIES.items():
         for row in conn.execute(query).fetchall():
             payload = {**payload_builder(row), "_artifact_table": table}
-            category = next(
-                (
-                    candidate for candidate in sorted(available)
-                    if _matches_deployed_capability(payload, candidate)
-                ),
+            promoted = promoted_titles.get(_normalized_artifact_title(payload.get("title") or payload.get("hypothesis")))
+            category = "promoted_code_evolution" if promoted else next(
+                (candidate for candidate in sorted(available) if _matches_deployed_capability(payload, candidate)),
                 None,
             )
             if not category:
                 continue
-            status = f"superseded_by_implemented_{category}"
+            status = "implemented_by_promoted_code_evolution" if promoted else f"superseded_by_implemented_{category}"
             changed = conn.execute(
                 f"update {table} set status = ? where id = ? and status = 'open'",
                 (status, row["id"]),
@@ -467,8 +489,18 @@ def reconcile_deployed_artifacts(conn: sqlite3.Connection) -> dict[str, Any]:
                     str(topic["topic_key"]),
                     status,
                     implemented_category=category,
+                    implementation_commit=promoted.get("candidate_commit") if promoted else None,
                 )
-            closed.append({"table": table, "id": row["id"], "category": category, "status": status})
+            closed.append(
+                {
+                    "table": table,
+                    "id": row["id"],
+                    "category": category,
+                    "status": status,
+                    "proposal_id": promoted.get("proposal_id") if promoted else None,
+                    "implementation_commit": promoted.get("candidate_commit") if promoted else None,
+                }
+            )
     reconciled_total_by_category: dict[str, int] = {}
     for category in sorted(available):
         status = f"superseded_by_implemented_{category}"
@@ -476,6 +508,10 @@ def reconcile_deployed_artifacts(conn: sqlite3.Connection) -> dict[str, Any]:
             int(conn.execute(f"select count(*) from {table} where status = ?", (status,)).fetchone()[0])
             for table in ARTIFACT_QUERIES
         )
+    reconciled_total_by_category["promoted_code_evolution"] = sum(
+        int(conn.execute(f"select count(*) from {table} where status = 'implemented_by_promoted_code_evolution'").fetchone()[0])
+        for table in ARTIFACT_QUERIES
+    )
     return {
         "available_categories": sorted(available),
         "closed_count": len(closed),
