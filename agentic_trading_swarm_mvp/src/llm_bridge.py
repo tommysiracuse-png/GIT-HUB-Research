@@ -181,6 +181,8 @@ GLOBAL_MARKET_DISCOVERY_IMPLEMENTED_TERMS = (
     "singapore exchange",
     "intercontinental exchange",
     "saudi exchange",
+    "tadawul all share index",
+    "tasi",
     "london metal exchange",
 )
 
