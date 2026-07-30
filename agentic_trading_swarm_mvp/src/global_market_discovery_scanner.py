@@ -243,6 +243,7 @@ def load_discovery_candidates(settings: dict | None = None) -> list[dict[str, An
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            item = normalize_market_candidate(item, created_at=str(item.get("created_at") or _utc_now()))
             candidate_id = _discovery_identity(item)
             if candidate_id and candidate_id in seen:
                 continue

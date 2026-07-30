@@ -111,7 +111,8 @@ class ResearchWorkerTests(unittest.TestCase):
                 "venue_or_source": "London Stock Exchange",
                 "asset_or_event": "UK equities and ADR relationships",
                 "public_docs_url": "https://example.com/lse",
-                "recommended_next_action": "growth_experiment",
+                "data_access_type": "public_no_key",
+                "recommended_next_action": "adapter_spec",
                 "priority": 82,
             }
         )
@@ -122,10 +123,10 @@ class ResearchWorkerTests(unittest.TestCase):
             {"research_worker": {"suppress_implemented_global_discovery_artifacts": True}},
         )
 
-        self.assertEqual(created[0]["type"], "growth_experiment")
+        self.assertEqual(created[0]["type"], "adapter_spec")
         self.assertTrue(created[0]["inserted"])
         open_rows = conn.execute("select * from growth_experiments where status='open'").fetchall()
-        self.assertEqual(len(open_rows), 1)
+        self.assertEqual(open_rows, [])
         conn.close()
 
     def test_new_global_discovery_artifact_still_gets_created(self) -> None:
@@ -260,7 +261,14 @@ class ResearchWorkerTests(unittest.TestCase):
         reconciled = research_worker.reconcile_discovery_route_lifecycle(conn)
         self.assertEqual(reconciled["reopened_legacy_route_probes"], 1)
         self.assertEqual(reconciled["open_global_route_probes"], 1)
+        self.assertEqual(research_worker.create_downstream_artifacts(conn, [candidate], {}), [])
         conn.close()
+
+    def test_five_point_model_priority_is_normalized_to_artifact_scale(self) -> None:
+        self.assertEqual(research_worker._normalize_priority(5), 90)
+        self.assertEqual(research_worker._normalize_priority(4), 82)
+        self.assertEqual(research_worker._normalize_priority(3), 74)
+        self.assertEqual(research_worker._normalize_priority(75), 75)
 
 
 if __name__ == "__main__":

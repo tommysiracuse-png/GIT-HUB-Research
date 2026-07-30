@@ -952,7 +952,7 @@ def _candidate_ledger_rows(path: pathlib.Path | None = None) -> list[dict[str, A
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict):
-            rows.append(payload)
+            rows.append(normalize_market_candidate(payload, created_at=str(payload.get("created_at") or _utc_now())))
     return rows
 
 
@@ -1008,7 +1008,7 @@ def _research_prompt(themes: list[dict[str, str]], known: list[dict[str, Any]], 
                 "latency_sensitivity": "low|medium|high|unknown",
                 "liquidity_hint": "what the source indicates",
                 "route_blockers": ["unknown or documented blockers"],
-                "priority": 1,
+                "priority": "integer 1-100 opportunity priority; this is not a 1-5 rank",
                 "confidence": 0.0,
             }
         ],
@@ -1201,6 +1201,16 @@ def _candidate_id(item: dict[str, Any]) -> str:
     return "gmd_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
+def _normalize_priority(value: object) -> int:
+    try:
+        priority = float(value or 50)
+    except (TypeError, ValueError):
+        priority = 50.0
+    if 0.0 < priority <= 5.0:
+        priority = 50.0 + (priority * 8.0)
+    return max(1, min(100, int(round(priority))))
+
+
 def _classify_surface(raw: str) -> str:
     text = raw.lower()
     if "crypto" in text:
@@ -1274,7 +1284,7 @@ def normalize_market_candidate(seed: dict[str, Any], *, created_at: str | None =
         "route_blockers": [str(item) for item in seed.get("route_blockers", [])],
         "recommended_next_action": str(seed.get("recommended_next_action") or ""),
         "recommended_next_actions": list(seed.get("recommended_next_actions") or []),
-        "priority": max(1, min(100, int(seed.get("priority") or 50))),
+        "priority": _normalize_priority(seed.get("priority")),
         "confidence": round(max(0.0, min(1.0, float(seed.get("confidence") or 0.5))), 3),
         "source_validation_status": str(seed.get("source_validation_status") or "seed_or_configured_source"),
         "discovered_by": str(seed.get("discovered_by") or "configured_seed"),
@@ -1362,6 +1372,39 @@ def _source_evidence(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _artifact_exists(conn: sqlite3.Connection, action: str, source_id: str, candidate: dict[str, Any]) -> bool:
+    if action == "adapter_spec":
+        return conn.execute(
+            "select 1 from adapter_specs where source_recommendation_id = ? limit 1",
+            (source_id,),
+        ).fetchone() is not None
+    if action == "route_probe":
+        return conn.execute(
+            """
+            select 1 from route_probe_tasks
+            where source_recommendation_id = ? and probe_type = 'global_market_route_feasibility'
+            limit 1
+            """,
+            (source_id,),
+        ).fetchone() is not None
+    if action == "growth_experiment":
+        hypothesis = f"Explore {candidate['venue_or_source']} {candidate['asset_or_event']}"
+        return conn.execute(
+            "select 1 from growth_experiments where hypothesis = ? limit 1",
+            (hypothesis,),
+        ).fetchone() is not None
+    if action in {"hunter_directive", "watchlist"}:
+        return conn.execute(
+            """
+            select 1 from market_hunter_directives
+            where market_key = ? and directive = 'global_market_discovery'
+            limit 1
+            """,
+            (f"global_discovery|{candidate['venue_or_source']}",),
+        ).fetchone() is not None
+    return False
+
+
 def create_downstream_artifacts(conn: sqlite3.Connection, candidates: list[dict[str, Any]], settings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     cfg = (settings or {}).get("research_worker", {})
     priority_floor = int(cfg.get("artifact_priority_floor", 70))
@@ -1379,6 +1422,8 @@ def create_downstream_artifacts(conn: sqlite3.Connection, candidates: list[dict[
         for action in actions:
             if len(created) >= max_artifacts:
                 break
+            if _artifact_exists(conn, action, source_id, candidate):
+                continue
             created_item: dict[str, Any] | None = None
             if action == "adapter_spec":
                 inserted = add_adapter_spec(
@@ -1435,7 +1480,7 @@ def create_downstream_artifacts(conn: sqlite3.Connection, candidates: list[dict[
                     evidence,
                 )
                 created_item = {"type": "market_hunter_directive", "inserted": conn.total_changes > before}
-            if created_item:
+            if created_item and created_item.get("inserted"):
                 created.append(
                     {
                         **created_item,
@@ -1615,8 +1660,16 @@ def run_once(
         include_bootstrap=include_bootstrap,
     )
     ledger = _append_new_candidates(candidates)
-    new_ids = set(ledger.get("new_candidate_ids", []))
-    artifact_candidates = [candidate for candidate in candidates if candidate.get("candidate_id") in new_ids]
+    artifact_pool = {
+        str(candidate.get("candidate_id")): candidate
+        for candidate in [*known_candidates, *candidates]
+        if candidate.get("candidate_id")
+    }
+    artifact_candidates = sorted(
+        artifact_pool.values(),
+        key=lambda row: (int(row.get("priority") or 0), float(row.get("confidence") or 0.0)),
+        reverse=True,
+    )
     owns_conn = conn is None
     if owns_conn:
         conn = connect()

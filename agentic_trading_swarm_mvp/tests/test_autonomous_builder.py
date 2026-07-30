@@ -18,6 +18,10 @@ from cost_router import ModelResult
 
 
 class AutonomousBuilderTests(unittest.TestCase):
+    def test_windows_pid_probe_system_error_is_treated_as_not_alive(self) -> None:
+        with mock.patch.object(autonomous_builder.os, "kill", side_effect=SystemError("win32 pid probe")):
+            self.assertFalse(autonomous_builder._pid_alive(999999))
+
     def _patch_report_paths(self, tmp: str):
         old_json = autonomous_builder.REPORT_JSON
         old_md = autonomous_builder.REPORT_MD
