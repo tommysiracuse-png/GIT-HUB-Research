@@ -308,6 +308,13 @@ def _apply_route_feasibility_metadata(candidate: Mapping[str, Any]) -> dict[str,
     if cell:
         annotated["paper_signal_cell"] = cell
         annotated["paper_signal_cell_key"] = cell.get("cell_key")
+    lineage_context = _paper_lineage_context(annotated)
+    if lineage_context:
+        annotated["paper_lineage_context"] = lineage_context
+        annotated["paper_lineage_context_key"] = lineage_context.get("context_key")
+        annotated["paper_lineage_inherited_boost_allowed"] = lineage_context.get(
+            "inherited_score_boost_allowed"
+        )
     return annotated
 
 
@@ -372,6 +379,10 @@ def _candidate_reference(candidate: Mapping[str, Any]) -> dict[str, Any]:
     if cell:
         reference["paper_signal_cell_key"] = cell.get("cell_key")
         reference["paper_signal_cell"] = cell
+    lineage_context = _paper_lineage_context(candidate)
+    if lineage_context:
+        reference["paper_lineage_context_key"] = lineage_context.get("context_key")
+        reference["paper_lineage_context"] = lineage_context
     return reference
 
 
@@ -398,6 +409,21 @@ def _paper_signal_cell(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
 
     try:
         record = _paper_signal_cell_record(candidate)
+    except Exception:
+        return None
+    if isinstance(record, Mapping):
+        return dict(record)
+    return None
+
+
+def _paper_lineage_context(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    try:
+        from strategy_reliability import paper_lineage_context as _paper_lineage_context_record
+    except Exception:
+        return None
+
+    try:
+        record = _paper_lineage_context_record(dict(candidate))
     except Exception:
         return None
     if isinstance(record, Mapping):

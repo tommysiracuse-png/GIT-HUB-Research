@@ -145,10 +145,124 @@ PAPER_CELL_SCOPE_SCOPES = (
     "strategy_reliability",
 )
 
+PAPER_LINEAGE_ID_FIELDS = (
+    "lineage_id",
+    "strategy_lineage_id",
+    "lineage_key",
+    "strategy_lineage_key",
+    "family_lineage_id",
+)
+PAPER_LINEAGE_OBSERVATION_COUNT_FIELDS = (
+    "target_context_paper_observation_count",
+    "paper_context_observation_count",
+    "paper_observation_count",
+    "completed_paper_trades",
+    "paper_trade_count",
+)
+PAPER_LINEAGE_WIN_COUNT_FIELDS = (
+    "target_context_paper_win_count",
+    "paper_context_win_count",
+    "paper_win_count",
+    "completed_paper_wins",
+    "paper_positive_outcome_count",
+)
+PAPER_HOLDING_PROFILE_FIELDS = (
+    "holding_profile",
+    "paper_holding_profile",
+    "holding_period_profile",
+    "holding_period_bucket",
+    "horizon_profile",
+)
+
 
 def _paper_cell_text(value: Any, default: str = "unknown") -> str:
     text = str(value or "").strip()
     return text or default
+
+
+def _paper_lineage_text(value: Any, default: str = "unknown") -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    return text.replace(" ", "_")
+
+
+def _paper_first_present_int(candidate: dict[str, Any], fields: tuple[str, ...]) -> int | None:
+    for field in fields:
+        value = candidate.get(field)
+        if value in (None, ""):
+            continue
+        try:
+            numeric = int(float(value))
+        except (TypeError, ValueError):
+            continue
+        return numeric
+    return None
+
+
+def _paper_lineage_id(candidate: dict[str, Any]) -> str:
+    for field in PAPER_LINEAGE_ID_FIELDS:
+        text = _paper_lineage_text(candidate.get(field), default="")
+        if text:
+            return text
+    for field in ("signal_family", "strategy_id", "strategy", "signal_key", "variant_id", "variant"):
+        text = _paper_lineage_text(candidate.get(field), default="")
+        if text:
+            return text
+    return "unknown"
+
+
+def _paper_holding_profile(candidate: dict[str, Any]) -> str:
+    for field in PAPER_HOLDING_PROFILE_FIELDS:
+        text = _paper_lineage_text(candidate.get(field), default="")
+        if text:
+            return text
+
+    minutes = _paper_first_present_int(
+        candidate,
+        ("expected_hold_minutes", "max_holding_minutes", "holding_minutes", "paper_holding_minutes"),
+    )
+    if minutes is not None:
+        if minutes <= 240:
+            return "intraday"
+        if minutes <= 1440:
+            return "overnight"
+        if minutes <= 4320:
+            return "swing"
+        return "multi_day"
+
+    haystack = " ".join(
+        str(candidate.get(field) or "")
+        for field in ("signal_key", "trade_type", "strategy", "variant", "context_key")
+    ).lower()
+    for profile in ("scalp", "intraday", "overnight", "swing", "multi_day", "multi-day"):
+        if profile in haystack:
+            return profile.replace("-", "_")
+    return "unknown"
+
+
+def paper_lineage_context(candidate: dict[str, Any], minimum_threshold: int = 1) -> dict[str, Any]:
+    """Return a strict paper-only lineage partition record for score carryover."""
+    threshold = max(int(minimum_threshold or 1), 1)
+    observation_count = _paper_first_present_int(candidate, PAPER_LINEAGE_OBSERVATION_COUNT_FIELDS) or 0
+    win_count = _paper_first_present_int(candidate, PAPER_LINEAGE_WIN_COUNT_FIELDS) or 0
+    record = {
+        "lineage_id": _paper_lineage_id(candidate),
+        "venue": _paper_lineage_text(candidate.get("venue")),
+        "trade_type": _paper_lineage_text(candidate.get("trade_type") or candidate.get("market_surface")),
+        "direction": _paper_cell_direction(candidate),
+        "holding_profile": _paper_holding_profile(candidate),
+    }
+    record["context_key"] = "|".join(
+        (record["lineage_id"], record["venue"], record["trade_type"], record["direction"], record["holding_profile"])
+    )
+    record["minimum_observation_threshold"] = threshold
+    record["target_context_observation_count"] = observation_count
+    record["target_context_positive_count"] = win_count
+    record["has_independent_target_context_observations"] = observation_count >= threshold
+    record["has_target_context_win_quality"] = win_count > 0
+    record["inherited_score_boost_allowed"] = observation_count >= threshold and win_count > 0
+    return record
 
 
 def _paper_cell_direction(candidate: dict[str, Any]) -> str:
