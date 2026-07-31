@@ -238,6 +238,31 @@ def _paper_only_route_intelligence_venue(record, surface, tokens):
     return None
 
 
+def _paper_only_route_intelligence_basis_mode(record, tokens):
+    direct = _paper_only_route_intelligence_tag(
+        _paper_only_route_intelligence_first(
+            record,
+            ("basis_mode", "basis_variant", "carry_mode", "basis_subfamily"),
+        )
+    )
+    if direct in {"funding_capture", "perp_funding_basis", "carry"}:
+        return "funding_capture"
+    if direct in {
+        "spot_legged",
+        "spot_legged_basis",
+        "long_perp_short_spot",
+        "short_perp_long_spot",
+    }:
+        return "spot_legged"
+    if direct in {"convergence", "basis_convergence", "mean_reversion"}:
+        return "convergence"
+    if "funding_capture" in tokens or "perp_funding_basis" in tokens:
+        return "funding_capture"
+    if any(token in tokens for token in ("long_perp_short_spot", "short_perp_long_spot", "spot_legged", "spot_legged_basis")):
+        return "spot_legged"
+    return "convergence" if any(token in tokens for token in ("convergence", "basis_convergence", "mean_reversion")) else None
+
+
 def _paper_only_route_intelligence_permissions(surface, *, spot_short=False, funding_capture=False, basis_trade=False):
     ordered = []
     for permission in (
@@ -286,9 +311,14 @@ def paper_only_route_requirement_profile(record):
     surface = _paper_only_route_intelligence_surface(record, tokens)
     direction = _paper_only_route_intelligence_direction(record, tokens)
     venue = _paper_only_route_intelligence_venue(record, surface, tokens)
+    basis_mode = _paper_only_route_intelligence_basis_mode(record, tokens)
     conditional = "conditional" in tokens
-    funding_capture = any(token in tokens for token in ("funding_capture", "perp_funding_basis"))
-    basis_trade = any(token in tokens for token in ("long_perp_short_spot", "short_perp_long_spot"))
+    funding_capture = bool(
+        basis_mode == "funding_capture" or any(token in tokens for token in ("funding_capture", "perp_funding_basis"))
+    )
+    basis_trade = bool(
+        basis_mode == "spot_legged" or any(token in tokens for token in ("long_perp_short_spot", "short_perp_long_spot"))
+    )
     spot_short = bool(
         surface == "spot"
         and (direction == "short" or "short_frontier_spot" in tokens or "short_spot" in tokens)
@@ -300,6 +330,14 @@ def paper_only_route_requirement_profile(record):
         basis_trade=basis_trade,
     )
     broker_surface = ":".join(part for part in (venue, surface) if part) or None
+    paper_context_key = "|".join(
+        (
+            venue or "unknown_venue",
+            surface or "unknown_surface",
+            direction or "neutral_direction",
+            basis_mode or "neutral_basis_mode",
+        )
+    )
     if spot_short:
         route_requirement_status = "supported_with_margin_and_borrow_requirements"
     elif funding_capture or basis_trade or surface == "perp":
@@ -316,6 +354,8 @@ def paper_only_route_requirement_profile(record):
         summary_parts.append(broker_surface)
     if conditional:
         summary_parts.append("conditional")
+    if basis_mode:
+        summary_parts.append(f"basis_mode={basis_mode}")
     if spot_short:
         summary_parts.append("spot_short_requires_margin_and_borrow")
     if funding_capture:
@@ -324,8 +364,10 @@ def paper_only_route_requirement_profile(record):
         summary_parts.append("basis_trade_requires_collateral_transfer")
     return {
         "broker_surface": broker_surface,
+        "paper_context_key": paper_context_key,
         "venue": venue,
         "market_surface": surface,
+        "basis_mode": basis_mode,
         "direction": direction,
         "conditional": conditional,
         "api_surface": "public_market_data_only",
