@@ -154,6 +154,7 @@ _PAPER_ONLY_SPREAD_VOLATILITY_GATE_FLAG = "paper_only_spread_volatility_gate_v1"
 _PAPER_ONLY_SHADOW_DIRECTION_INVERSION_FLAG = "paper_only_shadow_direction_inversion_v1"
 _PAPER_ONLY_OKX_CARRY_ALIGNMENT_GATE_FLAG = "paper_only_okx_carry_alignment_gate_v1"
 _PAPER_ONLY_FRONTIER_ROUTE_QUALITY_PROMOTION_FLAG = "paper_only_frontier_route_quality_promotion_v1"
+_PAPER_ONLY_STRATEGY_LAB_SURFACE_LINEAGE_FLAG = "paper_only_strategy_lab_surface_lineage_v1"
 
 
 def _paper_only_route_review_text(value):
@@ -264,6 +265,185 @@ def _paper_only_route_quality_lookup(value, *keys):
     return None
 
 
+def _paper_only_surface_token(value):
+    token = _paper_only_route_signal_token(value)
+    return token or None
+
+
+def _paper_only_transfer_policy_explicit(value):
+    if value is True:
+        return True
+    token = _paper_only_route_signal_token(value)
+    return token in {
+        "explicit",
+        "allow",
+        "allowed",
+        "validated",
+        "approved",
+        "permitted",
+        "cross_surface_allowed",
+        "cross_surface_validated",
+        "native_or_validated",
+        "same_or_validated",
+    }
+
+
+def _paper_only_strategy_lab_surface_lineage_review(value, metrics, *, explicit_confidence=None):
+    if not isinstance(value, dict):
+        return None
+
+    strategy_lab_marker = _paper_only_route_quality_lookup(
+        value,
+        "lab_id",
+        "strategy_lab_id",
+        "strategy_lab_signal_id",
+        "strategy_lab_candidate",
+        "strategy_lab_signal",
+    )
+    origin_surface = _paper_only_surface_token(
+        _paper_only_route_quality_lookup(value, "origin_surface", "source_surface", "home_surface")
+    )
+    target_surface = _paper_only_surface_token(
+        _paper_only_route_quality_lookup(value, "target_surface", "candidate_surface", "execution_surface")
+    )
+    transfer_policy_value = _paper_only_route_quality_lookup(
+        value, "transfer_policy", "surface_transfer_policy", "cross_surface_policy"
+    )
+    transfer_policy = _paper_only_route_signal_token(transfer_policy_value)
+
+    if strategy_lab_marker in (None, "", [], {}, ()) and not any(
+        item is not None for item in (origin_surface, target_surface, transfer_policy)
+    ):
+        return None
+
+    quote_age_seconds = metrics.get("quote_age_seconds")
+    liquidity_usd = metrics.get("liquidity_usd")
+    market_quality_score = metrics.get("market_quality_score")
+
+    max_quote_age_seconds = (
+        _paper_only_route_review_float(
+            _paper_only_route_quality_lookup(
+                value,
+                "max_quote_age_seconds",
+                "max_staleness_seconds",
+                "freshness_limit_seconds",
+            )
+        )
+        or 60.0
+    )
+    min_liquidity_usd = (
+        _paper_only_route_review_float(
+            _paper_only_route_quality_lookup(
+                value,
+                "min_liquidity_usd",
+                "min_depth_usd",
+                "min_book_depth_usd",
+            )
+        )
+        or 25000.0
+    )
+    min_behavior_consistency = (
+        _paper_only_route_review_float(
+            _paper_only_route_quality_lookup(
+                value,
+                "min_behavior_consistency",
+                "min_behavior_consistency_score",
+                "behavior_consistency_floor",
+            )
+        )
+        or 0.6
+    )
+
+    explicit_behavior_bool = _paper_only_route_review_bool(
+        _paper_only_route_quality_lookup(
+            value,
+            "behavior_consistency_passed",
+            "behavior_match",
+            "surface_behavior_match",
+        )
+    )
+    explicit_behavior_score = _paper_only_route_review_float(
+        _paper_only_route_quality_lookup(
+            value,
+            "behavior_consistency",
+            "behavior_consistency_score",
+            "surface_behavior_consistency",
+            "behavior_match_score",
+        )
+    )
+    if explicit_behavior_score is not None and 1.0 < explicit_behavior_score <= 100.0:
+        explicit_behavior_score /= 100.0
+
+    if explicit_behavior_bool is not None:
+        behavior_consistency_passed = explicit_behavior_bool
+    elif explicit_behavior_score is not None:
+        behavior_consistency_passed = explicit_behavior_score >= min_behavior_consistency
+    else:
+        behavior_consistency_passed = (
+            market_quality_score is not None and market_quality_score >= min_behavior_consistency
+        )
+
+    freshness_passed = quote_age_seconds is not None and quote_age_seconds <= max_quote_age_seconds
+    liquidity_passed = liquidity_usd is not None and liquidity_usd >= min_liquidity_usd
+    same_surface = bool(origin_surface and target_surface and origin_surface == target_surface)
+    explicit_cross_surface = _paper_only_transfer_policy_explicit(transfer_policy_value)
+
+    review = {
+        "flag": _PAPER_ONLY_STRATEGY_LAB_SURFACE_LINEAGE_FLAG,
+        "applies": True,
+        "origin_surface": origin_surface,
+        "target_surface": target_surface,
+        "transfer_policy": transfer_policy,
+        "same_surface": same_surface,
+        "explicit_cross_surface": explicit_cross_surface,
+        "freshness_passed": freshness_passed,
+        "liquidity_passed": liquidity_passed,
+        "behavior_consistency_passed": behavior_consistency_passed,
+        "confidence": None if explicit_confidence is None else max(0.0, min(1.0, explicit_confidence)),
+    }
+    if not origin_surface or not target_surface:
+        review.update(
+            {
+                "eligible": False,
+                "blocked": True,
+                "reason": "missing_lineage_metadata",
+                "confidence": 0.0,
+            }
+        )
+        return review
+    if same_surface:
+        review.update(
+            {
+                "eligible": True,
+                "blocked": False,
+                "reason": "native_surface_match",
+            }
+        )
+        return review
+    if not explicit_cross_surface:
+        review.update(
+            {
+                "eligible": False,
+                "blocked": True,
+                "reason": "cross_surface_requires_explicit_transfer_policy",
+                "confidence": 0.0,
+            }
+        )
+        return review
+    checks_passed = freshness_passed and liquidity_passed and behavior_consistency_passed
+    review.update(
+        {
+            "eligible": checks_passed,
+            "blocked": not checks_passed,
+            "reason": "cross_surface_transfer_validated"
+            if checks_passed
+            else "cross_surface_transfer_checks_failed",
+            "confidence": 1.0 if checks_passed else 0.0,
+        }
+    )
+    return review
+
+
 def _paper_only_frontier_route_quality_gate_review(value):
     if not isinstance(value, dict):
         return None
@@ -332,10 +512,19 @@ def _paper_only_frontier_route_quality_gate_review(value):
     explicit_confidence = _paper_only_route_review_float(
         _paper_only_route_quality_lookup(value, "route_confidence", "confidence", "route_quality_confidence")
     )
+    lineage_review = _paper_only_strategy_lab_surface_lineage_review(
+        value,
+        metrics,
+        explicit_confidence=explicit_confidence,
+    )
     complete = all(metric is not None for metric in metrics.values())
     if not complete:
+        if isinstance(lineage_review, dict) and lineage_review.get("blocked"):
+            review = dict(lineage_review)
+            review.setdefault("complete", False)
+            return review
         neutral_confidence = 0.5 if explicit_confidence is None else min(0.5, max(0.0, min(1.0, explicit_confidence)))
-        return {
+        review = {
             "flag": _PAPER_ONLY_FRONTIER_ROUTE_QUALITY_PROMOTION_FLAG,
             "applies": True,
             "complete": False,
@@ -344,6 +533,9 @@ def _paper_only_frontier_route_quality_gate_review(value):
             "reason": "incomplete_quality_metrics",
             "confidence": neutral_confidence,
         }
+        if isinstance(lineage_review, dict):
+            review["surface_lineage_review"] = lineage_review
+        return review
 
     checks = {
         "route_count": route_count >= (_paper_only_route_review_float(_paper_only_route_quality_lookup(value, "min_route_count", "min_routes", "min_route_richness")) or 2.0),
@@ -353,7 +545,7 @@ def _paper_only_frontier_route_quality_gate_review(value):
         "market_quality_score": market_quality_score >= (_paper_only_route_review_float(_paper_only_route_quality_lookup(value, "min_market_quality_score", "min_quality_score", "quality_floor")) or 0.5),
     }
     passed = all(checks.values())
-    return {
+    review = {
         "flag": _PAPER_ONLY_FRONTIER_ROUTE_QUALITY_PROMOTION_FLAG,
         "applies": True,
         "complete": True,
@@ -362,6 +554,21 @@ def _paper_only_frontier_route_quality_gate_review(value):
         "reason": "quality_thresholds_satisfied" if passed else "quality_threshold_failed",
         "confidence": max(0.0, min(1.0, explicit_confidence if explicit_confidence is not None and passed else (1.0 if passed else 0.0))),
     }
+    if isinstance(lineage_review, dict):
+        review["surface_lineage_review"] = lineage_review
+        if lineage_review.get("blocked"):
+            review.update(
+                {
+                    "flag": lineage_review.get("flag", review["flag"]),
+                    "eligible": False,
+                    "blocked": True,
+                    "reason": lineage_review.get("reason") or review["reason"],
+                    "confidence": 0.0,
+                }
+            )
+        elif passed and lineage_review.get("reason") == "cross_surface_transfer_validated":
+            review["reason"] = "cross_surface_transfer_validated"
+    return review
 
 
 def _paper_only_route_confidence(value, *, default=None):
