@@ -27,6 +27,133 @@ _PAPER_ONLY_ROUTE_INTELLIGENCE = {
     },
 }
 
+_PAPER_ONLY_FAMILY_DECAY_SUPPRESSION_FLAG = "paper_only_family_decay_suppression_v1"
+_PAPER_ONLY_FAMILY_DECAY_TARGET = {
+    "market_key": "YAHOO_PROXY",
+    "strategy_family": "global_proxy_momentum",
+    "family": "YAHOO_PROXY|global_proxy_momentum",
+    "latest_family_paper": {
+        "long_proxy_standard": {
+            "avg_pnl_bps": -16.225,
+            "closed_count": 176,
+            "score_adjustment": -7.861,
+            "win_rate": 0.318,
+        },
+        "short_proxy_conditional": {
+            "avg_pnl_bps": -24.614,
+            "closed_count": 171,
+            "score_adjustment": -10.755,
+            "win_rate": 0.322,
+        },
+    },
+}
+
+
+def _paper_only_family_decay_guard_review(record, config=None):
+    record_payload = record if isinstance(record, dict) else {}
+    config_payload = config if isinstance(config, dict) else {}
+
+    def _lookup(*keys):
+        for container in (record_payload, config_payload):
+            for key in keys:
+                value = container.get(key)
+                if value not in (None, "", [], {}, ()):
+                    return value
+        return None
+
+    def _token(value):
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return text or None
+
+    def _bool_value(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        token = _token(value)
+        if token in {"1", "true", "yes", "y", "on", "enabled", "allow", "allowed"}:
+            return True
+        if token in {"0", "false", "no", "n", "off", "disabled", "deny", "denied"}:
+            return False
+        return None
+
+    def _float_value(value):
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    execution_mode = _token(
+        _lookup(
+            "execution_mode",
+            "trading_mode",
+            "mode",
+            "destination_mode",
+            "runner_mode",
+        )
+    )
+    explicit_toggle = _bool_value(
+        _lookup(
+            _PAPER_ONLY_FAMILY_DECAY_SUPPRESSION_FLAG,
+            "family_decay_suppression_enabled",
+            "paper_family_decay_suppression_enabled",
+        )
+    )
+    enabled = explicit_toggle is not False
+    reason = "not_applicable"
+    if execution_mode and execution_mode not in {"paper", "paper_only", "simulation", "sim", "review"}:
+        enabled = False
+        reason = "non_paper_mode"
+    elif explicit_toggle is False:
+        reason = "guard_disabled"
+
+    market_key = str(_lookup("market_key", "signal_key", "source_market_key") or "").strip().upper() or None
+    strategy_family = _token(
+        _lookup(
+            "strategy_family",
+            "candidate_family",
+            "signal_family",
+            "family",
+            "feature_family",
+        )
+    )
+    applies = (
+        market_key == _PAPER_ONLY_FAMILY_DECAY_TARGET["market_key"]
+        and strategy_family == _PAPER_ONLY_FAMILY_DECAY_TARGET["strategy_family"]
+    )
+    blocked = bool(enabled and applies)
+    if blocked:
+        reason = "family_decay_suppressed"
+
+    attempted_direction = _token(
+        _lookup("direction", "side", "signal_side", "candidate_direction", "position_side")
+    )
+    freshness_state = _token(
+        _lookup("freshness_state", "signal_freshness", "proxy_freshness_state", "freshness")
+    ) or "unknown"
+
+    return {
+        "flag": _PAPER_ONLY_FAMILY_DECAY_SUPPRESSION_FLAG,
+        "enabled": enabled,
+        "applies": applies,
+        "blocked": blocked,
+        "eligible": not blocked,
+        "reason": reason,
+        "event": "family_decay_suppressed" if blocked else None,
+        "family": _PAPER_ONLY_FAMILY_DECAY_TARGET["family"],
+        "market_key": market_key,
+        "strategy_family": strategy_family,
+        "attempted_direction": attempted_direction,
+        "raw_score": _float_value(_lookup("raw_score", "paper_score", "score", "candidate_score")),
+        "freshness_state": freshness_state,
+        "paper_score_multiplier": 0.0 if blocked else 1.0,
+        "latest_family_paper": dict(_PAPER_ONLY_FAMILY_DECAY_TARGET["latest_family_paper"]),
+    }
+
 
 def _paper_only_freshness_now():
     return dt.datetime.now(dt.timezone.utc)

@@ -12,8 +12,9 @@ import datetime as dt
 try:
     from src.frontier_data_quality import (
         _paper_only_context_evidence_review,
-        _paper_only_parse_timestamp,
         _paper_only_cross_surface_seed_guard_review,
+        _paper_only_family_decay_guard_review,
+        _paper_only_parse_timestamp,
         paper_only_shadow_direction_inversion_review,
         paper_only_route_requirement_profile,
         paper_only_route_quality_record,
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
             _paper_only_parse_timestamp,
             paper_only_shadow_direction_inversion_review,
             paper_only_route_requirement_profile,
+            _paper_only_family_decay_guard_review,
             paper_only_route_quality_record,
         )
     except ImportError:  # pragma: no cover - route-quality enrichment becomes optional
@@ -85,6 +87,25 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "native_proxy_variant": False,
                 "cross_surface_target": False,
                 "policy": "guard_disabled",
+            }
+
+        def _paper_only_family_decay_guard_review(record, config=None):
+            return {
+                "flag": "paper_only_family_decay_suppression_v1",
+                "enabled": False,
+                "applies": False,
+                "blocked": False,
+                "eligible": True,
+                "reason": "guard_disabled",
+                "event": None,
+                "family": None,
+                "market_key": None,
+                "strategy_family": None,
+                "attempted_direction": None,
+                "raw_score": None,
+                "freshness_state": "unknown",
+                "paper_score_multiplier": 1.0,
+                "latest_family_paper": None,
             }
 
         def paper_only_shadow_direction_inversion_review(record, config=None):
@@ -495,7 +516,19 @@ def _paper_only_route_requirements_packet(route_status, profile):
         profile,
     )
     carry_alignment_review = _paper_only_okx_basis_variant_alignment_review(route_status, profile)
-    carry_alignment_review = dict(carry_alignment_review, cross_surface_seed_guard_review=cross_surface_seed_guard_review)
+    family_decay_guard_review = _paper_only_family_decay_guard_review(route_status, profile)
+    if family_decay_guard_review.get("blocked"):
+        carry_alignment_review = dict(
+            carry_alignment_review,
+            eligible=False,
+            blocked=True,
+            reason="family_decay_suppressed",
+        )
+    carry_alignment_review = dict(
+        carry_alignment_review,
+        cross_surface_seed_guard_review=cross_surface_seed_guard_review,
+        family_decay_guard_review=family_decay_guard_review,
+    )
 
     margin_available = _paper_only_route_support_bool(
         _paper_only_route_lookup(route_status, profile, "margin_available", "margin_enabled", "margin_support")
