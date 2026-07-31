@@ -92,6 +92,77 @@ def candidate(**overrides):
 
 
 class StrategyLabTest(unittest.TestCase):
+    def test_structured_frontier_refinement_compiles_without_prose_inference(self):
+        rec = {
+            "recommendation_id": "rec_structured_frontier",
+            "payload": {
+                "action": "propose_strategy_lab_experiment",
+                "title": "Isolate frontier spot longs to BITGET and GATE",
+                "rationale": "Test a paper-only venue-specific frontier long refinement.",
+                "market_key": "frontier_crypto_venue_map",
+                "proposed_change": {
+                    "asset_surface": "frontier_spot",
+                    "direction": "long_only",
+                    "include_venue_primary": "BITGET",
+                    "include_venue_secondary": "GATE",
+                },
+                "variant_config": {
+                    "variant_name": "frontier_spot_long_bitget_gate_only",
+                    "listing_freshness_max_hours": "72",
+                    "max_spread_bps": "35",
+                    "min_composite_score": "0.80",
+                    "min_liquidity_score": "0.70",
+                },
+            },
+        }
+        live_candidate = candidate(
+            venue="BITGET",
+            inst_id="ABC-USDT",
+            score=90.0,
+            liquidity_score=0.85,
+            spread_bps=5.0,
+            seen_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            row = conn.execute(
+                """
+                select experiment_type, status, strategy_logic_json
+                from strategy_lab_experiments
+                """
+            ).fetchone()
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                base_settings(),
+                [live_candidate, {**live_candidate, "venue": "OKX_SPOT"}],
+            )
+
+        logic = json.loads(row["strategy_logic_json"])
+        self.assertEqual("market_strategy", row["experiment_type"])
+        self.assertEqual("proposed", row["status"])
+        self.assertEqual(["BITGET", "GATE"], logic["venues"])
+        self.assertEqual(["long_frontier_spot"], logic["directions"])
+        self.assertEqual(1, report["generated_candidates"])
+        self.assertEqual("BITGET", generated[0]["venue"])
+
+    def test_unstructured_risk_filter_is_not_guessed_into_market_strategy(self):
+        rec = {
+            "recommendation_id": "rec_unstructured_filter",
+            "payload": {
+                "action": "propose_strategy_lab_experiment",
+                "title": "Tighten weak entries",
+                "rationale": "Filter weak and stale candidates.",
+            },
+        }
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            row = conn.execute(
+                "select experiment_type, status from strategy_lab_experiments"
+            ).fetchone()
+
+        self.assertEqual("risk_filter", row["experiment_type"])
+        self.assertEqual("rejected_invalid", row["status"])
+
     def test_swarm_contains_strategy_lab_between_researcher_and_red_team(self):
         names = [agent["name"] for agent in llm_swarm_runner.AGENTS]
         self.assertIn("strategy_lab", names)

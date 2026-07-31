@@ -471,6 +471,199 @@ def _resolved_experiment_type(stored: Any, item: dict, logic: dict) -> str:
     return stored_type or inferred
 
 
+def _explicit_values(*values: Any) -> list[str]:
+    output: list[str] = []
+    for value in values:
+        if isinstance(value, str):
+            pieces = value.replace(";", ",").split(",")
+            output.extend(piece.strip() for piece in pieces if piece.strip())
+        elif isinstance(value, (list, tuple, set)):
+            output.extend(str(item).strip() for item in value if str(item).strip())
+    return _unique(output)
+
+
+def _first_explicit(sources: list[dict], *keys: str) -> Any:
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                return value
+    return None
+
+
+def _structured_trade_type(sources: list[dict]) -> str | None:
+    raw = str(
+        _first_explicit(
+            sources,
+            "trade_type",
+            "market_key",
+            "strategy_family",
+            "asset_surface",
+            "universe",
+        )
+        or ""
+    ).strip().lower()
+    if raw in FALLBACK_TRADE_TYPE_EXAMPLES:
+        return raw
+    if raw in {"frontier_spot", "frontier_crypto", "frontier_crypto_spot"}:
+        return "frontier_crypto_venue_map"
+    if raw in {"okx_perp_funding_basis", "funding_capture", "perp_basis"}:
+        return "perp_funding_basis"
+    if raw in {"global_proxy", "country_proxy", "equity_proxy"}:
+        return "global_market_discovery_proxy"
+    if raw in {"yahoo_proxy", "proxy_momentum"}:
+        return "global_proxy_momentum"
+    if raw in {"prediction_market", "event_market"}:
+        return "prediction_market_probability"
+    return None
+
+
+def _structured_directions(sources: list[dict], trade_type: str) -> list[str]:
+    raw_values = _explicit_values(
+        *[
+            source.get(key)
+            for source in sources
+            for key in ("directions", "allowed_directions", "direction", "mode", "direction_mode")
+        ]
+    )
+    directions: list[str] = []
+    for raw in raw_values:
+        token = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        if token in FALLBACK_DIRECTION_EXAMPLES:
+            directions.append(token)
+            continue
+        is_long = token in {"long", "long_only"} or "long_only" in token
+        is_short = token in {"short", "short_only"} or "short_only" in token
+        if trade_type == "frontier_crypto_venue_map":
+            if is_long:
+                directions.append("long_frontier_spot")
+            if is_short:
+                directions.append("short_frontier_spot")
+        elif trade_type in {"global_market_discovery_proxy", "global_proxy_momentum"}:
+            if is_long:
+                directions.append("long_proxy")
+            if is_short:
+                directions.append("short_proxy")
+        elif trade_type == "perp_funding_basis" and "funding" in token:
+            if is_long:
+                directions.append("funding_capture_long_perp")
+            if is_short:
+                directions.append("funding_capture_short_perp")
+    return _unique(directions)
+
+
+def _structured_venues(sources: list[dict]) -> list[str]:
+    venues: list[str] = []
+    for source in sources:
+        venues.extend(_explicit_values(source.get("venues"), source.get("allowed_venues"), source.get("venue")))
+        venues.extend(
+            str(value).strip()
+            for key, value in source.items()
+            if key.startswith("include_venue") and value not in (None, "")
+        )
+    return _unique([venue.upper() for venue in venues if venue])
+
+
+def _structured_strategy_contract(payload: dict, proposed: dict) -> dict | None:
+    """Compile explicit model fields into the existing bounded lab contract.
+
+    This intentionally does not infer market scope from prose. It only accepts
+    structured market, direction, venue, and threshold fields supplied by the
+    agent, so new surfaces remain flexible without guessing implementation.
+    """
+
+    variant = payload.get("variant_config") if isinstance(payload.get("variant_config"), dict) else {}
+    nested_filters = variant.get("filters") if isinstance(variant.get("filters"), dict) else {}
+    sources = [nested_filters, variant, proposed, payload]
+    trade_type = _structured_trade_type(sources)
+    if not trade_type:
+        return None
+    directions = _structured_directions(sources, trade_type)
+    if not directions:
+        return None
+    venues = _structured_venues(sources)
+
+    logic: dict[str, Any] = {
+        "type": "candidate_filter",
+        "trade_types": [trade_type],
+        "directions": directions,
+    }
+    if venues:
+        logic["venues"] = venues
+
+    required_fields: list[str] = []
+    risk_gates: dict[str, Any] = {}
+    max_spread = _first_explicit(sources, "max_spread_bps", "spread_bps_max", "max_entry_spread_bps")
+    min_liquidity = _first_explicit(sources, "min_liquidity_score", "liquidity_score_floor")
+    min_score = _first_explicit(
+        sources,
+        "min_composite_score",
+        "min_score",
+        "min_confidence_score",
+        "min_confidence",
+    )
+    min_quality = _first_explicit(sources, "min_quality_score", "quality_score_floor")
+    min_edge = _first_explicit(sources, "min_edge_bps", "min_depth_adjusted_edge_bps")
+    max_stale_minutes = _first_explicit(sources, "max_stale_minutes")
+    max_age_seconds = _first_explicit(sources, "max_signal_age_seconds", "freshness_horizon_seconds")
+    max_age_hours = _first_explicit(sources, "listing_freshness_max_hours", "max_age_hours")
+    for key, value, field in (
+        ("max_spread_bps", max_spread, "spread_bps"),
+        ("min_liquidity_score", min_liquidity, "liquidity_score"),
+        ("min_score", min_score, "score"),
+        ("min_quality_score", min_quality, "quality_score"),
+        ("min_edge_bps", min_edge, "edge_bps_estimate"),
+    ):
+        if value is None:
+            continue
+        numeric = _as_float(value, math.nan)
+        if math.isfinite(numeric):
+            logic[key] = numeric
+            risk_gates[key] = numeric
+            required_fields.append(field)
+    if max_stale_minutes is None and max_age_seconds is not None:
+        max_stale_minutes = _as_float(max_age_seconds) / 60.0
+    if max_stale_minutes is None and max_age_hours is not None:
+        max_stale_minutes = _as_float(max_age_hours) * 60.0
+    if max_stale_minutes is not None:
+        stale = _as_float(max_stale_minutes, math.nan)
+        if math.isfinite(stale) and stale >= 0:
+            logic["max_stale_minutes"] = stale
+            risk_gates["max_stale_minutes"] = stale
+            required_fields.append("seen_at")
+    if required_fields:
+        logic["required_fields"] = _unique(required_fields)
+
+    variant_name = str(variant.get("variant_name") or proposed.get("variant_name") or "").strip()
+    hypothesis = str(payload.get("rationale") or proposed.get("hypothesis") or payload.get("title") or "").strip()
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "trade_type": trade_type,
+                "directions": directions,
+                "venues": venues,
+                "logic": logic,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:10]
+    strategy_lab_id = f"{_slug(variant_name or payload.get('title') or hypothesis)}_{digest}"
+    return {
+        "strategy_lab_id": strategy_lab_id,
+        "version": 1,
+        "experiment_type": "market_strategy",
+        "hypothesis": hypothesis,
+        "strategy_logic": logic,
+        "data_requirements": {
+            "paper_only": True,
+            "structured_contract_bridge": True,
+            "source_market_key": payload.get("market_key"),
+        },
+        "risk_gates": risk_gates,
+        "promotion_rules": {},
+    }
+
+
 def _contract_from_payload(payload: dict) -> dict:
     proposed = payload.get("proposed_change")
     contract = _first_dict(
@@ -486,6 +679,17 @@ def _contract_from_payload(payload: dict) -> dict:
             proposed.get("strategy_lab"),
             contract,
         )
+    if not _first_dict(
+        contract.get("strategy_logic"),
+        contract.get("strategy_logic_json"),
+        contract.get("logic"),
+    ):
+        structured = _structured_strategy_contract(
+            payload,
+            proposed if isinstance(proposed, dict) else contract,
+        )
+        if structured:
+            contract = structured
     if not contract:
         contract = {
             "hypothesis": str(proposed or payload.get("rationale") or payload.get("title") or "").strip(),
