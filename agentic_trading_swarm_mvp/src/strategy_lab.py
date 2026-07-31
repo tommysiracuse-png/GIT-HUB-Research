@@ -159,9 +159,22 @@ def _runtime_strategy_vocabulary(candidates: list[dict]) -> dict:
             directions.add(direction)
         if trade_type and direction:
             direction_trade_types[direction][trade_type] += 1
+    candidate_fields = Counter(
+        str(field)
+        for candidate in candidates
+        for field, value in candidate.items()
+        if value is not None
+    )
     return {
         "trade_types": trade_types,
         "directions": directions,
+        "venues": {str(candidate.get("venue")) for candidate in candidates if candidate.get("venue")},
+        "regions": {str(candidate.get("region")) for candidate in candidates if candidate.get("region")},
+        "asset_classes": {
+            str(candidate.get("asset_class")) for candidate in candidates if candidate.get("asset_class")
+        },
+        "candidate_fields": set(candidate_fields),
+        "candidate_field_counts": candidate_fields,
         "direction_trade_type_hints": {
             direction: counter.most_common(1)[0][0]
             for direction, counter in direction_trade_types.items()
@@ -323,6 +336,7 @@ def _classify_experiment_type(contract: dict, payload: dict, logic: dict) -> str
     if explicit:
         return explicit
 
+    semantic_logic = {key: value for key, value in logic.items() if key not in {"type", "logic_type"}}
     text = _text_blob(
         contract.get("strategy_lab_id"),
         contract.get("hypothesis"),
@@ -330,9 +344,9 @@ def _classify_experiment_type(contract: dict, payload: dict, logic: dict) -> str
         payload.get("rationale"),
         payload.get("market_key"),
         payload.get("signal_key"),
-        logic,
+        semantic_logic,
     )
-    has_surface = bool(_as_list(logic.get("trade_types")) or _as_list(logic.get("directions")))
+    has_surface = _has_strategy_scope(logic)
     alpha_terms = (
         "capture",
         "carry",
@@ -465,14 +479,16 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
     )
     logic_type = str(logic.get("type") or logic.get("logic_type") or "candidate_filter")
     if logic_type not in SUPPORTED_LOGIC_TYPES:
-        status = "needs_data"
+        status = "rejected_invalid"
     else:
-        status = "active_testing"
+        status = "proposed"
     logic["type"] = logic_type
     logic = _normalize_strategy_logic(logic)
     if not _has_strategy_scope(logic):
         status = "needs_data"
     experiment_type = _classify_experiment_type(contract, payload, logic)
+    if experiment_type != "market_strategy":
+        status = "rejected_invalid"
 
     strategy_lab_id = str(contract.get("strategy_lab_id") or "").strip()
     if not strategy_lab_id:
@@ -522,6 +538,18 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
         contract["status"],
         contract["hypothesis"],
         json.dumps(contract["strategy_logic"], sort_keys=True),
+        json.dumps(contract["strategy_logic"], sort_keys=True),
+        "uncompiled",
+        json.dumps(
+            {
+                "reason": (
+                    "non_market_experiment_routed_outside_strategy_lab"
+                    if contract["experiment_type"] != "market_strategy"
+                    else "awaiting_runtime_contract_compilation"
+                )
+            },
+            sort_keys=True,
+        ),
         json.dumps(contract["data_requirements"], sort_keys=True),
         json.dumps(contract["risk_gates"], sort_keys=True),
         json.dumps(contract["promotion_rules"], sort_keys=True),
@@ -535,10 +563,11 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
             """
             insert into strategy_lab_experiments (
                 strategy_lab_id, version, parent_strategy_lab_id, experiment_type, status, hypothesis,
-                strategy_logic_json, data_requirements_json, risk_gates_json,
+                strategy_logic_json, original_strategy_logic_json, compile_status, compile_diagnostics_json,
+                data_requirements_json, risk_gates_json,
                 promotion_rules_json, source_agent, source_recommendation_id,
                 created_at, updated_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -555,6 +584,10 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
                 hypothesis = ?,
                 experiment_type = ?,
                 strategy_logic_json = ?,
+                original_strategy_logic_json = ?,
+                compiled_strategy_logic_json = '{}',
+                compile_status = 'uncompiled',
+                compile_diagnostics_json = ?,
                 data_requirements_json = ?,
                 risk_gates_json = ?,
                 promotion_rules_json = ?,
@@ -567,6 +600,17 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
                 contract["hypothesis"],
                 contract["experiment_type"],
                 json.dumps(contract["strategy_logic"], sort_keys=True),
+                json.dumps(contract["strategy_logic"], sort_keys=True),
+                json.dumps(
+                    {
+                        "reason": (
+                            "non_market_experiment_routed_outside_strategy_lab"
+                            if contract["experiment_type"] != "market_strategy"
+                            else "awaiting_runtime_contract_compilation"
+                        )
+                    },
+                    sort_keys=True,
+                ),
                 json.dumps(contract["data_requirements"], sort_keys=True),
                 json.dumps(contract["risk_gates"], sort_keys=True),
                 json.dumps(contract["promotion_rules"], sort_keys=True),
@@ -594,7 +638,9 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
         """
         select *
         from strategy_lab_experiments
-        where status in ('active_testing', 'needs_data', 'needs_route', 'needs_more_evidence')
+        where status in ('active_testing', 'needs_more_evidence')
+          and experiment_type = 'market_strategy'
+          and compile_status = 'compiled'
         order by updated_at desc
         limit 100
         """
@@ -602,7 +648,12 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
     output = []
     for row in rows:
         item = dict(row)
-        item["strategy_logic"] = _json_loads(item.pop("strategy_logic_json"), {})
+        compiled_logic = item.pop("compiled_strategy_logic_json", None)
+        fallback_logic = item.pop("strategy_logic_json", None)
+        stored_logic = compiled_logic or fallback_logic
+        item["strategy_logic"] = _json_loads(stored_logic, {})
+        item.pop("original_strategy_logic_json", None)
+        item["compile_diagnostics"] = _json_loads(item.pop("compile_diagnostics_json", None), {})
         item["strategy_logic"] = _normalize_strategy_logic(item["strategy_logic"])
         item["experiment_type"] = _resolved_experiment_type(
             item.get("experiment_type"),
@@ -759,6 +810,196 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
     return not reasons, reasons
 
 
+def _scope_match_reasons(candidate: dict, logic: dict) -> list[str]:
+    """Check whether a live candidate can supply a contract, without applying alpha gates."""
+
+    reasons: list[str] = []
+    allowed_trade_types = _as_list(logic.get("trade_types") or logic.get("source_trade_types"))
+    allowed_venues = _as_list(logic.get("venues") or logic.get("allowed_venues"))
+    allowed_directions = _as_list(logic.get("directions") or logic.get("allowed_directions"))
+    allowed_regions = _as_list(logic.get("regions") or logic.get("allowed_regions"))
+    allowed_asset_classes = _as_list(logic.get("asset_classes") or logic.get("allowed_asset_classes"))
+    if str(candidate.get("direction") or "").lower() == "watch_only" and not (
+        bool(logic.get("allow_watch_only")) or "watch_only" in set(allowed_directions)
+    ):
+        reasons.append("watch_only_not_paper_testable")
+    if not _allowed(candidate.get("trade_type"), allowed_trade_types):
+        reasons.append("trade_type_not_observed")
+    if not _allowed(candidate.get("venue"), allowed_venues):
+        reasons.append("venue_not_observed")
+    if not _direction_allowed(candidate.get("direction"), allowed_directions):
+        reasons.append("direction_not_observed")
+    if not _allowed(candidate.get("region"), allowed_regions):
+        reasons.append("region_not_observed")
+    if not _allowed(candidate.get("asset_class"), allowed_asset_classes):
+        reasons.append("asset_class_not_observed")
+    required_fields = _as_list(logic.get("required_fields"))
+    missing = [field for field in required_fields if _candidate_field_value(candidate, field) is None]
+    if missing:
+        reasons.append("missing_required_fields:" + ",".join(missing[:8]))
+    return reasons
+
+
+def _compile_strategy_lab_contracts(
+    conn: sqlite3.Connection,
+    candidates: list[dict],
+) -> dict:
+    """Compile model intent against the actual runtime candidate schema.
+
+    Compilation is deliberately deterministic. The original model contract is
+    retained for audit, while only a contract with a real live match may enter
+    the paper candidate generator.
+    """
+
+    vocabulary = _runtime_strategy_vocabulary(candidates)
+    schema_payload = {
+        "fields": sorted(vocabulary.get("candidate_fields") or []),
+        "trade_types": sorted(vocabulary.get("trade_types") or []),
+        "directions": sorted(vocabulary.get("directions") or []),
+        "venues": sorted(vocabulary.get("venues") or []),
+    }
+    schema_fingerprint = hashlib.sha256(
+        json.dumps(schema_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    rows = conn.execute(
+        """
+        select *
+        from strategy_lab_experiments
+        where experiment_type = 'market_strategy'
+          and status in ('proposed', 'active_testing', 'needs_data', 'needs_route', 'needs_more_evidence')
+        order by updated_at desc
+        limit 500
+        """
+    ).fetchall()
+    summary = Counter()
+    diagnostics: dict[str, dict] = {}
+    now = _utc()
+    for raw in rows:
+        row = dict(raw)
+        original = _json_loads(row.get("original_strategy_logic_json"), {})
+        if not original:
+            original = _json_loads(row.get("strategy_logic_json"), {})
+        data_requirements = _json_loads(row.get("data_requirements_json"), {})
+        logic = _normalize_strategy_logic(original, vocabulary)
+
+        # Admission-generated ideas carry an exact instrument as evidence. Use
+        # that observation to learn the runtime surface, but keep the strategy
+        # scoped to the venue/surface rather than hard-coding one instrument.
+        requested_inst = str(data_requirements.get("inst_id") or "").strip()
+        evidence_candidates = [
+            candidate for candidate in candidates if requested_inst and str(candidate.get("inst_id")) == requested_inst
+        ]
+        if evidence_candidates:
+            exemplar = evidence_candidates[0]
+            if not _as_list(logic.get("venues") or logic.get("allowed_venues")) and exemplar.get("venue"):
+                logic["venues"] = [str(exemplar["venue"])]
+            if not _as_list(logic.get("trade_types") or logic.get("source_trade_types")) and exemplar.get("trade_type"):
+                logic["trade_types"] = [str(exemplar["trade_type"])]
+            logic.setdefault("normalization_notes", []).append("compiled_scope_from_admission_exemplar")
+            logic["normalization_notes"] = _unique(_as_list(logic.get("normalization_notes")))
+
+        nearest: list[dict] = []
+        matches: list[dict] = []
+        if _has_strategy_scope(logic):
+            for candidate in candidates:
+                reasons = _scope_match_reasons(candidate, logic)
+                if not reasons:
+                    matches.append(candidate)
+                else:
+                    nearest.append(
+                        {
+                            "inst_id": candidate.get("inst_id"),
+                            "venue": candidate.get("venue"),
+                            "trade_type": candidate.get("trade_type"),
+                            "direction": candidate.get("direction"),
+                            "failed_gate_count": len(reasons),
+                            "failed_gates": reasons[:5],
+                        }
+                    )
+
+        required_fields = _as_list(logic.get("required_fields"))
+        unsupported_fields = [
+            field
+            for field in required_fields
+            if not any(_candidate_field_value(candidate, field) is not None for candidate in candidates)
+        ]
+        if not _has_strategy_scope(logic):
+            compile_status = "needs_contract_repair"
+            status = "needs_data"
+            reason = "missing_strategy_scope"
+        elif unsupported_fields:
+            compile_status = "needs_data"
+            status = "needs_data"
+            reason = "unsupported_required_fields"
+        elif not candidates:
+            compile_status = "needs_data"
+            status = "needs_data"
+            reason = "runtime_candidate_pool_empty"
+        elif not matches:
+            compile_status = "needs_data"
+            status = "needs_data"
+            reason = "no_runtime_scope_match"
+        else:
+            compile_status = "compiled"
+            status = "needs_more_evidence" if row.get("status") == "needs_more_evidence" else "active_testing"
+            reason = "compiled_against_runtime_schema"
+
+        diagnostic = {
+            "compiled_at": now,
+            "compile_status": compile_status,
+            "reason": reason,
+            "runtime_schema_fingerprint": schema_fingerprint,
+            "source_candidate_count": len(candidates),
+            "scope_match_count": len(matches),
+            "unsupported_required_fields": unsupported_fields,
+            "match_preview": [
+                {
+                    "inst_id": item.get("inst_id"),
+                    "venue": item.get("venue"),
+                    "trade_type": item.get("trade_type"),
+                    "direction": item.get("direction"),
+                }
+                for item in matches[:5]
+            ],
+            "nearest_candidates": sorted(
+                nearest,
+                key=lambda item: (int(item.get("failed_gate_count") or 999), str(item.get("inst_id") or "")),
+            )[:5],
+            "llm_repair_requested": compile_status == "needs_contract_repair" and int(row.get("compile_attempts") or 0) == 0,
+        }
+        prior_evaluation = _json_loads(row.get("evaluation_json"), {})
+        conn.execute(
+            """
+            update strategy_lab_experiments
+            set strategy_logic_json = ?, compiled_strategy_logic_json = ?, compile_status = ?,
+                compile_diagnostics_json = ?, runtime_schema_fingerprint = ?,
+                compile_attempts = compile_attempts + 1, last_compiled_at = ?,
+                status = ?, updated_at = ?, evaluation_json = ?
+            where strategy_lab_id = ?
+            """,
+            (
+                json.dumps(logic, sort_keys=True),
+                json.dumps(logic, sort_keys=True) if compile_status == "compiled" else "{}",
+                compile_status,
+                json.dumps(diagnostic, sort_keys=True),
+                schema_fingerprint,
+                now,
+                status,
+                now,
+                json.dumps({**prior_evaluation, "contract_compilation": diagnostic}, sort_keys=True),
+                row["strategy_lab_id"],
+            ),
+        )
+        summary[compile_status] += 1
+        diagnostics[str(row["strategy_lab_id"])] = diagnostic
+    conn.commit()
+    return {
+        "runtime_schema_fingerprint": schema_fingerprint,
+        "by_compile_status": dict(summary),
+        "diagnostics": diagnostics,
+    }
+
+
 def generate_strategy_lab_candidates(
     conn: sqlite3.Connection,
     settings: dict,
@@ -769,6 +1010,7 @@ def generate_strategy_lab_candidates(
     if not cfg.get("enabled", True):
         return [], {"enabled": False, "generated_candidates": 0}
 
+    compilation = _compile_strategy_lab_contracts(conn, candidates)
     experiments = _active_experiments(conn)
     max_total = int(cfg.get("max_candidates_per_loop", 25))
     max_per_experiment = int(cfg.get("max_candidates_per_experiment", 5))
@@ -782,6 +1024,15 @@ def generate_strategy_lab_candidates(
 
     pool = sorted(candidates, key=lambda row: (_paper_route_rank(row), -_as_float(row.get("score"))))
     runtime_vocabulary = _runtime_strategy_vocabulary(pool)
+    for experiment_id, diagnostic in (compilation.get("diagnostics") or {}).items():
+        if diagnostic.get("compile_status") == "compiled":
+            continue
+        status_by_experiment[experiment_id] = "needs_data"
+        rejects[experiment_id][str(diagnostic.get("reason") or "contract_not_compiled")] += 1
+        for item in diagnostic.get("nearest_candidates") or []:
+            nearest_candidates[experiment_id].append(dict(item))
+            for reason in item.get("failed_gates") or []:
+                rejects[experiment_id][str(reason)] += 1
     for experiment in experiments:
         if len(generated) >= max_total:
             break
@@ -904,6 +1155,7 @@ def generate_strategy_lab_candidates(
             )[:5]
             for key, rows in nearest_candidates.items()
         },
+        "contract_compilation": compilation,
     }
     return generated, report
 
@@ -1264,7 +1516,8 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         """
         select strategy_lab_id, version, parent_strategy_lab_id, status, hypothesis,
                experiment_type, strategy_logic_json, created_at, updated_at, last_evaluated_at, evaluation_json,
-               consecutive_passes, promoted_proposal_id
+               consecutive_passes, promoted_proposal_id, compile_status,
+               compile_diagnostics_json, runtime_schema_fingerprint, compile_attempts, last_compiled_at
         from strategy_lab_experiments
         order by updated_at desc
         limit ?
@@ -1278,6 +1531,7 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         logic = _json_loads(item.pop("strategy_logic_json"), {})
         item["experiment_type"] = _resolved_experiment_type(item.get("experiment_type"), item, logic)
         item["evaluation"] = _json_loads(item.pop("evaluation_json"), {})
+        item["compile_diagnostics"] = _json_loads(item.pop("compile_diagnostics_json"), {})
         recent_status_counts[item["status"]] += 1
         items.append(item)
     total = conn.execute("select count(*) as n from strategy_lab_experiments").fetchone()
@@ -1303,6 +1557,18 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
             """
         ).fetchall()
     }
+    compile_status_counts = {
+        (row["compile_status"] or "uncompiled"): int(row["n"])
+        for row in conn.execute(
+            """
+            select compile_status, count(*) as n
+            from strategy_lab_experiments
+            where experiment_type = 'market_strategy'
+            group by compile_status
+            order by n desc
+            """
+        ).fetchall()
+    }
     generated_candidates = 0
     if REPORT_JSON.exists():
         latest = _json_loads(REPORT_JSON.read_text(encoding="utf-8"), {})
@@ -1313,6 +1579,22 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         "status_counts": dict(status_counts),
         "recent_status_counts": dict(recent_status_counts),
         "by_experiment_type": dict(type_counts),
+        "compile_status_counts": compile_status_counts,
+        "contract_repair_queue": [
+            {
+                "strategy_lab_id": item["strategy_lab_id"],
+                "status": item["status"],
+                "compile_status": item.get("compile_status"),
+                "hypothesis": item.get("hypothesis"),
+                "reason": (item.get("compile_diagnostics") or {}).get("reason"),
+                "unsupported_required_fields": (item.get("compile_diagnostics") or {}).get(
+                    "unsupported_required_fields", []
+                ),
+                "nearest_candidates": (item.get("compile_diagnostics") or {}).get("nearest_candidates", []),
+            }
+            for item in items
+            if item.get("experiment_type") == "market_strategy" and item.get("compile_status") != "compiled"
+        ][:20],
         "recent": items,
         "recent_market_strategies": [
             item for item in items if item.get("experiment_type") == "market_strategy"
@@ -1373,6 +1655,7 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         f"- Total experiments: `{summary.get('total_experiments', 0)}`",
         f"- Status counts: `{summary.get('status_counts', {})}`",
         f"- Experiment types: `{summary.get('by_experiment_type', {})}`",
+        f"- Runtime contract compilation: `{summary.get('compile_status_counts', {})}`",
         f"- Candidates generated this loop: `{(generation or {}).get('generated_candidates', 0)}`",
         "",
         "## Market Strategy Experiments",
@@ -1389,6 +1672,14 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
             f"status=`{item['status']}` decision=`{decision}` "
             f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
             f"win=`{metrics.get('win_rate')}` hypothesis={item.get('hypothesis')}"
+        )
+    lines.extend(["", "## Contract Repair Queue", ""])
+    if not summary.get("contract_repair_queue"):
+        lines.append("No Strategy Lab contracts currently need runtime repair.")
+    for item in summary.get("contract_repair_queue", [])[:20]:
+        lines.append(
+            f"- `{item['strategy_lab_id']}` compile=`{item.get('compile_status')}` "
+            f"reason=`{item.get('reason')}` missing=`{item.get('unsupported_required_fields')}`"
         )
     lines.extend(["", "## Non-Market Experiments", ""])
     if not summary.get("recent_non_market_experiments"):

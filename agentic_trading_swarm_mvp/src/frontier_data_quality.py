@@ -1962,7 +1962,11 @@ def _format_symbol(venue: str, symbol: str) -> str:
         # after venue-map normalization, so normalize them here before URL
         # construction to keep paper-only depth enrichment active for MXN books.
         return _normalize_bitso_symbol(symbol)
-    if venue in {"INDODAX", "QUIDAX", "BUDA"}:
+    if venue == "INDODAX":
+        # INDODAX depth paths use compact lowercase pairs (for example
+        # ``btcidr``), while ticker normalization stores ``BTC_IDR``.
+        return re.sub(r"[^A-Za-z0-9]", "", symbol or "").lower()
+    if venue in {"QUIDAX", "BUDA"}:
         return symbol.lower()
     if venue == "VALR":
         return symbol.replace("-", "").replace("_", "").replace("/", "").upper()
@@ -2024,9 +2028,11 @@ def _extract_depth(parser: str, payload: object, received_at: str) -> dict:
         asks = body.get("asks") or []
         book_timestamp = _timestamp_to_iso(body.get("ts"))
     elif parser in {"luno_orderbook", "valr_orderbook"}:
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-        book_timestamp = _timestamp_to_iso(data.get("timestamp"))
+        bids = data.get("bids") or data.get("Bids") or []
+        asks = data.get("asks") or data.get("Asks") or []
+        book_timestamp = _timestamp_to_iso(
+            data.get("timestamp") or data.get("Timestamp") or data.get("LastChange")
+        )
     elif parser == "quidax_depth":
         body = data.get("data") or data
         bids = body.get("bids") or body.get("buy") or []
@@ -2060,6 +2066,29 @@ def _extract_depth(parser: str, payload: object, received_at: str) -> dict:
         "book_timestamp": book_timestamp,
         "freshness_basis": freshness_basis,
     }
+
+
+def _depth_payload_error(parser: str, payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return "api_error_payload:non_object"
+    if parser == "bitget_orderbook":
+        code = str(payload.get("code") if payload.get("code") is not None else "00000")
+        if code not in {"0", "00000"}:
+            return f"api_error_payload:bitget_{code[:40]}"
+    if parser == "indodax_depth":
+        if payload.get("error"):
+            return "api_error_payload:indodax_invalid_pair"
+        if payload.get("success") in {0, False, "0", "false"}:
+            return "api_error_payload:indodax_unsuccessful"
+    return None
+
+
+def _empty_depth_reason(parser: str, payload: object) -> str:
+    if parser == "bitget_orderbook" and isinstance(payload, dict):
+        code = str(payload.get("code") if payload.get("code") is not None else "00000")
+        if code in {"0", "00000"}:
+            return "valid_empty_book"
+    return "parser_empty_book"
 
 
 def _should_prefer_trailing_price_quantity(
@@ -2133,7 +2162,28 @@ def _normalize_levels(raw_levels: list, side: str, max_levels: int) -> tuple[lis
     return valid, sorted(set(anomalies))
 
 
-def _depth_within(levels: list[list[float]], mid: float, band_bps: float, side: str) -> float:
+def _quote_to_usd_multiplier(observation: dict) -> float | None:
+    quote = str(observation.get("quote") or "").upper()
+    if quote in {"USD", "USDT", "USDC", "BUSD", "DAI", "FDUSD"}:
+        return 1.0
+    last = _as_float(observation.get("last"))
+    normalized = _as_float(observation.get("usd_normalized_last"))
+    if last and normalized and last > 0 and normalized > 0:
+        return normalized / last
+    reference_rate = _as_float(observation.get("fx_reference_rate"))
+    if reference_rate and reference_rate > 0:
+        return 1.0 / reference_rate
+    explicit = _as_float(observation.get("quote_to_usd_rate"))
+    return explicit if explicit and explicit > 0 else None
+
+
+def _depth_within(
+    levels: list[list[float]],
+    mid: float,
+    band_bps: float,
+    side: str,
+    quote_to_usd: float = 1.0,
+) -> float:
     if mid <= 0:
         return 0.0
     if side == "bids":
@@ -2142,22 +2192,27 @@ def _depth_within(levels: list[list[float]], mid: float, band_bps: float, side: 
     else:
         threshold = mid * (1.0 + band_bps / 10_000.0)
         chosen = [row for row in levels if row[0] <= threshold]
-    return sum(price * quantity for price, quantity in chosen)
+    return sum(price * quantity * max(0.0, quote_to_usd) for price, quantity in chosen)
 
 
-def simulate_fill(levels: list[list[float]], side: str, notional_usd: float) -> dict:
-    if not levels or notional_usd <= 0:
+def simulate_fill(
+    levels: list[list[float]],
+    side: str,
+    notional_usd: float,
+    quote_to_usd: float = 1.0,
+) -> dict:
+    if not levels or notional_usd <= 0 or quote_to_usd <= 0:
         return {"filled": False, "average_price": None, "slippage_bps": None, "depth_used_usd": 0.0}
     best = levels[0][0]
     remaining_quote = float(notional_usd)
     base_filled = 0.0
     quote_filled = 0.0
     for price, quantity in levels:
-        level_quote = price * quantity
-        used_quote = min(remaining_quote, level_quote)
-        base_filled += used_quote / price
-        quote_filled += used_quote
-        remaining_quote -= used_quote
+        level_quote_usd = price * quantity * quote_to_usd
+        used_quote_usd = min(remaining_quote, level_quote_usd)
+        base_filled += used_quote_usd / (price * quote_to_usd)
+        quote_filled += used_quote_usd
+        remaining_quote -= used_quote_usd
         if remaining_quote <= 1e-9:
             break
     if remaining_quote > max(0.01, notional_usd * 0.001) or base_filled <= 0:
@@ -2167,7 +2222,7 @@ def simulate_fill(levels: list[list[float]], side: str, notional_usd: float) -> 
             "slippage_bps": None,
             "depth_used_usd": round(quote_filled, 3),
         }
-    average = quote_filled / base_filled
+    average = (quote_filled / quote_to_usd) / base_filled
     if side == "buy":
         slippage = (average / best - 1.0) * 10_000.0
     else:
@@ -2273,17 +2328,21 @@ def analyze_book(
     if baseline_latency_ms and latency_ms > max(2000.0, baseline_latency_ms * 3.0):
         anomalies.append("latency_outlier")
 
+    quote_to_usd = _quote_to_usd_multiplier(observation)
+    if quote_to_usd is None:
+        anomalies.append("missing_fx_conversion")
+    depth_multiplier = float(quote_to_usd or 0.0)
     depth_usd = {
         side: {
-            str(band): round(_depth_within(levels, mid, float(band), side), 3)
+            str(band): round(_depth_within(levels, mid, float(band), side, depth_multiplier), 3)
             for band in (5, 10, 25)
         }
         for side, levels in (("bid", bids), ("ask", asks))
     }
     fills = {"buy": {}, "sell": {}}
     for notional in QUALITY_NOTIONALS:
-        fills["buy"][str(int(notional))] = simulate_fill(asks, "buy", notional)
-        fills["sell"][str(int(notional))] = simulate_fill(bids, "sell", notional)
+        fills["buy"][str(int(notional))] = simulate_fill(asks, "buy", notional, depth_multiplier)
+        fills["sell"][str(int(notional))] = simulate_fill(bids, "sell", notional, depth_multiplier)
     if not fills["buy"]["1000"]["filled"] or not fills["sell"]["1000"]["filled"]:
         anomalies.append("depth_cliff")
     total_10 = depth_usd["bid"]["10"] + depth_usd["ask"]["10"]
@@ -2323,7 +2382,7 @@ def analyze_book(
     )
     anomaly_flags = sorted(set(anomalies))
     critical = sorted(CRITICAL_ANOMALIES.intersection(anomaly_flags))
-    status = "verified" if not anomaly_flags else "degraded"
+    status = "unknown" if quote_to_usd is None else "verified" if not anomaly_flags else "degraded"
     return {
         "quality_status": status,
         "quality_score": score,
@@ -2342,6 +2401,7 @@ def analyze_book(
         "simulated_fills": fills,
         "book_imbalance_10bps": depth["imbalance_10bps"],
         "depth_concentration_25bps": depth["depth_concentration_25bps"],
+        "quote_to_usd_multiplier": round(quote_to_usd, 12) if quote_to_usd is not None else None,
         "anomaly_flags": anomaly_flags,
         "critical_anomaly_flags": critical,
     }
@@ -2393,7 +2453,7 @@ def _venue_depth_targets(registry: dict) -> dict[str, dict]:
 def _snapshot_rotation_state(conn: sqlite3.Connection) -> dict[str, dict]:
     rows = conn.execute(
         """
-        select inst_id, observed_at, quality_status
+        select inst_id, observed_at, quality_status, anomaly_json
         from frontier_quality_snapshots
         order by inst_id asc, observed_at desc
         """
@@ -2407,21 +2467,36 @@ def _snapshot_rotation_state(conn: sqlite3.Connection) -> dict[str, dict]:
                 "last_observed_at": row["observed_at"],
                 "consecutive_verified_count": 0,
                 "counting": True,
+                "consecutive_valid_empty_count": 0,
+                "empty_counting": True,
             },
         )
         if item["counting"] and row["quality_status"] == "verified":
             item["consecutive_verified_count"] += 1
         else:
             item["counting"] = False
+        try:
+            anomalies = set(json.loads(row["anomaly_json"] or "[]"))
+        except (TypeError, json.JSONDecodeError):
+            anomalies = set()
+        if item["empty_counting"] and "valid_empty_book" in anomalies:
+            item["consecutive_valid_empty_count"] += 1
+        else:
+            item["empty_counting"] = False
     return state
 
 
-def _snapshot_sort_key(row: dict, state: dict[str, dict]) -> tuple:
+def _snapshot_sort_key(row: dict, state: dict[str, dict], cfg: dict | None = None) -> tuple:
     inst_id = str(row.get("instrument_id"))
     item = state.get(inst_id, {})
     verified_count = int(item.get("consecutive_verified_count") or 0)
+    empty_count = int(item.get("consecutive_valid_empty_count") or 0)
     last_seen = item.get("last_observed_at") or ""
-    return (verified_count, last_seen, -float(row.get("quote_volume_24h") or 0.0))
+    cfg = cfg or {}
+    empty_threshold = int(cfg.get("valid_empty_book_cooldown_after", 2))
+    core_assets = {str(value).upper() for value in cfg.get("empty_book_core_asset_exemptions", ["BTC", "ETH", "USDT", "USDC"])}
+    cooled_down = empty_count >= empty_threshold and str(row.get("base") or "").upper() not in core_assets
+    return (1 if cooled_down else 0, verified_count, last_seen, -float(row.get("quote_volume_24h") or 0.0))
 
 
 def _known_quality_rate_from_state(observations: list[dict], state: dict[str, dict]) -> float:
@@ -2489,9 +2564,9 @@ def _quality_target_escalation(
     }
 
 
-def _starved_sort_key(row: dict, state: dict[str, dict], starved_venues: set[str]) -> tuple:
+def _starved_sort_key(row: dict, state: dict[str, dict], starved_venues: set[str], cfg: dict | None = None) -> tuple:
     venue = str(row.get("venue") or "").upper()
-    return (0 if venue in starved_venues else 1, *_snapshot_sort_key(row, state))
+    return (0 if venue in starved_venues else 1, *_snapshot_sort_key(row, state, cfg))
 
 
 def _venue_depth_minimum_targets(cfg: dict, starved_venues: set[str]) -> dict[str, int]:
@@ -2753,7 +2828,7 @@ def select_enrichment_observations(
 
     regional_ranked = sorted(
         [row for row in observations if row.get("region") and row.get("instrument_id")],
-        key=lambda row: _starved_sort_key(row, snapshot_state, starved_venues)
+        key=lambda row: _starved_sort_key(row, snapshot_state, starved_venues, cfg)
         if adaptive
         else (0 if str(row.get("venue") or "").upper() in starved_venues else 1, -float(row.get("quote_volume_24h") or 0.0)),
     )
@@ -2768,7 +2843,7 @@ def select_enrichment_observations(
             and float(row.get("quote_volume_24h") or 0.0) > 0
             and int((snapshot_state.get(str(row.get("instrument_id"))) or {}).get("consecutive_verified_count") or 0) == 0
         ],
-        key=lambda row: _starved_sort_key(row, snapshot_state, starved_venues)
+        key=lambda row: _starved_sort_key(row, snapshot_state, starved_venues, cfg)
         if adaptive
         else (0 if str(row.get("venue") or "").upper() in starved_venues else 1, -float(row.get("quote_volume_24h") or 0.0)),
     )
@@ -2786,7 +2861,7 @@ def select_enrichment_observations(
                 and row.get("data_status") == "reachable"
                 and str(row.get("venue") or "").upper() == venue
             ],
-            key=lambda row: _snapshot_sort_key(row, snapshot_state)
+            key=lambda row: _snapshot_sort_key(row, snapshot_state, cfg)
             if adaptive
             else -float(row.get("quote_volume_24h") or 0.0),
         )
@@ -2801,7 +2876,7 @@ def select_enrichment_observations(
                 and row.get("data_status") == "reachable"
                 and str(row.get("venue") or "").upper() in starved_venues
             ],
-            key=lambda row: _snapshot_sort_key(row, snapshot_state)
+            key=lambda row: _snapshot_sort_key(row, snapshot_state, cfg)
             if adaptive
             else -float(row.get("quote_volume_24h") or 0.0),
         )
@@ -2823,7 +2898,7 @@ def select_enrichment_observations(
                     and row.get("data_status") == "reachable"
                     and float(row.get("quote_volume_24h") or 0.0) > 0
                 ],
-                key=lambda row: _starved_sort_key(row, snapshot_state, starved_venues)
+                key=lambda row: _starved_sort_key(row, snapshot_state, starved_venues, cfg)
                 if adaptive
                 else (0 if str(row.get("venue") or "").upper() in starved_venues else 1, -float(row.get("quote_volume_24h") or 0.0)),
             )
@@ -2896,7 +2971,16 @@ def enrich_observations(
             result = _fetch_json(url, timeout)
             if not result["ok"]:
                 return inst_id, _unknown_quality(observation, result, f"depth_{result['status']}")
+            payload_error = _depth_payload_error(str(depth_config["parser"]), result["payload"])
+            if payload_error:
+                return inst_id, _unknown_quality(observation, result, payload_error)
             extracted = _extract_depth(str(depth_config["parser"]), result["payload"], result["received_at"])
+            if not extracted.get("bids") and not extracted.get("asks"):
+                return inst_id, _unknown_quality(
+                    observation,
+                    result,
+                    _empty_depth_reason(str(depth_config["parser"]), result["payload"]),
+                )
             quality = analyze_book(
                 observation,
                 extracted,

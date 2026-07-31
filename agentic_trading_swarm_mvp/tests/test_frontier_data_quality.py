@@ -96,6 +96,34 @@ class DepthParserTests(unittest.TestCase):
                 self.assertTrue(parsed["asks"])
                 self.assertIn(parsed["freshness_basis"], {"exchange_timestamp", "response_received"})
 
+    def test_valr_uppercase_book_and_indodax_compact_symbol(self) -> None:
+        parsed = quality._extract_depth(
+            "valr_orderbook",
+            {
+                "Bids": [{"price": "99", "quantity": "2"}],
+                "Asks": [{"price": "101", "quantity": "2"}],
+                "LastChange": "2026-07-30T20:00:00Z",
+            },
+            "2026-07-30T20:00:01+00:00",
+        )
+        self.assertTrue(parsed["bids"])
+        self.assertTrue(parsed["asks"])
+        self.assertEqual("btcidr", quality._format_symbol("INDODAX", "BTC_IDR"))
+
+    def test_http_200_business_errors_and_valid_empty_books_are_distinct(self) -> None:
+        self.assertEqual(
+            "api_error_payload:indodax_invalid_pair",
+            quality._depth_payload_error("indodax_depth", {"error": "Invalid pair"}),
+        )
+        self.assertEqual(
+            "api_error_payload:bitget_40015",
+            quality._depth_payload_error("bitget_orderbook", {"code": "40015", "msg": "bad symbol"}),
+        )
+        self.assertEqual(
+            "valid_empty_book",
+            quality._empty_depth_reason("bitget_orderbook", {"code": "00000", "data": {"bids": [], "asks": []}}),
+        )
+
 
 class QualityMathTests(unittest.TestCase):
     def test_depth_aggregation_fill_and_quality_score(self) -> None:
@@ -131,6 +159,51 @@ class QualityMathTests(unittest.TestCase):
         self.assertIn("stale_book", result["anomaly_flags"])
         self.assertIn("high_latency", result["anomaly_flags"])
         self.assertIn("invalid_level_value", result["anomaly_flags"])
+
+    def test_regional_depth_is_converted_to_usd_before_quality_scoring(self) -> None:
+        row = observation()
+        row.update(
+            {
+                "quote": "ZAR",
+                "last": 1900.0,
+                "bid": 1899.0,
+                "ask": 1901.0,
+                "usd_normalized_last": 100.0,
+                "quote_normalization_status": "external_fx_reference",
+            }
+        )
+        result = quality.analyze_book(
+            row,
+            {
+                "bids": [[1899.0, 2.0]],
+                "asks": [[1901.0, 2.0]],
+                "book_timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "freshness_basis": "exchange_timestamp",
+            },
+            latency_ms=20.0,
+            received_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+        self.assertAlmostEqual(100.0 / 1900.0, result["quote_to_usd_multiplier"], places=9)
+        self.assertLess(result["depth_usd"]["bid"]["25"], 250.0)
+        self.assertGreater(result["depth_usd"]["bid"]["25"], 190.0)
+
+    def test_regional_depth_without_fx_is_unknown_not_fake_usd(self) -> None:
+        row = observation()
+        row.update({"quote": "IDR", "last": 1_000_000.0, "bid": 999_000.0, "ask": 1_001_000.0})
+        result = quality.analyze_book(
+            row,
+            {
+                "bids": [[999_000.0, 1.0]],
+                "asks": [[1_001_000.0, 1.0]],
+                "book_timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "freshness_basis": "exchange_timestamp",
+            },
+            latency_ms=20.0,
+            received_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+        self.assertEqual("unknown", result["quality_status"])
+        self.assertIn("missing_fx_conversion", result["anomaly_flags"])
+        self.assertEqual(0.0, result["depth_usd"]["bid"]["25"])
 
     def test_candidate_uses_conservative_depth_adjusted_cost(self) -> None:
         cfg = settings()

@@ -20,6 +20,8 @@ import time
 from types import SimpleNamespace
 
 from agent_review import review_candidate
+from adapter_capabilities import reconcile_adapter_specs
+from adapter_runtime import build_scan_batch as build_public_adapter_scan_batch
 from autonomous_builder import run_autonomous_builder
 from contextual_failure_filters import run_contextual_failure_filters
 from crypto_venue_scanner import scan as scan_crypto_venues, write_outputs as write_crypto_venue_health
@@ -275,6 +277,8 @@ def _build_expansion_map(
     global_market_discovery_scan: dict | None = None,
     strategy_lab_generation: dict | None = None,
     strategy_lab_runtime: dict | None = None,
+    public_market_adapters: dict | None = None,
+    adapter_capabilities: dict | None = None,
 ) -> dict:
     frontier_summary = (frontier_crypto_venues or {}).get("summary", {})
     frontier_expansion = frontier_summary.get("expansion_map", {})
@@ -306,6 +310,8 @@ def _build_expansion_map(
             "report": str(RUNS_DIR / "route_intelligence_report.md"),
         },
         "strategy_lab": _strategy_lab_runtime_summary(strategy_lab_generation, strategy_lab_runtime),
+        "public_market_adapters": (public_market_adapters or {}).get("summary", {}),
+        "adapter_capabilities": (adapter_capabilities or {}).get("summary", {}),
         "reports": {
             "frontier": str(RUNS_DIR / "frontier_crypto_venues_report.md"),
             "global_market_discovery_scan": str(RUNS_DIR / "global_market_discovery_scan_report.md"),
@@ -313,6 +319,8 @@ def _build_expansion_map(
             "prediction_markets": str(RUNS_DIR / "prediction_markets_latest.json"),
             "route_intelligence": str(RUNS_DIR / "route_intelligence_report.md"),
             "market_admission": str(RUNS_DIR / "market_admission_report.md"),
+            "public_market_adapters": str(RUNS_DIR / "public_market_adapters_report.md"),
+            "adapter_capabilities": str(RUNS_DIR / "adapter_capability_inventory.md"),
         },
     }
 
@@ -346,6 +354,7 @@ def run_once(settings: dict) -> dict:
                 scan_id=okx_batch.generated_at,
             )
         batches.append(okx_batch)
+        admission_observations.extend(okx_batch.observations)
         candidates = list(okx_candidates)
         if scan_cfg.get("enable_global_proxy_scan", False):
             global_batch = build_global_proxy_scan_batch(
@@ -356,6 +365,12 @@ def run_once(settings: dict) -> dict:
             batches.append(global_batch)
             candidates.extend(global_batch.candidates)
             candidates.sort(key=lambda row: row["score"], reverse=True)
+        public_adapter_batch = build_public_adapter_scan_batch(settings)
+        public_market_adapters = public_adapter_batch.metadata.get("public_market_adapters", {})
+        batches.append(public_adapter_batch)
+        candidates.extend(public_adapter_batch.candidates)
+        admission_observations.extend(public_adapter_batch.observations)
+        adapter_capabilities = reconcile_adapter_specs(conn)
         global_market_discovery_scan = {}
         if scan_cfg.get("enable_global_market_discovery_scan", True) and settings.get(
             "global_market_discovery_scanner", {}
@@ -440,6 +455,8 @@ def run_once(settings: dict) -> dict:
             global_market_discovery_scan,
             strategy_lab_generation,
             strategy_lab_runtime,
+            public_market_adapters,
+            adapter_capabilities,
         )
         self_improvement_open_pack = build_open_pack_report(
             conn,
@@ -573,6 +590,8 @@ def run_once(settings: dict) -> dict:
             "crypto_venue_health": venue_health,
             "frontier_crypto_venues": frontier_crypto_venues,
             "global_market_discovery_scan": global_market_discovery_scan,
+            "public_market_adapters": public_market_adapters,
+            "adapter_capabilities": adapter_capabilities,
             "signal_redesign": signal_redesign,
             "okx_signal_research": okx_signal_research,
             "strategy_reliability": strategy_reliability,

@@ -1,0 +1,142 @@
+"""Small dependency-free helpers shared by official public-market plugins."""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import re
+import time
+import urllib.error
+import urllib.request
+from html.parser import HTMLParser
+from typing import Any
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def fetch_text(url: str, timeout: int = 15) -> dict[str, Any]:
+    started = time.perf_counter()
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json,text/html;q=0.9,*/*;q=0.5",
+            "User-Agent": "agentic-trading-swarm-paper-research/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            return {
+                "ok": True,
+                "status": "reachable",
+                "http_status": int(getattr(response, "status", 200)),
+                "text": text,
+                "received_at": utc_now(),
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
+    except urllib.error.HTTPError as exc:
+        return {
+            "ok": False,
+            "status": "blocked" if exc.code in {401, 403, 451} else "unavailable",
+            "http_status": int(exc.code),
+            "error": str(exc)[:300],
+            "text": "",
+            "received_at": utc_now(),
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        }
+    except Exception as exc:  # noqa: BLE001 - scanner health must survive source outages.
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "http_status": None,
+            "error": str(exc)[:300],
+            "text": "",
+            "received_at": utc_now(),
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        }
+
+
+def parse_json(text: str) -> Any:
+    return json.loads(text)
+
+
+def number(value: Any) -> float | None:
+    text = str(value or "").strip().replace("\u00a0", " ")
+    if not text or text in {"-", "–", "—", "n.s", "n.s.", "N/A", "n.a."}:
+        return None
+    text = text.replace(" ", "").replace(",", "." if text.count(",") == 1 and "." not in text else "")
+    text = re.sub(r"[^0-9.+-]", "", text)
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def slug(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", str(value).upper()).strip("_")
+
+
+class TableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: list[list[list[str]]] = []
+        self._table: list[list[str]] | None = None
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "table":
+            self._table = []
+        elif self._table is not None and tag == "tr":
+            self._row = []
+        elif self._row is not None and tag in {"td", "th"}:
+            self._cell = []
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._cell is not None and self._row is not None:
+            self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None and self._table is not None:
+            if any(self._row):
+                self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            self.tables.append(self._table)
+            self._table = None
+
+
+def html_tables(text: str) -> list[list[list[str]]]:
+    parser = TableParser()
+    parser.feed(text)
+    return parser.tables
+
+
+def health_observation(venue: str, source_url: str, result: dict[str, Any], surface: str) -> dict[str, Any]:
+    return {
+        "venue": venue,
+        "inst_id": f"{venue}:ADAPTER_HEALTH",
+        "instrument_id": f"{venue}:ADAPTER_HEALTH",
+        "symbol": "ADAPTER_HEALTH",
+        "base": "ADAPTER_HEALTH",
+        "quote": "N/A",
+        "market_type": "reference",
+        "market_surface": surface,
+        "asset_class": "market_data_health",
+        "trade_type": "official_market_reference",
+        "direction": "watch_only",
+        "last": 0.0,
+        "data_status": result.get("status", "unavailable"),
+        "http_status": result.get("http_status"),
+        "observed_at": result.get("received_at") or utc_now(),
+        "session_status": "unknown",
+        "source_url": source_url,
+        "latency_ms": result.get("latency_ms"),
+        "candidate_reject_reason": "public_reference_source_unavailable",
+        "notes": [str(result.get("error") or "Public reference source did not return usable data.")],
+    }

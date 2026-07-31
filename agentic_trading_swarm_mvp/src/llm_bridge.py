@@ -1087,6 +1087,15 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "execution_summary": payload.get("execution_summary", {}),
         "route_resolver": _compact_route_resolver(payload.get("route_resolver", {})),
         "expansion_map": payload.get("expansion_map", {}),
+        "public_market_adapters": (payload.get("public_market_adapters") or {}).get("summary", {}),
+        "adapter_capabilities": {
+            "summary": (payload.get("adapter_capabilities") or {}).get("summary", {}),
+            "capability_gaps": [
+                item
+                for item in (payload.get("adapter_capabilities") or {}).get("specs", [])
+                if item.get("status") == "adapter_capability_gap"
+            ][:20],
+        },
         "global_market_discovery": global_market_discovery,
         "frontier_execution_quality": _compact_frontier_execution_quality(payload.get("research_worker")),
         "hunter_allocation": hunter_allocation,

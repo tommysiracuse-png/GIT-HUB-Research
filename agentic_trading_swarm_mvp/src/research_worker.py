@@ -17,6 +17,11 @@ import sqlite3
 import urllib.parse
 from typing import Any, Callable, Iterable
 
+from adapter_capabilities import (
+    candidate_has_runtime_capability,
+    capability_inventory,
+    reconcile_adapter_specs,
+)
 from cost_router import ModelResult, complete
 from storage import (
     RUNS_DIR,
@@ -1418,8 +1423,17 @@ def _source_evidence(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _artifact_exists(conn: sqlite3.Connection, action: str, source_id: str, candidate: dict[str, Any]) -> bool:
+def _artifact_exists(
+    conn: sqlite3.Connection,
+    action: str,
+    source_id: str,
+    candidate: dict[str, Any],
+    adapter_inventory: list[dict] | None = None,
+) -> bool:
     if action == "adapter_spec":
+        capability = candidate_has_runtime_capability(candidate, adapter_inventory)
+        if capability.get("match_status") == "fully_covered":
+            return True
         return conn.execute(
             "select 1 from adapter_specs where source_recommendation_id = ? limit 1",
             (source_id,),
@@ -1455,6 +1469,7 @@ def create_downstream_artifacts(conn: sqlite3.Connection, candidates: list[dict[
     cfg = (settings or {}).get("research_worker", {})
     priority_floor = int(cfg.get("artifact_priority_floor", 70))
     max_artifacts = int(cfg.get("max_artifacts_per_run", 20))
+    adapter_inventory = capability_inventory()
     created: list[dict[str, Any]] = []
     for candidate in candidates:
         if len(created) >= max_artifacts:
@@ -1468,7 +1483,7 @@ def create_downstream_artifacts(conn: sqlite3.Connection, candidates: list[dict[
         for action in actions:
             if len(created) >= max_artifacts:
                 break
-            if _artifact_exists(conn, action, source_id, candidate):
+            if _artifact_exists(conn, action, source_id, candidate, adapter_inventory):
                 continue
             created_item: dict[str, Any] | None = None
             if action == "adapter_spec":
@@ -1722,7 +1737,9 @@ def run_once(
     assert conn is not None
     try:
         route_lifecycle = reconcile_discovery_route_lifecycle(conn)
+        adapter_reconciliation_before = reconcile_adapter_specs(conn)
         created_artifacts = create_downstream_artifacts(conn, artifact_candidates, settings)
+        adapter_reconciliation = reconcile_adapter_specs(conn)
         route_lifecycle["open_global_route_probes"] = int(
             conn.execute(
                 "select count(*) from route_probe_tasks where status = 'open' and market_key like 'global_discovery|%'"
@@ -1743,6 +1760,8 @@ def run_once(
         "discovery_journal": str(_journal_path()),
         "continuous_discovery": web_discovery,
         "route_lifecycle": route_lifecycle,
+        "adapter_reconciliation_before": adapter_reconciliation_before.get("summary", {}),
+        "adapter_reconciliation": adapter_reconciliation.get("summary", {}),
         "candidates": candidates,
         "created_artifacts": created_artifacts,
         "summary": _summary(candidates, created_artifacts, ledger, web_discovery),

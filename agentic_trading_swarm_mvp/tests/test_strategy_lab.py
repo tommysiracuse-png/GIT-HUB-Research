@@ -98,7 +98,7 @@ class StrategyLabTest(unittest.TestCase):
         self.assertLess(names.index("cross_market_researcher"), names.index("strategy_lab"))
         self.assertLess(names.index("strategy_lab"), names.index("red_team"))
 
-    def test_ingests_strategy_lab_recommendation_as_active_experiment(self):
+    def test_ingests_strategy_lab_recommendation_for_runtime_compilation(self):
         with memory_db() as conn:
             result = ingest_strategy_lab_recommendation(conn, lab_rec())
             self.assertEqual("created", result[0]["action_status"])
@@ -108,7 +108,7 @@ class StrategyLabTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual("okx_spot_survivor_lab_v1", row["strategy_lab_id"])
             self.assertEqual("market_strategy", row["experiment_type"])
-            self.assertEqual("active_testing", row["status"])
+            self.assertEqual("proposed", row["status"])
             self.assertIn("OKX spot", row["hypothesis"])
 
     def test_ingests_explicit_experiment_type(self):
@@ -271,7 +271,7 @@ class StrategyLabTest(unittest.TestCase):
                 ("okx_spot_survivor_lab_v1",),
             ).fetchone()
             self.assertEqual("needs_data", row["status"])
-            diagnostic = json.loads(row["evaluation_json"])["generation_diagnostic"]
+            diagnostic = json.loads(row["evaluation_json"])["contract_compilation"]
             self.assertTrue(diagnostic["nearest_candidates"])
 
             generated, report = generate_strategy_lab_candidates(conn, base_settings(), [candidate()])
@@ -391,6 +391,7 @@ class StrategyLabTest(unittest.TestCase):
         created_at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, lab_rec())
+            generate_strategy_lab_candidates(conn, settings, [candidate()])
             conn.execute(
                 """
                 update strategy_lab_experiments

@@ -644,6 +644,13 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(conn, "strategy_lab_experiments", "experiment_type", "text not null default 'market_strategy'")
+    _ensure_column(conn, "strategy_lab_experiments", "original_strategy_logic_json", "text not null default '{}'")
+    _ensure_column(conn, "strategy_lab_experiments", "compiled_strategy_logic_json", "text not null default '{}'")
+    _ensure_column(conn, "strategy_lab_experiments", "compile_status", "text not null default 'uncompiled'")
+    _ensure_column(conn, "strategy_lab_experiments", "compile_diagnostics_json", "text not null default '{}'")
+    _ensure_column(conn, "strategy_lab_experiments", "runtime_schema_fingerprint", "text")
+    _ensure_column(conn, "strategy_lab_experiments", "compile_attempts", "integer not null default 0")
+    _ensure_column(conn, "strategy_lab_experiments", "last_compiled_at", "text")
     conn.execute(
         """
         create table if not exists market_admission_states (
@@ -2572,7 +2579,7 @@ def open_adapter_specs(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
         select id, created_at, source_recommendation_id, market_key, priority,
                title, status, spec_json, evidence_json
         from adapter_specs
-        where status = 'open'
+        where status in ('open', 'adapter_capability_gap')
         order by priority desc, id asc
         limit ?
         """,

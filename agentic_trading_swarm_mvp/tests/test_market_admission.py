@@ -115,9 +115,17 @@ class MarketAdmissionTests(unittest.TestCase):
         with memory_db() as conn:
             for _ in range(4):
                 market_admission.run_market_admission_monitor(conn, settings(), [stalled], [], [])
-            tasks = conn.execute("select id, status from improvement_tasks where title like 'Market admission stalled [%'").fetchall()
+            tasks = conn.execute(
+                "select id, status from improvement_tasks where title like 'Market admission cohort stalled [%]'"
+            ).fetchall()
+            directives = conn.execute(
+                "select id, status from market_hunter_directives "
+                "where market_key like 'market_admission_cohort|%'"
+            ).fetchall()
             self.assertEqual(1, len(tasks))
             self.assertEqual("open", tasks[0]["status"])
+            self.assertEqual(1, len(directives))
+            self.assertEqual("open", directives[0]["status"])
 
             healthy = global_candidate()
             review = {"decision": "approve_paper_trade", "hard_blocks": []}
@@ -129,13 +137,34 @@ class MarketAdmissionTests(unittest.TestCase):
                 [],
             )
             status = conn.execute("select status from improvement_tasks where id = ?", (tasks[0]["id"],)).fetchone()["status"]
+            directive_status = conn.execute(
+                "select status from market_hunter_directives where id = ?",
+                (directives[0]["id"],),
+            ).fetchone()["status"]
             self.assertEqual("resolved_market_admission_advanced", status)
+            self.assertEqual("resolved_market_admission_advanced", directive_status)
 
     def test_report_is_machine_readable(self):
         with memory_db() as conn:
             market_admission.run_market_admission_monitor(conn, settings(), [global_candidate()], [], [])
         payload = json.loads(market_admission.REPORT_JSON.read_text(encoding="utf-8"))
         self.assertEqual(1, payload["summary"]["requested_symbols_observed"])
+
+    def test_legacy_per_instrument_stall_tasks_are_superseded_by_cohort_model(self):
+        with memory_db() as conn:
+            for idx in range(3):
+                conn.execute(
+                    """
+                    insert into improvement_tasks (created_at, priority, title, rationale, status)
+                    values ('now', 95, ?, 'OKX normalization_missing', 'open')
+                    """,
+                    (f"Market admission stalled [legacy-{idx}]",),
+                )
+            conn.commit()
+            report = market_admission.run_market_admission_monitor(conn, settings(), [], [], [])
+            statuses = [row["status"] for row in conn.execute("select status from improvement_tasks")]
+        self.assertEqual(["superseded_by_market_admission_cohort"] * 3, statuses)
+        self.assertEqual(3, report["summary"]["task_cohorts"]["legacy_instrument_tasks_superseded"])
 
 
 if __name__ == "__main__":

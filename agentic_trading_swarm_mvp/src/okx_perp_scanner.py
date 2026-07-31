@@ -158,8 +158,15 @@ def instrument_asset_context(inst_id: str, instrument: dict | None = None) -> di
     ).upper()
     index_id = f"{base_asset}-{quote_asset}" if base_asset and quote_asset else normalized_inst_id.replace("-SWAP", "")
     return {
+        "base": base_asset or None,
+        "quote": quote_asset or None,
         "base_asset": base_asset or None,
         "quote_asset": quote_asset or None,
+        "settlement_currency": str(instrument.get("settleCcy") or quote_asset or "").upper() or None,
+        "underlying": str(instrument.get("uly") or instrument_family or index_id).upper() or None,
+        "instrument_type": "perpetual_swap" if normalized_inst_id.endswith("-SWAP") else "derivative",
+        "asset_class": "crypto_linked_derivative",
+        "market_surface": "okx_perpetual_swap",
         "instrument_family": instrument_family or None,
         "index_id": index_id,
         "basis_context_key": f"OKX|{instrument_family or index_id}",
@@ -385,6 +392,10 @@ def build_scan_batch(
             "inst_id": row.get("instId"),
             "venue": "OKX",
             "trade_type": "perp_funding_basis",
+            **instrument_asset_context(
+                str(row.get("instId") or ""),
+                instrument_by_inst.get(str(row.get("instId") or ""), {}),
+            ),
             "last": as_float(row.get("last")),
             "observed_at": seen_at,
             "price_source": "OKX public REST market tickers",

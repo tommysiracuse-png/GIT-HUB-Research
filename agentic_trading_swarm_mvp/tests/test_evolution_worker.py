@@ -159,7 +159,9 @@ class EvolutionWorkerSeparationTests(unittest.TestCase):
         self.assertEqual("public_data_adapter", normalized["payload"]["change_category"])
         self.assertNotIn("expected_files", normalized["payload"])
         preflight = code_evolution.preflight_proposal(normalized["payload"], {"code_evolution": {}})
-        self.assertIn("src/research_worker.py", preflight["target_files"])
+        self.assertIn("src/adapter_runtime.py", preflight["target_files"])
+        self.assertIn("src/adapter_capabilities.py", preflight["target_files"])
+        self.assertNotIn("src/research_worker.py", preflight["target_files"])
         self.assertNotIn("src/frontier_crypto_adapter.py", preflight["target_files"])
 
     def test_unknown_crypto_exchange_still_maps_to_frontier_adapter_without_name_allowlist(self) -> None:

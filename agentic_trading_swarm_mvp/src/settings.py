@@ -140,6 +140,8 @@ DEFAULT_SETTINGS = {
         "min_verified_snapshots_for_regional_candidate": 3,
         "min_regional_quality_score": 70.0,
         "snapshot_retention_rows": 100000,
+        "valid_empty_book_cooldown_after": 2,
+        "empty_book_core_asset_exemptions": ["BTC", "ETH", "USDT", "USDC"],
     },
     "frontier_regional_fx": {
         "enabled": True,
@@ -147,6 +149,15 @@ DEFAULT_SETTINGS = {
         "max_reference_age_hours": 30,
         "timeout_seconds": 10,
         "quotes": ["ARS", "BRL", "CLP", "COP", "GHS", "IDR", "KES", "MXN", "MYR", "NGN", "PEN", "PHP", "SGD", "THB", "ZAR"],
+    },
+    "public_market_adapters": {
+        "enabled": True,
+        "workers": 5,
+        "twse_daily_public": {"enabled": True, "cache_minutes": 60, "max_instruments": 300},
+        "kase_futures_public_results": {"enabled": True, "cache_minutes": 15},
+        "nzx_gdt_event_reference": {"enabled": True, "cache_minutes": 60},
+        "bursa_derivatives_contract_catalog": {"enabled": True, "cache_minutes": 360},
+        "bahrain_cross_listings_catalog": {"enabled": True, "cache_minutes": 360},
     },
     "market_admission": {
         "enabled": True,

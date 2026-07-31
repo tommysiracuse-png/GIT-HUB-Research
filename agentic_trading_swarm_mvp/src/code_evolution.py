@@ -1964,11 +1964,10 @@ DEFAULT_CATEGORY_FILES = {
         "tests/test_code_evolution.py",
     ],
     "public_data_adapter": [
-        "src/frontier_crypto_adapter.py",
-        "src/frontier_data_quality.py",
-        "config/frontier_crypto_venues.example.json",
-        "tests/test_frontier_crypto_adapter.py",
-        "tests/test_frontier_data_quality.py",
+        "src/adapter_runtime.py",
+        "src/adapter_capabilities.py",
+        "src/adapters/registry.py",
+        "tests/test_public_market_adapters.py",
     ],
     "parser_improvement": [
         "src/frontier_crypto_adapter.py",
@@ -2078,6 +2077,9 @@ RUNTIME_INTEGRATION_PATHS = {
     "src/research_worker.py",
     "src/global_market_discovery_scanner.py",
     "src/global_proxy_scanner.py",
+    "src/adapter_runtime.py",
+    "src/adapter_capabilities.py",
+    "src/adapters/registry.py",
 }
 
 RUNTIME_INTEGRATED_CATEGORIES = {
@@ -2708,6 +2710,13 @@ def _path_creation_allowed(path: str, category: str) -> bool:
         return pathlib.PurePosixPath(path).suffix.lower() in {".json", ".jsonl", ".csv", ".txt", ".yaml", ".yml"}
     if path.startswith("tests/test_") and path.endswith(".py"):
         return True
+    if path.startswith("src/adapters/venues/") and path.endswith(".py") and category == "public_data_adapter":
+        return True
+    if path.startswith("src/signals/") and path.endswith(".py") and category in {
+        "paper_signal_variant",
+        "strategy_lab_promotion",
+    }:
+        return True
     if path.startswith("src/") and path.endswith(".py") and category in {
         "runtime_pipeline_integration",
         "parser_improvement",
@@ -2771,9 +2780,10 @@ def _semantic_target_files(raw: str, category: str, payload: dict) -> list[str]:
     )
     if category == "public_data_adapter" and any(token in text for token in global_public_data_terms):
         return [
-            "src/research_worker.py",
-            "src/llm_bridge.py",
-            "tests/test_research_worker.py",
+            "src/adapter_runtime.py",
+            "src/adapter_capabilities.py",
+            "src/adapters/registry.py",
+            "tests/test_public_market_adapters.py",
         ]
     if any(token in text for token in ("paper scoring", "signal scoring", "score_adjustment", "quarantine", "shadow_filtered")):
         return [
@@ -2833,6 +2843,26 @@ def preflight_proposal(payload: dict, settings: dict, root: pathlib.Path = ROOT)
     invalid_targets = []
     used_default_targets = False
     for raw in _target_files(payload):
+        norm = _normalize_path(raw)
+        canonical = _canonical_path(raw)
+        explicit_path = bool(
+            norm
+            and (
+                re.search(r"\b(?:src|tests|config|docs)/", norm)
+                or pathlib.PurePosixPath(norm).suffix
+            )
+        )
+        if (
+            explicit_path
+            and canonical
+            and canonical == norm
+            and not _path_blocked(canonical, cfg)
+            and ((root / canonical).exists() or _path_creation_allowed(canonical, category))
+        ):
+            if canonical != norm:
+                path_repairs.append({"from": norm or raw, "to": canonical})
+            target_files.append(canonical)
+            continue
         semantic_targets = _semantic_target_files(raw, category, payload)
         if semantic_targets:
             added_semantic: list[str] = []
@@ -3043,7 +3073,10 @@ def _runtime_integration_status(payload: dict, category: str, target_files: list
     runtime_targets = [
         path
         for path in target_files
-        if path in RUNTIME_INTEGRATION_PATHS or path.startswith("config/")
+        if path in RUNTIME_INTEGRATION_PATHS
+        or path.startswith("config/")
+        or path.startswith("src/adapters/venues/")
+        or path.startswith("src/signals/")
     ]
     if runtime_targets:
         return "integrated"
@@ -3604,6 +3637,18 @@ def generate_patch_with_frontier_model(
         likely_tests=[_command_display(command) for command in _test_commands(payload, {**cfg, "run_full_regression": False}, root=root)],
     )
     rendered_context = render_builder_context(builder_context)
+    category = _normalize_category(_field(payload, "change_category", "category"))
+    category_contract = ""
+    if category == "public_data_adapter":
+        category_contract = (
+            "\nPublic adapter contract:\n"
+            "- a real new venue adapter belongs in src/adapters/venues/<venue_slug>.py;\n"
+            "- it must register AdapterInfo and return a normalized ScanBatch;\n"
+            "- src/adapter_runtime.py auto-discovers registered plugins, so do not add bespoke radar branches;\n"
+            "- preserve source URL, data health, session state, and precise capability gaps;\n"
+            "- add parser/runtime tests in tests/test_public_market_adapters.py or a focused adapter test;\n"
+            "- editing research seeds alone is discovery work, not a completed runtime adapter.\n"
+        )
 
     system = (
         "You are the Build Planner for a paper-only trading research system. "
@@ -3627,6 +3672,7 @@ def generate_patch_with_frontier_model(
         "- include complete added files and complete modified hunks; no truncated patches;\n"
         "- do not wrap or duplicate existing functions when a local helper or report field is enough;\n"
         "- if the proposal is too large, implement the highest-value safe part that is actually used by runtime code.\n\n"
+        f"{category_contract}\n"
         f"PREFLIGHT:\n{json.dumps(preflight, sort_keys=True)}\n\n"
         f"PROPOSAL:\n{json.dumps(payload, sort_keys=True)}\n\n"
         f"{rendered_context}"

@@ -2223,6 +2223,8 @@ def _report_markdown(report: dict) -> str:
         regional_fx = expansion.get("regional_fx_reference") or {}
         prediction = expansion.get("prediction_markets") or {}
         route = expansion.get("route_intelligence") or {}
+        public_adapters = expansion.get("public_market_adapters") or {}
+        adapter_capabilities = expansion.get("adapter_capabilities") or {}
         lines.extend(["", "## Expansion Map", ""])
         lines.append(
             f"- Frontier observations: `{frontier.get('observation_count', 0)}` "
@@ -2253,6 +2255,17 @@ def _report_markdown(report: dict) -> str:
             f"- Route intelligence: blockers `{route.get('blocker_counts', {})}`, "
             f"potentially executable soon `{route.get('potentially_executable_soon_count', 0)}`"
         )
+        if public_adapters:
+            lines.append(
+                f"- Public adapter plugins: `{public_adapters.get('adapter_count', 0)}` adapters, "
+                f"`{public_adapters.get('observation_count', 0)}` observations, "
+                f"source health=`{public_adapters.get('by_source_status', {})}`"
+            )
+        if adapter_capabilities:
+            lines.append(
+                f"- Adapter capability registry: `{adapter_capabilities.get('inventory_count', 0)}` runtime adapters, "
+                f"spec reconciliation=`{adapter_capabilities.get('by_status', {})}`"
+            )
 
     admission = report.get("market_admission") or expansion.get("market_admission") or {}
     if admission:

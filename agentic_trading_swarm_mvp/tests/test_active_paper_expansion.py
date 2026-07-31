@@ -103,6 +103,11 @@ class ActivePaperExpansionTests(unittest.TestCase):
             {"instFamily": "BTC-USDT", "settleCcy": "USDT"},
         )
         self.assertEqual("BTC", context["base_asset"])
+        self.assertEqual("BTC", context["base"])
+        self.assertEqual("USDT", context["quote"])
+        self.assertEqual("USDT", context["settlement_currency"])
+        self.assertEqual("perpetual_swap", context["instrument_type"])
+        self.assertEqual("okx_perpetual_swap", context["market_surface"])
         self.assertEqual("BTC-USDT", context["index_id"])
         self.assertEqual("asset_specific", context["basis_context_status"])
         candidate = {

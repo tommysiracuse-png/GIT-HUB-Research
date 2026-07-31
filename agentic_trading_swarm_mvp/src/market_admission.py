@@ -106,7 +106,13 @@ def _is_normalized(item: dict) -> bool:
     return bool(
         item.get("venue")
         and (item.get("inst_id") or item.get("instrument_id"))
-        and (item.get("base") or item.get("asset_class") or item.get("market_surface"))
+        and (
+            item.get("base")
+            or item.get("base_asset")
+            or item.get("underlying")
+            or item.get("asset_class")
+            or item.get("market_surface")
+        )
     )
 
 
@@ -232,16 +238,56 @@ def _stats_for(item: dict, stats: dict[tuple[str, str], dict]) -> dict:
     }
 
 
+def _cohort_key(state: dict) -> str:
+    identity = "|".join(
+        (
+            _text(state.get("venue")).upper(),
+            _text(state.get("current_stage")),
+            _text(state.get("blocker_code")),
+            _text(state.get("market_surface")),
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+
+def _cohort_members(conn: sqlite3.Connection, state: dict) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        select admission_key, inst_id, stalled_eligible_scans
+        from market_admission_states
+        where venue = ? and current_stage = ? and coalesce(blocker_code, '') = ?
+          and market_surface = ?
+        order by stalled_eligible_scans desc, inst_id asc
+        """,
+        (
+            _text(state.get("venue")).upper(),
+            _text(state.get("current_stage")),
+            str(state.get("blocker_code") or ""),
+            _text(state.get("market_surface")),
+        ),
+    ).fetchall()
+
+
 def _upsert_diagnostic(conn: sqlite3.Connection, state: dict, priority: int) -> None:
-    market_key = f"market_admission|{state['admission_key']}"
-    directive = f"Diagnose {state['venue']} {state['inst_id']} stalled at {state['current_stage']}"
+    cohort_key = _cohort_key(state)
+    members = _cohort_members(conn, state)
+    market_key = f"market_admission_cohort|{cohort_key}"
+    directive = (
+        f"Diagnose {state['venue']} {state.get('market_surface')} cohort stalled at "
+        f"{state['current_stage']} by {state.get('blocker_code')}"
+    )
     evidence = json.dumps(
         {
-            "admission_key": state["admission_key"],
+            "cohort_key": cohort_key,
             "stage": state["current_stage"],
             "blocker": state.get("blocker_code"),
-            "eligible_scans": state["eligible_scans"],
-            "stalled_eligible_scans": state["stalled_eligible_scans"],
+            "market_surface": state.get("market_surface"),
+            "instrument_count": len(members),
+            "sample_instruments": [str(row["inst_id"]) for row in members[:20]],
+            "max_stalled_eligible_scans": max(
+                [int(row["stalled_eligible_scans"] or 0) for row in members],
+                default=int(state["stalled_eligible_scans"]),
+            ),
         },
         sort_keys=True,
     )
@@ -273,10 +319,14 @@ def _upsert_diagnostic(conn: sqlite3.Connection, state: dict, priority: int) -> 
 
 
 def _upsert_task(conn: sqlite3.Connection, state: dict) -> None:
-    title = f"Market admission stalled [{state['admission_key']}]"
+    cohort_key = _cohort_key(state)
+    members = _cohort_members(conn, state)
+    samples = [str(row["inst_id"]) for row in members[:20]]
+    title = f"Market admission cohort stalled [{cohort_key}]"
     rationale = (
-        f"{state['venue']} {state['inst_id']} is stalled at {state['current_stage']} after "
-        f"{state['stalled_eligible_scans']} eligible scans. Exact blocker: {state.get('blocker_code')}. "
+        f"{state['venue']} {state.get('market_surface')} has {len(members)} instruments stalled at "
+        f"{state['current_stage']}. Exact blocker: {state.get('blocker_code')}. "
+        f"Sample instruments: {', '.join(samples[:10])}. "
         "Fix only the owning admission stage and preserve independent strategy/route evidence."
     )
     conn.execute(
@@ -286,6 +336,16 @@ def _upsert_task(conn: sqlite3.Connection, state: dict) -> None:
         on conflict(title) do update set priority = 95, rationale = excluded.rationale, status = 'open'
         """,
         (utc_now(), title, rationale),
+    )
+    # Preserve history while removing the pre-cohort one-task-per-instrument flood.
+    conn.execute(
+        """
+        update improvement_tasks
+        set status = 'superseded_by_market_admission_cohort'
+        where status = 'open' and title like 'Market admission stalled [%'
+          and rationale like ? and rationale like ?
+        """,
+        (f"{state['venue']} %", f"%Exact blocker: {state.get('blocker_code')}%"),
     )
 
 
@@ -298,6 +358,83 @@ def _resolve_actions(conn: sqlite3.Connection, admission_key: str) -> None:
         "update market_hunter_directives set status = 'resolved_market_admission_advanced' where market_key = ? and status = 'open'",
         (f"market_admission|{admission_key}",),
     )
+
+
+def _reconcile_cohort_tasks(conn: sqlite3.Connection, diagnostic_after: int, task_after: int) -> dict:
+    rows = conn.execute(
+        """
+        select venue, current_stage, blocker_code, market_surface, stalled_eligible_scans
+        from market_admission_states
+        where blocker_code is not null and stalled_eligible_scans >= ?
+        """,
+        (int(task_after),),
+    ).fetchall()
+    active_titles = {
+        f"Market admission cohort stalled [{_cohort_key(dict(row))}]"
+        for row in rows
+    }
+    directive_rows = conn.execute(
+        """
+        select venue, current_stage, blocker_code, market_surface, stalled_eligible_scans
+        from market_admission_states
+        where blocker_code is not null and stalled_eligible_scans >= ?
+        """,
+        (int(diagnostic_after),),
+    ).fetchall()
+    active_directive_keys = {
+        f"market_admission_cohort|{_cohort_key(dict(row))}"
+        for row in directive_rows
+    }
+    open_rows = conn.execute(
+        "select id, title from improvement_tasks "
+        "where status = 'open' and title like 'Market admission cohort stalled [%]%'"
+    ).fetchall()
+    resolved = 0
+    for row in open_rows:
+        if str(row["title"]) in active_titles:
+            continue
+        conn.execute(
+            "update improvement_tasks set status = 'resolved_market_admission_advanced' where id = ?",
+            (int(row["id"]),),
+        )
+        resolved += 1
+    open_directives = conn.execute(
+        "select id, market_key from market_hunter_directives "
+        "where status = 'open' and market_key like 'market_admission_cohort|%'"
+    ).fetchall()
+    resolved_directives = 0
+    for row in open_directives:
+        if str(row["market_key"]) in active_directive_keys:
+            continue
+        conn.execute(
+            "update market_hunter_directives set status = 'resolved_market_admission_advanced' where id = ?",
+            (int(row["id"]),),
+        )
+        resolved_directives += 1
+    legacy_tasks = conn.execute(
+        """
+        update improvement_tasks
+        set status = 'superseded_by_market_admission_cohort'
+        where status = 'open'
+          and title like 'Market admission stalled [%]'
+          and title not like 'Market admission cohort stalled [%]'
+        """
+    ).rowcount
+    legacy_directives = conn.execute(
+        """
+        update market_hunter_directives
+        set status = 'superseded_by_market_admission_cohort'
+        where status = 'open' and market_key like 'market_admission|%'
+        """
+    ).rowcount
+    return {
+        "active_cohorts": len(active_titles),
+        "active_diagnostic_cohorts": len(active_directive_keys),
+        "resolved_cohort_tasks": resolved,
+        "resolved_cohort_directives": resolved_directives,
+        "legacy_instrument_tasks_superseded": int(legacy_tasks),
+        "legacy_instrument_directives_superseded": int(legacy_directives),
+    }
 
 
 def _write_report(states: list[dict], settings: dict) -> dict:
@@ -472,12 +609,15 @@ def run_market_admission_monitor(
             "eligible_scans": (int(previous["eligible_scans"] or 0) if previous else 0) + (1 if eligible else 0),
             "stalled_eligible_scans": stalled,
             "blocker_code": blocker,
+            "market_surface": _surface(item),
+            "strategy_lineage": lineage,
         }
         if stalled >= task_after:
             _upsert_task(conn, state_for_action)
         elif stalled >= diagnostic_after:
             _upsert_diagnostic(conn, state_for_action, 85)
         touched.append(admission_key)
+    cohort_tasks = _reconcile_cohort_tasks(conn, diagnostic_after, task_after)
     conn.commit()
 
     if touched:
@@ -493,4 +633,7 @@ def run_market_admission_monitor(
         output = dict(row)
         output["details"] = json.loads(output.pop("details_json") or "{}")
         states.append(output)
-    return _write_report(states, settings)
+    report = _write_report(states, settings)
+    report["summary"]["task_cohorts"] = cohort_tasks
+    REPORT_JSON.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    return report
