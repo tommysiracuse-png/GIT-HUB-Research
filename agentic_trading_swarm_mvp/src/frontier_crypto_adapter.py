@@ -372,6 +372,149 @@ def _paper_only_context_validation_passed(value):
     return score >= 0.6
 
 
+def _paper_only_surface_fingerprint_component(value, component):
+    token = _paper_only_surface_token(value)
+    if token is None:
+        return None
+    if component == "venue_family":
+        parts = [part for part in token.split("_") if part]
+        while parts and parts[-1] in {"spot", "perp", "basis", "proxy", "frontier", "cash"}:
+            parts.pop()
+        return "_".join(parts) or token
+    if component == "instrument_class":
+        if "basis" in token:
+            return "basis"
+        if "proxy" in token:
+            return "proxy"
+        if any(marker in token for marker in ("perp", "perpetual", "swap", "future", "futures")):
+            return "perp"
+        if "frontier" in token:
+            return "frontier"
+        if token == "cash" or "spot" in token:
+            return "spot"
+        return token
+    if component == "direction_family":
+        if token in {"buy", "bullish", "up"} or "long" in token:
+            return "long"
+        if token in {"sell", "bearish", "down"} or "short" in token:
+            return "short"
+        if token in {"neutral", "market_neutral", "hedged"} or "neutral" in token:
+            return "market_neutral"
+        return token
+    if component == "execution_style":
+        if token in {"maker", "post_only"} or "passive" in token:
+            return "passive"
+        if token in {"market", "ioc", "taker"} or "aggress" in token:
+            return "aggressive"
+        if "condition" in token or token in {"stop", "trigger"}:
+            return "conditional"
+        return token
+    if component == "horizon_bucket":
+        if token in {"intraday", "day", "scalp", "scalping"} or "intraday" in token:
+            return "intraday"
+        if token in {"swing", "position"} or "swing" in token:
+            return "swing"
+        if token in {"carry", "funding"} or "carry" in token or "funding" in token:
+            return "carry"
+        return token
+    if component == "cost_regime":
+        if token in {"low", "cheap"} or "low" in token:
+            return "low"
+        if token in {"medium", "mid"} or "medium" in token:
+            return "medium"
+        if token in {"high", "expensive"} or "high" in token:
+            return "high"
+        return token
+    return token
+
+
+def _paper_only_surface_fingerprint(value, *, namespace=None, fallback_surface=None):
+    if not isinstance(value, dict):
+        return {}
+
+    if namespace == "origin":
+        prefixes = ("origin", "source", "home", "seed", "prior")
+    elif namespace == "target":
+        prefixes = ("target", "candidate", "execution")
+    else:
+        prefixes = ()
+
+    def _lookup(*field_names):
+        keys = []
+        for field_name in field_names:
+            for prefix in prefixes:
+                keys.append(f"{prefix}_{field_name}")
+            keys.append(field_name)
+        return _paper_only_route_quality_lookup(value, *keys)
+
+    surface_token = _paper_only_surface_token(fallback_surface)
+    venue_family = _paper_only_surface_fingerprint_component(
+        _lookup("venue_family", "venue", "exchange", "broker", "execution_venue"),
+        "venue_family",
+    )
+    instrument_class = _paper_only_surface_fingerprint_component(
+        _lookup("instrument_class", "instrument", "asset_class", "market_type"),
+        "instrument_class",
+    )
+    direction_family = _paper_only_surface_fingerprint_component(
+        _lookup("direction_family", "direction", "side", "bias"),
+        "direction_family",
+    )
+    execution_style = _paper_only_surface_fingerprint_component(
+        _lookup("execution_style", "execution", "order_style", "order_type"),
+        "execution_style",
+    )
+    horizon_bucket = _paper_only_surface_fingerprint_component(
+        _lookup("horizon_bucket", "horizon", "holding_period", "term"),
+        "horizon_bucket",
+    )
+    cost_regime = _paper_only_surface_fingerprint_component(
+        _lookup("cost_regime", "cost", "fee_regime", "fee", "slippage"),
+        "cost_regime",
+    )
+
+    if venue_family is None and surface_token is not None:
+        venue_family = _paper_only_surface_fingerprint_component(surface_token, "venue_family")
+
+    return {
+        "venue_family": venue_family,
+        "instrument_class": instrument_class,
+        "direction_family": direction_family,
+        "execution_style": execution_style,
+        "horizon_bucket": horizon_bucket,
+        "cost_regime": cost_regime,
+    }
+
+
+def _paper_only_surface_fingerprint_matches(source, target):
+    source_fp = _paper_only_surface_fingerprint(source, namespace="origin", fallback_surface=source)
+    target_fp = _paper_only_surface_fingerprint(target, namespace="target", fallback_surface=target)
+    if not source_fp or not target_fp:
+        return False
+
+    matched = 0
+    checked = 0
+    for key in ("venue_family", "instrument_class", "direction_family", "execution_style"):
+        left = source_fp.get(key)
+        right = target_fp.get(key)
+        if left is None or right is None:
+            continue
+        checked += 1
+        if left == right:
+            matched += 1
+    if checked == 0:
+        return False
+    return matched == checked
+
+
+def _paper_only_surface_boost_allowed(source, target):
+    if not _paper_only_context_validation_passed(source):
+        return False
+    if not _paper_only_context_validation_passed(target):
+        return False
+    return _paper_only_surface_fingerprint_matches(source, target)
+
+
 def _paper_only_context_scoping_review(value, *, origin_surface=None, target_surface=None, same_surface=False):
     if not isinstance(value, dict):
         return None
