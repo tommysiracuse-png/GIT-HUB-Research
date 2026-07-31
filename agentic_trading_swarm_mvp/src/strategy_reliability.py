@@ -195,6 +195,210 @@ PAPER_FRONTIER_LIQUIDITY_SCORE_MIN = 0.5
 PAPER_FRONTIER_DEPTH_USD_MIN = 25000.0
 
 
+OKX_BASIS_PAPER_CARRY_FLAG_KEYS = (
+    "paper_okx_basis_carry_gate_enabled",
+    "okx_basis_paper_carry_gate_enabled",
+    "paper_okx_basis_carry_enabled",
+)
+OKX_BASIS_PAPER_CARRY_SCOPES = (
+    "paper",
+    "paper_policy",
+    "strategy_reliability",
+    "paper_order_router",
+)
+OKX_BASIS_PAPER_TARGET_FIELDS = (
+    "market_key",
+    "market_surface",
+    "signal_key",
+    "trade_type",
+    "strategy",
+    "strategy_id",
+    "variant",
+    "variant_id",
+    "context_key",
+    "notes",
+    "thesis",
+)
+OKX_BASIS_FUNDING_FIELDS = (
+    "net_funding_bps",
+    "net_funding_edge_bps",
+    "expected_net_funding_bps",
+    "forward_net_funding_bps",
+    "funding_edge_bps",
+    "carry_edge_bps",
+    "expected_carry_bps",
+    "expected_funding_bps",
+    "forward_funding_bps",
+    "forecast_funding_bps",
+    "funding_rate_bps",
+)
+OKX_BASIS_EXPLICIT_NET_FIELDS = (
+    "net_funding_bps",
+    "net_funding_edge_bps",
+    "expected_net_funding_bps",
+    "forward_net_funding_bps",
+    "net_edge_bps_estimate",
+)
+OKX_BASIS_ROUND_TRIP_COST_FIELDS = (
+    "estimated_round_trip_cost_bps",
+    "round_trip_cost_bps",
+    "total_cost_bps",
+    "estimated_total_cost_bps",
+)
+OKX_BASIS_FEE_FIELDS = (
+    "estimated_fee_bps",
+    "fee_bps",
+    "fees_bps",
+)
+OKX_BASIS_SLIPPAGE_FIELDS = (
+    "estimated_slippage_bps",
+    "slippage_bps",
+)
+OKX_BASIS_LEVEL_FIELDS = (
+    "basis_bps",
+    "basis_spread_bps",
+    "premium_bps",
+    "perp_premium_bps",
+)
+OKX_BASIS_ELEVATED_TERMS = ("rich", "elevated", "crowded")
+OKX_BASIS_WEAK_FUNDING_TERMS = ("weak_funding", "funding_weak", "negative_funding", "funding_negative")
+OKX_BASIS_UNSTABLE_FUNDING_TERMS = ("unstable_funding", "funding_unstable", "funding_flip", "flip_risk")
+OKX_BASIS_RICH_BPS_MIN = 12.0
+OKX_BASIS_RICH_MIN_NET_FUNDING_BPS = 1.0
+
+
+def okx_basis_paper_carry_gate_enabled(
+    config: Mapping[str, Any] | bool | None = None,
+) -> bool:
+    if isinstance(config, bool):
+        return config
+    if not isinstance(config, Mapping):
+        return True
+
+    for key in OKX_BASIS_PAPER_CARRY_FLAG_KEYS:
+        if key in config:
+            return _as_bool(config.get(key), True)
+
+    for scope in OKX_BASIS_PAPER_CARRY_SCOPES:
+        scoped = config.get(scope)
+        if not isinstance(scoped, Mapping):
+            continue
+        for key in OKX_BASIS_PAPER_CARRY_FLAG_KEYS:
+            if key in scoped:
+                return _as_bool(scoped.get(key), True)
+    return True
+
+
+def _okx_basis_text(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        return " ".join(_okx_basis_text(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_okx_basis_text(item) for item in value)
+    return str(value)
+
+
+def _okx_basis_first_present_float(
+    candidate: Mapping[str, Any],
+    fields: tuple[str, ...],
+) -> tuple[str | None, float | None]:
+    for container in (
+        candidate,
+        candidate.get("paper_metrics"),
+        candidate.get("analysis"),
+        candidate.get("thesis"),
+        candidate.get("metadata"),
+        candidate.get("paper_policy"),
+    ):
+        if not isinstance(container, Mapping):
+            continue
+        for field in fields:
+            value = container.get(field)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                return field, numeric
+    return None, None
+
+
+def _okx_basis_paper_carry_target(candidate: Mapping[str, Any]) -> bool:
+    haystack = " ".join(_okx_basis_text(candidate.get(field)) for field in OKX_BASIS_PAPER_TARGET_FIELDS).lower()
+    return "okx" in haystack and "basis" in haystack and any(term in haystack for term in ("swap", "perp", "carry", "funding"))
+
+
+def okx_basis_paper_carry_gate_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    if not okx_basis_paper_carry_gate_enabled(config):
+        return None
+    if not _okx_basis_paper_carry_target(candidate):
+        return None
+
+    descriptor = " ".join(_okx_basis_text(candidate.get(field)) for field in OKX_BASIS_PAPER_TARGET_FIELDS).lower()
+    funding_field, funding_bps = _okx_basis_first_present_float(candidate, OKX_BASIS_FUNDING_FIELDS)
+    explicit_net_field, explicit_net_funding_bps = _okx_basis_first_present_float(candidate, OKX_BASIS_EXPLICIT_NET_FIELDS)
+    round_trip_field, round_trip_cost_bps = _okx_basis_first_present_float(candidate, OKX_BASIS_ROUND_TRIP_COST_FIELDS)
+    fee_field, fee_bps = _okx_basis_first_present_float(candidate, OKX_BASIS_FEE_FIELDS)
+    slippage_field, slippage_bps = _okx_basis_first_present_float(candidate, OKX_BASIS_SLIPPAGE_FIELDS)
+    basis_field, basis_bps = _okx_basis_first_present_float(candidate, OKX_BASIS_LEVEL_FIELDS)
+
+    estimated_cost_bps = round_trip_cost_bps
+    if estimated_cost_bps is None and fee_bps is not None and slippage_bps is not None:
+        estimated_cost_bps = fee_bps + slippage_bps
+
+    net_funding_bps = explicit_net_funding_bps
+    if net_funding_bps is None and funding_bps is not None:
+        if estimated_cost_bps is not None:
+            net_funding_bps = funding_bps - estimated_cost_bps
+        else:
+            net_funding_bps = funding_bps
+
+    basis_rich = (basis_bps is not None and basis_bps >= OKX_BASIS_RICH_BPS_MIN) or any(
+        term in descriptor for term in OKX_BASIS_ELEVATED_TERMS
+    )
+    weak_funding = any(term in descriptor for term in OKX_BASIS_WEAK_FUNDING_TERMS)
+    unstable_funding = any(term in descriptor for term in OKX_BASIS_UNSTABLE_FUNDING_TERMS)
+
+    checks: list[dict[str, Any]] = []
+    failed_checks: list[dict[str, Any]] = []
+    if funding_bps is None and explicit_net_funding_bps is None:
+        checks.append({"code": "funding_expectation_missing"})
+    elif net_funding_bps is not None and net_funding_bps <= 0.0:
+        failed_checks.append({"code": "non_positive_net_funding_expectation", "value": net_funding_bps, "field": explicit_net_field or funding_field})
+    elif basis_rich and net_funding_bps is not None and net_funding_bps <= OKX_BASIS_RICH_MIN_NET_FUNDING_BPS:
+        failed_checks.append({"code": "weak_carry_for_rich_basis", "value": net_funding_bps, "field": explicit_net_field or funding_field})
+
+    if weak_funding and (net_funding_bps is None or net_funding_bps <= OKX_BASIS_RICH_MIN_NET_FUNDING_BPS):
+        failed_checks.append({"code": "rich_basis_with_weak_funding", "value": net_funding_bps, "field": explicit_net_field or funding_field})
+    if unstable_funding and (net_funding_bps is None or net_funding_bps <= OKX_BASIS_RICH_MIN_NET_FUNDING_BPS):
+        failed_checks.append({"code": "unstable_funding_carry_regime", "value": net_funding_bps, "field": explicit_net_field or funding_field})
+
+    return {
+        "guard": "paper_okx_basis_carry_gate",
+        "paper_only": True,
+        "eligible": not failed_checks,
+        "conviction_cap": "full" if not failed_checks else "hold",
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "funding_field": funding_field,
+        "estimated_cost_field": round_trip_field or fee_field or slippage_field,
+        "basis_field": basis_field,
+        "funding_bps": funding_bps,
+        "estimated_carry_cost_bps": estimated_cost_bps,
+        "net_funding_bps": net_funding_bps,
+        "basis_bps": basis_bps,
+        "basis_rich": basis_rich,
+        "weak_or_unstable_funding_context": weak_funding or unstable_funding,
+        "suppression_action": "hold_no_trade" if failed_checks else "allow",
+    }
+
+
 def paper_frontier_execution_quality_gate_enabled(
     config: Mapping[str, Any] | bool | None = None,
 ) -> bool:

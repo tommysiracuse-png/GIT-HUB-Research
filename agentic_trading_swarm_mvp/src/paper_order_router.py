@@ -455,6 +455,22 @@ def _paper_frontier_execution_quality_gate(
     return dict(record) if isinstance(record, Mapping) else None
 
 
+def _paper_okx_basis_carry_gate(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    try:
+        from strategy_reliability import okx_basis_paper_carry_gate_record as _carry_gate_record
+    except Exception:
+        return None
+
+    try:
+        record = _carry_gate_record(dict(candidate), config=config)
+    except Exception:
+        return None
+    return dict(record) if isinstance(record, Mapping) else None
+
+
 def frontier_shadow_filter_reason(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -476,6 +492,21 @@ def frontier_shadow_filter_reason(
         normalized.setdefault("candidate", _candidate_reference(candidate))
         normalized.setdefault("cell", _paper_signal_cell(candidate))
         return normalized
+
+    carry_gate = _paper_okx_basis_carry_gate(candidate, config=config)
+    if carry_gate is not None and not _as_bool(carry_gate.get("eligible"), True):
+        return {
+            "reason": "paper_okx_basis_carry_gate",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "paper_okx_basis_carry_gate",
+            "candidate": _candidate_reference(candidate),
+            "cell": _paper_signal_cell(candidate),
+            "checks": carry_gate.get("checks") or [],
+            "failed_checks": carry_gate.get("failed_checks") or [],
+            "conviction_cap": carry_gate.get("conviction_cap") or "hold",
+            "basis_carry_gate": carry_gate,
+        }
 
     if not frontier_paper_guard_enabled(config) or not is_frontier_crypto_candidate(candidate):
         return None
