@@ -315,6 +315,14 @@ def _apply_route_feasibility_metadata(candidate: Mapping[str, Any]) -> dict[str,
         annotated["paper_lineage_inherited_boost_allowed"] = lineage_context.get(
             "inherited_score_boost_allowed"
         )
+    execution_quality = _paper_frontier_execution_quality_gate(annotated)
+    if execution_quality:
+        annotated["paper_frontier_execution_quality"] = execution_quality
+        annotated["paper_frontier_execution_quality_key"] = execution_quality.get("guard")
+        annotated["paper_execution_quality_favorable"] = execution_quality.get("favorable_context")
+        annotated["paper_execution_quality_score_multiplier"] = execution_quality.get(
+            "paper_score_multiplier"
+        )
     return annotated
 
 
@@ -431,6 +439,22 @@ def _paper_lineage_context(candidate: Mapping[str, Any]) -> dict[str, Any] | Non
     return None
 
 
+def _paper_frontier_execution_quality_gate(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    try:
+        from strategy_reliability import paper_frontier_execution_quality_gate_record as _quality_gate_record
+    except Exception:
+        return None
+
+    try:
+        record = _quality_gate_record(dict(candidate), config=config)
+    except Exception:
+        return None
+    return dict(record) if isinstance(record, Mapping) else None
+
+
 def frontier_shadow_filter_reason(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -455,6 +479,20 @@ def frontier_shadow_filter_reason(
 
     if not frontier_paper_guard_enabled(config) or not is_frontier_crypto_candidate(candidate):
         return None
+
+    execution_quality = _paper_frontier_execution_quality_gate(candidate, config=config)
+    if execution_quality is not None and not _as_bool(execution_quality.get("eligible"), True):
+        return {
+            "reason": "paper_frontier_execution_quality_gate",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "paper_frontier_execution_quality_gate",
+            "candidate": _candidate_reference(candidate),
+            "cell": _paper_signal_cell(candidate),
+            "checks": execution_quality.get("checks") or [],
+            "failed_checks": execution_quality.get("failed_checks") or [],
+            "execution_quality": execution_quality,
+        }
     checks: list[dict[str, Any]] = []
     edge_field, edge_bps = _first_float(candidate, ("edge_bps_estimate", "net_edge_bps_estimate", "edge_bps"))
     if edge_bps is not None and edge_bps <= 0.0:

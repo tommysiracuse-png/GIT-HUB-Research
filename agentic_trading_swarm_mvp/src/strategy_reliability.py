@@ -9,6 +9,7 @@ to shadow/probation while working slices stay visible for expansion trials.
 from __future__ import annotations
 
 import collections
+from collections.abc import Mapping
 import datetime as dt
 import json
 import math
@@ -173,6 +174,238 @@ PAPER_HOLDING_PROFILE_FIELDS = (
     "holding_period_bucket",
     "horizon_profile",
 )
+
+PAPER_FRONTIER_EXECUTION_QUALITY_FLAG_KEYS = (
+    "paper_frontier_execution_quality_gate_enabled",
+    "paper_frontier_execution_quality_enabled",
+    "frontier_execution_quality_gate_enabled",
+)
+PAPER_FRONTIER_EXECUTION_QUALITY_SCOPES = (
+    "paper",
+    "paper_policy",
+    "strategy_reliability",
+    "paper_order_router",
+    "frontier",
+)
+PAPER_FRONTIER_EXECUTION_QUALITY_MARKETS = {"OKX_SPOT"}
+PAPER_FRONTIER_ROUTE_RICHNESS_MIN = 2
+PAPER_FRONTIER_SPREAD_BPS_MAX = 12.0
+PAPER_FRONTIER_FRESHNESS_SECONDS_MAX = 20.0
+PAPER_FRONTIER_LIQUIDITY_SCORE_MIN = 0.5
+PAPER_FRONTIER_DEPTH_USD_MIN = 25000.0
+
+
+def paper_frontier_execution_quality_gate_enabled(
+    config: Mapping[str, Any] | bool | None = None,
+) -> bool:
+    if isinstance(config, bool):
+        return config
+    if not isinstance(config, Mapping):
+        return True
+
+    for key in PAPER_FRONTIER_EXECUTION_QUALITY_FLAG_KEYS:
+        if key in config:
+            return _as_bool(config.get(key), True)
+
+    for scope in PAPER_FRONTIER_EXECUTION_QUALITY_SCOPES:
+        scoped = config.get(scope)
+        if not isinstance(scoped, Mapping):
+            continue
+        for key in PAPER_FRONTIER_EXECUTION_QUALITY_FLAG_KEYS:
+            if key in scoped:
+                return _as_bool(scoped.get(key), True)
+    return True
+
+
+def _paper_frontier_execution_quality_target(candidate: Mapping[str, Any]) -> bool:
+    market_key = _paper_cell_text(candidate.get("market_key") or candidate.get("market_surface"), "").upper()
+    if market_key not in PAPER_FRONTIER_EXECUTION_QUALITY_MARKETS and "OKX_SPOT" not in market_key:
+        return False
+
+    haystack = " ".join(
+        _paper_cell_text(candidate.get(field), "")
+        for field in (
+            "direction",
+            "signal_key",
+            "trade_type",
+            "strategy",
+            "strategy_id",
+            "variant",
+            "variant_id",
+            "context_key",
+        )
+    ).lower()
+    if "frontier_crypto_venue_map" not in haystack:
+        return False
+    return "short_frontier_spot" in haystack or ("short" in haystack and "spot" in haystack)
+
+
+def _paper_frontier_first_present_float(
+    candidate: Mapping[str, Any],
+    fields: tuple[str, ...],
+) -> tuple[str | None, float | None]:
+    for field in fields:
+        value = candidate.get(field)
+        if value in (None, ""):
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numeric):
+            return field, numeric
+    return None, None
+
+
+def _paper_frontier_first_present_int(
+    candidate: Mapping[str, Any],
+    fields: tuple[str, ...],
+) -> tuple[str | None, int | None]:
+    field, value = _paper_frontier_first_present_float(candidate, fields)
+    if field is None or value is None:
+        return None, None
+    return field, int(value)
+
+
+def _paper_frontier_flag_values(value: Any) -> set[str]:
+    if value in (None, ""):
+        return set()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return set()
+        if text[:1] in "[{":
+            try:
+                return _paper_frontier_flag_values(json.loads(text))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        parts = text.replace("|", ",").split(",")
+        return {part.strip().strip("'\"[] ") for part in parts if part.strip().strip("'\"[] ")}
+    if isinstance(value, Mapping):
+        return {str(key) for key, flagged in value.items() if flagged}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {str(item) for item in value if item not in (None, "")}
+    return {str(value)}
+
+
+def paper_frontier_execution_quality_gate_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    if not paper_frontier_execution_quality_gate_enabled(config):
+        return None
+    if not isinstance(candidate, Mapping) or not _paper_frontier_execution_quality_target(candidate):
+        return None
+
+    checks: list[dict[str, Any]] = []
+    failed_checks: list[dict[str, Any]] = []
+
+    def _record_check(name: str, passed: bool, field: str | None, observed: Any, threshold: Any) -> None:
+        record = {
+            "name": name,
+            "field": field,
+            "observed": observed,
+            "threshold": threshold,
+            "passed": passed,
+        }
+        checks.append(record)
+        if not passed:
+            failed_checks.append(record)
+
+    quality_action = str(candidate.get("quality_action") or "").strip().lower().replace("-", "_")
+    if quality_action == "shadow_only":
+        _record_check("quality_action", False, "quality_action", candidate.get("quality_action"), "not_shadow_only")
+
+    anomaly_flags = {
+        str(flag).strip().lower().replace(" ", "_")
+        for flag in _paper_frontier_flag_values(candidate.get("anomaly_flags"))
+        if str(flag).strip()
+    }
+    critical_flags = sorted(
+        flag for flag in anomaly_flags if any(term in flag for term in CRITICAL_ANOMALY_TERMS)
+    )
+    if critical_flags:
+        _record_check("critical_anomaly_flags", False, "anomaly_flags", critical_flags, "no_critical_flags")
+
+    route_field, route_count = _paper_frontier_first_present_int(
+        candidate,
+        ("route_richness", "route_count", "executable_route_count", "venue_route_count", "supporting_venue_count"),
+    )
+    if route_count is not None:
+        _record_check(
+            "route_richness",
+            route_count >= PAPER_FRONTIER_ROUTE_RICHNESS_MIN,
+            route_field,
+            route_count,
+            f">={PAPER_FRONTIER_ROUTE_RICHNESS_MIN}",
+        )
+
+    spread_field, spread_bps = _paper_frontier_first_present_float(
+        candidate,
+        ("spread_bps", "top_of_book_spread_bps", "quoted_spread_bps", "local_spread_bps"),
+    )
+    if spread_bps is not None:
+        _record_check(
+            "spread_bps",
+            spread_bps <= PAPER_FRONTIER_SPREAD_BPS_MAX,
+            spread_field,
+            round(spread_bps, 6),
+            f"<={PAPER_FRONTIER_SPREAD_BPS_MAX}",
+        )
+
+    freshness_field, freshness_seconds = _paper_frontier_first_present_float(
+        candidate,
+        ("book_age_seconds", "quote_age_seconds", "local_quote_age_seconds", "top_of_book_age_seconds", "source_age_seconds"),
+    )
+    if freshness_seconds is not None:
+        _record_check(
+            "freshness_seconds",
+            freshness_seconds <= PAPER_FRONTIER_FRESHNESS_SECONDS_MAX,
+            freshness_field,
+            round(freshness_seconds, 6),
+            f"<={PAPER_FRONTIER_FRESHNESS_SECONDS_MAX}",
+        )
+
+    liquidity_field, liquidity_score = _paper_frontier_first_present_float(
+        candidate,
+        ("local_liquidity_score", "liquidity_proxy_score", "book_depth_ratio", "top_of_book_size_ratio"),
+    )
+    if liquidity_score is not None:
+        _record_check(
+            "liquidity_score",
+            liquidity_score >= PAPER_FRONTIER_LIQUIDITY_SCORE_MIN,
+            liquidity_field,
+            round(liquidity_score, 6),
+            f">={PAPER_FRONTIER_LIQUIDITY_SCORE_MIN}",
+        )
+
+    depth_field, depth_usd = _paper_frontier_first_present_float(
+        candidate,
+        ("top_of_book_notional_usd", "book_depth_usd", "local_depth_usd"),
+    )
+    if depth_usd is not None:
+        _record_check(
+            "book_depth_usd",
+            depth_usd >= PAPER_FRONTIER_DEPTH_USD_MIN,
+            depth_field,
+            round(depth_usd, 6),
+            f">={PAPER_FRONTIER_DEPTH_USD_MIN}",
+        )
+
+    favorable_context = not failed_checks and sum(1 for check in checks if check.get("passed")) >= 2
+    eligible = not failed_checks
+    return {
+        "guard": "paper_frontier_execution_quality_gate",
+        "paper_only": True,
+        "applies": True,
+        "eligible": eligible,
+        "paper_fill_allowed": eligible,
+        "favorable_context": favorable_context,
+        "paper_score_multiplier": 1.0 if favorable_context else (0.85 if eligible else 0.0),
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "summary": "favorable_context_confirmed" if favorable_context else ("blocked_low_execution_quality" if failed_checks else "no_explicit_quality_failure"),
+    }
 
 
 def _paper_cell_text(value: Any, default: str = "unknown") -> str:
