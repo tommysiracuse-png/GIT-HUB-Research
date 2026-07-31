@@ -83,6 +83,93 @@ def _paper_only_route_intelligence_first(record, keys):
     return None
 
 
+def _paper_only_cross_surface_seed_guard_review(record, profile=None):
+    containers = []
+    if isinstance(record, dict):
+        containers.append(record)
+    if isinstance(profile, dict):
+        containers.append(profile)
+
+    def _lookup(*keys):
+        for container in containers:
+            value = _paper_only_route_intelligence_first(container, keys)
+            if value not in (None, "", [], {}, ()):
+                return value
+        return None
+
+    def _append_tokens(tokens, value):
+        text = _paper_only_route_intelligence_tag(value)
+        if not text:
+            return
+        normalized = text.replace("/", "|").replace(",", "|")
+        for token in normalized.split("|"):
+            token = token.strip()
+            if token:
+                tokens.add(token)
+
+    scope_tokens = set()
+    for container in containers:
+        for key in (
+            "source_family",
+            "data_source_family",
+            "observation_source_family",
+            "feature_family",
+            "signal_family",
+            "feature_set_family",
+            "market_key",
+            "signal_key",
+            "candidate_family",
+            "strategy_family",
+            "directional_template",
+            "variant",
+            "signal_variant",
+            "market_surface",
+            "execution_surface",
+            "market_type",
+            "surface",
+            "product_type",
+            "target_surface",
+        ):
+            _append_tokens(scope_tokens, container.get(key))
+
+    source_family = _paper_only_route_intelligence_tag(
+        _lookup("source_family", "data_source_family", "observation_source_family")
+    )
+    feature_family = _paper_only_route_intelligence_tag(
+        _lookup("feature_family", "signal_family", "feature_set_family")
+    )
+    if source_family is None and "yahoo_proxy" in scope_tokens:
+        source_family = "yahoo_proxy"
+    if feature_family is None and "global_proxy_momentum" in scope_tokens:
+        feature_family = "global_proxy_momentum"
+
+    candidate_surface = None
+    for container in containers:
+        candidate_surface = _paper_only_route_intelligence_surface(container, tuple(scope_tokens))
+        if candidate_surface:
+            break
+
+    native_proxy_variant = bool({"long_proxy", "short_proxy", "native"} & scope_tokens)
+    cross_surface_target = bool(
+        {"frontier", "perp", "perpetual", "cross_surface", "non_native"} & scope_tokens
+    )
+    applies = bool(source_family == "yahoo_proxy" and feature_family == "global_proxy_momentum")
+    blocked = bool(applies and (cross_surface_target or candidate_surface in {"frontier", "perp"} or native_proxy_variant))
+
+    return {
+        "enabled": True,
+        "applies": applies,
+        "blocked": blocked,
+        "eligible": not blocked,
+        "reason": "cross_surface_seed_blocked" if blocked else "not_applicable",
+        "source_family": source_family,
+        "feature_family": feature_family,
+        "candidate_surface": candidate_surface,
+        "native_proxy_variant": native_proxy_variant,
+        "cross_surface_target": cross_surface_target,
+        "policy": "block_cross_surface_propagation" if applies else "allow",
+    }
+
 def _paper_only_route_intelligence_surface(record, tokens):
     direct = _paper_only_route_intelligence_tag(
         _paper_only_route_intelligence_first(

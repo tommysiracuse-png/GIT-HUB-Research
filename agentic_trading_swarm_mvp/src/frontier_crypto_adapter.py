@@ -13,6 +13,7 @@ try:
     from src.frontier_data_quality import (
         _paper_only_context_evidence_review,
         _paper_only_parse_timestamp,
+        _paper_only_cross_surface_seed_guard_review,
         paper_only_shadow_direction_inversion_review,
         paper_only_route_requirement_profile,
         paper_only_route_quality_record,
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
     try:
         from frontier_data_quality import (
             _paper_only_context_evidence_review,
+            _paper_only_cross_surface_seed_guard_review,
             _paper_only_parse_timestamp,
             paper_only_shadow_direction_inversion_review,
             paper_only_route_requirement_profile,
@@ -68,6 +70,21 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "variant_state": "guard_disabled",
                 "activation_mode": "guard_disabled",
                 "reason": "guard_disabled",
+            }
+
+        def _paper_only_cross_surface_seed_guard_review(record, profile=None):
+            return {
+                "enabled": False,
+                "applies": False,
+                "blocked": False,
+                "eligible": True,
+                "reason": "guard_disabled",
+                "source_family": None,
+                "feature_family": None,
+                "candidate_surface": None,
+                "native_proxy_variant": False,
+                "cross_surface_target": False,
+                "policy": "guard_disabled",
             }
 
         def paper_only_shadow_direction_inversion_review(record, config=None):
@@ -473,7 +490,12 @@ def _paper_only_route_requirements_packet(route_status, profile):
     permissions = _paper_only_route_permissions(route_status, profile)
     permissions_set = set(permissions)
     required_side = _paper_only_required_side(route_status, profile)
+    cross_surface_seed_guard_review = _paper_only_cross_surface_seed_guard_review(
+        route_status,
+        profile,
+    )
     carry_alignment_review = _paper_only_okx_basis_variant_alignment_review(route_status, profile)
+    carry_alignment_review = dict(carry_alignment_review, cross_surface_seed_guard_review=cross_surface_seed_guard_review)
 
     margin_available = _paper_only_route_support_bool(
         _paper_only_route_lookup(route_status, profile, "margin_available", "margin_enabled", "margin_support")
@@ -553,6 +575,11 @@ def _paper_only_route_requirements_packet(route_status, profile):
     score_inputs = [route_confidence, fee_confidence, api_surface_confidence]
     route_complete = True
     critical_missing_fields = []
+    if cross_surface_seed_guard_review.get("blocked"):
+        route_confidence = 0.0
+        score_inputs[0] = 0.0
+        route_complete = False
+        critical_missing_fields.append("cross_surface_seeding_blocked")
 
     if borrow_required:
         score_inputs.append(borrow_confidence)
