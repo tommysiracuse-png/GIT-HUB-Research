@@ -507,6 +507,228 @@ def _paper_only_okx_basis_variant_alignment_review(route_status, profile):
     }
 
 
+def _paper_only_scope_contract_lookup(containers, *keys):
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, "", [], {}, ()):
+                return value
+    return None
+
+
+def _paper_only_scope_flag_enabled(route_status, profile):
+    values = _paper_only_route_lookup(
+        route_status,
+        profile,
+        "paper_policy_flags",
+        "policy_flags",
+        "feature_flags",
+        "activation_flags",
+        "flags",
+    )
+    if values in (None, "", [], {}, ()):
+        return False
+    if isinstance(values, (list, tuple, set)):
+        candidates = values
+    else:
+        candidates = str(values).replace(",", " ").split()
+    for candidate in candidates:
+        token = _paper_only_route_signal_token(candidate)
+        if token == _PAPER_ONLY_STRATEGY_LAB_EXACT_CONTEXT_PROMOTION_FLAG:
+            return True
+    return False
+
+
+def _paper_only_surface_scope_value(scope_name, value):
+    token = _paper_only_route_signal_token(value)
+    if not token:
+        return None
+    if scope_name == "direction_scope":
+        return _paper_only_alignment_direction_from_token(token) or token
+    if scope_name == "instrument_scope":
+        if token in {"spot", "cash"} or "spot" in token:
+            return "spot"
+        if token in {"perpetual", "perpetuals", "perp", "perps", "swap", "swaps"} or "perp" in token or "swap" in token:
+            return "perp"
+        if token in {"future", "futures", "dated_future", "dated_futures"} or "future" in token:
+            return "dated_futures"
+        return token
+    if scope_name == "trade_family_scope":
+        if "route" in token and "arb" in token:
+            return "route_arb"
+        if "basis" in token:
+            return "basis"
+        if "carry" in token or "funding" in token:
+            return "carry"
+        if "momentum" in token:
+            return "momentum"
+        if "reversion" in token:
+            return "mean_reversion"
+        return token
+    if scope_name == "execution_scope":
+        if token == "spot_plus_perp" or ("spot" in token and ("perp" in token or "swap" in token)):
+            return "spot_plus_perp"
+        if token == "spot_short" or ("spot" in token and "short" in token):
+            return "spot_short"
+        if token == "perp" or "perp" in token or "swap" in token:
+            return "perp"
+        if token == "spot" or "spot" in token:
+            return "spot"
+        if "maker" in token and "taker" not in token:
+            return "maker"
+        if "taker" in token and "maker" not in token:
+            return "taker"
+        return token
+    return token
+
+
+def _paper_only_surface_scope_contract(route_status, profile, *, source):
+    route_requirements = route_status.get("route_requirements") if isinstance(route_status, dict) else None
+    source_containers = [route_status, route_requirements]
+    target_containers = [profile, route_status, route_requirements]
+    if source:
+        field_keys = {
+            "venue_scope": (
+                "source_venue_scope",
+                "paper_venue_scope",
+                "training_venue_scope",
+                "evidence_venue",
+                "seed_venue",
+                "venue_scope",
+                "declared_venue",
+                "declared_venue_scope",
+            ),
+            "instrument_scope": (
+                "source_instrument_scope",
+                "paper_instrument_scope",
+                "training_instrument_scope",
+                "instrument_scope",
+                "declared_instrument_scope",
+                "source_market_type",
+            ),
+            "trade_family_scope": (
+                "source_trade_family_scope",
+                "paper_trade_family_scope",
+                "trade_family_scope",
+                "declared_trade_family",
+                "source_strategy_family",
+            ),
+            "direction_scope": (
+                "source_direction_scope",
+                "paper_direction_scope",
+                "direction_scope",
+                "declared_direction_scope",
+                "source_direction",
+                "seed_direction",
+            ),
+            "execution_scope": (
+                "source_execution_scope",
+                "paper_execution_scope",
+                "execution_scope",
+                "declared_execution_scope",
+                "source_route_style",
+                "seed_execution_scope",
+            ),
+        }
+        containers = source_containers
+    else:
+        field_keys = {
+            "venue_scope": ("target_venue_scope", "activation_venue", "venue", "execution_venue", "exchange", "broker", "venue_key"),
+            "instrument_scope": ("target_instrument_scope", "instrument_scope", "market_type", "market_kind", "instrument_type"),
+            "trade_family_scope": ("target_trade_family_scope", "trade_family_scope", "strategy_family", "candidate_family", "signal_key", "market_key"),
+            "direction_scope": ("target_direction_scope", "direction_scope", "direction", "side", "signal_side", "candidate_direction", "position_side", "directional_template", "variant", "signal_variant"),
+            "execution_scope": ("target_execution_scope", "execution_scope", "execution_style", "route_style", "required_side", "side_requirement"),
+        }
+        containers = target_containers
+
+    contract = {}
+    for scope_name, keys in field_keys.items():
+        raw_value = _paper_only_scope_contract_lookup(containers, *keys)
+        if scope_name == "execution_scope" and raw_value in (None, "", [], {}, ()) and not source:
+            raw_value = _paper_only_required_side(route_status, profile)
+        contract[scope_name] = _paper_only_surface_scope_value(scope_name, raw_value)
+    return contract
+
+
+def _paper_only_exact_surface_scope_review(route_status, profile):
+    source_scope_contract = _paper_only_surface_scope_contract(route_status, profile, source=True)
+    target_scope_contract = _paper_only_surface_scope_contract(route_status, profile, source=False)
+    strategy_tokens = " ".join(
+        token
+        for token in (
+            _paper_only_route_signal_token(
+                _paper_only_route_lookup(
+                    route_status,
+                    profile,
+                    "market_key",
+                    "signal_key",
+                    "strategy",
+                    "strategy_family",
+                    "candidate_family",
+                    "source_agent",
+                    "candidate_source",
+                    "variant",
+                    "signal_variant",
+                )
+            ),
+            _paper_only_route_signal_token(_paper_only_route_lookup(route_status, profile, "promotion_source", "idea_source", "generator")),
+        )
+        if token
+    )
+    applies = _paper_only_scope_flag_enabled(route_status, profile) or "strategy_lab" in strategy_tokens or any(source_scope_contract.values())
+    if not applies:
+        return {
+            "flag": _PAPER_ONLY_STRATEGY_LAB_EXACT_CONTEXT_PROMOTION_FLAG,
+            "enabled": True,
+            "applies": False,
+            "eligible": True,
+            "blocked": False,
+            "reason": "not_applicable",
+            "missing_fields": [],
+            "mismatched_fields": [],
+            "source_scope_contract": source_scope_contract,
+            "target_scope_contract": target_scope_contract,
+        }
+
+    missing_fields = []
+    for scope_name, value in source_scope_contract.items():
+        if not value:
+            missing_fields.append(f"source_{scope_name}")
+    for scope_name, value in target_scope_contract.items():
+        if not value:
+            missing_fields.append(f"target_{scope_name}")
+
+    mismatched_fields = []
+    for scope_name, source_value in source_scope_contract.items():
+        target_value = target_scope_contract.get(scope_name)
+        if source_value and target_value and source_value != target_value:
+            mismatched_fields.append(scope_name)
+
+    blocked = bool(missing_fields or mismatched_fields)
+    if missing_fields and mismatched_fields:
+        reason = "missing_scope_fields_and_surface_mismatch"
+    elif missing_fields:
+        reason = "missing_scope_fields"
+    elif mismatched_fields:
+        reason = "surface_scope_mismatch"
+    else:
+        reason = "scope_matched"
+    return {
+        "flag": _PAPER_ONLY_STRATEGY_LAB_EXACT_CONTEXT_PROMOTION_FLAG,
+        "enabled": True,
+        "applies": True,
+        "eligible": not blocked,
+        "blocked": blocked,
+        "reason": reason,
+        "missing_fields": missing_fields,
+        "mismatched_fields": mismatched_fields,
+        "source_scope_contract": source_scope_contract,
+        "target_scope_contract": target_scope_contract,
+    }
+
+
 def _paper_only_route_requirements_packet(route_status, profile):
     permissions = _paper_only_route_permissions(route_status, profile)
     permissions_set = set(permissions)
@@ -517,6 +739,7 @@ def _paper_only_route_requirements_packet(route_status, profile):
     )
     carry_alignment_review = _paper_only_okx_basis_variant_alignment_review(route_status, profile)
     family_decay_guard_review = _paper_only_family_decay_guard_review(route_status, profile)
+    exact_surface_scope_review = _paper_only_exact_surface_scope_review(route_status, profile)
     if family_decay_guard_review.get("blocked"):
         carry_alignment_review = dict(
             carry_alignment_review,
@@ -524,10 +747,18 @@ def _paper_only_route_requirements_packet(route_status, profile):
             blocked=True,
             reason="family_decay_suppressed",
         )
+    if exact_surface_scope_review.get("blocked"):
+        carry_alignment_review = dict(
+            carry_alignment_review,
+            eligible=False,
+            blocked=True,
+            reason=exact_surface_scope_review.get("reason") or "surface_scope_mismatch",
+        )
     carry_alignment_review = dict(
         carry_alignment_review,
         cross_surface_seed_guard_review=cross_surface_seed_guard_review,
         family_decay_guard_review=family_decay_guard_review,
+        exact_surface_scope_review=exact_surface_scope_review,
     )
 
     margin_available = _paper_only_route_support_bool(
