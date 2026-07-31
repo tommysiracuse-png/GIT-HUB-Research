@@ -200,6 +200,147 @@ def _route_unblocker_enabled(settings: dict) -> bool:
     return bool(cfg.get("enabled", True) and cfg.get("allow_paper_proxy_routes", True))
 
 
+def _paper_gate_text(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _paper_gate_route(candidate: dict) -> dict:
+    route = candidate.get("route")
+    if isinstance(route, dict):
+        return route
+    return {}
+
+
+def _paper_gate_direction(candidate: dict, route: dict) -> str:
+    return _paper_gate_text(
+        candidate.get("direction")
+        or route.get("direction")
+    )
+
+
+def _paper_gate_surface(candidate: dict, route: dict) -> str:
+    return _paper_gate_text(
+        candidate.get("surface")
+        or candidate.get("execution_surface")
+        or candidate.get("strategy_surface")
+        or candidate.get("trade_type")
+        or route.get("surface")
+        or route.get("execution_surface")
+    )
+
+
+def _paper_gate_missing_requirements(candidate: dict, route: dict) -> list[str]:
+    missing: list[str] = []
+    for requirement in route.get("requirements") or []:
+        if not isinstance(requirement, dict):
+            continue
+        status = _paper_gate_text(requirement.get("status"))
+        if status not in {"missing", "unknown"}:
+            continue
+        requirement_id = str(requirement.get("requirement_id") or "").strip()
+        if requirement_id and requirement_id not in missing:
+            missing.append(requirement_id)
+    for item in route.get("missing_requirements") or candidate.get("missing_requirements") or []:
+        requirement_id = str(item or "").strip()
+        if requirement_id and requirement_id not in missing:
+            missing.append(requirement_id)
+    return missing
+
+
+def _paper_gate_proxy_alternative(candidate: dict, route: dict) -> dict | None:
+    alternatives = route.get("paper_route_alternatives") or candidate.get("paper_route_alternatives") or []
+    for alternative in alternatives:
+        if not isinstance(alternative, dict):
+            continue
+        if _paper_gate_text(alternative.get("status")) in {
+            "paper_testable_proxy",
+            "paper_testable_via_proxy",
+        }:
+            return dict(alternative)
+    return None
+
+
+def assess_paper_short_route_gate(candidate: dict) -> dict[str, object]:
+    """Assess whether a paper candidate can use a direct spot-short route.
+
+    The assessment is read-only and paper-only. It never places orders,
+    changes account state, or enables live execution.
+    """
+
+    item = dict(candidate or {})
+    route = _paper_gate_route(item)
+    direction = _paper_gate_direction(item, route)
+    surface = _paper_gate_surface(item, route)
+    applies = direction == "short" and surface == "spot"
+    route_status = str(route.get("route_status") or item.get("route_status") or route.get("status") or "").strip()
+    missing_requirements = _paper_gate_missing_requirements(item, route)
+    direct_route_id = str(route.get("route_id") or item.get("route_id") or "").strip() or None
+
+    assessment: dict[str, object] = {
+        "applies": applies,
+        "direction": direction or None,
+        "surface": surface or None,
+        "route_status": route_status or None,
+        "direct_route_id": direct_route_id,
+        "missing_requirements": missing_requirements,
+        "selected_route_id": direct_route_id,
+        "paper_trade_allowed": True,
+        "gate_status": "not_applicable",
+        "execution_semantics": "direct_live_equivalent",
+        "allocation_multiplier": 1.0,
+        "suppression_reason": None,
+        "proxy_route": None,
+    }
+    if not applies:
+        return assessment
+
+    if route_status == "standard":
+        assessment["gate_status"] = "allowed_direct"
+        return assessment
+
+    proxy_route = _paper_gate_proxy_alternative(item, route)
+    if proxy_route:
+        assessment.update(
+            {
+                "gate_status": "rerouted_to_proxy",
+                "selected_route_id": str(proxy_route.get("route_id") or "").strip() or direct_route_id,
+                "execution_semantics": str(
+                    proxy_route.get("execution_semantics") or "proxy_not_live_equivalent"
+                ),
+                "allocation_multiplier": float(proxy_route.get("paper_allocation_multiplier") or 1.0),
+                "proxy_route": proxy_route,
+            }
+        )
+        return assessment
+
+    assessment.update(
+        {
+            "gate_status": "suppressed_no_proxy",
+            "paper_trade_allowed": False,
+            "execution_semantics": "paper_trade_suppressed",
+            "suppression_reason": "spot_short_route_requirements_unconfirmed",
+        }
+    )
+    return assessment
+
+
+def summarize_paper_short_route_gates(candidates: Iterable[dict]) -> dict[str, object]:
+    assessments = [assess_paper_short_route_gate(candidate) for candidate in candidates]
+    applicable = [item for item in assessments if item.get("applies")]
+    status_counts = collections.Counter(str(item.get("gate_status")) for item in applicable)
+    execution_semantics_counts = collections.Counter(
+        str(item.get("execution_semantics")) for item in applicable
+    )
+    return {
+        "enabled": bool(applicable),
+        "paper_only": True,
+        "candidate_count": len(applicable),
+        "status_counts": dict(status_counts),
+        "execution_semantics_counts": dict(execution_semantics_counts),
+        "gated_candidates": [item for item in applicable if str(item.get("gate_status")) != "allowed_direct"],
+    }
+
+
 def _paper_route_alternatives(
     candidate: dict,
     missing_permissions: list[str],

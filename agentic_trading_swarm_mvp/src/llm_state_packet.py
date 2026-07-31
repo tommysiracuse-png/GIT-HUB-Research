@@ -14,6 +14,10 @@ try:  # Support both direct ``src`` imports and package-style imports.
     from route_intelligence import build_route_requirements_report
 except ImportError:  # pragma: no cover - package import fallback
     from .route_intelligence import build_route_requirements_report
+try:  # Support both direct ``src`` imports and package-style imports.
+    from route_resolver import summarize_paper_short_route_gates
+except ImportError:  # pragma: no cover - package import fallback
+    from .route_resolver import summarize_paper_short_route_gates
 
 
 def _normalize_segment_value(value: Any, *, upper: bool = False) -> str | None:
@@ -303,5 +307,6 @@ def build_route_intelligence_packet_fragment(
             "no_live_trading",
         ],
         "route_intelligence_report": build_route_requirements_report(opportunities),
+        "paper_short_route_gate": summarize_paper_short_route_gates(opportunities),
         "strategy_lab_promotion_guard": build_strategy_lab_promotion_guard_fragment(opportunities),
     }
