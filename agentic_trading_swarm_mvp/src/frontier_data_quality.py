@@ -1,5 +1,172 @@
 import datetime as dt
 
+
+def _paper_only_scope_token(value):
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return text or None
+
+
+def _paper_only_scope_values(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        raw_values = list(value)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        for separator in ("|", ",", ";", "/"):
+            text = text.replace(separator, " ")
+        raw_values = text.split()
+    values = []
+    seen = set()
+    for raw_value in raw_values:
+        token = _paper_only_scope_token(raw_value)
+        if token and token not in seen:
+            seen.add(token)
+            values.append(token)
+    return values
+
+
+def _paper_only_scope_lookup(record, *keys):
+    if not isinstance(record, dict):
+        return None
+    containers = [record]
+    for nested_key in ("metadata", "route_quality", "route_requirements", "strategy_lab", "lineage", "context"):
+        nested = record.get(nested_key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+    for container in containers:
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, "", [], {}, (), set(), frozenset()):
+                return value
+    return None
+
+
+def _paper_only_scope_comparable_tokens(field, value):
+    token = _paper_only_scope_token(value)
+    if not token:
+        return set()
+    tokens = {token}
+    if field in {"venue", "instrument_family"}:
+        tokens.update(part for part in token.split("_") if part)
+    return tokens
+
+
+def _paper_only_scope_matches(field, actual_value, allowed_values):
+    comparable_actual = _paper_only_scope_comparable_tokens(field, actual_value)
+    if not comparable_actual:
+        return False
+    for allowed_value in allowed_values:
+        comparable_allowed = _paper_only_scope_comparable_tokens(field, allowed_value)
+        if comparable_actual & comparable_allowed:
+            return True
+    return False
+
+
+def _paper_only_strategy_scope_review(record, runtime_context=None):
+    runtime_context = runtime_context if isinstance(runtime_context, dict) else {}
+    strategy_lab_marker = _paper_only_scope_lookup(
+        record,
+        "lab_id",
+        "strategy_lab_id",
+        "strategy_lab_signal_id",
+        "strategy_lab_candidate",
+        "strategy_lab_signal",
+    )
+    is_strategy_lab = strategy_lab_marker not in (None, "", [], {}, ())
+    declared_scope = {
+        "venue": _paper_only_scope_values(_paper_only_scope_lookup(record, "allowed_venue")),
+        "instrument_family": _paper_only_scope_values(_paper_only_scope_lookup(record, "allowed_instrument_family")),
+        "direction": _paper_only_scope_values(_paper_only_scope_lookup(record, "allowed_direction")),
+        "surface": _paper_only_scope_values(_paper_only_scope_lookup(record, "allowed_surface")),
+        "quote_ccy": _paper_only_scope_values(_paper_only_scope_lookup(record, "allowed_quote_ccy")),
+    }
+    has_declared_scope = any(values for values in declared_scope.values())
+    applies = is_strategy_lab or has_declared_scope
+    runtime_scope = {
+        "venue": _paper_only_scope_token(
+            runtime_context.get("venue") or _paper_only_scope_lookup(record, "venue", "exchange", "broker")
+        ),
+        "instrument_family": _paper_only_scope_token(
+            runtime_context.get("instrument_family")
+            or _paper_only_scope_lookup(record, "instrument_family", "family", "market_family", "asset_class")
+        ),
+        "direction": _paper_only_scope_token(
+            runtime_context.get("direction")
+            or _paper_only_scope_lookup(record, "direction", "signal_direction", "position_direction", "side")
+        ),
+        "surface": _paper_only_scope_token(
+            runtime_context.get("surface")
+            or _paper_only_scope_lookup(record, "surface", "target_surface", "candidate_surface", "execution_surface")
+        ),
+        "quote_ccy": _paper_only_scope_token(
+            runtime_context.get("quote_ccy")
+            or _paper_only_scope_lookup(record, "quote_ccy", "quote_currency", "quote", "quote_asset")
+        ),
+    }
+    required_fields = ("venue", "instrument_family", "direction", "surface")
+    missing_scope_fields = [field for field in required_fields if is_strategy_lab and not declared_scope.get(field)]
+    missing_runtime_fields = []
+    mismatches = []
+    for field, allowed_values in declared_scope.items():
+        if not allowed_values:
+            continue
+        actual_value = runtime_scope.get(field)
+        if not actual_value:
+            if field in required_fields:
+                missing_runtime_fields.append(field)
+            continue
+        if not _paper_only_scope_matches(field, actual_value, allowed_values):
+            mismatches.append(
+                {
+                    "field": field,
+                    "allowed": list(allowed_values),
+                    "actual": actual_value,
+                }
+            )
+    if not applies:
+        return {
+            "flag": "paper_only_strategy_lab_scope_guard_v1",
+            "enabled": True,
+            "applies": False,
+            "eligible": True,
+            "blocked": False,
+            "rejected_by_scope": False,
+            "reason": "guard_not_applicable",
+            "declared_scope": declared_scope,
+            "runtime_scope": runtime_scope,
+            "missing_scope_fields": [],
+            "missing_runtime_fields": [],
+            "mismatches": [],
+        }
+    reason = "scope_matched"
+    blocked = False
+    if missing_scope_fields:
+        reason = "missing_scope_fields"
+        blocked = True
+    elif missing_runtime_fields:
+        reason = "missing_runtime_scope_fields"
+        blocked = True
+    elif mismatches:
+        reason = "scope_mismatch"
+        blocked = True
+    return {
+        "flag": "paper_only_strategy_lab_scope_guard_v1",
+        "enabled": True,
+        "applies": True,
+        "eligible": not blocked,
+        "blocked": blocked,
+        "rejected_by_scope": blocked,
+        "reason": reason,
+        "declared_scope": declared_scope,
+        "runtime_scope": runtime_scope,
+        "missing_scope_fields": missing_scope_fields,
+        "missing_runtime_fields": missing_runtime_fields,
+        "mismatches": mismatches,
+    }
+
 _PAPER_ONLY_ROUTE_INTELLIGENCE = {
     "OKX": {
         "broker_surface": "okx",

@@ -12,6 +12,7 @@ import datetime as dt
 try:
     from src.frontier_data_quality import (
         _paper_only_context_evidence_review,
+        _paper_only_strategy_scope_review,
         _paper_only_cross_surface_seed_guard_review,
         _paper_only_family_decay_guard_review,
         _paper_only_parse_timestamp,
@@ -23,6 +24,7 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
     try:
         from frontier_data_quality import (
             _paper_only_context_evidence_review,
+            _paper_only_strategy_scope_review,
             _paper_only_cross_surface_seed_guard_review,
             _paper_only_parse_timestamp,
             paper_only_shadow_direction_inversion_review,
@@ -72,6 +74,20 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "variant_state": "guard_disabled",
                 "activation_mode": "guard_disabled",
                 "reason": "guard_disabled",
+            }
+
+        def _paper_only_strategy_scope_review(record, runtime_context=None):
+            return {
+                "flag": "paper_only_strategy_lab_scope_guard_v1",
+                "enabled": False,
+                "applies": False,
+                "eligible": True,
+                "blocked": False,
+                "rejected_by_scope": False,
+                "reason": "guard_disabled",
+                "missing_scope_fields": [],
+                "missing_runtime_fields": [],
+                "mismatches": [],
             }
 
         def _paper_only_cross_surface_seed_guard_review(record, profile=None):
@@ -359,8 +375,28 @@ def _paper_only_context_validation_passed(value):
 def _paper_only_context_scoping_review(value, *, origin_surface=None, target_surface=None, same_surface=False):
     if not isinstance(value, dict):
         return None
-
     enabled = _paper_only_context_scoping_enabled(value)
+    runtime_context = {
+        "venue": _paper_only_surface_token(
+            _paper_only_route_quality_lookup(value, "venue", "exchange", "broker", "execution_venue")
+        ),
+        "instrument_family": _paper_only_surface_token(
+            _paper_only_route_quality_lookup(value, "instrument_family", "family", "market_family", "asset_class")
+        ),
+        "direction": _paper_only_surface_token(
+            _paper_only_route_quality_lookup(value, "direction", "signal_direction", "position_direction", "side")
+        ),
+        "surface": target_surface
+        or _paper_only_surface_token(
+            _paper_only_route_quality_lookup(value, "target_surface", "candidate_surface", "execution_surface")
+        ),
+        "quote_ccy": _paper_only_surface_token(
+            _paper_only_route_quality_lookup(value, "quote_ccy", "quote_currency", "quote", "quote_asset")
+        ),
+    }
+    scope_review = _paper_only_strategy_scope_review(value, runtime_context=runtime_context)
+    if scope_review.get("applies") and scope_review.get("blocked"):
+        return False
     market_key = _paper_only_surface_token(
         _paper_only_route_quality_lookup(value, "market_key", "paper_market_key", "context_signature_key")
     )
