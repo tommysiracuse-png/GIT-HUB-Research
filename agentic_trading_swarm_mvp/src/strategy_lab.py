@@ -944,6 +944,36 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
     missing = [field for field in required_fields if _candidate_field_value(candidate, field) is None]
     if missing:
         reasons.append("missing_required_fields:" + ",".join(missing[:5]))
+    allowed_field_values = _first_dict(
+        risk_gates.get("allowed_field_values"),
+        logic.get("allowed_field_values"),
+    )
+    for field, allowed_values in allowed_field_values.items():
+        observed = _candidate_field_value(candidate, str(field))
+        if observed is None:
+            reasons.append(f"missing_gate_field:{field}")
+        elif not _allowed(observed, _as_list(allowed_values)):
+            reasons.append(f"{field}_not_allowed")
+    min_field_values = _first_dict(
+        risk_gates.get("min_field_values"),
+        logic.get("min_field_values"),
+    )
+    for field, threshold in min_field_values.items():
+        observed = _candidate_field_value(candidate, str(field))
+        if observed is None:
+            reasons.append(f"missing_gate_field:{field}")
+        elif _as_float(observed) < _as_float(threshold):
+            reasons.append(f"{field}_below_gate")
+    max_field_values = _first_dict(
+        risk_gates.get("max_field_values"),
+        logic.get("max_field_values"),
+    )
+    for field, threshold in max_field_values.items():
+        observed = _candidate_field_value(candidate, str(field))
+        if observed is None:
+            reasons.append(f"missing_gate_field:{field}")
+        elif _as_float(observed) > _as_float(threshold):
+            reasons.append(f"{field}_above_gate")
     return not reasons, reasons
 
 

@@ -92,14 +92,6 @@ _STRATEGY_LAB_QUALITY_GATE_TERMS = (
     "liquidity",
     "confidence",
 )
-_STRATEGY_LAB_OKX_FUNDING_TERMS = (
-    "okx",
-    "funding",
-    "funding capture",
-    "funding_capture",
-    "perp",
-    "basis",
-)
 _STRATEGY_LAB_DISALLOWED_LIVE_TERMS = (
     "live trading",
     "live execution",
@@ -181,12 +173,38 @@ def _canonical_strategy_lab_key(payload: dict) -> str:
         f"age={entry_gates.get('max_signal_age_seconds', '')}",
         f"spread={entry_gates.get('max_spread_bps', '')}",
         f"liq={entry_gates.get('min_liquidity_usd', '')}",
+        f"liq_score={entry_gates.get('min_liquidity_score', '')}",
         f"conf={entry_gates.get('min_confidence', '')}",
         f"carry={bool(entry_gates.get('require_carry_alignment'))}",
         f"exclude={','.join(exclusions)}",
     ]
     raw = "|".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _funding_capture_directions(scope: dict) -> list[str]:
+    mode = str(_first_present(scope, "mode", "direction_mode", "strategy_mode") or "").lower()
+    requested = _coerce_string_list(
+        _first_present(scope, "allowed_directions", "directions", "trade_directions")
+    )
+    requested.extend(_coerce_string_list(_first_present(scope, "trade_types", "allowed_trade_types")))
+    requested.append(mode)
+    text = " ".join(requested)
+    if "long" in text and ("only" in text or "short" not in text):
+        return ["funding_capture_long_perp"]
+    if "short" in text and ("only" in text or "long" not in text):
+        return ["funding_capture_short_perp"]
+
+    directions: list[str] = []
+    for item in requested:
+        if item in {"long", "funding_capture_long_perp"}:
+            directions.append("funding_capture_long_perp")
+        elif item in {"short", "funding_capture_short_perp"}:
+            directions.append("funding_capture_short_perp")
+    return list(dict.fromkeys(directions)) or [
+        "funding_capture_long_perp",
+        "funding_capture_short_perp",
+    ]
 
 
 def _normalize_strategy_lab_recommendation_payload(payload: dict) -> dict:
@@ -205,6 +223,8 @@ def _normalize_strategy_lab_recommendation_payload(payload: dict) -> dict:
 
     code_change = payload.get("code_change") if isinstance(payload.get("code_change"), dict) else {}
     plan = payload.get("autonomous_plan") if isinstance(payload.get("autonomous_plan"), dict) else {}
+    variant = payload.get("variant_config") if isinstance(payload.get("variant_config"), dict) else {}
+    variant_filters = variant.get("filters") if isinstance(variant.get("filters"), dict) else {}
     scope = _merge_mapping_values(
         plan,
         code_change,
@@ -214,6 +234,8 @@ def _normalize_strategy_lab_recommendation_payload(payload: dict) -> dict:
         payload.get("gates"),
         payload.get("scope"),
         payload.get("target"),
+        variant,
+        variant_filters,
         payload,
     )
 
@@ -255,15 +277,35 @@ def _normalize_strategy_lab_recommendation_payload(payload: dict) -> dict:
             "decayed_confidence_min",
         )
     )
+    min_liquidity_score = _coerce_number(
+        _first_present(
+            scope,
+            "min_liquidity_score",
+            "liquidity_score_floor",
+        )
+    )
 
     entry_gates = {
         "max_signal_age_seconds": max_signal_age_seconds if max_signal_age_seconds is not None else 900,
         "max_spread_bps": max_spread_bps if max_spread_bps is not None else 8.0,
         "min_liquidity_usd": min_liquidity_usd if min_liquidity_usd is not None else 25000.0,
+        "min_liquidity_score": min_liquidity_score if min_liquidity_score is not None else 0.35,
         "min_confidence": min_confidence if min_confidence is not None else 0.55,
         "require_carry_alignment": bool(
-            _first_present(scope, "require_carry_alignment", "carry_alignment_required", "funding_alignment_required")
-            if _first_present(scope, "require_carry_alignment", "carry_alignment_required", "funding_alignment_required")
+            _first_present(
+                scope,
+                "require_carry_alignment",
+                "carry_alignment_required",
+                "funding_alignment_required",
+                "require_funding_carry_alignment",
+            )
+            if _first_present(
+                scope,
+                "require_carry_alignment",
+                "carry_alignment_required",
+                "funding_alignment_required",
+                "require_funding_carry_alignment",
+            )
             is not None
             else True
         ),
@@ -280,52 +322,127 @@ def _normalize_strategy_lab_recommendation_payload(payload: dict) -> dict:
     )
     if not excluded_modes:
         excluded_modes = ["basis_mean_reversion", "spot_leg", "spot_carry"]
-    trade_types = _coerce_string_list(
-        _first_present(scope, "trade_types", "allowed_trade_types", "strategy_modes", "modes")
+    allowed_directions = _funding_capture_directions(scope)
+    venue = str(_first_present(scope, "venue", "exchange") or "OKX").upper()
+    if "OKX" not in venue:
+        venue = "OKX"
+    strategy_logic = {
+        "type": "candidate_filter",
+        "venues": [venue],
+        "trade_types": ["perp_funding_basis"],
+        "directions": allowed_directions,
+        "required_fields": [
+            "funding_bps",
+            "spread_bps",
+            "liquidity_score",
+            "seen_at",
+        ],
+        "max_spread_bps": entry_gates["max_spread_bps"],
+        "min_liquidity_score": entry_gates["min_liquidity_score"],
+        "min_score": entry_gates["min_confidence"],
+        "max_stale_minutes": round(float(entry_gates["max_signal_age_seconds"]) / 60.0, 3),
+        "require_route_feasible": True,
+    }
+    if entry_gates["min_liquidity_usd"] is not None:
+        strategy_logic["required_fields"].append("quote_volume_24h")
+        strategy_logic["min_field_values"] = {
+            "quote_volume_24h": entry_gates["min_liquidity_usd"],
+        }
+    if entry_gates["require_carry_alignment"]:
+        strategy_logic["required_fields"].append("carry_alignment_status")
+        strategy_logic["allowed_field_values"] = {
+            "carry_alignment_status": ["carry_aligned_positive"],
+        }
+    evaluation = variant.get("evaluation") if isinstance(variant.get("evaluation"), dict) else {}
+    review_labels = _coerce_number(
+        _first_present(evaluation, "minimum_closed_trades_for_review", "min_closed_trades"),
+        integer=True,
     )
-    if not trade_types:
-        trade_types = ["funding_capture"]
-    allowed_directions = _coerce_string_list(
-        _first_present(scope, "allowed_directions", "directions", "trade_directions")
-    )
-    if not allowed_directions:
-        allowed_directions = ["long", "short"]
 
     normalized = dict(payload)
+    normalized["canonical_key"] = _canonical_strategy_lab_key(
+        {
+            "experiment_type": "market_strategy",
+            "market_key": "okx_perp_funding_basis",
+            "signal_key": "okx_funding_capture",
+            "trade_types": ["perp_funding_basis"],
+            "allowed_directions": allowed_directions,
+            "entry_gates": entry_gates,
+            "excluded_modes": excluded_modes,
+        }
+    )
+    strategy_lab_id = f"okx_funding_capture_quality_gate_{normalized['canonical_key'][:12]}"
     normalized.update(
         {
             "action": "propose_strategy_lab_experiment",
             "paper_only": True,
             "runtime_mode": "paper_only",
-            "experiment_type": "quality_gate_experiment",
-            "market_key": str(_first_present(scope, "market_key", "market", "target_market") or "okx_perp_funding_basis"),
-            "signal_key": str(_first_present(scope, "signal_key", "signal", "target_signal") or "okx_funding_capture"),
+            "experiment_type": "market_strategy",
+            "market_key": "okx_perp_funding_basis",
+            "signal_key": "okx_funding_capture",
             "strategy_family": str(_first_present(scope, "strategy_family", "family") or "funding_capture"),
-            "venue": str(_first_present(scope, "venue", "exchange") or "okx"),
-            "trade_types": trade_types,
+            "venue": venue,
+            "trade_types": ["perp_funding_basis"],
             "allowed_directions": allowed_directions,
             "entry_gates": entry_gates,
             "excluded_modes": excluded_modes,
             "scope": {
-                "venue": str(_first_present(scope, "venue", "exchange") or "okx"),
-                "market_key": str(_first_present(scope, "market_key", "market", "target_market") or "okx_perp_funding_basis"),
-                "signal_key": str(_first_present(scope, "signal_key", "signal", "target_signal") or "okx_funding_capture"),
-                "trade_types": trade_types,
+                "venue": venue,
+                "market_key": "okx_perp_funding_basis",
+                "signal_key": "okx_funding_capture",
+                "trade_types": ["perp_funding_basis"],
+            },
+            "strategy_lab_experiment": {
+                "strategy_lab_id": strategy_lab_id,
+                "version": 1,
+                "experiment_type": "market_strategy",
+                "hypothesis": str(
+                    payload.get("rationale")
+                    or payload.get("title")
+                    or "Tighter OKX funding-capture quality gates improve paper outcomes."
+                ),
+                "strategy_logic": strategy_logic,
+                "data_requirements": {
+                    "source_trade_type": "perp_funding_basis",
+                    "paper_only": True,
+                    "excluded_modes": excluded_modes,
+                    "requested_min_liquidity_usd": entry_gates["min_liquidity_usd"],
+                },
+                "risk_gates": {
+                    key: strategy_logic[key]
+                    for key in (
+                        "max_spread_bps",
+                        "min_liquidity_score",
+                        "min_score",
+                        "max_stale_minutes",
+                        "require_route_feasible",
+                        "min_field_values",
+                        "allowed_field_values",
+                    )
+                    if key in strategy_logic
+                },
+                "promotion_rules": (
+                    {"expand_min_labels": int(review_labels)}
+                    if review_labels is not None and review_labels > 0
+                    else {}
+                ),
             },
             "consumer_validation": {
                 "normalized_strategy_lab_packet": True,
                 "normalization_family": "okx_funding_capture_quality_gate",
-                "normalization_audit_version": 1,
+                "normalization_audit_version": 2,
             },
         }
     )
-    normalized["canonical_key"] = _canonical_strategy_lab_key(normalized)
     return normalized
 
 
-def ingest_strategy_lab_recommendation(payload: dict):
-    normalized_payload = _normalize_strategy_lab_recommendation_payload(payload)
-    return _strategy_lab_ingest_strategy_lab_recommendation(normalized_payload)
+def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict):
+    normalized_rec = dict(rec)
+    normalized_rec["payload"] = _normalize_strategy_lab_recommendation_payload(
+        dict(rec.get("payload") or {})
+    )
+    return _strategy_lab_ingest_strategy_lab_recommendation(conn, normalized_rec)
 
 IMPLEMENTED_MANUAL_STATUSES = {
     "route_requirements": ("implemented_route_requirements", ("improvement_tasks", "route_probe_tasks")),

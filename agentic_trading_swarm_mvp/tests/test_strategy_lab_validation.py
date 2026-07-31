@@ -29,13 +29,17 @@ class StrategyLabValidationTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual("quality_gate_experiment", normalized["experiment_type"])
+        self.assertEqual("market_strategy", normalized["experiment_type"])
         self.assertEqual("okx_perp_funding_basis", normalized["market_key"])
         self.assertEqual("okx_funding_capture", normalized["signal_key"])
         self.assertEqual(7.5, normalized["entry_gates"]["max_spread_bps"])
         self.assertEqual(30000.0, normalized["entry_gates"]["min_liquidity_usd"])
         self.assertEqual(0.58, normalized["entry_gates"]["min_confidence"])
         self.assertTrue(normalized["consumer_validation"]["normalized_strategy_lab_packet"])
+        contract = normalized["strategy_lab_experiment"]
+        self.assertEqual("market_strategy", contract["experiment_type"])
+        self.assertEqual(["OKX"], contract["strategy_logic"]["venues"])
+        self.assertEqual(["perp_funding_basis"], contract["strategy_logic"]["trade_types"])
 
     def test_normalizer_skips_live_expansions(self):
         payload = {
