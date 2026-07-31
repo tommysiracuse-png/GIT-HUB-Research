@@ -38,6 +38,9 @@ ROUTE_REQUIREMENT_FIELDS = (
     "fee_bps_per_side_or_unknown",
     "slippage_bps_per_side_or_unknown",
     "paper_route_only",
+    "paper_feasibility",
+    "paper_proxy_route",
+    "paper_proxy_not_live_equivalent",
 )
 
 _PRIORITY_SPOT_BORROW_INST_IDS = (
@@ -81,6 +84,7 @@ def build_route_requirements_report(
         "fields": list(ROUTE_REQUIREMENT_FIELDS),
         "routes": build_route_requirements_matrix(opportunities),
         "playbook_summary": build_route_playbook_summary(opportunities),
+        "paper_feasibility_summary": build_route_feasibility_summary(opportunities),
     }
 
 
@@ -162,6 +166,7 @@ def build_build_governor_fields(opportunities: Iterable[dict[str, Any]]) -> dict
         "opportunity_count": len(opportunities),
         "route_count": len(build_route_requirements_matrix(opportunities)),
         "quality_gate": build_conditional_paper_quality_gate(opportunities),
+        "paper_feasibility_summary": build_route_feasibility_summary(opportunities),
         "report_summary": build_route_playbook_summary(opportunities),
     }
 
@@ -239,6 +244,28 @@ def build_route_playbook_summary(opportunities: Iterable[dict[str, Any]]) -> dic
     }
 
 
+def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    opportunities = list(opportunities)
+    counts: dict[str, int] = {}
+    proxy_routes: dict[str, int] = {}
+    for opportunity in opportunities:
+        blockers = _route_blockers(opportunity)
+        proxy_route = _paper_proxy_route(opportunity, blockers=blockers)
+        feasibility = _paper_feasibility(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=proxy_route,
+        )
+        counts[feasibility] = counts.get(feasibility, 0) + 1
+        if proxy_route != "not_applicable":
+            proxy_routes[proxy_route] = proxy_routes.get(proxy_route, 0) + 1
+    return {
+        "paper_only": True,
+        "counts_by_feasibility": dict(sorted(counts.items())),
+        "proxy_routes": dict(sorted(proxy_routes.items())),
+    }
+
+
 def _route_blocker_playbook(blocker: str) -> dict[str, Any]:
     if blocker in {"prediction_markets_account", "venue_api_access", "jurisdiction_eligibility"}:
         return {
@@ -290,6 +317,49 @@ def _route_blocker_playbook(blocker: str) -> dict[str, Any]:
     }
 
 
+def _paper_proxy_route(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+) -> str:
+    raw_proxy_route = _first_known(
+        opportunity,
+        "paper_testable_proxy",
+        "paper_proxy_route",
+        "proxy_route",
+        "paper_route_proxy",
+    )
+    if isinstance(raw_proxy_route, str):
+        proxy_route = raw_proxy_route.strip()
+        if proxy_route and proxy_route.lower() != UNKNOWN:
+            return proxy_route
+    elif _bool_flag(raw_proxy_route) is True:
+        return "paper_testable_proxy"
+
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    if "spot_borrow" in blockers and _bool_flag(_first_known(opportunity, "proxy_supported", "paper_proxy_supported")) is True:
+        return "paper_testable_proxy"
+    return "not_applicable"
+
+
+def _paper_feasibility(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+    paper_proxy_route: str | None = None,
+) -> str:
+    explicit = str(opportunity.get("paper_feasibility") or "").strip().lower()
+    if explicit in {"direct_feasible", "proxy_only", "assumption_sensitive", "blocked", UNKNOWN}:
+        return explicit
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    paper_proxy_route = paper_proxy_route or _paper_proxy_route(opportunity, blockers=blockers)
+    if _unconfirmed_frontier_spot_short_route(opportunity) or blockers:
+        if paper_proxy_route != "not_applicable":
+            return "proxy_only"
+        return "blocked"
+    return "direct_feasible"
+
+
 def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
     blockers = _route_blockers(opportunity)
     venue = _venue(opportunity)
@@ -300,6 +370,8 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
     borrow_required = "spot_borrow" in requirement_flags
     account_requirements = _account_requirements(requirement_flags)
     route_status = _paper_route_status(opportunity, blockers=blockers)
+    paper_proxy_route = _paper_proxy_route(opportunity, blockers=blockers)
+    paper_feasibility = _paper_feasibility(opportunity, blockers=blockers, paper_proxy_route=paper_proxy_route)
 
     return {
         "venue": venue,
@@ -331,6 +403,9 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
             "slippage_bps_per_side",
         ),
         "paper_route_only": True,
+        "paper_feasibility": paper_feasibility,
+        "paper_proxy_route": paper_proxy_route,
+        "paper_proxy_not_live_equivalent": paper_proxy_route != "not_applicable",
     }
 
 
@@ -352,8 +427,12 @@ def _paper_route_status(
     blockers: list[str] | None = None,
 ) -> str:
     blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    if _unconfirmed_frontier_spot_short_route(opportunity) and _paper_proxy_route(opportunity, blockers=blockers) != "not_applicable":
+        return "paper_testable_via_proxy"
     if _unconfirmed_frontier_spot_short_route(opportunity):
         return "unsupported_or_unknown"
+    if blockers and _paper_proxy_route(opportunity, blockers=blockers) != "not_applicable":
+        return "paper_testable_via_proxy"
     if blockers:
         return "blocked_until_requirements_confirmed"
     return "paper_observation_only"
