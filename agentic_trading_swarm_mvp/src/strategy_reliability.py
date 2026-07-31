@@ -47,6 +47,138 @@ PAPER_FAMILY_QUARANTINE_SCOPES = (
     "paper_policy",
     "strategy_reliability",
 )
+PAPER_MODE_CONFIG_KEYS = (
+    "mode",
+    "runtime_mode",
+    "execution_mode",
+    "trading_mode",
+)
+PAPER_MODE_VALUES = {"paper", "paper_only", "research", "simulation", "sim", "dry_run", "dryrun", "backtest"}
+LIVE_MODE_VALUES = {"live", "production", "prod", "real", "broker"}
+
+
+def _paper_family_quarantine_enabled(config: Mapping[str, Any] | bool | None = None) -> bool:
+    if isinstance(config, bool):
+        return config
+    if not isinstance(config, Mapping):
+        return True
+
+    for key in PAPER_FAMILY_QUARANTINE_FLAG_KEYS:
+        if key in config:
+            return _as_bool(config.get(key), True)
+
+    for scope in PAPER_FAMILY_QUARANTINE_SCOPES:
+        scoped = config.get(scope)
+        if not isinstance(scoped, Mapping):
+            continue
+        for key in PAPER_FAMILY_QUARANTINE_FLAG_KEYS:
+            if key in scoped:
+                return _as_bool(scoped.get(key), True)
+    return True
+
+
+def _paper_family_quarantine_applies_in_context(config: Mapping[str, Any] | bool | None = None) -> bool:
+    if isinstance(config, bool) or not isinstance(config, Mapping):
+        return True
+
+    containers: list[Mapping[str, Any]] = [config]
+    for scope in PAPER_FAMILY_QUARANTINE_SCOPES:
+        scoped = config.get(scope)
+        if isinstance(scoped, Mapping):
+            containers.append(scoped)
+
+    saw_explicit_mode = False
+    for container in containers:
+        for key in PAPER_MODE_CONFIG_KEYS:
+            raw_mode = container.get(key)
+            if raw_mode in (None, ""):
+                continue
+            saw_explicit_mode = True
+            normalized = str(raw_mode).strip().lower().replace("-", "_").replace(" ", "_")
+            if normalized in LIVE_MODE_VALUES:
+                return False
+            if normalized in PAPER_MODE_VALUES:
+                return True
+    return not saw_explicit_mode or True
+
+
+def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> tuple[str, str] | None:
+    texts: list[str] = []
+    for field in (
+        "market_key",
+        "market_surface",
+        "signal_family",
+        "signal_key",
+        "strategy",
+        "strategy_id",
+        "variant",
+        "variant_id",
+        "context_key",
+        "trade_type",
+    ):
+        value = candidate.get(field)
+        if value not in (None, ""):
+            texts.append(str(value).strip().lower())
+
+    try:
+        derived_signal_key = signal_key(candidate)
+    except Exception:
+        derived_signal_key = None
+    if derived_signal_key:
+        texts.append(str(derived_signal_key).strip().lower())
+
+    combined = " | ".join(texts)
+    for descendant_key in QUARANTINED_DESCENDANT_KEYS:
+        normalized = str(descendant_key).strip().lower()
+        if normalized and normalized in combined:
+            return ("descendant_key", normalized)
+
+    for lineage_terms in QUARANTINED_BASE_LINEAGE_TERMS:
+        normalized_terms = tuple(str(term).strip().lower() for term in lineage_terms if str(term).strip())
+        if normalized_terms and all(term in combined for term in normalized_terms):
+            return ("base_lineage", "|".join(normalized_terms))
+    return None
+
+
+def paper_family_quarantine_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    if not _paper_family_quarantine_enabled(config) or not _paper_family_quarantine_applies_in_context(config):
+        return None
+    if not isinstance(candidate, Mapping):
+        return None
+    matched = _paper_family_quarantine_match(candidate)
+    if matched is None:
+        return None
+    match_type, matched_value = matched
+    return {
+        "reason": "paper_strategy_family_quarantine",
+        "guard": "paper_strategy_family_quarantine",
+        "paper_only": True,
+        "eligible": False,
+        "paper_fill_allowed": False,
+        "paper_score_multiplier": 0.0,
+        "paper_allocation_multiplier": 0.0,
+        "quarantine_action": "monitor_only",
+        "family_key": "YAHOO_PROXY|global_proxy_momentum",
+        "reentry_rule": (
+            "Keep quarantined until rolling paper performance is positive on both long and short branches "
+            "with materially improved win rate and sample depth."
+        ),
+        "matched_on": {"type": match_type, "value": matched_value},
+        "evidence": {
+            "long_proxy_standard_bps": -16.225,
+            "long_proxy_standard_closes": 176,
+            "long_proxy_standard_win_rate_pct": 31.8,
+            "short_proxy_conditional_bps": -24.614,
+            "short_proxy_conditional_closes": 171,
+            "short_proxy_conditional_win_rate_pct": 32.2,
+            "short_proxy_standard_bps": -72.504,
+            "short_proxy_standard_closes": 7,
+        },
+    }
+
 QUARANTINED_BASE_LINEAGE_TERMS = (("yahoo_proxy", "global_proxy_momentum"),)
 QUARANTINED_DESCENDANT_KEYS = {
     "YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM",

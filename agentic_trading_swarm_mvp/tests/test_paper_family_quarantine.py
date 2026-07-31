@@ -1,3 +1,58 @@
+import sys
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from paper_order_router import frontier_shadow_filter_reason
+from strategy_reliability import paper_family_quarantine_record
+
+
+class PaperFamilyQuarantineTests(unittest.TestCase):
+    def test_quarantine_record_matches_family_market_key(self):
+        candidate = {
+            "market_key": "STRATEGY_LAB|YAHOO_PROXY|global_proxy_momentum",
+            "signal_family": "YAHOO_PROXY",
+            "strategy": "global_proxy_momentum",
+            "symbol": "SPY",
+        }
+
+        record = paper_family_quarantine_record(candidate, config={"mode": "paper"})
+
+        self.assertIsNotNone(record)
+        self.assertEqual(record["guard"], "paper_strategy_family_quarantine")
+        self.assertFalse(record["eligible"])
+        self.assertFalse(record["paper_fill_allowed"])
+        self.assertEqual(record["paper_score_multiplier"], 0.0)
+
+    def test_quarantine_record_is_disabled_outside_paper_mode(self):
+        candidate = {
+            "market_key": "STRATEGY_LAB|YAHOO_PROXY|global_proxy_momentum",
+            "signal_family": "YAHOO_PROXY",
+            "strategy": "global_proxy_momentum",
+        }
+
+        self.assertIsNone(paper_family_quarantine_record(candidate, config={"mode": "live"}))
+        self.assertIsNone(paper_family_quarantine_record(candidate, config=False))
+
+    def test_router_surfaces_quarantine_reason_before_frontier_checks(self):
+        candidate = {
+            "market_key": "strategy_lab|red_team_yahoo_proxy_momentum_sanity_check_c6d14fc0",
+            "signal_family": "YAHOO_PROXY",
+            "strategy": "global_proxy_momentum",
+            "symbol": "QQQ",
+        }
+
+        reason = frontier_shadow_filter_reason(candidate, config={"mode": "paper"})
+
+        self.assertIsNotNone(reason)
+        self.assertEqual(reason["guard"], "paper_strategy_family_quarantine")
+        self.assertFalse(reason["paper_fill_allowed"])
+        self.assertEqual(reason["candidate"]["market_key"], candidate["market_key"])
 import json
 import sys
 from pathlib import Path
