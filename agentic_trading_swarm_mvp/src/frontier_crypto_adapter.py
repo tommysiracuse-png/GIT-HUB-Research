@@ -114,6 +114,7 @@ _PAPER_ONLY_ENFORCED_ROUTE_RESOLUTION_FLAG = "paper_only_enforced_route_resoluti
 _PAPER_ONLY_STRATEGY_LAB_EXACT_CONTEXT_PROMOTION_FLAG = "paper_only_strategy_lab_exact_context_promotion_v1"
 _PAPER_ONLY_SPREAD_VOLATILITY_GATE_FLAG = "paper_only_spread_volatility_gate_v1"
 _PAPER_ONLY_SHADOW_DIRECTION_INVERSION_FLAG = "paper_only_shadow_direction_inversion_v1"
+_PAPER_ONLY_OKX_CARRY_ALIGNMENT_GATE_FLAG = "paper_only_okx_carry_alignment_gate_v1"
 
 
 def _paper_only_route_review_text(value):
@@ -303,10 +304,176 @@ def _paper_only_required_side(route_status, profile):
     return None
 
 
+def _paper_only_alignment_direction_from_token(value):
+    token = _paper_only_route_signal_token(value)
+    if token in {
+        "short",
+        "sell",
+        "short_perp",
+        "short_perp_long_spot",
+        "receive_funding",
+        "positive_carry",
+        "perp_rich",
+    }:
+        return "short"
+    if token in {
+        "long",
+        "buy",
+        "long_perp",
+        "long_perp_short_spot",
+        "pay_funding",
+        "negative_carry",
+        "perp_cheap",
+    }:
+        return "long"
+    return None
+
+
+def _paper_only_alignment_direction_from_numeric(value):
+    numeric = _paper_only_route_review_float(value)
+    if numeric is None or numeric == 0.0:
+        return None
+    return "short" if numeric > 0.0 else "long"
+
+
+def _paper_only_alignment_lookup(route_status, profile, direct_keys, numeric_keys=()):
+    direct = _paper_only_alignment_direction_from_token(
+        _paper_only_route_lookup(route_status, profile, *tuple(direct_keys))
+    )
+    if direct:
+        return direct
+    for key in tuple(numeric_keys):
+        direction = _paper_only_alignment_direction_from_numeric(_paper_only_route_lookup(route_status, profile, key))
+        if direction:
+            return direction
+    return None
+
+
+def _paper_only_okx_basis_variant_alignment_review(route_status, profile):
+    scope_tokens = " ".join(
+        token
+        for token in (
+            _paper_only_route_signal_token(
+                _paper_only_route_lookup(
+                    route_status,
+                    profile,
+                    "venue",
+                    "execution_venue",
+                    "exchange",
+                    "broker",
+                    "venue_key",
+                )
+            ),
+            _paper_only_route_signal_token(
+                _paper_only_route_lookup(
+                    route_status,
+                    profile,
+                    "market_key",
+                    "signal_key",
+                    "strategy",
+                    "strategy_family",
+                    "candidate_family",
+                )
+            ),
+            _paper_only_route_signal_token(
+                _paper_only_route_lookup(
+                    route_status,
+                    profile,
+                    "strategy_family",
+                    "candidate_family",
+                    "directional_template",
+                    "variant",
+                    "signal_variant",
+                )
+            ),
+        )
+        if token
+    )
+    applies = "okx" in scope_tokens and "perp_funding_basis" in scope_tokens
+    candidate_direction = _paper_only_alignment_lookup(
+        route_status,
+        profile,
+        (
+            "direction",
+            "side",
+            "signal_side",
+            "candidate_direction",
+            "position_side",
+            "directional_template",
+            "variant",
+            "signal_variant",
+        ),
+    )
+    basis_direction = _paper_only_alignment_lookup(
+        route_status,
+        profile,
+        (
+            "basis_direction",
+            "basis_side",
+            "basis_trade_direction",
+            "basis_variant_direction",
+        ),
+        (
+            "basis_bps",
+            "basis_edge_bps",
+            "basis_alignment_edge_bps",
+            "spot_perp_basis_bps",
+            "perp_spot_basis_bps",
+            "perp_premium_bps",
+        ),
+    )
+    funding_direction = _paper_only_alignment_lookup(
+        route_status,
+        profile,
+        (
+            "funding_direction",
+            "funding_capture_direction",
+            "carry_capture_direction",
+            "expected_funding_direction",
+        ),
+        (
+            "expected_funding_capture_bps",
+            "perp_funding_edge_bps",
+            "funding_rate_bps",
+            "predicted_funding_bps",
+            "next_funding_rate_bps",
+            "funding_rate",
+        ),
+    )
+    expected_direction = basis_direction if basis_direction and basis_direction == funding_direction else None
+    blocked = False
+    eligible = True
+    reason = "not_applicable"
+    if applies:
+        reason = "insufficient_alignment_evidence"
+        if basis_direction and funding_direction and basis_direction != funding_direction:
+            blocked = True
+            eligible = False
+            reason = "carry_misaligned"
+        elif expected_direction and candidate_direction and candidate_direction != expected_direction:
+            blocked = True
+            eligible = False
+            reason = "direction_fights_carry"
+        elif expected_direction:
+            reason = "carry_aligned"
+    return {
+        "flag": _PAPER_ONLY_OKX_CARRY_ALIGNMENT_GATE_FLAG,
+        "applies": applies,
+        "eligible": eligible,
+        "blocked": blocked,
+        "reason": reason,
+        "candidate_direction": candidate_direction,
+        "basis_direction": basis_direction,
+        "funding_direction": funding_direction,
+        "expected_direction": expected_direction,
+    }
+
+
 def _paper_only_route_requirements_packet(route_status, profile):
     permissions = _paper_only_route_permissions(route_status, profile)
     permissions_set = set(permissions)
     required_side = _paper_only_required_side(route_status, profile)
+    carry_alignment_review = _paper_only_okx_basis_variant_alignment_review(route_status, profile)
 
     margin_available = _paper_only_route_support_bool(
         _paper_only_route_lookup(route_status, profile, "margin_available", "margin_enabled", "margin_support")
@@ -417,9 +584,16 @@ def _paper_only_route_requirements_packet(route_status, profile):
             route_viability_score = min(route_viability_score, 0.49)
     if fee_confidence < 0.5:
         route_viability_score = max(0.0, route_viability_score - 0.1)
+    paper_only_route_blocked = bool(carry_alignment_review.get("blocked"))
+    paper_only_block_reason = carry_alignment_review.get("reason") if paper_only_route_blocked else None
+    if paper_only_route_blocked:
+        route_complete = False
+        if "carry_alignment" not in critical_missing_fields:
+            critical_missing_fields.append("carry_alignment")
+        route_viability_score = min(route_viability_score, 0.19)
     route_viability_score = round(max(0.0, min(1.0, route_viability_score)), 4)
 
-    if (not route_complete) or route_viability_score < 0.35:
+    if paper_only_route_blocked or (not route_complete) or route_viability_score < 0.35:
         route_actionability = "low_priority_research"
         route_priority_cap = "low"
     elif route_viability_score < 0.75:
@@ -450,6 +624,9 @@ def _paper_only_route_requirements_packet(route_status, profile):
         "route_priority_cap": route_priority_cap,
         "route_actionability": route_actionability,
         "critical_missing_fields": critical_missing_fields,
+        "carry_alignment_review": carry_alignment_review,
+        "paper_only_route_blocked": paper_only_route_blocked,
+        "paper_only_block_reason": paper_only_block_reason,
     }
 
 
@@ -491,6 +668,15 @@ def _paper_only_annotate_route_intelligence(route_status):
         merged_packet.update(route_packet)
         route_packet = merged_packet
     route_status["route_requirements_packet"] = route_packet
+    if route_packet.get("paper_only_route_blocked"):
+        route_status["route_requirement_status"] = "blocked"
+        route_status["route_complete"] = False
+        route_status["route_priority_cap"] = route_packet.get("route_priority_cap") or "low"
+        route_status["route_actionability"] = route_packet.get("route_actionability") or "low_priority_research"
+        if route_status.get("route_requirement_summary") in (None, "", [], {}, ()):
+            route_status["route_requirement_summary"] = (
+                f"paper_only_blocked:{route_packet.get('paper_only_block_reason') or 'carry_alignment'}"
+            )
     existing_capabilities = route_status.get("venue_capabilities")
     if isinstance(existing_capabilities, dict):
         merged_capabilities = dict(existing_capabilities)
@@ -509,6 +695,9 @@ def _paper_only_annotate_route_intelligence(route_status):
         "route_priority_cap",
         "route_actionability",
         "critical_missing_fields",
+        "carry_alignment_review",
+        "paper_only_route_blocked",
+        "paper_only_block_reason",
     ):
         if route_status.get(field_name) in (None, "", [], {}, ()):
             route_status[field_name] = route_packet.get(field_name)
