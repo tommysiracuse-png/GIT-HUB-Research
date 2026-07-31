@@ -48,6 +48,10 @@ PAPER_FAMILY_QUARANTINE_SCOPES = (
 )
 QUARANTINED_BASE_LINEAGE_TERMS = (("yahoo_proxy", "global_proxy_momentum"),)
 QUARANTINED_DESCENDANT_KEYS = {
+    "YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM",
+    "yahoo_proxy_global_proxy_momentum",
+    "YAHOO_PROXY|GLOBAL_PROXY_MOMENTUM",
+    "yahoo_proxy|global_proxy_momentum",
     "strategy_lab|gate_yahoo_momentum_to_fresh_tight_high_quality_proxies_3342a7f1",
     "strategy_lab|red_team_yahoo_proxy_momentum_sanity_check_c6d14fc0",
     "strategy_lab|route_rich_frontier_long_filter_2942c975",

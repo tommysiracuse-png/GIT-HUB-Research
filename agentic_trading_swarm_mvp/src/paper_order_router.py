@@ -356,7 +356,16 @@ def _is_short_frontier_spot(candidate: Mapping[str, Any]) -> bool:
 
 def _candidate_reference(candidate: Mapping[str, Any]) -> dict[str, Any]:
     reference: dict[str, Any] = {}
-    for field in ("inst_id", "instrument_id", "symbol", "venue", "signal_key", "trade_type", "market_surface"):
+    for field in (
+        "inst_id",
+        "instrument_id",
+        "symbol",
+        "venue",
+        "signal_key",
+        "trade_type",
+        "market_surface",
+        "market_key",
+    ):
         if candidate.get(field) not in (None, ""):
             reference[field] = candidate.get(field)
     cell = _paper_signal_cell(candidate)
@@ -402,13 +411,24 @@ def frontier_shadow_filter_reason(
 ) -> dict[str, Any] | None:
     """Return a structured paper-only shadow-filter reason, or ``None``.
 
-    The guard is intentionally narrow: only frontier crypto venue-map candidates
-    are considered, and verified positive-net candidates with no slippage/quality
-    blocker remain eligible for paper fills.
+    A paper-only family quarantine can suppress known-decayed lineages before
+    frontier-specific checks run. The bounded frontier guard remains narrow:
+    verified positive-net candidates with no slippage or quality blocker remain
+    eligible for paper fills.
     """
+    family_reason = _paper_family_quarantine_reason(candidate, config=config)
+    if family_reason is not None:
+        normalized = dict(family_reason) if isinstance(family_reason, Mapping) else {"detail": family_reason}
+        normalized.setdefault("reason", "paper_strategy_family_quarantine")
+        normalized.setdefault("paper_only", True)
+        normalized.setdefault("paper_fill_allowed", False)
+        normalized.setdefault("guard", "paper_strategy_family_quarantine")
+        normalized.setdefault("candidate", _candidate_reference(candidate))
+        normalized.setdefault("cell", _paper_signal_cell(candidate))
+        return normalized
+
     if not frontier_paper_guard_enabled(config) or not is_frontier_crypto_candidate(candidate):
         return None
-
     checks: list[dict[str, Any]] = []
     edge_field, edge_bps = _first_float(candidate, ("edge_bps_estimate", "net_edge_bps_estimate", "edge_bps"))
     if edge_bps is not None and edge_bps <= 0.0:

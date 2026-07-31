@@ -1,3 +1,66 @@
+import json
+import sys
+from pathlib import Path
+import unittest
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+import paper_order_router
+import strategy_reliability
+
+
+class PaperFamilyQuarantineTests(unittest.TestCase):
+    @staticmethod
+    def _candidate() -> dict[str, str]:
+        return {
+            "market_key": "YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM",
+            "signal_family": "yahoo_proxy",
+            "strategy": "global_proxy_momentum",
+            "signal_key": "YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM",
+            "venue": "TEST",
+            "direction": "long",
+        }
+
+    def test_strategy_reliability_quarantines_exact_market_key(self) -> None:
+        helper = getattr(strategy_reliability, "paper_family_quarantine_record", None)
+        self.assertTrue(callable(helper))
+
+        record = helper(self._candidate())
+        self.assertIsInstance(record, dict)
+        self.assertTrue(record)
+        self.assertIn("quarantine", json.dumps(record, sort_keys=True, default=str).lower())
+
+    def test_router_shadows_quarantined_family_before_frontier_checks(self) -> None:
+        reason = paper_order_router.frontier_shadow_filter_reason(self._candidate())
+
+        self.assertIsInstance(reason, dict)
+        self.assertFalse(reason.get("paper_fill_allowed", True))
+        self.assertEqual(
+            reason.get("candidate", {}).get("market_key"),
+            "YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM",
+        )
+        self.assertIn("quarantine", json.dumps(reason, sort_keys=True, default=str).lower())
+
+    def test_router_normalizes_minimal_family_quarantine_record(self) -> None:
+        with mock.patch.object(
+            strategy_reliability,
+            "paper_family_quarantine_record",
+            return_value={"reason": "paper_strategy_family_quarantine"},
+        ):
+            reason = paper_order_router.frontier_shadow_filter_reason(self._candidate())
+
+        self.assertEqual(reason.get("guard"), "paper_strategy_family_quarantine")
+        self.assertFalse(reason.get("paper_fill_allowed", True))
+        self.assertEqual(reason.get("candidate", {}).get("market_key"), "YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM")
+
+
+if __name__ == "__main__":
+    unittest.main()
 import pathlib
 import sys
 import unittest
