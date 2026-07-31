@@ -158,6 +158,9 @@ class PublicAdapterParserTests(unittest.TestCase):
             batch = adapter_runtime.build_scan_batch(settings)
         self.assertEqual(1, len(batch.observations))
         self.assertEqual("FAKE:X", batch.observations[0]["inst_id"])
+        self.assertEqual({"FAKE": 1}, batch.metadata["public_market_adapters"]["summary"]["observations_by_venue"])
+        inventory = batch.metadata["public_market_adapters"]["summary"]["surface_inventory"]
+        self.assertEqual("FAKE:X", inventory[0]["sample_instruments"][0])
 
 
 class AdapterCapabilityTests(unittest.TestCase):

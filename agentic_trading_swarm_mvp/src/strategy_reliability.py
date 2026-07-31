@@ -1943,12 +1943,14 @@ def _repair_okx_candidate(candidate: dict) -> dict | None:
     spread = _as_float(candidate.get("spread_bps"), 999.0)
     liquidity = _as_float(candidate.get("liquidity_score"), 0.0)
     route_status = _route_status(candidate)
+    venue = str(candidate.get("venue") or "").upper()
+    funding_profile = "okx_funding_capture" if venue == "OKX" else "public_perpetual_funding_capture"
 
     if direction in {"funding_capture_short_perp", "funding_capture_long_perp"}:
         if funding >= 3.0 and spread <= 4.0 and liquidity >= 0.45:
             return _annotate(
                 candidate,
-                profile="okx_funding_capture",
+                profile=funding_profile,
                 action="protect_working_funding_slice",
                 reasons=["funding magnitude, spread, and liquidity agree"],
                 score_delta=3.0,
@@ -1957,7 +1959,7 @@ def _repair_okx_candidate(candidate: dict) -> dict | None:
             )
         return _annotate(
             candidate,
-            profile="okx_funding_capture",
+            profile=funding_profile,
             action="funding_capture_observe",
             reasons=["funding capture lacks full protected-slice evidence"],
             score_delta=-2.0,

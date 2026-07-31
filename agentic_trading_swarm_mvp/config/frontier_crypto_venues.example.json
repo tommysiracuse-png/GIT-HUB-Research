@@ -8,8 +8,8 @@
     "No live trading."
   ],
   "filters": {
-    "quote_assets": ["USD", "USDT", "USDC", "ZAR", "NGN", "GHS", "KES", "IDR", "THB", "SGD", "MYR", "PHP", "MXN", "BRL", "CLP", "COP", "PEN", "ARS"],
-    "exclude_base_assets": ["USD", "USDT", "USDC", "DAI", "TUSD", "FDUSD", "BUSD", "USDP", "PYUSD", "EUR", "GBP", "ZAR", "NGN", "GHS", "KES", "IDR", "THB", "SGD", "MYR", "PHP", "MXN", "BRL", "CLP", "COP", "PEN", "ARS"],
+    "quote_assets": ["USD", "USDT", "USDC", "AUD", "EUR", "GBP", "ZAR", "NGN", "GHS", "KES", "IDR", "THB", "SGD", "MYR", "PHP", "MXN", "BRL", "CLP", "COP", "PEN", "ARS"],
+    "exclude_base_assets": ["USD", "USDT", "USDC", "DAI", "TUSD", "FDUSD", "BUSD", "USDP", "PYUSD", "AUD", "EUR", "GBP", "ZAR", "NGN", "GHS", "KES", "IDR", "THB", "SGD", "MYR", "PHP", "MXN", "BRL", "CLP", "COP", "PEN", "ARS"],
     "top_volume_per_venue": 80,
     "frontier_symbols_per_venue": 40,
     "frontier_max_listing_count": 3,
@@ -381,6 +381,57 @@
         "timestamp_capability": "response_received"
       },
       "notes": "Public Buda markets/ticker/order-book endpoints for Chile, Colombia, Peru and Argentina quotes."
+    },
+    {
+      "venue": "COINJAR",
+      "enabled": true,
+      "market_type": "spot",
+      "route_id": "coinjar_spot_public",
+      "region": "Australia",
+      "url": "https://api.exchange.coinjar.com/products",
+      "parser": "coinjar_products",
+      "quote_assets": ["AUD", "EUR", "GBP", "USD", "USDC", "USDT"],
+      "max_product_tickers": 24,
+      "depth": {
+        "url_template": "https://data.exchange.coinjar.com/products/{symbol}/book?level=2",
+        "parser": "coinjar_book",
+        "max_levels": 20,
+        "timestamp_capability": "response_received"
+      },
+      "notes": "Official public product, ticker and Level 2 order-book APIs."
+    },
+    {
+      "venue": "RIPIO",
+      "enabled": true,
+      "market_type": "spot",
+      "route_id": "ripio_spot_public",
+      "region": "LATAM",
+      "url": "https://api.ripio.com/trade/public/tickers",
+      "parser": "ripio_tickers",
+      "quote_assets": ["ARS", "BRL", "MXN", "USD", "USDC", "USDT"],
+      "depth": {
+        "url_template": "https://api.ripio.com/trade/public/orders/level-2?pair={symbol}&limit={limit}",
+        "parser": "ripio_level2",
+        "max_levels": 20,
+        "timestamp_capability": "exchange"
+      },
+      "notes": "Official public all-ticker and Level 2 order-book APIs; cached source data may be delayed."
+    },
+    {
+      "venue": "WHITEBIT",
+      "enabled": true,
+      "market_type": "spot",
+      "route_id": "whitebit_spot_public",
+      "url": "https://whitebit.com/api/v4/public/ticker",
+      "parser": "whitebit_tickers",
+      "quote_assets": ["USD", "USDC", "USDT"],
+      "depth": {
+        "url_template": "https://whitebit.com/api/v4/public/orderbook/depth/{symbol}",
+        "parser": "whitebit_depth",
+        "max_levels": 50,
+        "timestamp_capability": "exchange"
+      },
+      "notes": "Official no-key spot ticker and aggregated depth APIs."
     }
   ]
 }

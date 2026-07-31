@@ -170,10 +170,18 @@ def build_scan_batch(settings: dict) -> ScanBatch:
     observations = [observation for _adapter_id, batch, _mode in completed for observation in batch.observations]
     details = []
     statuses = Counter()
+    venues = Counter()
+    surfaces = Counter()
     for adapter_id, batch, mode in completed:
         info = get_adapter(adapter_id).info
         source_status = str(batch.metadata.get("source_status") or "unknown")
         statuses[source_status] += 1
+        venues[str(info.venue)] += len(batch.observations)
+        batch_surfaces = Counter(
+            str(row.get("market_surface") or row.get("market_type") or "unknown")
+            for row in batch.observations
+        )
+        surfaces.update(batch_surfaces)
         details.append(
             {
                 "adapter_id": adapter_id,
@@ -183,6 +191,17 @@ def build_scan_batch(settings: dict) -> ScanBatch:
                 "cache_status": batch.metadata.get("cache_status") or mode,
                 "observation_count": len(batch.observations),
                 "candidate_count": len(batch.candidates),
+                "research_only_count": sum(
+                    1
+                    for row in batch.observations
+                    if row.get("direction") == "watch_only" or row.get("candidate_reject_reason")
+                ),
+                "market_surfaces": dict(batch_surfaces),
+                "sample_instruments": [
+                    str(row.get("inst_id") or row.get("instrument_id"))
+                    for row in batch.observations
+                    if row.get("inst_id") or row.get("instrument_id")
+                ][:8],
                 "capability_gap": batch.metadata.get("capability_gap"),
                 "runtime_entrypoint": info.runtime_entrypoint,
                 "docs_url": info.docs_url,
@@ -195,6 +214,18 @@ def build_scan_batch(settings: dict) -> ScanBatch:
             "observation_count": len(observations),
             "candidate_count": len(candidates),
             "by_source_status": dict(statuses),
+            "observations_by_venue": dict(venues),
+            "observations_by_market_surface": dict(surfaces),
+            "surface_inventory": [
+                {
+                    "adapter_id": item["adapter_id"],
+                    "venue": item["venue"],
+                    "market_surfaces": item["market_surfaces"],
+                    "sample_instruments": item["sample_instruments"][:4],
+                    "candidate_count": item["candidate_count"],
+                }
+                for item in details
+            ],
         },
         "adapters": details,
     }

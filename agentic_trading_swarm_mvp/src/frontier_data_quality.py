@@ -2461,7 +2461,7 @@ def _extract_depth(parser: str, payload: object, received_at: str) -> dict:
     asks: list = []
     book_timestamp = None
     freshness_basis = "response_received"
-    if parser in {"binance_depth", "mexc_depth", "coinbase_book"}:
+    if parser in {"binance_depth", "mexc_depth", "coinbase_book", "coinjar_book"}:
         bids = data.get("bids") or []
         asks = data.get("asks") or []
     elif parser == "kucoin_level2":
@@ -2526,6 +2526,15 @@ def _extract_depth(parser: str, payload: object, received_at: str) -> dict:
         body = body or {}
         bids = body.get("bids") or []
         asks = body.get("asks") or []
+    elif parser == "ripio_level2":
+        body = data.get("data") or {}
+        bids = body.get("bids") or []
+        asks = body.get("asks") or []
+        book_timestamp = _timestamp_to_iso(body.get("timestamp"))
+    elif parser == "whitebit_depth":
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+        book_timestamp = _timestamp_to_iso(data.get("timestamp"), unit="seconds")
     else:
         raise ValueError(f"Unsupported depth parser: {parser}")
     if book_timestamp:

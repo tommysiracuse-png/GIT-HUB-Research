@@ -626,22 +626,23 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
             market_hours_status="not_applicable",
         )
 
-    if venue == "OKX" and trade_type == "perp_funding_basis":
-        standard_perp = direction in {
-            "short_perp_long_spot",
-            "basis_mean_reversion_short_perp",
-            "funding_capture_short_perp",
-        }
+    if venue in {"OKX", "WHITEBIT", "DERIBIT"} and trade_type == "perp_funding_basis":
+        needs_long_spot = direction == "short_perp_long_spot"
+        needs_short_spot = direction == "long_perp_short_spot"
         required = ["crypto_derivatives"]
         missing = [] if caps.get("crypto_derivatives", False) else ["crypto_derivatives"]
-        route_id = "okx_derivatives_paper"
+        route_id = "okx_derivatives_paper" if venue == "OKX" else "public_crypto_derivatives_paper"
         borrow_required = False
         margin_required = True
-        notes = ["OKX perpetual leg can be paper-tested through the derivatives route."]
-        if not standard_perp:
+        notes = [f"{venue} public perpetual data can be paper-tested through the derivatives route."]
+        if needs_long_spot:
+            required.append("crypto_spot")
+            if not caps.get("crypto_spot", False):
+                missing.append("crypto_spot")
+            notes.append("Cash-and-carry requires a long spot hedge in addition to the perpetual leg.")
+        elif needs_short_spot:
             route_id = "conditional_crypto_route_paper"
             borrow_required = True
-            margin_required = True
             required.extend(["crypto_spot", "spot_borrow"])
             if not caps.get("crypto_spot", False):
                 missing.append("crypto_spot")

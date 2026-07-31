@@ -4866,6 +4866,7 @@ def paper_only_indodax_market_health(payload=None, max_markets=None):
 
 import argparse
 import collections
+import concurrent.futures
 import copy
 import datetime as dt
 import json
@@ -6186,6 +6187,9 @@ EXAMPLE_REGISTRY_PATH = CONFIG_DIR / "frontier_crypto_venues.example.json"
 
 USD_LIKE_QUOTES = {"USD", "USDT", "USDC"}
 REGIONAL_FIAT_QUOTES = {
+    "AUD",
+    "EUR",
+    "GBP",
     "ZAR",
     "NGN",
     "GHS",
@@ -6669,6 +6673,54 @@ DEFAULT_REGISTRY = {
                 "parser": "buda_order_book",
                 "max_levels": 50,
                 "timestamp_capability": "response_received",
+            },
+        },
+        {
+            "venue": "COINJAR",
+            "enabled": True,
+            "market_type": "spot",
+            "route_id": "coinjar_spot_public",
+            "region": "Australia",
+            "url": "https://api.exchange.coinjar.com/products",
+            "parser": "coinjar_products",
+            "quote_assets": ["AUD", "EUR", "GBP", "USD", "USDC", "USDT"],
+            "max_product_tickers": 24,
+            "depth": {
+                "url_template": "https://data.exchange.coinjar.com/products/{symbol}/book?level=2",
+                "parser": "coinjar_book",
+                "max_levels": 20,
+                "timestamp_capability": "response_received",
+            },
+        },
+        {
+            "venue": "RIPIO",
+            "enabled": True,
+            "market_type": "spot",
+            "route_id": "ripio_spot_public",
+            "region": "LATAM",
+            "url": "https://api.ripio.com/trade/public/tickers",
+            "parser": "ripio_tickers",
+            "quote_assets": ["ARS", "BRL", "MXN", "USD", "USDC", "USDT"],
+            "depth": {
+                "url_template": "https://api.ripio.com/trade/public/orders/level-2?pair={symbol}&limit={limit}",
+                "parser": "ripio_level2",
+                "max_levels": 20,
+                "timestamp_capability": "exchange",
+            },
+        },
+        {
+            "venue": "WHITEBIT",
+            "enabled": True,
+            "market_type": "spot",
+            "route_id": "whitebit_spot_public",
+            "url": "https://whitebit.com/api/v4/public/ticker",
+            "parser": "whitebit_tickers",
+            "quote_assets": ["USD", "USDC", "USDT"],
+            "depth": {
+                "url_template": "https://whitebit.com/api/v4/public/orderbook/depth/{symbol}",
+                "parser": "whitebit_depth",
+                "max_levels": 50,
+                "timestamp_capability": "exchange",
             },
         },
     ],
@@ -7748,6 +7800,126 @@ def _parse_buda_markets(target: dict, result: dict) -> list[dict]:
     return observations
 
 
+def _parse_coinjar_products(target: dict, result: dict) -> list[dict]:
+    products = result.get("payload") or []
+    by_symbol = {
+        str(item.get("id") or "").upper(): item
+        for item in products
+        if isinstance(item, dict) and item.get("id")
+    }
+    symbols = _top_symbols_for_subfetch(target, list(by_symbol))
+    ticker_results: dict[str, tuple[str, dict]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(symbols) or 1)) as pool:
+        futures = {}
+        for symbol in symbols:
+            ticker_url = f"https://data.exchange.coinjar.com/products/{urllib.request.pathname2url(symbol)}/ticker"
+            futures[pool.submit(fetch_json, ticker_url)] = (symbol, ticker_url)
+        for future in concurrent.futures.as_completed(futures):
+            symbol, ticker_url = futures[future]
+            try:
+                ticker_results[symbol] = (ticker_url, future.result())
+            except Exception as exc:  # noqa: BLE001 - preserve the rest of the public venue.
+                ticker_results[symbol] = (
+                    ticker_url,
+                    {
+                        "ok": False,
+                        "data_status": "unavailable",
+                        "http_status": None,
+                        "latency_ms": None,
+                        "error": str(exc)[:300],
+                    },
+                )
+    observations = []
+    for symbol in symbols:
+        ticker_url, ticker = ticker_results[symbol]
+        product = by_symbol[symbol]
+        row = _base_observation(target, ticker, symbol)
+        row["source_url"] = ticker_url
+        row["base"] = _canonical_asset((product.get("base_currency") or {}).get("iso_code"))
+        row["quote"] = str((product.get("counter_currency") or {}).get("iso_code") or "").upper() or None
+        if not ticker["ok"]:
+            row["notes"].append(f"CoinJar ticker fetch failed: {ticker['http_status']}")
+            observations.append(_finalize_observation(row))
+            continue
+        data = ticker.get("payload") or {}
+        last = as_float(data.get("last") or data.get("mark_price"))
+        base_volume = as_float(data.get("volume_24h") or data.get("volume"), 0.0) or 0.0
+        row.update(
+            {
+                "bid": as_float(data.get("bid")),
+                "ask": as_float(data.get("ask")),
+                "last": last,
+                "quote_volume_24h": base_volume * float(last or 0.0),
+                "change_24h_pct": as_float(data.get("change_24h"), 0.0) * 100.0,
+                "session_status": str(data.get("status") or "unknown"),
+                "exchange_timestamp": data.get("current_time"),
+            }
+        )
+        observations.append(_finalize_observation(row))
+    return observations
+
+
+def _parse_ripio_tickers(target: dict, result: dict) -> list[dict]:
+    payload = result.get("payload") or {}
+    rows = payload.get("data") if isinstance(payload, dict) else payload
+    observations = []
+    for data in rows if isinstance(rows, list) else []:
+        if not isinstance(data, dict):
+            continue
+        symbol = str(data.get("pair") or "").upper()
+        if not symbol:
+            continue
+        row = _base_observation(target, result, symbol)
+        row["base"] = _canonical_asset(data.get("base_code"))
+        row["quote"] = str(data.get("quote_code") or "").upper() or None
+        row.update(
+            {
+                "bid": as_float(data.get("bid")),
+                "ask": as_float(data.get("ask")),
+                "last": as_float(data.get("last")),
+                "quote_volume_24h": as_float(data.get("quote_volume")),
+                "change_24h_pct": as_float(data.get("price_change_percent_24h"), 0.0),
+                "exchange_timestamp": data.get("date"),
+            }
+        )
+        if data.get("is_frozen"):
+            row["data_status"] = "degraded"
+            row["notes"].append("Ripio market is frozen.")
+        observations.append(_finalize_observation(row))
+    return observations
+
+
+def _parse_whitebit_tickers(target: dict, result: dict) -> list[dict]:
+    payload = result.get("payload") or {}
+    rows = payload.items() if isinstance(payload, dict) else []
+    observations = []
+    for raw_symbol, data in rows:
+        if not isinstance(data, dict):
+            continue
+        symbol = str(raw_symbol or "").upper()
+        if not symbol or symbol.endswith("_PERP"):
+            continue
+        base, quote = _split_symbol(symbol, _target_quote_assets(target))
+        if not base or not quote:
+            continue
+        row = _base_observation(target, result, symbol)
+        row.update(
+            {
+                "base": base,
+                "quote": quote,
+                "last": as_float(data.get("last_price")),
+                "quote_volume_24h": as_float(data.get("quote_volume")),
+                "change_24h_pct": as_float(data.get("change"), 0.0),
+            }
+        )
+        if data.get("isFrozen") or data.get("is_frozen"):
+            row["data_status"] = "degraded"
+            row["notes"].append("WhiteBIT market is frozen.")
+        observations.append(_finalize_observation(row))
+    observations.sort(key=lambda row: float(row.get("quote_volume_24h") or 0.0), reverse=True)
+    return observations
+
+
 PARSERS = {
     "coinbase_ticker": _parse_coinbase,
     "coinbase_products": _parse_coinbase_products,
@@ -7770,6 +7942,9 @@ PARSERS = {
     "bitso_available_books": _parse_bitso_available_books,
     "mercado_bitcoin_symbols": _parse_mercado_bitcoin_symbols,
     "buda_markets": _parse_buda_markets,
+    "coinjar_products": _parse_coinjar_products,
+    "ripio_tickers": _parse_ripio_tickers,
+    "whitebit_tickers": _parse_whitebit_tickers,
 }
 
 
@@ -8212,6 +8387,17 @@ def _preliminary_feasibility(direction: str, market_type: str, data_status: str,
     return {"status": "route_unknown", "requires_short_spot": False, "legs": [], "route_blockers": ["route_model"], "notes": ["No route model."]}
 
 
+def _effective_spread_bps(observation: dict) -> float:
+    last = float(observation.get("last") or 0.0)
+    spread = float(observation.get("spread_bps") or spread_bps(observation.get("bid"), observation.get("ask"), last))
+    book_levels = observation.get("book_levels") or {}
+    book_bids = book_levels.get("bids") or []
+    book_asks = book_levels.get("asks") or []
+    if spread >= 900.0 and book_bids and book_asks:
+        spread = spread_bps(book_bids[0][0], book_asks[0][0], last)
+    return round(spread, 3)
+
+
 def _direction_for_observation(observation: dict, reference_price: float | None, settings: dict) -> tuple[str, float, str | None]:
     cfg = settings.get("frontier_crypto_adapter", {})
     risk = settings.get("risk", {})
@@ -8223,7 +8409,7 @@ def _direction_for_observation(observation: dict, reference_price: float | None,
     if observation.get("data_status") != "reachable" or not reference_price or last <= 0:
         return "watch_only", 0.0, "no_reliable_reference"
     deviation = bps(last, reference_price)
-    if float(observation.get("spread_bps") or 999.0) > max_spread:
+    if _effective_spread_bps(observation) > max_spread:
         return "watch_only", round(deviation, 3), "spread_too_wide"
     if abs(deviation) < min_dislocation_bps:
         return "watch_only", round(deviation, 3), "below_dislocation_threshold"
@@ -8238,7 +8424,7 @@ def _candidate_from_observation(observation: dict, settings: dict, reference_pri
     direction, deviation, reject_reason = _direction_for_observation(observation, reference_price, settings)
     last = float(observation.get("last") or 0.0)
     comparison_price = _comparison_price(observation)
-    spread = round(float(observation.get("spread_bps") or spread_bps(observation.get("bid"), observation.get("ask"), last)), 3)
+    spread = _effective_spread_bps(observation)
     liq = round(liquidity_score(observation.get("quote_volume_24h")), 3)
     fee_bps_per_side = float(quality_cfg.get("conservative_fee_bps_per_side", 10.0))
     fills = observation.get("simulated_fills") or {}
