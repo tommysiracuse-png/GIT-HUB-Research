@@ -41,6 +41,13 @@ ROUTE_REQUIREMENT_FIELDS = (
     "paper_feasibility",
     "paper_proxy_route",
     "paper_proxy_not_live_equivalent",
+    "route_type",
+    "route_feasible_paper",
+    "route_cost_bps_paper",
+    "route_cost_reason_codes",
+    "api_surface_required",
+    "requires_spot_borrow",
+    "requires_margin_permission",
 )
 
 _PRIORITY_SPOT_BORROW_INST_IDS = (
@@ -248,6 +255,8 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
     opportunities = list(opportunities)
     counts: dict[str, int] = {}
     proxy_routes: dict[str, int] = {}
+    route_types: dict[str, int] = {}
+    route_costs: list[float] = []
     for opportunity in opportunities:
         blockers = _route_blockers(opportunity)
         proxy_route = _paper_proxy_route(opportunity, blockers=blockers)
@@ -256,14 +265,250 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
             blockers=blockers,
             paper_proxy_route=proxy_route,
         )
+        route_type = _route_type(opportunity, blockers=blockers)
+        route_feasible_paper = _route_feasible_paper(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=proxy_route,
+        )
+        route_cost_bps_paper, _ = _paper_route_cost_bps(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=proxy_route,
+        )
         counts[feasibility] = counts.get(feasibility, 0) + 1
+        route_types[route_type] = route_types.get(route_type, 0) + 1
         if proxy_route != "not_applicable":
             proxy_routes[proxy_route] = proxy_routes.get(proxy_route, 0) + 1
+        if isinstance(route_feasible_paper, bool) and route_feasible_paper and isinstance(route_cost_bps_paper, float):
+            route_costs.append(route_cost_bps_paper)
+    estimated_cost_summary = {
+        "count": len(route_costs),
+        "average": round(sum(route_costs) / len(route_costs), 4) if route_costs else 0.0,
+        "max": round(max(route_costs), 4) if route_costs else 0.0,
+    }
     return {
         "paper_only": True,
         "counts_by_feasibility": dict(sorted(counts.items())),
+        "counts_by_route_type": dict(sorted(route_types.items())),
         "proxy_routes": dict(sorted(proxy_routes.items())),
+        "estimated_route_cost_bps": estimated_cost_summary,
     }
+
+
+def _float_or_none(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _numeric_field(opportunity: dict[str, Any], *keys: str) -> float | None:
+    return _float_or_none(_first_known(opportunity, *keys))
+
+
+def _route_type(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+) -> str:
+    explicit = str(
+        _first_known(
+            opportunity,
+            "route_type",
+            "route_profile",
+            "execution_route",
+        )
+        or ""
+    ).strip()
+    if explicit and explicit.lower() != UNKNOWN:
+        return explicit
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    combined = " ".join(
+        str(
+            _first_known(
+                opportunity,
+                "market_key",
+                "strategy_profile",
+                "profile",
+                "direction",
+            )
+            or ""
+        ).lower()
+        for _ in (0,)
+    )
+    if (
+        "long_perp_short_spot" in combined
+        or "conditional_spot_short" in combined
+        or ("perp" in combined and "spot" in combined and "short" in combined)
+    ):
+        return "long_perp_short_spot_conditional"
+    if any(tag in combined for tag in ("funding", "basis", "carry")):
+        return "perp_carry"
+    if blockers:
+        return "conditional_manual"
+    return "direct_market_access"
+
+
+def _requires_spot_borrow(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+) -> bool:
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    explicit = _bool_flag(
+        _first_known(
+            opportunity,
+            "requires_spot_borrow",
+            "borrow_required",
+            "spot_borrow_required",
+        )
+    )
+    if explicit is not None:
+        return explicit
+    return "spot_borrow" in blockers
+
+
+def _requires_margin_permission(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+    borrow_required: bool = False,
+) -> bool | str:
+    explicit = _bool_flag(
+        _first_known(
+            opportunity,
+            "requires_margin_permission",
+            "margin_required",
+        )
+    )
+    if explicit is not None:
+        return explicit
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    if borrow_required or "spot_borrow" in blockers or "equity_short" in blockers:
+        return True
+    return UNKNOWN
+
+
+def _api_surface_required(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+    borrow_required: bool = False,
+    requires_margin_permission: bool | str = UNKNOWN,
+) -> str:
+    explicit = str(
+        _first_known(
+            opportunity,
+            "api_surface_required",
+            "venue_api_requirement",
+        )
+        or ""
+    ).strip()
+    if explicit and explicit.lower() != UNKNOWN:
+        return explicit
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    if borrow_required or "spot_borrow" in blockers:
+        return "public_plus_margin_and_borrow"
+    if requires_margin_permission is True:
+        return "public_plus_margin"
+    if blockers or "conditional" in _route_type(opportunity, blockers=blockers).lower():
+        return "public_plus_conditional_planning"
+    return "public_market_data_only"
+
+
+def _route_feasible_paper(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+    paper_proxy_route: str | None = None,
+) -> bool | str:
+    feasibility = _paper_feasibility(
+        opportunity,
+        blockers=blockers,
+        paper_proxy_route=paper_proxy_route,
+    )
+    if feasibility in {"direct_feasible", "proxy_only"}:
+        return True
+    if feasibility == "blocked":
+        return False
+    return UNKNOWN
+
+
+def _paper_route_cost_bps(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+    paper_proxy_route: str | None = None,
+) -> tuple[float, list[str]]:
+    explicit = _numeric_field(
+        opportunity,
+        "route_cost_bps_paper",
+        "paper_route_cost_bps",
+        "estimated_route_cost_bps",
+    )
+    if explicit is not None:
+        return (round(explicit, 4), ["explicit_route_cost_bps_paper"])
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    paper_proxy_route = paper_proxy_route or _paper_proxy_route(opportunity, blockers=blockers)
+    borrow_required = _requires_spot_borrow(opportunity, blockers=blockers)
+    requires_margin_permission = _requires_margin_permission(
+        opportunity,
+        blockers=blockers,
+        borrow_required=borrow_required,
+    )
+    fee_per_side = _numeric_field(
+        opportunity,
+        "fee_bps_per_side_or_unknown",
+        "fee_bps_per_side",
+    )
+    slippage_per_side = _numeric_field(
+        opportunity,
+        "slippage_bps_per_side_or_unknown",
+        "slippage_bps_per_side",
+    )
+    borrow_fee = _numeric_field(
+        opportunity,
+        "borrow_fee_bps_estimate_or_unknown",
+        "borrow_fee_bps_estimate",
+        "borrow_fee_bps",
+    )
+    cost_bps = 0.0
+    reason_codes: list[str] = []
+    if fee_per_side is not None:
+        cost_bps += fee_per_side * 2.0
+        reason_codes.append("fees_two_sided")
+    else:
+        cost_bps += 4.0
+        reason_codes.append("fees_unknown_penalty")
+    if slippage_per_side is not None:
+        cost_bps += slippage_per_side * 2.0
+        reason_codes.append("slippage_two_sided")
+    else:
+        cost_bps += 6.0
+        reason_codes.append("slippage_unknown_penalty")
+    if borrow_required:
+        if borrow_fee is not None:
+            cost_bps += max(0.0, borrow_fee)
+            reason_codes.append("borrow_cost")
+        else:
+            cost_bps += 15.0
+            reason_codes.append("borrow_cost_unknown_penalty")
+    if requires_margin_permission is True:
+        cost_bps += 5.0
+        reason_codes.append("margin_operational_drag")
+    if paper_proxy_route != "not_applicable":
+        cost_bps += 7.5
+        reason_codes.append("paper_proxy_basis_risk")
+    if _paper_feasibility(opportunity, blockers=blockers, paper_proxy_route=paper_proxy_route) == "blocked":
+        cost_bps += 25.0
+        reason_codes.append("blocked_route_penalty")
+    return (round(cost_bps, 4), reason_codes)
 
 
 def _route_blocker_playbook(blocker: str) -> dict[str, Any]:
@@ -368,10 +613,17 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
     if _requires_frontier_spot_short_route(opportunity) and "spot_borrow" not in requirement_flags:
         requirement_flags.append("spot_borrow")
     borrow_required = "spot_borrow" in requirement_flags
+    requires_margin_permission = _requires_margin_permission(
+        opportunity,
+        blockers=blockers,
+        borrow_required=borrow_required,
+    )
     account_requirements = _account_requirements(requirement_flags)
     route_status = _paper_route_status(opportunity, blockers=blockers)
+    route_type = _route_type(opportunity, blockers=blockers)
     paper_proxy_route = _paper_proxy_route(opportunity, blockers=blockers)
     paper_feasibility = _paper_feasibility(opportunity, blockers=blockers, paper_proxy_route=paper_proxy_route)
+    route_cost_bps_paper, route_cost_reason_codes = _paper_route_cost_bps(opportunity, blockers=blockers, paper_proxy_route=paper_proxy_route)
 
     return {
         "venue": venue,
@@ -406,6 +658,22 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
         "paper_feasibility": paper_feasibility,
         "paper_proxy_route": paper_proxy_route,
         "paper_proxy_not_live_equivalent": paper_proxy_route != "not_applicable",
+        "route_type": route_type,
+        "route_feasible_paper": _route_feasible_paper(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=paper_proxy_route,
+        ),
+        "route_cost_bps_paper": route_cost_bps_paper,
+        "route_cost_reason_codes": route_cost_reason_codes,
+        "api_surface_required": _api_surface_required(
+            opportunity,
+            blockers=blockers,
+            borrow_required=borrow_required,
+            requires_margin_permission=requires_margin_permission,
+        ),
+        "requires_spot_borrow": borrow_required,
+        "requires_margin_permission": requires_margin_permission,
     }
 
 

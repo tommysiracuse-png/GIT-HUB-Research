@@ -32,7 +32,16 @@ ROUTE_INTELLIGENCE_MD = RUNS_DIR / "route_intelligence_report.md"
 
 REQUIREMENT_STATUSES = {"confirmed", "missing", "unknown", "not_applicable"}
 HARD_BLOCKING_LEVELS = {"hard", "blocking"}
-ROUTE_STATUSES = {"standard", "conditional", "route_unknown", "blocked", "unsupported_or_unknown"}
+ROUTE_STATUSES = {
+    "standard",
+    "conditional",
+    "route_unknown",
+    "blocked",
+    "unsupported_or_unknown",
+    "paper_testable_via_proxy",
+    "blocked_until_requirements_confirmed",
+    "paper_observation_only",
+}
 
 
 def _utc_now() -> str:
