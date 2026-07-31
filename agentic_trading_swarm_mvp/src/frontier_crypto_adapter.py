@@ -155,6 +155,7 @@ _PAPER_ONLY_SHADOW_DIRECTION_INVERSION_FLAG = "paper_only_shadow_direction_inver
 _PAPER_ONLY_OKX_CARRY_ALIGNMENT_GATE_FLAG = "paper_only_okx_carry_alignment_gate_v1"
 _PAPER_ONLY_FRONTIER_ROUTE_QUALITY_PROMOTION_FLAG = "paper_only_frontier_route_quality_promotion_v1"
 _PAPER_ONLY_STRATEGY_LAB_SURFACE_LINEAGE_FLAG = "paper_only_strategy_lab_surface_lineage_v1"
+_PAPER_ONLY_CONTEXT_SCOPING_FLAG = "paper_only_context_scoping_v1"
 
 
 def _paper_only_route_review_text(value):
@@ -287,6 +288,108 @@ def _paper_only_transfer_policy_explicit(value):
         "same_or_validated",
     }
 
+
+def _paper_only_context_scoping_enabled(value):
+    explicit = _paper_only_route_review_bool(
+        _paper_only_route_quality_lookup(
+            value,
+            "paper_only_context_scoping_enabled",
+            "context_scoping_enabled",
+            "execution_context_scoping_enabled",
+        )
+    )
+    return True if explicit is None else explicit
+
+
+def _paper_only_context_scope_tokens(value):
+    tokens = []
+    for key in (
+        "strategy_family",
+        "signal_family",
+        "feature_family",
+        "source_family",
+        "seed_family",
+        "prior_family",
+        "variant",
+        "strategy_key",
+        "source_market_key",
+        "market_key",
+    ):
+        token = _paper_only_surface_token(_paper_only_route_quality_lookup(value, key))
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _paper_only_context_contains_token(tokens, *needles):
+    for token in tokens:
+        if token and any(needle in token for needle in needles):
+            return True
+    return False
+
+
+def _paper_only_context_validation_passed(value):
+    explicit = _paper_only_route_review_bool(
+        _paper_only_route_quality_lookup(
+            value,
+            "independent_validation_passed",
+            "independent_validation",
+            "basis_context_validated",
+            "cross_surface_validated",
+            "paper_validation_passed",
+        )
+    )
+    if explicit is not None:
+        return explicit
+    score = _paper_only_route_review_float(
+        _paper_only_route_quality_lookup(
+            value,
+            "independent_validation_score",
+            "basis_validation_score",
+            "cross_surface_validation_score",
+        )
+    )
+    if score is None:
+        return False
+    if 1.0 < score <= 100.0:
+        score /= 100.0
+    return score >= 0.6
+
+
+def _paper_only_context_scoping_review(value, *, origin_surface=None, target_surface=None, same_surface=False):
+    if not isinstance(value, dict):
+        return None
+
+    enabled = _paper_only_context_scoping_enabled(value)
+    market_key = _paper_only_surface_token(
+        _paper_only_route_quality_lookup(value, "market_key", "paper_market_key", "context_signature_key")
+    )
+    family_tokens = _paper_only_context_scope_tokens(value)
+    scope_tokens = [token for token in (origin_surface, target_surface, market_key) if token]
+    all_tokens = family_tokens + scope_tokens
+    target_tokens = [token for token in (target_surface, market_key) if token]
+
+    frontier_execution = _paper_only_context_contains_token(target_tokens, "frontier")
+    funding_context = _paper_only_context_contains_token(scope_tokens, "funding")
+    proxy_like_source = _paper_only_context_contains_token(all_tokens, "yahoo", "proxy")
+    momentum_family = _paper_only_context_contains_token(all_tokens, "momentum")
+    basis_family = _paper_only_context_contains_token(all_tokens, "basis")
+    mean_reversion_family = _paper_only_context_contains_token(
+        all_tokens, "mean_reversion", "reversion", "convergence"
+    )
+    carry_family = _paper_only_context_contains_token(all_tokens, "carry", "funding")
+
+    if frontier_execution and proxy_like_source and momentum_family:
+        return False
+    if frontier_execution and basis_family and not _paper_only_context_validation_passed(value):
+        return False
+    if frontier_execution and carry_family and funding_context:
+        return True
+    if same_surface and mean_reversion_family:
+        return _paper_only_context_validation_passed(value)
+    if not enabled:
+        return None
+    return None
 
 def _paper_only_strategy_lab_surface_lineage_review(value, metrics, *, explicit_confidence=None):
     if not isinstance(value, dict):
