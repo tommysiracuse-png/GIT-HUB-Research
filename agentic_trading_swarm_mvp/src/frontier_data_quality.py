@@ -37,6 +37,20 @@ def _paper_only_parse_timestamp(value):
         return None
     if isinstance(value, dt.datetime):
         return value if value.tzinfo is not None else value.replace(tzinfo=dt.timezone.utc)
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is not None:
+        try:
+            if abs(numeric) >= 1_000_000_000_000:
+                numeric /= 1000.0
+            parsed = dt.datetime.fromtimestamp(numeric, tz=dt.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)
     text = str(value).strip()
     if not text:
         return None
