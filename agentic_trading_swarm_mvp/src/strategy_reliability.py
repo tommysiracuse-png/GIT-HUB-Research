@@ -55,6 +55,231 @@ PAPER_MODE_CONFIG_KEYS = (
 )
 PAPER_MODE_VALUES = {"paper", "paper_only", "research", "simulation", "sim", "dry_run", "dryrun", "backtest"}
 LIVE_MODE_VALUES = {"live", "production", "prod", "real", "broker"}
+PAPER_CONTEXT_PROMOTION_FLAG_KEYS = (
+    "paper_context_promotion_guard_enabled",
+    "paper_cross_surface_scope_guard_enabled",
+    "paper_scope_validator_enabled",
+)
+PAPER_CONTEXT_PROMOTION_SCOPES = (
+    "paper",
+    "paper_policy",
+    "paper_runtime",
+    "strategy_reliability",
+)
+_PAPER_CONTEXT_PROMOTION_SOURCE_FIELDS = (
+    "promotion_source_context",
+    "source_context",
+    "lineage_source_context",
+    "origin_context",
+    "recommendation_context",
+    "strategy_context_source",
+    "paper_lineage_source_context",
+)
+_PAPER_CONTEXT_PROMOTION_RULE_FIELDS = (
+    "promotion_compatibility_rule",
+    "compatibility_rule",
+    "cross_surface_compatibility_rule",
+    "cross_context_compatibility_rule",
+)
+
+
+def _paper_context_promotion_guard_enabled(config: Mapping[str, Any] | bool | None = None) -> bool:
+    if isinstance(config, bool):
+        return config
+    if not isinstance(config, Mapping):
+        return True
+
+    for key in PAPER_MODE_CONFIG_KEYS:
+        mode = str(config.get(key) or "").strip().lower()
+        if mode in LIVE_MODE_VALUES:
+            return False
+
+    for key in PAPER_CONTEXT_PROMOTION_FLAG_KEYS:
+        if key in config:
+            return _as_bool(config.get(key), True)
+
+    for scope in PAPER_CONTEXT_PROMOTION_SCOPES:
+        scoped = config.get(scope)
+        if not isinstance(scoped, Mapping):
+            continue
+        for key in PAPER_MODE_CONFIG_KEYS:
+            mode = str(scoped.get(key) or "").strip().lower()
+            if mode in LIVE_MODE_VALUES:
+                return False
+        for key in PAPER_CONTEXT_PROMOTION_FLAG_KEYS:
+            if key in scoped:
+                return _as_bool(scoped.get(key), True)
+    return True
+
+
+def _paper_context_value(value: Any) -> str | None:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return text or None
+
+
+def _coerce_context_mapping(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text[:1] in "[{":
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if isinstance(parsed, Mapping):
+                return dict(parsed)
+    return None
+
+
+def _paper_context_bucket(candidate: Mapping[str, Any]) -> dict[str, str]:
+    trade_family = (
+        candidate.get("trade_family")
+        or candidate.get("signal_family")
+        or candidate.get("trade_type")
+    )
+    bucket = {
+        "venue": _paper_context_value(candidate.get("venue")),
+        "direction": _paper_context_value(candidate.get("direction")),
+        "trade_family": _paper_context_value(trade_family),
+        "market_surface": _paper_context_value(candidate.get("market_surface")),
+        "market_key": _paper_context_value(candidate.get("market_key")),
+    }
+    return {field: value for field, value in bucket.items() if value}
+
+
+def _paper_context_source_context(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    for field in _PAPER_CONTEXT_PROMOTION_SOURCE_FIELDS:
+        record = _coerce_context_mapping(candidate.get(field))
+        if record:
+            record.setdefault("context_source_field", field)
+            return record
+
+    for container_field in ("paper_lineage_context", "lineage_context", "recommendation_lineage"):
+        container = candidate.get(container_field)
+        if not isinstance(container, Mapping):
+            continue
+        for field in ("source_context",) + _PAPER_CONTEXT_PROMOTION_SOURCE_FIELDS:
+            record = _coerce_context_mapping(container.get(field))
+            if record:
+                record.setdefault("context_source_field", f"{container_field}.{field}")
+                return record
+    return None
+
+
+def _paper_context_compatibility_rule(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    for field in _PAPER_CONTEXT_PROMOTION_RULE_FIELDS:
+        value = candidate.get(field)
+        if value in (None, "", False):
+            continue
+        if isinstance(value, Mapping):
+            record = dict(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                continue
+            if text[:1] in "[{":
+                try:
+                    parsed = json.loads(text)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    record = {"rule": text}
+                else:
+                    if isinstance(parsed, Mapping):
+                        record = dict(parsed)
+                    elif isinstance(parsed, list):
+                        record = {"fields": [str(item) for item in parsed if item not in (None, "")]}
+                    else:
+                        record = {"rule": text}
+            else:
+                record = {"rule": text}
+        elif isinstance(value, (list, tuple, set)):
+            record = {"fields": [str(item) for item in value if item not in (None, "")]}
+        elif value is True:
+            record = {"allowed": True}
+        else:
+            continue
+        record.setdefault("rule_source_field", field)
+        return record
+    return None
+
+
+def _paper_context_rule_allows(rule: Mapping[str, Any] | None, mismatched_fields: list[str]) -> bool:
+    if not isinstance(rule, Mapping) or not mismatched_fields:
+        return False
+
+    control_values = (
+        rule.get("allow_cross_context"),
+        rule.get("allow_promotion"),
+        rule.get("compatible"),
+        rule.get("allowed"),
+        rule.get("enabled"),
+    )
+    explicit_allow = any(_as_bool(value, False) for value in control_values if value is not None)
+    if not explicit_allow and all(value is None for value in control_values):
+        explicit_allow = True
+
+    allowed_fields: set[str] = set()
+    for field_name in ("fields", "compatible_fields", "dimensions", "scopes"):
+        values = rule.get(field_name)
+        if isinstance(values, str):
+            values = [part.strip() for part in values.replace("|", ",").split(",")]
+        if not isinstance(values, (list, tuple, set)):
+            continue
+        for value in values:
+            normalized = _paper_context_value(value)
+            if normalized:
+                allowed_fields.add(normalized)
+    return explicit_allow and (not allowed_fields or set(mismatched_fields).issubset(allowed_fields))
+
+
+def paper_context_promotion_guard_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(candidate, Mapping) or not _paper_context_promotion_guard_enabled(config):
+        return None
+
+    source_context = _paper_context_source_context(candidate)
+    if not source_context:
+        return None
+
+    source_bucket = _paper_context_bucket(source_context)
+    if not source_bucket:
+        return None
+
+    destination_bucket = _paper_context_bucket(candidate)
+    compared_fields = [field for field in ("venue", "direction", "trade_family", "market_surface", "market_key") if source_bucket.get(field)]
+    if not compared_fields:
+        return None
+
+    matching_fields: list[str] = []
+    mismatched_fields: list[str] = []
+    for field in compared_fields:
+        if destination_bucket.get(field) == source_bucket.get(field):
+            matching_fields.append(field)
+        else:
+            mismatched_fields.append(field)
+
+    compatibility_rule = _paper_context_compatibility_rule(candidate)
+    allowed_by_rule = _paper_context_rule_allows(compatibility_rule, mismatched_fields)
+    eligible = not mismatched_fields or allowed_by_rule
+    return {
+        "guard": "paper_context_promotion_scope",
+        "reason": None if eligible else "paper_context_promotion_mismatch",
+        "paper_only": True,
+        "eligible": eligible,
+        "promotion_blocked": bool(mismatched_fields) and not allowed_by_rule,
+        "compatibility_rule_logged": compatibility_rule is not None,
+        "compatibility_rule": compatibility_rule,
+        "source_context": source_bucket,
+        "destination_context": destination_bucket,
+        "matching_fields": matching_fields,
+        "mismatched_fields": mismatched_fields,
+        "paper_score_multiplier": 1.0 if eligible else 0.0,
+        "paper_fill_allowed": eligible,
+    }
 
 
 def _paper_family_quarantine_enabled(config: Mapping[str, Any] | bool | None = None) -> bool:

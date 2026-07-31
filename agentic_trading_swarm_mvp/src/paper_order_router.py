@@ -315,6 +315,13 @@ def _apply_route_feasibility_metadata(candidate: Mapping[str, Any]) -> dict[str,
         annotated["paper_lineage_inherited_boost_allowed"] = lineage_context.get(
             "inherited_score_boost_allowed"
         )
+    context_promotion = _paper_context_promotion_guard(annotated)
+    if context_promotion:
+        annotated["paper_context_promotion_guard"] = context_promotion
+        annotated["paper_context_promotion_guard_key"] = context_promotion.get("guard")
+        annotated["paper_context_promotion_eligible"] = context_promotion.get("eligible")
+        annotated["paper_context_promotion_blocked"] = context_promotion.get("promotion_blocked")
+        annotated["paper_context_promotion_reason"] = context_promotion.get("reason")
     execution_quality = _paper_frontier_execution_quality_gate(annotated)
     if execution_quality:
         annotated["paper_frontier_execution_quality"] = execution_quality
@@ -439,6 +446,22 @@ def _paper_lineage_context(candidate: Mapping[str, Any]) -> dict[str, Any] | Non
     return None
 
 
+def _paper_context_promotion_guard(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    try:
+        from strategy_reliability import paper_context_promotion_guard_record as _context_guard_record
+    except Exception:
+        return None
+
+    try:
+        record = _context_guard_record(dict(candidate), config=config)
+    except Exception:
+        return None
+    return dict(record) if isinstance(record, Mapping) else None
+
+
 def _paper_frontier_execution_quality_gate(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -506,6 +529,24 @@ def frontier_shadow_filter_reason(
             "failed_checks": carry_gate.get("failed_checks") or [],
             "conviction_cap": carry_gate.get("conviction_cap") or "hold",
             "basis_carry_gate": carry_gate,
+        }
+    context_promotion = _paper_context_promotion_guard(candidate, config=config)
+    if context_promotion is not None and not _as_bool(context_promotion.get("eligible"), True):
+        return {
+            "reason": context_promotion.get("reason") or "paper_context_promotion_mismatch",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": context_promotion.get("guard") or "paper_context_promotion_scope",
+            "candidate": _candidate_reference(candidate),
+            "cell": _paper_signal_cell(candidate),
+            "source_context": context_promotion.get("source_context") or {},
+            "destination_context": context_promotion.get("destination_context") or {},
+            "mismatched_fields": context_promotion.get("mismatched_fields") or [],
+            "matching_fields": context_promotion.get("matching_fields") or [],
+            "compatibility_rule_logged": _as_bool(
+                context_promotion.get("compatibility_rule_logged"), False
+            ),
+            "context_promotion_guard": context_promotion,
         }
 
     if not frontier_paper_guard_enabled(config) or not is_frontier_crypto_candidate(candidate):
