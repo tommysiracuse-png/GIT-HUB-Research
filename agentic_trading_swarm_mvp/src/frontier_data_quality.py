@@ -138,6 +138,8 @@ _PAPER_ONLY_FAMILY_DECAY_TARGET = {
     },
 }
 
+_PAPER_ONLY_PROMOTION_CONTEXT_GUARD_FLAG = "paper_only_promotion_context_guard_v1"
+
 
 def _paper_only_family_decay_guard_review(record, config=None):
     record_payload = record if isinstance(record, dict) else {}
@@ -298,6 +300,116 @@ def _paper_only_route_intelligence_first(record, keys):
         if value not in (None, "", [], {}, ()):
             return value
     return None
+
+
+def _paper_only_promotion_context_tokens(value):
+    tokens = set()
+
+    def _append(raw):
+        text = _paper_only_route_intelligence_text(raw)
+        if not text:
+            return
+        normalized = text.lower().replace("/", "|").replace(",", "|").replace("-", "_").replace(" ", "_")
+        for token in normalized.split("|"):
+            token = token.strip("_ ")
+            if token:
+                tokens.add(token)
+
+    if isinstance(value, dict):
+        for raw in value.values():
+            _append(raw)
+    elif isinstance(value, (list, tuple, set)):
+        for raw in value:
+            _append(raw)
+    else:
+        _append(value)
+    return tokens
+
+
+def _paper_only_promotion_context_guard_review(record, profile=None):
+    source_payload = record if isinstance(record, dict) else {}
+    target_payload = profile if isinstance(profile, dict) else {}
+
+    def _lookup(container, *keys):
+        return _paper_only_route_intelligence_first(container, keys)
+
+    def _target_lookup(*keys):
+        value = _lookup(target_payload, *keys)
+        if value not in (None, "", [], {}, ()):
+            return value
+        return _lookup(source_payload, *keys)
+
+    def _flag_value(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        token = _paper_only_route_intelligence_tag(value)
+        if token in {"1", "true", "yes", "y", "on", "enabled", "allow", "allowed"}:
+            return True
+        if token in {"0", "false", "no", "n", "off", "disabled", "deny", "denied"}:
+            return False
+        return None
+
+    def _tag(value):
+        return _paper_only_route_intelligence_tag(value)
+
+    def _direction_tokens(value):
+        normalized = set()
+        for token in _paper_only_promotion_context_tokens(value):
+            if token in {"buy", "long", "bull", "up", "long_only"}:
+                normalized.add("long")
+            elif token in {"sell", "short", "bear", "down", "short_only"}:
+                normalized.add("short")
+            elif token in {"both", "two_way", "two_sided", "long_short", "bi_directional"}:
+                normalized.update({"long", "short"})
+            elif token in {"watch_only", "flat", "neutral", "none"}:
+                normalized.add("flat")
+            else:
+                normalized.add(token)
+        return normalized
+
+    def _match(source_value, target_value):
+        source_tokens = _direction_tokens(source_value)
+        target_tokens = _direction_tokens(target_value)
+        if not source_tokens or not target_tokens:
+            return None
+        return source_tokens.issubset(target_tokens)
+
+    execution_mode = _tag(_target_lookup("execution_mode", "trading_mode", "mode", "destination_mode", "runner_mode"))
+    explicit_toggle = _flag_value(
+        _target_lookup(
+            _PAPER_ONLY_PROMOTION_CONTEXT_GUARD_FLAG,
+            "promotion_context_guard_enabled",
+            "paper_promotion_context_guard_enabled",
+        )
+    )
+    enabled = explicit_toggle is not False
+    if execution_mode and execution_mode not in {"paper", "paper_only", "simulation", "sim", "review"}:
+        enabled = False
+
+    source_context = {
+        "venue_class": _tag(_lookup(source_payload, "recommendation_venue_class", "source_venue_class", "discovery_venue_class", "venue_class")),
+        "market_surface": _tag(_lookup(source_payload, "recommendation_market_surface", "discovery_market_surface", "source_market_surface", "market_surface", "surface")),
+        "trade_family": _tag(_lookup(source_payload, "recommendation_trade_family", "discovery_trade_family", "source_trade_family", "trade_family", "family")),
+        "direction": _direction_tokens(_lookup(source_payload, "recommendation_direction", "direction", "side", "signal_side")),
+    }
+    target_context = {
+        "venue_class": _tag(_target_lookup("target_venue_class", "venue_class", "runtime_venue_class")),
+        "market_surface": _tag(_target_lookup("target_market_surface", "market_surface", "runtime_market_surface")),
+        "trade_family": _tag(_target_lookup("target_trade_family", "trade_family", "runtime_trade_family")),
+        "direction": _direction_tokens(_target_lookup("target_direction", "direction", "side", "signal_side")),
+    }
+
+    checks = {
+        "venue_class": bool(source_context["venue_class"]) and bool(target_context["venue_class"]) and source_context["venue_class"] == target_context["venue_class"],
+        "market_surface": bool(source_context["market_surface"]) and bool(target_context["market_surface"]) and source_context["market_surface"] == target_context["market_surface"],
+        "trade_family": bool(source_context["trade_family"]) and bool(target_context["trade_family"]) and source_context["trade_family"] == target_context["trade_family"],
+        "direction": _match(source_context["direction"], target_context["direction"]),
+    }
+    if enabled and any(value is False for value in checks.values()):
+        return {"allowed": False, "reason": "paper_promotion_context_mismatch", "checks": checks}
+    return {"allowed": True, "reason": "paper_promotion_context_ok", "checks": checks}
 
 
 def _paper_only_cross_surface_seed_guard_review(record, profile=None):
