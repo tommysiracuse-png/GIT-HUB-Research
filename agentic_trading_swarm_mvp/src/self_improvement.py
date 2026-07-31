@@ -34,7 +34,10 @@ from storage import (
     update_llm_recommendation_status,
 )
 from signal_redesign import create_proposed_variant
-from strategy_lab import ingest_strategy_lab_recommendation, strategy_lab_summary
+from strategy_lab import (
+    ingest_strategy_lab_recommendation as _strategy_lab_ingest_strategy_lab_recommendation,
+    strategy_lab_summary,
+)
 from code_evolution import (
     code_evolution_summary,
     evaluate_code_evolution,
@@ -75,6 +78,254 @@ def _utc_now_dt() -> dt.datetime:
 def _proposal_fingerprint(payload: dict) -> str:
     raw = json.dumps(payload or {}, sort_keys=True, default=repr)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+_STRATEGY_LAB_QUALITY_GATE_TERMS = (
+    "quality gate",
+    "quality_gate",
+    "quality_gate_experiment",
+    "risk filter",
+    "risk_filter",
+    "entry gate",
+    "freshness",
+    "spread",
+    "liquidity",
+    "confidence",
+)
+_STRATEGY_LAB_OKX_FUNDING_TERMS = (
+    "okx",
+    "funding",
+    "funding capture",
+    "funding_capture",
+    "perp",
+    "basis",
+)
+_STRATEGY_LAB_DISALLOWED_LIVE_TERMS = (
+    "live trading",
+    "live execution",
+    "send order",
+    "place order",
+    "broker write",
+    "api key",
+    "credentials",
+    "private key",
+)
+
+
+def _merge_mapping_values(*values: object) -> dict:
+    merged: dict = {}
+    for value in values:
+        if isinstance(value, dict):
+            merged.update(value)
+    return merged
+
+
+def _first_present(mapping: dict, *keys: str) -> object:
+    for key in keys:
+        if key not in mapping:
+            continue
+        value = mapping.get(key)
+        if isinstance(value, str):
+            if value.strip():
+                return value.strip()
+            continue
+        if value is not None:
+            return value
+    return None
+
+
+def _coerce_number(value: object, *, integer: bool = False) -> int | float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if integer:
+        return int(round(number))
+    return number
+
+
+def _coerce_string_list(value: object) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r"[,;\n]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+    normalized_items: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = str(item or "").strip().lower()
+        if not text:
+            continue
+        text = text.replace("-", "_").replace(" ", "_")
+        if text in seen:
+            continue
+        seen.add(text)
+        normalized_items.append(text)
+    return normalized_items
+
+
+def _canonical_strategy_lab_key(payload: dict) -> str:
+    entry_gates = payload.get("entry_gates") if isinstance(payload.get("entry_gates"), dict) else {}
+    exclusions = _coerce_string_list(payload.get("excluded_modes"))
+    parts = [
+        str(payload.get("experiment_type") or ""),
+        str(payload.get("market_key") or ""),
+        str(payload.get("signal_key") or ""),
+        ",".join(_coerce_string_list(payload.get("trade_types"))),
+        ",".join(_coerce_string_list(payload.get("allowed_directions"))),
+        f"age={entry_gates.get('max_signal_age_seconds', '')}",
+        f"spread={entry_gates.get('max_spread_bps', '')}",
+        f"liq={entry_gates.get('min_liquidity_usd', '')}",
+        f"conf={entry_gates.get('min_confidence', '')}",
+        f"carry={bool(entry_gates.get('require_carry_alignment'))}",
+        f"exclude={','.join(exclusions)}",
+    ]
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _normalize_strategy_lab_recommendation_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return payload
+    full_text = f"{_payload_text(payload)} {json.dumps(payload, sort_keys=True, default=repr)}".lower()
+    if _contains_any(full_text, _STRATEGY_LAB_DISALLOWED_LIVE_TERMS):
+        return payload
+    action = str(payload.get("action") or "")
+    if action != "propose_strategy_lab_experiment" and "strategy lab" not in full_text:
+        return payload
+    if not _contains_any(full_text, _STRATEGY_LAB_QUALITY_GATE_TERMS):
+        return payload
+    if not (_contains_any(full_text, ("okx",)) and _contains_any(full_text, ("funding", "funding_capture", "perp", "basis"))):
+        return payload
+
+    code_change = payload.get("code_change") if isinstance(payload.get("code_change"), dict) else {}
+    plan = payload.get("autonomous_plan") if isinstance(payload.get("autonomous_plan"), dict) else {}
+    scope = _merge_mapping_values(
+        plan,
+        code_change,
+        payload.get("experiment"),
+        payload.get("policy"),
+        payload.get("filters"),
+        payload.get("gates"),
+        payload.get("scope"),
+        payload.get("target"),
+        payload,
+    )
+
+    max_signal_age_seconds = _coerce_number(
+        _first_present(
+            scope,
+            "max_signal_age_seconds",
+            "signal_max_age_seconds",
+            "max_age_seconds",
+            "freshness_horizon_seconds",
+            "max_signal_age_s",
+        ),
+        integer=True,
+    )
+    max_spread_bps = _coerce_number(
+        _first_present(
+            scope,
+            "max_spread_bps",
+            "spread_bps_max",
+            "max_entry_spread_bps",
+            "spread_cap_bps",
+        )
+    )
+    min_liquidity_usd = _coerce_number(
+        _first_present(
+            scope,
+            "min_liquidity_usd",
+            "liquidity_floor_usd",
+            "min_depth_usd",
+            "min_notional_usd",
+        )
+    )
+    min_confidence = _coerce_number(
+        _first_present(
+            scope,
+            "min_confidence",
+            "confidence_floor",
+            "min_emit_confidence",
+            "decayed_confidence_min",
+        )
+    )
+
+    entry_gates = {
+        "max_signal_age_seconds": max_signal_age_seconds if max_signal_age_seconds is not None else 900,
+        "max_spread_bps": max_spread_bps if max_spread_bps is not None else 8.0,
+        "min_liquidity_usd": min_liquidity_usd if min_liquidity_usd is not None else 25000.0,
+        "min_confidence": min_confidence if min_confidence is not None else 0.55,
+        "require_carry_alignment": bool(
+            _first_present(scope, "require_carry_alignment", "carry_alignment_required", "funding_alignment_required")
+            if _first_present(scope, "require_carry_alignment", "carry_alignment_required", "funding_alignment_required")
+            is not None
+            else True
+        ),
+    }
+    excluded_modes = _coerce_string_list(
+        _first_present(
+            scope,
+            "excluded_modes",
+            "exclude_modes",
+            "exclusions",
+            "disabled_variants",
+            "disallowed_modes",
+        )
+    )
+    if not excluded_modes:
+        excluded_modes = ["basis_mean_reversion", "spot_leg", "spot_carry"]
+    trade_types = _coerce_string_list(
+        _first_present(scope, "trade_types", "allowed_trade_types", "strategy_modes", "modes")
+    )
+    if not trade_types:
+        trade_types = ["funding_capture"]
+    allowed_directions = _coerce_string_list(
+        _first_present(scope, "allowed_directions", "directions", "trade_directions")
+    )
+    if not allowed_directions:
+        allowed_directions = ["long", "short"]
+
+    normalized = dict(payload)
+    normalized.update(
+        {
+            "action": "propose_strategy_lab_experiment",
+            "paper_only": True,
+            "runtime_mode": "paper_only",
+            "experiment_type": "quality_gate_experiment",
+            "market_key": str(_first_present(scope, "market_key", "market", "target_market") or "okx_perp_funding_basis"),
+            "signal_key": str(_first_present(scope, "signal_key", "signal", "target_signal") or "okx_funding_capture"),
+            "strategy_family": str(_first_present(scope, "strategy_family", "family") or "funding_capture"),
+            "venue": str(_first_present(scope, "venue", "exchange") or "okx"),
+            "trade_types": trade_types,
+            "allowed_directions": allowed_directions,
+            "entry_gates": entry_gates,
+            "excluded_modes": excluded_modes,
+            "scope": {
+                "venue": str(_first_present(scope, "venue", "exchange") or "okx"),
+                "market_key": str(_first_present(scope, "market_key", "market", "target_market") or "okx_perp_funding_basis"),
+                "signal_key": str(_first_present(scope, "signal_key", "signal", "target_signal") or "okx_funding_capture"),
+                "trade_types": trade_types,
+            },
+            "consumer_validation": {
+                "normalized_strategy_lab_packet": True,
+                "normalization_family": "okx_funding_capture_quality_gate",
+                "normalization_audit_version": 1,
+            },
+        }
+    )
+    normalized["canonical_key"] = _canonical_strategy_lab_key(normalized)
+    return normalized
+
+
+def ingest_strategy_lab_recommendation(payload: dict):
+    normalized_payload = _normalize_strategy_lab_recommendation_payload(payload)
+    return _strategy_lab_ingest_strategy_lab_recommendation(normalized_payload)
 
 IMPLEMENTED_MANUAL_STATUSES = {
     "route_requirements": ("implemented_route_requirements", ("improvement_tasks", "route_probe_tasks")),
