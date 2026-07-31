@@ -547,9 +547,279 @@ def _paper_only_strategy_lab_surface_lineage_review(value, metrics, *, explicit_
     return review
 
 
+def _paper_only_route_requirement_profile_dict(value):
+    if not isinstance(value, dict):
+        return {}
+    try:
+        profile = paper_only_route_requirement_profile(value)
+    except Exception:
+        profile = {}
+    return profile if isinstance(profile, dict) else {}
+
+
+def _paper_only_route_classification(value, profile=None):
+    profile = profile if isinstance(profile, dict) else {}
+    explicit = _paper_only_route_signal_token(
+        _paper_only_route_lookup(
+            value,
+            profile,
+            "route_classification",
+            "route_type",
+            "route_requirement",
+            "route_profile",
+            "route_kind",
+            "route_side",
+        )
+    )
+    if explicit in {"spot_only", "spot", "long_spot"}:
+        return "spot_only"
+    if explicit in {"perp_only", "perp", "perpetual", "swap", "future", "futures", "linear_perp"}:
+        return "perp_only"
+    if explicit in {
+        "spot_plus_perp",
+        "basis",
+        "cash_and_carry",
+        "funding_capture",
+        "basis_trade",
+    }:
+        return "spot_plus_perp"
+    if explicit in {
+        "spot_short",
+        "short_spot",
+        "spot_short_with_borrow",
+        "borrow_dependent_spot_short",
+    }:
+        return "spot_short_with_borrow"
+    if explicit in {"cross_venue_conditional", "conditional_cross_venue"}:
+        return "cross_venue_conditional"
+
+    side_pattern = _paper_only_route_signal_token(
+        _paper_only_route_lookup(
+            value,
+            profile,
+            "side_pattern",
+            "candidate_side_pattern",
+            "side",
+            "signal",
+            "direction",
+        )
+    )
+    instrument_type = _paper_only_route_signal_token(
+        _paper_only_route_lookup(
+            value,
+            profile,
+            "instrument_type",
+            "market_type",
+            "product_type",
+            "instrument",
+            "instrument_kind",
+        )
+    )
+    leg_count = _paper_only_route_review_float(
+        _paper_only_route_lookup(value, profile, "leg_count", "legs", "route_leg_count", "route_count")
+    )
+    conditional = _paper_only_route_review_bool(
+        _paper_only_route_lookup(
+            value,
+            profile,
+            "conditional",
+            "is_conditional",
+            "cross_venue_conditional",
+            "requires_conditionals",
+        )
+    )
+    route_tokens = " ".join(token for token in (explicit, side_pattern, instrument_type) if token)
+
+    if "spot_short" in route_tokens or ("short" in route_tokens and "spot" in route_tokens):
+        return "spot_short_with_borrow"
+    if leg_count is not None and leg_count >= 2.0 and (
+        "perp" in route_tokens or "swap" in route_tokens or "future" in route_tokens
+    ):
+        return "spot_plus_perp"
+    if conditional and leg_count is not None and leg_count >= 2.0:
+        return "cross_venue_conditional"
+    if "perp" in route_tokens or "swap" in route_tokens or "future" in route_tokens:
+        return "perp_only"
+    return "spot_only"
+
+
+def _paper_only_frontier_route_feasibility_gate_review(value):
+    if not isinstance(value, dict):
+        return None
+
+    profile = _paper_only_route_requirement_profile_dict(value)
+    route_classification = _paper_only_route_classification(value, profile)
+    if route_classification not in {
+        "spot_short_with_borrow",
+        "spot_plus_perp",
+        "cross_venue_conditional",
+    }:
+        return None
+
+    venue = _paper_only_surface_token(
+        _paper_only_route_lookup(
+            value,
+            profile,
+            "venue",
+            "exchange",
+            "broker",
+            "broker_surface",
+            "execution_venue",
+        )
+    )
+    review = {
+        "flag": _PAPER_ROUTE_GUARD_SHORT_FRONTIER_SPOT_FLAG,
+        "applies": True,
+        "eligible": True,
+        "blocked": False,
+        "route_classification": route_classification,
+        "venue": venue,
+        "reason": "route_supported",
+    }
+
+    if route_classification == "spot_short_with_borrow":
+        short_support = _paper_only_route_support_bool(
+            _paper_only_route_lookup(
+                value,
+                profile,
+                "spot_short_support",
+                "short_support",
+                "margin_short_support",
+            )
+        )
+        margin_support = _paper_only_route_support_bool(
+            _paper_only_route_lookup(
+                value,
+                profile,
+                "margin_support",
+                "spot_margin_support",
+                "margin_enabled",
+            )
+        )
+        borrow_reference = _paper_only_route_review_text(
+            _paper_only_route_lookup(
+                value,
+                profile,
+                "borrow_reference",
+                "borrow_proxy",
+                "borrow_source",
+                "borrow_cost_reference",
+            )
+        )
+        review.update(
+            {
+                "spot_short_support": short_support,
+                "margin_support": margin_support,
+                "borrow_reference": borrow_reference,
+            }
+        )
+        if short_support is False or margin_support is False:
+            review.update(
+                {
+                    "eligible": False,
+                    "blocked": True,
+                    "reason": "spot_short_route_unsupported",
+                    "confidence": 0.0,
+                }
+            )
+            return review
+        if short_support is None and margin_support is None:
+            review.update(
+                {
+                    "eligible": False,
+                    "blocked": True,
+                    "reason": "spot_short_route_support_unknown",
+                    "confidence": 0.0,
+                }
+            )
+            return review
+        if not borrow_reference:
+            review.update(
+                {
+                    "reason": "borrow_proxy_missing",
+                    "confidence_cap": 0.55,
+                }
+            )
+        return review
+
+    if route_classification == "spot_plus_perp":
+        basis_support = _paper_only_route_support_bool(
+            _paper_only_route_lookup(value, profile, "basis_support", "spot_plus_perp_support")
+        )
+        perp_support = _paper_only_route_support_bool(
+            _paper_only_route_lookup(value, profile, "perp_support", "swap_support", "futures_support")
+        )
+        fee_reference = _paper_only_route_review_text(
+            _paper_only_route_lookup(
+                value,
+                profile,
+                "fee_reference",
+                "fee_schedule_reference",
+                "trading_fee_reference",
+            )
+        )
+        review.update(
+            {
+                "basis_support": basis_support,
+                "perp_support": perp_support,
+                "fee_reference": fee_reference,
+            }
+        )
+        if basis_support is False or perp_support is False:
+            review.update(
+                {
+                    "eligible": False,
+                    "blocked": True,
+                    "reason": "spot_plus_perp_route_unsupported",
+                    "confidence": 0.0,
+                }
+            )
+            return review
+        if not fee_reference:
+            review.update(
+                {
+                    "reason": "fee_reference_missing",
+                    "confidence_cap": 0.65,
+                }
+            )
+        return review
+
+    fee_reference = _paper_only_route_review_text(
+        _paper_only_route_lookup(
+            value,
+            profile,
+            "fee_reference",
+            "fee_schedule_reference",
+            "trading_fee_reference",
+        )
+    )
+    if not venue:
+        review.update(
+            {
+                "eligible": False,
+                "blocked": True,
+                "reason": "missing_venue_metadata",
+                "confidence": 0.0,
+            }
+        )
+        return review
+    if not fee_reference:
+        review.update(
+            {
+                "reason": "fee_reference_missing",
+                "confidence_cap": 0.6,
+            }
+        )
+    return review
+
+
 def _paper_only_frontier_route_quality_gate_review(value):
     if not isinstance(value, dict):
         return None
+
+    route_feasibility_review = _paper_only_frontier_route_feasibility_gate_review(value)
+    if isinstance(route_feasibility_review, dict) and route_feasibility_review.get("blocked"):
+        return route_feasibility_review
 
     route_count = _paper_only_route_review_float(
         _paper_only_route_quality_lookup(value, "route_count", "route_richness", "venue_count", "path_count", "routes")
