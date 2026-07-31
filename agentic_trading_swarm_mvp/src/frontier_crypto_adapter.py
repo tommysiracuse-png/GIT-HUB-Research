@@ -153,6 +153,7 @@ _PAPER_ONLY_STRATEGY_LAB_EXACT_CONTEXT_PROMOTION_FLAG = "paper_only_strategy_lab
 _PAPER_ONLY_SPREAD_VOLATILITY_GATE_FLAG = "paper_only_spread_volatility_gate_v1"
 _PAPER_ONLY_SHADOW_DIRECTION_INVERSION_FLAG = "paper_only_shadow_direction_inversion_v1"
 _PAPER_ONLY_OKX_CARRY_ALIGNMENT_GATE_FLAG = "paper_only_okx_carry_alignment_gate_v1"
+_PAPER_ONLY_FRONTIER_ROUTE_QUALITY_PROMOTION_FLAG = "paper_only_frontier_route_quality_promotion_v1"
 
 
 def _paper_only_route_review_text(value):
@@ -240,6 +241,129 @@ def _paper_only_route_support_bool(value):
     return _paper_only_route_review_bool(value)
 
 
+def _paper_only_route_quality_lookup(value, *keys):
+    if not isinstance(value, dict):
+        return None
+    containers = [value]
+    for nested_key in (
+        "route_quality",
+        "route_metrics",
+        "execution_quality",
+        "market_quality",
+        "quality",
+        "route_requirements",
+    ):
+        nested = value.get(nested_key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+    for container in containers:
+        for key in keys:
+            candidate = container.get(key)
+            if candidate not in (None, "", [], {}, ()):
+                return candidate
+    return None
+
+
+def _paper_only_frontier_route_quality_gate_review(value):
+    if not isinstance(value, dict):
+        return None
+
+    route_count = _paper_only_route_review_float(
+        _paper_only_route_quality_lookup(value, "route_count", "route_richness", "venue_count", "path_count", "routes")
+    )
+    liquidity_usd = _paper_only_route_review_float(
+        _paper_only_route_quality_lookup(
+            value,
+            "liquidity_usd",
+            "depth_usd",
+            "book_depth_usd",
+            "top_of_book_depth_usd",
+            "notional_liquidity_usd",
+            "dollar_volume_usd",
+        )
+    )
+    spread_pct = _paper_only_route_review_float(
+        _paper_only_route_quality_lookup(value, "spread_pct", "effective_spread_pct", "quoted_spread_pct")
+    )
+    if spread_pct is None:
+        spread_bps = _paper_only_route_review_float(
+            _paper_only_route_quality_lookup(value, "spread_bps", "effective_spread_bps", "quoted_spread_bps")
+        )
+        if spread_bps is not None:
+            spread_pct = spread_bps / 100.0
+    quote_age_seconds = _paper_only_route_review_float(
+        _paper_only_route_quality_lookup(
+            value,
+            "quote_age_seconds",
+            "quote_staleness_seconds",
+            "staleness_seconds",
+            "data_age_seconds",
+            "freshness_seconds",
+        )
+    )
+    if quote_age_seconds is None:
+        quote_age_ms = _paper_only_route_review_float(
+            _paper_only_route_quality_lookup(value, "quote_age_ms", "quote_staleness_ms", "staleness_ms")
+        )
+        if quote_age_ms is not None:
+            quote_age_seconds = quote_age_ms / 1000.0
+    market_quality_score = _paper_only_route_review_float(
+        _paper_only_route_quality_lookup(
+            value,
+            "market_quality_score",
+            "quality_score",
+            "data_quality_score",
+            "market_score",
+        )
+    )
+    if market_quality_score is not None and 1.0 < market_quality_score <= 100.0:
+        market_quality_score /= 100.0
+
+    metrics = {
+        "route_count": route_count,
+        "liquidity_usd": liquidity_usd,
+        "spread_pct": spread_pct,
+        "quote_age_seconds": quote_age_seconds,
+        "market_quality_score": market_quality_score,
+    }
+    if not any(metric is not None for metric in metrics.values()):
+        return None
+
+    explicit_confidence = _paper_only_route_review_float(
+        _paper_only_route_quality_lookup(value, "route_confidence", "confidence", "route_quality_confidence")
+    )
+    complete = all(metric is not None for metric in metrics.values())
+    if not complete:
+        neutral_confidence = 0.5 if explicit_confidence is None else min(0.5, max(0.0, min(1.0, explicit_confidence)))
+        return {
+            "flag": _PAPER_ONLY_FRONTIER_ROUTE_QUALITY_PROMOTION_FLAG,
+            "applies": True,
+            "complete": False,
+            "eligible": True,
+            "blocked": False,
+            "reason": "incomplete_quality_metrics",
+            "confidence": neutral_confidence,
+        }
+
+    checks = {
+        "route_count": route_count >= (_paper_only_route_review_float(_paper_only_route_quality_lookup(value, "min_route_count", "min_routes", "min_route_richness")) or 2.0),
+        "liquidity_usd": liquidity_usd >= (_paper_only_route_review_float(_paper_only_route_quality_lookup(value, "min_liquidity_usd", "min_depth_usd", "min_book_depth_usd")) or 25000.0),
+        "spread_pct": spread_pct <= (_paper_only_route_review_float(_paper_only_route_quality_lookup(value, "max_spread_pct", "max_effective_spread_pct", "spread_limit_pct")) or 1.0),
+        "quote_age_seconds": quote_age_seconds <= (_paper_only_route_review_float(_paper_only_route_quality_lookup(value, "max_quote_age_seconds", "max_staleness_seconds", "freshness_limit_seconds")) or 60.0),
+        "market_quality_score": market_quality_score >= (_paper_only_route_review_float(_paper_only_route_quality_lookup(value, "min_market_quality_score", "min_quality_score", "quality_floor")) or 0.5),
+    }
+    passed = all(checks.values())
+    return {
+        "flag": _PAPER_ONLY_FRONTIER_ROUTE_QUALITY_PROMOTION_FLAG,
+        "applies": True,
+        "complete": True,
+        "eligible": passed,
+        "blocked": not passed,
+        "reason": "quality_thresholds_satisfied" if passed else "quality_threshold_failed",
+        "confidence": max(0.0, min(1.0, explicit_confidence if explicit_confidence is not None and passed else (1.0 if passed else 0.0))),
+    }
+
+
 def _paper_only_route_confidence(value, *, default=None):
     if value is None:
         return default
@@ -247,6 +371,18 @@ def _paper_only_route_confidence(value, *, default=None):
         return 1.0 if value else 0.0
     if isinstance(value, (int, float)):
         return max(0.0, min(1.0, float(value)))
+    if isinstance(value, dict):
+        gate_review = _paper_only_frontier_route_quality_gate_review(value)
+        if isinstance(gate_review, dict):
+            confidence = _paper_only_route_review_float(gate_review.get("confidence"))
+            if confidence is not None:
+                return max(0.0, min(1.0, confidence))
+        explicit_confidence = _paper_only_route_review_float(
+            _paper_only_route_quality_lookup(value, "route_confidence", "confidence", "route_quality_confidence")
+        )
+        if explicit_confidence is not None:
+            return max(0.0, min(1.0, explicit_confidence))
+        return default
     token = _paper_only_route_signal_token(value)
     if not token:
         return default
