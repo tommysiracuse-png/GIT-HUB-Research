@@ -191,6 +191,115 @@ class StrategyLabTest(unittest.TestCase):
         self.assertEqual(1, len(generated), report)
         self.assertEqual("field_alias_lab_v1", generated[0]["strategy_lab_id"])
 
+    def test_candidate_generation_normalizes_feature_scales_and_broad_dimensions(self):
+        rec = lab_rec()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "normalized_okx_funding_lab_v1"
+        experiment["strategy_logic"] = {
+            "type": "candidate_filter",
+            "venues": ["OKX"],
+            "trade_types": ["perp_funding_basis"],
+            "directions": ["funding_capture_long_perp"],
+            "regions": ["global"],
+            "asset_classes": ["crypto"],
+            "required_fields": ["quality_score", "stale_minutes", "timestamp"],
+            "min_score": 0.6,
+            "min_liquidity_score": 55,
+            "min_quality_score": 0.65,
+            "max_spread_bps": 8,
+        }
+        source = candidate(
+            venue="OKX",
+            inst_id="BTC-USDT-SWAP",
+            trade_type="perp_funding_basis",
+            direction="funding_capture_long_perp",
+            asset_class="crypto_linked_derivative",
+            score=72.0,
+            liquidity_score=0.8,
+            spread_bps=2.0,
+            seen_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            generated, report = generate_strategy_lab_candidates(conn, base_settings(), [source])
+
+        self.assertEqual(1, len(generated), report)
+        features = generated[0]["strategy_lab_normalized_features"]
+        self.assertEqual("crypto", features["asset_class"])
+        self.assertEqual("global", features["region"])
+        self.assertGreaterEqual(features["quality_score"], 65.0)
+
+    def test_compiled_contract_survives_closed_session_using_persisted_runtime_evidence(self):
+        rec = lab_rec()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "jse_dormant_session_lab_v1"
+        experiment["strategy_logic"] = {
+            "type": "candidate_filter",
+            "venues": ["JOHANNESBURG_STOCK_EXCHANGE"],
+            "trade_types": ["global_market_discovery_proxy"],
+            "directions": ["long_proxy"],
+            "required_fields": ["edge_bps", "timestamp"],
+            "min_edge_bps": 10,
+        }
+        historical = candidate(
+            venue="JOHANNESBURG_STOCK_EXCHANGE",
+            inst_id="JOHANNESBURG_STOCK_EXCHANGE:SBSW",
+            trade_type="global_market_discovery_proxy",
+            direction="long_proxy",
+            seen_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+        review = {
+            "learned_score": 70.0,
+            "decision": "approve_paper_trade",
+            "route_status": "standard",
+            "hard_blocks": [],
+        }
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            save_opportunity(conn, historical, review)
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                base_settings(),
+                [candidate(venue="OTHER_VENUE")],
+            )
+            row = conn.execute(
+                "select status, compile_status from strategy_lab_experiments where strategy_lab_id = ?",
+                ("jse_dormant_session_lab_v1",),
+            ).fetchone()
+            recovered, _ = generate_strategy_lab_candidates(conn, base_settings(), [historical])
+
+        self.assertEqual([], generated)
+        self.assertEqual("compiled", row["compile_status"])
+        self.assertEqual("needs_more_evidence", row["status"])
+        self.assertEqual({"compiled": 1}, report["contract_compilation"]["by_compile_status"])
+        self.assertEqual(1, len(recovered))
+
+    def test_scope_metadata_is_not_treated_as_missing_candidate_data(self):
+        rec = lab_rec()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "scope_metadata_repair_lab_v1"
+        experiment["strategy_logic"]["required_fields"] = [
+            "venues",
+            "trade_types",
+            "directions",
+            "edge_bps",
+        ]
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            generated, report = generate_strategy_lab_candidates(conn, base_settings(), [candidate()])
+            row = conn.execute(
+                "select strategy_logic_json, compile_status from strategy_lab_experiments where strategy_lab_id = ?",
+                ("scope_metadata_repair_lab_v1",),
+            ).fetchone()
+
+        logic = json.loads(row["strategy_logic_json"])
+        self.assertEqual(["edge_bps"], logic["required_fields"])
+        self.assertEqual("compiled", row["compile_status"])
+        self.assertEqual(1, len(generated), report)
+
     def test_candidate_generation_does_not_treat_watch_only_as_paper_testable(self):
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, lab_rec())

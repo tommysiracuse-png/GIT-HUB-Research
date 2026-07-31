@@ -165,13 +165,24 @@ def _runtime_strategy_vocabulary(candidates: list[dict]) -> dict:
         for field, value in candidate.items()
         if value is not None
     )
+    for field in ("quality_score", "stale_minutes", "timestamp", "price", "region", "asset_class"):
+        candidate_fields[field] = sum(
+            _candidate_field_value(candidate, field) is not None
+            for candidate in candidates
+        )
     return {
         "trade_types": trade_types,
         "directions": directions,
         "venues": {str(candidate.get("venue")) for candidate in candidates if candidate.get("venue")},
-        "regions": {str(candidate.get("region")) for candidate in candidates if candidate.get("region")},
+        "regions": {
+            str(_candidate_region(candidate))
+            for candidate in candidates
+            if _candidate_region(candidate)
+        },
         "asset_classes": {
-            str(candidate.get("asset_class")) for candidate in candidates if candidate.get("asset_class")
+            str(_candidate_asset_class(candidate))
+            for candidate in candidates
+            if _candidate_asset_class(candidate)
         },
         "candidate_fields": set(candidate_fields),
         "candidate_field_counts": candidate_fields,
@@ -255,6 +266,23 @@ def _normalize_strategy_logic(logic: dict, vocabulary: dict | None = None) -> di
         normalized["directions"] = _unique(normalized_directions)
     elif "directions" in normalized:
         normalized["directions"] = []
+    required_fields = _as_list(normalized.get("required_fields"))
+    scope_metadata_fields = {
+        "venue",
+        "venues",
+        "trade_type",
+        "trade_types",
+        "direction",
+        "directions",
+        "region",
+        "regions",
+        "asset_class",
+        "asset_classes",
+    }
+    removed_scope_fields = [field for field in required_fields if field in scope_metadata_fields]
+    if removed_scope_fields:
+        normalized["required_fields"] = [field for field in required_fields if field not in scope_metadata_fields]
+        notes.append("removed_scope_metadata_from_required_fields:" + ",".join(removed_scope_fields))
     if notes:
         normalized["normalization_notes"] = _unique(notes)
     return normalized
@@ -669,7 +697,10 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
 
 
 def _allowed(value: Any, allowed: list[str]) -> bool:
-    return not allowed or str(value) in set(allowed)
+    if not allowed:
+        return True
+    value_text = str(value or "").strip().lower()
+    return value_text in {str(item).strip().lower() for item in allowed}
 
 
 def _direction_polarity(direction: Any) -> str | None:
@@ -718,6 +749,78 @@ def _paper_route_rank(candidate: dict) -> int:
     }.get(_candidate_route_status(candidate), 3)
 
 
+def _candidate_asset_class(candidate: dict) -> str | None:
+    raw = str(candidate.get("asset_class") or candidate.get("market_type") or "").strip()
+    context = " ".join(
+        str(candidate.get(key) or "")
+        for key in ("asset_class", "market_type", "market_surface", "trade_type", "instrument_type")
+    ).lower()
+    if "crypto" in context or "perp" in context:
+        return "crypto"
+    if any(token in context for token in ("equity", "stock", "etf", "adr")):
+        return "equity"
+    if any(token in context for token in ("future", "commodity", "dairy")):
+        return "futures"
+    if "prediction" in context or "event" in context:
+        return "prediction_market"
+    return raw or None
+
+
+def _candidate_region(candidate: dict) -> str | None:
+    raw = str(candidate.get("region") or "").strip()
+    if raw:
+        return raw
+    if _candidate_asset_class(candidate) in {"crypto", "prediction_market"}:
+        return "global"
+    return None
+
+
+def _candidate_stale_minutes(candidate: dict) -> float | None:
+    if candidate.get("stale_minutes") is not None:
+        return _as_float(candidate.get("stale_minutes"))
+    if candidate.get("freshness_age_seconds") is not None:
+        return _as_float(candidate.get("freshness_age_seconds")) / 60.0
+    for key in ("seen_at", "observed_at", "detected_at", "as_of", "updated_at", "timestamp"):
+        observed = _parse_time(candidate.get(key))
+        if not observed:
+            continue
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=dt.timezone.utc)
+        return max(0.0, (dt.datetime.now(dt.timezone.utc) - observed).total_seconds() / 60.0)
+    return None
+
+
+def _candidate_quality_score(candidate: dict) -> float | None:
+    direct_values = (
+        candidate.get("quality_score"),
+        candidate.get("execution_quality_score"),
+        candidate.get("instrument_quality_score"),
+        (candidate.get("strategy_reliability") or {}).get("quality_score"),
+    )
+    for raw in direct_values:
+        if raw is None:
+            continue
+        value = _as_float(raw)
+        return value * 100.0 if 0.0 <= value <= 1.0 else value
+
+    components: list[tuple[float, float]] = []
+    if candidate.get("liquidity_score") is not None:
+        liquidity = _as_float(candidate.get("liquidity_score"))
+        liquidity = liquidity * 100.0 if 0.0 <= liquidity <= 1.0 else liquidity
+        components.append((max(0.0, min(100.0, liquidity)), 0.55))
+    if candidate.get("spread_bps") is not None:
+        spread_quality = max(0.0, 100.0 - min(100.0, _as_float(candidate.get("spread_bps")) * 4.0))
+        components.append((spread_quality, 0.3))
+    stale = _candidate_stale_minutes(candidate)
+    if stale is not None:
+        freshness_quality = max(0.0, 100.0 - min(100.0, stale * 5.0))
+        components.append((freshness_quality, 0.15))
+    if not components:
+        return None
+    weight = sum(item[1] for item in components)
+    return round(sum(value * item_weight for value, item_weight in components) / weight, 3)
+
+
 def _candidate_field_value(candidate: dict, field: str) -> Any:
     if candidate.get(field) is not None:
         return candidate.get(field)
@@ -731,15 +834,40 @@ def _candidate_field_value(candidate: dict, field: str) -> Any:
         "detected_at": ("seen_at", "observed_at", "as_of"),
         "observed_at": ("seen_at", "detected_at", "as_of"),
         "seen_at": ("observed_at", "detected_at", "as_of"),
+        "updated_at": ("seen_at", "observed_at", "detected_at", "as_of"),
+        "timestamp": ("seen_at", "observed_at", "detected_at", "as_of", "updated_at"),
+        "price": ("last", "mark_px", "index_px", "mid"),
     }
     for alias in aliases.get(field, ()):
         if candidate.get(alias) is not None:
             return candidate.get(alias)
-    if field == "stale_minutes" and candidate.get("freshness_age_seconds") is not None:
-        return _as_float(candidate.get("freshness_age_seconds")) / 60.0
+    if field in {"quality", "quality_score"}:
+        return _candidate_quality_score(candidate)
+    if field == "stale_minutes":
+        return _candidate_stale_minutes(candidate)
     if field == "freshness_age_seconds" and candidate.get("stale_minutes") is not None:
         return _as_float(candidate.get("stale_minutes")) * 60.0
+    if field == "region":
+        return _candidate_region(candidate)
+    if field == "asset_class":
+        return _candidate_asset_class(candidate)
     return None
+
+
+def _scaled_gate(value: Any, candidate_value: Any, metric: str, default: float) -> float:
+    threshold = _as_float(value, default)
+    observed = _as_float(candidate_value, default)
+    if metric in {"score", "quality"}:
+        if 0.0 <= threshold <= 1.0 and observed > 1.5:
+            return threshold * 100.0
+        if threshold > 1.5 and 0.0 <= observed <= 1.0:
+            return threshold / 100.0
+    if metric == "liquidity":
+        if threshold > 1.5 and 0.0 <= observed <= 1.0:
+            return threshold / 100.0
+        if 0.0 <= threshold <= 1.0 and observed > 1.5:
+            return threshold * 100.0
+    return threshold
 
 
 def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dict) -> tuple[bool, list[str]]:
@@ -763,16 +891,23 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
         reasons.append("venue_not_allowed")
     if not _direction_allowed(candidate.get("direction"), allowed_directions):
         reasons.append("direction_not_allowed")
-    if not _allowed(candidate.get("region"), allowed_regions):
+    if not _allowed(_candidate_region(candidate), allowed_regions):
         reasons.append("region_not_allowed")
-    if not _allowed(candidate.get("asset_class"), allowed_asset_classes):
+    if not _allowed(_candidate_asset_class(candidate), allowed_asset_classes):
         reasons.append("asset_class_not_allowed")
 
     risk = settings.get("risk", {})
     min_edge = _as_float(risk_gates.get("min_edge_bps", logic.get("min_edge_bps")), _as_float(risk.get("min_net_edge_bps"), 2.0))
-    min_score = _as_float(risk_gates.get("min_score", logic.get("min_score")), 0.0)
-    min_liquidity = _as_float(
+    candidate_score = _candidate_field_value(candidate, "score")
+    candidate_liquidity = _candidate_field_value(candidate, "liquidity_score")
+    candidate_quality = _candidate_field_value(candidate, "quality_score")
+    min_score = _scaled_gate(
+        risk_gates.get("min_score", logic.get("min_score")), candidate_score, "score", 0.0
+    )
+    min_liquidity = _scaled_gate(
         risk_gates.get("min_liquidity_score", logic.get("min_liquidity_score")),
+        candidate_liquidity,
+        "liquidity",
         _as_float(risk.get("min_liquidity_score"), 0.35),
     )
     max_spread = _as_float(
@@ -783,14 +918,16 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
     max_stale = risk_gates.get("max_stale_minutes", logic.get("max_stale_minutes"))
     if _candidate_edge(candidate) < min_edge:
         reasons.append("edge_below_gate")
-    if _as_float(candidate.get("score")) < min_score:
+    if _as_float(candidate_score) < min_score:
         reasons.append("score_below_gate")
-    if _as_float(candidate.get("liquidity_score")) < min_liquidity:
+    if _as_float(candidate_liquidity) < min_liquidity:
         reasons.append("liquidity_below_gate")
     if _as_float(candidate.get("spread_bps"), 999.0) > max_spread:
         reasons.append("spread_above_gate")
-    if min_quality is not None and _as_float(candidate.get("quality_score"), 0.0) < _as_float(min_quality):
-        reasons.append("quality_below_gate")
+    if min_quality is not None:
+        quality_gate = _scaled_gate(min_quality, candidate_quality, "quality", 0.0)
+        if candidate_quality is None or _as_float(candidate_quality) < quality_gate:
+            reasons.append("quality_below_gate")
     if max_stale is not None and _as_float(_candidate_field_value(candidate, "stale_minutes"), 0.0) > _as_float(max_stale):
         reasons.append("stale_above_gate")
     if bool(risk_gates.get("require_route_feasible") or logic.get("require_route_feasible")):
@@ -829,15 +966,130 @@ def _scope_match_reasons(candidate: dict, logic: dict) -> list[str]:
         reasons.append("venue_not_observed")
     if not _direction_allowed(candidate.get("direction"), allowed_directions):
         reasons.append("direction_not_observed")
-    if not _allowed(candidate.get("region"), allowed_regions):
+    if not _allowed(_candidate_region(candidate), allowed_regions):
         reasons.append("region_not_observed")
-    if not _allowed(candidate.get("asset_class"), allowed_asset_classes):
+    if not _allowed(_candidate_asset_class(candidate), allowed_asset_classes):
         reasons.append("asset_class_not_observed")
     required_fields = _as_list(logic.get("required_fields"))
     missing = [field for field in required_fields if _candidate_field_value(candidate, field) is None]
     if missing:
         reasons.append("missing_required_fields:" + ",".join(missing[:8]))
     return reasons
+
+
+def _runtime_contract_evidence(conn: sqlite3.Connection, current: list[dict], limit: int = 750) -> list[dict]:
+    """Combine current candidates with bounded persisted runtime exemplars.
+
+    A contract must not become invalid merely because its exchange is closed in
+    the current minute. Recent opportunities and admission records describe
+    what the running system can produce without turning memory into a new
+    strategy language.
+    """
+
+    evidence = [dict(candidate) for candidate in current if isinstance(candidate, dict)]
+    try:
+        rows = conn.execute(
+            """
+            select candidate_json
+            from opportunities
+            where candidate_json is not null and candidate_json != ''
+            order by id desc
+            limit ?
+            """,
+            (max(0, int(limit)),),
+        ).fetchall()
+        for row in rows:
+            candidate = _json_loads(row["candidate_json"], {})
+            if isinstance(candidate, dict) and candidate and not candidate.get("strategy_lab_id"):
+                evidence.append(candidate)
+    except sqlite3.OperationalError:
+        pass
+    try:
+        rows = conn.execute(
+            """
+            select venue, inst_id, market_surface, details_json
+            from (
+                select venue, inst_id, market_surface, details_json, last_seen_at,
+                       row_number() over (
+                           partition by venue, market_surface
+                           order by last_seen_at desc
+                       ) as recency_rank
+                from market_admission_states
+            )
+            where recency_rank = 1
+            order by last_seen_at desc
+            limit ?
+            """,
+            (max(0, int(limit)),),
+        ).fetchall()
+        for row in rows:
+            details = _json_loads(row["details_json"], {})
+            if not isinstance(details, dict):
+                details = {}
+            evidence.append(
+                {
+                    **details,
+                    "venue": row["venue"],
+                    "inst_id": row["inst_id"],
+                    "market_surface": row["market_surface"],
+                    "strategy_lab_evidence_only": True,
+                }
+            )
+    except sqlite3.OperationalError:
+        pass
+
+    deduped: list[dict] = []
+    seen = set()
+    for candidate in evidence:
+        key = (
+            str(candidate.get("venue") or ""),
+            str(candidate.get("inst_id") or ""),
+            str(candidate.get("trade_type") or ""),
+            str(candidate.get("direction") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _scope_capability_issues(logic: dict, vocabulary: dict, candidates: list[dict]) -> list[str]:
+    issues: list[str] = []
+    observed_trade_types = {str(item).lower() for item in vocabulary.get("trade_types") or []}
+    observed_venues = {str(item).lower() for item in vocabulary.get("venues") or []}
+    observed_directions = {str(item).lower() for item in vocabulary.get("directions") or []}
+    observed_regions = {str(item).lower() for item in vocabulary.get("regions") or []}
+    observed_assets = {str(item).lower() for item in vocabulary.get("asset_classes") or []}
+
+    trade_types = {item.lower() for item in _as_list(logic.get("trade_types") or logic.get("source_trade_types"))}
+    venues = {item.lower() for item in _as_list(logic.get("venues") or logic.get("allowed_venues"))}
+    directions = {item.lower() for item in _as_list(logic.get("directions") or logic.get("allowed_directions"))}
+    regions = {item.lower() for item in _as_list(logic.get("regions") or logic.get("allowed_regions"))}
+    asset_classes = {
+        item.lower() for item in _as_list(logic.get("asset_classes") or logic.get("allowed_asset_classes"))
+    }
+    if trade_types and not trade_types.intersection(observed_trade_types | {item.lower() for item in FALLBACK_TRADE_TYPE_EXAMPLES}):
+        issues.append("trade_type_unavailable")
+    if venues and not venues.intersection(observed_venues):
+        issues.append("venue_unavailable")
+    known_directions = observed_directions | {item.lower() for item in FALLBACK_DIRECTION_EXAMPLES} | GENERIC_DIRECTIONS
+    if directions and not directions.intersection(known_directions):
+        issues.append("direction_unavailable")
+    if regions and not regions.intersection(observed_regions | {"global"}):
+        issues.append("region_unavailable")
+    if asset_classes and not asset_classes.intersection(observed_assets):
+        issues.append("asset_class_unavailable")
+
+    required_fields = _as_list(logic.get("required_fields"))
+    unsupported = [
+        field
+        for field in required_fields
+        if not any(_candidate_field_value(candidate, field) is not None for candidate in candidates)
+    ]
+    if unsupported:
+        issues.append("unsupported_required_fields:" + ",".join(unsupported))
+    return issues
 
 
 def _compile_strategy_lab_contracts(
@@ -847,11 +1099,13 @@ def _compile_strategy_lab_contracts(
     """Compile model intent against the actual runtime candidate schema.
 
     Compilation is deliberately deterministic. The original model contract is
-    retained for audit, while only a contract with a real live match may enter
-    the paper candidate generator.
+    retained for audit. A contract may compile from persisted runtime evidence
+    while its market is closed, but only a current live candidate may enter the
+    paper candidate generator.
     """
 
-    vocabulary = _runtime_strategy_vocabulary(candidates)
+    runtime_evidence = _runtime_contract_evidence(conn, candidates)
+    vocabulary = _runtime_strategy_vocabulary(runtime_evidence)
     schema_payload = {
         "fields": sorted(vocabulary.get("candidate_fields") or []),
         "trade_types": sorted(vocabulary.get("trade_types") or []),
@@ -887,7 +1141,9 @@ def _compile_strategy_lab_contracts(
         # scoped to the venue/surface rather than hard-coding one instrument.
         requested_inst = str(data_requirements.get("inst_id") or "").strip()
         evidence_candidates = [
-            candidate for candidate in candidates if requested_inst and str(candidate.get("inst_id")) == requested_inst
+            candidate
+            for candidate in runtime_evidence
+            if requested_inst and str(candidate.get("inst_id")) == requested_inst
         ]
         if evidence_candidates:
             exemplar = evidence_candidates[0]
@@ -901,7 +1157,7 @@ def _compile_strategy_lab_contracts(
         nearest: list[dict] = []
         matches: list[dict] = []
         if _has_strategy_scope(logic):
-            for candidate in candidates:
+            for candidate in runtime_evidence:
                 reasons = _scope_match_reasons(candidate, logic)
                 if not reasons:
                     matches.append(candidate)
@@ -921,8 +1177,9 @@ def _compile_strategy_lab_contracts(
         unsupported_fields = [
             field
             for field in required_fields
-            if not any(_candidate_field_value(candidate, field) is not None for candidate in candidates)
+            if not any(_candidate_field_value(candidate, field) is not None for candidate in runtime_evidence)
         ]
+        capability_issues = _scope_capability_issues(logic, vocabulary, runtime_evidence)
         if not _has_strategy_scope(logic):
             compile_status = "needs_contract_repair"
             status = "needs_data"
@@ -931,27 +1188,30 @@ def _compile_strategy_lab_contracts(
             compile_status = "needs_data"
             status = "needs_data"
             reason = "unsupported_required_fields"
-        elif not candidates:
+        elif not runtime_evidence:
             compile_status = "needs_data"
             status = "needs_data"
             reason = "runtime_candidate_pool_empty"
-        elif not matches:
+        elif capability_issues:
             compile_status = "needs_data"
             status = "needs_data"
-            reason = "no_runtime_scope_match"
+            reason = "runtime_capability_unavailable"
         else:
             compile_status = "compiled"
             status = "needs_more_evidence" if row.get("status") == "needs_more_evidence" else "active_testing"
-            reason = "compiled_against_runtime_schema"
+            reason = "compiled_against_runtime_schema" if matches else "compiled_dormant_scope"
 
         diagnostic = {
             "compiled_at": now,
             "compile_status": compile_status,
             "reason": reason,
             "runtime_schema_fingerprint": schema_fingerprint,
-            "source_candidate_count": len(candidates),
+            "source_candidate_count": len(runtime_evidence),
+            "current_candidate_count": len(candidates),
+            "persisted_evidence_count": max(0, len(runtime_evidence) - len(candidates)),
             "scope_match_count": len(matches),
             "unsupported_required_fields": unsupported_fields,
+            "capability_issues": capability_issues,
             "match_preview": [
                 {
                     "inst_id": item.get("inst_id"),
@@ -971,13 +1231,17 @@ def _compile_strategy_lab_contracts(
         conn.execute(
             """
             update strategy_lab_experiments
-            set strategy_logic_json = ?, compiled_strategy_logic_json = ?, compile_status = ?,
+            set original_strategy_logic_json = case
+                    when original_strategy_logic_json is null or original_strategy_logic_json = '{}'
+                    then ? else original_strategy_logic_json end,
+                strategy_logic_json = ?, compiled_strategy_logic_json = ?, compile_status = ?,
                 compile_diagnostics_json = ?, runtime_schema_fingerprint = ?,
                 compile_attempts = compile_attempts + 1, last_compiled_at = ?,
                 status = ?, updated_at = ?, evaluation_json = ?
             where strategy_lab_id = ?
             """,
             (
+                json.dumps(original, sort_keys=True),
                 json.dumps(logic, sort_keys=True),
                 json.dumps(logic, sort_keys=True) if compile_status == "compiled" else "{}",
                 compile_status,
@@ -1069,6 +1333,12 @@ def generate_strategy_lab_candidates(
             lab_candidate["strategy_lab_source_trade_type"] = candidate.get("trade_type")
             lab_candidate["strategy_lab_source_signal_key"] = candidate.get("signal_key")
             lab_candidate["strategy_lab_candidate"] = True
+            lab_candidate["strategy_lab_normalized_features"] = {
+                "quality_score": _candidate_field_value(candidate, "quality_score"),
+                "stale_minutes": _candidate_field_value(candidate, "stale_minutes"),
+                "region": _candidate_region(candidate),
+                "asset_class": _candidate_asset_class(candidate),
+            }
             lab_candidate["score"] = round(min(100.0, _as_float(candidate.get("score")) + bonus), 3)
             lab_candidate["edge_bps_estimate"] = round(max(0.0, _candidate_edge(candidate) + edge_bonus), 3)
             lab_candidate["thesis"] = (
@@ -1085,6 +1355,8 @@ def generate_strategy_lab_candidates(
             diagnostic_status = "needs_data"
         elif any(str(reason).startswith("route_not_feasible") for reason in reason_counts):
             diagnostic_status = "needs_route"
+        elif (compilation.get("diagnostics") or {}).get(experiment_id, {}).get("compile_status") == "compiled":
+            diagnostic_status = "needs_more_evidence"
         elif reason_counts and all(
             str(reason).startswith(
                 (
@@ -1111,6 +1383,9 @@ def generate_strategy_lab_candidates(
             "status": diagnostic_status,
             "source_candidate_count": len(pool),
             "generated_candidate_count": int(per_experiment[experiment_id]),
+            "contract_compile_status": (compilation.get("diagnostics") or {}).get(experiment_id, {}).get(
+                "compile_status"
+            ),
             "dominant_reject_reasons": dict(reason_counts.most_common(8)),
             "nearest_candidates": nearest,
             "runtime_vocabulary": {
