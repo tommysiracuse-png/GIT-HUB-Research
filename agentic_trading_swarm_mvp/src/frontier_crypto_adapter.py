@@ -150,6 +150,309 @@ def _paper_only_route_review_float(value):
         return None
 
 
+def _paper_only_route_signal_token(value):
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return text or None
+
+
+def _paper_only_route_lookup(route_status, profile, *keys):
+    containers = []
+    if isinstance(route_status, dict):
+        containers.append(route_status)
+        existing_requirements = route_status.get("route_requirements")
+        if isinstance(existing_requirements, dict):
+            containers.append(existing_requirements)
+    if isinstance(profile, dict):
+        containers.append(profile)
+    for container in containers:
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, "", [], {}, ()):
+                return value
+    return None
+
+
+def _paper_only_route_support_bool(value):
+    token = _paper_only_route_signal_token(value)
+    if token in {
+        "supported",
+        "available",
+        "enabled",
+        "allow",
+        "allowed",
+        "reachable",
+        "confirmed",
+        "explicit",
+        "present",
+        "public_market_data",
+    }:
+        return True
+    if token in {
+        "unsupported",
+        "unavailable",
+        "blocked",
+        "forbidden",
+        "restricted",
+        "denied",
+        "paper_shadow_only",
+        "shadow_only",
+    }:
+        return False
+    return _paper_only_route_review_bool(value)
+
+
+def _paper_only_route_confidence(value, *, default=None):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    token = _paper_only_route_signal_token(value)
+    if not token:
+        return default
+    if token in {
+        "supported",
+        "available",
+        "enabled",
+        "allow",
+        "allowed",
+        "reachable",
+        "confirmed",
+        "explicit",
+        "present",
+        "public_market_data",
+        "public_taker_fee_schedule",
+    }:
+        return 1.0
+    if token in {"conditional", "partial", "fallback", "secondary", "estimated", "derived", "hinted", "hint"}:
+        return 0.75
+    if token in {"paper_shadow_only", "shadow_only"}:
+        return 0.15
+    if token in {"unsupported", "unavailable", "blocked", "forbidden", "restricted", "denied"}:
+        return 0.0
+    if token in {"unknown", "unclear", "unverified", "missing", "absent"}:
+        return 0.25 if default is None else default
+    if "supported" in token or "available" in token or "reachable" in token:
+        return 1.0
+    if "shadow" in token:
+        return 0.15
+    if "blocked" in token or "restricted" in token or "unsupported" in token or "forbidden" in token:
+        return 0.0
+    if "unknown" in token or "missing" in token or "unverified" in token:
+        return 0.25 if default is None else default
+    return default
+
+
+def _paper_only_route_permissions(route_status, profile):
+    permissions = []
+    for container in (route_status, profile):
+        if not isinstance(container, dict):
+            continue
+        values = container.get("required_permissions")
+        if values in (None, "", [], {}, ()):
+            continue
+        if isinstance(values, (list, tuple, set)):
+            candidates = values
+        else:
+            candidates = [values]
+        for candidate in candidates:
+            token = _paper_only_route_signal_token(candidate)
+            if token and token not in permissions:
+                permissions.append(token)
+    return permissions
+
+
+def _paper_only_required_side(route_status, profile):
+    explicit = _paper_only_route_review_text(
+        _paper_only_route_lookup(route_status, profile, "required_side", "required_route_side", "side_requirement")
+    )
+    if explicit:
+        return explicit
+    summary = " ".join(
+        value
+        for value in (
+            _paper_only_route_signal_token(_paper_only_route_lookup(route_status, profile, "summary")),
+            _paper_only_route_signal_token(
+                _paper_only_route_lookup(route_status, profile, "route_requirement_summary")
+            ),
+            _paper_only_route_signal_token(_paper_only_route_lookup(route_status, profile, "strategy")),
+        )
+        if value
+    )
+    permissions = set(_paper_only_route_permissions(route_status, profile))
+    basis_support = _paper_only_route_lookup(route_status, profile, "basis_support")
+    spot_short_support = _paper_only_route_lookup(
+        route_status, profile, "spot_short_support", "shortability", "spot_shortability", "short_support"
+    )
+    perp_support = _paper_only_route_lookup(route_status, profile, "perp_support", "perp_available", "perp_enabled")
+    if basis_support not in (None, "", [], {}, ()) or "basis" in summary or "funding" in summary:
+        return "spot_plus_perp"
+    if (
+        spot_short_support not in (None, "", [], {}, ())
+        or "spot_short" in permissions
+        or "short" in permissions
+        or "borrow" in permissions
+        or "margin" in permissions
+        or "spot_short" in summary
+        or "borrow" in summary
+    ):
+        return "spot_short"
+    if perp_support not in (None, "", [], {}, ()) or "perp" in summary or "swap" in summary or "futures" in summary:
+        return "perp"
+    return None
+
+
+def _paper_only_route_requirements_packet(route_status, profile):
+    permissions = _paper_only_route_permissions(route_status, profile)
+    permissions_set = set(permissions)
+    required_side = _paper_only_required_side(route_status, profile)
+
+    margin_available = _paper_only_route_support_bool(
+        _paper_only_route_lookup(route_status, profile, "margin_available", "margin_enabled", "margin_support")
+    )
+    if margin_available is None and permissions_set.intersection({"margin", "cross_margin", "isolated_margin"}):
+        margin_available = True
+
+    shortability = _paper_only_route_support_bool(
+        _paper_only_route_lookup(
+            route_status, profile, "spot_short_support", "shortability", "spot_shortability", "short_support"
+        )
+    )
+    perp_available = _paper_only_route_support_bool(
+        _paper_only_route_lookup(route_status, profile, "perp_support", "perp_available", "perp_enabled")
+    )
+    if perp_available is None:
+        basis_support = _paper_only_route_support_bool(_paper_only_route_lookup(route_status, profile, "basis_support"))
+        if basis_support is True:
+            perp_available = True
+
+    hedge_mode_support = _paper_only_route_support_bool(
+        _paper_only_route_lookup(route_status, profile, "hedge_mode_support", "hedge_mode", "hedge_support")
+    )
+
+    borrow_hint_value = _paper_only_route_lookup(
+        route_status,
+        profile,
+        "borrow_hint",
+        "borrow_available",
+        "borrow_support",
+        "borrow_indication",
+        "borrow_required",
+    )
+    borrow_hint_present = _paper_only_route_support_bool(borrow_hint_value)
+    borrow_hint_token = _paper_only_route_signal_token(borrow_hint_value)
+    if borrow_hint_present is None and borrow_hint_token in {"hinted", "hint", "present", "required"}:
+        borrow_hint_present = True
+    if borrow_hint_present is None and permissions_set.intersection({"borrow", "margin", "short"}):
+        borrow_hint_present = True
+
+    route_confidence = _paper_only_route_confidence(
+        _paper_only_route_lookup(
+            route_status,
+            profile,
+            "route_confidence",
+            "route_requirement_status",
+            "route_status",
+            "route_access_status",
+            "status",
+        ),
+        default=0.25,
+    )
+    fee_confidence = _paper_only_route_confidence(
+        _paper_only_route_lookup(route_status, profile, "fee_confidence", "fee_reference", "fee_source"),
+        default=0.35,
+    )
+    api_surface_confidence = _paper_only_route_confidence(
+        _paper_only_route_lookup(route_status, profile, "api_surface_confidence", "api_surface"),
+        default=0.35,
+    )
+
+    borrow_required = required_side == "spot_short"
+    borrow_confidence = _paper_only_route_confidence(
+        _paper_only_route_lookup(
+            route_status,
+            profile,
+            "borrow_confidence",
+            "borrow_support",
+            "borrow_hint",
+            "borrow_available",
+            "borrow_indication",
+            "spot_short_support",
+        ),
+        default=0.25 if borrow_required else 1.0,
+    )
+
+    score_inputs = [route_confidence, fee_confidence, api_surface_confidence]
+    route_complete = True
+    critical_missing_fields = []
+
+    if borrow_required:
+        score_inputs.append(borrow_confidence)
+        if shortability is not True:
+            route_complete = False
+            critical_missing_fields.append("shortability")
+        if borrow_confidence < 0.75:
+            route_complete = False
+            critical_missing_fields.append("borrow")
+
+    if required_side in {"perp", "spot_plus_perp"}:
+        perp_confidence = 1.0 if perp_available is True else 0.0 if perp_available is False else 0.25
+        score_inputs.append(perp_confidence)
+        if perp_available is not True:
+            route_complete = False
+            critical_missing_fields.append("perp")
+
+    if api_surface_confidence < 0.5:
+        route_complete = False
+        critical_missing_fields.append("api_surface")
+
+    route_viability_score = sum(score_inputs) / float(len(score_inputs) or 1)
+    if required_side == "spot_short" and (shortability is not True or borrow_confidence < 0.75):
+        route_viability_score = min(route_viability_score, 0.34)
+    if required_side == "spot_plus_perp":
+        if perp_available is not True:
+            route_viability_score = min(route_viability_score, 0.34)
+        if route_confidence < 0.75:
+            route_viability_score = min(route_viability_score, 0.49)
+    if fee_confidence < 0.5:
+        route_viability_score = max(0.0, route_viability_score - 0.1)
+    route_viability_score = round(max(0.0, min(1.0, route_viability_score)), 4)
+
+    if (not route_complete) or route_viability_score < 0.35:
+        route_actionability = "low_priority_research"
+        route_priority_cap = "low"
+    elif route_viability_score < 0.75:
+        route_actionability = "guarded_paper_review"
+        route_priority_cap = "medium"
+    else:
+        route_actionability = "actionable_paper"
+        route_priority_cap = "high"
+
+    venue_capabilities = {
+        "margin_available": margin_available,
+        "shortability_indication": shortability,
+        "borrow_hint_present": borrow_hint_present,
+        "perp_available": perp_available,
+        "hedge_mode_support": hedge_mode_support,
+        "fee_source_confidence": fee_confidence,
+    }
+    return {
+        "required_side": required_side,
+        "required_permissions": permissions,
+        "venue_capabilities": venue_capabilities,
+        "route_confidence": route_confidence,
+        "borrow_confidence": borrow_confidence,
+        "fee_confidence": fee_confidence,
+        "api_surface_confidence": api_surface_confidence,
+        "route_viability_score": route_viability_score,
+        "route_complete": route_complete,
+        "route_priority_cap": route_priority_cap,
+        "route_actionability": route_actionability,
+        "critical_missing_fields": critical_missing_fields,
+    }
+
+
 def _paper_only_annotate_route_intelligence(route_status):
     if not isinstance(route_status, dict):
         return route_status
@@ -181,6 +484,34 @@ def _paper_only_annotate_route_intelligence(route_status):
         route_status["api_surface"] = api_surface
     if route_status.get("required_permissions") in (None, "", [], {}, ()):
         route_status["required_permissions"] = list(profile.get("required_permissions") or [])
+    route_packet = _paper_only_route_requirements_packet(route_status, profile)
+    existing_packet = route_status.get("route_requirements_packet")
+    if isinstance(existing_packet, dict):
+        merged_packet = dict(existing_packet)
+        merged_packet.update(route_packet)
+        route_packet = merged_packet
+    route_status["route_requirements_packet"] = route_packet
+    existing_capabilities = route_status.get("venue_capabilities")
+    if isinstance(existing_capabilities, dict):
+        merged_capabilities = dict(existing_capabilities)
+        merged_capabilities.update(route_packet.get("venue_capabilities") or {})
+        route_status["venue_capabilities"] = merged_capabilities
+    else:
+        route_status["venue_capabilities"] = dict(route_packet.get("venue_capabilities") or {})
+    for field_name in (
+        "required_side",
+        "route_confidence",
+        "borrow_confidence",
+        "fee_confidence",
+        "api_surface_confidence",
+        "route_viability_score",
+        "route_complete",
+        "route_priority_cap",
+        "route_actionability",
+        "critical_missing_fields",
+    ):
+        if route_status.get(field_name) in (None, "", [], {}, ()):
+            route_status[field_name] = route_packet.get(field_name)
     return route_status
 
 
