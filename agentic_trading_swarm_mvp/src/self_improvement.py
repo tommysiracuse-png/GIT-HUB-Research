@@ -321,10 +321,10 @@ def _normalize_code_change_test_commands(payload: dict) -> dict:
     return normalized_payload
 
 
-def process_code_change_recommendation(conn: sqlite3.Connection, rec: dict):
+def process_code_change_recommendation(conn: sqlite3.Connection, rec: dict, settings: dict):
     normalized_rec = dict(rec)
     normalized_rec["payload"] = _normalize_code_change_test_commands(dict(rec.get("payload") or {}))
-    return _process_code_change_recommendation(conn, normalized_rec)
+    return _process_code_change_recommendation(conn, normalized_rec, settings)
 
 
 def _canonical_strategy_lab_key(payload: dict) -> str:

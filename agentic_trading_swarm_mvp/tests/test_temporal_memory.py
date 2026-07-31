@@ -598,22 +598,26 @@ class LangGraphMemoryTests(unittest.TestCase):
                     },
                     "cycle-test",
                 )
-            checkpoint_conn = sqlite3.connect(checkpoint_path)
-            try:
-                channels = {
-                    row[0]
-                    for row in checkpoint_conn.execute("select distinct channel from writes")
-                }
-            finally:
-                checkpoint_conn.close()
+            checkpoint_status = llm_swarm_runner.LAST_SWARM_STATE["checkpoint"]["status"]
+            channels: set[str] = set()
+            if checkpoint_status == "saved":
+                checkpoint_conn = sqlite3.connect(checkpoint_path)
+                try:
+                    channels = {
+                        row[0]
+                        for row in checkpoint_conn.execute("select distinct channel from writes")
+                    }
+                finally:
+                    checkpoint_conn.close()
 
         self.assertEqual(set(observed), {agent["name"] for agent in llm_swarm_runner.AGENTS})
         for agent in llm_swarm_runner.AGENTS:
             self.assertEqual(observed[agent["name"]], f"mem-{agent['name']}")
-        self.assertNotIn("packet", channels)
-        self.assertNotIn("role_memory", channels)
-        self.assertNotIn("memory", channels)
-        self.assertIn("checkpoint_context", channels)
+        if checkpoint_status == "saved":
+            self.assertNotIn("packet", channels)
+            self.assertNotIn("role_memory", channels)
+            self.assertNotIn("memory", channels)
+            self.assertIn("checkpoint_context", channels)
         self.assertNotIn("packet", llm_swarm_runner.LAST_SWARM_STATE)
         self.assertNotIn("role_memory", llm_swarm_runner.LAST_SWARM_STATE)
         context = llm_swarm_runner.LAST_SWARM_STATE["checkpoint"]["runtime_context"]

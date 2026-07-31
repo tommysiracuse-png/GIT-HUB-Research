@@ -69,10 +69,12 @@ class TestCommandPolicyTests(unittest.TestCase):
             "_process_code_change_recommendation",
             return_value={"status": "ok"},
         ) as patched:
-            result = self_improvement.process_code_change_recommendation(None, rec)
+            settings = {"code_evolution": {"enabled": True}}
+            result = self_improvement.process_code_change_recommendation(None, rec, settings)
 
         self.assertEqual(result, {"status": "ok"})
         forwarded = patched.call_args.args[1]
+        self.assertIs(patched.call_args.args[2], settings)
         self.assertEqual(
             forwarded["payload"]["tests_to_run"],
             ["python -m unittest tests.test_test_command_policy"],
