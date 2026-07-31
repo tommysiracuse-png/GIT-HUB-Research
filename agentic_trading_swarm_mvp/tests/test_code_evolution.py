@@ -1184,6 +1184,75 @@ new file mode 100644
             "changed_source_without_runtime_wiring",
         )
 
+    def test_scan_rejects_signal_plugin_that_no_runtime_consumer_imports(self) -> None:
+        diff = """diff --git a/src/signals/new_frontier_signal.py b/src/signals/new_frontier_signal.py
+new file mode 100644
+--- /dev/null
++++ b/src/signals/new_frontier_signal.py
+@@ -0,0 +1,2 @@
++def generate(observations):
++    return observations
+diff --git a/tests/test_new_frontier_signal.py b/tests/test_new_frontier_signal.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_new_frontier_signal.py
+@@ -0,0 +1,2 @@
++def test_signal():
++    assert True
+"""
+        payload = proposal(
+            diff,
+            change_category="paper_signal_variant",
+            expected_files=[
+                "src/frontier_crypto_adapter.py",
+                "src/signals/new_frontier_signal.py",
+                "tests/test_new_frontier_signal.py",
+            ],
+            proposed_change="Add and wire a new frontier paper signal.",
+        )
+        preflight = code_evolution.preflight_proposal(payload, settings())
+        self.assertEqual(preflight["quality_scorecard"]["runtime_integration_status"], "integrated")
+
+        safety = code_evolution.validate_and_scan(payload, diff, settings(), preflight=preflight)
+
+        self.assertFalse(safety["allowed"])
+        self.assertEqual(safety["decision"], "rejected_preflight_no_runtime_integration")
+        self.assertIn("no_runtime_integration_target", safety["reasons"])
+        self.assertEqual(
+            safety["actual_runtime_integration_status"],
+            "changed_source_without_runtime_wiring",
+        )
+
+    def test_signal_plugin_with_runtime_consumer_is_integrated(self) -> None:
+        diff = """diff --git a/src/signals/new_frontier_signal.py b/src/signals/new_frontier_signal.py
+new file mode 100644
+--- /dev/null
++++ b/src/signals/new_frontier_signal.py
+@@ -0,0 +1,2 @@
++def generate(observations):
++    return observations
+diff --git a/src/frontier_crypto_adapter.py b/src/frontier_crypto_adapter.py
+--- a/src/frontier_crypto_adapter.py
++++ b/src/frontier_crypto_adapter.py
+@@ -1 +1,2 @@
+ # adapter
++from signals.new_frontier_signal import generate
+"""
+        payload = proposal(
+            diff,
+            change_category="paper_signal_variant",
+            expected_files=[
+                "src/frontier_crypto_adapter.py",
+                "src/signals/new_frontier_signal.py",
+            ],
+            proposed_change="Wire a new frontier paper signal into the runtime adapter.",
+        )
+        preflight = code_evolution.preflight_proposal(payload, settings())
+        safety = code_evolution.validate_and_scan(payload, diff, settings(), preflight=preflight)
+
+        self.assertTrue(safety["allowed"])
+        self.assertEqual("integrated", safety["actual_runtime_integration_status"])
+
     def test_runtime_active_patch_cannot_promote_tests_without_runtime_code(self) -> None:
         diff = """diff --git a/tests/test_strategy_lab_ingestion.py b/tests/test_strategy_lab_ingestion.py
 --- a/tests/test_strategy_lab_ingestion.py

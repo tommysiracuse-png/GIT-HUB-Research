@@ -3070,6 +3070,20 @@ def _runtime_integration_status(payload: dict, category: str, target_files: list
         return "test_or_fixture_only"
     if category not in RUNTIME_INTEGRATED_CATEGORIES:
         return "not_required"
+    signal_plugin_targets = [
+        path
+        for path in target_files
+        if path.startswith("src/signals/") and path.endswith(".py")
+    ]
+    signal_runtime_consumers = [
+        path
+        for path in target_files
+        if path.startswith("src/")
+        and path.endswith(".py")
+        and not path.startswith("src/signals/")
+    ]
+    if signal_plugin_targets and not signal_runtime_consumers:
+        return "integration_claim_without_target"
     runtime_targets = [
         path
         for path in target_files
@@ -3493,12 +3507,30 @@ def _with_frontier_usefulness(safety: dict, status: str, patch_generation: dict 
         return output
     category = str(output.get("category") or "")
     changed_files = list(output.get("changed_files") or [])
-    useful = status in SUCCESS_STATUSES and _has_substantive_changed_files(category, changed_files)
+    runtime_status = str(
+        output.get("actual_runtime_integration_status")
+        or _actual_runtime_integration_status({}, category, changed_files)
+    )
+    runtime_integrated = runtime_status in {
+        "integrated",
+        "not_required",
+        "test_or_fixture_only",
+    }
+    substantive = _has_substantive_changed_files(category, changed_files)
+    useful = (
+        status in SUCCESS_STATUSES
+        and substantive
+        and runtime_integrated
+    )
     output["frontier_call_useful"] = useful
     if useful:
         output["frontier_call_wasted_reason"] = None
     elif status in SUCCESS_STATUSES and changed_files:
-        output["frontier_call_wasted_reason"] = "no_actual_runtime_changed_files"
+        output["frontier_call_wasted_reason"] = (
+            "no_actual_runtime_changed_files"
+            if not substantive
+            else "no_runtime_integration_target"
+        )
     else:
         output["frontier_call_wasted_reason"] = _frontier_wasted_reason(
             status,
@@ -5178,9 +5210,16 @@ def normalize_code_evolution_statuses(conn: Any, root: pathlib.Path = ROOT) -> d
 def _successful_row_is_useful(row: dict) -> bool:
     if row.get("status") not in SUCCESS_STATUSES:
         return False
-    return _has_substantive_changed_files(
-        str(row.get("category") or ""),
-        list(row.get("changed_files") or []),
+    category = str(row.get("category") or "")
+    changed_files = list(row.get("changed_files") or [])
+    runtime_status = _actual_runtime_integration_status(
+        row.get("payload") or {},
+        category,
+        changed_files,
+    )
+    return (
+        _has_substantive_changed_files(category, changed_files)
+        and runtime_status in {"integrated", "not_required", "test_or_fixture_only"}
     )
 
 
