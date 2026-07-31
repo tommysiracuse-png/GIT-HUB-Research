@@ -1272,6 +1272,10 @@ new file mode 100644
                         "patch_generation": patch_generation,
                     },
                 )
+                conn.execute(
+                    "update code_evolution_proposals set updated_at = '2026-01-02T03:04:05+00:00'"
+                )
+                conn.commit()
 
                 normalized = code_evolution.normalize_code_evolution_statuses(conn, root=pathlib.Path(tmp))
                 rows = {row["proposal_id"]: row for row in storage.code_evolution_recent(conn, limit=10)}
@@ -1287,6 +1291,8 @@ new file mode 100644
             rows["tests-only-promoted"]["safety"]["frontier_call_wasted_reason"],
             "no_actual_runtime_changed_files",
         )
+        self.assertEqual(rows["runtime-promoted"]["updated_at"], "2026-01-02T03:04:05+00:00")
+        self.assertEqual(rows["tests-only-promoted"]["updated_at"], "2026-01-02T03:04:05+00:00")
         self.assertEqual(summary["failure_benchmark"]["useful_merge_count"], 1)
 
     def test_grounded_contract_rejects_existence_only_test(self) -> None:

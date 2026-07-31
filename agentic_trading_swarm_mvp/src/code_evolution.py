@@ -5114,8 +5114,13 @@ def _normalize_promoted_usefulness(conn: Any) -> int:
         )
         if after == before:
             continue
-        update_code_evolution_proposal(conn, row["proposal_id"], safety=safety)
+        conn.execute(
+            "update code_evolution_proposals set safety_json = ? where proposal_id = ?",
+            (json.dumps(safety, sort_keys=True), row["proposal_id"]),
+        )
         updated += 1
+    if updated:
+        conn.commit()
     return updated
 
 
