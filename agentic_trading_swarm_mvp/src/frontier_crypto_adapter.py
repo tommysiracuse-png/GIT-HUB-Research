@@ -7689,6 +7689,8 @@ def build_scan_batch(
     limit: int | None = None,
     required_inst_ids: set[str] | None = None,
     conn=None,
+    *,
+    write_preliminary_report: bool = True,
 ) -> ScanBatch:
     all_observations = scan_venues(
         settings,
@@ -7716,7 +7718,8 @@ def build_scan_batch(
     candidates.sort(key=lambda row: row.get("score", 0.0), reverse=True)
     if limit:
         candidates = candidates[: int(limit)]
-    write_outputs(observations, candidates, settings)
+    if write_preliminary_report:
+        write_outputs(observations, candidates, settings)
     price_observations = [
         normalize_observation(row, source=f"{row.get('venue')} public REST")
         for row in all_observations

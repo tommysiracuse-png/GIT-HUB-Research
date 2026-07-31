@@ -5,6 +5,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -35,6 +36,32 @@ def result(payload: object) -> dict:
 
 
 class FrontierCryptoAdapterTests(unittest.TestCase):
+    def test_scan_batch_can_defer_preliminary_report_until_quality_enrichment(self) -> None:
+        cfg = settings()
+        observation = self._obs("A", "ABC-USDT", "ABC", "USDT", 100, 100000)
+        candidate = frontier._candidate_from_observation(observation, cfg, 95, 3)
+        with (
+            mock.patch.object(frontier, "scan_venues", return_value=[observation]),
+            mock.patch.object(frontier, "_select_observations", return_value=[observation]),
+            mock.patch.object(frontier, "_reference_prices", return_value={"ABC": 95.0}),
+            mock.patch.object(frontier, "_candidate_from_observation", return_value=candidate),
+            mock.patch.object(frontier, "write_outputs") as write_outputs,
+        ):
+            deferred = frontier.build_scan_batch(
+                cfg,
+                conn=object(),
+                write_preliminary_report=False,
+            )
+            self.assertEqual(1, len(deferred.candidates))
+            write_outputs.assert_not_called()
+
+            frontier.build_scan_batch(
+                cfg,
+                conn=object(),
+                write_preliminary_report=True,
+            )
+            write_outputs.assert_called_once()
+
     def test_public_venue_parsers_normalize_symbols(self) -> None:
         cases = [
             (

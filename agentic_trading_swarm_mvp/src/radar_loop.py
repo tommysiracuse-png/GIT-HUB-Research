@@ -407,15 +407,17 @@ def run_once(settings: dict) -> dict:
             "enabled", True
         ):
             frontier_limit = int(scan_cfg.get("frontier_crypto_review_top", 10))
+            redesign_enabled = bool(settings.get("signal_redesign", {}).get("enabled", True))
             frontier_batch = build_frontier_crypto_scan_batch(
                 settings,
                 limit=frontier_limit,
                 required_inst_ids=required.get("frontier_crypto_venue_map", set()),
                 conn=conn,
+                write_preliminary_report=not redesign_enabled,
             )
             batches.append(frontier_batch)
             price_observations = merge_observations(batches)
-            if settings.get("signal_redesign", {}).get("enabled", True):
+            if redesign_enabled:
                 frontier_candidates, signal_redesign = run_frontier_redesign(
                     conn,
                     settings,
