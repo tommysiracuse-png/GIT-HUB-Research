@@ -203,9 +203,9 @@ def claim_topic(
     digest = evidence_digest(evidence)
     if match is None:
         refs = [source_ref] if source_ref else []
-        conn.execute(
+        inserted = conn.execute(
             """
-            insert into recommendation_topics (
+            insert or ignore into recommendation_topics (
                 topic_key, created_at, updated_at, topic_type, status, priority,
                 descriptor_json, evidence_digest, evidence_json, source_refs_json,
                 occurrence_count, reopen_count
@@ -216,12 +216,26 @@ def claim_topic(
                 digest, json.dumps(evidence or {}, sort_keys=True, default=repr), json.dumps(refs),
             ),
         )
-        if source_ref:
-            conn.execute(
-                "insert or ignore into recommendation_topic_sources (source_ref, topic_key, created_at) values (?, ?, ?)",
-                (source_ref, exact_key, now),
-            )
-        return TopicClaim(exact_key, True, False, False, None, None)
+        if inserted.rowcount == 1:
+            if source_ref:
+                conn.execute(
+                    "insert or ignore into recommendation_topic_sources (source_ref, topic_key, created_at) values (?, ?, ?)",
+                    (source_ref, exact_key, now),
+                )
+            return TopicClaim(exact_key, True, False, False, None, None)
+        # Another worker claimed the exact topic after our lookup. Treat it as
+        # the canonical duplicate instead of losing the whole evolution cycle.
+        match = conn.execute(
+            """
+            select topic_key, status, canonical_table, canonical_row_id, descriptor_json,
+                   source_refs_json, occurrence_count, reopen_count
+            from recommendation_topics
+            where topic_key = ?
+            """,
+            (exact_key,),
+        ).fetchone()
+        if match is None:
+            raise sqlite3.OperationalError("recommendation topic claim disappeared after insert conflict")
 
     key = str(match["topic_key"])
     prior_descriptor = json.loads(match["descriptor_json"] or "{}")

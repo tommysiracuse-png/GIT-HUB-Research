@@ -1184,6 +1184,111 @@ new file mode 100644
             "changed_source_without_runtime_wiring",
         )
 
+    def test_runtime_active_patch_cannot_promote_tests_without_runtime_code(self) -> None:
+        diff = """diff --git a/tests/test_strategy_lab_ingestion.py b/tests/test_strategy_lab_ingestion.py
+--- a/tests/test_strategy_lab_ingestion.py
++++ b/tests/test_strategy_lab_ingestion.py
+@@ -1 +1,2 @@
+ # tests
++assert True
+"""
+        payload = proposal(
+            diff,
+            change_category="evolution_loop_improvement",
+            expected_files=["src/code_evolution.py", "tests/test_strategy_lab_ingestion.py"],
+            proposed_change="Fix strategy-lab recommendation ingestion in the running evolution loop.",
+        )
+        preflight = code_evolution.preflight_proposal(payload, settings())
+        self.assertEqual(preflight["quality_scorecard"]["runtime_integration_status"], "integrated")
+
+        safety = code_evolution.validate_and_scan(payload, diff, settings(), preflight=preflight)
+
+        self.assertFalse(safety["allowed"])
+        self.assertEqual(safety["decision"], "discarded_no_runtime_change")
+        self.assertIn("no_actual_runtime_changed_files", safety["reasons"])
+        self.assertEqual(safety["actual_runtime_integration_status"], "missing")
+
+    def test_promoted_usefulness_reconciliation_repairs_stale_and_test_only_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(":memory:")
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            runtime_payload = proposal(
+                "",
+                change_category="evolution_loop_improvement",
+                expected_files=["src/code_evolution.py"],
+            )
+            tests_only_payload = proposal(
+                "",
+                change_category="evolution_loop_improvement",
+                expected_files=["src/code_evolution.py", "tests/test_code_evolution.py"],
+            )
+            patch_generation = {
+                "requested_model_tier": "frontier",
+                "model_name": "openai/gpt-5.6-sol",
+            }
+            try:
+                for proposal_id, payload in (
+                    ("runtime-promoted", runtime_payload),
+                    ("tests-only-promoted", tests_only_payload),
+                ):
+                    storage.add_code_evolution_proposal(
+                        conn,
+                        proposal_id,
+                        None,
+                        "builder",
+                        "openai/gpt-5.6-sol",
+                        "frontier",
+                        "test",
+                        proposal_id,
+                        "evolution_loop_improvement",
+                        90,
+                        payload,
+                        {},
+                    )
+                storage.update_code_evolution_proposal(
+                    conn,
+                    "runtime-promoted",
+                    status="promoted",
+                    changed_files=["src/code_evolution.py"],
+                    safety={
+                        "category": "evolution_loop_improvement",
+                        "changed_files": ["src/code_evolution.py"],
+                        "frontier_call_useful": False,
+                        "frontier_call_wasted_reason": "discarded_patch_apply_failure",
+                        "patch_generation": patch_generation,
+                    },
+                )
+                storage.update_code_evolution_proposal(
+                    conn,
+                    "tests-only-promoted",
+                    status="promoted",
+                    changed_files=["tests/test_code_evolution.py"],
+                    safety={
+                        "category": "evolution_loop_improvement",
+                        "changed_files": ["tests/test_code_evolution.py"],
+                        "frontier_call_useful": True,
+                        "frontier_call_wasted_reason": None,
+                        "patch_generation": patch_generation,
+                    },
+                )
+
+                normalized = code_evolution.normalize_code_evolution_statuses(conn, root=pathlib.Path(tmp))
+                rows = {row["proposal_id"]: row for row in storage.code_evolution_recent(conn, limit=10)}
+                summary = code_evolution.code_evolution_summary(conn)
+            finally:
+                conn.close()
+
+        self.assertEqual(normalized["promoted_usefulness_reconciled"], 2)
+        self.assertTrue(rows["runtime-promoted"]["safety"]["frontier_call_useful"])
+        self.assertIsNone(rows["runtime-promoted"]["safety"]["frontier_call_wasted_reason"])
+        self.assertFalse(rows["tests-only-promoted"]["safety"]["frontier_call_useful"])
+        self.assertEqual(
+            rows["tests-only-promoted"]["safety"]["frontier_call_wasted_reason"],
+            "no_actual_runtime_changed_files",
+        )
+        self.assertEqual(summary["failure_benchmark"]["useful_merge_count"], 1)
+
     def test_grounded_contract_rejects_existence_only_test(self) -> None:
         diff = """diff --git a/src/llm_swarm_runner.py b/src/llm_swarm_runner.py
 --- a/src/llm_swarm_runner.py

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 import tempfile
@@ -159,6 +160,36 @@ class HunterAllocationTests(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(floor_selected), 4)
         self.assertEqual(report["selected_by_bucket"]["explore"], 5)
+
+    def test_global_discovery_report_merges_case_only_region_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_discovery = hunter_allocation.DISCOVERY_JSONL
+            try:
+                hunter_allocation.DISCOVERY_JSONL = pathlib.Path(tmp) / "market_discovery_candidates.jsonl"
+                rows = [
+                    {
+                        "region": "Global",
+                        "surface_type_classified": "Listed Derivatives",
+                        "created_at": "2026-07-30T20:00:00+00:00",
+                    },
+                    {
+                        "region": "global",
+                        "surface_type_classified": "listed derivatives",
+                        "created_at": "2026-07-30T20:00:00+00:00",
+                    },
+                ]
+                hunter_allocation.DISCOVERY_JSONL.write_text(
+                    "\n".join(json.dumps(row) for row in rows) + "\n",
+                    encoding="utf-8",
+                )
+
+                report = hunter_allocation._global_discovery_counts()
+            finally:
+                hunter_allocation.DISCOVERY_JSONL = old_discovery
+
+        self.assertEqual(report["by_region"], {"global": 2})
+        self.assertEqual(len(report["by_surface_type"]), 1)
+        self.assertEqual(sum(report["by_surface_type"].values()), 2)
 
 
 if __name__ == "__main__":

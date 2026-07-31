@@ -3110,6 +3110,24 @@ def _actual_runtime_integration_status(payload: dict, category: str, changed_fil
     return status
 
 
+def _has_substantive_changed_files(category: str, changed_files: list[str]) -> bool:
+    """Distinguish an implementation from tests or documentation about one."""
+    if category == "tests_fixtures":
+        return any(path.startswith("tests/") for path in changed_files)
+    if category == "report_dashboard":
+        return any(
+            path.startswith(("src/", "config/", "docs/"))
+            or path in {"README.md", "COST_AWARE_SWARM.md", "LLM_AGENT_BRIDGE.md"}
+            for path in changed_files
+        )
+    return any(
+        path.startswith("src/")
+        or path.startswith("config/")
+        or path in DEPENDENCY_MANIFESTS
+        for path in changed_files
+    )
+
+
 def _behavioral_integration_contract_reasons(payload: dict, diff_text: str, changed_files: list[str]) -> list[str]:
     """Verify grounded swarm proposals change and exercise their declared consumer."""
     integration = _code_change(payload).get("runtime_integration")
@@ -3280,6 +3298,8 @@ def _safety_decision(reasons: list[str], patch_generation: dict | None = None, p
         return "rejected_preflight_invalid_tests"
     if "no_runtime_integration_target" in reasons:
         return "rejected_preflight_no_runtime_integration"
+    if "no_actual_runtime_changed_files" in reasons:
+        return "discarded_no_runtime_change"
     if "invalid_patch_format" in reasons:
         return "invalid_patch_format"
     if "missing_unified_diff" in reasons and ("no_changed_files" in reasons or (patch_generation or {}).get("status")):
@@ -3380,6 +3400,8 @@ def validate_and_scan(
                 reasons.append(str(status))
 
     actual_runtime_status = _actual_runtime_integration_status(payload, category, changed_files) if changed_files else None
+    if changed_files and not _has_substantive_changed_files(category, changed_files):
+        reasons.append("no_actual_runtime_changed_files")
     if (
         cfg.get("reject_orphan_helpers", True)
         and actual_runtime_status == "changed_source_without_runtime_wiring"
@@ -3469,13 +3491,20 @@ def _with_frontier_usefulness(safety: dict, status: str, patch_generation: dict 
         output["frontier_call_useful"] = None
         output["frontier_call_wasted_reason"] = None
         return output
-    useful = status in SUCCESS_STATUSES and bool(output.get("changed_files"))
+    category = str(output.get("category") or "")
+    changed_files = list(output.get("changed_files") or [])
+    useful = status in SUCCESS_STATUSES and _has_substantive_changed_files(category, changed_files)
     output["frontier_call_useful"] = useful
-    output["frontier_call_wasted_reason"] = None if useful else _frontier_wasted_reason(
-        status,
-        list(output.get("reasons") or []),
-        patch_generation,
-    )
+    if useful:
+        output["frontier_call_wasted_reason"] = None
+    elif status in SUCCESS_STATUSES and changed_files:
+        output["frontier_call_wasted_reason"] = "no_actual_runtime_changed_files"
+    else:
+        output["frontier_call_wasted_reason"] = _frontier_wasted_reason(
+            status,
+            list(output.get("reasons") or []),
+            patch_generation,
+        )
     return output
 
 
@@ -5003,7 +5032,8 @@ def reconcile_code_evolution_git_statuses(conn: Any, root: pathlib.Path = ROOT) 
     updated: dict[str, int] = {}
     rows = conn.execute(
         """
-        select proposal_id, status, candidate_commit, evaluation_json
+        select proposal_id, status, candidate_commit, evaluation_json,
+               payload_json, category, changed_files_json, safety_json
         from code_evolution_proposals
         where candidate_commit is not null and status not in ('promoted', 'reverted')
         order by updated_at desc
@@ -5021,10 +5051,29 @@ def reconcile_code_evolution_git_statuses(conn: Any, root: pathlib.Path = ROOT) 
             "previous_status": row["status"],
             "is_ancestor_of_head": True,
         }
+        payload = json.loads(row["payload_json"] or "{}")
+        changed_files = json.loads(row["changed_files_json"] or "[]")
+        if not isinstance(changed_files, list):
+            changed_files = []
+        safety = json.loads(row["safety_json"] or "{}")
+        category = str(row["category"] or _normalize_category(_field(payload, "change_category", "category")))
+        safety["category"] = category
+        safety["changed_files"] = changed_files
+        safety["actual_runtime_integration_status"] = _actual_runtime_integration_status(
+            payload,
+            category,
+            changed_files,
+        )
+        safety = _with_frontier_usefulness(
+            safety,
+            "promoted",
+            safety.get("patch_generation") or {},
+        )
         update_code_evolution_proposal(
             conn,
             row["proposal_id"],
             status="promoted",
+            safety=safety,
             evaluation=evaluation,
             promotion_reason="Reconciled from candidate commit present in current Git ancestry.",
             applied_at=_utc_now(),
@@ -5033,10 +5082,50 @@ def reconcile_code_evolution_git_statuses(conn: Any, root: pathlib.Path = ROOT) 
     return updated
 
 
+def _normalize_promoted_usefulness(conn: Any) -> int:
+    """Repair stale success accounting after a repaired patch or Git reconciliation."""
+    updated = 0
+    for row in code_evolution_by_status(conn, ["promoted"], limit=2000):
+        payload = row.get("payload") or {}
+        category = str(row.get("category") or _normalize_category(_field(payload, "change_category", "category")))
+        changed_files = list(row.get("changed_files") or [])
+        safety = dict(row.get("safety") or {})
+        before = (
+            safety.get("actual_runtime_integration_status"),
+            safety.get("frontier_call_useful"),
+            safety.get("frontier_call_wasted_reason"),
+        )
+        safety["category"] = category
+        safety["changed_files"] = changed_files
+        safety["actual_runtime_integration_status"] = _actual_runtime_integration_status(
+            payload,
+            category,
+            changed_files,
+        )
+        safety = _with_frontier_usefulness(
+            safety,
+            "promoted",
+            safety.get("patch_generation") or {},
+        )
+        after = (
+            safety.get("actual_runtime_integration_status"),
+            safety.get("frontier_call_useful"),
+            safety.get("frontier_call_wasted_reason"),
+        )
+        if after == before:
+            continue
+        update_code_evolution_proposal(conn, row["proposal_id"], safety=safety)
+        updated += 1
+    return updated
+
+
 def normalize_code_evolution_statuses(conn: Any, root: pathlib.Path = ROOT) -> dict:
     updated: dict[str, int] = {}
     for key, count in reconcile_code_evolution_git_statuses(conn, root=root).items():
         updated[key] = updated.get(key, 0) + count
+    usefulness_updates = _normalize_promoted_usefulness(conn)
+    if usefulness_updates:
+        updated["promoted_usefulness_reconciled"] = usefulness_updates
     for row in code_evolution_by_status(conn, ["blocked_human_review"], limit=1000):
         safety = row.get("safety") or {}
         reasons = safety.get("reasons") or []
@@ -5079,6 +5168,15 @@ def normalize_code_evolution_statuses(conn: Any, root: pathlib.Path = ROOT) -> d
             update_code_evolution_proposal(conn, row["proposal_id"], status=status, safety=updated_safety)
             updated[f"{status}_reason_cleanup"] = updated.get(f"{status}_reason_cleanup", 0) + 1
     return updated
+
+
+def _successful_row_is_useful(row: dict) -> bool:
+    if row.get("status") not in SUCCESS_STATUSES:
+        return False
+    return _has_substantive_changed_files(
+        str(row.get("category") or ""),
+        list(row.get("changed_files") or []),
+    )
 
 
 def code_evolution_summary(conn: Any) -> dict:
@@ -5130,7 +5228,7 @@ def code_evolution_summary(conn: Any) -> dict:
                 failure_class_counts["invalid_tests"] += 1
             if "patch_apply" in reason or "stale" in reason:
                 failure_class_counts["stale_hunks_or_patch_apply"] += 1
-            if reason in {"no_changed_files", "missing_unified_diff"}:
+            if reason in {"no_changed_files", "missing_unified_diff", "no_actual_runtime_changed_files"}:
                 failure_class_counts["no_op_or_empty_patch"] += 1
             if "invalid_patch_format" in reason:
                 failure_class_counts["malformed_diff"] += 1
@@ -5158,7 +5256,7 @@ def code_evolution_summary(conn: Any) -> dict:
                 quality_scores.append(float(scorecard["proposal_quality_score"]))
             except (TypeError, ValueError):
                 pass
-    useful = sum(counts.get(status, 0) for status in SUCCESS_STATUSES)
+    useful = sum(1 for row in rows if _successful_row_is_useful(row))
     attempted = len(rows)
     tracked_failures = sum(failure_class_counts.values())
     return {

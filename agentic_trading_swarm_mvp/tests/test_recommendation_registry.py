@@ -104,6 +104,41 @@ class RecommendationRegistryTests(unittest.TestCase):
         )
         self.assertTrue(two.reopened)
 
+    def test_concurrent_exact_claim_becomes_duplicate_instead_of_crashing(self) -> None:
+        class InsertRaceConnection:
+            def __init__(self, conn: sqlite3.Connection) -> None:
+                self.conn = conn
+                self.injected = False
+
+            def execute(self, sql: str, params: tuple = ()):
+                if (
+                    not self.injected
+                    and "insert or ignore into recommendation_topics" in " ".join(sql.lower().split())
+                ):
+                    self.injected = True
+                    self.conn.execute(sql, params)
+                return self.conn.execute(sql, params)
+
+        claim = claim_topic(
+            InsertRaceConnection(self.conn),
+            payload={
+                "market_key": "OKX|basis",
+                "title": "Diagnose OKX basis sign",
+                "proposed_change": "Run the canonical basis sign diagnostic.",
+            },
+            topic_type="diagnostic",
+            priority=95,
+            source_ref="llm:race",
+        )
+
+        self.assertFalse(claim.created)
+        self.assertTrue(claim.duplicate)
+        row = self.conn.execute(
+            "select occurrence_count from recommendation_topics where topic_key = ?",
+            (claim.topic_key,),
+        ).fetchone()
+        self.assertEqual(row["occurrence_count"], 2)
+
     def test_backfill_preserves_one_canonical_row_and_supersedes_duplicate(self) -> None:
         self.conn.execute(
             "insert into improvement_tasks (created_at, priority, title, rationale, status) values ('now', 90, ?, ?, 'open')",

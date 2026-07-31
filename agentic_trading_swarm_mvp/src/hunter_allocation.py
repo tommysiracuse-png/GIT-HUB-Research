@@ -184,6 +184,8 @@ def _global_discovery_counts() -> dict[str, Any]:
     last_day = 0
     by_region: dict[str, int] = {}
     by_surface: dict[str, int] = {}
+    region_keys: dict[str, str] = {}
+    surface_keys: dict[str, str] = {}
     for line in DISCOVERY_JSONL.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -192,8 +194,13 @@ def _global_discovery_counts() -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
         total += 1
-        by_region[str(item.get("region") or "unknown")] = by_region.get(str(item.get("region") or "unknown"), 0) + 1
-        surface = str(item.get("surface_type_classified") or "unknown")
+        raw_region = str(item.get("region") or "unknown").strip() or "unknown"
+        region_folded = raw_region.casefold()
+        region = region_keys.setdefault(region_folded, "global" if region_folded == "global" else raw_region)
+        by_region[region] = by_region.get(region, 0) + 1
+        raw_surface = str(item.get("surface_type_classified") or "unknown").strip() or "unknown"
+        surface_folded = raw_surface.casefold()
+        surface = surface_keys.setdefault(surface_folded, raw_surface)
         by_surface[surface] = by_surface.get(surface, 0) + 1
         created = _parse_iso(item.get("created_at"))
         if created:
