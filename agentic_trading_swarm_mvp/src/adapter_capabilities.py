@@ -115,6 +115,23 @@ def _required_capabilities(text: str, spec: dict) -> set[str]:
     required: set[str] = set()
     if any(token in blob for token in ("order book", "orderbook", "market depth", "level 2", "depth")):
         required.add("order_book")
+    if any(
+        token in blob
+        for token in (
+            "real-time",
+            "real time",
+            "realtime",
+            "intraday",
+            "five-second",
+            "five second",
+            "5-second",
+            "5 second",
+            "streaming quote",
+            "live quote",
+            "websocket",
+        )
+    ):
+        required.add("entry_quality_quote")
     if any(token in blob for token in ("ticker", "quote", "price", "market data", "ohlc")):
         required.add("ticker")
     if any(token in blob for token in ("catalog", "instrument list", "contract list", "cross-list")):
@@ -186,6 +203,10 @@ def match_adapter_spec(spec_row: dict, inventory: list[dict] | None = None) -> d
             satisfied.add("ticker")
         if available.intersection({"settlement_reference", "daily_ohlcv", "event_price_reference"}):
             satisfied.add("settlement_reference")
+        if available.intersection(
+            {"ticker", "realtime_ticker", "live_quote", "intraday_quote", "order_book", "executable_quality"}
+        ):
+            satisfied.add("entry_quality_quote")
         missing = sorted(required - satisfied)
         scored.append((score, len(missing), adapter, missing))
     if not scored:
@@ -235,7 +256,7 @@ def reconcile_adapter_specs(conn: sqlite3.Connection) -> dict:
             select id, created_at, source_recommendation_id, market_key, priority,
                    title, status, spec_json, evidence_json
             from adapter_specs
-            where status in ('open', 'adapter_capability_gap')
+            where status in ('open', 'adapter_capability_gap', 'resolved_existing_adapter_capability')
             order by priority desc, id asc
             """
         ).fetchall()

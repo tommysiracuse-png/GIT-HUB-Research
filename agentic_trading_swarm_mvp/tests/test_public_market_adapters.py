@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import pathlib
 import ssl
 import sqlite3
@@ -180,6 +181,13 @@ class AdapterCapabilityTests(unittest.TestCase):
         self.assertEqual("partial_capability_gap", gap["match_status"])
         self.assertIn("order_book", gap["missing_capabilities"])
 
+        realtime = copy.deepcopy(daily)
+        realtime["title"] = "TWSE real-time five-second market snapshot"
+        realtime["spec"]["candidate"]["why_interesting"] = "intraday entry-quality price coverage"
+        gap = adapter_capabilities.match_adapter_spec(realtime)
+        self.assertEqual("partial_capability_gap", gap["match_status"])
+        self.assertIn("entry_quality_quote", gap["missing_capabilities"])
+
     def test_reconciliation_closes_covered_spec_and_supersedes_duplicate(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -207,6 +215,40 @@ class AdapterCapabilityTests(unittest.TestCase):
         self.assertEqual("resolved_existing_adapter_capability", statuses[0])
         self.assertEqual("superseded_duplicate_adapter_spec", statuses[1])
         self.assertEqual(2, report["summary"]["specs_reconciled"])
+        conn.close()
+
+    def test_reconciliation_reopens_resolved_spec_when_capability_is_not_deployed(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        storage.add_adapter_spec(
+            conn,
+            "rec-realtime",
+            "global_discovery|Taiwan Stock Exchange",
+            92,
+            "TWSE real-time five-second market snapshot",
+            {
+                "candidate": {
+                    "venue_or_source": "Taiwan Stock Exchange",
+                    "public_docs_url": "https://openapi.twse.com.tw/",
+                    "why_interesting": "intraday entry-quality price coverage",
+                }
+            },
+            {},
+        )
+        conn.execute("update adapter_specs set status = 'resolved_existing_adapter_capability'")
+        conn.commit()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            adapter_capabilities, "REPORT_JSON", pathlib.Path(tmp) / "inventory.json"
+        ), mock.patch.object(adapter_capabilities, "REPORT_MD", pathlib.Path(tmp) / "inventory.md"):
+            adapter_capabilities.reconcile_adapter_specs(conn)
+        row = conn.execute("select status, evidence_json from adapter_specs").fetchone()
+        self.assertEqual("adapter_capability_gap", row["status"])
+        evidence = json.loads(row["evidence_json"])
+        self.assertIn(
+            "entry_quality_quote",
+            evidence["adapter_capability_reconciliation"]["missing_capabilities"],
+        )
         conn.close()
 
     def test_auto_coder_accepts_new_adapter_plugin_as_runtime_integration(self) -> None:
