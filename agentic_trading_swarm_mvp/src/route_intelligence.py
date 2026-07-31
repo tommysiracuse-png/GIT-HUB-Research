@@ -146,6 +146,18 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
             route_cost_bps_paper=route_friction_bps,
         )
         feasibility_state = str(feasibility_fields.get("feasibility_state") or UNKNOWN)
+        requirement_checklist = _paper_route_requirement_checklist(
+            opportunity,
+            blockers=blockers,
+            borrow_required=feasibility_state == "requires_borrow",
+            requires_margin_permission=True if feasibility_state == "requires_margin" else UNKNOWN,
+            feasibility_state=feasibility_state,
+        )
+        route_confidence = _paper_route_confidence(
+            requirement_checklist,
+            route_required=_requires_frontier_spot_short_route(opportunity),
+            feasibility_state=feasibility_state,
+        )
         edge_bps_estimate = _first_known(
             opportunity,
             "edge_bps_estimate",
@@ -153,6 +165,7 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
             "depth_adjusted_edge_bps",
         )
         edge_bps_number = _float_or_none(edge_bps_estimate)
+        reasons = list(route_confidence["reason_codes"])
         reasons = list(_conditional_gate_reasons(opportunity))
         if feasibility_state == "unsupported":
             reasons.append("unsupported_route")
@@ -182,6 +195,9 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
                 "route_blockers": _route_blockers(opportunity),
                 "feasibility_state": feasibility_state,
                 "route_friction_bps": feasibility_fields.get("route_friction_bps", UNKNOWN),
+                "paper_confidence_action": route_confidence["action"],
+                "route_requirement_checks": requirement_checklist,
+                "route_requirement_gaps": route_confidence["gap_fields"],
                 "quality_action": str(opportunity.get("quality_action") or UNKNOWN),
                 "edge_bps_estimate": edge_bps_estimate,
                 "paper_policy_action": _conditional_paper_policy_action(opportunity),
@@ -312,6 +328,8 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
     feasibility_states: dict[str, int] = {}
     proxy_routes: dict[str, int] = {}
     route_types: dict[str, int] = {}
+    confidence_actions: dict[str, int] = {}
+    route_requirement_gap_counts: dict[str, int] = {}
     recommendation_actions: dict[str, int] = {}
     route_costs: list[float] = []
     for opportunity in opportunities:
@@ -346,9 +364,24 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
         counts[feasibility] = counts.get(feasibility, 0) + 1
         feasibility_states[feasibility_state] = feasibility_states.get(feasibility_state, 0) + 1
         route_types[route_type] = route_types.get(route_type, 0) + 1
+        requirement_checklist = _paper_route_requirement_checklist(
+            opportunity,
+            blockers=blockers,
+            borrow_required=feasibility_state == "requires_borrow",
+            requires_margin_permission=True if feasibility_state == "requires_margin" else UNKNOWN,
+            feasibility_state=feasibility_state,
+        )
+        route_confidence = _paper_route_confidence(
+            requirement_checklist,
+            route_required=_requires_frontier_spot_short_route(opportunity),
+            feasibility_state=feasibility_state,
+        )
+        confidence_actions[route_confidence["action"]] = confidence_actions.get(route_confidence["action"], 0) + 1
         recommendation_action = str(feasibility_fields.get("paper_recommendation_action") or UNKNOWN)
         recommendation_actions[recommendation_action] = recommendation_actions.get(recommendation_action, 0) + 1
         if proxy_route != "not_applicable":
+            for gap_field in route_confidence["gap_fields"]:
+                route_requirement_gap_counts[gap_field] = route_requirement_gap_counts.get(gap_field, 0) + 1
             proxy_routes[proxy_route] = proxy_routes.get(proxy_route, 0) + 1
         if isinstance(route_feasible_paper, bool) and route_feasible_paper and isinstance(route_cost_bps_paper, float):
             route_costs.append(route_cost_bps_paper)
@@ -362,6 +395,8 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
         "counts_by_feasibility": dict(sorted(counts.items())),
         "counts_by_feasibility_state": dict(sorted(feasibility_states.items())),
         "counts_by_route_type": dict(sorted(route_types.items())),
+        "counts_by_paper_confidence_action": dict(sorted(confidence_actions.items())),
+        "route_requirement_gap_counts": dict(sorted(route_requirement_gap_counts.items())),
         "counts_by_paper_recommendation_action": dict(sorted(recommendation_actions.items())),
         "proxy_routes": dict(sorted(proxy_routes.items())),
         "estimated_route_cost_bps": estimated_cost_summary,
@@ -391,6 +426,14 @@ _ROUTE_CHECKLIST_FIELDS = (
     "fees_modeled",
     "order_api_surface_mapped",
 )
+
+_ROUTE_REQUIREMENT_REASON_CODES = {
+    "venue_supports_margin_or_equivalent": "margin_support_unconfirmed",
+    "shortable_inventory_declared": "short_inventory_unconfirmed",
+    "borrow_cost_model_present": "borrow_cost_model_unconfirmed",
+    "fees_modeled": "fees_unconfirmed",
+    "order_api_surface_mapped": "order_api_surface_unconfirmed",
+}
 
 
 def _requirement_check_status(*, required: bool, satisfied: bool | None) -> str:
@@ -505,6 +548,56 @@ def _paper_route_requirement_checklist(
         "borrow_cost_model_present": _requirement_check_status(required=borrow_cost_model_required, satisfied=borrow_cost_model_satisfied),
         "fees_modeled": _requirement_check_status(required=fees_modeled_required, satisfied=fees_modeled_satisfied),
         "order_api_surface_mapped": _requirement_check_status(required=order_api_surface_required, satisfied=order_api_surface_satisfied),
+    }
+
+
+def _route_requirement_gap_fields(requirement_checklist: dict[str, str]) -> tuple[list[str], list[str]]:
+    missing_fields: list[str] = []
+    unknown_fields: list[str] = []
+    for field in _ROUTE_CHECKLIST_FIELDS:
+        status = str(requirement_checklist.get(field) or UNKNOWN).lower()
+        if status == "missing":
+            missing_fields.append(field)
+        elif status == UNKNOWN:
+            unknown_fields.append(field)
+    return missing_fields, unknown_fields
+
+
+def _paper_route_confidence(
+    requirement_checklist: dict[str, str],
+    *,
+    route_required: bool,
+    feasibility_state: str,
+) -> dict[str, Any]:
+    missing_fields, unknown_fields = _route_requirement_gap_fields(requirement_checklist)
+    gap_fields = [*missing_fields, *unknown_fields]
+    reason_codes = [
+        _ROUTE_REQUIREMENT_REASON_CODES.get(field, f"{field}_unconfirmed")
+        for field in gap_fields
+    ]
+    normalized_feasibility_state = str(feasibility_state or UNKNOWN).lower()
+    if route_required and normalized_feasibility_state == UNKNOWN:
+        reason_codes.append("route_feasibility_unconfirmed")
+    if not route_required:
+        action = "not_applicable"
+    elif normalized_feasibility_state == "unsupported":
+        action = "reject"
+    elif normalized_feasibility_state in {"requires_borrow", "requires_margin"}:
+        action = "paper_conditional"
+    elif gap_fields or normalized_feasibility_state == UNKNOWN:
+        action = "paper_conditional"
+    else:
+        action = "executable_paper"
+    return {
+        "action": action,
+        "gap_fields": gap_fields,
+        "missing_fields": missing_fields,
+        "unknown_fields": unknown_fields,
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "checklist_complete": not gap_fields,
+        "route_required": route_required,
+        "feasibility_state": feasibility_state,
+        "paper_only": True,
     }
 
 
