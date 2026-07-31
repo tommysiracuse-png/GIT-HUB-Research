@@ -2337,6 +2337,23 @@ def evaluate_active_experiments(conn: sqlite3.Connection, settings: dict) -> lis
     return evaluated
 
 
+def _select_recommendations_for_lane(
+    queued_recommendations: list[dict],
+    max_tasks: int,
+    *,
+    include_code_changes: bool,
+) -> list[tuple[dict, str]]:
+    selected: list[tuple[dict, str]] = []
+    for rec in queued_recommendations:
+        task_type = classify_recommendation(rec["payload"])
+        if task_type == "code_change" and not include_code_changes:
+            continue
+        selected.append((rec, task_type))
+        if len(selected) >= max_tasks:
+            break
+    return selected
+
+
 def run_auto_improvement(
     conn: sqlite3.Connection,
     settings: dict,
@@ -2356,13 +2373,20 @@ def run_auto_improvement(
     deployed_reconciliation = reconcile_deployed_artifacts(conn)
     consumed = []
     max_tasks = int(cfg.get("max_tasks_per_loop", 5))
-    for rec in llm_recommendations_for_auto_execution(
+    scan_limit = max_tasks if include_code_changes else max(max_tasks * 100, max_tasks)
+    queued_recommendations = llm_recommendations_for_auto_execution(
         conn,
-        limit=max_tasks,
+        limit=scan_limit,
         include_code_changes=include_code_changes,
-    ):
+    )
+    selected_recommendations = _select_recommendations_for_lane(
+        queued_recommendations,
+        max_tasks,
+        include_code_changes=include_code_changes,
+    )
+
+    for rec, task_type in selected_recommendations:
         payload = rec["payload"]
-        task_type = classify_recommendation(payload)
         topic = claim_topic(
             conn,
             payload=payload,
