@@ -5,11 +5,27 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
 from typing import Any
+
+
+def _system_trust_context() -> ssl.SSLContext | None:
+    try:
+        import truststore
+    except ImportError:
+        return None
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def _is_certificate_verification_error(exc: BaseException) -> bool:
+    reason = getattr(exc, "reason", None)
+    return isinstance(exc, ssl.SSLCertVerificationError) or isinstance(
+        reason, ssl.SSLCertVerificationError
+    ) or "CERTIFICATE_VERIFY_FAILED" in str(exc).upper()
 
 
 def utc_now() -> str:
@@ -25,8 +41,12 @@ def fetch_text(url: str, timeout: int = 15) -> dict[str, Any]:
             "User-Agent": "agentic-trading-swarm-paper-research/1.0",
         },
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+
+    def _fetch(context: ssl.SSLContext | None = None) -> dict[str, Any]:
+        kwargs = {"timeout": timeout}
+        if context is not None:
+            kwargs["context"] = context
+        with urllib.request.urlopen(request, **kwargs) as response:
             text = response.read().decode("utf-8", errors="replace")
             return {
                 "ok": True,
@@ -35,7 +55,11 @@ def fetch_text(url: str, timeout: int = 15) -> dict[str, Any]:
                 "text": text,
                 "received_at": utc_now(),
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                "tls_trust_source": "system" if context is not None else "python_default",
             }
+
+    try:
+        return _fetch()
     except urllib.error.HTTPError as exc:
         return {
             "ok": False,
@@ -47,6 +71,24 @@ def fetch_text(url: str, timeout: int = 15) -> dict[str, Any]:
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
         }
     except Exception as exc:  # noqa: BLE001 - scanner health must survive source outages.
+        if _is_certificate_verification_error(exc):
+            context = _system_trust_context()
+            if context is not None:
+                try:
+                    return _fetch(context)
+                except urllib.error.HTTPError as retry_exc:
+                    return {
+                        "ok": False,
+                        "status": "blocked" if retry_exc.code in {401, 403, 451} else "unavailable",
+                        "http_status": int(retry_exc.code),
+                        "error": str(retry_exc)[:300],
+                        "text": "",
+                        "received_at": utc_now(),
+                        "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                        "tls_trust_source": "system",
+                    }
+                except Exception as retry_exc:  # noqa: BLE001 - retain source health evidence.
+                    exc = retry_exc
         return {
             "ok": False,
             "status": "unavailable",

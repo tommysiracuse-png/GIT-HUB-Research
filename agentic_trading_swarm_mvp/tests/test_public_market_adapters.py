@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import pathlib
+import ssl
 import sqlite3
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 
@@ -18,6 +20,7 @@ import adapter_capabilities
 import adapter_runtime
 import code_evolution
 import storage
+from adapters.venues import common as venue_common
 from adapters.registry import discover_adapters
 from adapters.venues.bahrain_cross_listings import cross_listing_observations
 from adapters.venues.bursa_derivatives import contract_observations
@@ -29,6 +32,38 @@ from settings import DEFAULT_SETTINGS
 
 
 class PublicAdapterParserTests(unittest.TestCase):
+    def test_public_fetch_retries_certificate_failure_with_system_trust(self) -> None:
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read() -> bytes:
+                return b"[]"
+
+        certificate_error = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        system_context = mock.sentinel.system_context
+        with mock.patch.object(
+            venue_common.urllib.request,
+            "urlopen",
+            side_effect=[urllib.error.URLError(certificate_error), Response()],
+        ) as urlopen, mock.patch.object(
+            venue_common,
+            "_system_trust_context",
+            return_value=system_context,
+        ):
+            result = venue_common.fetch_text("https://official.example.test/market-data")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("system", result["tls_trust_source"])
+        self.assertEqual(2, urlopen.call_count)
+        self.assertIs(system_context, urlopen.call_args_list[1].kwargs["context"])
+
     def test_registered_batch_is_discoverable(self) -> None:
         expected = {
             "twse_daily_public",
