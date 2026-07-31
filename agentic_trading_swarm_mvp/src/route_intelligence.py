@@ -42,6 +42,13 @@ ROUTE_REQUIREMENT_FIELDS = (
     "paper_proxy_route",
     "feasibility_state",
     "route_friction_bps",
+    "venue_supports_margin_or_equivalent",
+    "shortable_inventory_declared",
+    "borrow_cost_model_present",
+    "fees_modeled",
+    "order_api_surface_mapped",
+    "paper_recommendation_action",
+    "paper_recommendation_reason",
     "paper_proxy_not_live_equivalent",
     "route_type",
     "route_feasible_paper",
@@ -305,6 +312,7 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
     feasibility_states: dict[str, int] = {}
     proxy_routes: dict[str, int] = {}
     route_types: dict[str, int] = {}
+    recommendation_actions: dict[str, int] = {}
     route_costs: list[float] = []
     for opportunity in opportunities:
         blockers = _route_blockers(opportunity)
@@ -338,6 +346,8 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
         counts[feasibility] = counts.get(feasibility, 0) + 1
         feasibility_states[feasibility_state] = feasibility_states.get(feasibility_state, 0) + 1
         route_types[route_type] = route_types.get(route_type, 0) + 1
+        recommendation_action = str(feasibility_fields.get("paper_recommendation_action") or UNKNOWN)
+        recommendation_actions[recommendation_action] = recommendation_actions.get(recommendation_action, 0) + 1
         if proxy_route != "not_applicable":
             proxy_routes[proxy_route] = proxy_routes.get(proxy_route, 0) + 1
         if isinstance(route_feasible_paper, bool) and route_feasible_paper and isinstance(route_cost_bps_paper, float):
@@ -352,6 +362,7 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
         "counts_by_feasibility": dict(sorted(counts.items())),
         "counts_by_feasibility_state": dict(sorted(feasibility_states.items())),
         "counts_by_route_type": dict(sorted(route_types.items())),
+        "counts_by_paper_recommendation_action": dict(sorted(recommendation_actions.items())),
         "proxy_routes": dict(sorted(proxy_routes.items())),
         "estimated_route_cost_bps": estimated_cost_summary,
     }
@@ -371,6 +382,130 @@ def _float_or_none(value: Any) -> float | None:
 
 def _numeric_field(opportunity: dict[str, Any], *keys: str) -> float | None:
     return _float_or_none(_first_known(opportunity, *keys))
+
+
+_ROUTE_CHECKLIST_FIELDS = (
+    "venue_supports_margin_or_equivalent",
+    "shortable_inventory_declared",
+    "borrow_cost_model_present",
+    "fees_modeled",
+    "order_api_surface_mapped",
+)
+
+
+def _requirement_check_status(*, required: bool, satisfied: bool | None) -> str:
+    if not required:
+        return "not_applicable"
+    if satisfied is True:
+        return "satisfied"
+    if satisfied is False:
+        return "missing"
+    return UNKNOWN
+
+
+def _paper_route_requirement_checklist(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+    borrow_required: bool = False,
+    requires_margin_permission: bool | str = UNKNOWN,
+    feasibility_state: str = UNKNOWN,
+) -> dict[str, str]:
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    route_requires_frontier_short = _requires_frontier_spot_short_route(opportunity)
+    capability_confirmed = _frontier_spot_short_capability_confirmed(opportunity) is True
+    explicit_inventory = _bool_flag(
+        _first_known(
+            opportunity,
+            "shortable_inventory_declared",
+            "short_inventory_confirmed",
+            "inventory_locate_available",
+        )
+    )
+    explicit_borrow_cost_model = _bool_flag(
+        _first_known(
+            opportunity,
+            "borrow_cost_model_present",
+            "borrow_fee_modeled",
+        )
+    )
+    explicit_fees_modeled = _bool_flag(
+        _first_known(
+            opportunity,
+            "fees_modeled",
+            "entry_exit_fees_modeled",
+        )
+    )
+    explicit_api_mapped = _bool_flag(
+        _first_known(
+            opportunity,
+            "order_api_surface_mapped",
+            "api_surface_mapped",
+        )
+    )
+    borrow_cost_bps = _numeric_field(
+        opportunity,
+        "borrow_fee_bps_estimate_or_unknown",
+        "borrow_cost_bps",
+        "borrow_fee_bps_estimate",
+    )
+    fee_bps = _numeric_field(
+        opportunity,
+        "fee_bps_per_side_or_unknown",
+        "fee_bps_per_side",
+        "taker_fee_bps",
+    )
+    api_surface = _api_surface_required(
+        opportunity,
+        blockers=blockers,
+        borrow_required=borrow_required,
+        requires_margin_permission=requires_margin_permission,
+    )
+    venue_margin_required = route_requires_frontier_short or requires_margin_permission is True or borrow_required
+    venue_margin_satisfied = True if capability_confirmed else False if feasibility_state == "unsupported" else None
+    shortable_inventory_required = route_requires_frontier_short or borrow_required
+    if explicit_inventory is not None:
+        shortable_inventory_satisfied = explicit_inventory
+    elif capability_confirmed:
+        shortable_inventory_satisfied = True
+    elif feasibility_state == "unsupported" and shortable_inventory_required:
+        shortable_inventory_satisfied = False
+    else:
+        shortable_inventory_satisfied = None
+    borrow_cost_model_required = borrow_required
+    if explicit_borrow_cost_model is not None:
+        borrow_cost_model_satisfied = explicit_borrow_cost_model
+    elif borrow_cost_bps is not None:
+        borrow_cost_model_satisfied = True
+    elif feasibility_state == "unsupported" and borrow_cost_model_required:
+        borrow_cost_model_satisfied = False
+    else:
+        borrow_cost_model_satisfied = None
+    fees_modeled_required = route_requires_frontier_short
+    if explicit_fees_modeled is not None:
+        fees_modeled_satisfied = explicit_fees_modeled
+    elif fee_bps is not None:
+        fees_modeled_satisfied = True
+    elif feasibility_state == "unsupported" and fees_modeled_required:
+        fees_modeled_satisfied = False
+    else:
+        fees_modeled_satisfied = None
+    order_api_surface_required = route_requires_frontier_short
+    if explicit_api_mapped is not None:
+        order_api_surface_satisfied = explicit_api_mapped
+    elif capability_confirmed or (api_surface and str(api_surface).lower() != UNKNOWN):
+        order_api_surface_satisfied = True
+    elif feasibility_state == "unsupported" and order_api_surface_required:
+        order_api_surface_satisfied = False
+    else:
+        order_api_surface_satisfied = None
+    return {
+        "venue_supports_margin_or_equivalent": _requirement_check_status(required=venue_margin_required, satisfied=venue_margin_satisfied),
+        "shortable_inventory_declared": _requirement_check_status(required=shortable_inventory_required, satisfied=shortable_inventory_satisfied),
+        "borrow_cost_model_present": _requirement_check_status(required=borrow_cost_model_required, satisfied=borrow_cost_model_satisfied),
+        "fees_modeled": _requirement_check_status(required=fees_modeled_required, satisfied=fees_modeled_satisfied),
+        "order_api_surface_mapped": _requirement_check_status(required=order_api_surface_required, satisfied=order_api_surface_satisfied),
+    }
 
 
 def _annotate_route_feasibility_fields(
@@ -419,7 +554,63 @@ def _annotate_route_feasibility_fields(
     )
     friction_bps = _float_or_none(route_cost_bps_paper)
     row["route_friction_bps"] = round(friction_bps, 4) if friction_bps is not None else UNKNOWN
+    checklist = _paper_route_requirement_checklist(
+        opportunity,
+        blockers=blockers,
+        borrow_required=borrow_required,
+        requires_margin_permission=requires_margin_permission,
+        feasibility_state=str(row["feasibility_state"] or UNKNOWN),
+    )
+    row.update(checklist)
+    row["paper_recommendation_action"] = _paper_recommendation_action(
+        opportunity,
+        feasibility_state=str(row["feasibility_state"] or UNKNOWN),
+        checklist=checklist,
+    )
+    row["paper_recommendation_reason"] = _paper_recommendation_reason(
+        opportunity,
+        feasibility_state=str(row["feasibility_state"] or UNKNOWN),
+        checklist=checklist,
+    )
     return row
+
+
+def _paper_recommendation_action(
+    opportunity: dict[str, Any],
+    *,
+    feasibility_state: str,
+    checklist: dict[str, Any],
+) -> str:
+    if not _requires_frontier_spot_short_route(opportunity):
+        return "allow_paper_evaluation"
+    if feasibility_state == "supported":
+        return "allow_paper_evaluation"
+    if feasibility_state == "unsupported":
+        return "suppress_from_paper_recommendations"
+    if any(str(checklist.get(field) or UNKNOWN) == "missing" for field in _ROUTE_CHECKLIST_FIELDS):
+        return "suppress_from_paper_recommendations"
+    return "downgrade_confidence_and_label_unverified_route"
+
+
+def _paper_recommendation_reason(
+    opportunity: dict[str, Any],
+    *,
+    feasibility_state: str,
+    checklist: dict[str, Any],
+) -> str:
+    if not _requires_frontier_spot_short_route(opportunity):
+        return "not_applicable"
+    if feasibility_state == "supported":
+        return "explicit_route_supported"
+    if feasibility_state == "unsupported":
+        return "route_explicitly_unsupported"
+    for field in _ROUTE_CHECKLIST_FIELDS:
+        if str(checklist.get(field) or UNKNOWN) == "missing":
+            return f"{field}_missing"
+    for field in _ROUTE_CHECKLIST_FIELDS:
+        if str(checklist.get(field) or UNKNOWN) == UNKNOWN:
+            return f"{field}_unverified"
+    return "route_unverified"
 
 
 def _paper_route_feasibility_state(

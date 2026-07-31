@@ -1,5 +1,86 @@
 import unittest
 
+from src.route_intelligence import build_route_feasibility_summary, build_route_requirements_matrix
+
+
+class PaperOnlyRouteIntelligenceAnnotationTests(unittest.TestCase):
+    def test_conditional_spot_short_profile_reports_margin_and_borrow_requirements(self):
+        candidate = {
+            "inst_id": "OKX:BTC-USDT",
+            "direction": "short",
+            "market_key": "STRATEGY_LAB|route_rich_frontier_long_filter_2942c975|OKX_SPOT|short_frontier_spot|conditional",
+            "strategy_profile": "conditional_spot_short",
+            "requires_spot_borrow": True,
+            "requires_margin_permission": True,
+            "fee_bps_per_side_or_unknown": 8.5,
+            "api_surface_required": "margin_api",
+        }
+
+        row = build_route_requirements_matrix([candidate])[0]
+
+        self.assertEqual(row["feasibility_state"], "requires_borrow")
+        self.assertEqual(row["venue_supports_margin_or_equivalent"], "unknown")
+        self.assertEqual(row["shortable_inventory_declared"], "unknown")
+        self.assertEqual(row["borrow_cost_model_present"], "unknown")
+        self.assertEqual(row["fees_modeled"], "satisfied")
+        self.assertEqual(row["order_api_surface_mapped"], "satisfied")
+        self.assertEqual(row["paper_recommendation_action"], "downgrade_confidence_and_label_unverified_route")
+        self.assertEqual(row["paper_recommendation_reason"], "venue_supports_margin_or_equivalent_unverified")
+
+    def test_funding_capture_profile_reports_perp_and_collateral_requirements(self):
+        candidate = {
+            "inst_id": "OKX:ETH-USDT-SWAP",
+            "direction": "long",
+            "market_key": "frontier_crypto_routes",
+            "route_type": "perp_carry",
+        }
+
+        row = build_route_requirements_matrix([candidate])[0]
+
+        self.assertEqual(row["paper_recommendation_action"], "allow_paper_evaluation")
+        self.assertEqual(row["venue_supports_margin_or_equivalent"], "not_applicable")
+        self.assertEqual(row["shortable_inventory_declared"], "not_applicable")
+        self.assertEqual(row["borrow_cost_model_present"], "not_applicable")
+        self.assertEqual(row["fees_modeled"], "not_applicable")
+        self.assertEqual(row["order_api_surface_mapped"], "not_applicable")
+
+    def test_route_lookup_annotates_route_status_in_place(self):
+        unverified_short = {
+            "inst_id": "OKX:XRP-USDT",
+            "direction": "short",
+            "market_key": "STRATEGY_LAB|route_rich_frontier_long_filter_2942c975|OKX_SPOT|short_frontier_spot|conditional",
+            "strategy_profile": "conditional_spot_short",
+            "requires_spot_borrow": True,
+            "requires_margin_permission": True,
+            "fee_bps_per_side_or_unknown": 6.0,
+            "api_surface_required": "margin_api",
+        }
+        explicit_missing = {
+            "inst_id": "OKX:ARB-USDT",
+            "direction": "short",
+            "market_key": "STRATEGY_LAB|route_rich_frontier_long_filter_2942c975|OKX_SPOT|short_frontier_spot|conditional",
+            "strategy_profile": "conditional_spot_short",
+            "requires_spot_borrow": True,
+            "requires_margin_permission": True,
+            "shortable_inventory_declared": False,
+            "borrow_cost_model_present": False,
+            "fees_modeled": False,
+            "order_api_surface_mapped": False,
+        }
+        direct_long = {
+            "inst_id": "BINANCE:SOL-USDT",
+            "direction": "long",
+            "market_key": "frontier_crypto_routes",
+            "route_type": "direct_market_access",
+        }
+
+        summary = build_route_feasibility_summary([unverified_short, explicit_missing, direct_long])
+
+        self.assertEqual(summary["counts_by_paper_recommendation_action"]["allow_paper_evaluation"], 1)
+        self.assertEqual(summary["counts_by_paper_recommendation_action"]["downgrade_confidence_and_label_unverified_route"], 1)
+        self.assertEqual(summary["counts_by_paper_recommendation_action"]["suppress_from_paper_recommendations"], 1)
+import unittest
+
 from src.frontier_crypto_adapter import _paper_only_route_review_lookup
 from src.frontier_data_quality import paper_only_route_requirement_profile
 
