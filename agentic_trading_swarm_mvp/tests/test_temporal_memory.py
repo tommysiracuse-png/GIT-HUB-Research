@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -581,28 +582,96 @@ class LangGraphMemoryTests(unittest.TestCase):
                 "agent_name": agent["name"],
             }
 
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
-            llm_swarm_runner, "run_agent", side_effect=fake_agent
-        ):
-            llm_swarm_runner.run_langgraph_if_available(
-                packet,
-                role_memory,
-                {
-                    "agent_memory": {
-                        "checkpoint_enabled": True,
-                        "checkpoint_path": str(pathlib.Path(tmp) / "checkpoints.sqlite"),
-                    }
-                },
-                "cycle-test",
-            )
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = pathlib.Path(tmp) / "checkpoints.sqlite"
+            with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=fake_agent):
+                llm_swarm_runner.run_langgraph_if_available(
+                    packet,
+                    role_memory,
+                    {
+                        "agent_memory": {
+                            "checkpoint_enabled": True,
+                            "checkpoint_path": str(checkpoint_path),
+                            "checkpoint_retention_cycles": 8,
+                            "checkpoint_max_storage_mb": 8,
+                        }
+                    },
+                    "cycle-test",
+                )
+            checkpoint_conn = sqlite3.connect(checkpoint_path)
+            try:
+                channels = {
+                    row[0]
+                    for row in checkpoint_conn.execute("select distinct channel from writes")
+                }
+            finally:
+                checkpoint_conn.close()
 
         self.assertEqual(set(observed), {agent["name"] for agent in llm_swarm_runner.AGENTS})
         for agent in llm_swarm_runner.AGENTS:
             self.assertEqual(observed[agent["name"]], f"mem-{agent['name']}")
+        self.assertNotIn("packet", channels)
+        self.assertNotIn("role_memory", channels)
+        self.assertNotIn("memory", channels)
+        self.assertIn("checkpoint_context", channels)
+        self.assertNotIn("packet", llm_swarm_runner.LAST_SWARM_STATE)
+        self.assertNotIn("role_memory", llm_swarm_runner.LAST_SWARM_STATE)
+        context = llm_swarm_runner.LAST_SWARM_STATE["checkpoint"]["runtime_context"]
+        self.assertEqual(context["runtime_context_mode"], "reference_only")
+        self.assertGreater(context["packet_bytes"], 0)
+        self.assertEqual(context["role_memory_counts"]["market_scout"], 1)
         self.assertIn(
             llm_swarm_runner.LAST_SWARM_STATE["checkpoint"]["status"],
             {"saved", "package_missing"},
         )
+
+    def test_checkpoint_pruning_enforces_cycle_and_payload_limits(self) -> None:
+        class FakeSaver:
+            def __init__(self, conn: sqlite3.Connection) -> None:
+                self.conn = conn
+
+            def setup(self) -> None:
+                return None
+
+            def delete_thread(self, thread_id: str) -> None:
+                self.conn.execute("delete from checkpoints where thread_id = ?", (thread_id,))
+                self.conn.execute("delete from writes where thread_id = ?", (thread_id,))
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "create table checkpoints (thread_id text, checkpoint blob, metadata blob)"
+            )
+            conn.execute("create table writes (thread_id text, value blob)")
+            for index in range(8):
+                thread_id = f"swarm:{index}"
+                conn.execute(
+                    "insert into checkpoints(thread_id, checkpoint, metadata) values (?, ?, ?)",
+                    (thread_id, b"x" * 2048, b"m" * 128),
+                )
+                conn.execute(
+                    "insert into writes(thread_id, value) values (?, ?)",
+                    (thread_id, b"w" * 512),
+                )
+            conn.commit()
+
+            removed = llm_swarm_runner._prune_checkpoint_threads(
+                FakeSaver(conn),
+                conn,
+                retain=8,
+                max_storage_mb=0.006,
+            )
+            retained = [
+                row[0]
+                for row in conn.execute(
+                    "select distinct thread_id from checkpoints order by rowid"
+                )
+            ]
+        finally:
+            conn.close()
+
+        self.assertEqual(removed, 6)
+        self.assertEqual(retained, ["swarm:6", "swarm:7"])
 
 
 if __name__ == "__main__":

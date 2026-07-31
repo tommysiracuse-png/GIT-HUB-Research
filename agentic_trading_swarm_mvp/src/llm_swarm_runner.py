@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import ast
 import datetime as dt
+import hashlib
 import json
 import operator
 import pathlib
@@ -45,6 +46,8 @@ class SwarmState(TypedDict, total=False):
     packet: dict
     memory: list[dict]
     role_memory: dict[str, list[dict]]
+    checkpoint_context: dict
+    memory_context_counts: dict[str, int]
     cycle_id: str
     agent_outputs: Annotated[list[dict], operator.add]
     critiques: Annotated[list[dict], operator.add]
@@ -748,16 +751,37 @@ def _coerce_role_memory(memory: list[dict] | dict[str, list[dict]]) -> dict[str,
     return {agent["name"]: list(memory or []) for agent in AGENTS}
 
 
+def _compact_checkpoint_context(packet: dict, role_memory: dict[str, list[dict]]) -> dict:
+    encoded_packet = json.dumps(packet, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    memory_ids = {
+        name: [
+            str(item.get("memory_id") or item.get("id"))
+            for item in items
+            if item.get("memory_id") or item.get("id")
+        ]
+        for name, items in role_memory.items()
+    }
+    return {
+        "runtime_context_mode": "reference_only",
+        "packet_sha256": hashlib.sha256(encoded_packet).hexdigest(),
+        "packet_bytes": len(encoded_packet),
+        "role_memory_counts": {name: len(items) for name, items in role_memory.items()},
+        "role_memory_ids": memory_ids,
+        "durable_memory_source": "runs/radar.sqlite",
+        "note": "Large packet and memory payloads are runtime-only and are not duplicated into every graph checkpoint.",
+    }
+
+
 def _initial_state(
     packet: dict,
     memory: list[dict] | dict[str, list[dict]],
     mode: str,
     cycle_id: str | None = None,
+    *,
+    persist_runtime_context: bool = True,
 ) -> SwarmState:
-    return {
-        "packet": packet,
-        "memory": list(memory) if isinstance(memory, list) else [],
-        "role_memory": _coerce_role_memory(memory),
+    role_memory = _coerce_role_memory(memory)
+    state: SwarmState = {
         "cycle_id": cycle_id or f"swarm:{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
         "agent_outputs": [],
         "critiques": [],
@@ -769,6 +793,14 @@ def _initial_state(
         "checkpoint": {},
         "memory_reflection": {},
     }
+    if persist_runtime_context:
+        state["packet"] = packet
+        state["memory"] = list(memory) if isinstance(memory, list) else []
+        state["role_memory"] = role_memory
+    else:
+        state["checkpoint_context"] = _compact_checkpoint_context(packet, role_memory)
+        state["memory_context_counts"] = {name: len(items) for name, items in role_memory.items()}
+    return state
 
 
 def _merge_state(state: SwarmState, update: SwarmState) -> SwarmState:
@@ -828,16 +860,23 @@ def _record_agent_result(
     }
 
 
-def _run_agent_node(agent: dict, state: SwarmState) -> SwarmState:
+def _run_agent_node(
+    agent: dict,
+    state: SwarmState,
+    *,
+    runtime_packet: dict | None = None,
+    runtime_role_memory: dict[str, list[dict]] | None = None,
+) -> SwarmState:
     started = time.perf_counter()
-    agent_packet = dict(state["packet"])
+    agent_packet = dict(runtime_packet if runtime_packet is not None else state.get("packet") or {})
     agent_packet["current_cycle_recommendations"] = _accepted_outputs(state)
     agent_packet["current_cycle_agent_outputs"] = state.get("agent_outputs", [])
     agent_packet["current_cycle_critiques"] = state.get("critiques", [])
     agent_packet["current_cycle_ranked_actions"] = state.get("ranked_actions", [])
     if agent["name"] == "build_planner":
         agent_packet["repository_grounding"] = _repository_grounding(state)
-    memory = list((state.get("role_memory") or {}).get(agent["name"]) or state.get("memory") or [])
+    role_memory = runtime_role_memory if runtime_role_memory is not None else state.get("role_memory") or {}
+    memory = list(role_memory.get(agent["name"]) or state.get("memory") or [])
     rec = run_agent(agent, agent_packet, memory)
     return _record_agent_result(agent, rec, int((time.perf_counter() - started) * 1000), memory)
 
@@ -903,18 +942,104 @@ def _checkpoint_path(settings: dict) -> pathlib.Path:
     return configured if configured.is_absolute() else ROOT / configured
 
 
-def _prune_checkpoint_threads(saver: Any, conn: sqlite3.Connection, retain: int) -> int:
-    retain = max(10, int(retain))
-    saver.setup()
+def _checkpoint_storage_stats(conn: sqlite3.Connection) -> dict:
+    page_size = int(conn.execute("pragma page_size").fetchone()[0])
+    page_count = int(conn.execute("pragma page_count").fetchone()[0])
+    freelist_count = int(conn.execute("pragma freelist_count").fetchone()[0])
+    checkpoint_bytes = int(
+        conn.execute(
+            "select coalesce(sum(coalesce(length(checkpoint), 0) + coalesce(length(metadata), 0)), 0) "
+            "from checkpoints"
+        ).fetchone()[0]
+    )
+    write_bytes = int(
+        conn.execute("select coalesce(sum(coalesce(length(value), 0)), 0) from writes").fetchone()[0]
+    )
+    thread_count = int(
+        conn.execute(
+            "select count(distinct thread_id) from checkpoints where thread_id like 'swarm:%'"
+        ).fetchone()[0]
+    )
+    return {
+        "thread_count": thread_count,
+        "db_size_bytes": page_size * page_count,
+        "free_bytes": page_size * freelist_count,
+        "live_payload_bytes": checkpoint_bytes + write_bytes,
+    }
+
+
+def _checkpoint_thread_usage(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
-        "select thread_id, max(rowid) as latest_row from checkpoints "
-        "where thread_id like 'swarm:%' group by thread_id order by latest_row desc"
+        """
+        with checkpoint_usage as (
+            select thread_id,
+                   max(rowid) as latest_row,
+                   sum(coalesce(length(checkpoint), 0) + coalesce(length(metadata), 0)) as checkpoint_bytes
+            from checkpoints
+            where thread_id like 'swarm:%'
+            group by thread_id
+        ),
+        write_usage as (
+            select thread_id, sum(coalesce(length(value), 0)) as write_bytes
+            from writes
+            where thread_id like 'swarm:%'
+            group by thread_id
+        )
+        select c.thread_id,
+               c.latest_row,
+               c.checkpoint_bytes + coalesce(w.write_bytes, 0) as payload_bytes
+        from checkpoint_usage c
+        left join write_usage w on w.thread_id = c.thread_id
+        order by c.latest_row desc
+        """
     ).fetchall()
+    return [
+        {
+            "thread_id": str(row[0]),
+            "latest_row": int(row[1]),
+            "payload_bytes": int(row[2] or 0),
+        }
+        for row in rows
+    ]
+
+
+def _prune_checkpoint_threads(
+    saver: Any,
+    conn: sqlite3.Connection,
+    retain: int,
+    max_storage_mb: float | None = None,
+) -> int:
+    retain = max(4, int(retain))
+    saver.setup()
+    rows = _checkpoint_thread_usage(conn)
+    keep_count = min(retain, len(rows))
+    if max_storage_mb is not None and rows:
+        budget_bytes = max(1024, int(float(max_storage_mb) * 1024 * 1024))
+        budget_keep_count = 0
+        retained_payload = 0
+        for index, row in enumerate(rows[:retain]):
+            next_payload = retained_payload + row["payload_bytes"]
+            if index >= 2 and next_payload > budget_bytes:
+                break
+            retained_payload = next_payload
+            budget_keep_count = index + 1
+        keep_count = min(keep_count, max(2, budget_keep_count))
     removed = 0
-    for thread_id, _latest_row in rows[retain:]:
-        saver.delete_thread(str(thread_id))
+    for row in rows[keep_count:]:
+        saver.delete_thread(row["thread_id"])
         removed += 1
+    conn.commit()
     return removed
+
+
+def _compact_checkpoint_database(conn: sqlite3.Connection, minimum_reclaim_mb: float) -> bool:
+    stats = _checkpoint_storage_stats(conn)
+    minimum_reclaim_bytes = max(0, int(float(minimum_reclaim_mb) * 1024 * 1024))
+    if stats["free_bytes"] < minimum_reclaim_bytes:
+        return False
+    conn.commit()
+    conn.execute("vacuum")
+    return True
 
 
 def _invoke_graph(graph: Any, initial: SwarmState, settings: dict) -> tuple[SwarmState, dict]:
@@ -938,8 +1063,16 @@ def _invoke_graph(graph: Any, initial: SwarmState, settings: dict) -> tuple[Swar
         pruned = _prune_checkpoint_threads(
             saver,
             checkpoint_conn,
-            int(cfg.get("checkpoint_retention_cycles", 250)),
+            int(cfg.get("checkpoint_retention_cycles", 48)),
+            float(cfg.get("checkpoint_max_storage_mb", 64)),
         )
+        compacted = False
+        if pruned and cfg.get("checkpoint_compact_on_prune", True):
+            compacted = _compact_checkpoint_database(
+                checkpoint_conn,
+                float(cfg.get("checkpoint_vacuum_min_reclaim_mb", 16)),
+            )
+        storage = _checkpoint_storage_stats(checkpoint_conn)
     finally:
         checkpoint_conn.close()
     return output, {
@@ -947,6 +1080,10 @@ def _invoke_graph(graph: Any, initial: SwarmState, settings: dict) -> tuple[Swar
         "path": str(path),
         "thread_id": initial["cycle_id"],
         "pruned_threads": pruned,
+        "compacted": compacted,
+        "retention_cycles": int(cfg.get("checkpoint_retention_cycles", 48)),
+        "max_storage_mb": float(cfg.get("checkpoint_max_storage_mb", 64)),
+        **storage,
     }
 
 
@@ -963,9 +1100,16 @@ def run_langgraph_if_available(
     except Exception:
         return run_sequential(packet, memory, settings, cycle_id)
 
+    runtime_role_memory = _coerce_role_memory(memory)
+
     def make_node(agent: dict):
         def node(state: SwarmState) -> SwarmState:
-            return _run_agent_node(agent, state)
+            return _run_agent_node(
+                agent,
+                state,
+                runtime_packet=packet,
+                runtime_role_memory=runtime_role_memory,
+            )
 
         return node
 
@@ -997,9 +1141,22 @@ def run_langgraph_if_available(
     graph.add_edge("build_planner", "ranker")
     graph.add_edge("ranker", "memory_checkpoint")
     graph.add_edge("memory_checkpoint", END)
-    initial = _initial_state(packet, memory, COLLABORATION_MODE, cycle_id)
+    initial = _initial_state(
+        packet,
+        runtime_role_memory,
+        COLLABORATION_MODE,
+        cycle_id,
+        persist_runtime_context=False,
+    )
     output, checkpoint = _invoke_graph(graph, initial, settings)
-    output["checkpoint"] = checkpoint
+    output["checkpoint"] = {
+        **checkpoint,
+        "runtime_context": output.get("checkpoint_context", {}),
+    }
+    output["memory_context_counts"] = {
+        name: len(items)
+        for name, items in runtime_role_memory.items()
+    }
     LAST_SWARM_STATE = dict(output)
     return list(output.get("ranked_actions", []))
 
@@ -1094,7 +1251,7 @@ def write_recommendations(
                 "action_package": action_package,
                 "checkpoint": state.get("checkpoint", {}),
                 "memory_reflection": state.get("memory_reflection", {}),
-                "memory_context_counts": {
+                "memory_context_counts": state.get("memory_context_counts") or {
                     name: len(items)
                     for name, items in (state.get("role_memory") or {}).items()
                 },

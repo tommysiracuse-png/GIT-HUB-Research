@@ -204,7 +204,10 @@ DEFAULT_SETTINGS = {
         "retrieval_log_retention_rows": 10000,
         "checkpoint_enabled": True,
         "checkpoint_path": "runs/langgraph_checkpoints.sqlite",
-        "checkpoint_retention_cycles": 250,
+        "checkpoint_retention_cycles": 48,
+        "checkpoint_max_storage_mb": 64,
+        "checkpoint_compact_on_prune": True,
+        "checkpoint_vacuum_min_reclaim_mb": 16,
         "graphiti": {
             "mode": "auto",
             "uri_env": "GRAPHITI_URI",
