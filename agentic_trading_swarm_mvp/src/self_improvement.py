@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import json
 import re
+import shlex
 import sqlite3
 
 from storage import (
@@ -41,7 +42,7 @@ from strategy_lab import (
 from code_evolution import (
     code_evolution_summary,
     evaluate_code_evolution,
-    process_code_change_recommendation,
+    process_code_change_recommendation as _process_code_change_recommendation,
     write_code_evolution_reports,
 )
 from self_improvement_open_pack import IMPLEMENTED_STATUS as OPEN_PACK_IMPLEMENTED_STATUS
@@ -69,6 +70,11 @@ RECOMMENDATION_ALLOWED_FILES = {
 }
 RECOMMENDATION_REJECTION_TTL_SECONDS = 6 * 3600
 _CONSUMER_REJECTION_CACHE: dict[str, dt.datetime] = {}
+_SAFE_CODE_EVOLUTION_TEST_FALLBACK = (
+    "python -m unittest tests.test_code_evolution_runner",
+    "python -m unittest tests.test_test_command_policy",
+    "python -m unittest discover -s tests -p test_*self_improvement*.py",
+)
 
 
 def _utc_now_dt() -> dt.datetime:
@@ -159,6 +165,166 @@ def _coerce_string_list(value: object) -> list[str]:
         seen.add(text)
         normalized_items.append(text)
     return normalized_items
+
+
+def _command_list(value: object) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item or "").strip()]
+    return [str(value)]
+
+
+def _clean_command_text(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith("```") and text.endswith("```"):
+        text = text[3:-3].strip()
+    text = text.strip().strip("`").strip()
+    text = re.sub(r"^\s*(?:\d+[.)]\s*|[-*]\s*)", "", text)
+    text = re.sub(
+        r"^\s*(?:command|cmd|tests?_to_run|tests?|run)\s*:\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text.strip()
+
+
+def _looks_like_python_executable(token: str) -> bool:
+    base = str(token or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return base in {"python", "python.exe", "py", "py.exe"} or base.startswith("python3")
+
+
+def _normalize_unittest_target_token(token: str) -> str:
+    text = str(token or "").strip()
+    if not text:
+        return text
+    if text.startswith("-") or text == "discover":
+        return text
+    if text.startswith("./"):
+        text = text[2:]
+    candidate = text.replace("\\", "/")
+    if candidate.endswith(".py") and not any(ch in candidate for ch in "*?[]"):
+        candidate = candidate[:-3].strip("/")
+        if candidate:
+            return candidate.replace("/", ".")
+    return text
+
+
+def _normalize_unittest_command(command: object) -> str | None:
+    if isinstance(command, (list, tuple)):
+        tokens = [str(part).strip() for part in command if str(part).strip()]
+    else:
+        text = _clean_command_text(str(command or ""))
+        if not text:
+            return None
+        if any(operator in text for operator in ("&&", "||", ";", "|", ">", "<")):
+            return None
+        try:
+            tokens = shlex.split(text, posix=True)
+        except ValueError:
+            return None
+    if len(tokens) < 3 or not _looks_like_python_executable(tokens[0]):
+        return None
+    if tokens[1] != "-m" or tokens[2] != "unittest":
+        return None
+    normalized_tokens = ["python", "-m", "unittest"]
+    for token in tokens[3:]:
+        if any(operator in token for operator in ("&&", "||", ";", "|", ">", "<")):
+            return None
+        normalized_tokens.append(_normalize_unittest_target_token(token))
+    return " ".join(part for part in normalized_tokens if part)
+
+
+def _normalize_code_change_test_commands(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized_payload = dict(payload)
+    requested_commands: list[str] = []
+    source_keys: list[str] = []
+    for key in ("tests_to_run", "test_command"):
+        values = _command_list(payload.get(key))
+        if values:
+            source_keys.append(key)
+            requested_commands.extend(values)
+
+    for parent_key in ("code_change", "autonomous_plan"):
+        parent = payload.get(parent_key)
+        if not isinstance(parent, dict):
+            continue
+        for child_key in ("tests_to_run", "test_command"):
+            values = _command_list(parent.get(child_key))
+            if values:
+                source_keys.append(f"{parent_key}.{child_key}")
+                requested_commands.extend(values)
+
+    requested_commands = [str(command).strip() for command in requested_commands if str(command).strip()]
+    normalized_commands: list[str] = []
+    rejected_commands: list[str] = []
+    for command in requested_commands:
+        normalized_command = _normalize_unittest_command(command)
+        if normalized_command:
+            if normalized_command not in normalized_commands:
+                normalized_commands.append(normalized_command)
+            continue
+        rejected_commands.append(command)
+
+    used_fallback = not normalized_commands
+    if used_fallback:
+        normalized_commands = list(_SAFE_CODE_EVOLUTION_TEST_FALLBACK)
+
+    consumer_validation = (
+        dict(normalized_payload.get("consumer_validation") or {})
+        if isinstance(normalized_payload.get("consumer_validation"), dict)
+        else {}
+    )
+    consumer_validation["normalized_test_commands"] = True
+
+    test_command_policy = (
+        dict(normalized_payload.get("test_command_policy") or {})
+        if isinstance(normalized_payload.get("test_command_policy"), dict)
+        else {}
+    )
+    test_command_policy.update(
+        {
+            "original_test_commands": requested_commands,
+            "normalized_test_commands": list(normalized_commands),
+            "rejected_test_commands": rejected_commands,
+            "source_keys": source_keys,
+            "used_fallback": used_fallback,
+            "fallback_reason": "missing_or_invalid_unittest_command" if used_fallback else None,
+            "repaired": bool(
+                used_fallback
+                or rejected_commands
+                or normalized_commands != requested_commands
+            ),
+        }
+    )
+
+    normalized_payload["consumer_validation"] = consumer_validation
+    normalized_payload["test_command_policy"] = test_command_policy
+    normalized_payload["tests_to_run"] = list(normalized_commands)
+    normalized_payload["test_command"] = normalized_commands[0]
+
+    for parent_key in ("code_change", "autonomous_plan"):
+        parent = normalized_payload.get(parent_key)
+        if not isinstance(parent, dict):
+            continue
+        parent_copy = dict(parent)
+        parent_copy["tests_to_run"] = list(normalized_commands)
+        parent_copy["test_command"] = normalized_commands[0]
+        normalized_payload[parent_key] = parent_copy
+
+    return normalized_payload
+
+
+def process_code_change_recommendation(conn: sqlite3.Connection, rec: dict):
+    normalized_rec = dict(rec)
+    normalized_rec["payload"] = _normalize_code_change_test_commands(dict(rec.get("payload") or {}))
+    return _process_code_change_recommendation(conn, normalized_rec)
 
 
 def _canonical_strategy_lab_key(payload: dict) -> str:
