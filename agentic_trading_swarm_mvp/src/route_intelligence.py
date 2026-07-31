@@ -40,6 +40,8 @@ ROUTE_REQUIREMENT_FIELDS = (
     "paper_route_only",
     "paper_feasibility",
     "paper_proxy_route",
+    "feasibility_state",
+    "route_friction_bps",
     "paper_proxy_not_live_equivalent",
     "route_type",
     "route_feasible_paper",
@@ -75,7 +77,10 @@ def build_route_requirements_matrix(
     requirement metadata and explicit unknown placeholders.
     """
 
-    rows = [_build_route_requirement_row(opportunity) for opportunity in opportunities]
+    rows = []
+    for opportunity in opportunities:
+        row = _build_route_requirement_row(opportunity)
+        rows.append(_annotate_route_feasibility_fields(opportunity, row))
     return sorted(rows, key=_route_priority_key)
 
 
@@ -105,8 +110,54 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
     gated: list[dict[str, Any]] = []
     reason_counts: dict[str, int] = {}
     decay_flip_guard_count = 0
+
     for opportunity in opportunities:
-        reasons = _conditional_gate_reasons(opportunity)
+        blockers = _route_blockers(opportunity)
+        proxy_route = _paper_proxy_route(opportunity, blockers=blockers)
+        paper_feasibility = _paper_feasibility(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=proxy_route,
+        )
+        route_feasible_paper = _route_feasible_paper(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=proxy_route,
+        )
+        route_friction_bps, _ = _paper_route_cost_bps(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=proxy_route,
+        )
+        feasibility_fields = _annotate_route_feasibility_fields(
+            opportunity,
+            {},
+            blockers=blockers,
+            paper_proxy_route=proxy_route,
+            paper_feasibility=paper_feasibility,
+            route_feasible_paper=route_feasible_paper,
+            route_cost_bps_paper=route_friction_bps,
+        )
+        feasibility_state = str(feasibility_fields.get("feasibility_state") or UNKNOWN)
+        edge_bps_estimate = _first_known(
+            opportunity,
+            "edge_bps_estimate",
+            "net_edge_after_borrow_cost_bps",
+            "depth_adjusted_edge_bps",
+        )
+        edge_bps_number = _float_or_none(edge_bps_estimate)
+        reasons = list(_conditional_gate_reasons(opportunity))
+        if feasibility_state == "unsupported":
+            reasons.append("unsupported_route")
+        elif feasibility_state == "requires_borrow":
+            reasons.append("spot_borrow_unconfirmed")
+            if edge_bps_number is None or route_friction_bps >= edge_bps_number:
+                reasons.append("borrow_route_friction_exceeds_edge")
+        elif feasibility_state == "requires_margin":
+            reasons.append("margin_permission_unconfirmed")
+            if edge_bps_number is None or route_friction_bps >= edge_bps_number:
+                reasons.append("margin_route_friction_exceeds_edge")
+        reasons = list(dict.fromkeys(reasons))
         if not reasons:
             continue
         for reason in reasons:
@@ -122,13 +173,10 @@ def build_conditional_paper_quality_gate(opportunities: Iterable[dict[str, Any]]
                 "direction": str(opportunity.get("direction") or UNKNOWN),
                 "route_status": _paper_route_status(opportunity),
                 "route_blockers": _route_blockers(opportunity),
+                "feasibility_state": feasibility_state,
+                "route_friction_bps": feasibility_fields.get("route_friction_bps", UNKNOWN),
                 "quality_action": str(opportunity.get("quality_action") or UNKNOWN),
-                "edge_bps_estimate": _first_known(
-                    opportunity,
-                    "edge_bps_estimate",
-                    "net_edge_after_borrow_cost_bps",
-                    "depth_adjusted_edge_bps",
-                ),
+                "edge_bps_estimate": edge_bps_estimate,
                 "paper_policy_action": _conditional_paper_policy_action(opportunity),
                 "paper_policy_guard": _conditional_decay_flip_guard(opportunity),
                 "reasons": reasons,
@@ -254,6 +302,7 @@ def build_route_playbook_summary(opportunities: Iterable[dict[str, Any]]) -> dic
 def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> dict[str, Any]:
     opportunities = list(opportunities)
     counts: dict[str, int] = {}
+    feasibility_states: dict[str, int] = {}
     proxy_routes: dict[str, int] = {}
     route_types: dict[str, int] = {}
     route_costs: list[float] = []
@@ -276,7 +325,18 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
             blockers=blockers,
             paper_proxy_route=proxy_route,
         )
+        feasibility_fields = _annotate_route_feasibility_fields(
+            opportunity,
+            {},
+            blockers=blockers,
+            paper_proxy_route=proxy_route,
+            paper_feasibility=feasibility,
+            route_feasible_paper=route_feasible_paper,
+            route_cost_bps_paper=route_cost_bps_paper,
+        )
+        feasibility_state = str(feasibility_fields.get("feasibility_state") or UNKNOWN)
         counts[feasibility] = counts.get(feasibility, 0) + 1
+        feasibility_states[feasibility_state] = feasibility_states.get(feasibility_state, 0) + 1
         route_types[route_type] = route_types.get(route_type, 0) + 1
         if proxy_route != "not_applicable":
             proxy_routes[proxy_route] = proxy_routes.get(proxy_route, 0) + 1
@@ -290,6 +350,7 @@ def build_route_feasibility_summary(opportunities: Iterable[dict[str, Any]]) -> 
     return {
         "paper_only": True,
         "counts_by_feasibility": dict(sorted(counts.items())),
+        "counts_by_feasibility_state": dict(sorted(feasibility_states.items())),
         "counts_by_route_type": dict(sorted(route_types.items())),
         "proxy_routes": dict(sorted(proxy_routes.items())),
         "estimated_route_cost_bps": estimated_cost_summary,
@@ -310,6 +371,93 @@ def _float_or_none(value: Any) -> float | None:
 
 def _numeric_field(opportunity: dict[str, Any], *keys: str) -> float | None:
     return _float_or_none(_first_known(opportunity, *keys))
+
+
+def _annotate_route_feasibility_fields(
+    opportunity: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+    paper_proxy_route: str | None = None,
+    paper_feasibility: str | None = None,
+    route_feasible_paper: bool | str | None = None,
+    route_cost_bps_paper: float | None = None,
+) -> dict[str, Any]:
+    blockers = blockers if blockers is not None else _route_blockers(opportunity)
+    paper_proxy_route = paper_proxy_route or _paper_proxy_route(opportunity, blockers=blockers)
+    paper_feasibility = paper_feasibility or _paper_feasibility(
+        opportunity,
+        blockers=blockers,
+        paper_proxy_route=paper_proxy_route,
+    )
+    if route_feasible_paper is None:
+        route_feasible_paper = _route_feasible_paper(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=paper_proxy_route,
+        )
+    if route_cost_bps_paper is None:
+        route_cost_bps_paper, _ = _paper_route_cost_bps(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=paper_proxy_route,
+        )
+    borrow_required = _requires_spot_borrow(opportunity, blockers=blockers)
+    requires_margin_permission = _requires_margin_permission(
+        opportunity,
+        blockers=blockers,
+        borrow_required=borrow_required,
+    )
+    row["feasibility_state"] = _paper_route_feasibility_state(
+        opportunity,
+        blockers=blockers,
+        paper_proxy_route=paper_proxy_route,
+        paper_feasibility=paper_feasibility,
+        route_feasible_paper=route_feasible_paper,
+        borrow_required=borrow_required,
+        requires_margin_permission=requires_margin_permission,
+    )
+    friction_bps = _float_or_none(route_cost_bps_paper)
+    row["route_friction_bps"] = round(friction_bps, 4) if friction_bps is not None else UNKNOWN
+    return row
+
+
+def _paper_route_feasibility_state(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str] | None = None,
+    paper_proxy_route: str | None = None,
+    paper_feasibility: str | None = None,
+    route_feasible_paper: bool | str | None = None,
+    borrow_required: bool = False,
+    requires_margin_permission: bool | str = UNKNOWN,
+) -> str:
+    paper_feasibility = str(
+        paper_feasibility
+        or _paper_feasibility(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=paper_proxy_route,
+        )
+        or UNKNOWN
+    )
+    if route_feasible_paper is None:
+        route_feasible_paper = _route_feasible_paper(
+            opportunity,
+            blockers=blockers,
+            paper_proxy_route=paper_proxy_route,
+        )
+    if paper_feasibility == "blocked" or route_feasible_paper is False:
+        return "unsupported"
+    if _frontier_spot_short_capability_confirmed(opportunity) is True:
+        return "supported"
+    if borrow_required:
+        return "requires_borrow"
+    if requires_margin_permission is True:
+        return "requires_margin"
+    if paper_feasibility in {"direct_feasible", "proxy_only"}:
+        return "supported"
+    return UNKNOWN
 
 
 def _route_type(
