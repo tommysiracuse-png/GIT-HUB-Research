@@ -399,7 +399,19 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                 "Result",
                 (),
                 {
-                    "text": "diff --git a/src/frontier_crypto_adapter.py b/src/frontier_crypto_adapter.py\n",
+                    "text": json.dumps(
+                        {
+                            "summary": "Add a focused module marker.",
+                            "edits": [
+                                {
+                                    "path": "src/frontier_crypto_adapter.py",
+                                    "operation": "replace",
+                                    "old_text": "\"\"\"Frontier crypto venue adapter.",
+                                    "new_text": "\"\"\"Frontier crypto venue discovery and quality adapter.",
+                                }
+                            ],
+                        }
+                    ),
                     "status": "model_call:responses",
                     "model_name": "openai/gpt-5.6-sol",
                     "model_tier": "frontier",
@@ -410,10 +422,11 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
             )()
             diff, meta = code_evolution.generate_patch_with_frontier_model(payload, settings())
         self.assertIn("src/frontier_crypto_adapter.py", complete.call_args.args[1])
-        self.assertIn("BUILDER_CONTEXT version=1", complete.call_args.args[1])
+        self.assertIn("BUILDER_CONTEXT version=2", complete.call_args.args[1])
         self.assertTrue(diff.startswith("diff --git"))
         self.assertEqual(meta["status"], "model_call:responses")
-        self.assertEqual(meta["builder_context"]["version"], 1)
+        self.assertEqual(meta["builder_context"]["version"], 2)
+        self.assertEqual(meta["edit_compilation"]["status"], "compiled")
 
     def test_patch_repair_reloads_current_builder_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -443,7 +456,19 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                     "Result",
                     (),
                     {
-                        "text": "diff --git a/src/llm_bridge.py b/src/llm_bridge.py\n",
+                        "text": json.dumps(
+                            {
+                                "summary": "Repair against current text.",
+                                "edits": [
+                                    {
+                                        "path": "src/llm_bridge.py",
+                                        "operation": "replace",
+                                        "old_text": "return 'current file text'",
+                                        "new_text": "return 'current file text repaired'",
+                                    }
+                                ],
+                            }
+                        ),
                         "status": "model_call:responses",
                         "model_name": "openai/gpt-5.4-mini",
                         "model_tier": "fast",
@@ -461,7 +486,7 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                 )
 
         prompt = complete.call_args.args[1]
-        self.assertIn("BUILDER_CONTEXT version=1", prompt)
+        self.assertIn("BUILDER_CONTEXT version=2", prompt)
         self.assertIn("current_function", prompt)
         self.assertIn("current file text", prompt)
         self.assertEqual(meta["builder_context"]["files"][0]["path"], "src/llm_bridge.py")

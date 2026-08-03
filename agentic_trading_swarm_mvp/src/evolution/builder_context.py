@@ -21,12 +21,50 @@ def _python_symbols(text: str) -> list[str]:
     return sorted(dict.fromkeys(symbols))[:40]
 
 
+def _focused_file_text(text: str, max_chars: int, focus_text: str) -> tuple[str, bool]:
+    """Return exact source windows that are relevant to the current proposal."""
+
+    if len(text) <= max_chars:
+        return text, False
+    terms = sorted(_tokens(focus_text), key=len, reverse=True)[:30]
+    lines = text.splitlines(keepends=True)
+    scored: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        score = sum(3 if f"def {term}" in lowered or f"class {term}" in lowered else 1 for term in terms if term in lowered)
+        if score:
+            scored.append((score, index))
+    selected: set[int] = set(range(min(50, len(lines))))
+    for _score, index in sorted(scored, key=lambda item: (-item[0], item[1]))[:12]:
+        selected.update(range(max(0, index - 18), min(len(lines), index + 35)))
+    chunks: list[str] = []
+    last = -2
+    used = 0
+    for index in sorted(selected):
+        if index != last + 1 and chunks:
+            marker = "\n# ... builder context omitted; anchors below remain exact ...\n"
+            if used + len(marker) > max_chars:
+                break
+            chunks.append(marker)
+            used += len(marker)
+        line = lines[index]
+        if used + len(line) > max_chars:
+            break
+        chunks.append(line)
+        used += len(line)
+        last = index
+    if not chunks:
+        return text[:max_chars], True
+    return "".join(chunks), True
+
+
 def build_builder_context(
     root: pathlib.Path,
     files: list[str],
     *,
     max_chars: int,
     likely_tests: list[str] | None = None,
+    focus_text: str = "",
 ) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for rel in files:
@@ -40,21 +78,20 @@ def build_builder_context(
                 text = ""
             entry["sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
             entry["symbols"] = _python_symbols(text) if rel.endswith(".py") else []
-            entry["text"] = text[:max_chars]
-            entry["truncated"] = len(text) > max_chars
+            entry["text"], entry["truncated"] = _focused_file_text(text, max_chars, focus_text)
         else:
             entry["text"] = "<missing file>"
             entry["symbols"] = []
         entries.append(entry)
     return {
-        "version": 1,
+        "version": 2,
         "files": entries,
         "likely_tests": likely_tests or [],
     }
 
 
 def render_builder_context(context: dict[str, Any]) -> str:
-    lines = ["BUILDER_CONTEXT version=1"]
+    lines = [f"BUILDER_CONTEXT version={context.get('version', 1)}"]
     likely_tests = context.get("likely_tests") or []
     if likely_tests:
         lines.append("LIKELY_TESTS:")

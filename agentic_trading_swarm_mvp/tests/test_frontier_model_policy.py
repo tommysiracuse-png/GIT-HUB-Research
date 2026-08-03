@@ -86,6 +86,27 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertTrue(kwargs["structured_json"])
         self.assertEqual(captured[0].api, "responses")
 
+    def test_quota_failure_opens_shared_circuit_before_more_paid_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            cost_router, "QUOTA_STATE_PATH", pathlib.Path(tmp) / "quota.json"
+        ), mock.patch.dict(
+            os.environ, {"RADAR_USE_LITELLM": "1", "OPENAI_API_KEY": "test"}, clear=False
+        ), mock.patch.object(
+            cost_router, "_spent_today", return_value=0.0
+        ), mock.patch.object(
+            cost_router, "_log"
+        ), mock.patch.object(
+            cost_router,
+            "_complete_openai_responses",
+            side_effect=RuntimeError("429 insufficient_quota"),
+        ) as call:
+            first = cost_router.complete("market_scout", "one", tier_override="fast")
+            second = cost_router.complete("red_team", "two", tier_override="fast")
+
+        self.assertIn("insufficient_quota", first.status)
+        self.assertTrue(second.status.startswith("quota_circuit_open_until:"))
+        self.assertEqual(1, call.call_count)
+
     def test_swarm_escalates_market_scout_for_large_quality_gap(self) -> None:
         packet = {
             "expansion_map": {

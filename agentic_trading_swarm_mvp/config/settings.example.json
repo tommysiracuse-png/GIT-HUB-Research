@@ -334,7 +334,13 @@
   },
   "evolution_worker": {
     "enabled": true,
-    "interval_seconds": 300
+    "interval_seconds": 300,
+    "defer_generic_builder_when_targeted_code_attempted": true
+  },
+  "adapter_implementation_owner": {
+    "enabled": true,
+    "min_minutes_between_attempts": 15,
+    "scan_limit": 100
   },
   "research_worker": {
     "enabled": true,
@@ -359,7 +365,7 @@
     "enabled": true,
     "auto_run": true,
     "run_in_radar_loop": false,
-    "min_minutes_between_runs": 0,
+    "min_minutes_between_runs": 20,
     "lock_stale_minutes": 180,
     "model_tier": "standard",
     "plan_max_context_chars": 35000,

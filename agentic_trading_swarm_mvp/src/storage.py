@@ -1826,6 +1826,8 @@ def llm_cost_summary(conn: sqlite3.Connection) -> dict:
     total = sum(float(row["cost"] or 0) for row in rows)
     return {
         "daily_estimated_cost_usd": round(total, 6),
+        "cost_measurement": "local_estimate_from_logged_usage_not_provider_invoice",
+        "provider_billing_authoritative": True,
         "by_agent": [dict(row) for row in rows],
         "by_model": [dict(row) for row in by_model],
         "by_operation": [dict(row) for row in by_operation],
@@ -2579,7 +2581,7 @@ def open_adapter_specs(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
         select id, created_at, source_recommendation_id, market_key, priority,
                title, status, spec_json, evidence_json
         from adapter_specs
-        where status in ('open', 'adapter_capability_gap')
+        where status in ('open', 'adapter_capability_gap', 'implementation_queued_retry')
         order by priority desc, id asc
         limit ?
         """,

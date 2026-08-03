@@ -40,7 +40,7 @@ class BuilderContextTests(unittest.TestCase):
         self.assertIn("Demo", entry["symbols"])
         self.assertIn("run_demo", entry["symbols"])
         self.assertIn("sha256", entry)
-        self.assertIn("BUILDER_CONTEXT version=1", rendered)
+        self.assertIn("BUILDER_CONTEXT version=2", rendered)
         self.assertIn("python -m unittest tests/test_sample.py", rendered)
 
     def test_context_records_missing_files_without_crashing(self) -> None:

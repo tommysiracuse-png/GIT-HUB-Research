@@ -256,7 +256,10 @@ def reconcile_adapter_specs(conn: sqlite3.Connection) -> dict:
             select id, created_at, source_recommendation_id, market_key, priority,
                    title, status, spec_json, evidence_json
             from adapter_specs
-            where status in ('open', 'adapter_capability_gap', 'resolved_existing_adapter_capability')
+            where status in (
+                'open', 'adapter_capability_gap', 'resolved_existing_adapter_capability',
+                'deployed_waiting_acceptance', 'implementation_failed_review'
+            )
             order by priority desc, id asc
             """
         ).fetchall()
@@ -276,7 +279,15 @@ def reconcile_adapter_specs(conn: sqlite3.Connection) -> dict:
                 status = "superseded_duplicate_adapter_spec"
                 evidence["canonical_spec_id"] = items[0][0]["id"]
             elif match["match_status"] == "fully_covered":
-                status = "resolved_existing_adapter_capability"
+                status = (
+                    "implemented_runtime_adapter"
+                    if row.get("status") == "deployed_waiting_acceptance"
+                    else "resolved_existing_adapter_capability"
+                )
+            elif row.get("status") == "deployed_waiting_acceptance":
+                status = "deployed_acceptance_failed"
+            elif row.get("status") == "implementation_failed_review":
+                status = "implementation_failed_review"
             elif match["match_status"] == "partial_capability_gap":
                 status = "adapter_capability_gap"
             else:

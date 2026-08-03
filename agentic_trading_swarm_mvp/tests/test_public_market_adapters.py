@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import adapter_capabilities
+import adapter_implementation_owner
 import adapter_runtime
 import code_evolution
 import storage
@@ -218,6 +219,81 @@ class AdapterCapabilityTests(unittest.TestCase):
         self.assertEqual("resolved_existing_adapter_capability", statuses[0])
         self.assertEqual("superseded_duplicate_adapter_spec", statuses[1])
         self.assertEqual(2, report["summary"]["specs_reconciled"])
+
+
+class AdapterImplementationOwnerTests(unittest.TestCase):
+    def test_owner_turns_best_tradable_spec_into_concrete_plugin_proposal(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        storage.add_adapter_spec(
+            conn,
+            "watch-only",
+            "global_discovery|Watch Market",
+            99,
+            "Watch-only auction surface",
+            {
+                "candidate": {
+                    "venue_or_source": "Watch Market",
+                    "data_access_type": "public_no_key",
+                    "tradability_guess": "watch_only",
+                    "confidence": 0.99,
+                    "public_docs_url": "https://example.test/watch",
+                    "source_validation_status": "public_url_present",
+                }
+            },
+            {},
+        )
+        storage.add_adapter_spec(
+            conn,
+            "tradable",
+            "global_discovery|Nairobi Coffee Exchange",
+            90,
+            "Nairobi Coffee Exchange public prices",
+            {
+                "candidate": {
+                    "candidate_id": "coffee-1",
+                    "venue_or_source": "Nairobi Coffee Exchange",
+                    "asset_or_event": "coffee auction settlement prices",
+                    "data_access_type": "public_no_key",
+                    "tradability_guess": "directly_tradable",
+                    "confidence": 0.91,
+                    "public_docs_url": "https://example.test/coffee",
+                    "source_validation_status": "public_url_present",
+                }
+            },
+            {},
+        )
+        captured = {}
+
+        def fake_process(_conn, recommendation, _settings):
+            captured.update(recommendation)
+            return [{"proposal_id": "adapter-code-1", "action_status": "created", "status": "promoted"}]
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            adapter_implementation_owner, "REPORT_JSON", pathlib.Path(tmp) / "owner.json"
+        ), mock.patch.object(
+            adapter_implementation_owner, "REPORT_MD", pathlib.Path(tmp) / "owner.md"
+        ), mock.patch.object(
+            adapter_implementation_owner, "MARKER", pathlib.Path(tmp) / "owner.marker"
+        ), mock.patch.object(
+            adapter_implementation_owner, "process_code_change_recommendation", side_effect=fake_process
+        ):
+            report = adapter_implementation_owner.run_once(
+                conn,
+                {"adapter_implementation_owner": {"enabled": True, "min_minutes_between_attempts": 0}},
+            )
+
+        self.assertEqual("deployed_waiting_acceptance", report["status"])
+        self.assertEqual("adapter-spec:2:implementation", captured["recommendation_id"])
+        payload = captured["payload"]
+        self.assertEqual("public_data_adapter", payload["code_change"]["change_category"])
+        self.assertIn(
+            "src/adapters/venues/nairobi_coffee_exchange.py",
+            payload["code_change"]["expected_files"],
+        )
+        status = conn.execute("select status from adapter_specs where id = 2").fetchone()["status"]
+        self.assertEqual("deployed_waiting_acceptance", status)
         conn.close()
 
     def test_reconciliation_reopens_resolved_spec_when_capability_is_not_deployed(self) -> None:

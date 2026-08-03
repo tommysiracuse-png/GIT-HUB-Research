@@ -337,6 +337,12 @@ DEFAULT_SETTINGS = {
     "evolution_worker": {
         "enabled": True,
         "interval_seconds": 300,
+        "defer_generic_builder_when_targeted_code_attempted": True,
+    },
+    "adapter_implementation_owner": {
+        "enabled": True,
+        "min_minutes_between_attempts": 15,
+        "scan_limit": 100,
     },
     "research_worker": {
         "enabled": True,
@@ -361,7 +367,7 @@ DEFAULT_SETTINGS = {
         "enabled": True,
         "auto_run": True,
         "run_in_radar_loop": False,
-        "min_minutes_between_runs": 0,
+        "min_minutes_between_runs": 20,
         "lock_stale_minutes": 180,
         "model_tier": "standard",
         "plan_max_context_chars": 35000,

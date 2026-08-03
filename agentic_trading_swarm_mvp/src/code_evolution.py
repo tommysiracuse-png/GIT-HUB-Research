@@ -10,6 +10,7 @@ install repo-declared Python dependencies after sandbox validation.
 from __future__ import annotations
 
 import datetime as dt
+import difflib
 import hashlib
 import json
 import os
@@ -3348,7 +3349,7 @@ def _patch_generation_unavailable_reason(patch_generation: dict | None) -> str |
         return "missing_provider_key"
     if "agent_budget_guard" in status or "global_budget_guard" in status:
         return "budget_guard"
-    if "insufficient_quota" in status or "429" in status:
+    if "insufficient_quota" in status or "quota_circuit_open" in status or "429" in status:
         return "quota_429"
     if "connection error" in status or "api connection" in status:
         return "connection_error"
@@ -3665,6 +3666,143 @@ def _builder_context_metadata(context: dict) -> dict:
     }
 
 
+def _parse_structured_edit_response(value: str) -> dict | None:
+    """Recover the JSON edit contract without treating prose as a patch."""
+
+    text = _strip_fence(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _render_file_diff(path: str, before: str, after: str, *, existed: bool) -> str:
+    if before == after:
+        return ""
+    before_lines = before.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+    body = list(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=f"a/{path}" if existed else "/dev/null",
+            tofile=f"b/{path}",
+            lineterm="\n",
+        )
+    )
+    if not body:
+        return ""
+    header = [f"diff --git a/{path} b/{path}\n"]
+    if not existed:
+        header.append("new file mode 100644\n")
+    rendered = "".join([*header, *body])
+    return rendered if rendered.endswith("\n") else rendered + "\n"
+
+
+def _structured_edits_to_diff(
+    response_text: str,
+    payload: dict,
+    preflight: dict,
+    settings: dict,
+    *,
+    root: pathlib.Path,
+) -> tuple[str, dict]:
+    """Compile exact anchored model edits into a deterministic unified diff."""
+
+    parsed = _parse_structured_edit_response(response_text)
+    if parsed is None:
+        return "", {"status": "invalid_json", "errors": ["response_is_not_a_json_object"]}
+    edits = parsed.get("edits")
+    if not isinstance(edits, list) or not edits:
+        return "", {"status": "invalid_edits", "errors": ["missing_nonempty_edits"]}
+
+    cfg = _cfg(settings)
+    category = _normalize_category(_field(payload, "change_category", "category"))
+    safe_existing = set(preflight.get("target_files") or [])
+    file_states: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    applied = 0
+    max_edits = int(cfg.get("structured_edit_max_operations", 16))
+
+    for index, raw_edit in enumerate(edits[:max_edits]):
+        if not isinstance(raw_edit, dict):
+            errors.append(f"edit_{index}:not_an_object")
+            continue
+        path = _canonical_path(str(raw_edit.get("path") or ""))
+        operation = str(raw_edit.get("operation") or "replace").strip().lower()
+        if not path or _path_blocked(path, cfg):
+            errors.append(f"edit_{index}:invalid_or_blocked_path")
+            continue
+        disk_path = root / path
+        can_create = _path_creation_allowed(path, category)
+        if path not in safe_existing and not (operation == "create" and can_create):
+            errors.append(f"edit_{index}:path_not_in_preflight:{path}")
+            continue
+        if path not in file_states:
+            existed = disk_path.exists() and disk_path.is_file()
+            try:
+                before = disk_path.read_text(encoding="utf-8", errors="replace") if existed else ""
+            except OSError as exc:
+                errors.append(f"edit_{index}:read_failed:{path}:{exc}")
+                continue
+            file_states[path] = {"existed": existed, "before": before, "after": before}
+        state = file_states[path]
+
+        if operation == "create":
+            content = raw_edit.get("content")
+            if state["existed"] or not can_create:
+                errors.append(f"edit_{index}:create_not_allowed:{path}")
+                continue
+            if not isinstance(content, str) or not content.strip():
+                errors.append(f"edit_{index}:empty_create_content:{path}")
+                continue
+            state["after"] = content if content.endswith("\n") else content + "\n"
+            applied += 1
+            continue
+
+        if operation != "replace":
+            errors.append(f"edit_{index}:unsupported_operation:{operation}")
+            continue
+        old_text = raw_edit.get("old_text")
+        new_text = raw_edit.get("new_text")
+        if not state["existed"] or not isinstance(old_text, str) or not old_text:
+            errors.append(f"edit_{index}:replace_requires_existing_exact_anchor:{path}")
+            continue
+        if not isinstance(new_text, str) or new_text == old_text:
+            errors.append(f"edit_{index}:replace_is_empty_or_noop:{path}")
+            continue
+        matches = state["after"].count(old_text)
+        if matches != 1:
+            errors.append(f"edit_{index}:anchor_match_count_{matches}:{path}")
+            continue
+        state["after"] = state["after"].replace(old_text, new_text, 1)
+        applied += 1
+
+    diffs = [
+        _render_file_diff(path, state["before"], state["after"], existed=bool(state["existed"]))
+        for path, state in sorted(file_states.items())
+    ]
+    diff_text = "".join(item for item in diffs if item)
+    status = "compiled" if diff_text and not errors else "compiled_with_errors" if diff_text else "failed"
+    return diff_text, {
+        "status": status,
+        "edit_count_requested": len(edits),
+        "edit_count_applied": applied,
+        "changed_files": changed_files_from_diff(diff_text),
+        "errors": errors[:20],
+    }
+
+
 def generate_patch_with_frontier_model(
     payload: dict,
     settings: dict,
@@ -3696,6 +3834,7 @@ def generate_patch_with_frontier_model(
         safe_files,
         max_chars=max_chars,
         likely_tests=[_command_display(command) for command in _test_commands(payload, {**cfg, "run_full_regression": False}, root=root)],
+        focus_text=json.dumps(payload, sort_keys=True, default=str),
     )
     rendered_context = render_builder_context(builder_context)
     category = _normalize_category(_field(payload, "change_category", "category"))
@@ -3713,24 +3852,32 @@ def generate_patch_with_frontier_model(
 
     system = (
         "You are the Build Planner for a paper-only trading research system. "
-        "Return only a unified diff. Do not add live trading, credentials, broker writes, "
+        "Return one JSON object containing exact anchored file edits. Do not add live trading, credentials, broker writes, "
         "startup changes, destructive data actions, or raw installer commands. "
         "Python dependencies may be declared only in requirements-autonomous.txt or requirements-llm.txt."
     )
     prompt = (
-        "Create a useful safe unified diff for this code-evolution proposal.\n"
+        "Create a useful safe set of exact file edits for this code-evolution proposal.\n"
         "Allowed paths are src/, tests/, config/, docs/, README.md, COST_AWARE_SWARM.md, "
         "LLM_AGENT_BRIDGE.md, requirements-autonomous.txt, and requirements-llm.txt.\n"
         "The patch must be paper-only and include or preserve tests where practical.\n\n"
+        "Return exactly this JSON shape and no prose:\n"
+        "{\"summary\":\"what changes\",\"edits\":["
+        "{\"path\":\"existing repo-relative path\",\"operation\":\"replace\","
+        "\"old_text\":\"exact unique current text\",\"new_text\":\"complete replacement text\"},"
+        "{\"path\":\"allowed new repo-relative path\",\"operation\":\"create\","
+        "\"content\":\"complete file content\"}]}\n"
+        "Use replace for existing files and create only for explicitly allowed plugin/test paths. "
+        "Every old_text must be copied exactly from BUILDER_CONTEXT and match once.\n\n"
         "Patch discipline:\n"
         "- prefer one focused, working change over a broad rewrite;\n"
         "- wiring existing helper code into the normal paper runner/report/LLM packet is allowed;\n"
         "- fixing or improving prior generated paper-only code is allowed;\n"
         "- feature-flag paper-only scoring, policy, variant, and adapter changes when behavior could affect trades;\n"
         "- use exact current file context, hashes, and symbols from BUILDER_CONTEXT;\n"
-        "- return a valid `git apply` compatible unified diff with exact hunk headers;\n"
-        "- do not use placeholder hunks like `@@?`, ellipses, omitted context, or prose outside the diff;\n"
-        "- include complete added files and complete modified hunks; no truncated patches;\n"
+        "- do not invent file paths, line numbers, diff hunks, ellipses, or omitted context;\n"
+        "- use only PREFLIGHT target_files, except a category-approved new adapter/signal/test plugin path;\n"
+        "- keep old_text anchors compact but unique, and include complete new file content;\n"
         "- do not wrap or duplicate existing functions when a local helper or report field is enough;\n"
         "- if the proposal is too large, implement the highest-value safe part that is actually used by runtime code.\n\n"
         f"{category_contract}\n"
@@ -3770,14 +3917,21 @@ def generate_patch_with_frontier_model(
             else None
         ),
         reasoning_effort_override=reasoning_effort,
-        structured_json=False,
+        structured_json=True,
         max_output_tokens_override=int(cfg.get("patch_generation_max_output_tokens", 16000)),
         timeout_seconds_override=float(cfg.get("patch_generation_timeout_seconds", 90)),
     )
     generated_text = _strip_fence(result.text)
     if not result.status.startswith("model_call:"):
         generated_text = ""
-    return generated_text, {
+    generated_diff, edit_compilation = _structured_edits_to_diff(
+        generated_text,
+        payload,
+        preflight,
+        settings,
+        root=root,
+    ) if generated_text else ("", {"status": "model_unavailable", "errors": []})
+    return generated_diff, {
         "status": result.status,
         "model_name": result.model_name,
         "model_tier": result.model_tier,
@@ -3787,7 +3941,8 @@ def generate_patch_with_frontier_model(
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
         "builder_context": _builder_context_metadata(builder_context),
-        "returned_patch_format": "unified_diff" if _looks_like_unified_diff(generated_text) else "invalid_or_empty",
+        "returned_patch_format": "structured_edits_compiled" if _looks_like_unified_diff(generated_diff) else "invalid_or_empty",
+        "edit_compilation": edit_compilation,
     }
 
 
@@ -3821,6 +3976,7 @@ def repair_patch_with_frontier_model(
         safe_files,
         max_chars=max_chars,
         likely_tests=[_command_display(command) for command in _test_commands(payload, {**cfg, "run_full_regression": False}, root=root)],
+        focus_text=json.dumps(payload, sort_keys=True, default=str),
     )
     rendered_context = render_builder_context(builder_context)
 
@@ -3830,17 +3986,20 @@ def repair_patch_with_frontier_model(
         error_tail = str(commands[-1].get("stderr_tail") or commands[-1].get("stdout_tail") or "")[-4000:]
     failure_stage = str(failure.get("stage") or "unknown") if isinstance(failure, dict) else "unknown"
     system = (
-        "You repair unified diffs for a paper-only trading research system. "
-        "Return only a corrected unified diff. Do not add live trading, credentials, "
+        "You repair code changes for a paper-only trading research system. "
+        "Return one JSON object containing exact anchored file edits. Do not add live trading, credentials, "
         "broker writes, startup changes, destructive data actions, or raw installer commands. "
         "Python dependencies may be declared only in requirements-autonomous.txt or requirements-llm.txt."
     )
     prompt = (
         f"The previous safe-scope patch failed at sandbox stage `{failure_stage}`. "
-        "Return a corrected full unified diff only, using the exact current BUILDER_CONTEXT. "
+        "Return corrected exact file edits using the current BUILDER_CONTEXT. "
         "Keep the same intended paper-only behavior and touch only the same safe files. "
-        "Use valid `git apply` compatible hunk headers, no `@@?` placeholders, no ellipses, "
-        "and no prose outside the diff. If tests failed, fix the patch so the requested "
+        "Return exactly {\"summary\":\"...\",\"edits\":[{\"path\":\"...\","
+        "\"operation\":\"replace\",\"old_text\":\"exact unique current text\","
+        "\"new_text\":\"complete replacement\"}]} with no prose. New allowed files may use "
+        "operation=create and complete content. Do not invent paths, hunk headers, or ellipses. "
+        "If tests failed, fix the change so the requested "
         "safe tests pass without weakening safety rules.\n\n"
         f"APPLY_ERROR:\n{error_tail}\n\n"
         f"PROPOSAL:\n{json.dumps(payload, sort_keys=True)}\n\n"
@@ -3861,14 +4020,22 @@ def repair_patch_with_frontier_model(
             else None
         ),
         reasoning_effort_override=_patch_reasoning_effort(repair_tier),
-        structured_json=False,
+        structured_json=True,
         max_output_tokens_override=int(cfg.get("patch_generation_max_output_tokens", 16000)),
         timeout_seconds_override=float(cfg.get("patch_generation_timeout_seconds", 90)),
     )
     repaired_text = _strip_fence(result.text)
     if not result.status.startswith("model_call:"):
         repaired_text = ""
-    return repaired_text, {
+    repair_preflight = preflight_proposal(payload, settings, root=root)
+    repaired_diff, edit_compilation = _structured_edits_to_diff(
+        repaired_text,
+        payload,
+        repair_preflight,
+        settings,
+        root=root,
+    ) if repaired_text else ("", {"status": "model_unavailable", "errors": []})
+    return repaired_diff, {
         "status": result.status,
         "model_name": result.model_name,
         "model_tier": result.model_tier,
@@ -3878,7 +4045,8 @@ def repair_patch_with_frontier_model(
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
         "builder_context": _builder_context_metadata(builder_context),
-        "returned_patch_format": "unified_diff" if _looks_like_unified_diff(repaired_text) else "invalid_or_empty",
+        "returned_patch_format": "structured_edits_compiled" if _looks_like_unified_diff(repaired_diff) else "invalid_or_empty",
+        "edit_compilation": edit_compilation,
     }
 
 

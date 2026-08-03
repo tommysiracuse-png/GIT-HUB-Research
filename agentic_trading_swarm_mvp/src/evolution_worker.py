@@ -12,10 +12,12 @@ import argparse
 import copy
 import json
 import pathlib
+import sqlite3
 import sys
 import time
 from typing import Any
 
+from adapter_implementation_owner import run_once as run_adapter_implementation_owner
 from autonomous_builder import run_autonomous_builder
 from llm_bridge import STATE_JSON, ingest_llm_recommendations
 from llm_swarm_runner import run_once as run_llm_swarm_once
@@ -27,6 +29,32 @@ from storage import RUNS_DIR, connect, llm_cost_summary, llm_inbox_summary
 
 REPORT_JSON = RUNS_DIR / "evolution_worker_report.json"
 REPORT_MD = RUNS_DIR / "evolution_worker_report.md"
+
+
+def _database_locked(exc: BaseException) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def _run_db_stage(stage: str, callback: Any, *, attempts: int = 3) -> tuple[Any, dict | None]:
+    """Keep transient radar writes from crashing the paid evolution cycle."""
+
+    last_error = ""
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            with connect() as conn:
+                return callback(conn), None
+        except sqlite3.OperationalError as exc:
+            if not _database_locked(exc):
+                raise
+            last_error = str(exc)
+            if attempt < attempts:
+                time.sleep(float(attempt * 2))
+    return None, {
+        "status": "database_busy_retry_later",
+        "stage": stage,
+        "attempts": attempts,
+        "reason": last_error or "database is locked",
+    }
 
 
 def _worker_settings(settings: dict) -> dict:
@@ -48,6 +76,7 @@ def _write_report(report: dict) -> dict:
         f"- LLM swarm recommendations: `{len(report.get('llm_swarm_generated') or [])}`",
         f"- Inbox ingested: `{len(report.get('llm_recommendations_ingested') or [])}`",
         f"- Auto-improvement consumed: `{len((report.get('self_improvement') or {}).get('consumed') or [])}`",
+        f"- Adapter owner status: `{(report.get('adapter_implementation_owner') or {}).get('status')}`",
         f"- Autonomous builder status: `{(report.get('autonomous_builder') or {}).get('status')}`",
     ]
     if report.get("reason"):
@@ -76,29 +105,100 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         )
 
     worker_settings = _worker_settings(settings)
+    # Existing executable work gets the first claim on model budget. Research
+    # and new recommendations are generated afterward for the next cycle.
+    ingested, ingest_error = _run_db_stage("ingest_llm_recommendations", lambda conn: ingest_llm_recommendations(conn, settings))
+    ingested = ingested or []
+    adapter_owner, adapter_error = _run_db_stage(
+        "adapter_implementation_owner",
+        lambda conn: run_adapter_implementation_owner(conn, worker_settings),
+    )
+    adapter_owner = adapter_owner or {"status": "database_busy_retry_later"}
+    adapter_code_attempted = str(adapter_owner.get("status") or "") not in {
+        "disabled",
+        "not_due",
+        "no_eligible_adapter_spec",
+        "database_busy_retry_later",
+    }
+    self_improvement, improvement_error = _run_db_stage(
+        "self_improvement",
+        lambda conn: run_auto_improvement(
+            conn,
+            worker_settings,
+            include_code_changes=not adapter_code_attempted,
+        ),
+    )
+    self_improvement = self_improvement or {"status": "database_busy_retry_later", "consumed": []}
+
+    code_attempted = any(
+        str(item.get("task_type") or "") == "code_change"
+        for item in (self_improvement.get("consumed") or [])
+        if isinstance(item, dict)
+    ) or adapter_code_attempted
+    defer_generic = bool(
+        settings.get("evolution_worker", {}).get("defer_generic_builder_when_targeted_code_attempted", True)
+    )
+    if code_attempted and defer_generic and not force_builder:
+        autonomous_builder = {
+            "status": "deferred_for_targeted_code_attempt",
+            "reason": "A concrete recommendation or adapter implementation already used this cycle's code budget.",
+        }
+        builder_error = None
+    else:
+        autonomous_builder, builder_error = _run_db_stage(
+            "autonomous_builder",
+            lambda conn: run_autonomous_builder(settings=settings, conn=conn, force=force_builder),
+        )
+        autonomous_builder = autonomous_builder or {"status": "database_busy_retry_later"}
+
     research_worker_report = {}
     if settings.get("research_worker", {}).get("enabled", True) and settings.get("research_worker", {}).get(
         "run_every_evolution_cycle", True
     ):
         research_worker_report = run_research_worker_once(settings=worker_settings)
     llm_swarm_generated = run_llm_swarm_once(settings=settings, force=force_swarm)
-    with connect() as conn:
-        ingested = ingest_llm_recommendations(conn, settings)
-        self_improvement = run_auto_improvement(conn, worker_settings, include_code_changes=True)
-        autonomous_builder = run_autonomous_builder(settings=settings, conn=conn, force=force_builder)
-        report = {
-            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "status": "ok",
-            "mode": settings.get("mode"),
-            "live_trading_allowed": bool(settings.get("allow_live_trading", False)),
-            "research_worker": research_worker_report,
-            "llm_swarm_generated": llm_swarm_generated,
-            "llm_recommendations_ingested": ingested,
-            "self_improvement": self_improvement,
-            "autonomous_builder": autonomous_builder,
-            "llm_inbox": llm_inbox_summary(),
-            "llm_cost_summary": llm_cost_summary(conn),
-        }
+    newly_ingested, new_ingest_error = _run_db_stage(
+        "ingest_new_llm_recommendations",
+        lambda conn: ingest_llm_recommendations(conn, settings),
+    )
+    if newly_ingested:
+        known = {str(item.get("recommendation_id") or "") for item in ingested if isinstance(item, dict)}
+        ingested.extend(
+            item
+            for item in newly_ingested
+            if not isinstance(item, dict) or str(item.get("recommendation_id") or "") not in known
+        )
+
+    cost_summary, cost_error = _run_db_stage("cost_summary", lambda conn: llm_cost_summary(conn))
+    inbox_summary, inbox_error = _run_db_stage("llm_inbox_summary", lambda _conn: llm_inbox_summary())
+    database_errors = [
+        error
+        for error in (
+            ingest_error,
+            improvement_error,
+            adapter_error,
+            builder_error,
+            new_ingest_error,
+            cost_error,
+            inbox_error,
+        )
+        if error
+    ]
+    report = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status": "degraded_database_busy" if database_errors else "ok",
+        "mode": settings.get("mode"),
+        "live_trading_allowed": bool(settings.get("allow_live_trading", False)),
+        "research_worker": research_worker_report,
+        "llm_swarm_generated": llm_swarm_generated,
+        "llm_recommendations_ingested": ingested,
+        "self_improvement": self_improvement,
+        "adapter_implementation_owner": adapter_owner,
+        "autonomous_builder": autonomous_builder,
+        "llm_inbox": inbox_summary or {},
+        "llm_cost_summary": cost_summary or {},
+        "database_errors": database_errors,
+    }
     return _write_report(report)
 
 

@@ -8,6 +8,7 @@ verbosity, structured JSON, and prompt caching are explicit.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import pathlib
@@ -20,6 +21,7 @@ from storage import connect, record_llm_cost_event
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config" / "llm_config.example.yaml"
 COST_LOG_DEFERRED_PATH = ROOT / "runs" / "llm_cost_events_deferred.jsonl"
+QUOTA_STATE_PATH = ROOT / "runs" / "llm_quota_state.json"
 
 PROVIDER_KEY_ENV = {
     "openai": "OPENAI_API_KEY",
@@ -123,6 +125,69 @@ def _provider_ready(model_name: str) -> tuple[bool, str]:
     if os.environ.get(key_name):
         return True, f"provider_key_present:{key_name}"
     return False, f"fallback_missing_provider_key:{key_name}"
+
+
+def _utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _read_quota_state() -> dict:
+    try:
+        value = json.loads(QUOTA_STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _quota_circuit_status() -> dict | None:
+    state = _read_quota_state()
+    next_probe = str(state.get("next_probe_at") or "")
+    if not next_probe:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(next_probe.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    if _utc_now() >= parsed:
+        return None
+    return state
+
+
+def _write_quota_state(state: dict) -> None:
+    QUOTA_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = QUOTA_STATE_PATH.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, QUOTA_STATE_PATH)
+
+
+def _mark_quota_failure(status: str) -> None:
+    lowered = status.lower()
+    if "insufficient_quota" not in lowered and "credit_balance" not in lowered and "429" not in lowered:
+        return
+    previous = _read_quota_state()
+    failures = int(previous.get("consecutive_failures") or 0) + 1
+    cooldown_minutes = min(30, 5 * (2 ** min(3, failures - 1)))
+    now = _utc_now()
+    _write_quota_state(
+        {
+            "status": "quota_circuit_open",
+            "consecutive_failures": failures,
+            "opened_at": previous.get("opened_at") or now.isoformat(),
+            "last_failure_at": now.isoformat(),
+            "next_probe_at": (now + dt.timedelta(minutes=cooldown_minutes)).isoformat(),
+            "cooldown_minutes": cooldown_minutes,
+            "last_error": status[:1000],
+        }
+    )
+
+
+def _clear_quota_state() -> None:
+    try:
+        QUOTA_STATE_PATH.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _is_sqlite_locked(exc: BaseException) -> bool:
@@ -235,6 +300,18 @@ def completion_preflight_status(
             "prompt_tokens": prompt_tokens,
         }
 
+    quota_state = _quota_circuit_status()
+    if quota_state:
+        return {
+            "ok": False,
+            "status": f"quota_circuit_open_until:{quota_state.get('next_probe_at')}",
+            "model_name": model_name,
+            "model_tier": tier_name,
+            "provider": provider,
+            "api": api,
+            "prompt_tokens": prompt_tokens,
+        }
+
     allowed, budget_status = _budget_allows_call(agent_name, cfg, agent_cfg, tier_cfg, prompt_tokens)
     return {
         "ok": bool(allowed),
@@ -331,6 +408,31 @@ def complete(
         _log(agent_name, result)
         return result
 
+    quota_state = _quota_circuit_status()
+    if quota_state:
+        text = _fallback_response(agent_name, prompt)
+        completion_tokens = estimate_tokens(text)
+        result = ModelResult(
+            text,
+            model_name,
+            tier_name,
+            prompt_tokens,
+            completion_tokens,
+            0.0,
+            f"quota_circuit_open_until:{quota_state.get('next_probe_at')}",
+            provider=provider,
+            api=api,
+            reasoning_effort=reasoning_effort,
+            reasoning_mode=reasoning_mode,
+            verbosity=verbosity,
+            operation=operation,
+            prompt_cache_key=prompt_cache_key,
+            frontier_escalation_reason=frontier_escalation_reason,
+            structured_json=structured_json_enabled,
+        )
+        _log(agent_name, result)
+        return result
+
     allowed, budget_status = _budget_allows_call(agent_name, cfg, agent_cfg, tier_cfg, prompt_tokens)
     if not allowed:
         text = _fallback_response(agent_name, prompt)
@@ -387,6 +489,7 @@ def complete(
                 timeout_seconds=timeout_seconds,
             )
         estimated_cost = _cost_usd(prompt_tokens, completion_tokens, tier_cfg)
+        _clear_quota_state()
         result = ModelResult(
             text,
             model_name,
@@ -408,6 +511,7 @@ def complete(
         _log(agent_name, result)
         return result
     except Exception as exc:  # noqa: BLE001
+        _mark_quota_failure(str(exc))
         text = _fallback_response(agent_name, prompt)
         completion_tokens = estimate_tokens(text)
         result = ModelResult(
