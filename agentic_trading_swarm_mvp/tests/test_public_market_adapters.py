@@ -222,6 +222,47 @@ class AdapterCapabilityTests(unittest.TestCase):
 
 
 class AdapterImplementationOwnerTests(unittest.TestCase):
+    def test_owner_does_not_consume_attempt_marker_before_queue_write(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        storage.add_adapter_spec(
+            conn,
+            "tradable-lock",
+            "global_discovery|Lock Test Exchange",
+            90,
+            "Lock test public prices",
+            {
+                "candidate": {
+                    "venue_or_source": "Lock Test Exchange",
+                    "data_access_type": "public_no_key",
+                    "tradability_guess": "directly_tradable",
+                    "confidence": 0.9,
+                    "public_docs_url": "https://example.test/lock",
+                    "source_validation_status": "public_url_present",
+                }
+            },
+            {},
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            adapter_implementation_owner, "REPORT_JSON", pathlib.Path(tmp) / "owner.json"
+        ), mock.patch.object(
+            adapter_implementation_owner, "REPORT_MD", pathlib.Path(tmp) / "owner.md"
+        ), mock.patch.object(
+            adapter_implementation_owner, "MARKER", pathlib.Path(tmp) / "owner.marker"
+        ) as marker, mock.patch.object(
+            adapter_implementation_owner,
+            "_update_spec_status",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                adapter_implementation_owner.run_once(
+                    conn,
+                    {"adapter_implementation_owner": {"enabled": True, "min_minutes_between_attempts": 0}},
+                )
+            self.assertFalse(marker.exists())
+        conn.close()
+
     def test_owner_turns_best_tradable_spec_into_concrete_plugin_proposal(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

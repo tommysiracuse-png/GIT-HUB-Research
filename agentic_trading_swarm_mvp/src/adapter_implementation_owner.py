@@ -73,7 +73,10 @@ def _load_specs(conn: sqlite3.Connection, limit: int) -> list[dict]:
         select id, created_at, source_recommendation_id, market_key, priority,
                title, status, spec_json, evidence_json
         from adapter_specs
-        where status in ('open', 'adapter_capability_gap', 'implementation_queued_retry')
+        where status in (
+            'open', 'adapter_capability_gap', 'implementation_queued',
+            'implementation_queued_retry'
+        )
         order by priority desc, id asc
         limit ?
         """,
@@ -251,8 +254,8 @@ def run_once(conn: sqlite3.Connection, settings: dict) -> dict:
         return _write_report({"generated_at": _utc_now(), "status": "no_eligible_adapter_spec"})
 
     proposal = _proposal_for_spec(row)
-    MARKER.write_text(_utc_now(), encoding="utf-8")
     _update_spec_status(conn, row, "implementation_queued", None)
+    MARKER.write_text(_utc_now(), encoding="utf-8")
     artifacts = process_code_change_recommendation(conn, proposal, settings)
     artifact = artifacts[0] if artifacts else {}
     proposal_status = str(artifact.get("status") or "no_artifact")
