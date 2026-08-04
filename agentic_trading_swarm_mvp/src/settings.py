@@ -269,6 +269,12 @@ DEFAULT_SETTINGS = {
     },
     "strategy_lab": {
         "enabled": True,
+        "observation_programs_enabled": True,
+        "promoted_signal_plugins_enabled": True,
+        "feature_snapshot_minutes": 5,
+        "feature_snapshot_retention_days": 14,
+        "feature_snapshot_max_rows": 2_000_000,
+        "feature_history_max_points": 4032,
         "max_candidates_per_loop": 100,
         "max_candidates_per_experiment": 10,
         "runtime_review_reserved_slots": 50,

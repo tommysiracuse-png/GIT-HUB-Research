@@ -651,6 +651,25 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "strategy_lab_experiments", "runtime_schema_fingerprint", "text")
     _ensure_column(conn, "strategy_lab_experiments", "compile_attempts", "integer not null default 0")
     _ensure_column(conn, "strategy_lab_experiments", "last_compiled_at", "text")
+    _ensure_column(conn, "strategy_lab_experiments", "novelty_signature", "text")
+    _ensure_column(conn, "strategy_lab_experiments", "novelty_status", "text not null default 'unassessed'")
+    _ensure_column(conn, "strategy_lab_experiments", "novelty_details_json", "text not null default '{}'")
+    conn.execute(
+        """
+        create table if not exists strategy_feature_snapshots (
+            id integer primary key autoincrement,
+            bucket_at text not null,
+            observed_at text not null,
+            venue text not null,
+            inst_id text not null,
+            trade_type text not null,
+            last real not null,
+            price_source text not null,
+            features_json text not null,
+            unique(bucket_at, venue, inst_id)
+        )
+        """
+    )
     conn.execute(
         """
         create table if not exists market_admission_states (
@@ -788,6 +807,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_code_evolution_status on code_evolution_proposals(status, updated_at)")
     conn.execute("create index if not exists idx_signal_variants_status on signal_variants(signal_family, status)")
     conn.execute("create index if not exists idx_strategy_lab_status on strategy_lab_experiments(status, updated_at)")
+    conn.execute(
+        "create index if not exists idx_strategy_feature_instrument_time "
+        "on strategy_feature_snapshots(venue, inst_id, bucket_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_strategy_feature_bucket "
+        "on strategy_feature_snapshots(bucket_at)"
+    )
     conn.execute("create index if not exists idx_paper_strategy_lab on paper_trades(strategy_lab_id, status)")
     conn.execute("create index if not exists idx_signal_trials_variant on signal_trials(variant_id, created_at)")
     conn.execute("create index if not exists idx_signal_trial_outcomes_due on signal_trial_outcomes(trial_id, horizon_minutes)")

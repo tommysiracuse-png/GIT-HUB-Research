@@ -2081,6 +2081,9 @@ RUNTIME_INTEGRATION_PATHS = {
     "src/adapter_runtime.py",
     "src/adapter_capabilities.py",
     "src/adapters/registry.py",
+    "src/signals/registry.py",
+    "src/signals/runtime.py",
+    "src/strategy_program.py",
 }
 
 RUNTIME_INTEGRATED_CATEGORIES = {
@@ -3084,6 +3087,8 @@ def _runtime_integration_status(payload: dict, category: str, target_files: list
         and not path.startswith("src/signals/")
     ]
     if signal_plugin_targets and not signal_runtime_consumers:
+        if all(path.startswith("src/signals/generated/") for path in signal_plugin_targets):
+            return "integrated"
         return "integration_claim_without_target"
     runtime_targets = [
         path

@@ -43,6 +43,7 @@ from okx_signal_research import run_okx_signal_research
 from prediction_market_scanner import build_scan_batch as build_prediction_market_scan_batch
 from route_resolver import enrich_candidates, write_route_resolver_report
 from scan_batch import merge_observations
+from signals.runtime import run_signal_plugins
 from self_improvement import (
     record_open_policy_effects,
     record_review_policy_effects,
@@ -148,6 +149,14 @@ def _is_strategy_lab_candidate_filter(item: dict) -> bool:
     )
 
 
+def _is_strategy_lab_runtime_candidate(item: dict) -> bool:
+    return bool(
+        _is_strategy_lab_candidate_filter(item)
+        or item.get("strategy_lab_logic_type") in {"observation_program", "generated_signal_plugin"}
+        or item.get("signal_plugin_id")
+    )
+
+
 def _strategy_lab_runtime_selection_summary(
     candidates: list[dict],
     *,
@@ -196,7 +205,7 @@ def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: di
             continue
         if str(candidate.get("direction") or "").lower() == "watch_only":
             continue
-        if not _is_strategy_lab_candidate_filter(candidate):
+        if not _is_strategy_lab_runtime_candidate(candidate):
             continue
         by_experiment.setdefault(strategy_lab_id, []).append(candidate)
 
@@ -250,7 +259,7 @@ def _select_runtime_strategy_lab_candidates(candidates: list[dict], settings: di
     selected = []
     skipped = 0
     for candidate in candidates:
-        if not _is_strategy_lab_candidate_filter(candidate):
+        if not _is_strategy_lab_runtime_candidate(candidate):
             skipped += 1
             continue
         if candidate.get("enabled") is False:
@@ -435,12 +444,21 @@ def run_once(settings: dict) -> dict:
                 frontier_crypto_venues = json.loads(FRONTIER_CRYPTO_REPORT_JSON.read_text(encoding="utf-8"))
             admission_observations.extend(frontier_batch.metadata.get("selected_observations", []))
         price_observations = merge_observations(batches)
+        promoted_signal_candidates, promoted_signal_runtime = run_signal_plugins(
+            conn,
+            price_observations,
+            settings,
+        )
+        if promoted_signal_candidates:
+            candidates.extend(promoted_signal_candidates)
+            candidates.sort(key=lambda row: row["score"], reverse=True)
         strategy_lab_candidates, strategy_lab_generation = generate_strategy_lab_candidates(
             conn,
             settings,
             candidates,
             price_observations,
         )
+        strategy_lab_generation["promoted_signal_runtime"] = promoted_signal_runtime
         selected_strategy_lab_candidates, strategy_lab_runtime = _select_runtime_strategy_lab_candidates(
             strategy_lab_candidates,
             settings,

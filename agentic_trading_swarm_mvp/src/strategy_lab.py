@@ -1,9 +1,8 @@
 """Paper-only Strategy Lab experiments.
 
-The lab is an R&D layer for LLM-invented strategy ideas. It does not execute
-arbitrary model code. Accepted ideas become bounded contracts that select or
-transform existing radar candidates, then the normal route/review/paper engine
-decides whether they deserve paper trades.
+Candidate filters remain supported. Observation programs additionally let the
+lab derive independent candidates from normalized market history without
+executing arbitrary model code.
 """
 
 from __future__ import annotations
@@ -16,7 +15,15 @@ import sqlite3
 from collections import Counter, defaultdict
 from typing import Any
 
+from signals.registry import discover_signals, known_strategy_signatures, promoted_strategy_lab_ids
 from storage import RUNS_DIR, add_llm_recommendation, utc_now
+from strategy_program import (
+    LOGIC_TYPE as OBSERVATION_PROGRAM,
+    compile_observation_program,
+    generate_program_candidates,
+    novelty_signature,
+    record_feature_snapshots,
+)
 
 
 REPORT_JSON = RUNS_DIR / "strategy_lab_report.json"
@@ -45,7 +52,12 @@ EXPERIMENT_TYPES = {
     "reporting_quality",
 }
 DEFAULT_EXPERIMENT_TYPE = "market_strategy"
-SUPPORTED_LOGIC_TYPES = {"candidate_filter", "candidate_selector", "candidate_transform"}
+SUPPORTED_LOGIC_TYPES = {
+    "candidate_filter",
+    "candidate_selector",
+    "candidate_transform",
+    OBSERVATION_PROGRAM,
+}
 FALLBACK_TRADE_TYPE_EXAMPLES = {
     "frontier_crypto_venue_map",
     "perp_funding_basis",
@@ -204,6 +216,9 @@ def _match_observed_token(token: str, observed: set[str]) -> str | None:
 
 def _normalize_strategy_logic(logic: dict, vocabulary: dict | None = None) -> dict:
     normalized = dict(logic)
+    if str(normalized.get("type") or normalized.get("logic_type")) == OBSERVATION_PROGRAM:
+        normalized["type"] = OBSERVATION_PROGRAM
+        return normalized
     notes = _as_list(normalized.get("normalization_notes"))
     vocabulary = vocabulary or {}
     observed_trade_types = set(vocabulary.get("trade_types") or set())
@@ -289,6 +304,8 @@ def _normalize_strategy_logic(logic: dict, vocabulary: dict | None = None) -> di
 
 
 def _has_strategy_scope(logic: dict) -> bool:
+    if str(logic.get("type") or logic.get("logic_type")) == OBSERVATION_PROGRAM:
+        return True
     if bool(logic.get("allow_any_surface")):
         return True
     return any(
@@ -363,6 +380,8 @@ def _classify_experiment_type(contract: dict, payload: dict, logic: dict) -> str
     )
     if explicit:
         return explicit
+    if str(logic.get("type") or logic.get("logic_type")) == OBSERVATION_PROGRAM:
+        return "market_strategy"
 
     semantic_logic = {key: value for key, value in logic.items() if key not in {"type", "logic_type"}}
     text = _text_blob(
@@ -716,6 +735,14 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
         status = "proposed"
     logic["type"] = logic_type
     logic = _normalize_strategy_logic(logic)
+    if logic_type == OBSERVATION_PROGRAM:
+        compiled_program, program_diagnostic = compile_observation_program(logic)
+        if compiled_program:
+            logic = compiled_program
+        elif program_diagnostic.get("status") == "needs_feature_code":
+            status = "needs_data"
+        else:
+            status = "rejected_invalid"
     if not _has_strategy_scope(logic):
         status = "needs_data"
     experiment_type = _classify_experiment_type(contract, payload, logic)
@@ -762,6 +789,39 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
         ]
 
     now = _utc()
+    logic_type = str(contract["strategy_logic"].get("type") or "candidate_filter")
+    signature = novelty_signature(contract["strategy_logic"]) if logic_type == OBSERVATION_PROGRAM else None
+    duplicate = None
+    promoted_match = None
+    if signature:
+        duplicate = conn.execute(
+            """
+            select strategy_lab_id
+            from strategy_lab_experiments
+            where novelty_signature = ? and strategy_lab_id <> ?
+            order by created_at
+            limit 1
+            """,
+            (signature, contract["strategy_lab_id"]),
+        ).fetchone()
+        discover_signals()
+        promoted_match = known_strategy_signatures().get(signature)
+        if duplicate or promoted_match:
+            contract["status"] = "rejected_invalid"
+    novelty_status = (
+        "duplicate_experiment"
+        if duplicate
+        else "matches_promoted_signal"
+        if promoted_match
+        else "novel"
+        if signature
+        else "not_applicable"
+    )
+    novelty_details = {
+        "signature": signature,
+        "duplicate_strategy_lab_id": duplicate["strategy_lab_id"] if duplicate else None,
+        "promoted_signal_id": promoted_match,
+    }
     values = (
         contract["strategy_lab_id"],
         contract["version"],
@@ -853,6 +913,21 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
         conn.commit()
         created = False
 
+    conn.execute(
+        """
+        update strategy_lab_experiments
+        set novelty_signature = ?, novelty_status = ?, novelty_details_json = ?
+        where strategy_lab_id = ?
+        """,
+        (
+            signature,
+            novelty_status,
+            json.dumps(novelty_details, sort_keys=True),
+            contract["strategy_lab_id"],
+        ),
+    )
+    conn.commit()
+
     return [
         {
             "action_status": "created",
@@ -860,6 +935,7 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
             "strategy_lab_id": contract["strategy_lab_id"],
             "experiment_type": contract["experiment_type"],
             "status": contract["status"],
+            "novelty_status": novelty_status,
             "created": created,
         }
     ]
@@ -886,7 +962,9 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
         item["strategy_logic"] = _json_loads(stored_logic, {})
         item.pop("original_strategy_logic_json", None)
         item["compile_diagnostics"] = _json_loads(item.pop("compile_diagnostics_json", None), {})
-        item["strategy_logic"] = _normalize_strategy_logic(item["strategy_logic"])
+        item["novelty_details"] = _json_loads(item.pop("novelty_details_json", None), {})
+        if str(item["strategy_logic"].get("type") or "") != OBSERVATION_PROGRAM:
+            item["strategy_logic"] = _normalize_strategy_logic(item["strategy_logic"])
         item["experiment_type"] = _resolved_experiment_type(
             item.get("experiment_type"),
             item,
@@ -1326,9 +1404,66 @@ def _scope_capability_issues(logic: dict, vocabulary: dict, candidates: list[dic
     return issues
 
 
+def _queue_missing_feature_proposal(
+    conn: sqlite3.Connection,
+    experiment: dict,
+    missing_features: list[str],
+) -> str | None:
+    signature = hashlib.sha256(
+        json.dumps(
+            {"strategy_lab_id": experiment["strategy_lab_id"], "missing_features": sorted(missing_features)},
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    rec_id = f"strategy_lab_feature_extension_{signature}"
+    payload = {
+        "action": "propose_code_change",
+        "priority": 88,
+        "title": f"Add Strategy Lab features: {', '.join(sorted(missing_features)[:5])}",
+        "rationale": "An observation-native strategy is valid in intent but requires feature calculations the runtime does not yet expose.",
+        "market_key": f"strategy_lab.{experiment['strategy_lab_id']}",
+        "signal_key": f"STRATEGY_LAB|{experiment['strategy_lab_id']}",
+        "change_category": "runtime_pipeline_integration",
+        "implementation_mode": "runtime_active",
+        "evidence": {
+            "strategy_lab_id": experiment["strategy_lab_id"],
+            "missing_features": sorted(missing_features),
+            "strategy_logic": experiment.get("strategy_logic") or {},
+        },
+        "proposed_change": {
+            "summary": "Add the missing normalized market-history features, snapshot provenance, and deterministic tests without changing the strategy contract.",
+            "missing_features": sorted(missing_features),
+        },
+        "code_change": {
+            "change_category": "runtime_pipeline_integration",
+            "implementation_mode": "runtime_active",
+            "expected_files": ["src/strategy_program.py", "tests/test_strategy_program.py"],
+            "tests_to_run": ["python -m unittest tests.test_strategy_program tests.test_strategy_lab"],
+            "runtime_integration": {
+                "entrypoint_file": "src/strategy_program.py",
+                "entrypoint_symbol": "build_feature_frames",
+                "invocation_path": "radar_loop.run_once -> strategy_lab.generate_strategy_lab_candidates -> strategy_program",
+                "test_file": "tests/test_strategy_program.py",
+                "behavioral_test": "The previously missing feature is calculated from stored observations and the unchanged program emits candidates.",
+            },
+            "rollback_criteria": "Revert if feature snapshots or the normal paper radar loop fail regression tests.",
+        },
+    }
+    created = add_llm_recommendation(
+        conn,
+        rec_id,
+        "propose_code_change",
+        payload["title"],
+        payload["rationale"],
+        payload,
+    )
+    return rec_id if created else None
+
+
 def _compile_strategy_lab_contracts(
     conn: sqlite3.Connection,
     candidates: list[dict],
+    observation_frames: list[dict] | None = None,
 ) -> dict:
     """Compile model intent against the actual runtime candidate schema.
 
@@ -1368,6 +1503,102 @@ def _compile_strategy_lab_contracts(
         if not original:
             original = _json_loads(row.get("strategy_logic_json"), {})
         data_requirements = _json_loads(row.get("data_requirements_json"), {})
+        if str(original.get("type") or original.get("logic_type") or "") == OBSERVATION_PROGRAM:
+            compiled_program, program_diagnostic = compile_observation_program(original)
+            signature = novelty_signature(compiled_program or original) if original else None
+            duplicate = conn.execute(
+                """
+                select strategy_lab_id
+                from strategy_lab_experiments
+                where novelty_signature = ? and strategy_lab_id <> ?
+                  and status not in ('rejected_invalid', 'retired_bad_evidence', 'retired_no_activity')
+                order by created_at
+                limit 1
+                """,
+                (signature, row["strategy_lab_id"]),
+            ).fetchone() if signature else None
+            discover_signals()
+            promoted_match = known_strategy_signatures().get(str(signature)) if signature else None
+            missing_features = list(program_diagnostic.get("missing_features") or [])
+            feature_proposal_id = None
+            if program_diagnostic.get("status") == "compiled" and not duplicate and not promoted_match:
+                compile_status = "compiled"
+                status = "needs_more_evidence" if row.get("status") == "needs_more_evidence" else "active_testing"
+                reason = "observation_program_compiled"
+                novelty_status = "novel"
+            elif duplicate or promoted_match:
+                compile_status = "duplicate_program"
+                status = "rejected_invalid"
+                reason = "duplicate_observation_program"
+                novelty_status = "duplicate_experiment" if duplicate else "matches_promoted_signal"
+            elif missing_features:
+                compile_status = "needs_data"
+                status = "needs_data"
+                reason = "missing_program_features"
+                novelty_status = "unassessed"
+                feature_proposal_id = _queue_missing_feature_proposal(
+                    conn,
+                    {**row, "strategy_logic": original},
+                    missing_features,
+                )
+            else:
+                compile_status = "invalid"
+                status = "rejected_invalid"
+                reason = str(program_diagnostic.get("reason") or "invalid_observation_program")
+                novelty_status = "unassessed"
+            diagnostic = {
+                "compiled_at": now,
+                "compile_status": compile_status,
+                "reason": reason,
+                "logic_type": OBSERVATION_PROGRAM,
+                "source_observation_count": len(observation_frames or []),
+                "missing_features": missing_features,
+                "feature_code_recommendation_id": feature_proposal_id,
+                "novelty_signature": signature,
+                "duplicate_strategy_lab_id": duplicate["strategy_lab_id"] if duplicate else None,
+                "promoted_signal_id": promoted_match,
+            }
+            prior_evaluation = _json_loads(row.get("evaluation_json"), {})
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set original_strategy_logic_json = case
+                        when original_strategy_logic_json is null or original_strategy_logic_json = '{}'
+                        then ? else original_strategy_logic_json end,
+                    strategy_logic_json = ?, compiled_strategy_logic_json = ?, compile_status = ?,
+                    compile_diagnostics_json = ?, runtime_schema_fingerprint = ?,
+                    compile_attempts = compile_attempts + 1, last_compiled_at = ?,
+                    status = ?, updated_at = ?, evaluation_json = ?, novelty_signature = ?,
+                    novelty_status = ?, novelty_details_json = ?
+                where strategy_lab_id = ?
+                """,
+                (
+                    json.dumps(original, sort_keys=True),
+                    json.dumps(compiled_program or original, sort_keys=True),
+                    json.dumps(compiled_program, sort_keys=True) if compile_status == "compiled" else "{}",
+                    compile_status,
+                    json.dumps(diagnostic, sort_keys=True),
+                    str(signature or "")[:16] or None,
+                    now,
+                    status,
+                    now,
+                    json.dumps({**prior_evaluation, "contract_compilation": diagnostic}, sort_keys=True),
+                    signature,
+                    novelty_status,
+                    json.dumps(
+                        {
+                            "signature": signature,
+                            "duplicate_strategy_lab_id": duplicate["strategy_lab_id"] if duplicate else None,
+                            "promoted_signal_id": promoted_match,
+                        },
+                        sort_keys=True,
+                    ),
+                    row["strategy_lab_id"],
+                ),
+            )
+            summary[compile_status] += 1
+            diagnostics[str(row["strategy_lab_id"])] = diagnostic
+            continue
         logic = _normalize_strategy_logic(original, vocabulary)
 
         # Admission-generated ideas carry an exact instrument as evidence. Use
@@ -1508,7 +1739,27 @@ def generate_strategy_lab_candidates(
     if not cfg.get("enabled", True):
         return [], {"enabled": False, "generated_candidates": 0}
 
-    compilation = _compile_strategy_lab_contracts(conn, candidates)
+    discover_signals()
+    promoted_plugins = promoted_strategy_lab_ids()
+    if promoted_plugins:
+        conn.executemany(
+            """
+            update strategy_lab_experiments
+            set status = 'promoted_to_code', updated_at = ?
+            where strategy_lab_id = ? and status in ('promote_candidate', 'promotion_queued')
+            """,
+            [(_utc(), strategy_lab_id) for strategy_lab_id in promoted_plugins],
+        )
+        conn.commit()
+    if cfg.get("observation_programs_enabled", True):
+        observation_frames, snapshot_summary = record_feature_snapshots(
+            conn,
+            price_observations,
+            settings,
+        )
+    else:
+        observation_frames, snapshot_summary = [], {"enabled": False}
+    compilation = _compile_strategy_lab_contracts(conn, candidates, observation_frames)
     experiments = _active_experiments(conn)
     max_total = int(cfg.get("max_candidates_per_loop", 25))
     max_per_experiment = int(cfg.get("max_candidates_per_experiment", 5))
@@ -1534,7 +1785,56 @@ def generate_strategy_lab_candidates(
     for experiment in experiments:
         if len(generated) >= max_total:
             break
-        logic = _normalize_strategy_logic(experiment.get("strategy_logic") or {}, runtime_vocabulary)
+        raw_logic = experiment.get("strategy_logic") or {}
+        if str(raw_logic.get("type") or "") == OBSERVATION_PROGRAM:
+            remaining = max(0, max_total - len(generated))
+            program_candidates, program_diagnostic = generate_program_candidates(
+                experiment,
+                observation_frames,
+                settings,
+                max_candidates=min(max_per_experiment, remaining),
+            )
+            generated.extend(program_candidates)
+            experiment_id = experiment["strategy_lab_id"]
+            per_experiment[experiment_id] += len(program_candidates)
+            for reason, count in (program_diagnostic.get("reject_reasons") or {}).items():
+                rejects[experiment_id][str(reason)] += int(count)
+            if program_candidates:
+                diagnostic_status = "active_testing"
+            elif not observation_frames or (
+                program_diagnostic.get("reject_reasons")
+                and set(program_diagnostic.get("reject_reasons") or {}) == {"universe_mismatch"}
+            ):
+                diagnostic_status = "needs_data"
+            else:
+                diagnostic_status = "needs_more_evidence"
+            status_by_experiment[experiment_id] = diagnostic_status
+            generation_diagnostic = {
+                "checked_at": _utc(),
+                "status": diagnostic_status,
+                "logic_type": OBSERVATION_PROGRAM,
+                "source_observation_count": len(observation_frames),
+                "generated_candidate_count": len(program_candidates),
+                "dominant_reject_reasons": dict(rejects[experiment_id].most_common(8)),
+                "novelty_signature": program_diagnostic.get("novelty_signature"),
+            }
+            prior_evaluation = experiment.get("evaluation") or {}
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set status = ?, updated_at = ?, last_evaluated_at = ?, evaluation_json = ?
+                where strategy_lab_id = ?
+                """,
+                (
+                    diagnostic_status,
+                    _utc(),
+                    _utc(),
+                    json.dumps({**prior_evaluation, "generation_diagnostic": generation_diagnostic}, sort_keys=True),
+                    experiment_id,
+                ),
+            )
+            continue
+        logic = _normalize_strategy_logic(raw_logic, runtime_vocabulary)
         risk_gates = experiment.get("risk_gates") or {}
         bonus = max(0.0, min(max_bonus, _as_float(logic.get("score_bonus"), default_bonus)))
         edge_bonus = max(0.0, min(max_bonus, _as_float(logic.get("edge_bonus_bps"), 0.0)))
@@ -1665,6 +1965,11 @@ def generate_strategy_lab_candidates(
             for key, rows in nearest_candidates.items()
         },
         "contract_compilation": compilation,
+        "feature_snapshots": snapshot_summary,
+        "observation_program_count": sum(
+            1 for experiment in experiments if str((experiment.get("strategy_logic") or {}).get("type")) == OBSERVATION_PROGRAM
+        ),
+        "promoted_signal_plugins": promoted_plugins,
     }
     return generated, report
 
@@ -1772,6 +2077,15 @@ def _queue_promotion(conn: sqlite3.Connection, experiment: dict, evaluation: dic
     proposal_id = "strategy_lab_promotion_" + hashlib.sha256(
         f"{experiment['strategy_lab_id']}:{experiment['version']}".encode("utf-8")
     ).hexdigest()[:16]
+    logic = experiment.get("strategy_logic", {})
+    is_observation_program = str(logic.get("type") or "") == OBSERVATION_PROGRAM
+    signal_slug = _slug(str(experiment["strategy_lab_id"]))
+    target_module = f"src/signals/generated/{signal_slug}.py"
+    expected_files = (
+        [target_module, "tests/test_generated_strategy_parity.py"]
+        if is_observation_program
+        else ["src/strategy_lab.py", "src/radar_loop.py", "tests/test_strategy_lab.py"]
+    )
     payload = {
         "action": "propose_code_change",
         "priority": 92,
@@ -1792,8 +2106,22 @@ def _queue_promotion(conn: sqlite3.Connection, experiment: dict, evaluation: dic
                 "version": experiment["version"],
                 "experiment_type": experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE),
                 "hypothesis": experiment["hypothesis"],
-                "strategy_logic": experiment.get("strategy_logic", {}),
+                "strategy_logic": logic,
                 "risk_gates": experiment.get("risk_gates", {}),
+            },
+            "promotion_target": {
+                "module": target_module if is_observation_program else None,
+                "signal_id": f"strategy_lab_{signal_slug}",
+                "novelty_signature": experiment.get("novelty_signature") or (
+                    novelty_signature(logic) if is_observation_program else None
+                ),
+                "registry": "signals.registry.discover_signals",
+                "parity_requirement": (
+                    "The generated plugin must reproduce strategy_program.generate_program_candidates "
+                    "for identical feature fixtures before promotion."
+                    if is_observation_program
+                    else "Preserve the accepted candidate-filter contract."
+                ),
             },
             "required_candidate_fields": [
                 "strategy_lab_id",
@@ -1813,12 +2141,27 @@ def _queue_promotion(conn: sqlite3.Connection, experiment: dict, evaluation: dic
         "code_change": {
             "change_category": "strategy_lab_promotion",
             "implementation_mode": "runtime_active",
-            "expected_files": [
-                "src/strategy_lab.py",
-                "src/radar_loop.py",
-                "tests/test_strategy_lab.py",
+            "expected_files": expected_files,
+            "tests_to_run": [
+                "python -m unittest tests.test_generated_strategy_parity tests.test_strategy_program"
+                if is_observation_program
+                else "python -m unittest tests.test_strategy_lab"
             ],
-            "tests_to_run": ["python -m unittest tests.test_strategy_lab"],
+            "runtime_integration": {
+                "entrypoint_file": "src/signals/registry.py" if is_observation_program else "src/radar_loop.py",
+                "entrypoint_symbol": "discover_signals" if is_observation_program else "run_once",
+                "invocation_path": (
+                    "radar_loop.run_once -> signals.registry.discover_signals -> generated signal plugin"
+                    if is_observation_program
+                    else "radar_loop.run_once -> strategy_lab.generate_strategy_lab_candidates"
+                ),
+                "test_file": "tests/test_generated_strategy_parity.py" if is_observation_program else "tests/test_strategy_lab.py",
+                "behavioral_test": (
+                    "Generated plugin candidates equal the observation-program interpreter candidates on fixtures."
+                    if is_observation_program
+                    else "Promoted candidate behavior remains route-compatible."
+                ),
+            },
             "rollback_criteria": "Revert if promoted strategy candidates fail validation, reports stop refreshing, or paper-only safety checks fail.",
             "evidence": {
                 "strategy_lab_id": experiment["strategy_lab_id"],
@@ -2026,7 +2369,8 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         select strategy_lab_id, version, parent_strategy_lab_id, status, hypothesis,
                experiment_type, strategy_logic_json, created_at, updated_at, last_evaluated_at, evaluation_json,
                consecutive_passes, promoted_proposal_id, compile_status,
-               compile_diagnostics_json, runtime_schema_fingerprint, compile_attempts, last_compiled_at
+               compile_diagnostics_json, runtime_schema_fingerprint, compile_attempts, last_compiled_at,
+               novelty_signature, novelty_status, novelty_details_json
         from strategy_lab_experiments
         order by updated_at desc
         limit ?
@@ -2041,6 +2385,7 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         item["experiment_type"] = _resolved_experiment_type(item.get("experiment_type"), item, logic)
         item["evaluation"] = _json_loads(item.pop("evaluation_json"), {})
         item["compile_diagnostics"] = _json_loads(item.pop("compile_diagnostics_json"), {})
+        item["novelty_details"] = _json_loads(item.pop("novelty_details_json"), {})
         recent_status_counts[item["status"]] += 1
         items.append(item)
     total = conn.execute("select count(*) as n from strategy_lab_experiments").fetchone()
@@ -2078,6 +2423,17 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
             """
         ).fetchall()
     }
+    novelty_status_counts = {
+        (row["novelty_status"] or "unassessed"): int(row["n"])
+        for row in conn.execute(
+            """
+            select novelty_status, count(*) as n
+            from strategy_lab_experiments
+            group by novelty_status
+            order by n desc
+            """
+        ).fetchall()
+    }
     generated_candidates = 0
     if REPORT_JSON.exists():
         latest = _json_loads(REPORT_JSON.read_text(encoding="utf-8"), {})
@@ -2089,6 +2445,7 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         "recent_status_counts": dict(recent_status_counts),
         "by_experiment_type": dict(type_counts),
         "compile_status_counts": compile_status_counts,
+        "novelty_status_counts": novelty_status_counts,
         "contract_repair_queue": [
             {
                 "strategy_lab_id": item["strategy_lab_id"],
@@ -2165,7 +2522,9 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         f"- Status counts: `{summary.get('status_counts', {})}`",
         f"- Experiment types: `{summary.get('by_experiment_type', {})}`",
         f"- Runtime contract compilation: `{summary.get('compile_status_counts', {})}`",
+        f"- Program novelty: `{summary.get('novelty_status_counts', {})}`",
         f"- Candidates generated this loop: `{(generation or {}).get('generated_candidates', 0)}`",
+        f"- Feature snapshots: `{(generation or {}).get('feature_snapshots', {})}`",
         "",
         "## Market Strategy Experiments",
         "",

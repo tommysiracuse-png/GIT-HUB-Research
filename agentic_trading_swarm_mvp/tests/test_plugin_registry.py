@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import tempfile
 import unittest
+import importlib
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -13,7 +15,7 @@ if str(SRC) not in sys.path:
 from adapters.base import AdapterInfo  # noqa: E402
 from adapters.registry import get_adapter, list_adapters, register_adapter  # noqa: E402
 from signals.base import SignalInfo  # noqa: E402
-from signals.registry import get_signal, list_signals, register_signal  # noqa: E402
+from signals.registry import discover_signals, get_signal, list_signals, register_signal  # noqa: E402
 
 
 class _Adapter:
@@ -50,6 +52,31 @@ class PluginRegistryTests(unittest.TestCase):
             register_adapter(object())
         with self.assertRaises(ValueError):
             register_signal(object())
+
+    def test_generated_signal_package_is_discovered_at_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = pathlib.Path(tmpdir)
+            package = root / "fixture_generated_signals"
+            package.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "alpha.py").write_text(
+                "from signals.base import SignalInfo\n"
+                "info = SignalInfo(signal_id='runtime_discovered_alpha', family='fixture', version='1')\n"
+                "def generate(observations, context=None):\n"
+                "    return []\n",
+                encoding="utf-8",
+            )
+            sys.path.insert(0, tmpdir)
+            try:
+                importlib.invalidate_caches()
+                report = discover_signals("fixture_generated_signals")
+            finally:
+                sys.path.remove(tmpdir)
+                for name in list(sys.modules):
+                    if name == "fixture_generated_signals" or name.startswith("fixture_generated_signals."):
+                        sys.modules.pop(name, None)
+        self.assertIn("runtime_discovered_alpha", report["discovered"])
+        self.assertIsNotNone(get_signal("runtime_discovered_alpha"))
 
 
 if __name__ == "__main__":
