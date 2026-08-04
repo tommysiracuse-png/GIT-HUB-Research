@@ -173,6 +173,40 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertIsNone(program)
         self.assertEqual("shock_reversal_invalid_long_expression", diagnostic["reason"])
 
+    def test_calculated_feature_dependencies_ignore_serialized_key_order(self) -> None:
+        logic = json.loads(json.dumps(shock_reversal_logic(), sort_keys=True))
+        self.assertEqual(
+            "cost_adjusted_reversal_edge_bps",
+            next(iter(logic["calculated_features"])),
+        )
+
+        program, diagnostic = compile_observation_program(logic)
+
+        self.assertIsNotNone(program, diagnostic)
+        calculated_names = list(program["calculated_features"])
+        self.assertLess(
+            calculated_names.index("flip_strength_bps"),
+            calculated_names.index("cost_adjusted_reversal_edge_bps"),
+        )
+
+    def test_calculated_feature_dependency_cycles_are_invalid(self) -> None:
+        logic = program_logic()
+        logic["calculated_features"] = {
+            "first": "second + 1",
+            "second": "first + 1",
+        }
+        logic["entry_expression"] = "first > 0"
+        logic["long_expression"] = "first > 0"
+
+        program, diagnostic = compile_observation_program(logic)
+
+        self.assertIsNone(program)
+        self.assertEqual("invalid", diagnostic["status"])
+        self.assertEqual(
+            "calculated_feature_dependency_cycle:first,second",
+            diagnostic["reason"],
+        )
+
     def test_shock_reversal_output_preserves_source_lineage_and_emits_both_sides(self) -> None:
         base = {
             **observation(100.0, dt.datetime.now(dt.timezone.utc).isoformat()),
@@ -252,6 +286,67 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertEqual("compiled", row["compile_status"])
         self.assertEqual("novel", row["novelty_status"])
         self.assertEqual(0, report["source_candidate_count"])
+
+    def test_sorted_shock_reversal_contract_activates_without_feature_extension(self) -> None:
+        cfg = settings()
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        logic = json.loads(json.dumps(shock_reversal_logic(), sort_keys=True))
+        recommendation = lab_recommendation(
+            "global_proxy_shock_reversal_observation_v1",
+            logic,
+        )
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            for index in range(12):
+                record_feature_snapshots(
+                    conn,
+                    [
+                        observation(
+                            100.0 if index == 0 else 99.1,
+                            (now - dt.timedelta(minutes=60 - index * 5)).isoformat(),
+                        )
+                    ],
+                    cfg,
+                )
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [observation(99.2, now.isoformat())],
+            )
+            row = conn.execute(
+                """
+                select status, compile_status, novelty_status, compile_diagnostics_json
+                from strategy_lab_experiments where strategy_lab_id = ?
+                """,
+                ("global_proxy_shock_reversal_observation_v1",),
+            ).fetchone()
+            recommendations_table = conn.execute(
+                """
+                select count(*) from sqlite_master
+                where type = 'table' and name = 'llm_recommendations'
+                """
+            ).fetchone()[0]
+            feature_extensions = (
+                conn.execute(
+                    """
+                    select count(*) from llm_recommendations
+                    where recommendation_id like 'strategy_lab_feature_extension_%'
+                    """
+                ).fetchone()[0]
+                if recommendations_table
+                else 0
+            )
+
+        self.assertEqual(1, len(generated), report)
+        self.assertEqual("global_proxy_shock_reversal", generated[0]["trade_type"])
+        self.assertEqual("long_proxy", generated[0]["direction"])
+        self.assertEqual("active_testing", row["status"])
+        self.assertEqual("compiled", row["compile_status"])
+        self.assertEqual("novel", row["novelty_status"])
+        self.assertEqual([], json.loads(row["compile_diagnostics_json"])["missing_features"])
+        self.assertEqual(0, feature_extensions)
 
     def test_radar_runtime_selection_admits_observation_program_candidates(self) -> None:
         candidate = {

@@ -497,6 +497,63 @@ def _validate_output_trade_type_contract(program: dict) -> None:
         raise ProgramValidationError("shock_reversal_entry_requires_shock_and_flip_features")
 
 
+def _ordered_calculated_features(calculated: dict) -> tuple[dict[str, str], set[str]]:
+    """Validate and dependency-order calculated features.
+
+    Strategy contracts are persisted as sorted JSON, so mapping insertion order
+    cannot define calculation order. References to another declared calculated
+    feature are graph dependencies; only references outside the declared and
+    runtime feature sets require feature code.
+    """
+    expressions: dict[str, str] = {}
+    referenced_names: dict[str, set[str]] = {}
+    for raw_name, raw_expression in calculated.items():
+        name = str(raw_name)
+        if not name.isidentifier() or name.startswith("_"):
+            raise ProgramValidationError(f"invalid_feature_name:{name}")
+        if name in expressions:
+            raise ProgramValidationError(f"duplicate_feature_name:{name}")
+        expression = str(raw_expression)
+        expressions[name] = expression
+        referenced_names[name] = expression_names(expression)
+
+    declared = set(expressions)
+    runtime_features = set(BASE_FEATURES | METADATA_NAMES)
+    missing = {
+        referenced
+        for names in referenced_names.values()
+        for referenced in names - declared - runtime_features
+    }
+    dependencies = {
+        name: set(names & declared)
+        for name, names in referenced_names.items()
+    }
+    dependents: dict[str, set[str]] = {name: set() for name in declared}
+    for name, required in dependencies.items():
+        for dependency in required:
+            dependents[dependency].add(name)
+
+    ready = sorted(name for name, required in dependencies.items() if not required)
+    ordered_names: list[str] = []
+    while ready:
+        name = ready.pop(0)
+        ordered_names.append(name)
+        for dependent in sorted(dependents[name]):
+            dependencies[dependent].discard(name)
+            if (
+                not dependencies[dependent]
+                and dependent not in ordered_names
+                and dependent not in ready
+            ):
+                ready.append(dependent)
+        ready.sort()
+
+    if len(ordered_names) != len(expressions):
+        cycle = sorted(name for name, required in dependencies.items() if required)
+        raise ProgramValidationError("calculated_feature_dependency_cycle:" + ",".join(cycle))
+    return {name: expressions[name] for name in ordered_names}, missing
+
+
 def compile_observation_program(logic: dict) -> tuple[dict | None, dict]:
     program = dict(logic or {})
     program["type"] = LOGIC_TYPE
@@ -508,11 +565,9 @@ def compile_observation_program(logic: dict) -> tuple[dict | None, dict]:
     available = set(BASE_FEATURES | METADATA_NAMES)
     missing: set[str] = set()
     try:
-        for name, expression in calculated.items():
-            if not str(name).isidentifier() or str(name).startswith("_"):
-                raise ProgramValidationError(f"invalid_feature_name:{name}")
-            missing.update(expression_names(str(expression)) - available)
-            available.add(str(name))
+        ordered_calculated, calculated_missing = _ordered_calculated_features(calculated)
+        missing.update(calculated_missing)
+        available.update(ordered_calculated)
         expressions = {
             "entry_expression": str(program.get("entry_expression") or "True"),
             "invalidation_expression": str(program.get("invalidation_expression") or "False"),
@@ -528,7 +583,7 @@ def compile_observation_program(logic: dict) -> tuple[dict | None, dict]:
             raise ProgramValidationError("direction_expression_required")
         for expression in expressions.values():
             missing.update(expression_names(expression) - available)
-        program["calculated_features"] = {str(key): str(value) for key, value in calculated.items()}
+        program["calculated_features"] = ordered_calculated
         program.update(expressions)
         program["route_surface"] = str(program.get("route_surface") or "auto").lower()
         if program["route_surface"] not in {"auto", "spot", "perp", "proxy", "prediction"}:
