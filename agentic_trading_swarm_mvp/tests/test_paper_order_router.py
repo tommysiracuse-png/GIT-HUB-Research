@@ -107,6 +107,11 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
                 gross_edge_bps_estimate=60.0,
                 estimated_round_trip_cost_bps=20.0,
                 quality_action="verified",
+                venue_capabilities={"paper_route_feasible": True},
+                paper_short_simulation_allowed=True,
+                borrowable=True,
+                borrow_cost_bps=4.0,
+                margin_eligible=True,
                 execution_route={
                     "route_status": "conditional",
                     "missing_permissions": ["spot_borrow"],
@@ -130,6 +135,11 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
                 gross_edge_bps_estimate=60.0,
                 estimated_round_trip_cost_bps=20.0,
                 quality_action="verified",
+                venue_capabilities={"paper_route_feasible": True},
+                paper_short_simulation_allowed=True,
+                borrowable=True,
+                borrow_cost_bps=4.0,
+                margin_eligible=True,
                 execution_route={
                     "route_status": "standard",
                     "missing_permissions": [],
@@ -141,7 +151,7 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
 
         self.assertNotIn("shadow_filtered", guarded)
 
-    def test_non_frontier_candidate_is_not_filtered_by_frontier_guard(self) -> None:
+    def test_carry_candidate_without_route_capabilities_is_filtered(self) -> None:
         candidate = frontier_candidate(
             trade_type="perp_funding_basis",
             market_surface="funding_basis",
@@ -151,8 +161,14 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
             estimated_round_trip_cost_bps=9.0,
         )
 
-        self.assertFalse(router.should_shadow_filter_frontier_candidate(candidate))
-        self.assertEqual(router.apply_frontier_paper_guard(candidate)["status"], "paper_filled")
+        guarded = router.apply_frontier_paper_guard(candidate)
+
+        self.assertTrue(router.should_shadow_filter_frontier_candidate(guarded))
+        self.assertEqual(guarded["status"], "shadow_filtered")
+        self.assertIn(
+            "venue_capability_metadata_missing",
+            guarded["candidate_reject_detail"]["blocker_reasons"],
+        )
 
     def test_feature_flag_can_disable_guard_for_paper_rollback(self) -> None:
         candidate = frontier_candidate(edge_bps_estimate=0.0)

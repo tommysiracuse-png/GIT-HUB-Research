@@ -24,6 +24,28 @@ def _candidate(**overrides):
 
 
 class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
+    def test_direct_pretrade_path_blocks_short_without_venue_metadata(self):
+        candidate = _candidate(
+            venue="UNKNOWN_FRONTIER",
+            paper_short_simulation_allowed=True,
+            borrowable=True,
+            borrow_cost_bps=4.0,
+            margin_eligible=True,
+            execution_feasibility={"status": "standard"},
+        )
+
+        guarded = apply_frontier_paper_guard(candidate)
+
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual(
+            "paper_route_eligibility_gate",
+            guarded["candidate_reject_detail"]["guard"],
+        )
+        self.assertIn(
+            "venue_capability_metadata_missing",
+            guarded["candidate_reject_detail"]["blocker_reasons"],
+        )
+
     def test_direct_pretrade_path_blocks_carry_with_unsupported_venue_metadata(self):
         candidate = {
             "venue": "TEST_SPOT",
@@ -54,6 +76,7 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
 
     def test_blocked_short_without_paper_proxy_is_shadow_filtered(self):
         candidate = _candidate(
+            venue_capabilities={"paper_route_feasible": True},
             route_blockers=["spot_borrow"],
             execution_feasibility={
                 "status": "blocked",
@@ -75,6 +98,7 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
 
     def test_proxy_short_is_allowed_with_reduced_allocation_and_proxy_metadata(self):
         candidate = _candidate(
+            venue_capabilities={"paper_route_feasible": True},
             route_blockers=["spot_borrow"],
             execution_feasibility={
                 "status": "blocked",

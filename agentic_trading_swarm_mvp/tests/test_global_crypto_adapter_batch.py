@@ -266,6 +266,7 @@ class DerivativesAdapterTests(unittest.TestCase):
                 "hedge_venue",
                 "hedge_instrument",
                 "paper_leg_mapping_valid",
+                "venue_capabilities",
             },
             set(candidate["paper_route_eligibility"]["missing_prerequisites"]),
         )

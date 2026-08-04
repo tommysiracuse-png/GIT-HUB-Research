@@ -417,6 +417,8 @@ def _venue_capability_metadata(candidate: dict) -> dict:
         packet = container.get("route_requirements_packet")
         if isinstance(packet, dict) and isinstance(packet.get("venue_capabilities"), dict):
             merged.update(packet["venue_capabilities"])
+    if not merged:
+        merged.update(_configured_venue_capabilities(candidate))
     return merged
 
 
@@ -425,6 +427,25 @@ def _capability_bool(capabilities: dict, *keys: str) -> bool | None:
         if key in capabilities:
             return _eligibility_bool(capabilities.get(key))
     return None
+
+
+def _route_capability_bool(capabilities: dict, *keys: str) -> bool | None:
+    """Resolve a route capability without letting a coarse flag hide a veto.
+
+    Detailed venue metadata takes precedence whenever it is present.  A venue
+    may instead publish one explicit route-level feasibility flag, but that
+    aggregate flag cannot override a detailed ``False`` value.
+    """
+
+    detailed = _capability_bool(capabilities, *keys)
+    if detailed is not None:
+        return detailed
+    return _capability_bool(
+        capabilities,
+        "paper_route_feasible",
+        "route_feasible",
+        "explicit_route_feasible",
+    )
 
 
 def _append_route_gap(missing: list[str], reasons: list[str], prerequisite: str, reason: str) -> None:
@@ -444,30 +465,40 @@ def _enforce_venue_capability_contract(
 ) -> None:
     """Fail closed when present venue metadata does not confirm a route.
 
-    Legacy candidates without capability metadata continue through the
-    existing instrument-level checks. Once a venue capability packet is
-    present, however, loose candidate flags cannot override an unsupported or
-    unknown short, margin, borrow, perp, spot-leg, or carry capability.
+    Capability-dependent short and carry candidates fail closed when the
+    packet is absent. Once a packet is present, loose candidate flags cannot
+    override an unsupported or unknown short, margin, borrow, perp, spot-leg,
+    or carry capability.
     """
 
+    capability_confirmation_required = spot_short_required or hedged_structure_required
+    if not capability_confirmation_required:
+        return
+
     if not capabilities:
+        _append_route_gap(
+            missing,
+            reasons,
+            "venue_capabilities",
+            "venue_capability_metadata_missing",
+        )
         return
 
     if spot_short_required:
-        short_supported = _capability_bool(
+        short_supported = _route_capability_bool(
             capabilities,
             "spot_short_supported",
             "supports_spot_short",
             "supports_spot_short_margin",
             "shortability_indication",
         )
-        margin_supported = _capability_bool(
+        margin_supported = _route_capability_bool(
             capabilities,
             "margin_supported",
             "margin_available",
             "supports_margin",
         )
-        borrow_supported = _capability_bool(
+        borrow_supported = _route_capability_bool(
             capabilities,
             "borrow_supported",
             "spot_borrow_supported",
@@ -483,20 +514,20 @@ def _enforce_venue_capability_contract(
                 _append_route_gap(missing, reasons, prerequisite, reason)
 
     if hedged_structure_required:
-        carry_supported = _capability_bool(
+        carry_supported = _route_capability_bool(
             capabilities,
             "synthetic_carry_supported",
             "supports_basis_carry",
             "basis_support",
             "carry_supported",
         )
-        perp_supported = _capability_bool(
+        perp_supported = _route_capability_bool(
             capabilities,
             "perp_supported",
             "supports_perpetuals",
             "perp_available",
         )
-        spot_supported = _capability_bool(
+        spot_supported = _route_capability_bool(
             capabilities,
             "spot_supported",
             "supports_spot",
@@ -663,9 +694,10 @@ def _paper_route_costs(
 def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
     """Return a paper-only route verdict suitable for pre-review score gating.
 
-    Instrument-level fields must explicitly establish routeability. Coarse
-    account capabilities and inferred alternatives are deliberately not treated
-    as proof of borrowability, hedge availability, or modeled costs.
+    Instrument-level fields and configured venue metadata must explicitly
+    establish routeability. Coarse account capabilities and inferred
+    alternatives are deliberately not treated as proof of borrowability,
+    hedge availability, or modeled costs.
     """
 
     item = dict(candidate or {})
@@ -676,6 +708,36 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
     )
     legacy_proxy_allowed = _eligibility_bool(requirements.get("proxy_allowed")) is True
     legacy_proxy_id = requirements.get("paper_proxy_id")
+    for container in (item, item.get("execution_feasibility"), item.get("execution_route")):
+        if not isinstance(container, dict):
+            continue
+        alternative = (
+            container.get("best_route_alternative")
+            or container.get("paper_route_alternative")
+            or container.get("route_alternative")
+        )
+        if not isinstance(alternative, dict):
+            continue
+        alternative_status = _paper_gate_text(
+            alternative.get("status") or alternative.get("route_status")
+        )
+        alternative_missing = {
+            str(value)
+            for field in ("missing_permissions", "missing_requirements", "route_blockers")
+            for value in (alternative.get(field) or [])
+            if value
+        }
+        replaces = {
+            str(value) for value in (alternative.get("replaces_blockers") or []) if value
+        }
+        if (
+            alternative_status in {"paper_testable_proxy", "paper_testable_via_proxy"}
+            and not alternative_missing
+            and "spot_borrow" in replaces
+        ):
+            legacy_proxy_allowed = True
+            legacy_proxy_id = alternative.get("route_id") or alternative.get("route")
+            break
     spot_short_required = _spot_short_dependency(item)
     hedged_structure_required = _hedged_structure_dependency(item)
     venue_capabilities = _venue_capability_metadata(item)

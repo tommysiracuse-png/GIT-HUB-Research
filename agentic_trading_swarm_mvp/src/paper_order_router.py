@@ -356,7 +356,11 @@ def _apply_paper_route_eligibility_metadata(candidate: Mapping[str, Any]) -> dic
     if not (
         isinstance(verdict, Mapping)
         and verdict.get("applies")
-        and verdict.get("venue_capability_metadata_present")
+        and (
+            verdict.get("spot_short_required")
+            or verdict.get("hedged_structure_required")
+            or verdict.get("venue_capability_metadata_present")
+        )
     ):
         return annotated
     annotated["paper_route_eligibility"] = dict(verdict)
@@ -543,6 +547,22 @@ def frontier_shadow_filter_reason(
     if isinstance(route_eligibility, Mapping) and _as_bool(
         route_eligibility.get("suppressed"), False
     ):
+        checks: list[dict[str, Any]] = []
+        if (
+            _is_short_frontier_spot(candidate)
+            and not _is_confirmed_borrow(candidate)
+            and (
+                "spot_borrow_missing" in route_eligibility.get("blocker_reasons", [])
+                or "spot_borrow" in _route_blockers(candidate)
+            )
+        ):
+            checks.append(
+                {
+                    "code": SPOT_BORROW_SHADOW_CODE,
+                    "field": "paper_route_eligibility",
+                    "note": "short spot frontier paper fill requires confirmed borrow or equivalent hedge route",
+                }
+            )
         return {
             "reason": "paper_route_eligibility_blocked",
             "paper_only": True,
@@ -551,6 +571,7 @@ def frontier_shadow_filter_reason(
             "candidate": _candidate_reference(candidate),
             "missing_prerequisites": route_eligibility.get("missing_prerequisites") or [],
             "blocker_reasons": route_eligibility.get("blocker_reasons") or [],
+            "checks": checks,
             "route_eligibility": dict(route_eligibility),
         }
 

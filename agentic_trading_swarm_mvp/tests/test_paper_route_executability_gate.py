@@ -38,6 +38,7 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
                 "borrowable",
                 "borrow_cost_assumption",
                 "margin_eligible",
+                "venue_capabilities",
             },
             set(verdict["missing_prerequisites"]),
         )
@@ -53,6 +54,7 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
                 "borrowable": True,
                 "borrow_cost_bps": 4.0,
                 "margin_eligible": True,
+                "venue_capabilities": {"paper_route_feasible": True},
                 "expected_edge_bps": 20.0,
                 "estimated_fee_bps": 2.0,
                 "estimated_slippage_bps": 1.0,
@@ -93,6 +95,7 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
                 "hedge_instrument",
                 "fee_model",
                 "paper_leg_mapping_valid",
+                "venue_capabilities",
             },
             set(verdict["missing_prerequisites"]),
         )
@@ -106,6 +109,7 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
                 "hedge_instrument": "BTC-USDT",
                 "fee_model": "paper_conservative_v1",
                 "paper_leg_mapping_valid": True,
+                "venue_capabilities": {"paper_route_feasible": True},
                 "expected_edge_bps": 18.0,
                 "estimated_fee_bps": 3.0,
                 "estimated_slippage_bps": 2.0,
@@ -115,6 +119,48 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
 
         self.assertTrue(verdict["route_eligible"])
         self.assertEqual([], verdict["missing_prerequisites"])
+
+    def test_candidate_flags_cannot_replace_missing_venue_capability_metadata(self):
+        verdict = evaluate_route_intelligence(
+            {
+                "surface": "spot",
+                "direction": "short",
+                "paper_short_simulation_allowed": True,
+                "borrowable": True,
+                "borrow_cost_bps": 4.0,
+                "margin_eligible": True,
+            }
+        )
+
+        self.assertTrue(verdict["suppressed"])
+        self.assertFalse(verdict["venue_capability_metadata_present"])
+        self.assertIn("venue_capabilities", verdict["missing_prerequisites"])
+        self.assertIn(
+            "venue_capability_metadata_missing",
+            verdict["blocker_reasons"],
+        )
+
+    def test_detailed_capability_veto_overrides_aggregate_feasible_flag(self):
+        verdict = evaluate_route_intelligence(
+            {
+                "surface": "spot",
+                "direction": "short",
+                "paper_short_simulation_allowed": True,
+                "borrowable": True,
+                "borrow_cost_bps": 4.0,
+                "margin_eligible": True,
+                "venue_capabilities": {
+                    "paper_route_feasible": True,
+                    "borrow_supported": False,
+                },
+            }
+        )
+
+        self.assertTrue(verdict["suppressed"])
+        self.assertIn(
+            "venue_borrow_capability_unconfirmed",
+            verdict["blocker_reasons"],
+        )
 
     def test_unsupported_venue_short_capabilities_override_loose_candidate_flags(self):
         verdict = evaluate_route_intelligence(
@@ -199,6 +245,7 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
                     "proxy_allowed": True,
                     "paper_proxy_id": "perp_paper_proxy",
                 },
+                "venue_capabilities": {"paper_route_feasible": True},
                 "expected_edge_bps": 2.0,
                 "estimated_fee_bps": 3.0,
             }

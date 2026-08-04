@@ -41,6 +41,7 @@ class RouteIntelligenceGateTests(unittest.TestCase):
             "venue": "okx",
             "market_key": "eth-usdt",
             "route_requirements": {"borrow_required": True, "proxy_allowed": True, "paper_proxy_id": "okx_derivatives_paper"},
+            "venue_capabilities": {"paper_route_feasible": True},
         }
         verdict = evaluate_route_intelligence(candidate)
         self.assertEqual(verdict["route_decision"], "executable_proxy")

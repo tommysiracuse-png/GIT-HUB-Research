@@ -27,6 +27,11 @@ class FrontierConditionalShortAdmissionTests(unittest.TestCase):
         guarded = apply_frontier_paper_guard(
             _candidate(
                 borrow_confirmed=True,
+                paper_short_simulation_allowed=True,
+                borrowable=True,
+                borrow_cost_bps=4.0,
+                margin_eligible=True,
+                venue_capabilities={"paper_route_feasible": True},
                 execution_feasibility={"status": "executable"},
             )
         )
