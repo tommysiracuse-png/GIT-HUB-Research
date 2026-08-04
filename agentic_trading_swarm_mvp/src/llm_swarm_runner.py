@@ -32,6 +32,7 @@ from memory_graph import (
     sync_graphiti,
     write_memory_exports,
 )
+from recommendation_schema import REQUIRED_RECOMMENDATION_KEYS, finalize_recommendation_response
 from settings import load_settings
 from storage import RUNS_DIR, connect
 from dynamic_agents import (
@@ -206,7 +207,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "\"priority\": integer 1-100, "
         "\"title\": short title, "
         "\"rationale\": reason, "
-        "\"market_key\": optional market, "
+        "\"market_key\": market identifier, "
         "\"signal_key\": optional signal, "
         "\"evidence\": object, "
         "\"frontier_escalation_reason\": required if a frontier model is used, "
@@ -292,7 +293,10 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
 
 def parse_recommendation(text: str, agent: dict, packet: dict) -> dict:
     allowed = set(packet.get("allowed_recommendation_actions", []))
-    rec, parse_status, reason = _parse_json_recommendation(text)
+    rec, parse_status, reason = _parse_json_recommendation(
+        text,
+        strict_contract=agent.get("name") == "cross_market_researcher",
+    )
     if rec is None:
         return _reject_recommendation(agent, text, parse_status, reason)
     rec["parse_status"] = parse_status
@@ -634,10 +638,30 @@ def _appears_truncated_json(text: str) -> bool:
     return depth > 0 or in_string
 
 
-def _parse_json_recommendation(text: str) -> tuple[dict | None, str, str | None]:
+def _parse_json_recommendation(
+    text: str,
+    *,
+    strict_contract: bool = False,
+) -> tuple[dict | None, str, str | None]:
     raw = (text or "").strip()
     if not raw:
         return None, "empty_response", "empty_response"
+    if strict_contract:
+        try:
+            return finalize_recommendation_response(raw), "native_valid", None
+        except ValueError:
+            if _appears_truncated_json(raw):
+                return None, "truncated_json", "truncated_json"
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return None, "invalid_json", "extra_text_or_invalid_json"
+            if not isinstance(parsed, dict):
+                return None, "invalid_schema", "top_level_json_not_object"
+            missing = [key for key in REQUIRED_RECOMMENDATION_KEYS if key not in parsed]
+            if missing:
+                return None, "invalid_schema", f"missing_required_fields:{','.join(missing)}"
+            return None, "invalid_schema", "recommendation_schema_invalid"
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:

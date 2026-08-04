@@ -7,6 +7,7 @@ simulation and reporting; it does not enable execution.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -48,3 +49,24 @@ def validate_recommendation_object(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
     return all(key in payload for key in REQUIRED_RECOMMENDATION_KEYS)
+
+
+def finalize_recommendation_response(response: str | bytes | bytearray) -> dict[str, Any]:
+    """Return one complete recommendation object or reject the model response.
+
+    ``json.loads`` deliberately parses the entire response, so markdown fences,
+    commentary, multiple values, arrays, and partial objects are never recovered
+    heuristically. Whitespace surrounding the single JSON value is permitted.
+    """
+    if not isinstance(response, (str, bytes, bytearray)):
+        raise ValueError("recommendation response must be JSON text")
+    try:
+        payload = json.loads(response)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("recommendation response must be exactly one complete JSON object") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("recommendation response must be a JSON object")
+    missing = [key for key in REQUIRED_RECOMMENDATION_KEYS if key not in payload]
+    if missing:
+        raise ValueError(f"recommendation response missing required fields: {', '.join(missing)}")
+    return payload
