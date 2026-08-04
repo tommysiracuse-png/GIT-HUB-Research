@@ -260,6 +260,34 @@ class StrategyReliabilityTests(unittest.TestCase):
             report["summary"]["by_quality_failure"]["proxy_short_quality_missing_freshness"],
         )
 
+    def test_distinct_proxy_shock_reversal_uses_its_own_quality_profile(self) -> None:
+        candidate = base_candidate(
+            venue="YAHOO_PROXY",
+            inst_id="YAHOO_PROXY:EWZ",
+            trade_type="global_proxy_shock_reversal",
+            direction="short_proxy",
+            edge_bps_estimate=12.0,
+            spread_bps=3.0,
+            liquidity_score=0.8,
+            stale_minutes=1.0,
+            freshness_age_seconds=60.0,
+            proxy_depth_notional_usd=2_000_000.0,
+            proxy_venue_health_status="reachable",
+        )
+
+        rows, report = strategy_reliability.apply_strategy_reliability([candidate])
+
+        self.assertFalse(rows[0].get("paper_entry_blocked", False))
+        self.assertEqual("shock_reversal_confirmation_probe", rows[0]["strategy_reliability_action"])
+        self.assertEqual("yahoo_proxy_shock_reversal", rows[0]["strategy_reliability"]["profile"])
+        self.assertEqual(0, report["summary"]["family_quarantine_count"])
+
+        missing_depth = {**candidate, "proxy_depth_notional_usd": None}
+        blocked, _ = strategy_reliability.apply_strategy_reliability([missing_depth])
+        self.assertTrue(blocked[0]["paper_entry_blocked"])
+        self.assertEqual("shock_reversal_shadow_confirmation", blocked[0]["strategy_reliability_action"])
+        self.assertIn("proxy_short_quality_missing_depth", blocked[0]["strategy_reliability_reasons"])
+
     def test_duplicate_suppression_recognizes_strategy_pack_themes(self) -> None:
         self.assertEqual(
             llm_bridge._implemented_manual_category("Investigate microstructure and liquidity impact on frontier spot"),

@@ -1643,7 +1643,11 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
             ),
         )
 
-    if venue == "YAHOO_PROXY" or trade_type in {"global_proxy_momentum", "global_market_discovery_proxy"}:
+    if venue == "YAHOO_PROXY" or trade_type in {
+        "global_proxy_momentum",
+        "global_market_discovery_proxy",
+        "global_proxy_shock_reversal",
+    }:
         route_note_prefix = (
             "Global discovery proxy exposure uses a public/proxy instrument."
             if trade_type == "global_market_discovery_proxy"

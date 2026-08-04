@@ -116,6 +116,34 @@ class RouteResolverTests(unittest.TestCase):
         self.assertEqual(route["missing_permissions"], [])
         self.assertIn("Global discovery proxy exposure", route["route_notes"][0])
 
+    def test_global_proxy_shock_reversal_uses_only_the_existing_paper_equity_routes(self) -> None:
+        long_route = route_resolver.resolve_candidate_route(
+            {
+                "venue": "YAHOO_PROXY",
+                "trade_type": "global_proxy_shock_reversal",
+                "direction": "long_proxy",
+                "asset_class": "equity_proxy",
+                "score": 78.0,
+            },
+            settings(),
+        )
+        short_route = route_resolver.resolve_candidate_route(
+            {
+                "venue": "YAHOO_PROXY",
+                "trade_type": "global_proxy_shock_reversal",
+                "direction": "short_proxy",
+                "asset_class": "equity_proxy",
+                "score": 78.0,
+            },
+            settings(),
+        )
+
+        self.assertEqual("equity_proxy_paper", long_route["route_id"])
+        self.assertEqual("standard", long_route["route_status"])
+        self.assertEqual("conditional_equity_route_paper", short_route["route_id"])
+        self.assertIn(short_route["route_status"], {"conditional", "blocked"})
+        self.assertEqual("public_data_only", short_route["api_access_status"])
+
     def test_enriched_candidate_preserves_legacy_feasibility_fields(self) -> None:
         candidate = {
             "venue": "OKX",

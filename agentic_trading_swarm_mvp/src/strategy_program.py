@@ -19,6 +19,18 @@ from typing import Any, Iterable
 
 
 LOGIC_TYPE = "observation_program"
+OUTPUT_TRADE_TYPE_SURFACES = {
+    "global_proxy_shock_reversal": "proxy",
+}
+SHOCK_REVERSAL_CALCULATED_FEATURES = {
+    "shock_magnitude_bps": "abs(return_60m_bps)",
+    "shock_sigma": "abs(return_60m_bps) / max(volatility_60m_bps, 10)",
+    "flip_strength_bps": "max(0, -(return_5m_bps * return_60m_bps) / max(abs(return_60m_bps), 1))",
+}
+SHOCK_REVERSAL_DIRECTION_EXPRESSIONS = {
+    "long_expression": "return_60m_bps < 0 and return_5m_bps > 0",
+    "short_expression": "return_60m_bps > 0 and return_5m_bps < 0",
+}
 SAFE_FUNCTIONS = {
     "abs": abs,
     "min": min,
@@ -456,12 +468,33 @@ def canonical_program(logic: dict) -> dict:
         "edge_expression": _canonical_expression(logic.get("edge_expression") or "0"),
         "score_expression": _canonical_expression(logic.get("score_expression") or "50"),
         "route_surface": str(logic.get("route_surface") or "auto").lower(),
+        "output_trade_type": str(logic.get("output_trade_type") or "").lower(),
     }
 
 
 def novelty_signature(logic: dict) -> str:
     payload = json.dumps(canonical_program(logic), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_output_trade_type_contract(program: dict) -> None:
+    if program.get("output_trade_type") != "global_proxy_shock_reversal":
+        return
+    universe = program.get("universe") if isinstance(program.get("universe"), dict) else {}
+    venues = universe.get("venues")
+    venue_values = venues if isinstance(venues, list) else [venues] if venues else []
+    if {str(value).strip().upper() for value in venue_values} != {"YAHOO_PROXY"}:
+        raise ProgramValidationError("shock_reversal_requires_yahoo_proxy_universe")
+    calculated = program.get("calculated_features") or {}
+    for name, expected in SHOCK_REVERSAL_CALCULATED_FEATURES.items():
+        if name not in calculated or _canonical_expression(calculated[name]) != _canonical_expression(expected):
+            raise ProgramValidationError(f"shock_reversal_invalid_{name}")
+    for name, expected in SHOCK_REVERSAL_DIRECTION_EXPRESSIONS.items():
+        if _canonical_expression(program.get(name)) != _canonical_expression(expected):
+            raise ProgramValidationError(f"shock_reversal_invalid_{name}")
+    entry_names = expression_names(str(program.get("entry_expression") or ""))
+    if not {"shock_magnitude_bps", "shock_sigma", "flip_strength_bps"}.issubset(entry_names):
+        raise ProgramValidationError("shock_reversal_entry_requires_shock_and_flip_features")
 
 
 def compile_observation_program(logic: dict) -> tuple[dict | None, dict]:
@@ -500,6 +533,16 @@ def compile_observation_program(logic: dict) -> tuple[dict | None, dict]:
         program["route_surface"] = str(program.get("route_surface") or "auto").lower()
         if program["route_surface"] not in {"auto", "spot", "perp", "proxy", "prediction"}:
             raise ProgramValidationError("unsupported_route_surface")
+        program["output_trade_type"] = str(program.get("output_trade_type") or "").lower()
+        if program["output_trade_type"]:
+            required_surface = OUTPUT_TRADE_TYPE_SURFACES.get(program["output_trade_type"])
+            if required_surface is None:
+                raise ProgramValidationError("unsupported_output_trade_type")
+            if program["route_surface"] != required_surface:
+                raise ProgramValidationError(
+                    f"output_trade_type_requires_{required_surface}_route_surface"
+                )
+            _validate_output_trade_type_contract(program)
         signature = novelty_signature(program)
     except ProgramValidationError as exc:
         return None, {"status": "invalid", "reason": str(exc)}
@@ -562,6 +605,9 @@ def _route_mapping(frame: dict, program: dict, side: str) -> tuple[str, str]:
         return "frontier_crypto_venue_map", f"{side}_frontier_perp"
     if surface == "prediction":
         return "prediction_market_probability", "yes" if side == "long" else "no"
+    output_trade_type = str(program.get("output_trade_type") or "")
+    if output_trade_type:
+        return output_trade_type, f"{side}_proxy"
     source_type = str(frame.get("trade_type") or "")
     trade_type = source_type if source_type in {"global_proxy_momentum", "global_market_discovery_proxy"} else "global_market_discovery_proxy"
     return trade_type, f"{side}_proxy"
@@ -619,6 +665,7 @@ def generate_program_candidates(
             rejects["expression_runtime_error"] += 1
             continue
         target_surface = _route_surface(frame, program)
+        source_trade_type = str(frame.get("trade_type") or "")
         trade_type, direction = _route_mapping(frame, program, side)
         signature = str(diagnostic.get("novelty_signature") or novelty_signature(program))
         candidate = {
@@ -633,6 +680,25 @@ def generate_program_candidates(
             "last": _float(frame.get("last")),
             "edge_bps_estimate": round(edge, 3),
             "change_24h_pct": _float(frame.get("change_24h_pct")),
+            "stale_minutes": max(0.0, _float(frame.get("stale_minutes"))),
+            "freshness_age_seconds": max(
+                0.0,
+                _float(
+                    frame.get("freshness_age_seconds"),
+                    _float(frame.get("provider_age_seconds"), _float(frame.get("stale_minutes")) * 60.0),
+                ),
+            ),
+            "quote_volume_24h": max(0.0, _float(frame.get("quote_volume_24h"))),
+            "proxy_depth_notional_usd": max(
+                0.0,
+                _float(frame.get("proxy_depth_notional_usd"), _float(frame.get("quote_volume_24h"))),
+            ),
+            "proxy_venue_health_status": str(
+                frame.get("proxy_venue_health_status")
+                or frame.get("venue_health_status")
+                or frame.get("data_status")
+                or ""
+            ),
             "funding_bps": _float(frame.get("funding_bps")),
             "basis_bps": _float(frame.get("basis_bps")),
             "seen_at": str(frame.get("observed_at") or dt.datetime.now(dt.timezone.utc).isoformat()),
@@ -649,6 +715,8 @@ def generate_program_candidates(
             "strategy_lab_hypothesis": str(experiment.get("hypothesis") or ""),
             "strategy_lab_logic_type": LOGIC_TYPE,
             "strategy_lab_candidate": True,
+            "strategy_lab_source_trade_type": source_trade_type,
+            "strategy_lab_output_trade_type": trade_type,
             "strategy_lab_program_signature": signature,
             "strategy_lab_program_features": {
                 key: values.get(key)

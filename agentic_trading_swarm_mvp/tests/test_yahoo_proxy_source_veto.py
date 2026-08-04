@@ -15,7 +15,11 @@ if str(SRC) not in sys.path:
 from settings import DEFAULT_SETTINGS
 from storage import init_db
 from strategy_lab import generate_strategy_lab_candidates, ingest_strategy_lab_recommendation
-from strategy_reliability import paper_source_veto_record, paper_source_veto_recovery_status
+from strategy_reliability import (
+    paper_family_quarantine_record,
+    paper_source_veto_record,
+    paper_source_veto_recovery_status,
+)
 
 
 def memory_db() -> sqlite3.Connection:
@@ -90,6 +94,71 @@ class YahooProxySourceVetoTests(unittest.TestCase):
         self.assertEqual("skipped", result[0]["action_status"])
         self.assertEqual("paper_source_family_veto", result[0]["reason"])
         self.assertEqual(0, count)
+
+    def test_distinct_shock_reversal_lineage_does_not_relax_momentum_veto(self) -> None:
+        reversal = {
+            "venue": "YAHOO_PROXY",
+            "inst_id": "EWZ",
+            "trade_type": "global_proxy_shock_reversal",
+            "direction": "short_proxy",
+            "strategy_lab_source_trade_type": "global_proxy_momentum",
+        }
+        momentum = {**reversal, "trade_type": "global_proxy_momentum"}
+
+        self.assertIsNone(paper_source_veto_record(reversal, settings()))
+        self.assertIsNone(paper_family_quarantine_record(reversal, settings()))
+        self.assertIsNotNone(paper_source_veto_record(momentum, settings()))
+        self.assertIsNotNone(paper_family_quarantine_record(momentum, settings()))
+
+    def test_ingestion_accepts_bounded_reversal_program_but_still_blocks_momentum_contract(self) -> None:
+        experiment = {
+            "strategy_lab_id": "global_proxy_shock_reversal_observation_v1",
+            "version": 1,
+            "experiment_type": "market_strategy",
+            "hypothesis": "Extreme Yahoo proxy moves reverse after five-minute momentum flips.",
+            "source_surface": "yahoo_proxy_global_proxy_momentum",
+            "permitted_target_surface": ["proxy"],
+            "strategy_logic": {
+                "type": "observation_program",
+                "universe": {"venues": ["YAHOO_PROXY"]},
+                "calculated_features": {
+                    "shock_magnitude_bps": "abs(return_60m_bps)",
+                    "shock_sigma": "abs(return_60m_bps) / max(volatility_60m_bps, 10)",
+                    "flip_strength_bps": "max(0, -(return_5m_bps * return_60m_bps) / max(abs(return_60m_bps), 1))",
+                },
+                "entry_expression": "shock_magnitude_bps >= 40 and shock_sigma >= 1.75 and flip_strength_bps >= 5 and return_5m_bps * return_60m_bps < 0",
+                "invalidation_expression": "return_5m_bps * return_60m_bps >= 0",
+                "long_expression": "return_60m_bps < 0 and return_5m_bps > 0",
+                "short_expression": "return_60m_bps > 0 and return_5m_bps < 0",
+                "edge_expression": "shock_magnitude_bps",
+                "score_expression": "clip(shock_magnitude_bps, 0, 100)",
+                "route_surface": "proxy",
+                "output_trade_type": "global_proxy_shock_reversal",
+            },
+            "data_requirements": {"paper_only": True, "source_market_key": "YAHOO_PROXY"},
+            "risk_gates": {},
+            "promotion_rules": {},
+        }
+        rec = {
+            "recommendation_id": "rec_shock_reversal",
+            "payload": {
+                "action": "propose_strategy_lab_experiment",
+                "strategy_lab_experiment": experiment,
+            },
+        }
+        with memory_db() as conn:
+            created = ingest_strategy_lab_recommendation(conn, rec, settings())
+            blocked = ingest_strategy_lab_recommendation(
+                conn,
+                recommendation(
+                    market_key="YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
+                    lab_id="new_yahoo_descendant",
+                ),
+                settings(),
+            )
+
+        self.assertEqual("created", created[0]["action_status"])
+        self.assertEqual("paper_source_family_veto", blocked[0]["reason"])
 
     def test_blocks_cross_surface_child_by_parent_lineage(self) -> None:
         with memory_db() as conn:

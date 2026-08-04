@@ -345,6 +345,12 @@ def _build_expansion_map(
     }
 
 
+def _required_global_proxy_instruments(required: dict[str, set[str]]) -> set[str]:
+    instruments = set(required.get("global_proxy_momentum", set()))
+    instruments.update(required.get("global_proxy_shock_reversal", set()))
+    return instruments
+
+
 def run_once(settings: dict) -> dict:
     auxiliary_policy = _auxiliary_runtime_policy(settings)
     capabilities = settings["account_capabilities"]
@@ -377,10 +383,11 @@ def run_once(settings: dict) -> dict:
         admission_observations.extend(okx_batch.observations)
         candidates = list(okx_candidates)
         if scan_cfg.get("enable_global_proxy_scan", False):
+            required_global_proxy = _required_global_proxy_instruments(required)
             global_batch = build_global_proxy_scan_batch(
                 settings,
                 limit=int(scan_cfg.get("global_review_top", 40)),
-                required_inst_ids=required.get("global_proxy_momentum", set()),
+                required_inst_ids=required_global_proxy,
             )
             batches.append(global_batch)
             candidates.extend(global_batch.candidates)

@@ -639,6 +639,89 @@ class StrategyLabTest(unittest.TestCase):
             self.assertEqual("strategy_lab_promotion", payload["change_category"])
             self.assertEqual("promotion_queued", report["evaluated"][0]["decision"])
 
+    def test_evaluator_requires_balanced_direction_evidence_when_configured(self):
+        settings = base_settings()
+        rec = lab_rec()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "balanced_direction_lab"
+        experiment["strategy_logic"]["directions"] = ["long_frontier_spot", "short_frontier_spot"]
+        experiment["promotion_rules"] = {
+            "promote_min_labels": 30,
+            "promote_min_active_hours": 48,
+            "promote_min_avg_pnl_bps": 10,
+            "promote_min_win_rate": 0.53,
+            "promote_min_valid_label_rate": 0.9,
+            "promote_worst_decile_floor_bps": -45,
+            "min_labels_per_direction": 20,
+            "min_avg_pnl_bps_per_direction": 0,
+            "min_win_rate_per_direction": 0.48,
+            "consecutive_passes_to_promote": 2,
+        }
+        created_at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()
+
+        def add_outcomes(conn, direction, start, count):
+            for idx in range(start, start + count):
+                lab_candidate = candidate(
+                    inst_id=f"{direction}-{idx}",
+                    direction=direction,
+                    strategy_lab_id="balanced_direction_lab",
+                    strategy_lab_version=1,
+                )
+                review = {
+                    "learned_score": 75.0,
+                    "decision": "approve_paper_trade",
+                    "route_status": "standard",
+                    "hard_blocks": [],
+                }
+                trade_id = open_paper_trade(conn, lab_candidate, review, settings=settings)
+                conn.execute(
+                    """
+                    insert into paper_trade_outcomes (
+                        trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                        context_json, target_at, observed_at, delay_seconds,
+                        measurement_status, price_source
+                    ) values (?, 60, ?, 4, 14, '{}', ?, ?, 0, 'valid', 'test')
+                    """,
+                    (trade_id, created_at, created_at, created_at),
+                )
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            generate_strategy_lab_candidates(
+                conn,
+                settings,
+                [candidate(), candidate(inst_id="SHORT", direction="short_frontier_spot")],
+            )
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set created_at = ?, consecutive_passes = 1
+                where strategy_lab_id = 'balanced_direction_lab'
+                """,
+                (created_at,),
+            )
+            add_outcomes(conn, "long_frontier_spot", 0, 30)
+            add_outcomes(conn, "short_frontier_spot", 0, 10)
+            conn.commit()
+
+            first = evaluate_strategy_lab(conn, settings)["evaluated"][0]
+            self.assertFalse(first["direction_promotion"]["passed"])
+            self.assertEqual(
+                ["min_labels"],
+                first["direction_promotion"]["checks"]["short_frontier_spot"]["failed_thresholds"],
+            )
+            self.assertIsNone(first["promotion_recommendation_id"])
+
+            add_outcomes(conn, "short_frontier_spot", 10, 10)
+            conn.execute(
+                "update strategy_lab_experiments set status = 'active_testing', consecutive_passes = 1 where strategy_lab_id = 'balanced_direction_lab'"
+            )
+            conn.commit()
+            second = evaluate_strategy_lab(conn, settings)["evaluated"][0]
+
+        self.assertTrue(second["direction_promotion"]["passed"])
+        self.assertEqual("promotion_queued", second["decision"])
+
     def test_summary_reports_recent_experiments(self):
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, lab_rec())

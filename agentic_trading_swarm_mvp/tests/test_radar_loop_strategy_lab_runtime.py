@@ -1,5 +1,9 @@
 import unittest
 
+try:
+    import radar_loop as radar_loop_module
+except Exception:  # pragma: no cover
+    radar_loop_module = None
 
 try:
     from radar_loop import strategy_lab_runtime as strategy_lab_runtime_module
@@ -123,6 +127,22 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
 
         self.assertEqual({"BTC-USDT", "ETHUSD"}, {row["inst_id"] for row in selected})
         self.assertEqual(2, summary["distinct_source_count"])
+
+
+class GlobalProxyRuntimeIntegrationTests(unittest.TestCase):
+    def test_open_shock_reversal_instruments_are_kept_in_the_yahoo_scan(self):
+        if radar_loop_module is None:
+            self.skipTest("radar loop unavailable")
+        required = {
+            "global_proxy_momentum": {"EWZ"},
+            "global_proxy_shock_reversal": {"EEM", "EWZ"},
+            "frontier_crypto_venue_map": {"ABC-USDT"},
+        }
+
+        self.assertEqual(
+            {"EEM", "EWZ"},
+            radar_loop_module._required_global_proxy_instruments(required),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

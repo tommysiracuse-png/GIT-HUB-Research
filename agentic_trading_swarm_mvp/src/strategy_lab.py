@@ -2441,6 +2441,7 @@ def _experiment_outcomes(
     route_counts: Counter = Counter()
     by_region: dict[str, list[float]] = defaultdict(list)
     by_venue: dict[str, list[float]] = defaultdict(list)
+    by_direction: dict[str, list[float]] = defaultdict(list)
     examples = []
     surface_quarantined = []
     for row in rows:
@@ -2469,6 +2470,7 @@ def _experiment_outcomes(
             valid.append(pnl)
             by_region[str(candidate.get("region") or "unknown")].append(pnl)
             by_venue[str(item.get("venue") or "unknown")].append(pnl)
+            by_direction[str(item.get("direction") or candidate.get("direction") or "unknown")].append(pnl)
             if len(examples) < 10:
                 examples.append(
                     {
@@ -2488,6 +2490,7 @@ def _experiment_outcomes(
         "metrics": _pnl_stats(valid),
         "by_region": {key: _pnl_stats(value) for key, value in by_region.items()},
         "by_venue": {key: _pnl_stats(value) for key, value in by_venue.items()},
+        "by_direction": {key: _pnl_stats(value) for key, value in by_direction.items()},
         "examples": examples,
         "surface_quarantined_count": len(surface_quarantined),
         "surface_quarantined_examples": surface_quarantined[:10],
@@ -2497,7 +2500,7 @@ def _experiment_outcomes(
 def _rules(settings: dict, experiment: dict) -> dict:
     defaults = settings.get("strategy_lab", {})
     custom = experiment.get("promotion_rules") or {}
-    return {
+    rules = {
         "horizon_minutes": int(custom.get("horizon_minutes", defaults.get("evaluation_horizon_minutes", 60))),
         "expand_min_labels": int(custom.get("expand_min_labels", defaults.get("expand_min_labels", 12))),
         "expand_min_avg_pnl_bps": float(custom.get("expand_min_avg_pnl_bps", defaults.get("expand_min_avg_pnl_bps", 6.0))),
@@ -2512,6 +2515,91 @@ def _rules(settings: dict, experiment: dict) -> dict:
         "retire_max_avg_pnl_bps": float(custom.get("retire_max_avg_pnl_bps", defaults.get("retire_max_avg_pnl_bps", -8.0))),
         "retire_max_win_rate": float(custom.get("retire_max_win_rate", defaults.get("retire_max_win_rate", 0.43))),
         "consecutive_passes_to_promote": int(custom.get("consecutive_passes_to_promote", defaults.get("consecutive_passes_to_promote", 2))),
+    }
+    for key, cast in (
+        ("min_labels_per_direction", int),
+        ("min_avg_pnl_bps_per_direction", float),
+        ("min_win_rate_per_direction", float),
+    ):
+        value = custom.get(key)
+        rules[key] = cast(value) if value is not None else None
+    return rules
+
+
+def _promotion_directions(experiment: dict) -> list[str]:
+    custom = experiment.get("promotion_rules") or {}
+    explicit = custom.get("required_directions")
+    if isinstance(explicit, str):
+        explicit = [piece.strip() for piece in explicit.replace(";", ",").split(",")]
+    if isinstance(explicit, (list, tuple, set)):
+        directions = _unique([str(item).strip() for item in explicit if str(item).strip()])
+        if directions:
+            return directions
+
+    logic = experiment.get("strategy_logic") or {}
+    configured = _as_list(logic.get("directions") or logic.get("allowed_directions"))
+    if configured:
+        return _unique([str(item).strip() for item in configured if str(item).strip()])
+    if str(logic.get("type") or "") != OBSERVATION_PROGRAM:
+        direction = str(logic.get("direction") or "").strip()
+        return [direction] if direction else []
+
+    surface = str(logic.get("route_surface") or "auto").lower()
+    suffixes = {
+        "proxy": ("long_proxy", "short_proxy"),
+        "spot": ("long_frontier_spot", "short_frontier_spot"),
+        "perp": ("long_frontier_perp", "short_frontier_perp"),
+        "prediction": ("yes", "no"),
+    }
+    long_direction, short_direction = suffixes.get(surface, ("long", "short"))
+    fixed = str(logic.get("direction") or "").lower()
+    if fixed == "long":
+        return [long_direction]
+    if fixed == "short":
+        return [short_direction]
+    directions = []
+    if str(logic.get("long_expression") or "False") != "False":
+        directions.append(long_direction)
+    if str(logic.get("short_expression") or "False") != "False":
+        directions.append(short_direction)
+    return directions
+
+
+def _direction_promotion_gate(experiment: dict, outcomes: dict, rules: dict) -> dict:
+    thresholds = {
+        "min_labels": rules.get("min_labels_per_direction"),
+        "min_avg_pnl_bps": rules.get("min_avg_pnl_bps_per_direction"),
+        "min_win_rate": rules.get("min_win_rate_per_direction"),
+    }
+    enabled = any(value is not None for value in thresholds.values())
+    required = _promotion_directions(experiment) if enabled else []
+    checks = {}
+    for direction in required:
+        metrics = (outcomes.get("by_direction") or {}).get(direction) or _pnl_stats([])
+        failures = []
+        if thresholds["min_labels"] is not None and int(metrics.get("count") or 0) < int(thresholds["min_labels"]):
+            failures.append("min_labels")
+        if thresholds["min_avg_pnl_bps"] is not None and (
+            metrics.get("avg_pnl_bps") is None
+            or float(metrics["avg_pnl_bps"]) < float(thresholds["min_avg_pnl_bps"])
+        ):
+            failures.append("min_avg_pnl_bps")
+        if thresholds["min_win_rate"] is not None and (
+            metrics.get("win_rate") is None
+            or float(metrics["win_rate"]) < float(thresholds["min_win_rate"])
+        ):
+            failures.append("min_win_rate")
+        checks[direction] = {
+            "passed": not failures,
+            "failed_thresholds": failures,
+            "metrics": metrics,
+        }
+    return {
+        "enabled": enabled,
+        "passed": not enabled or (bool(required) and all(item["passed"] for item in checks.values())),
+        "required_directions": required,
+        "thresholds": thresholds,
+        "checks": checks,
     }
 
 
@@ -2743,6 +2831,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
         worst_decile = metrics.get("worst_decile_pnl_bps")
         active_hours = _age_hours(experiment.get("created_at"))
         blocked_routes = int(outcomes.get("route_status_counts", {}).get("blocked", 0))
+        direction_promotion = _direction_promotion_gate(experiment, outcomes, rules)
         generation_diagnostic = (experiment.get("evaluation") or {}).get("generation_diagnostic") or {}
         diagnostic_status = str(generation_diagnostic.get("status") or experiment.get("status") or "active_testing")
         decision = diagnostic_status if diagnostic_status in {"needs_data", "needs_route", "needs_more_evidence"} else "needs_more_evidence"
@@ -2759,6 +2848,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             and (worst_decile is not None and worst_decile > rules["promote_worst_decile_floor_bps"])
             and outcomes["valid_label_rate"] >= rules["promote_min_valid_label_rate"]
             and blocked_routes == 0
+            and direction_promotion["passed"]
         )
         retire_ready = (
             count >= rules["retire_min_labels"]
@@ -2808,6 +2898,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             "promotion_recommendation_id": promotion_id,
             "child_strategy_lab_ids": children,
             "generation_diagnostic": generation_diagnostic,
+            "direction_promotion": direction_promotion,
         }
         conn.execute(
             """
@@ -2836,6 +2927,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
                 "decision": decision,
                 "metrics": metrics,
                 "valid_label_rate": outcomes["valid_label_rate"],
+                "direction_promotion": direction_promotion,
                 "promotion_recommendation_id": promotion_id,
             }
         )

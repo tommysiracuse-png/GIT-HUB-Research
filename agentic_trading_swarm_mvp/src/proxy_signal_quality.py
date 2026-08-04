@@ -12,7 +12,11 @@ from collections.abc import Mapping
 from typing import Any
 
 
-PROXY_TRADE_TYPES = {"global_proxy_momentum", "global_market_discovery_proxy"}
+PROXY_TRADE_TYPES = {
+    "global_proxy_momentum",
+    "global_market_discovery_proxy",
+    "global_proxy_shock_reversal",
+}
 DEFAULT_MAX_FRESHNESS_AGE_SECONDS = 3600.0
 DEFAULT_MIN_DEPTH_NOTIONAL_USD = 1.0
 DEFAULT_MIN_LIQUIDITY_SCORE = 0.65

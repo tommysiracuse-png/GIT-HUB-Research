@@ -15,7 +15,7 @@ import json
 import math
 from typing import Any
 
-from proxy_signal_quality import proxy_short_quality_review
+from proxy_signal_quality import PROXY_TRADE_TYPES, proxy_short_quality_review
 from storage import RUNS_DIR, signal_key
 
 
@@ -2456,6 +2456,44 @@ def _repair_proxy_candidate(
     return None
 
 
+def _repair_proxy_shock_reversal_candidate(
+    candidate: dict,
+    config: Mapping[str, Any] | None = None,
+) -> dict | None:
+    if candidate.get("trade_type") != "global_proxy_shock_reversal":
+        return None
+    reasons = []
+    if str(candidate.get("direction") or "") == "short_proxy":
+        quality_review = _record_proxy_short_quality(candidate, config)
+        reasons.extend(quality_review.get("quality_failure_reasons") or [])
+    if _as_float(candidate.get("edge_bps_estimate"), 0.0) < 3.0:
+        reasons.append("shock_reversal_edge_below_confirmation")
+    if _as_float(candidate.get("spread_bps"), 999.0) > 8.0:
+        reasons.append("shock_reversal_cost_too_high")
+    if _as_float(candidate.get("liquidity_score"), 0.0) < 0.65:
+        reasons.append("shock_reversal_liquidity_weak")
+    if _as_float(candidate.get("stale_minutes"), 999.0) > 5.0:
+        reasons.append("shock_reversal_data_stale")
+    if reasons:
+        return _annotate(
+            candidate,
+            profile="yahoo_proxy_shock_reversal",
+            action="shock_reversal_shadow_confirmation",
+            reasons=list(dict.fromkeys(reasons)),
+            score_delta=-12.0,
+            allocation_multiplier=0.0,
+            shadow_only=True,
+        )
+    return _annotate(
+        candidate,
+        profile="yahoo_proxy_shock_reversal",
+        action="shock_reversal_confirmation_probe",
+        reasons=["distinct shock-reversal candidate passed edge, cost, liquidity, freshness, and proxy quality gates"],
+        score_delta=-3.0,
+        allocation_multiplier=0.25,
+    )
+
+
 def _apply_family_quarantine(
     candidate: dict,
     config: Mapping[str, Any] | bool | None = None,
@@ -2502,7 +2540,9 @@ def _apply_one(
         return _repair_frontier_candidate(candidate)
     if trade_type == "perp_funding_basis":
         return _repair_okx_candidate(candidate)
-    if trade_type in {"global_proxy_momentum", "global_market_discovery_proxy"}:
+    if trade_type == "global_proxy_shock_reversal":
+        return _repair_proxy_shock_reversal_candidate(candidate, config=config)
+    if trade_type in PROXY_TRADE_TYPES:
         return _repair_proxy_candidate(candidate, config=config)
     return None
 
