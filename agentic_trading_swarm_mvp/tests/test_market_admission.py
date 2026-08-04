@@ -90,6 +90,80 @@ class MarketAdmissionTests(unittest.TestCase):
             self.assertEqual("healthy", state["health_status"])
             self.assertIn("country_adr_relative_momentum_v1", state["strategy_lineage"])
 
+    def test_proxy_short_missing_quality_evidence_fails_closed_with_report_reason(self):
+        candidate = global_candidate(
+            direction="short_proxy",
+            proxy_quality_status="verified_proxy",
+        )
+        candidate.pop("stale_minutes")
+        candidate.pop("liquidity_score")
+
+        with memory_db() as conn:
+            report = market_admission.run_market_admission_monitor(
+                conn,
+                settings(),
+                [candidate],
+                [{"candidate": candidate, "review": {"decision": "approve_paper_trade", "hard_blocks": []}}],
+            )
+
+        state = report["states"][0]
+        self.assertEqual("priceable", state["current_stage"])
+        self.assertEqual("proxy_short_quality_missing_freshness", state["blocker_code"])
+        self.assertEqual(
+            "proxy_short_quality_missing_freshness",
+            state["details"]["quality_failure_reason"],
+        )
+        self.assertEqual(
+            1,
+            report["summary"]["by_quality_failure"]["proxy_short_quality_missing_freshness"],
+        )
+
+    def test_proxy_short_requires_fresh_depth_and_venue_health_evidence(self):
+        candidate = global_candidate(
+            direction="short_proxy",
+            proxy_quality_status="verified_proxy",
+            freshness_age_seconds=30.0,
+            proxy_depth_notional_usd=2_000_000.0,
+            proxy_depth_basis="recent_traded_notional",
+            proxy_venue_health_status="healthy",
+            proxy_venue_health_basis="successful_public_chart_parse",
+        )
+
+        with memory_db() as conn:
+            report = market_admission.run_market_admission_monitor(
+                conn,
+                settings(),
+                [candidate],
+                [{"candidate": candidate, "review": {"decision": "approve_paper_trade", "hard_blocks": []}}],
+            )
+
+        state = report["states"][0]
+        self.assertEqual("paper_eligible", state["current_stage"])
+        self.assertIsNone(state["details"]["quality_failure_reason"])
+        self.assertTrue(state["details"]["proxy_short_quality_review"]["eligible"])
+
+    def test_proxy_short_stale_enrichment_is_blocked_before_paper_review(self):
+        candidate = global_candidate(
+            direction="short_proxy",
+            proxy_quality_status="verified_proxy",
+            freshness_age_seconds=3601.0,
+            proxy_depth_notional_usd=2_000_000.0,
+            proxy_depth_basis="recent_traded_notional",
+            proxy_venue_health_status="healthy",
+        )
+
+        with memory_db() as conn:
+            report = market_admission.run_market_admission_monitor(
+                conn,
+                settings(),
+                [candidate],
+                [{"candidate": candidate, "review": {"decision": "approve_paper_trade", "hard_blocks": []}}],
+            )
+
+        state = report["states"][0]
+        self.assertEqual("priceable", state["current_stage"])
+        self.assertEqual("proxy_short_quality_stale", state["blocker_code"])
+
     def test_bybit_403_is_network_state_not_strategy_failure(self):
         observation = {
             "venue": "BYBIT_SPOT",

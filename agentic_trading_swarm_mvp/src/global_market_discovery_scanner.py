@@ -26,6 +26,7 @@ from global_proxy_scanner import (
 )
 from research_worker import DEFAULT_GLOBAL_DISCOVERY_SEEDS, normalize_market_candidate
 from scan_batch import ScanBatch, observation_from_candidate
+from proxy_signal_quality import enrich_parsed_proxy_quality
 from yahoo_proxy_reuse import evaluate_yahoo_proxy_reuse
 
 
@@ -677,7 +678,7 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
     source_urls = discovery.get("source_urls") or []
     source_url = source_urls[0] if source_urls else discovery.get("public_docs_url")
 
-    return {
+    candidate = {
         "seen_at": _utc_now(),
         "venue": _venue_key(venue),
         "venue_display_name": venue,
@@ -738,6 +739,7 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
             "public_docs_url": discovery.get("public_docs_url"),
         },
     }
+    return enrich_parsed_proxy_quality(candidate)
 
 
 def _watch_only_candidate(discovery: dict[str, Any]) -> dict[str, Any]:

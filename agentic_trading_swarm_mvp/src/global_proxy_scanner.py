@@ -22,6 +22,7 @@ import urllib.request
 
 from scan_batch import ScanBatch, observation_from_candidate
 from paper_context_cost import annotate_paper_context_cost
+from proxy_signal_quality import enrich_parsed_proxy_quality
 from yahoo_proxy_reuse import evaluate_yahoo_proxy_reuse
 
 
@@ -191,6 +192,7 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
             "currency": meta.get("currency"),
         },
     }
+    enrich_parsed_proxy_quality(candidate)
     return annotate_paper_context_cost(candidate, settings)
 
 

@@ -224,6 +224,42 @@ class StrategyReliabilityTests(unittest.TestCase):
             self.assertEqual(candidate["score"], 0.0)
             self.assertEqual(candidate["strategy_reliability_action"], "family_quarantine_shadow_only")
 
+    def test_proxy_short_quality_failure_is_preserved_through_family_quarantine(self) -> None:
+        candidate = base_candidate(
+            venue="YAHOO_PROXY",
+            inst_id="YAHOO_PROXY:EWZ",
+            trade_type="global_proxy_momentum",
+            direction="short_proxy",
+            change_24h_pct=-3.0,
+            short_return_pct=-2.0,
+            edge_bps_estimate=12.0,
+            spread_bps=3.0,
+            liquidity_score=0.8,
+            stale_minutes=None,
+            quality_score=None,
+        )
+
+        rows, report = strategy_reliability.apply_strategy_reliability([candidate])
+
+        self.assertTrue(rows[0]["paper_entry_blocked"])
+        self.assertEqual("proxy_short_quality_missing_freshness", rows[0]["quality_failure_reason"])
+        self.assertIn(
+            "proxy_short_quality_missing_freshness",
+            rows[0]["strategy_reliability"]["quality_failure_reasons"],
+        )
+        self.assertIn(
+            "proxy_short_quality_missing_depth",
+            rows[0]["strategy_reliability"]["quality_failure_reasons"],
+        )
+        self.assertIn(
+            "proxy_short_quality_missing_venue_health",
+            rows[0]["strategy_reliability"]["quality_failure_reasons"],
+        )
+        self.assertEqual(
+            1,
+            report["summary"]["by_quality_failure"]["proxy_short_quality_missing_freshness"],
+        )
+
     def test_duplicate_suppression_recognizes_strategy_pack_themes(self) -> None:
         self.assertEqual(
             llm_bridge._implemented_manual_category("Investigate microstructure and liquidity impact on frontier spot"),

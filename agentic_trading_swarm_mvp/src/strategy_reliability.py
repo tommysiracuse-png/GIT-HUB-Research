@@ -15,6 +15,7 @@ import json
 import math
 from typing import Any
 
+from proxy_signal_quality import proxy_short_quality_review
 from storage import RUNS_DIR, signal_key
 
 
@@ -1951,6 +1952,13 @@ def _base_profile(candidate: dict) -> dict:
         "hour_utc": hour_utc,
         "recent_decay_status": candidate.get("recent_decay_status") or candidate.get("decay_status"),
         "quote_normalization_status": _quote_status(candidate),
+        "quality_failure_reason": candidate.get("proxy_short_quality_failure_reason") or candidate.get("quality_failure_reason"),
+        "quality_failure_reasons": list(
+            candidate.get("proxy_short_quality_failure_reasons")
+            or candidate.get("quality_failure_reasons")
+            or []
+        ),
+        "proxy_short_quality_review": candidate.get("proxy_short_quality_review"),
     }
 
 
@@ -2355,7 +2363,32 @@ def _repair_okx_candidate(candidate: dict) -> dict | None:
     return None
 
 
-def _repair_proxy_candidate(candidate: dict) -> dict | None:
+def _record_proxy_short_quality(
+    candidate: dict,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    review = proxy_short_quality_review(candidate, config)
+    if not review["applies"]:
+        return review
+    candidate["proxy_short_quality_review"] = review
+    proxy_reasons = list(review.get("quality_failure_reasons") or [])
+    candidate["proxy_short_quality_failure_reason"] = review.get("quality_failure_reason")
+    candidate["proxy_short_quality_failure_reasons"] = proxy_reasons
+    if proxy_reasons:
+        existing_reasons = candidate.get("quality_failure_reasons") or []
+        if isinstance(existing_reasons, str):
+            existing_reasons = [existing_reasons]
+        candidate["quality_failure_reason"] = review["quality_failure_reason"]
+        candidate["quality_failure_reasons"] = list(dict.fromkeys([*existing_reasons, *proxy_reasons]))
+    for reason in proxy_reasons:
+        _append_note(candidate, f"proxy_short_quality:{reason}")
+    return review
+
+
+def _repair_proxy_candidate(
+    candidate: dict,
+    config: Mapping[str, Any] | None = None,
+) -> dict | None:
     if candidate.get("trade_type") not in {"global_proxy_momentum", "global_market_discovery_proxy"}:
         return None
     direction = str(candidate.get("direction") or "")
@@ -2368,6 +2401,8 @@ def _repair_proxy_candidate(candidate: dict) -> dict | None:
 
     if direction == "short_proxy":
         reasons = []
+        quality_review = _record_proxy_short_quality(candidate, config)
+        reasons.extend(quality_review.get("quality_failure_reasons") or [])
         if move > -2.0 and short_return > -1.0:
             reasons.append("short_proxy_needs_stronger_reversal")
         if edge < 8.0:
@@ -2458,6 +2493,7 @@ def _apply_one(
     candidate: dict,
     config: Mapping[str, Any] | bool | None = None,
 ) -> dict | None:
+    _record_proxy_short_quality(candidate, config)
     quarantined = _apply_family_quarantine(candidate, config=config)
     if quarantined is not None:
         return quarantined
@@ -2467,7 +2503,7 @@ def _apply_one(
     if trade_type == "perp_funding_basis":
         return _repair_okx_candidate(candidate)
     if trade_type in {"global_proxy_momentum", "global_market_discovery_proxy"}:
-        return _repair_proxy_candidate(candidate)
+        return _repair_proxy_candidate(candidate, config=config)
     return None
 
 
@@ -2480,11 +2516,17 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
     blocked = sum(1 for item in items if item["action"].startswith("shadow") or "shadow" in item["action"])
     protected = sum(1 for item in items if item.get("protect_working_slice"))
     quarantined = sum(1 for item in items if item.get("profile") == "yahoo_proxy_family_quarantine")
+    by_quality_failure = collections.Counter(
+        reason
+        for candidate in candidates
+        for reason in candidate.get("proxy_short_quality_failure_reasons") or []
+    )
     return {
         "candidate_count": len(candidates),
         "annotated_count": len(items),
         "shadow_or_blocked_count": blocked,
         "family_quarantine_count": quarantined,
+        "by_quality_failure": dict(by_quality_failure),
         "protected_working_slice_count": protected,
         "by_action": dict(by_action),
         "by_profile": dict(by_profile),
@@ -2575,6 +2617,7 @@ def _report_markdown(report: dict) -> str:
         f"- Protected working slices: `{summary.get('protected_working_slice_count', 0)}`",
         f"- Actions: `{summary.get('by_action', {})}`",
         f"- Profiles: `{summary.get('by_profile', {})}`",
+        f"- Proxy-short quality failures: `{summary.get('by_quality_failure', {})}`",
         f"- Manual repair focus: `{summary.get('manual_repair_focus', {})}`",
         "",
         "## Top Adjustments",
@@ -2617,6 +2660,7 @@ def apply_strategy_reliability(
 
     for candidate in candidates:
         _remove_invalid_proxy_confirmation(candidate)
+        _record_proxy_short_quality(candidate, settings)
     if settings is not None and not settings.get("strategy_reliability", {}).get("enabled", True):
         quarantined = [
             record

@@ -14,6 +14,7 @@ import sqlite3
 from collections import Counter
 from typing import Any
 
+from proxy_signal_quality import proxy_short_quality_review
 from storage import RUNS_DIR, signal_key, utc_now
 
 
@@ -116,7 +117,10 @@ def _is_normalized(item: dict) -> bool:
     )
 
 
-def _quality_verified(item: dict) -> bool:
+def _quality_verified(item: dict, config: dict | None = None) -> bool:
+    proxy_short_review = proxy_short_quality_review(item, config)
+    if proxy_short_review["applies"] and not proxy_short_review["eligible"]:
+        return False
     quality = str(item.get("quality_status") or item.get("proxy_quality_status") or "").lower()
     if quality in {"verified", "verified_proxy", "normal"}:
         return True
@@ -129,7 +133,7 @@ def _quality_verified(item: dict) -> bool:
     return False
 
 
-def _blocker(item: dict, review: dict | None, stage: str) -> str | None:
+def _blocker(item: dict, review: dict | None, stage: str, config: dict | None = None) -> str | None:
     session = _session_status(item)
     if session == "closed":
         return "market_closed"
@@ -151,7 +155,10 @@ def _blocker(item: dict, review: dict | None, stage: str) -> str | None:
     normalization = str(item.get("quote_normalization_status") or "").lower()
     if normalization.startswith("missing") or normalization == "unsupported_quote":
         return "missing_quote_normalization"
-    if stage == "priceable" and not _quality_verified(item):
+    if stage == "priceable" and not _quality_verified(item, config):
+        proxy_short_review = proxy_short_quality_review(item, config)
+        if proxy_short_review["applies"] and proxy_short_review["quality_failure_reason"]:
+            return str(proxy_short_review["quality_failure_reason"])
         return str(item.get("regional_candidate_gate_status") or item.get("quality_action") or "quality_unverified")
     reason = str(item.get("candidate_reject_reason") or "").strip()
     if stage == "quality_verified" and (item.get("direction") in {None, "", "watch_only"}):
@@ -165,7 +172,7 @@ def _blocker(item: dict, review: dict | None, stage: str) -> str | None:
     return reason or None
 
 
-def _stage_for(item: dict, review: dict | None, stats: dict) -> str:
+def _stage_for(item: dict, review: dict | None, stats: dict, config: dict | None = None) -> str:
     stage = "discovered"
     data_status = str(item.get("data_status") or "reachable").lower()
     if data_status != "reachable":
@@ -177,7 +184,7 @@ def _stage_for(item: dict, review: dict | None, stats: dict) -> str:
     if float(item.get("last") or 0.0) <= 0.0:
         return stage
     stage = "priceable"
-    if not _quality_verified(item):
+    if not _quality_verified(item, config):
         return stage
     stage = "quality_verified"
     if item.get("direction") in {None, "", "watch_only"}:
@@ -441,6 +448,11 @@ def _write_report(states: list[dict], settings: dict) -> dict:
     by_stage = Counter(item["current_stage"] for item in states)
     by_health = Counter(item["health_status"] for item in states)
     by_blocker = Counter(item.get("blocker_code") for item in states if item.get("blocker_code"))
+    by_quality_failure = Counter(
+        item.get("details", {}).get("quality_failure_reason")
+        for item in states
+        if item.get("details", {}).get("quality_failure_reason")
+    )
     requested = set((settings.get("market_admission") or {}).get("requested_symbols") or [])
     requested_rows = [item for item in states if str(item.get("inst_id") or "").split(":")[-1] in requested]
     summary = {
@@ -449,6 +461,7 @@ def _write_report(states: list[dict], settings: dict) -> dict:
         "by_stage": dict(by_stage),
         "by_health": dict(by_health),
         "by_blocker": dict(by_blocker),
+        "by_quality_failure": dict(by_quality_failure),
         "requested_symbol_count": len(requested),
         "requested_symbols_observed": len({str(item["inst_id"]).split(":")[-1] for item in requested_rows}),
         "paper_eligible_count": sum(STAGE_INDEX[item["highest_stage"]] >= STAGE_INDEX["paper_eligible"] for item in states),
@@ -465,6 +478,7 @@ def _write_report(states: list[dict], settings: dict) -> dict:
         f"- By stage: `{summary['by_stage']}`",
         f"- By health: `{summary['by_health']}`",
         f"- By blocker: `{summary['by_blocker']}`",
+        f"- Proxy-short quality failures: `{summary['by_quality_failure']}`",
         f"- Requested symbols observed: `{summary['requested_symbols_observed']}/{summary['requested_symbol_count']}`",
         "",
         "## Requested Markets",
@@ -517,9 +531,9 @@ def run_market_admission_monitor(
         lineage = _lineage(item)
         review = review_by_identity.get((str(item.get("inst_id")), lineage))
         stats = _stats_for(item, paper_stats)
-        current_stage = _stage_for(item, review, stats)
+        current_stage = _stage_for(item, review, stats, cfg)
         session_status = _session_status(item)
-        blocker = _blocker(item, review, current_stage)
+        blocker = _blocker(item, review, current_stage, cfg)
         eligible = session_status in ACTIVE_SESSION_STATES
         previous = conn.execute(
             "select * from market_admission_states where admission_key = ?",
@@ -543,6 +557,7 @@ def run_market_admission_monitor(
             health_status = "waiting"
         else:
             health_status = "healthy"
+        proxy_short_review = proxy_short_quality_review(item, cfg)
         details = {
             **stats,
             "direction": item.get("direction"),
@@ -554,6 +569,9 @@ def run_market_admission_monitor(
             "http_status": item.get("http_status"),
             "last": item.get("last"),
             "review_decision": (review or {}).get("decision"),
+            "quality_failure_reason": proxy_short_review.get("quality_failure_reason") if proxy_short_review["applies"] else None,
+            "quality_failure_reasons": proxy_short_review.get("quality_failure_reasons", []) if proxy_short_review["applies"] else [],
+            "proxy_short_quality_review": proxy_short_review if proxy_short_review["applies"] else None,
         }
         conn.execute(
             """

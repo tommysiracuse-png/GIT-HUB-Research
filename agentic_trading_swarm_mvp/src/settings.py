@@ -229,6 +229,12 @@ DEFAULT_SETTINGS = {
         "consecutive_failures_degraded": 5,
         "diagnostic_after_eligible_scans": 30,
         "implementation_task_after_eligible_scans": 120,
+        "proxy_short_quality_gate": {
+            "enabled": True,
+            "max_freshness_age_seconds": 3600.0,
+            "min_depth_notional_usd": 1.0,
+            "min_liquidity_score": 0.65,
+        },
         "requested_symbols": [
             "VIXY", "VXX", "UVXY", "SVXY", "EWY", "PKX", "EWT", "TSM", "UMC",
             "EWZ", "NU", "SHOP", "TD", "RY", "GLD", "SLV", "SPY", "EWJ", "BHP",
