@@ -68,6 +68,18 @@ def _host(value: Any) -> str:
         return ""
 
 
+def _normalized_url(value: Any) -> str:
+    try:
+        parsed = urllib.parse.urlparse(str(value or ""))
+    except ValueError:
+        return ""
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if not host:
+        return ""
+    path = re.sub(r"/+", "/", parsed.path or "/").rstrip("/") or "/"
+    return f"{host}{path}"
+
+
 def _legacy_records() -> list[dict]:
     records = []
     for row in load_venue_registry().get("venues", []):
@@ -166,6 +178,7 @@ def _spec_identity(spec_row: dict) -> dict:
         "venue_words": _words(venue),
         "words": _words(text),
         "hosts": {_host(value) for value in urls if _host(value)},
+        "urls": {_normalized_url(value) for value in urls if _normalized_url(value)},
         "required_capabilities": _required_capabilities(text, spec),
     }
 
@@ -185,10 +198,20 @@ def match_adapter_spec(spec_row: dict, inventory: list[dict] | None = None) -> d
             )
         )
         hosts = {_host(adapter.get("docs_url")), _host(adapter.get("source"))} - {""}
+        urls = {
+            _normalized_url(adapter.get("docs_url")),
+            _normalized_url(adapter.get("source")),
+        } - {""}
+        exact_url_match = bool(identity["urls"].intersection(urls))
         host_match = bool(identity["hosts"].intersection(hosts))
         venue_overlap = identity["venue_words"].intersection(adapter_words)
         exact_venue = bool(identity["venue_words"] and identity["venue_words"] <= adapter_words)
-        score = (100 if host_match else 0) + (50 if exact_venue else 0) + min(20, len(venue_overlap) * 5)
+        score = (
+            (100 if exact_url_match else 0)
+            + (100 if host_match else 0)
+            + (50 if exact_venue else 0)
+            + min(20, len(venue_overlap) * 5)
+        )
         if not host_match and not exact_venue:
             continue
         available = set(adapter.get("capabilities") or [])

@@ -69,9 +69,15 @@ from adapters.venues.e_auksion_district_hokimiyat_notices import (
     parse_e_auksion_lots,
 )
 from adapters.venues.ethiopian_securities_exchange import (
+    FIXED_INCOME_INSTRUMENTS_URL as ESX_FIXED_INCOME_INSTRUMENTS_URL,
+    FIXED_INCOME_OPERATIONS_URL as ESX_FIXED_INCOME_OPERATIONS_URL,
+    FIXED_INCOME_OVERVIEW_URL as ESX_FIXED_INCOME_OVERVIEW_URL,
     LISTED_COMPANIES_URL as ESX_LISTED_COMPANIES_URL,
     EthiopianSecuritiesExchangeAdapter,
+    EthiopianSecuritiesExchangeFixedIncomeAdapter,
     parse_esx_equity_listings,
+    parse_esx_fixed_income_instruments,
+    parse_esx_fixed_income_session,
 )
 from adapters.venues.kase_futures import parse_kase_futures
 from adapters.venues.kalshi import (
@@ -119,6 +125,47 @@ from adapters.venues.vietnam_securities_depository_and_clearing_corporation_hano
 )
 from scan_batch import ScanBatch
 from settings import DEFAULT_SETTINGS
+
+
+def _esx_fixed_income_instruments_fixture() -> str:
+    return """
+    <html><body>
+      <h1>Treasury Bills and Bonds</h1>
+      <ul>
+        <li>Treasury Bills (T-Bills) are short-term debt securities issued by
+        the Ethiopian government with a maturity period of one year or less.</li>
+        <li>T-Bills are auctioned biweekly with a minimum investment amount of
+        ETB 5,000 in maturities of 28-days, 91-days, 182-days and 364-days.</li>
+        <li>Treasury Bonds are long-term government debt securities with a
+        maturity period of more than one year.</li>
+      </ul>
+      <h1>Corporate Bonds</h1>
+      <p>A corporate bond is issued by a company at fixed or variable interest.</p>
+      <h1>REPURCHASE AGREEMENTS/ REPOS</h1>
+      <p>A repurchase agreement (repo) is secured short-term borrowing, usually
+      a 1-7 day term.</p>
+      <h1>Commercial Papers</h1>
+      <p>Commercial papers are corporate obligations with a maturity period of
+      less than 270 days.</p>
+    </body></html>
+    """
+
+
+def _esx_fixed_income_operations_fixture() -> str:
+    return """
+    <html><body>
+      <table>
+        <tr><th>Session</th><th>Time</th><th>Price Limit</th></tr>
+        <tr><td>Pre-open</td><td>9:00 AM - 9:30 AM</td><td>-</td></tr>
+        <tr><td>Continuous</td><td>9:30 AM - 3:00 PM</td><td>-</td></tr>
+        <tr><td>Close</td><td>3:00 PM</td><td>-</td></tr>
+      </table>
+      <table>
+        <tr><th>Date</th><th>Holiday</th></tr>
+        <tr><td>Tuesday, Aug 25, 2026</td><td>The Prophet's Birthday</td></tr>
+      </table>
+    </body></html>
+    """
 
 
 def _eex_auction_workbook_fixture() -> bytes:
@@ -728,6 +775,135 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
         self.assertEqual("blocked", unavailable_batch.observations[0]["fetch_status"])
         self.assertEqual(ESX_LISTED_COMPANIES_URL, unavailable_batch.observations[0]["source_url"])
+
+    def test_esx_fixed_income_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "ethiopian_securities_exchange_fixed_income"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsNotNone(adapter)
+        self.assertEqual("ESX", adapter.info.venue)
+        self.assertEqual(ESX_FIXED_INCOME_OVERVIEW_URL, adapter.info.docs_url)
+        self.assertIn("fixed_income_instrument_catalog", adapter.info.capabilities)
+        self.assertIn("trading_session", adapter.info.capabilities)
+        self.assertNotIn("ticker", adapter.info.capabilities)
+        self.assertNotIn("order_book", adapter.info.capabilities)
+
+    def test_esx_fixed_income_parser_normalizes_instruments_and_session(self) -> None:
+        session = parse_esx_fixed_income_session(
+            _esx_fixed_income_operations_fixture(),
+            received_at="2026-08-04T08:00:00+00:00",
+        )
+        self.assertEqual("continuous", session["session_status"])
+        self.assertEqual("Africa/Addis_Ababa", session["session_timezone"])
+        holiday_session = parse_esx_fixed_income_session(
+            _esx_fixed_income_operations_fixture(),
+            received_at="2026-08-25T08:00:00+00:00",
+        )
+        self.assertEqual("holiday_closed", holiday_session["session_status"])
+        self.assertEqual("The Prophet's Birthday", holiday_session["holiday_name"])
+
+        rows = parse_esx_fixed_income_instruments(
+            _esx_fixed_income_instruments_fixture(),
+            received_at="2026-08-04T08:00:00+00:00",
+            session_status=session["session_status"],
+        )
+        self.assertEqual(
+            [
+                "GOVT_TBILL",
+                "COMMERCIAL_PAPER",
+                "REPO",
+                "TREASURY_BOND",
+                "CORPORATE_BOND",
+            ],
+            [row["symbol"] for row in rows],
+        )
+        by_symbol = {row["symbol"]: row for row in rows}
+        self.assertEqual([28, 91, 182, 364], by_symbol["GOVT_TBILL"]["tenor_days"])
+        self.assertEqual(5000.0, by_symbol["GOVT_TBILL"]["minimum_investment_etb"])
+        self.assertEqual(269, by_symbol["COMMERCIAL_PAPER"]["maximum_maturity_days"])
+        self.assertEqual("continuous", by_symbol["REPO"]["session_status"])
+        self.assertEqual(ESX_FIXED_INCOME_INSTRUMENTS_URL, rows[0]["source_url"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in rows))
+        self.assertTrue(all(row["candidate_reject_reason"] for row in rows))
+
+    def test_esx_fixed_income_adapter_preserves_fetch_and_parser_evidence(self) -> None:
+        overview = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<h1>Fixed Income Market</h1>",
+            "received_at": "2026-08-04T08:00:00+00:00",
+            "latency_ms": 1.0,
+        }
+        instruments = {
+            **overview,
+            "text": _esx_fixed_income_instruments_fixture(),
+            "latency_ms": 2.0,
+        }
+        operations = {
+            **overview,
+            "text": _esx_fixed_income_operations_fixture(),
+            "latency_ms": 3.0,
+        }
+        with mock.patch(
+            "adapters.venues.ethiopian_securities_exchange.fetch_text",
+            side_effect=[overview, instruments, operations],
+        ) as fetch:
+            batch = EthiopianSecuritiesExchangeFixedIncomeAdapter().scan({})
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual(5, len(batch.observations))
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("fresh", batch.metadata["freshness_state"])
+        self.assertEqual("continuous", batch.metadata["session_state"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertEqual(1296, batch.metadata["adapter_spec_id"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertEqual(
+            [
+                ESX_FIXED_INCOME_OVERVIEW_URL,
+                ESX_FIXED_INCOME_INSTRUMENTS_URL,
+                ESX_FIXED_INCOME_OPERATIONS_URL,
+            ],
+            [call.args[0] for call in fetch.call_args_list],
+        )
+
+        bad_instruments = {**instruments, "text": "<h1>Unrelated page</h1>"}
+        with mock.patch(
+            "adapters.venues.ethiopian_securities_exchange.fetch_text",
+            side_effect=[overview, bad_instruments, operations],
+        ):
+            parser_batch = EthiopianSecuritiesExchangeFixedIncomeAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual(1, len(parser_batch.metadata["parser_failures"]))
+        self.assertEqual("fixed_income_instruments", parser_batch.metadata["parser_failures"][0]["parser"])
+        self.assertEqual(
+            "public_fixed_income_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+        self.assertTrue(parser_batch.observations[0]["parser_failure"])
+
+        blocked = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T08:00:00+00:00",
+            "latency_ms": 4.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch(
+            "adapters.venues.ethiopian_securities_exchange.fetch_text",
+            side_effect=[overview, blocked, operations],
+        ):
+            unavailable_batch = EthiopianSecuritiesExchangeFixedIncomeAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual("blocked", unavailable_batch.observations[0]["fetch_status"])
+        self.assertEqual(
+            ESX_FIXED_INCOME_INSTRUMENTS_URL,
+            unavailable_batch.observations[0]["source_url"],
+        )
 
     def test_set_yuanta_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
         adapter_id = "stock_exchange_of_thailand_yuanta_securities_thailand"
@@ -2083,6 +2259,34 @@ class AdapterCapabilityTests(unittest.TestCase):
         self.assertEqual("ethiopian_securities_exchange", match["adapter_id"])
         self.assertNotIn("entry_quality_quote", match["available_capabilities"])
         self.assertNotIn("ticker", match["available_capabilities"])
+
+    def test_esx_fixed_income_adapter_closes_spec_1296(self) -> None:
+        spec = {
+            "title": "Implement public adapter #1296: Ethiopian Securities Exchange",
+            "market_key": "global_discovery|Ethiopian Securities Exchange",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "Ethiopian Securities Exchange",
+                    "public_docs_url": ESX_FIXED_INCOME_OVERVIEW_URL,
+                    "source_urls": [
+                        ESX_FIXED_INCOME_INSTRUMENTS_URL,
+                        ESX_FIXED_INCOME_OPERATIONS_URL,
+                    ],
+                    "asset_or_event": (
+                        "Government T-Bills, commercial papers, repos, "
+                        "Treasury bonds, corporate bonds"
+                    ),
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("ethiopian_securities_exchange_fixed_income", match["adapter_id"])
+        self.assertIn("fixed_income_instrument_catalog", match["available_capabilities"])
+        self.assertNotIn("ticker", match["available_capabilities"])
+        self.assertNotIn("order_book", match["available_capabilities"])
 
     def test_b3_adapter_closes_public_surface_spec_without_quote_claims(self) -> None:
         spec = {
