@@ -1,5 +1,12 @@
 import copy
+import pathlib
+import sys
 import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from src.route_resolver import (
     enrich_candidate_with_route,
@@ -7,6 +14,7 @@ from src.route_resolver import (
     summarize_routes,
 )
 from src.settings import DEFAULT_SETTINGS
+from strategy_reliability import _annotate
 
 
 class TestPaperRouteExecutabilityGate(unittest.TestCase):
@@ -170,6 +178,9 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
         self.assertEqual(0.0, enriched["score"])
         self.assertEqual(88.0, enriched["pre_route_eligibility_score"])
         self.assertTrue(enriched["paper_entry_blocked"])
+        self.assertFalse(enriched["promotion_eligible"])
+        self.assertEqual(0.0, enriched["paper_route_allocation_multiplier"])
+        self.assertTrue(enriched["paper_route_score_clamped"])
         self.assertIn("borrowable", enriched["paper_route_eligibility"]["missing_prerequisites"])
         self.assertEqual(
             1,
@@ -179,6 +190,39 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
             1,
             summary["by_paper_route_eligibility_blocker"]["spot_borrow_missing"],
         )
+
+    def test_reliability_scoring_cannot_resurrect_blocked_candidate(self):
+        candidate = enrich_candidate_with_route(
+            {
+                "venue": "GATE",
+                "trade_type": "frontier_crypto_venue_map",
+                "direction": "short_frontier_spot",
+                "asset_class": "crypto_spot",
+                "data_status": "reachable",
+                "score": 88.0,
+            },
+            copy.deepcopy(DEFAULT_SETTINGS),
+        )
+
+        reliability = _annotate(
+            candidate,
+            profile="test_positive_reliability",
+            action="would_raise_score_without_route_gate",
+            reasons=["positive_alpha_evidence"],
+            score_delta=25.0,
+            allocation_multiplier=1.0,
+            protect=True,
+        )
+
+        self.assertEqual(0.0, candidate["score"])
+        self.assertFalse(candidate["promotion_eligible"])
+        self.assertTrue(candidate["paper_entry_blocked"])
+        self.assertEqual(0.0, candidate["strategy_reliability_allocation_multiplier"])
+        self.assertTrue(reliability["route_eligibility_enforced"])
+        self.assertFalse(reliability["protect_working_slice"])
+        self.assertEqual(25.0, reliability["requested_score_delta"])
+        self.assertEqual(0.0, reliability["score_delta"])
+        self.assertIn("paper_route_eligibility_blocked", reliability["reasons"])
 
 
 if __name__ == "__main__":

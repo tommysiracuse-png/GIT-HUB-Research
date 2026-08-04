@@ -1665,6 +1665,17 @@ def _annotate(
     shadow_only: bool = False,
     protect: bool = False,
 ) -> dict:
+    route_eligibility = candidate.get("paper_route_eligibility") or {}
+    route_eligibility_blocked = bool(route_eligibility.get("suppressed", False))
+    requested_score_delta = score_delta
+    reasons = list(reasons)
+    if route_eligibility_blocked:
+        score_delta = 0.0
+        allocation_multiplier = 0.0
+        shadow_only = True
+        protect = False
+        if "paper_route_eligibility_blocked" not in reasons:
+            reasons.append("paper_route_eligibility_blocked")
     allocation_multiplier = max(0.0, min(1.0, allocation_multiplier))
     reliability = _base_profile(candidate)
     reliability.update(
@@ -1677,6 +1688,9 @@ def _annotate(
             "protect_working_slice": bool(protect),
         }
     )
+    if route_eligibility_blocked:
+        reliability["route_eligibility_enforced"] = True
+        reliability["requested_score_delta"] = round(requested_score_delta, 3)
     candidate["strategy_reliability"] = reliability
     candidate["strategy_reliability_action"] = action
     candidate["strategy_reliability_allocation_multiplier"] = allocation_multiplier
@@ -1693,6 +1707,13 @@ def _annotate(
     if context_penalty is not None:
         reliability["paper_score_context_penalty"] = context_penalty
         candidate["strategy_reliability_context_penalty"] = context_penalty
+    if route_eligibility_blocked:
+        candidate.setdefault("pre_route_eligibility_score", candidate.get("score", 0.0))
+        candidate["score"] = 0.0
+        candidate["paper_entry_blocked"] = True
+        candidate["promotion_eligible"] = False
+        candidate["paper_route_allocation_multiplier"] = 0.0
+        candidate["paper_route_score_clamped"] = True
     candidate["strategy_reliability"] = reliability
     _append_note(candidate, f"strategy_reliability:{profile}:{action}")
     return reliability

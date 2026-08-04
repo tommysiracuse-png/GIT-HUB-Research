@@ -1212,6 +1212,9 @@ def enrich_candidate_with_route(candidate: dict, settings: dict, registry: dict 
             enriched.setdefault("pre_route_eligibility_score", enriched["score"])
             enriched["score"] = 0.0
         enriched["paper_entry_blocked"] = True
+        enriched["promotion_eligible"] = False
+        enriched["paper_route_allocation_multiplier"] = 0.0
+        enriched["paper_route_score_clamped"] = True
         enriched["paper_route_block_reasons"] = eligibility["blocker_reasons"]
     return enriched
 
