@@ -180,7 +180,11 @@ def _create_enrichment(conn: sqlite3.Connection, state: dict[str, Any]) -> dict[
     return {"action": directive, "status": "created", "topic_key": claim.topic_key}
 
 
-def _create_strategy_discovery(conn: sqlite3.Connection, state: dict[str, Any]) -> dict[str, Any]:
+def _create_strategy_discovery(
+    conn: sqlite3.Connection,
+    settings: dict,
+    state: dict[str, Any],
+) -> dict[str, Any]:
     claim = _claim(conn, state, "discover_surface_specific_strategy", 90)
     if claim.duplicate and claim.canonical_row_id:
         return {"action": "strategy_lab_discovery", "status": "deduplicated", "topic_key": claim.topic_key}
@@ -217,7 +221,7 @@ def _create_strategy_discovery(conn: sqlite3.Connection, state: dict[str, Any]) 
             "evidence": evidence,
         },
     }
-    result = ingest_strategy_lab_recommendation(conn, rec)[0]
+    result = ingest_strategy_lab_recommendation(conn, rec, settings)[0]
     if result.get("strategy_lab_id"):
         bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
     return {
@@ -288,7 +292,7 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
         if stage == "priceable":
             actions.append(_create_enrichment(conn, state))
         elif stage == "quality_verified" and str(state.get("strategy_lineage") or "") == "adapter_observation":
-            actions.append(_create_strategy_discovery(conn, state))
+            actions.append(_create_strategy_discovery(conn, settings, state))
         elif stage == "strategy_candidate":
             actions.append(_create_route_action(conn, settings, state))
         elif stage == "route_feasible":

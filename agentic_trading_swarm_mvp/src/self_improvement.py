@@ -607,12 +607,16 @@ def _normalize_strategy_lab_recommendation_payload(payload: dict) -> dict:
     return normalized
 
 
-def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict):
+def ingest_strategy_lab_recommendation(
+    conn: sqlite3.Connection,
+    rec: dict,
+    settings: dict | None = None,
+):
     normalized_rec = dict(rec)
     normalized_rec["payload"] = _normalize_strategy_lab_recommendation_payload(
         dict(rec.get("payload") or {})
     )
-    return _strategy_lab_ingest_strategy_lab_recommendation(conn, normalized_rec)
+    return _strategy_lab_ingest_strategy_lab_recommendation(conn, normalized_rec, settings)
 
 IMPLEMENTED_MANUAL_STATUSES = {
     "route_requirements": ("implemented_route_requirements", ("improvement_tasks", "route_probe_tasks")),

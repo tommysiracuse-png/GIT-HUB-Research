@@ -618,7 +618,12 @@ def _record_memory(conn: sqlite3.Connection, task: dict, result: dict, status: s
     conn.commit()
 
 
-def _handle_materialize(conn: sqlite3.Connection, task: dict, decision: dict) -> tuple[str, dict]:
+def _handle_materialize(
+    conn: sqlite3.Connection,
+    task: dict,
+    decision: dict,
+    settings: dict | None = None,
+) -> tuple[str, dict]:
     experiment = decision.get("strategy_experiment")
     if not isinstance(experiment, dict):
         return "analyzing", {"validation_error": "materialize_experiment_missing_strategy_experiment"}
@@ -631,7 +636,7 @@ def _handle_materialize(conn: sqlite3.Connection, task: dict, decision: dict) ->
             "strategy_lab_experiment": experiment,
         },
     }
-    artifacts = ingest_strategy_lab_recommendation(conn, rec)
+    artifacts = ingest_strategy_lab_recommendation(conn, rec, settings)
     created = next((item for item in artifacts if item.get("action_status") == "created"), None)
     if not created:
         return "analyzing", {"validation_error": artifacts}
@@ -830,7 +835,7 @@ def process_one(conn: sqlite3.Connection, settings: dict, *, cycle_id: str) -> d
         return {"status": "implementation_paused", "task_id": task["task_id"], "codex": result}
     choice = str(decision.get("decision") or "")
     if choice == "materialize_experiment":
-        status, handled = _handle_materialize(conn, task, decision)
+        status, handled = _handle_materialize(conn, task, decision, settings)
     elif choice == "implement_code":
         status, handled = _handle_code(conn, task, decision, settings, result.get("session_id"))
     elif choice == "wait_for_data":

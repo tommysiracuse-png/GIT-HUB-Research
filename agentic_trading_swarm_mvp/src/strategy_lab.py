@@ -18,6 +18,7 @@ from typing import Any
 from route_resolver import evaluate_route_intelligence
 from signals.registry import discover_signals, known_strategy_signatures, promoted_strategy_lab_ids
 from storage import RUNS_DIR, add_llm_recommendation, utc_now
+from strategy_reliability import paper_source_veto_record, paper_source_veto_recovery_status
 from strategy_program import (
     LOGIC_TYPE as OBSERVATION_PROGRAM,
     compile_observation_program,
@@ -761,6 +762,14 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
     risk_gates = _first_dict(contract.get("risk_gates"), contract.get("risk_gates_json"))
     promotion_rules = _first_dict(contract.get("promotion_rules"), contract.get("promotion_rules_json"))
     data_requirements = _first_dict(contract.get("data_requirements"), contract.get("data_requirements_json"))
+    for target, source in (
+        ("source_market_key", "market_key"),
+        ("source_signal_key", "signal_key"),
+        ("source_strategy_lab_parent", "strategy_lab_parent"),
+        ("source_strategy_lab_variant", "strategy_lab_variant"),
+    ):
+        if payload.get(source) not in (None, ""):
+            data_requirements.setdefault(target, payload[source])
     parent = contract.get("parent_strategy_lab_id")
 
     return {
@@ -777,7 +786,11 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
     }, None
 
 
-def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> list[dict]:
+def ingest_strategy_lab_recommendation(
+    conn: sqlite3.Connection,
+    rec: dict,
+    settings: dict | None = None,
+) -> list[dict]:
     payload = dict(rec.get("payload") or {})
     contract, error = _validate_contract(payload)
     if contract is None:
@@ -786,6 +799,21 @@ def ingest_strategy_lab_recommendation(conn: sqlite3.Connection, rec: dict) -> l
                 "action_status": "skipped",
                 "artifact": "strategy_lab_experiment",
                 "reason": error or "invalid_contract",
+            }
+        ]
+
+    veto_subject = dict(payload)
+    veto_subject["validated_strategy_contract"] = contract
+    source_veto = paper_source_veto_record(veto_subject, settings)
+    if source_veto is not None:
+        return [
+            {
+                "action_status": "skipped",
+                "artifact": "strategy_lab_experiment",
+                "reason": "paper_source_family_veto",
+                "strategy_lab_id": contract["strategy_lab_id"],
+                "paper_only": True,
+                "source_veto": source_veto,
             }
         ]
 
@@ -1797,11 +1825,45 @@ def generate_strategy_lab_candidates(
         )
     else:
         observation_frames, snapshot_summary = [], {"enabled": False}
+    source_vetoed_candidates: list[dict] = []
+    source_rank_candidates: list[dict] = []
+    for candidate in candidates:
+        source_veto = paper_source_veto_record(candidate, settings)
+        if source_veto is None:
+            source_rank_candidates.append(candidate)
+            continue
+        source_vetoed_candidates.append(
+            {
+                "inst_id": candidate.get("inst_id"),
+                "venue": candidate.get("venue"),
+                "trade_type": candidate.get("trade_type"),
+                "direction": candidate.get("direction"),
+                "market_key": candidate.get("market_key"),
+                "strategy_lab_id": candidate.get("strategy_lab_id"),
+                "reason": source_veto["reason"],
+                "matched_on": source_veto["matched_on"],
+            }
+        )
     eligible_candidates, route_blocked, route_missing_counts, route_blocker_counts = (
-        _paper_route_eligible_candidates(candidates)
+        _paper_route_eligible_candidates(source_rank_candidates)
     )
     compilation = _compile_strategy_lab_contracts(conn, eligible_candidates, observation_frames)
-    experiments = _active_experiments(conn)
+    all_experiments = _active_experiments(conn)
+    source_vetoed_experiments: list[dict] = []
+    experiments: list[dict] = []
+    for experiment in all_experiments:
+        source_veto = paper_source_veto_record(experiment, settings)
+        if source_veto is None:
+            experiments.append(experiment)
+            continue
+        source_vetoed_experiments.append(
+            {
+                "strategy_lab_id": experiment.get("strategy_lab_id"),
+                "parent_strategy_lab_id": experiment.get("parent_strategy_lab_id"),
+                "reason": source_veto["reason"],
+                "matched_on": source_veto["matched_on"],
+            }
+        )
     max_total = int(cfg.get("max_candidates_per_loop", 25))
     max_per_experiment = int(cfg.get("max_candidates_per_experiment", 5))
     default_bonus = float(cfg.get("candidate_score_bonus", 1.0))
@@ -2004,6 +2066,11 @@ def generate_strategy_lab_candidates(
         "generated_at": _utc(),
         "active_experiments": len(experiments),
         "source_candidate_count": len(candidates),
+        "source_vetoed_candidate_count": len(source_vetoed_candidates),
+        "source_vetoed_candidates": source_vetoed_candidates[:20],
+        "source_vetoed_experiment_count": len(source_vetoed_experiments),
+        "source_vetoed_experiments": source_vetoed_experiments[:20],
+        "paper_source_veto_recovery": paper_source_veto_recovery_status(settings),
         "route_eligible_source_candidate_count": len(eligible_candidates),
         "route_ineligible_candidate_count": len(route_blocked),
         "route_ineligible_missing_prerequisite_counts": dict(route_missing_counts),
@@ -2133,7 +2200,15 @@ def _rules(settings: dict, experiment: dict) -> dict:
     }
 
 
-def _queue_promotion(conn: sqlite3.Connection, experiment: dict, evaluation: dict, rules: dict) -> str | None:
+def _queue_promotion(
+    conn: sqlite3.Connection,
+    experiment: dict,
+    evaluation: dict,
+    rules: dict,
+    settings: dict | None = None,
+) -> str | None:
+    if paper_source_veto_record(experiment, settings) is not None:
+        return None
     proposal_id = "strategy_lab_promotion_" + hashlib.sha256(
         f"{experiment['strategy_lab_id']}:{experiment['version']}".encode("utf-8")
     ).hexdigest()[:16]
@@ -2242,8 +2317,15 @@ def _queue_promotion(conn: sqlite3.Connection, experiment: dict, evaluation: dic
     return rec_id if created else None
 
 
-def _maybe_split_children(conn: sqlite3.Connection, experiment: dict, outcomes: dict) -> list[str]:
+def _maybe_split_children(
+    conn: sqlite3.Connection,
+    experiment: dict,
+    outcomes: dict,
+    settings: dict | None = None,
+) -> list[str]:
     created = []
+    if paper_source_veto_record(experiment, settings) is not None:
+        return created
     good_regions = [
         (region, metrics)
         for region, metrics in outcomes.get("by_region", {}).items()
@@ -2314,6 +2396,18 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
     experiments = _active_experiments(conn)
     evaluations = []
     for experiment in experiments:
+        source_veto = paper_source_veto_record(experiment, settings)
+        if source_veto is not None:
+            evaluations.append(
+                {
+                    "strategy_lab_id": experiment["strategy_lab_id"],
+                    "experiment_type": experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE),
+                    "status": experiment.get("status"),
+                    "decision": "paper_source_family_veto",
+                    "source_veto": source_veto,
+                }
+            )
+            continue
         rules = _rules(settings, experiment)
         outcomes = _experiment_outcomes(conn, experiment["strategy_lab_id"], rules["horizon_minutes"])
         metrics = outcomes["metrics"]
@@ -2358,7 +2452,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             passes += 1
             decision = "promotion_gate_passed"
             if passes >= rules["consecutive_passes_to_promote"]:
-                promotion_id = _queue_promotion(conn, experiment, outcomes, rules)
+                promotion_id = _queue_promotion(conn, experiment, outcomes, rules, settings)
                 status = "promotion_queued"
                 decision = "promotion_queued" if promotion_id else "promotion_already_queued"
         elif retire_ready:
@@ -2368,7 +2462,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
         elif expand_ready:
             decision = "expand_testing_modestly"
         elif count >= rules["retire_min_labels"]:
-            children = _maybe_split_children(conn, experiment, outcomes)
+            children = _maybe_split_children(conn, experiment, outcomes, settings)
             if children:
                 status = "split_into_children"
                 decision = "split_into_children"
@@ -2585,6 +2679,8 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         f"- Program novelty: `{summary.get('novelty_status_counts', {})}`",
         f"- Candidates generated this loop: `{(generation or {}).get('generated_candidates', 0)}`",
         f"- Route-ineligible candidates filtered: `{(generation or {}).get('route_ineligible_candidate_count', 0)}`",
+        f"- Source-vetoed candidates: `{(generation or {}).get('source_vetoed_candidate_count', 0)}`",
+        f"- Source-vetoed experiments: `{(generation or {}).get('source_vetoed_experiment_count', 0)}`",
         f"- Missing route prerequisites: `{(generation or {}).get('route_ineligible_missing_prerequisite_counts', {})}`",
         f"- Route eligibility blockers: `{(generation or {}).get('route_ineligible_blocker_counts', {})}`",
         f"- Feature snapshots: `{(generation or {}).get('feature_snapshots', {})}`",

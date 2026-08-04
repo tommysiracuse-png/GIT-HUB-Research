@@ -287,13 +287,19 @@ QUARANTINED_PAPER_SOURCE_FAMILY = "yahoo_proxy"
 QUARANTINED_PAPER_STRATEGY_FAMILY = "global_proxy_momentum"
 QUARANTINED_STRATEGY_LAB_PREFIXES = (
     "gate_yahoo_momentum_to_fresh_tight_high_quality_proxies_3342a7f1",
+    "lab_yahoo_proxy_momentum_freshness_quality_gate_v1",
     "red_team_yahoo_proxy_momentum_sanity_check_c6d14fc0",
     "route_rich_frontier_long_filter_2942c975",
 )
 QUARANTINE_RELEASE_CONDITION = (
-    "Keep quarantined until a fresh paper validation window demonstrates stable "
-    "positive after-cost expectancy and an acceptable hit rate for the family."
+    "Lift only after the source family and its immediate descendants each show "
+    "sustained non-negative paper expectancy with acceptable freshness and "
+    "execution-quality diagnostics."
 )
+SOURCE_VETO_POLICY_KEY = "yahoo_proxy_momentum_source_veto"
+SOURCE_VETO_DEFAULT_MIN_WINDOWS = 3
+SOURCE_VETO_DEFAULT_MIN_SAMPLES_PER_WINDOW = 10
+SOURCE_VETO_DEFAULT_MIN_DIAGNOSTIC_PASS_RATE = 0.90
 
 COVERED_IMPROVEMENT_TASK_IDS = [
     68036,
@@ -1259,18 +1265,32 @@ def _identity_has_prefix(identity: str, prefix: str) -> bool:
 
 
 def _paper_family_containers(candidate: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:
-    containers: list[tuple[str, Mapping[str, Any]]] = [("candidate", candidate)]
-    for field in (
-        "family_metadata",
-        "current_family_metadata",
-        "strategy_family_metadata",
-        "lineage_metadata",
-        "strategy_metadata",
-    ):
-        value = candidate.get(field)
-        if isinstance(value, Mapping):
-            containers.append((field, value))
+    """Return nested structured metadata without relying on prose inference."""
+    containers: list[tuple[str, Mapping[str, Any]]] = []
+    pending: list[tuple[str, Mapping[str, Any], int]] = [("candidate", candidate, 0)]
+    seen: set[int] = set()
+    while pending:
+        name, container, depth = pending.pop(0)
+        identity = id(container)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        containers.append((name, container))
+        if depth >= 5:
+            continue
+        for field, value in container.items():
+            if isinstance(value, Mapping):
+                pending.append((f"{name}.{field}", value, depth + 1))
+            elif isinstance(value, (list, tuple)):
+                for index, nested in enumerate(value):
+                    if isinstance(nested, Mapping):
+                        pending.append((f"{name}.{field}[{index}]", nested, depth + 1))
     return containers
+
+
+def _family_field_tokens(value: Any) -> set[str]:
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return {_family_identity_token(item) for item in values if _family_identity_token(item)}
 
 
 def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1281,8 +1301,11 @@ def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> dict[str, An
         "data_source_family",
         "observation_source_family",
         "venue",
+        "venues",
+        "allowed_venues",
         "source_venue",
         "market_key",
+        "source_market_key",
         "family_key",
         "signal_family",
     )
@@ -1292,6 +1315,8 @@ def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> dict[str, An
         "feature_family",
         "feature_set_family",
         "trade_type",
+        "trade_types",
+        "source_trade_types",
         "strategy",
         "family",
         "signal_family",
@@ -1302,6 +1327,8 @@ def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> dict[str, An
         "paper_family_key",
         "market_key",
         "signal_key",
+        "source_market_key",
+        "source_signal_key",
     )
 
     for container_name, container in _paper_family_containers(candidate):
@@ -1317,12 +1344,12 @@ def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> dict[str, An
         source_matches = [
             field
             for field in source_fields
-            if _family_identity_token(container.get(field)) == QUARANTINED_PAPER_SOURCE_FAMILY
+            if QUARANTINED_PAPER_SOURCE_FAMILY in _family_field_tokens(container.get(field))
         ]
         strategy_matches = [
             field
             for field in strategy_fields
-            if _family_identity_token(container.get(field)) == QUARANTINED_PAPER_STRATEGY_FAMILY
+            if QUARANTINED_PAPER_STRATEGY_FAMILY in _family_field_tokens(container.get(field))
         ]
         if source_matches and strategy_matches:
             return {
@@ -1348,29 +1375,33 @@ def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> dict[str, An
         "parent_signal_key",
     )
     normalized_prefixes = tuple(_family_identity_token(value) for value in QUARANTINED_STRATEGY_LAB_PREFIXES)
-    for field in lineage_fields:
-        for text in _lineage_texts(candidate.get(field)):
-            identity = _family_identity_token(text)
-            for raw_prefix, prefix in zip(QUARANTINED_STRATEGY_LAB_PREFIXES, normalized_prefixes):
-                if _identity_has_prefix(identity, prefix) or _identity_has_prefix(identity, f"strategy_lab_{prefix}"):
-                    return {
-                        "type": "strategy_lab_name_prefix",
-                        "field": field,
-                        "value": text,
-                        "prefix": raw_prefix,
-                    }
+    for container_name, container in _paper_family_containers(candidate):
+        for field in lineage_fields:
+            for text in _lineage_texts(container.get(field)):
+                identity = _family_identity_token(text)
+                for raw_prefix, prefix in zip(QUARANTINED_STRATEGY_LAB_PREFIXES, normalized_prefixes):
+                    if _identity_has_prefix(identity, prefix) or _identity_has_prefix(identity, f"strategy_lab_{prefix}"):
+                        return {
+                            "type": "strategy_lab_name_prefix",
+                            "field": f"{container_name}.{field}",
+                            "value": text,
+                            "prefix": raw_prefix,
+                        }
 
+    containers = _paper_family_containers(candidate)
     lineage_tokens = {
         token
+        for _container_name, container in containers
         for field in ("lineage", "lineage_tags")
-        for text in _lineage_texts(candidate.get(field))
+        for text in _lineage_texts(container.get(field))
         for token in _family_identity_token(text).split("_")
         if token
     }
     lineage_text = "_".join(
         text
+        for _container_name, container in containers
         for field in ("lineage", "lineage_tags")
-        for text in (_family_identity_token(candidate.get(field)),)
+        for text in (_family_identity_token(container.get(field)),)
         if text
     )
     if (
@@ -1383,6 +1414,135 @@ def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> dict[str, An
             "value": QUARANTINED_PAPER_FAMILY_KEY,
         }
     return None
+
+
+def _source_veto_policy_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if not isinstance(config, Mapping):
+        return {}
+    for container in (
+        config,
+        config.get("paper_policy"),
+        config.get("strategy_lab"),
+        config.get("strategy_reliability"),
+    ):
+        if not isinstance(container, Mapping):
+            continue
+        for key in (SOURCE_VETO_POLICY_KEY, "paper_source_veto", "source_veto"):
+            policy = container.get(key)
+            if isinstance(policy, Mapping):
+                return policy
+    return {}
+
+
+def _recovery_window_passes(
+    window: Any,
+    *,
+    min_samples: int,
+    min_diagnostic_pass_rate: float,
+) -> bool:
+    if not isinstance(window, Mapping):
+        return False
+    expectancy = _maybe_float(
+        window.get("after_cost_expectancy_bps", window.get("expectancy_bps", window.get("avg_pnl_bps")))
+    )
+    samples = _as_int(window.get("sample_count", window.get("closed_count", window.get("count"))), 0)
+    freshness = window.get("freshness_acceptable")
+    if freshness is None:
+        freshness = _as_float(window.get("freshness_pass_rate"), -1.0) >= min_diagnostic_pass_rate
+    execution_quality = window.get("execution_quality_acceptable")
+    if execution_quality is None:
+        execution_quality = (
+            _as_float(window.get("execution_quality_pass_rate"), -1.0) >= min_diagnostic_pass_rate
+        )
+    return bool(
+        expectancy is not None
+        and expectancy >= 0.0
+        and samples >= min_samples
+        and _as_bool(freshness, False)
+        and _as_bool(execution_quality, False)
+    )
+
+
+def paper_source_veto_recovery_status(
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate the fail-closed recovery contract from trusted runtime settings."""
+    policy = _source_veto_policy_config(config)
+    evidence = policy.get("recovery_evidence") if isinstance(policy.get("recovery_evidence"), Mapping) else {}
+    min_windows = max(1, _as_int(policy.get("min_recovery_windows"), SOURCE_VETO_DEFAULT_MIN_WINDOWS))
+    min_samples = max(
+        1,
+        _as_int(policy.get("min_samples_per_window"), SOURCE_VETO_DEFAULT_MIN_SAMPLES_PER_WINDOW),
+    )
+    min_diagnostic_pass_rate = max(
+        0.0,
+        min(
+            1.0,
+            _as_float(
+                policy.get("min_diagnostic_pass_rate"),
+                SOURCE_VETO_DEFAULT_MIN_DIAGNOSTIC_PASS_RATE,
+            ),
+        ),
+    )
+    scopes: dict[str, Any] = {}
+    for scope in ("source_family", "immediate_descendants"):
+        scoped = evidence.get(scope) if isinstance(evidence, Mapping) else None
+        windows = scoped.get("windows") if isinstance(scoped, Mapping) else None
+        windows = windows if isinstance(windows, list) else []
+        passing = [
+            _recovery_window_passes(
+                window,
+                min_samples=min_samples,
+                min_diagnostic_pass_rate=min_diagnostic_pass_rate,
+            )
+            for window in windows
+        ]
+        scopes[scope] = {
+            "window_count": len(windows),
+            "passing_window_count": sum(passing),
+            "recovered": len(windows) >= min_windows and all(passing),
+        }
+    recovered = all(scope["recovered"] for scope in scopes.values())
+    return {
+        "recovered": recovered,
+        "required_scopes": list(scopes),
+        "min_recovery_windows": min_windows,
+        "min_samples_per_window": min_samples,
+        "min_diagnostic_pass_rate": min_diagnostic_pass_rate,
+        "scopes": scopes,
+    }
+
+
+def paper_source_veto_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Block the decayed Yahoo momentum source and descendants in paper R&D."""
+    if not isinstance(candidate, Mapping) or not _paper_family_quarantine_applies_in_context(config):
+        return None
+    matched_on = _paper_family_quarantine_match(candidate)
+    if matched_on is None:
+        return None
+    recovery = paper_source_veto_recovery_status(config)
+    if recovery["recovered"]:
+        return None
+    return {
+        "reason": "paper_source_family_veto",
+        "guard": "paper_only_source_veto",
+        "policy_key": SOURCE_VETO_POLICY_KEY,
+        "paper_only": True,
+        "eligible": False,
+        "creation_allowed": False,
+        "paper_score_eligible": False,
+        "paper_rank_eligible": False,
+        "paper_fill_allowed": False,
+        "paper_score_multiplier": 0.0,
+        "paper_allocation_multiplier": 0.0,
+        "family_key": QUARANTINED_PAPER_FAMILY_KEY,
+        "matched_on": matched_on,
+        "release_condition": QUARANTINE_RELEASE_CONDITION,
+        "recovery": recovery,
+    }
 
 
 def paper_family_quarantine_record(
@@ -1398,6 +1558,9 @@ def paper_family_quarantine_record(
     matched_on = _paper_family_quarantine_match(candidate)
     if matched_on is None:
         return None
+    recovery = paper_source_veto_recovery_status(config if isinstance(config, Mapping) else None)
+    if recovery["recovered"]:
+        return None
     return {
         "reason": "quarantined_family_decay",
         "guard": "paper_strategy_family_quarantine",
@@ -1412,6 +1575,7 @@ def paper_family_quarantine_record(
         "family_key": QUARANTINED_PAPER_FAMILY_KEY,
         "quarantine_family": QUARANTINED_PAPER_FAMILY_KEY,
         "release_condition": QUARANTINE_RELEASE_CONDITION,
+        "recovery": recovery,
         "matched_on": matched_on,
         "matched_fields": [matched_on["field"]],
         "matched_descendants": [str(matched_on.get("value") or "").lower()]

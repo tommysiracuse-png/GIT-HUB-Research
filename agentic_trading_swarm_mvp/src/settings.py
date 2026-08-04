@@ -329,6 +329,12 @@ DEFAULT_SETTINGS = {
         "retire_max_avg_pnl_bps": -8.0,
         "retire_max_win_rate": 0.43,
         "consecutive_passes_to_promote": 2,
+        "yahoo_proxy_momentum_source_veto": {
+            "min_recovery_windows": 3,
+            "min_samples_per_window": 10,
+            "min_diagnostic_pass_rate": 0.90,
+            "recovery_evidence": {},
+        },
     },
     "okx_signal_research": {
         "enabled": True,
