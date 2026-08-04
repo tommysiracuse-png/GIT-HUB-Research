@@ -30,6 +30,7 @@ def base_candidate(**overrides: object) -> dict:
         "funding_bps": 0.0,
         "basis_bps": 0.0,
         "spread_bps": 2.0,
+        "freshness_age_seconds": 30.0,
         "change_24h_pct": 0.0,
         "liquidity_score": 0.8,
         "edge_bps_estimate": 12.0,
@@ -75,6 +76,22 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertFalse(rows[0]["promotion_eligible"])
         self.assertEqual(rows[0]["strategy_reliability_action"], "shadow_only_long_strict_gate")
         self.assertEqual(report["summary"]["shadow_or_blocked_count"], 1)
+
+    def test_frontier_long_requires_minimum_liquidity_and_freshness(self) -> None:
+        candidate = base_candidate(
+            venue="MEXC",
+            inst_id="MEXC:THIN_USDT",
+            direction="long_frontier_spot",
+            liquidity_score=0.3,
+            freshness_age_seconds=120.0,
+        )
+
+        rows, _ = strategy_reliability.apply_strategy_reliability([candidate])
+
+        self.assertTrue(rows[0]["paper_entry_blocked"])
+        self.assertFalse(rows[0]["promotion_eligible"])
+        self.assertIn("liquidity_score<0.45", rows[0]["strategy_reliability_reasons"])
+        self.assertIn("freshness_age>90s", rows[0]["strategy_reliability_reasons"])
 
     def test_gate_short_good_quality_gets_probation_not_blanket_block(self) -> None:
         candidate = base_candidate(venue="GATE", direction="short_frontier_spot")
@@ -236,6 +253,7 @@ class StrategyReliabilityTests(unittest.TestCase):
             spread_bps=3.0,
             liquidity_score=0.8,
             stale_minutes=None,
+            freshness_age_seconds=None,
             quality_score=None,
         )
 

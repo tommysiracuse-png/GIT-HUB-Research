@@ -8,6 +8,7 @@ import json
 import pathlib
 import sqlite3
 
+from paper_context_cost import realized_paper_cost_audit
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
@@ -1745,11 +1746,14 @@ def close_due_trades(
                     exit_px = float(latest["last"])
                     pnl_bps = (exit_px / float(row["entry"]) - 1.0) * 10_000.0 * sign
                     risk = (settings or {}).get("risk", {})
+                    charged_cost_bps = float(row["entry_fee_bps"] or 0.0) + float(
+                        row["entry_slippage_bps"] or 0.0
+                    )
                     if row["trade_type"] == "frontier_crypto_venue_map" and candidate.get(
                         "frontier_cost_source"
                     ):
                         pnl_bps -= float(row["entry_fee_bps"] or 0.0)
-                        pnl_bps -= float(
+                        exit_fee_bps = float(
                             candidate.get(
                                 "estimated_fee_bps_per_side",
                                 (settings or {}).get("frontier_data_quality", {}).get(
@@ -1757,17 +1761,30 @@ def close_due_trades(
                                 ),
                             )
                         )
-                        pnl_bps -= float(
+                        exit_slippage_bps = float(
                             candidate.get(
                                 "exit_slippage_bps_estimate",
                                 risk.get("slippage_bps_per_leg", 0.0),
                             )
                         )
+                        pnl_bps -= exit_fee_bps
+                        pnl_bps -= exit_slippage_bps
+                        charged_cost_bps += exit_fee_bps + exit_slippage_bps
                     else:
                         pnl_bps -= float(row["entry_fee_bps"] or 0.0)
                         pnl_bps -= float(row["entry_slippage_bps"] or 0.0)
                         pnl_bps -= float(risk.get("taker_fee_bps_per_leg", 0.0))
                         pnl_bps -= float(risk.get("slippage_bps_per_leg", 0.0))
+                        charged_cost_bps += float(risk.get("taker_fee_bps_per_leg", 0.0))
+                        charged_cost_bps += float(risk.get("slippage_bps_per_leg", 0.0))
+                    cost_audit = realized_paper_cost_audit(
+                        candidate,
+                        pnl_bps,
+                        charged_cost_bps=charged_cost_bps,
+                        settings=settings,
+                        already_backfilled=not isinstance(candidate.get("paper_context_cost_gate"), dict),
+                    )
+                    pnl_bps = float(cost_audit["adjusted_pnl_bps"])
                     now = utc_now()
                     observed_at = (
                         latest.get("observed_at")
@@ -1817,6 +1834,7 @@ def close_due_trades(
                             "forced_exit": True,
                             "exit_reason": alignment.get("exit_reason"),
                             "alignment_guard": alignment,
+                            "paper_realized_cost_audit": cost_audit,
                         }
                     )
                     continue
@@ -1980,6 +1998,7 @@ def record_due_horizon_outcomes(
                 continue
             latest = latest_by_inst.get(row["inst_id"])
             observed_at = None
+            cost_audit = None
             if latest:
                 raw_observed = latest.get("observed_at") or latest.get("seen_at") or latest.get("last_checked_at")
                 try:
@@ -1997,12 +2016,15 @@ def record_due_horizon_outcomes(
                 pnl_bps = (price / float(row["entry"]) - 1.0) * 10_000.0 * sign
                 risk = settings.get("risk", {})
                 candidate = json.loads(row["candidate_json"] or "{}")
+                charged_cost_bps = float(row["entry_fee_bps"] or 0) + float(
+                    row["entry_slippage_bps"] or 0
+                )
                 if (
                     row["trade_type"] == "frontier_crypto_venue_map"
                     and candidate.get("frontier_cost_source")
                 ):
                     pnl_bps -= float(row["entry_fee_bps"] or 0)
-                    pnl_bps -= float(
+                    exit_fee_bps = float(
                         candidate.get(
                             "estimated_fee_bps_per_side",
                             settings.get("frontier_data_quality", {}).get(
@@ -2010,17 +2032,30 @@ def record_due_horizon_outcomes(
                             ),
                         )
                     )
-                    pnl_bps -= float(
+                    exit_slippage_bps = float(
                         candidate.get(
                             "exit_slippage_bps_estimate",
                             risk.get("slippage_bps_per_leg", 0),
                         )
                     )
+                    pnl_bps -= exit_fee_bps
+                    pnl_bps -= exit_slippage_bps
+                    charged_cost_bps += exit_fee_bps + exit_slippage_bps
                 else:
                     pnl_bps -= float(row["entry_fee_bps"] or 0)
                     pnl_bps -= float(row["entry_slippage_bps"] or 0)
                     pnl_bps -= float(risk.get("taker_fee_bps_per_leg", 0))
                     pnl_bps -= float(risk.get("slippage_bps_per_leg", 0))
+                    charged_cost_bps += float(risk.get("taker_fee_bps_per_leg", 0))
+                    charged_cost_bps += float(risk.get("slippage_bps_per_leg", 0))
+                cost_audit = realized_paper_cost_audit(
+                    candidate,
+                    pnl_bps,
+                    charged_cost_bps=charged_cost_bps,
+                    settings=settings,
+                    already_backfilled=not isinstance(candidate.get("paper_context_cost_gate"), dict),
+                )
+                pnl_bps = float(cost_audit["adjusted_pnl_bps"])
                 price_source = (
                     latest.get("price_source")
                     or (latest.get("data_source") or {}).get("provider")
@@ -2035,6 +2070,12 @@ def record_due_horizon_outcomes(
                 price_source = None
             else:
                 continue
+            try:
+                outcome_context = json.loads(row["context_json"] or "{}")
+            except (TypeError, ValueError):
+                outcome_context = {}
+            if pnl_bps is not None and cost_audit is not None:
+                outcome_context["paper_realized_cost_audit"] = cost_audit
             conn.execute(
                 """
                 insert into paper_trade_outcomes (
@@ -2048,7 +2089,7 @@ def record_due_horizon_outcomes(
                     utc_now(),
                     price,
                     round(pnl_bps, 3) if pnl_bps is not None else None,
-                    row["context_json"] or "{}",
+                    json.dumps(outcome_context, sort_keys=True),
                     target.isoformat(),
                     observed_at.isoformat() if observed_at else None,
                     round(delay_seconds, 3),
@@ -2064,6 +2105,7 @@ def record_due_horizon_outcomes(
                     "measurement_status": measurement_status,
                     "delay_seconds": round(delay_seconds, 3),
                     "price_source": price_source,
+                    "paper_realized_cost_audit": cost_audit if pnl_bps is not None else None,
                 }
             )
     conn.commit()

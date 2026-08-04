@@ -16,6 +16,7 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from route_resolver import evaluate_route_intelligence
+from paper_context_cost import realized_paper_cost_audit
 from signals.registry import discover_signals, known_strategy_signatures, promoted_strategy_lab_ids
 from storage import RUNS_DIR, add_llm_recommendation, utc_now
 from strategy_reliability import paper_source_veto_record, paper_source_veto_recovery_status
@@ -1354,6 +1355,13 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
     reasons = []
     if candidate.get("proxy_valid_for_reuse") is False:
         reasons.append("proxy_invalid_for_reuse")
+    context_cost_gate = candidate.get("paper_context_cost_gate") or {}
+    if (
+        context_cost_gate.get("applicable")
+        and context_cost_gate.get("enabled")
+        and not context_cost_gate.get("eligible")
+    ):
+        reasons.append("paper_context_cost_floor_not_cleared")
     allowed_trade_types = _as_list(logic.get("trade_types") or logic.get("source_trade_types"))
     allowed_venues = _as_list(logic.get("venues") or logic.get("allowed_venues"))
     allowed_directions = _as_list(logic.get("directions") or logic.get("allowed_directions"))
@@ -2424,11 +2432,13 @@ def _experiment_outcomes(
     strategy_lab_id: str,
     horizon: int,
     experiment: dict | None = None,
+    settings: dict | None = None,
 ) -> dict:
     rows = conn.execute(
         """
         select p.id, p.opened_at, p.closed_at, p.venue, p.inst_id, p.direction, p.trade_type,
-               p.candidate_json, p.review_json, o.pnl_bps, o.measurement_status
+               p.candidate_json, p.review_json, p.entry_fee_bps, p.entry_slippage_bps,
+               o.pnl_bps, o.measurement_status, o.context_json as outcome_context_json
         from paper_trades p
         left join paper_trade_outcomes o
           on o.trade_id = p.id and o.horizon_minutes = ?
@@ -2443,6 +2453,7 @@ def _experiment_outcomes(
     by_venue: dict[str, list[float]] = defaultdict(list)
     by_direction: dict[str, list[float]] = defaultdict(list)
     examples = []
+    cost_audits = []
     surface_quarantined = []
     for row in rows:
         item = dict(row)
@@ -2466,7 +2477,44 @@ def _experiment_outcomes(
         route = str(review.get("route_status") or candidate.get("route_status") or (candidate.get("execution_feasibility") or {}).get("status") or "unknown")
         route_counts[route] += 1
         if status == "valid" and item.get("pnl_bps") is not None:
-            pnl = _as_float(item["pnl_bps"])
+            raw_pnl = _as_float(item["pnl_bps"])
+            outcome_context = _json_loads(item.get("outcome_context_json"), {})
+            prior_cost_audit = outcome_context.get("paper_realized_cost_audit") if isinstance(outcome_context, dict) else None
+            has_entry_cost_model = bool(
+                isinstance(candidate.get("paper_context_cost_gate"), dict)
+                or candidate.get("estimated_round_trip_cost_bps") is not None
+                or candidate.get("route_cost_bps_paper") is not None
+                or candidate.get("paper_route_cost_bps") is not None
+            )
+            risk = (settings or {}).get("risk", {}) if isinstance(settings, dict) else {}
+            charged_cost = max(0.0, _as_float(item.get("entry_fee_bps"))) + max(
+                0.0, _as_float(item.get("entry_slippage_bps"))
+            )
+            charged_cost += max(
+                0.0,
+                _as_float(
+                    candidate.get("estimated_fee_bps_per_side"),
+                    _as_float(risk.get("taker_fee_bps_per_leg")),
+                ),
+            )
+            charged_cost += max(
+                0.0,
+                _as_float(
+                    candidate.get("exit_slippage_bps_estimate"),
+                    _as_float(risk.get("slippage_bps_per_leg")),
+                ),
+            )
+            cost_audit = realized_paper_cost_audit(
+                candidate,
+                raw_pnl,
+                charged_cost_bps=charged_cost,
+                settings=settings,
+                already_backfilled=bool(prior_cost_audit and prior_cost_audit.get("cost_basis") == "after_modeled_context_cost")
+                or not has_entry_cost_model,
+            )
+            pnl = _as_float(cost_audit.get("adjusted_pnl_bps"), raw_pnl)
+            if cost_audit.get("backfill_applied"):
+                cost_audits.append({"trade_id": item["id"], **cost_audit})
             valid.append(pnl)
             by_region[str(candidate.get("region") or "unknown")].append(pnl)
             by_venue[str(item.get("venue") or "unknown")].append(pnl)
@@ -2479,6 +2527,8 @@ def _experiment_outcomes(
                         "inst_id": item["inst_id"],
                         "direction": item["direction"],
                         "pnl_bps": round(pnl, 3),
+                        "raw_pnl_bps": round(raw_pnl, 3),
+                        "realized_cost_backfill_bps": cost_audit.get("realized_cost_backfill_bps"),
                     }
                 )
     return {
@@ -2494,6 +2544,14 @@ def _experiment_outcomes(
         "examples": examples,
         "surface_quarantined_count": len(surface_quarantined),
         "surface_quarantined_examples": surface_quarantined[:10],
+        "realized_cost_backfill": {
+            "paper_only": True,
+            "applied_count": len(cost_audits),
+            "total_backfill_bps": round(
+                sum(_as_float(item.get("realized_cost_backfill_bps")) for item in cost_audits), 3
+            ),
+            "examples": cost_audits[:10],
+        },
     }
 
 
@@ -2823,6 +2881,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             experiment["strategy_lab_id"],
             rules["horizon_minutes"],
             experiment,
+            settings,
         )
         metrics = outcomes["metrics"]
         count = int(metrics.get("count") or 0)
@@ -2927,6 +2986,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
                 "decision": decision,
                 "metrics": metrics,
                 "valid_label_rate": outcomes["valid_label_rate"],
+                "realized_cost_backfill": outcomes["realized_cost_backfill"],
                 "direction_promotion": direction_promotion,
                 "promotion_recommendation_id": promotion_id,
             }
@@ -3127,12 +3187,15 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
     for item in summary.get("recent_market_strategies", [])[:20]:
         latest = item.get("evaluation", {})
         decision = latest.get("decision")
-        metrics = ((latest.get("outcomes") or {}).get("metrics") or {})
+        outcomes = latest.get("outcomes") or {}
+        metrics = outcomes.get("metrics") or {}
+        cost_backfill = outcomes.get("realized_cost_backfill") or {}
         lines.append(
             f"- `{item['strategy_lab_id']}` type=`{item.get('experiment_type')}` "
             f"status=`{item['status']}` decision=`{decision}` "
             f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
-            f"win=`{metrics.get('win_rate')}` hypothesis={item.get('hypothesis')}"
+            f"win=`{metrics.get('win_rate')}` cost_backfills=`{cost_backfill.get('applied_count', 0)}` "
+            f"hypothesis={item.get('hypothesis')}"
         )
     lines.extend(["", "## Contract Repair Queue", ""])
     if not summary.get("contract_repair_queue"):
@@ -3148,12 +3211,15 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
     for item in summary.get("recent_non_market_experiments", [])[:20]:
         latest = item.get("evaluation", {})
         decision = latest.get("decision")
-        metrics = ((latest.get("outcomes") or {}).get("metrics") or {})
+        outcomes = latest.get("outcomes") or {}
+        metrics = outcomes.get("metrics") or {}
+        cost_backfill = outcomes.get("realized_cost_backfill") or {}
         lines.append(
             f"- `{item['strategy_lab_id']}` type=`{item.get('experiment_type')}` "
             f"status=`{item['status']}` decision=`{decision}` "
             f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
-            f"win=`{metrics.get('win_rate')}` hypothesis={item.get('hypothesis')}"
+            f"win=`{metrics.get('win_rate')}` cost_backfills=`{cost_backfill.get('applied_count', 0)}` "
+            f"hypothesis={item.get('hypothesis')}"
         )
     REPORT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report

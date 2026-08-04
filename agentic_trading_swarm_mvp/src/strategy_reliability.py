@@ -15,6 +15,7 @@ import json
 import math
 from typing import Any
 
+from paper_context_cost import realized_paper_cost_audit
 from proxy_signal_quality import PROXY_TRADE_TYPES, proxy_short_quality_review
 from storage import RUNS_DIR, signal_key
 
@@ -1038,6 +1039,63 @@ def _paper_cell_asymmetric_direction_reasons(record: dict[str, Any], cell: dict[
     return reasons
 
 
+def _paper_cell_quality_audit(
+    record: dict[str, Any],
+    cell: dict[str, Any],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    direction = str(cell.get("direction") or record.get("direction") or "").lower()
+    haystack = " ".join(
+        str(value or "").lower()
+        for value in (cell.get("signal_key"), cell.get("signal_family"), record.get("trade_type"))
+    )
+    if direction == "short_proxy" or ("short" in direction and "proxy" in haystack):
+        floor_name = "proxy_short"
+    elif direction.startswith("long_frontier"):
+        floor_name = "frontier_long"
+    else:
+        return {"applies": False, "passed": True, "reasons": []}
+
+    liquidity = _as_float(record.get("liquidity_score"), -1.0)
+    freshness_field = "freshness_age_seconds"
+    freshness = record.get(freshness_field)
+    if freshness is None and record.get("stale_minutes") is not None:
+        freshness_field = "stale_minutes"
+        freshness = _as_float(record.get("stale_minutes")) * 60.0
+    freshness_age = _as_float(freshness, -1.0)
+    min_liquidity = _as_float(settings.get(f"{floor_name}_min_liquidity_score"), 0.65 if floor_name == "proxy_short" else 0.35)
+    max_freshness = _as_float(settings.get(f"{floor_name}_max_freshness_age_seconds"), 900.0 if floor_name == "proxy_short" else 90.0)
+    allowed_routes = {
+        str(value).strip().lower()
+        for value in settings.get("allowed_promotion_route_statuses", ["standard", "feasible", "executable"])
+    }
+    route_status = str(cell.get("paper_route_status") or "unknown").lower()
+    reasons: list[str] = []
+    if liquidity < 0.0:
+        reasons.append("missing_promotion_liquidity_evidence")
+    elif liquidity < min_liquidity:
+        reasons.append("promotion_liquidity_below_floor")
+    if freshness_age < 0.0:
+        reasons.append("missing_promotion_freshness_evidence")
+    elif freshness_age > max_freshness:
+        reasons.append("promotion_freshness_above_ceiling")
+    if route_status not in allowed_routes:
+        reasons.append("promotion_route_status_not_standard")
+    return {
+        "applies": True,
+        "name": floor_name,
+        "passed": not reasons,
+        "liquidity_score": None if liquidity < 0.0 else liquidity,
+        "min_liquidity_score": min_liquidity,
+        "freshness_field": freshness_field if freshness_age >= 0.0 else None,
+        "freshness_age_seconds": None if freshness_age < 0.0 else freshness_age,
+        "max_freshness_age_seconds": max_freshness,
+        "route_status": route_status,
+        "allowed_route_statuses": sorted(allowed_routes),
+        "reasons": reasons,
+    }
+
+
 def evaluate_paper_cell_policy(
     record: dict[str, Any],
     config: dict[str, Any] | None = None,
@@ -1060,7 +1118,7 @@ def evaluate_paper_cell_policy(
                     settings.update(value)
 
     closed_count = _as_int(record.get("closed_count", record.get("closed_trades", record.get("trades", 0))))
-    avg_pnl_bps = _as_float(record.get("avg_pnl_bps", record.get("pnl_bps", 0.0)))
+    reported_avg_pnl_bps = _as_float(record.get("avg_pnl_bps", record.get("pnl_bps", 0.0)))
     win_rate_raw = record.get("win_rate")
     win_rate = _as_float(win_rate_raw, default=-1.0) if win_rate_raw is not None else None
     min_closed_trades = max(1, _as_int(settings.get("min_closed_trades"), 3))
@@ -1080,6 +1138,18 @@ def evaluate_paper_cell_policy(
             probation_expired = False
 
     cell = paper_signal_cell(record)
+    quality_audit = _paper_cell_quality_audit(record, cell, settings)
+    gross_avg = record.get("gross_avg_pnl_bps")
+    cost_basis = str(record.get("avg_pnl_cost_basis") or record.get("pnl_cost_basis") or "").lower()
+    needs_cost_backfill = gross_avg is not None or cost_basis in {"gross", "price_only", "legacy_unadjusted"}
+    cost_audit = realized_paper_cost_audit(
+        record,
+        gross_avg if gross_avg is not None else reported_avg_pnl_bps,
+        charged_cost_bps=record.get("realized_cost_bps", record.get("charged_cost_bps", 0.0)),
+        settings=config,
+        already_backfilled=not needs_cost_backfill,
+    )
+    avg_pnl_bps = _as_float(cost_audit.get("adjusted_pnl_bps"), reported_avg_pnl_bps)
     promotion_min_closed_trades = min_closed_trades
     asymmetric_direction_reasons = _paper_cell_asymmetric_direction_reasons(record, cell)
     if asymmetric_direction_reasons:
@@ -1109,11 +1179,25 @@ def evaluate_paper_cell_policy(
         )
     if win_rate is not None and win_rate < promote_min_win_rate:
         promotion_blockers.append("win_rate_below_floor")
+    promotion_blockers.extend(quality_audit["reasons"])
+    verified_cost_basis = cost_basis in {
+        "net",
+        "after_cost",
+        "after_costs",
+        "after_modeled_context_cost",
+    } or bool(cost_audit.get("backfill_applied"))
+    if quality_audit["applies"] and not verified_cost_basis:
+        promotion_blockers.append("unverified_realized_cost_basis")
 
     if closed_count >= min_closed_trades and avg_pnl_bps <= revert_avg_pnl_bps:
         decision = "reverted"
         action = "rollback_cell"
-    elif closed_count >= promotion_min_closed_trades and avg_pnl_bps >= promote_min_avg_pnl_bps and (win_rate is None or win_rate >= promote_min_win_rate):
+    elif (
+        not promotion_blockers
+        and closed_count >= promotion_min_closed_trades
+        and avg_pnl_bps >= promote_min_avg_pnl_bps
+        and (win_rate is None or win_rate >= promote_min_win_rate)
+    ):
         decision = "promoted"
         action = "promote_cell"
     elif probation_expired and avg_pnl_bps < 0.0 and prior_state in {"probation", "new"}:
@@ -1131,6 +1215,7 @@ def evaluate_paper_cell_policy(
         "action": action,
         "closed_count": closed_count,
         "avg_pnl_bps": avg_pnl_bps,
+        "reported_avg_pnl_bps": reported_avg_pnl_bps,
         "win_rate": None if win_rate is None or win_rate < 0.0 else win_rate,
         "prior_state": prior_state,
         "probation_ttl_days": probation_ttl_days,
@@ -1143,6 +1228,9 @@ def evaluate_paper_cell_policy(
             "min_avg_pnl_bps": promote_min_avg_pnl_bps,
             "min_win_rate": promote_min_win_rate,
             "blockers": promotion_blockers,
+            "quality_audit": quality_audit,
+            "realized_cost_audit": cost_audit,
+            "realized_cost_basis_verified": verified_cost_basis,
         },
         "reviewed_at": current_now.isoformat(),
     }
@@ -2057,6 +2145,21 @@ def _frontier_reasons(
         reasons.append(f"route_status={_route_status(candidate)}")
     if _quote_status(candidate) not in quote_statuses:
         reasons.append(f"quote_normalization={_quote_status(candidate)}")
+    direction = str(candidate.get("direction") or "").lower()
+    if direction.startswith("long_frontier"):
+        liquidity = _as_float(candidate.get("liquidity_score"), -1.0)
+        freshness = candidate.get("freshness_age_seconds")
+        if freshness is None and candidate.get("stale_minutes") is not None:
+            freshness = _as_float(candidate.get("stale_minutes")) * 60.0
+        if liquidity < 0.45:
+            reasons.append("liquidity_score<0.45")
+        if freshness is None:
+            reasons.append("missing_freshness_age")
+        elif _as_float(freshness) > 90.0:
+            reasons.append("freshness_age>90s")
+        context_gate = candidate.get("paper_context_cost_gate") or {}
+        if context_gate.get("applicable") and context_gate.get("enabled") and not context_gate.get("eligible"):
+            reasons.append("paper_context_cost_floor_not_cleared")
     if candidate.get("cross_quote_reference"):
         reasons.append("cross_quote_reference_contamination")
     reasons.extend(_critical_quality_reasons(candidate))

@@ -639,6 +639,64 @@ class StrategyLabTest(unittest.TestCase):
             self.assertEqual("strategy_lab_promotion", payload["change_category"])
             self.assertEqual("promotion_queued", report["evaluated"][0]["decision"])
 
+    def test_evaluator_backfills_route_cost_before_promotion(self):
+        settings = base_settings()
+        created_at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()
+        source = candidate(
+            gross_edge_bps_estimate=60.0,
+            estimated_round_trip_cost_bps=12.0,
+            freshness_age_seconds=30.0,
+            paper_context_cost_gate={
+                "paper_only": True,
+                "applicable": True,
+                "enabled": True,
+                "eligible": True,
+                "context_cost_floor_bps": 25.0,
+                "inputs": {"route_status": "conditional"},
+                "quality_floor": {"applies": True, "passed": True},
+            },
+        )
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            generated, _ = generate_strategy_lab_candidates(conn, settings, [source])
+            self.assertEqual(1, len(generated))
+            conn.execute(
+                "update strategy_lab_experiments set created_at = ?, consecutive_passes = 1 where strategy_lab_id = ?",
+                (created_at, "okx_spot_survivor_lab_v1"),
+            )
+            for idx in range(30):
+                lab_candidate = {
+                    **generated[0],
+                    "inst_id": f"ROUTE-COST-{idx}",
+                }
+                review = {
+                    "learned_score": 75.0,
+                    "decision": "approve_paper_trade",
+                    "route_status": "conditional",
+                    "hard_blocks": [],
+                }
+                trade_id = open_paper_trade(conn, lab_candidate, review, settings=settings)
+                conn.execute(
+                    """
+                    insert into paper_trade_outcomes (
+                        trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                        context_json, target_at, observed_at, delay_seconds,
+                        measurement_status, price_source
+                    ) values (?, 60, ?, 4.0, 14.0, '{}', ?, ?, 0, 'valid', 'test')
+                    """,
+                    (trade_id, created_at, created_at, created_at),
+                )
+            conn.commit()
+
+            evaluation = evaluate_strategy_lab(conn, settings)["evaluated"][0]
+
+        self.assertNotEqual("promotion_queued", evaluation["decision"])
+        self.assertLess(evaluation["metrics"]["avg_pnl_bps"], 10.0)
+        self.assertEqual(
+            30,
+            evaluation["realized_cost_backfill"]["applied_count"],
+        )
+
     def test_evaluator_requires_balanced_direction_evidence_when_configured(self):
         settings = base_settings()
         rec = lab_rec()

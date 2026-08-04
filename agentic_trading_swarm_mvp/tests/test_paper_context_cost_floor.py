@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import datetime as dt
+import json
 import pathlib
 import sqlite3
 import sys
@@ -17,9 +19,10 @@ from execution_engine import execute_order  # noqa: E402
 from paper_context_cost import (  # noqa: E402
     annotate_paper_context_cost,
     paper_context_cost_gate,
+    realized_paper_cost_audit,
 )
 from settings import DEFAULT_SETTINGS  # noqa: E402
-from storage import init_db  # noqa: E402
+from storage import init_db, open_paper_trade, record_due_horizon_outcomes  # noqa: E402
 
 
 def frontier_candidate(**overrides: object) -> dict:
@@ -84,7 +87,8 @@ class PaperContextCostFloorTests(unittest.TestCase):
         self.assertGreater(poor["components_bps"]["liquidity"], healthy["components_bps"]["liquidity"])
         self.assertGreater(poor["components_bps"]["volatility"], healthy["components_bps"]["volatility"])
         self.assertEqual(poor["components_bps"]["complexity"], 4.0)
-        self.assertTrue(poor["eligible"])
+        self.assertFalse(poor["eligible"])
+        self.assertIn("liquidity_below_promotion_floor", poor["reasons"])
         self.assertLess(poor["score_multiplier"], healthy["score_multiplier"])
 
     def test_annotation_down_ranks_thin_stale_surface_without_mutation(self) -> None:
@@ -114,6 +118,48 @@ class PaperContextCostFloorTests(unittest.TestCase):
             any("paper context cost floor not cleared" in block for block in review["hard_blocks"])
         )
         self.assertFalse(review["paper_context_cost_gate"]["eligible"])
+
+    def test_discovery_proxy_short_has_hard_liquidity_and_freshness_floor(self) -> None:
+        candidate = frontier_candidate(
+            venue="CME_GROUP",
+            inst_id="ES=F",
+            trade_type="global_market_discovery_proxy",
+            direction="short_proxy",
+            gross_edge_bps_estimate=80.0,
+            liquidity_score=0.5,
+            freshness_age_seconds=1200.0,
+        )
+
+        gate = paper_context_cost_gate(candidate, DEFAULT_SETTINGS)
+
+        self.assertTrue(gate["applicable"])
+        self.assertEqual("proxy", gate["family_kind"])
+        self.assertFalse(gate["eligible"])
+        self.assertIn("liquidity_below_promotion_floor", gate["reasons"])
+        self.assertIn("freshness_above_promotion_ceiling", gate["reasons"])
+
+    def test_route_friction_is_costed_and_missing_realized_cost_is_backfilled(self) -> None:
+        candidate = frontier_candidate(
+            gross_edge_bps_estimate=80.0,
+            paper_route_eligibility={"assumed_route_cost_bps": 24.0},
+            execution_feasibility={"status": "conditional"},
+        )
+
+        gate = paper_context_cost_gate(candidate, DEFAULT_SETTINGS)
+        candidate["paper_context_cost_gate"] = gate
+        audit = realized_paper_cost_audit(
+            candidate,
+            18.0,
+            charged_cost_bps=10.0,
+            settings=DEFAULT_SETTINGS,
+        )
+
+        self.assertGreaterEqual(gate["components_bps"]["route"], 4.0)
+        self.assertTrue(audit["backfill_applied"])
+        self.assertAlmostEqual(
+            audit["adjusted_pnl_bps"],
+            18.0 - audit["realized_cost_backfill_bps"],
+        )
 
     def test_policy_is_paper_only_configurable_and_scope_limited(self) -> None:
         disabled = copy.deepcopy(DEFAULT_SETTINGS)
@@ -171,6 +217,60 @@ class PaperContextCostFloorTests(unittest.TestCase):
             result["order"]["shadow_filter"]["family_key"],
             "YAHOO_PROXY|global_proxy_momentum",
         )
+
+    def test_new_outcome_persists_realized_cost_backfill_audit(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+        settings["learning"]["horizon_minutes"] = [0]
+        candidate = {
+            "venue": "CME_GROUP",
+            "inst_id": "CME_GROUP:ES=F",
+            "trade_type": "global_market_discovery_proxy",
+            "direction": "short_proxy",
+            "score": 70.0,
+            "last": 100.0,
+            "thesis": "paper-only cost audit fixture",
+            "paper_context_cost_gate": {
+                "paper_only": True,
+                "applicable": True,
+                "enabled": True,
+                "eligible": True,
+                "context_cost_floor_bps": 25.0,
+                "inputs": {"route_status": "conditional"},
+            },
+        }
+        review = {
+            "learned_score": 70.0,
+            "decision": "approve_conditional_paper_trade",
+            "route_status": "conditional",
+        }
+        try:
+            trade_id = open_paper_trade(conn, candidate, review, settings=settings)
+            now = dt.datetime.now(dt.timezone.utc).isoformat()
+            recorded = record_due_horizon_outcomes(
+                conn,
+                {
+                    candidate["inst_id"]: {
+                        "last": 99.8,
+                        "observed_at": now,
+                        "venue": candidate["venue"],
+                    }
+                },
+                settings,
+            )
+            row = conn.execute(
+                "select pnl_bps, context_json from paper_trade_outcomes where trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, len(recorded))
+        audit = json.loads(row["context_json"])["paper_realized_cost_audit"]
+        self.assertTrue(audit["backfill_applied"])
+        self.assertEqual(row["pnl_bps"], audit["adjusted_pnl_bps"])
 
 
 if __name__ == "__main__":

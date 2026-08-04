@@ -15,6 +15,8 @@ import json
 import pathlib
 from typing import Iterable
 
+from paper_context_cost import annotate_paper_context_cost
+
 try:
     from storage import RUNS_DIR
 except ModuleNotFoundError:  # pragma: no cover - fallback for isolated test imports
@@ -1848,6 +1850,23 @@ def enrich_candidate_with_route(
         enriched["paper_route_allocation_multiplier"] = eligibility["paper_score_multiplier"]
         enriched["paper_allocation_multiplier"] = eligibility["paper_score_multiplier"]
         enriched["paper_route_assumption_penalty_applied"] = True
+    prior_context_gate = enriched.get("paper_context_cost_gate") or {}
+    prior_context_multiplier = float(prior_context_gate.get("score_multiplier", 1.0) or 1.0)
+    refresh_context_cost = bool(prior_context_gate) or enriched.get("trade_type") in {
+        "global_proxy_momentum",
+        "global_market_discovery_proxy",
+        "global_proxy_shock_reversal",
+    }
+    if refresh_context_cost:
+        enriched = annotate_paper_context_cost(enriched, settings, adjust_score=False)
+    refreshed_context_gate = enriched.get("paper_context_cost_gate") or {}
+    if refresh_context_cost and refreshed_context_gate.get("applicable") and enriched.get("score") is not None:
+        refreshed_multiplier = float(refreshed_context_gate.get("score_multiplier", 1.0) or 1.0)
+        enriched["score_before_route_context_cost"] = round(float(enriched["score"]), 6)
+        enriched["score"] = round(
+            float(enriched["score"]) * refreshed_multiplier / max(prior_context_multiplier, 0.000001),
+            6,
+        )
     return enriched
 
 

@@ -48,6 +48,13 @@
     "missing_spread_penalty_bps": 4.0,
     "missing_liquidity_penalty_bps": 3.0,
     "missing_freshness_penalty_bps": 2.0,
+    "conditional_route_penalty_bps": 4.0,
+    "paper_proxy_route_penalty_bps": 6.0,
+    "unknown_route_penalty_bps": 8.0,
+    "proxy_short_min_liquidity_score": 0.65,
+    "proxy_short_max_freshness_age_seconds": 900.0,
+    "frontier_long_min_liquidity_score": 0.35,
+    "frontier_long_max_freshness_age_seconds": 90.0,
     "minimum_score_multiplier": 0.5
   },
   "yahoo_proxy_reuse_gate": {
@@ -69,7 +76,12 @@
     "promote_min_win_rate": 0.5,
     "revert_avg_pnl_bps": -5.0,
     "asymmetric_direction_min_closed_trades": 20,
-    "asymmetric_direction_min_avg_pnl_bps": 1.0
+    "asymmetric_direction_min_avg_pnl_bps": 1.0,
+    "proxy_short_min_liquidity_score": 0.65,
+    "proxy_short_max_freshness_age_seconds": 900.0,
+    "frontier_long_min_liquidity_score": 0.35,
+    "frontier_long_max_freshness_age_seconds": 90.0,
+    "allowed_promotion_route_statuses": ["standard", "feasible", "executable"]
   },
   "paper_hold_optimizer": {
     "enabled": true,

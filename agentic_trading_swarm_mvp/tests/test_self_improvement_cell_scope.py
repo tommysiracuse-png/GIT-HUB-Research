@@ -126,12 +126,47 @@ class TestSelfImprovementCellScope(unittest.TestCase):
                 "paper_route_status": "standard",
                 "closed_count": 20,
                 "avg_pnl_bps": 3.25,
+                "avg_pnl_cost_basis": "after_modeled_context_cost",
                 "win_rate": 0.55,
+                "liquidity_score": 0.8,
+                "freshness_age_seconds": 60.0,
             }
         )
 
         self.assertEqual(result["decision"], "promoted")
         self.assertEqual(result["promotion_gate"]["blockers"], [])
+
+    def test_short_proxy_gross_edge_does_not_promote_after_cost_backfill(self) -> None:
+        result = evaluate_paper_cell_policy(
+            {
+                "signal_key": "CME_GROUP|global_market_discovery_proxy|short_proxy|standard",
+                "signal_family": "global_market_discovery_proxy",
+                "trade_type": "global_market_discovery_proxy",
+                "venue": "CME_GROUP",
+                "direction": "short_proxy",
+                "paper_route_status": "standard",
+                "closed_count": 24,
+                "avg_pnl_bps": 4.0,
+                "gross_avg_pnl_bps": 4.0,
+                "avg_pnl_cost_basis": "price_only",
+                "realized_cost_bps": 1.0,
+                "estimated_round_trip_cost_bps": 6.0,
+                "gross_edge_bps_estimate": 20.0,
+                "spread_bps": 3.0,
+                "liquidity_score": 0.8,
+                "freshness_age_seconds": 60.0,
+                "win_rate": 0.58,
+            }
+        )
+
+        self.assertEqual("probation", result["decision"])
+        audit = result["promotion_gate"]["realized_cost_audit"]
+        self.assertTrue(audit["backfill_applied"])
+        self.assertLess(result["avg_pnl_bps"], 1.0)
+        self.assertIn(
+            "direction_specific_realized_edge_below_floor",
+            result["promotion_gate"]["blockers"],
+        )
 
     def test_long_discovery_cell_keeps_generic_promotion_threshold(self) -> None:
         result = evaluate_paper_cell_policy(

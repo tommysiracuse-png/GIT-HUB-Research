@@ -27,10 +27,32 @@ DEFAULT_PAPER_CONTEXT_COST_POLICY = {
     "missing_spread_penalty_bps": 4.0,
     "missing_liquidity_penalty_bps": 3.0,
     "missing_freshness_penalty_bps": 2.0,
+    "conditional_route_penalty_bps": 4.0,
+    "paper_proxy_route_penalty_bps": 6.0,
+    "unknown_route_penalty_bps": 8.0,
+    "proxy_short_min_liquidity_score": 0.65,
+    "proxy_short_max_freshness_age_seconds": 900.0,
+    "frontier_long_min_liquidity_score": 0.35,
+    "frontier_long_max_freshness_age_seconds": 90.0,
     "minimum_score_multiplier": 0.5,
 }
 
-_PAPER_CONTEXT_FAMILIES = {"global_proxy_momentum", "frontier_crypto_venue_map"}
+_PAPER_CONTEXT_FAMILIES = {
+    "global_proxy_momentum": "proxy",
+    "global_market_discovery_proxy": "proxy",
+    "global_proxy_shock_reversal": "proxy",
+    "frontier_crypto_venue_map": "frontier",
+}
+_BLOCKED_ROUTE_STATUSES = {
+    "blocked",
+    "blocked_for_paper_route",
+    "route_unknown",
+    "unknown",
+    "unavailable",
+    "watch_only",
+}
+_CONDITIONAL_ROUTE_STATUSES = {"conditional", "paper_testable_proxy"}
+_PAPER_PROXY_ROUTE_STATUSES = {"paper_proxy", "proxy", "synthetic", "simulated"}
 
 
 def _finite_float(value: Any) -> float | None:
@@ -105,6 +127,83 @@ def _leg_count(candidate: Mapping[str, Any]) -> int:
     return 1
 
 
+def _route_context(candidate: Mapping[str, Any]) -> tuple[str, str | None, float | None]:
+    containers: list[Any] = [
+        candidate,
+        candidate.get("frontier_route_feasibility"),
+        candidate.get("execution_feasibility"),
+        candidate.get("execution_route"),
+        candidate.get("route_intelligence"),
+        candidate.get("paper_route_eligibility"),
+    ]
+    for parent in tuple(containers):
+        if isinstance(parent, Mapping):
+            containers.append(parent.get("paper_route_eligibility"))
+    route_status = "unknown"
+    cost_field: str | None = None
+    route_cost: float | None = None
+    for container in containers:
+        if not isinstance(container, Mapping):
+            continue
+        if route_status == "unknown":
+            for field in ("paper_route_status", "route_status", "status", "execution_status"):
+                value = str(container.get(field) or "").strip().lower().replace("-", "_").replace(" ", "_")
+                if value:
+                    route_status = value
+                    break
+        if route_cost is None:
+            for field in (
+                "route_cost_bps_paper",
+                "paper_route_cost_bps",
+                "estimated_route_cost_bps",
+                "total_route_cost_bps",
+                "assumed_route_cost_bps",
+                "route_friction_bps",
+            ):
+                value = _finite_float(container.get(field))
+                if value is not None:
+                    cost_field = field
+                    route_cost = max(0.0, value)
+                    break
+    return route_status, cost_field, route_cost
+
+
+def _quality_floor(
+    candidate: Mapping[str, Any],
+    family_kind: str,
+    policy: Mapping[str, Any],
+    liquidity: float | None,
+    freshness_age: float | None,
+) -> dict[str, Any]:
+    direction = str(candidate.get("direction") or "").strip().lower()
+    if family_kind == "proxy" and direction == "short_proxy":
+        floor_name = "proxy_short"
+    elif family_kind == "frontier" and direction.startswith("long_frontier"):
+        floor_name = "frontier_long"
+    else:
+        return {"applies": False, "passed": True, "reasons": []}
+
+    min_liquidity = float(policy[f"{floor_name}_min_liquidity_score"])
+    max_freshness = float(policy[f"{floor_name}_max_freshness_age_seconds"])
+    reasons: list[str] = []
+    if liquidity is None:
+        reasons.append("missing_minimum_liquidity_evidence")
+    elif liquidity < min_liquidity:
+        reasons.append("liquidity_below_promotion_floor")
+    if freshness_age is None:
+        reasons.append("missing_minimum_freshness_evidence")
+    elif freshness_age > max_freshness:
+        reasons.append("freshness_above_promotion_ceiling")
+    return {
+        "applies": True,
+        "name": floor_name,
+        "passed": not reasons,
+        "min_liquidity_score": min_liquidity,
+        "max_freshness_age_seconds": max_freshness,
+        "reasons": reasons,
+    }
+
+
 def paper_context_cost_gate(
     candidate: Mapping[str, Any],
     settings: Mapping[str, Any] | None = None,
@@ -116,6 +215,7 @@ def paper_context_cost_gate(
     additional legs are conservative premiums on top.
     """
     family = paper_context_family(candidate)
+    family_kind = _PAPER_CONTEXT_FAMILIES.get(family or "")
     policy = _policy(settings)
     paper_mode = str((settings or {}).get("mode", "paper")).lower() == "paper"
     enabled = bool(policy.get("enabled", True)) and paper_mode
@@ -190,7 +290,7 @@ def paper_context_cost_gate(
     )
     freshness_window = float(
         policy["proxy_freshness_window_seconds"]
-        if family == "global_proxy_momentum"
+        if family_kind == "proxy"
         else policy["frontier_freshness_window_seconds"]
     )
     if freshness_age is None:
@@ -207,16 +307,38 @@ def paper_context_cost_gate(
     )
     leg_count = _leg_count(candidate)
     complexity_component = max(0, leg_count - 1) * float(policy["extra_leg_cost_bps"])
+    route_status, route_cost_field, route_cost = _route_context(candidate)
+    route_cost_increment = max(0.0, (route_cost or 0.0) - execution_component)
+    if route_status in _CONDITIONAL_ROUTE_STATUSES:
+        route_status_penalty = float(policy["conditional_route_penalty_bps"])
+    elif route_status in _PAPER_PROXY_ROUTE_STATUSES:
+        route_status_penalty = float(policy["paper_proxy_route_penalty_bps"])
+    elif route_status in _BLOCKED_ROUTE_STATUSES:
+        route_status_penalty = float(policy["unknown_route_penalty_bps"])
+    else:
+        route_status_penalty = 0.0
+    route_component = route_cost_increment + route_status_penalty
     floor = (
         execution_component
         + liquidity_component
         + freshness_component
         + volatility_component
         + complexity_component
+        + route_component
     )
     safety_multiplier = max(1.0, float(policy["safety_multiplier"]))
     required_edge = floor * safety_multiplier
-    eligible = bool(enabled is False or (gross_edge is not None and gross_edge > required_edge))
+    quality_floor = _quality_floor(candidate, family_kind or "", policy, liquidity, freshness_age)
+    route_blocked = route_status in _BLOCKED_ROUTE_STATUSES
+    eligible = bool(
+        enabled is False
+        or (
+            gross_edge is not None
+            and gross_edge > required_edge
+            and quality_floor["passed"]
+            and not route_blocked
+        )
+    )
 
     reasons: list[str] = []
     if gross_edge is None:
@@ -233,6 +355,9 @@ def paper_context_cost_gate(
         reasons.append("missing_freshness_age")
     elif freshness_age > freshness_window:
         reasons.append("stale_market_context")
+    reasons.extend(quality_floor["reasons"])
+    if route_blocked:
+        reasons.append("route_status_not_paper_promotable")
 
     if not enabled:
         score_multiplier = 1.0
@@ -259,6 +384,7 @@ def paper_context_cost_gate(
         "applicable": True,
         "enabled": enabled,
         "family": family,
+        "family_kind": family_kind,
         "eligible": eligible,
         "gross_edge_field": gross_field,
         "gross_edge_bps": round(gross_edge, 3) if gross_edge is not None else None,
@@ -267,6 +393,7 @@ def paper_context_cost_gate(
         "required_gross_edge_bps": round(required_edge, 3),
         "score_multiplier": round(score_multiplier, 4),
         "reasons": reasons,
+        "quality_floor": quality_floor,
         "inputs": {
             "spread_field": spread_field,
             "spread_bps": spread,
@@ -279,6 +406,9 @@ def paper_context_cost_gate(
             "recent_volatility_bps": volatility,
             "modeled_cost_field": cost_field,
             "modeled_round_trip_cost_bps": modeled_cost,
+            "route_status": route_status,
+            "route_cost_field": route_cost_field,
+            "route_cost_bps": route_cost,
             "leg_count": leg_count,
         },
         "components_bps": {
@@ -287,7 +417,46 @@ def paper_context_cost_gate(
             "freshness": round(freshness_component, 3),
             "volatility": round(volatility_component, 3),
             "complexity": round(complexity_component, 3),
+            "route": round(route_component, 3),
         },
+    }
+
+
+def realized_paper_cost_audit(
+    candidate: Mapping[str, Any],
+    observed_pnl_bps: Any,
+    *,
+    charged_cost_bps: Any = 0.0,
+    settings: Mapping[str, Any] | None = None,
+    already_backfilled: bool = False,
+) -> dict[str, Any]:
+    """Backfill modeled paper friction omitted from a realized PnL label.
+
+    ``charged_cost_bps`` is the fee/slippage already represented in the label.
+    Only the positive difference to the entry-time context floor is deducted,
+    which avoids double charging fills while preserving route/freshness costs.
+    """
+    observed = _finite_float(observed_pnl_bps)
+    charged = max(0.0, _finite_float(charged_cost_bps) or 0.0)
+    stored_gate = candidate.get("paper_context_cost_gate")
+    gate = dict(stored_gate) if isinstance(stored_gate, Mapping) else paper_context_cost_gate(candidate, settings)
+    applicable = bool(gate.get("applicable")) and observed is not None
+    modeled_floor = max(0.0, _finite_float(gate.get("context_cost_floor_bps")) or 0.0)
+    backfill = 0.0 if already_backfilled or not applicable else max(0.0, modeled_floor - charged)
+    adjusted = None if observed is None else observed - backfill
+    return {
+        "paper_only": True,
+        "applicable": applicable,
+        "cost_basis": "after_modeled_context_cost",
+        "observed_pnl_bps": round(observed, 3) if observed is not None else None,
+        "charged_cost_bps": round(charged, 3),
+        "modeled_context_cost_bps": round(modeled_floor, 3),
+        "realized_cost_backfill_bps": round(backfill, 3),
+        "adjusted_pnl_bps": round(adjusted, 3) if adjusted is not None else None,
+        "backfill_applied": backfill > 0.0,
+        "already_backfilled": bool(already_backfilled),
+        "route_status": (gate.get("inputs") or {}).get("route_status"),
+        "quality_floor": gate.get("quality_floor") or {},
     }
 
 
