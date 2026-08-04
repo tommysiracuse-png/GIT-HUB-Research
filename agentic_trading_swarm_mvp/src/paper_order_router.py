@@ -505,6 +505,21 @@ def frontier_shadow_filter_reason(
     verified positive-net candidates with no slippage or quality blocker remain
     eligible for paper fills.
     """
+    route_eligibility = candidate.get("paper_route_eligibility") or {}
+    if isinstance(route_eligibility, Mapping) and _as_bool(
+        route_eligibility.get("suppressed"), False
+    ):
+        return {
+            "reason": "paper_route_eligibility_blocked",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "paper_route_eligibility_gate",
+            "candidate": _candidate_reference(candidate),
+            "missing_prerequisites": route_eligibility.get("missing_prerequisites") or [],
+            "blocker_reasons": route_eligibility.get("blocker_reasons") or [],
+            "route_eligibility": dict(route_eligibility),
+        }
+
     family_reason = _paper_family_quarantine_reason(candidate, config=config)
     if family_reason is not None:
         normalized = dict(family_reason) if isinstance(family_reason, Mapping) else {"detail": family_reason}

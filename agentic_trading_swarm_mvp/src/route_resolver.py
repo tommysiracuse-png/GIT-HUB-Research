@@ -341,6 +341,400 @@ def summarize_paper_short_route_gates(candidates: Iterable[dict]) -> dict[str, o
     }
 
 
+def _eligibility_value(candidate: dict, *keys: str) -> object:
+    """Return candidate-supplied route evidence without inferring it from account config."""
+
+    containers = (
+        candidate,
+        candidate.get("paper_route_requirements"),
+        candidate.get("route_requirements"),
+    )
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in keys:
+            if key in container and container.get(key) is not None:
+                return container.get(key)
+    return None
+
+
+def _eligibility_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {
+        "true", "yes", "1", "confirmed", "supported", "available",
+        "eligible", "valid", "allowed",
+    }:
+        return True
+    if text in {
+        "false", "no", "0", "missing", "unsupported", "unavailable",
+        "ineligible", "invalid", "blocked",
+    }:
+        return False
+    return None
+
+
+def _eligibility_number(candidate: dict, *keys: str) -> float | None:
+    value = _eligibility_value(candidate, *keys)
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _eligibility_present(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict):
+        return bool(value)
+    return str(value).strip().lower() not in {
+        "", "none", "unknown", "missing", "not_checked", "not_applicable",
+    }
+
+
+def _spot_short_dependency(candidate: dict) -> bool:
+    direction = _paper_gate_text(_eligibility_value(candidate, "direction", "signal_direction"))
+    surface = _paper_gate_text(_eligibility_value(candidate, "surface", "market_type", "instrument_type"))
+    route_id = _paper_gate_text(_eligibility_value(candidate, "route_id"))
+    borrow_required = _eligibility_bool(
+        _eligibility_value(candidate, "borrow_required", "requires_spot_borrow")
+    )
+    inventory_held = _eligibility_bool(
+        _eligibility_value(
+            candidate,
+            "spot_inventory_held",
+            "inventory_already_held",
+            "inventory_available",
+        )
+    )
+    explicit_short_spot = direction in {
+        "short_frontier_spot", "long_perp_short_spot", "short_spot",
+    }
+    plain_spot_short = direction == "short" and (surface == "spot" or "spot" in route_id)
+    return inventory_held is not True and (
+        explicit_short_spot or plain_spot_short or borrow_required is True
+    )
+
+
+def _hedged_structure_dependency(candidate: dict) -> bool:
+    descriptor = " ".join(
+        _paper_gate_text(_eligibility_value(candidate, key))
+        for key in ("trade_type", "strategy", "signal", "direction", "route_type")
+    )
+    requires_hedge = _eligibility_bool(
+        _eligibility_value(candidate, "requires_hedge", "hedge_required")
+    )
+    return requires_hedge is True or any(
+        token in descriptor for token in ("basis", "funding", "carry", "hedge_offset")
+    )
+
+
+def _paper_route_costs(
+    candidate: dict,
+    *,
+    spot_short_required: bool,
+) -> tuple[dict[str, float], float]:
+    explicit_total = _eligibility_number(
+        candidate,
+        "route_cost_bps_paper",
+        "paper_route_cost_bps",
+        "total_route_cost_bps",
+        "total_cost_bps",
+    )
+    if explicit_total is not None:
+        costs = {"route_total": max(0.0, explicit_total)}
+        return costs, round(sum(costs.values()), 6)
+
+    costs: dict[str, float] = {}
+    round_trip = _eligibility_number(
+        candidate, "estimated_round_trip_cost_bps", "round_trip_cost_bps"
+    )
+    if round_trip is not None:
+        costs["round_trip"] = max(0.0, round_trip)
+        fee = None
+        slippage = None
+    else:
+        fee = _eligibility_number(
+            candidate, "total_fee_bps", "estimated_fee_bps", "fee_bps", "route_fee_bps"
+        )
+        if fee is None:
+            per_side_fee = _eligibility_number(
+                candidate,
+                "fee_bps_per_side",
+                "fee_bps_per_side_or_unknown",
+                "estimated_fee_bps_per_side",
+            )
+            fee = None if per_side_fee is None else per_side_fee * 2.0
+        slippage = _eligibility_number(
+            candidate, "total_slippage_bps", "estimated_slippage_bps", "slippage_bps"
+        )
+        if slippage is None:
+            per_side_slippage = _eligibility_number(
+                candidate, "slippage_bps_per_side", "slippage_bps_per_side_or_unknown"
+            )
+            slippage = None if per_side_slippage is None else per_side_slippage * 2.0
+        if slippage is None:
+            entry_slippage = _eligibility_number(candidate, "entry_slippage_bps_estimate")
+            exit_slippage = _eligibility_number(candidate, "exit_slippage_bps_estimate")
+            if entry_slippage is not None or exit_slippage is not None:
+                slippage = (entry_slippage or 0.0) + (exit_slippage or 0.0)
+    borrow = _eligibility_number(
+        candidate,
+        "borrow_cost_bps",
+        "borrow_fee_bps",
+        "borrow_fee_bps_estimate",
+        "borrow_fee_bps_estimate_or_unknown",
+    )
+    funding_drag = _eligibility_number(
+        candidate, "funding_drag_bps", "expected_funding_drag_bps"
+    )
+    for name, value in (
+        ("fees", fee),
+        ("slippage", slippage),
+        ("funding_drag", funding_drag),
+    ):
+        if value is not None:
+            costs[name] = max(0.0, value)
+    if spot_short_required and borrow is not None:
+        costs["borrow"] = max(0.0, borrow)
+    return costs, round(sum(costs.values()), 6)
+
+
+def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
+    """Return a paper-only route verdict suitable for pre-review score gating.
+
+    Instrument-level fields must explicitly establish routeability. Coarse
+    account capabilities and inferred alternatives are deliberately not treated
+    as proof of borrowability, hedge availability, or modeled costs.
+    """
+
+    item = dict(candidate or {})
+    requirements = (
+        item.get("route_requirements")
+        if isinstance(item.get("route_requirements"), dict)
+        else {}
+    )
+    legacy_proxy_allowed = _eligibility_bool(requirements.get("proxy_allowed")) is True
+    legacy_proxy_id = requirements.get("paper_proxy_id")
+    spot_short_required = _spot_short_dependency(item)
+    hedged_structure_required = _hedged_structure_dependency(item)
+    missing: list[str] = []
+    reasons: list[str] = []
+
+    if spot_short_required:
+        paper_short_allowed = _eligibility_bool(
+            _eligibility_value(
+                item,
+                "paper_short_simulation_allowed",
+                "paper_spot_short_simulation_allowed",
+                "paper_short_allowed",
+                "synthetic_short_allowed",
+                "supported_short_simulation",
+                "short_simulation_supported",
+            )
+        )
+        borrowable = _eligibility_bool(
+            _eligibility_value(
+                item,
+                "borrowable",
+                "borrowable_status",
+                "borrowable_confirmed",
+                "borrow_supported",
+                "spot_borrow_supported",
+            )
+        )
+        margin_eligible = _eligibility_bool(
+            _eligibility_value(
+                item,
+                "margin_eligible",
+                "margin_eligibility",
+                "margin_eligibility_status",
+                "margin_supported",
+                "venue_supports_margin_or_equivalent",
+            )
+        )
+        borrow_cost = _eligibility_number(
+            item,
+            "borrow_cost_bps",
+            "borrow_fee_bps",
+            "borrow_fee_bps_estimate",
+            "borrow_fee_bps_estimate_or_unknown",
+        )
+        borrow_cost_model = _eligibility_bool(
+            _eligibility_value(item, "borrow_cost_model_present", "borrow_fee_modeled")
+        )
+        borrow_cost_assumption = _eligibility_value(
+            item, "borrow_cost_assumption", "borrow_cost_model"
+        )
+        short_checks = (
+            (
+                paper_short_allowed is True,
+                "paper_short_simulation_allowed",
+                "paper_short_simulation_permission_missing",
+            ),
+            (borrowable is True, "borrowable", "spot_borrow_missing"),
+            (
+                borrow_cost is not None
+                or borrow_cost_model is True
+                or _eligibility_present(borrow_cost_assumption),
+                "borrow_cost_assumption",
+                "borrow_cost_assumption_missing",
+            ),
+            (
+                margin_eligible is True,
+                "margin_eligible",
+                "margin_eligibility_unconfirmed",
+            ),
+        )
+        for satisfied, prerequisite, reason in short_checks:
+            if not satisfied:
+                missing.append(prerequisite)
+                reasons.append(reason)
+
+    if hedged_structure_required:
+        hedge_venue = _eligibility_value(item, "hedge_venue", "route_hedge_venue")
+        hedge_instrument = _eligibility_value(
+            item,
+            "hedge_instrument",
+            "hedge_instrument_id",
+            "hedge_symbol",
+            "route_hedge_instrument_id",
+            "route_hedge_symbol",
+        )
+        fee_model = _eligibility_value(
+            item, "fee_model", "fee_model_status", "fee_assumptions"
+        )
+        fees_modeled = _eligibility_bool(
+            _eligibility_value(item, "fees_modeled", "fee_model_available")
+        )
+        numeric_fee = _eligibility_number(
+            item,
+            "total_fee_bps",
+            "estimated_fee_bps",
+            "fee_bps",
+            "route_fee_bps",
+            "estimated_round_trip_cost_bps",
+            "round_trip_cost_bps",
+            "total_cost_bps",
+        )
+        leg_mapping_value = _eligibility_value(
+            item,
+            "paper_leg_mapping_valid",
+            "leg_mapping_paper_valid",
+            "paper_valid_leg_mapping",
+            "paper_leg_mapping",
+            "leg_mapping",
+        )
+        if isinstance(leg_mapping_value, dict):
+            leg_mapping = _eligibility_bool(
+                leg_mapping_value.get("paper_valid", leg_mapping_value.get("valid"))
+            )
+        else:
+            leg_mapping = _eligibility_bool(leg_mapping_value)
+        hedge_checks = (
+            (_eligibility_present(hedge_venue), "hedge_venue", "hedge_venue_missing"),
+            (
+                _eligibility_present(hedge_instrument),
+                "hedge_instrument",
+                "hedge_instrument_missing",
+            ),
+            (
+                _eligibility_present(fee_model)
+                or fees_modeled is True
+                or numeric_fee is not None,
+                "fee_model",
+                "fee_model_missing",
+            ),
+            (
+                leg_mapping is True,
+                "paper_leg_mapping_valid",
+                "paper_leg_mapping_missing_or_invalid",
+            ),
+        )
+        for satisfied, prerequisite, reason in hedge_checks:
+            if not satisfied:
+                missing.append(prerequisite)
+                reasons.append(reason)
+
+    cost_breakdown, assumed_cost_bps = _paper_route_costs(
+        item, spot_short_required=spot_short_required
+    )
+    expected_edge_bps = _eligibility_number(
+        item,
+        "expected_edge_bps",
+        "edge_bps_estimate",
+        "net_carry_edge_bps",
+        "depth_adjusted_edge_bps",
+    )
+    if (
+        expected_edge_bps is not None
+        and cost_breakdown
+        and expected_edge_bps < assumed_cost_bps
+    ):
+        missing.append("positive_edge_after_route_costs")
+        reasons.append("expected_edge_below_route_costs")
+
+    # An explicitly mapped paper proxy replaces the spot sale. This preserves
+    # the older route-intelligence contract without treating inferred proxies
+    # as proof that a direct short route exists.
+    if (
+        spot_short_required
+        and not hedged_structure_required
+        and legacy_proxy_allowed
+        and _eligibility_present(legacy_proxy_id)
+    ):
+        direct_short_reasons = {
+            "paper_short_simulation_permission_missing",
+            "spot_borrow_missing",
+            "borrow_cost_assumption_missing",
+            "margin_eligibility_unconfirmed",
+        }
+        direct_short_prerequisites = {
+            "paper_short_simulation_allowed",
+            "borrowable",
+            "borrow_cost_assumption",
+            "margin_eligible",
+        }
+        missing = [value for value in missing if value not in direct_short_prerequisites]
+        reasons = [value for value in reasons if value not in direct_short_reasons]
+        decision = "blocked_hard" if reasons else "executable_proxy"
+        proxy_used = True
+    else:
+        decision = "blocked_hard" if reasons else "executable_standard"
+        proxy_used = False
+
+    suppressed = bool(reasons)
+    applies = bool(
+        spot_short_required
+        or hedged_structure_required
+        or (expected_edge_bps is not None and cost_breakdown)
+    )
+    return {
+        "paper_only": True,
+        "applies": applies,
+        "spot_short_required": spot_short_required,
+        "hedged_structure_required": hedged_structure_required,
+        "route_decision": decision,
+        "route_eligible": not suppressed,
+        "eligible_for_scoring": not suppressed,
+        "suppressed": suppressed,
+        "proxy_used": proxy_used,
+        "selected_proxy_id": legacy_proxy_id if proxy_used else None,
+        "missing_prerequisites": list(dict.fromkeys(missing)),
+        "blocker_reasons": list(dict.fromkeys(reasons)),
+        "expected_edge_bps": expected_edge_bps,
+        "assumed_route_cost_bps": assumed_cost_bps,
+        "cost_breakdown_bps": cost_breakdown,
+    }
+
+
 def _paper_route_alternatives(
     candidate: dict,
     missing_permissions: list[str],
@@ -770,6 +1164,11 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
 def enrich_candidate_with_route(candidate: dict, settings: dict, registry: dict | None = None) -> dict:
     enriched = dict(candidate)
     route = resolve_candidate_route(enriched, settings, registry=registry)
+    eligibility_input = dict(enriched)
+    eligibility_input.setdefault("route_id", route.get("route_id"))
+    eligibility = evaluate_route_intelligence(eligibility_input)
+    route["paper_route_eligibility"] = eligibility
+    route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
     existing = dict(enriched.get("execution_feasibility") or {})
     status = route["route_status"]
     if status == "route_unknown":
@@ -799,12 +1198,21 @@ def enrich_candidate_with_route(candidate: dict, settings: dict, registry: dict 
             "api_access_status": route["api_access_status"],
             "fee_model_status": route["fee_model_status"],
             "market_hours_status": route["market_hours_status"],
+            "paper_route_eligibility": eligibility,
+            "eligibility_missing_prerequisites": eligibility["missing_prerequisites"],
         }
     )
     enriched["execution_feasibility"] = existing
     enriched["execution_route"] = route
     enriched["route_id"] = route["route_id"]
     enriched["route_status"] = route["route_status"]
+    enriched["paper_route_eligibility"] = eligibility
+    if eligibility["suppressed"]:
+        if "score" in enriched:
+            enriched.setdefault("pre_route_eligibility_score", enriched["score"])
+            enriched["score"] = 0.0
+        enriched["paper_entry_blocked"] = True
+        enriched["paper_route_block_reasons"] = eligibility["blocker_reasons"]
     return enriched
 
 
@@ -850,6 +1258,9 @@ def summarize_routes(candidates: Iterable[dict]) -> dict:
     by_requirement_category: collections.Counter[tuple[str, str]] = collections.Counter()
     by_requirement_id: collections.Counter[tuple[str, str]] = collections.Counter()
     by_alternative_status: collections.Counter[str] = collections.Counter()
+    by_eligibility_decision: collections.Counter[str] = collections.Counter()
+    by_eligibility_blocker: collections.Counter[str] = collections.Counter()
+    eligibility_blocked_samples: list[dict] = []
     manual_actions: dict[tuple[str, str], dict] = {}
     samples = {"conditional": [], "route_unknown": [], "blocked": [], "standard": []}
     total = 0
@@ -860,6 +1271,22 @@ def summarize_routes(candidates: Iterable[dict]) -> dict:
         route_id = route.get("route_id") or candidate.get("route_id") or "unknown"
         by_status[status] += 1
         by_route[route_id] += 1
+        eligibility = candidate.get("paper_route_eligibility") or route.get("paper_route_eligibility") or {}
+        if eligibility:
+            by_eligibility_decision[str(eligibility.get("route_decision") or "unknown")] += 1
+            for reason in eligibility.get("blocker_reasons", []) or []:
+                by_eligibility_blocker[str(reason)] += 1
+            if eligibility.get("suppressed") and len(eligibility_blocked_samples) < 20:
+                eligibility_blocked_samples.append(
+                    {
+                        "inst_id": candidate.get("inst_id"),
+                        "venue": candidate.get("venue"),
+                        "direction": candidate.get("direction"),
+                        "pre_gate_score": candidate.get("pre_route_eligibility_score"),
+                        "missing_prerequisites": eligibility.get("missing_prerequisites", []),
+                        "blocker_reasons": eligibility.get("blocker_reasons", []),
+                    }
+                )
         for requirement in route.get("requirements", []) or []:
             req_id = str(requirement.get("requirement_id") or "unknown")
             req_status = str(requirement.get("status") or "unknown")
@@ -919,6 +1346,9 @@ def summarize_routes(candidates: Iterable[dict]) -> dict:
         "by_requirement_category": _requirement_counter_to_dict(by_requirement_category),
         "by_requirement_id": _requirement_counter_to_dict(by_requirement_id),
         "by_route_alternative_status": dict(by_alternative_status),
+        "by_paper_route_eligibility": dict(by_eligibility_decision),
+        "by_paper_route_eligibility_blocker": dict(by_eligibility_blocker),
+        "paper_route_eligibility_blocked_samples": eligibility_blocked_samples,
         "paper_proxy_available_count": int(by_alternative_status.get("paper_testable_proxy", 0)),
         "paper_research_available_count": int(by_alternative_status.get("paper_testable_research", 0)),
         "top_manual_actions": _ranked_manual_actions(manual_actions),
@@ -936,7 +1366,9 @@ def summarize_route_intelligence(candidates: Iterable[dict], min_interesting_sco
     research_testable = []
     for candidate in candidates:
         route = candidate.get("execution_route") or {}
-        score = float(candidate.get("score") or 0.0)
+        score = float(
+            candidate.get("pre_route_eligibility_score", candidate.get("score")) or 0.0
+        )
         status = route.get("route_status") or candidate.get("route_status") or "unknown"
         route_id = route.get("route_id") or candidate.get("route_id") or "unknown"
         missing = list(route.get("missing_permissions", []) or [])
@@ -1231,6 +1663,15 @@ def _markdown(report: dict) -> str:
         lines.append("No missing requirements in the considered candidate set.")
     for item, count in sorted(missing.items(), key=lambda row: row[1], reverse=True):
         lines.append(f"- `{item}`: `{count}`")
+    lines.extend(["", "## Paper Route Eligibility", ""])
+    eligibility = summary.get("by_paper_route_eligibility", {})
+    if not eligibility:
+        lines.append("No candidate-level route eligibility checks were recorded.")
+    for decision, count in sorted(eligibility.items()):
+        lines.append(f"- `{decision}`: `{count}`")
+    blockers = summary.get("by_paper_route_eligibility_blocker", {})
+    for reason, count in sorted(blockers.items(), key=lambda row: row[1], reverse=True):
+        lines.append(f"- blocker `{reason}`: `{count}`")
     lines.extend(["", "## Alternative Paper Routes", ""])
     alternatives = summary.get("by_route_alternative_status", {})
     if not alternatives:

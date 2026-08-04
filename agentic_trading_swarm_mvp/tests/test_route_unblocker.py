@@ -43,21 +43,29 @@ def base_candidate(**overrides: object) -> dict:
 
 
 class RouteUnblockerTests(unittest.TestCase):
-    def test_spot_borrow_blocker_uses_reduced_derivatives_proxy_for_paper(self) -> None:
+    def test_inferred_proxy_does_not_bypass_spot_short_eligibility_gate(self) -> None:
         cfg = settings()
         enriched = route_resolver.enrich_candidate_with_route(base_candidate(), cfg)
 
         review = agent_review.review_candidate(enriched, cfg, {})
 
-        self.assertEqual(review["decision"], "approve_conditional_paper_trade")
-        self.assertTrue(review["route_alternative_used"])
-        self.assertEqual(review["effective_route_id"], "frontier_crypto_perp_proxy_paper")
-        self.assertEqual(review["route_alternative"]["status"], "paper_testable_proxy")
-        self.assertEqual(review["paper_allocation_multiplier"], 0.25)
-        self.assertFalse(any("unconfirmed route capability" in block for block in review["hard_blocks"]))
+        self.assertEqual(review["decision"], "conditional_review")
+        self.assertFalse(review["route_alternative_used"])
+        self.assertEqual(review["effective_route_id"], "conditional_crypto_route_paper")
+        self.assertTrue(
+            any("paper route eligibility blocked" in block for block in review["hard_blocks"])
+        )
+        self.assertIn(
+            "borrowable",
+            enriched["paper_route_eligibility"]["missing_prerequisites"],
+        )
 
         guarded = paper_order_router.apply_frontier_paper_guard(enriched, cfg)
-        self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertTrue(guarded.get("shadow_filtered", False))
+        self.assertEqual(
+            guarded["frontier_paper_guard"]["reason"],
+            "paper_route_eligibility_blocked",
+        )
 
     def test_prediction_market_blockers_use_research_paper_route_only(self) -> None:
         cfg = settings()

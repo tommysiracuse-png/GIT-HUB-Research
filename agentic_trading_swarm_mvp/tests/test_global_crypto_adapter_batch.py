@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import pathlib
-import sqlite3
 import sys
 import unittest
 from unittest import mock
@@ -19,11 +18,10 @@ from adapters.venues.crypto_derivatives import funding_candidate
 from adapters.venues.deribit import _normalize_deribit_book, parse_deribit_summaries
 from adapters.venues.whitebit import parse_whitebit_futures
 from agent_review import review_candidate
-from execution_engine import execute_order
 from frontier_data_quality import _extract_depth
 from route_resolver import enrich_candidate_with_route
 from settings import DEFAULT_SETTINGS
-from storage import init_db, open_paper_trade, signal_key
+from storage import signal_key
 
 
 def fetch_result(payload: object) -> dict:
@@ -226,7 +224,7 @@ class DerivativesAdapterTests(unittest.TestCase):
         self.assertEqual(10.0, book["bids"][0][1])
         self.assertEqual(20.0, book["asks"][0][1])
 
-    def test_profitable_public_funding_candidate_reaches_paper_trade(self) -> None:
+    def test_under_specified_public_funding_candidate_is_blocked_before_paper_trade(self) -> None:
         settings = copy.deepcopy(DEFAULT_SETTINGS)
         observation = {
             "venue": "DERIBIT",
@@ -261,18 +259,22 @@ class DerivativesAdapterTests(unittest.TestCase):
         self.assertEqual("standard", candidate["execution_feasibility"]["status"])
         self.assertEqual("public_crypto_derivatives_paper", candidate["route_id"])
         self.assertTrue(signal_key(candidate).startswith("public_perpetual_funding_capture_v1|DERIBIT|"))
+        self.assertEqual(0.0, candidate["score"])
+        self.assertFalse(candidate["paper_route_eligibility"]["route_eligible"])
+        self.assertEqual(
+            {
+                "hedge_venue",
+                "hedge_instrument",
+                "paper_leg_mapping_valid",
+            },
+            set(candidate["paper_route_eligibility"]["missing_prerequisites"]),
+        )
 
         review = review_candidate(candidate, settings, adjustments={})
-        self.assertEqual("approve_paper_trade", review["decision"])
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        init_db(conn)
-        execution = execute_order(conn, candidate, review, settings)
-        self.assertTrue(execution["paper_filled"])
-        trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=settings)
-        row = conn.execute("select venue, inst_id, status from paper_trades where id = ?", (trade_id,)).fetchone()
-        self.assertEqual(("DERIBIT", "DERIBIT:BTC-PERPETUAL", "open"), tuple(row))
-        conn.close()
+        self.assertEqual("reject", review["decision"])
+        self.assertTrue(
+            any("paper route eligibility blocked" in block for block in review["hard_blocks"])
+        )
 
     def test_long_perpetual_funding_does_not_require_spot_borrow(self) -> None:
         settings = copy.deepcopy(DEFAULT_SETTINGS)

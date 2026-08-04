@@ -88,7 +88,11 @@ def review_candidate(
     route_id = feasibility.get("route_id") or route.get("route_id")
     missing_requirements = feasibility.get("missing_requirements") or route.get("missing_permissions") or []
     route_alternative = _best_route_alternative(feasibility, route)
-    route_alternative_usable = _route_alternative_covers_missing(missing_requirements, route_alternative)
+    paper_route_eligibility = candidate.get("paper_route_eligibility") or {}
+    route_alternative_usable = (
+        _route_alternative_covers_missing(missing_requirements, route_alternative)
+        and not paper_route_eligibility.get("suppressed", False)
+    )
     net_edge_bps = estimate_net_edge_bps(candidate, settings)
     context_features = build_context_features(candidate, {}, net_edge_bps=net_edge_bps)
     matched_policies = _matching_policies(key, policies, context_features)
@@ -169,7 +173,15 @@ def review_candidate(
         if allocation_multiplier < 1.0 and not candidate.get("paper_entry_blocked"):
             warnings.append(f"strategy reliability allocation multiplier {allocation_multiplier}: {action}")
     if candidate.get("paper_entry_blocked"):
-        if strategy_reliability:
+        if paper_route_eligibility.get("suppressed"):
+            reasons = paper_route_eligibility.get("blocker_reasons") or []
+            missing = paper_route_eligibility.get("missing_prerequisites") or []
+            hard_blocks.append(
+                "paper route eligibility blocked: "
+                + ", ".join(str(item) for item in reasons)
+                + (f"; missing prerequisites: {', '.join(str(item) for item in missing)}" if missing else "")
+            )
+        elif strategy_reliability:
             reason_text = ", ".join((strategy_reliability.get("reasons") or [])[:3])
             hard_blocks.append(
                 f"strategy reliability pack moved this signal to shadow-only: "
