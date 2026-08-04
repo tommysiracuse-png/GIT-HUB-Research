@@ -62,7 +62,18 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
     mode = settings.get("mode", "paper")
     notional = float(risk.get("paper_notional_usd", 1000.0))
     if mode == "paper":
-        notional *= max(0.0, min(1.0, float(review.get("paper_allocation_multiplier", 1.0))))
+        review_multiplier = max(
+            0.0,
+            min(1.0, float(review.get("paper_allocation_multiplier", 1.0))),
+        )
+        registry_multiplier = max(
+            0.0,
+            min(
+                1.0,
+                float(candidate.get("paper_route_registry_allocation_multiplier", 1.0)),
+            ),
+        )
+        notional *= min(review_multiplier, registry_multiplier)
     if mode == "live":
         notional = min(notional, float(risk.get("max_live_notional_usd", 0.0)))
 

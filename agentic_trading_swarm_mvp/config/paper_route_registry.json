@@ -1,0 +1,157 @@
+{
+  "version": 1,
+  "paper_only": true,
+  "unspecified_score_multiplier": 0.2,
+  "routes": [
+    {
+      "venue": "OKX_SPOT",
+      "trade_type": "frontier_crypto_venue_map",
+      "direction": "short_frontier_spot",
+      "support_status": "unsupported",
+      "required_permissions": ["crypto_spot", "margin_spot", "spot_short", "spot_borrow"],
+      "required_account_modes": ["margin"],
+      "estimated_cost_bps": {"fee_round_trip": 20.0, "slippage_round_trip": 6.0, "borrow": null},
+      "reason": "The maintained paper route has no confirmed OKX spot-short, margin, or borrow path."
+    },
+    {
+      "venue": "OKX",
+      "trade_type": "frontier_crypto_venue_map",
+      "direction": "short_frontier_spot",
+      "support_status": "unsupported",
+      "required_permissions": ["crypto_spot", "margin_spot", "spot_short", "spot_borrow"],
+      "required_account_modes": ["margin"],
+      "estimated_cost_bps": {"fee_round_trip": 20.0, "slippage_round_trip": 6.0, "borrow": null},
+      "reason": "The maintained paper route has no confirmed OKX spot-short, margin, or borrow path."
+    },
+    {
+      "venue": "BITGET",
+      "trade_type": "frontier_crypto_venue_map",
+      "direction": "short_frontier_spot",
+      "support_status": "unsupported",
+      "required_permissions": ["crypto_spot", "margin_spot", "spot_short", "spot_borrow"],
+      "required_account_modes": ["margin"],
+      "estimated_cost_bps": {"fee_round_trip": 20.0, "slippage_round_trip": 8.0, "borrow": null},
+      "reason": "Spot borrow and margin-short availability are not confirmed for the maintained paper route."
+    },
+    {
+      "venue": "BINANCE_US",
+      "trade_type": "frontier_crypto_venue_map",
+      "direction": "short_frontier_spot",
+      "support_status": "unsupported",
+      "required_permissions": ["crypto_spot", "margin_spot", "spot_short", "spot_borrow"],
+      "required_account_modes": ["margin"],
+      "estimated_cost_bps": {"fee_round_trip": 20.0, "slippage_round_trip": 8.0, "borrow": null},
+      "reason": "The maintained venue route is spot-long only and does not model a borrowable short."
+    },
+    {
+      "venue": "KRAKEN",
+      "trade_type": "frontier_crypto_venue_map",
+      "direction": "short_frontier_spot",
+      "support_status": "unsupported",
+      "required_permissions": ["crypto_spot", "margin_spot", "spot_short", "spot_borrow"],
+      "required_account_modes": ["margin"],
+      "estimated_cost_bps": {"fee_round_trip": 24.0, "slippage_round_trip": 8.0, "borrow": null},
+      "reason": "Spot borrow and instrument-level margin eligibility are not confirmed for the paper route."
+    },
+    {
+      "venue": "MEXC",
+      "trade_type": "frontier_crypto_venue_map",
+      "direction": "short_frontier_spot",
+      "support_status": "unsupported",
+      "required_permissions": ["crypto_spot", "margin_spot", "spot_short", "spot_borrow"],
+      "required_account_modes": ["margin"],
+      "estimated_cost_bps": {"fee_round_trip": 20.0, "slippage_round_trip": 10.0, "borrow": null},
+      "reason": "Spot borrow and instrument-level margin eligibility are not confirmed for the paper route."
+    },
+    {
+      "venue": "LUNO",
+      "trade_type": "frontier_crypto_venue_map",
+      "direction": "short_frontier_spot",
+      "support_status": "unsupported",
+      "required_permissions": ["crypto_spot", "margin_spot", "spot_short", "spot_borrow"],
+      "required_account_modes": ["margin"],
+      "estimated_cost_bps": {"fee_round_trip": 30.0, "slippage_round_trip": 12.0, "borrow": null},
+      "reason": "The maintained Luno paper route is spot-long only and has no modeled borrow path."
+    },
+    {
+      "venue": "OKX",
+      "trade_type": "perp_funding_basis",
+      "direction": "long_perp_short_spot",
+      "support_status": "unsupported",
+      "required_permissions": ["crypto_derivatives", "crypto_spot", "spot_borrow", "margin_spot"],
+      "required_account_modes": ["derivatives_margin", "spot_margin"],
+      "estimated_cost_bps": {"fee_round_trip": 40.0, "slippage_round_trip": 12.0, "borrow": null},
+      "reason": "The short-spot hedge has no confirmed borrow inventory or borrow-cost route."
+    },
+    {
+      "venue": "OKX",
+      "trade_type": "perp_funding_basis",
+      "direction": "short_perp_long_spot",
+      "support_status": "supported",
+      "required_permissions": ["crypto_derivatives", "crypto_spot"],
+      "required_account_modes": ["derivatives_margin", "spot"],
+      "estimated_cost_bps": {"fee_round_trip": 40.0, "slippage_round_trip": 12.0, "borrow": 0.0},
+      "reason": "Both paper legs are representable without spot borrow."
+    },
+    {
+      "venue": "OKX",
+      "trade_type": "perp_funding_basis",
+      "direction": "basis_mean_reversion_long_perp",
+      "support_status": "supported",
+      "required_permissions": ["crypto_derivatives"],
+      "required_account_modes": ["derivatives_margin"],
+      "estimated_cost_bps": {"fee_round_trip": 20.0, "slippage_round_trip": 6.0, "borrow": 0.0},
+      "reason": "Single-perpetual paper exposure is modeled with conservative round-trip costs."
+    },
+    {
+      "venue": "OKX",
+      "trade_type": "perp_funding_basis",
+      "direction": "basis_mean_reversion_short_perp",
+      "support_status": "supported",
+      "required_permissions": ["crypto_derivatives"],
+      "required_account_modes": ["derivatives_margin"],
+      "estimated_cost_bps": {"fee_round_trip": 20.0, "slippage_round_trip": 6.0, "borrow": 0.0},
+      "reason": "Single-perpetual paper exposure is modeled with conservative round-trip costs."
+    },
+    {
+      "venue": "OKX",
+      "trade_type": "perp_funding_basis",
+      "direction": "funding_capture_long_perp",
+      "support_status": "supported",
+      "required_permissions": ["crypto_derivatives"],
+      "required_account_modes": ["derivatives_margin"],
+      "estimated_cost_bps": {"fee_round_trip": 20.0, "slippage_round_trip": 6.0, "borrow": 0.0},
+      "reason": "Single-perpetual paper exposure is modeled with conservative round-trip costs."
+    },
+    {
+      "venue": "OKX",
+      "trade_type": "perp_funding_basis",
+      "direction": "funding_capture_short_perp",
+      "support_status": "supported",
+      "required_permissions": ["crypto_derivatives"],
+      "required_account_modes": ["derivatives_margin"],
+      "estimated_cost_bps": {"fee_round_trip": 20.0, "slippage_round_trip": 6.0, "borrow": 0.0},
+      "reason": "Single-perpetual paper exposure is modeled with conservative round-trip costs."
+    },
+    {
+      "venue": "WHITEBIT",
+      "trade_type": "perp_funding_basis",
+      "direction": "funding_capture_long_perp",
+      "support_status": "conditional",
+      "required_permissions": ["crypto_derivatives"],
+      "required_account_modes": ["derivatives_margin"],
+      "estimated_cost_bps": {"fee_round_trip": 10.0, "slippage_round_trip": 6.0, "borrow": 0.0},
+      "reason": "Public data supports paper modeling; derivative access and margin mode remain account-specific."
+    },
+    {
+      "venue": "WHITEBIT",
+      "trade_type": "perp_funding_basis",
+      "direction": "funding_capture_short_perp",
+      "support_status": "conditional",
+      "required_permissions": ["crypto_derivatives"],
+      "required_account_modes": ["derivatives_margin"],
+      "estimated_cost_bps": {"fee_round_trip": 10.0, "slippage_round_trip": 6.0, "borrow": 0.0},
+      "reason": "Public data supports paper modeling; derivative access and margin mode remain account-specific."
+    }
+  ]
+}

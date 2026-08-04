@@ -44,6 +44,9 @@ DEFAULT_SETTINGS = {
         "enabled": True,
         "min_score": 0.65,
     },
+    "paper_route_registry": {
+        "enabled": True,
+    },
     "paper_context_cost_floor": {
         "enabled": True,
         "min_net_edge_buffer_bps": 2.0,

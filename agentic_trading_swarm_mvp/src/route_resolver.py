@@ -16,6 +16,7 @@ import pathlib
 from typing import Iterable
 
 from paper_context_cost import annotate_paper_context_cost
+from paper_route_registry import apply_paper_route_registry
 
 try:
     from storage import RUNS_DIR
@@ -2000,6 +2001,7 @@ def enrich_candidate_with_route(
             if isinstance(supplied_capabilities, dict)
             else "paper_route_intelligence.crypto_venues"
         )
+    enriched = apply_paper_route_registry(enriched, settings)
     route = resolve_candidate_route(enriched, settings, registry=registry)
     eligibility_input = dict(enriched)
     eligibility_input.setdefault("route_id", route.get("route_id"))
@@ -2012,6 +2014,10 @@ def enrich_candidate_with_route(
     route["route_feasibility_score"] = route_feasibility_score
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
+    route["paper_route_registry"] = enriched["paper_route_registry"]
+    route["registry_required_permissions"] = enriched["paper_route_required_permissions"]
+    route["registry_required_account_modes"] = enriched["paper_route_required_account_modes"]
+    route["registry_estimated_cost_bps"] = enriched["paper_route_estimated_cost_bps"]
     existing = dict(enriched.get("execution_feasibility") or {})
     status = route["route_status"]
     if status == "route_unknown":
@@ -2045,6 +2051,10 @@ def enrich_candidate_with_route(
             "fee_model_status": route["fee_model_status"],
             "market_hours_status": route["market_hours_status"],
             "paper_route_eligibility": eligibility,
+            "paper_route_registry": enriched["paper_route_registry"],
+            "registry_required_permissions": enriched["paper_route_required_permissions"],
+            "registry_required_account_modes": enriched["paper_route_required_account_modes"],
+            "registry_estimated_cost_bps": enriched["paper_route_estimated_cost_bps"],
             "eligibility_missing_prerequisites": eligibility["missing_prerequisites"],
             "paper_feasibility_status": eligibility["feasibility_status"],
             "execution_eligibility": eligibility["execution_eligibility"],
@@ -2080,7 +2090,10 @@ def enrich_candidate_with_route(
     enriched["rank_contribution"] = eligibility["rank_contribution"]
     if eligibility["suppressed"]:
         if "score" in enriched:
-            enriched.setdefault("pre_route_eligibility_score", enriched["score"])
+            enriched.setdefault(
+                "pre_route_eligibility_score",
+                enriched.get("pre_paper_route_registry_score", enriched["score"]),
+            )
             enriched["score"] = 0.0
         enriched["paper_entry_blocked"] = True
         enriched["promotion_eligible"] = False

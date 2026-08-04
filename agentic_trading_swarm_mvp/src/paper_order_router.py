@@ -13,6 +13,8 @@ import math
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from paper_route_registry import apply_paper_route_registry
+
 
 FRONTIER_MARKER = "frontier_crypto_venue_map"
 FRONTIER_SHADOW_REASON = "frontier_shadow_filtered"
@@ -1079,7 +1081,8 @@ def apply_frontier_paper_guard(
 ) -> dict[str, Any]:
     """Return a copy of ``candidate`` annotated as shadow-filtered when needed."""
     route_guard_enabled = frontier_route_feasibility_guard_enabled(config)
-    guarded = dict(candidate)
+    guarded = apply_paper_route_registry(candidate, config if isinstance(config, Mapping) else None)
+    registry_gate = guarded.get("paper_route_registry") or {}
     existing_route_reason = frontier_shadow_filter_reason(guarded, config)
     score_gate = paper_route_feasibility_gate_review(guarded, config)
     guarded["paper_route_feasibility_gate"] = score_gate
@@ -1132,10 +1135,23 @@ def apply_frontier_paper_guard(
         is_frontier_crypto_candidate(guarded) and route_guard_enabled
     ) else guarded
     reason = frontier_shadow_filter_reason(guarded, config)
-    if reason is None:
-        return guarded
-
-    return _annotate_shadow_filtered_candidate(guarded, reason, "frontier_paper_guard")
+    if reason is not None:
+        return _annotate_shadow_filtered_candidate(guarded, reason, "frontier_paper_guard")
+    if registry_gate.get("action") == "suppress":
+        reason = {
+            "reason": "unsupported_paper_route",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "paper_route_registry_gate",
+            "candidate": _candidate_reference(guarded),
+            "route_registry": dict(registry_gate),
+        }
+        return _annotate_shadow_filtered_candidate(
+            guarded,
+            reason,
+            "paper_route_registry_guard",
+        )
+    return guarded
 
 
 def filter_frontier_paper_candidates(
