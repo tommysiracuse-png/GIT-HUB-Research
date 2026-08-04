@@ -1,9 +1,11 @@
 $ErrorActionPreference = "Stop"
 
-$TaskName = "AgenticTradingRadar"
-$StartScript = Resolve-Path (Join-Path $PSScriptRoot "start_radar_hidden.ps1")
+$TaskName = "AgenticTradingSystem"
+$LegacyTaskName = "AgenticTradingRadar"
+$StartScript = Resolve-Path (Join-Path $PSScriptRoot "system_watchdog.ps1")
 $StartupDir = [Environment]::GetFolderPath("Startup")
-$ShortcutPath = Join-Path $StartupDir "AgenticTradingRadar.lnk"
+$ShortcutPath = Join-Path $StartupDir "AgenticTradingSystem.lnk"
+$LegacyShortcutPath = Join-Path $StartupDir "AgenticTradingRadar.lnk"
 $PowerShellPath = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
 
 try {
@@ -15,18 +17,24 @@ try {
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
         -StartWhenAvailable `
-        -MultipleInstances IgnoreNew
+        -MultipleInstances IgnoreNew `
+        -RestartCount 999 `
+        -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+    Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -Force -ErrorAction SilentlyContinue $LegacyShortcutPath
 
     Register-ScheduledTask `
         -TaskName $TaskName `
         -Action $Action `
         -Trigger $Trigger `
         -Settings $Settings `
-        -Description "Starts the Agentic Trading Radar hidden supervisor at logon." `
+        -Description "Keeps the Agentic Trading radar and evolution supervisors healthy for the current user." `
         -Force `
         -ErrorAction Stop | Out-Null
 
-    Write-Output "Installed scheduled task '$TaskName' to start the radar at logon."
+    Write-Output "Installed scheduled task '$TaskName' to keep radar and evolution running."
 }
 catch {
     Write-Output "Scheduled task install failed: $($_.Exception.Message)"
@@ -38,7 +46,7 @@ catch {
     $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$StartScript`""
     $shortcut.WorkingDirectory = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
     $shortcut.WindowStyle = 7
-    $shortcut.Description = "Starts the Agentic Trading Radar hidden supervisor."
+    $shortcut.Description = "Keeps the Agentic Trading radar and evolution supervisors healthy."
     $shortcut.Save()
 
     Write-Output "Installed Startup shortcut: $ShortcutPath"

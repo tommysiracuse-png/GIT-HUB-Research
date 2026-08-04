@@ -71,6 +71,12 @@ ROLE_MEMORY_POLICIES = {
         "namespaces": ["strategies", "outcomes", "markets", "recommendations"],
         "keywords": ["strategy hypothesis experiment variant promotion retired labels pnl win rate tail"],
     },
+    "strategy_implementation_owner": {
+        "namespaces": ["strategies", "outcomes", "code", "recommendations", "markets", "routes"],
+        "keywords": [
+            "strategy owner hypothesis contract compile candidate paper outcome promotion code commit test failure recovery"
+        ],
+    },
     "red_team": {
         "namespaces": ["outcomes", "strategies", "policies", "code"],
         "keywords": ["failure decay loss tail risk regression invalidated rejected policy diagnosis"],

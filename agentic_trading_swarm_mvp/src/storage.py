@@ -726,6 +726,91 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "strategy_lab_experiments", "novelty_details_json", "text not null default '{}'")
     conn.execute(
         """
+        create table if not exists strategy_owner_tasks (
+            task_id text primary key,
+            created_at text not null,
+            updated_at text not null,
+            completed_at text,
+            dedupe_key text not null,
+            objective_type text not null,
+            priority integer not null,
+            status text not null,
+            strategy_lab_id text,
+            strategy_lab_version integer,
+            source_recommendation_id text,
+            hypothesis text not null,
+            acceptance_json text not null default '{}',
+            dependency_json text not null default '{}',
+            memory_ids_json text not null default '[]',
+            memory_context_hash text,
+            code_proposal_id text,
+            codex_session_id text,
+            codex_pid integer,
+            branch_name text,
+            worktree_path text,
+            claimed_by text,
+            claimed_pid integer,
+            lease_expires_at text,
+            heartbeat_at text,
+            next_retry_at text,
+            attempt_count integer not null default 0,
+            last_error_json text not null default '{}',
+            last_result_json text not null default '{}',
+            recovery_journal_json text not null default '[]',
+            unique(dedupe_key)
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_strategy_owner_tasks_status "
+        "on strategy_owner_tasks(status, priority desc, updated_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_strategy_owner_tasks_strategy "
+        "on strategy_owner_tasks(strategy_lab_id, strategy_lab_version)"
+    )
+    conn.execute(
+        """
+        create table if not exists strategy_owner_runs (
+            run_id text primary key,
+            task_id text not null,
+            cycle_id text not null,
+            started_at text not null,
+            completed_at text,
+            status_before text not null,
+            status_after text,
+            decision text,
+            codex_session_id text,
+            worktree_path text,
+            memory_ids_json text not null default '[]',
+            context_hash text,
+            model_json text not null default '{}',
+            result_json text not null default '{}',
+            tests_json text not null default '{}',
+            estimated_cost_usd real not null default 0,
+            error_json text not null default '{}',
+            foreign key(task_id) references strategy_owner_tasks(task_id)
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_strategy_owner_runs_task "
+        "on strategy_owner_runs(task_id, started_at desc)"
+    )
+    conn.execute(
+        """
+        create table if not exists evolution_owner_scheduler (
+            scheduler_key text primary key,
+            next_lane text not null,
+            last_lane text,
+            turn_number integer not null default 0,
+            updated_at text not null,
+            history_json text not null default '[]'
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists strategy_feature_snapshots (
             id integer primary key autoincrement,
             bucket_at text not null,

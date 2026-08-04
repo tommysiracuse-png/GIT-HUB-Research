@@ -7,13 +7,19 @@ $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $PythonExe = if (Test-Path $VenvPython) { $VenvPython } else { "python" }
 $LogPath = Join-Path $RunsDir "evolution_worker_forever.log"
 $PidPath = Join-Path $RunsDir "evolution_worker_forever.pid"
+$PidMetaPath = Join-Path $RunsDir "evolution_worker_forever.pid.json"
 $HeartbeatPath = Join-Path $RunsDir "evolution_worker_heartbeat.json"
 $MaxLogBytes = 10MB
 $IntervalSeconds = 300
 
 New-Item -ItemType Directory -Force -Path $RunsDir | Out-Null
 Set-Content -Path $PidPath -Value $PID -Encoding ASCII
+$SupervisorStartedAt = (Get-Date).ToUniversalTime().ToString("o")
+@{ pid=$PID; started_at_utc=$SupervisorStartedAt; project_root="$ProjectRoot"; script="run_evolution_worker_forever.ps1" } | ConvertTo-Json | Set-Content -Path $PidMetaPath -Encoding UTF8
 $env:PYTHONDONTWRITEBYTECODE = "1"
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $env:RADAR_USE_LITELLM = "1"
 
 $ProviderEnvNames = @(

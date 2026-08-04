@@ -379,6 +379,17 @@ DEFAULT_SETTINGS = {
         "min_minutes_between_attempts": 15,
         "scan_limit": 100,
     },
+    "strategy_implementation_owner": {
+        "enabled": True,
+        "lease_seconds": 2400,
+        "retry_backoff_seconds": 300,
+        "memory_context_chars": 70000,
+        "memory_retrieval_limit": 80,
+        "salvage_invalid_backlog": True,
+        "salvage_limit_per_cycle": 12,
+        "stalled_testing_hours": 24,
+        "report_limit": 100,
+    },
     "research_worker": {
         "enabled": True,
         "global_market_discovery": True,

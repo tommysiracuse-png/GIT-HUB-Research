@@ -5122,8 +5122,28 @@ def _run_codex_candidate(
             )
             return {"handled": True, "artifacts": artifacts}
 
-        release = _candidate_release_from_row(existing_row or {})
-        release_preflight = (existing_row or {}).get("evaluation", {}).get("release", {}).get("preflight", {})
+        release_seed = existing_row or {}
+        owner_release = payload.get("strategy_owner_release") if isinstance(payload.get("strategy_owner_release"), dict) else {}
+        if not release_seed and owner_release:
+            release_seed = {
+                "proposal_id": proposal_id,
+                "parent_commit": owner_release.get("parent_commit"),
+                "branch_name": owner_release.get("branch_name"),
+                "worktree_path": owner_release.get("worktree_path"),
+                "evaluation": {
+                    "release": {
+                        **owner_release,
+                        "proposal_id": proposal_id,
+                        "preflight": {
+                            "ok": True,
+                            "reason": "strategy_owner_prepared_worktree",
+                            "parent_commit": owner_release.get("parent_commit"),
+                        },
+                    }
+                },
+            }
+        release = _candidate_release_from_row(release_seed)
+        release_preflight = release_seed.get("evaluation", {}).get("release", {}).get("preflight", {})
         if release is None:
             base_dir = pathlib.Path(str(cfg.get("release_worktree_dir") or RUNS_DIR / "evolution_worktrees"))
             base_dir.mkdir(parents=True, exist_ok=True)
@@ -5145,7 +5165,12 @@ def _run_codex_candidate(
 
         prior_safety = (existing_row or {}).get("safety") or {}
         prior_agent = prior_safety.get("codex_repo_agent") or prior_safety.get("patch_generation") or {}
-        session_id = str(prior_agent.get("session_id") or "") or None
+        session_id = str(
+            prior_agent.get("session_id")
+            or payload.get("strategy_owner_codex_session_id")
+            or (payload.get("code_change") or {}).get("strategy_owner_codex_session_id")
+            or ""
+        ) or None
         agent = run_codex_repo_agent(
             proposal_id=proposal_id,
             payload=payload,
@@ -5159,6 +5184,19 @@ def _run_codex_candidate(
         diff_text, diff_meta = _candidate_worktree_diff(release, int(cfg.get("sandbox_timeout_seconds", 120)))
         patch_generation = _codex_patch_generation(agent)
         if agent.get("status") == "unavailable" and not existing_row and not diff_text.strip():
+            if owner_release:
+                artifacts = _pause_codex_candidate(
+                    conn,
+                    proposal_id,
+                    release,
+                    release_preflight,
+                    agent,
+                    diff_text,
+                    {"allowed": False, "reasons": [str(agent.get("reason") or "codex_unavailable")]},
+                    tests={"worktree_diff": diff_meta},
+                    reason=str(agent.get("reason") or "codex_unavailable"),
+                )
+                return {"handled": True, "artifacts": artifacts}
             cleanup_worktree(release, root)
             return {"handled": False, "patch_generation": patch_generation}
         if agent.get("status") != "completed":

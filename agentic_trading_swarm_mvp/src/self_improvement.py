@@ -54,6 +54,10 @@ from recommendation_registry import (
     reconcile_deployed_artifacts,
     registry_summary,
 )
+from strategy_implementation_owner import (
+    enqueue_recommendation as enqueue_strategy_owner_recommendation,
+    summary as strategy_owner_summary,
+)
 
 
 ACTIVE_POLICIES_JSON = RUNS_DIR / "active_signal_policies.json"
@@ -2288,8 +2292,8 @@ def _execute_diagnostic_hypothesis(conn: sqlite3.Connection, rec: dict) -> list[
     return [{"action_status": "created", "signal_key": signal}]
 
 
-def _execute_strategy_lab_experiment(conn: sqlite3.Connection, rec: dict) -> list[dict]:
-    return ingest_strategy_lab_recommendation(conn, rec)
+def _execute_strategy_lab_experiment(conn: sqlite3.Connection, rec: dict, settings: dict) -> list[dict]:
+    return [enqueue_strategy_owner_recommendation(conn, rec, settings)]
 
 
 def evaluate_active_experiments(conn: sqlite3.Connection, settings: dict) -> list[dict]:
@@ -2424,7 +2428,7 @@ def run_auto_improvement(
         elif task_type == "diagnostic_hypothesis":
             created = _execute_diagnostic_hypothesis(conn, rec)
         elif task_type == "strategy_lab_experiment":
-            created = _execute_strategy_lab_experiment(conn, rec)
+            created = _execute_strategy_lab_experiment(conn, rec, settings)
         elif task_type == "code_change":
             created = process_code_change_recommendation(conn, _normalize_code_change_recommendation(rec), settings)
 
@@ -2437,7 +2441,7 @@ def run_auto_improvement(
                 "market_adapter": "adapter_specs",
                 "signal_variant": "signal_variants",
                 "diagnostic_hypothesis": "growth_experiments",
-                "strategy_lab_experiment": "strategy_lab_experiments",
+                "strategy_lab_experiment": "strategy_owner_tasks",
                 "code_change": "code_evolution_proposals",
             }.get(task_type)
             artifact_id = next(
@@ -2534,6 +2538,7 @@ def write_reports(conn: sqlite3.Connection, report: dict | None = None, settings
     report["progress_summary"] = _progress_summary(conn, settings)
     report["code_evolution"] = report.get("code_evolution") or write_code_evolution_reports(conn, settings)
     report["strategy_lab"] = report.get("strategy_lab") or strategy_lab_summary(conn)
+    report["strategy_implementation_owner"] = strategy_owner_summary(conn, limit=40)
     report["recommendation_registry"] = registry_summary(conn)
     ACTIVE_POLICIES_JSON.write_text(json.dumps(report.get("active_policies", []), indent=2), encoding="utf-8")
     REPORT_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")

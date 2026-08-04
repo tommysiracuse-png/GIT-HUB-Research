@@ -7,6 +7,7 @@ events so interrupted implementations can resume in the same persisted thread.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import datetime as dt
 import importlib
 import json
@@ -15,7 +16,7 @@ import pathlib
 import shutil
 import subprocess
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 PINNED_CODEX_PACKAGE = "openai-codex==0.144.4"
@@ -190,7 +191,29 @@ def _child_environment(cfg: dict[str, Any], api_key: str) -> dict[str, str]:
     env["CODEX_API_KEY"] = api_key
     env["CODEX_HOME"] = str(pathlib.Path(str(cfg["codex_home"])).expanduser().resolve())
     env["CODEX_NON_INTERACTIVE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     return env
+
+
+def _pid_alive(pid: object) -> bool:
+    try:
+        numeric = int(pid or 0)
+        if numeric <= 0:
+            return False
+        if os.name == "nt":
+            process = ctypes.windll.kernel32.OpenProcess(0x1000, False, numeric)
+            if not process:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                return bool(ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code))) and exit_code.value == 259
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process)
+        os.kill(numeric, 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def build_implementation_prompt(
@@ -247,7 +270,8 @@ def build_implementation_prompt(
 
 
 def _command(
-    runtime: dict[str, Any], cfg: dict[str, Any], worktree_root: pathlib.Path, session_id: str | None
+    runtime: dict[str, Any], cfg: dict[str, Any], worktree_root: pathlib.Path, session_id: str | None,
+    *, output_schema: pathlib.Path | None = None, output_last_message: pathlib.Path | None = None,
 ) -> list[str]:
     shared = [
         "--json",
@@ -264,12 +288,18 @@ def _command(
         'shell_environment_policy.exclude=["*KEY*","*SECRET*","*TOKEN*","*PASSWORD*","*CREDENTIAL*"]',
     ]
     prefix = list(runtime["command_prefix"])
+    output_args: list[str] = []
+    if output_schema is not None:
+        output_args.extend(["--output-schema", str(output_schema)])
+    if output_last_message is not None:
+        output_args.extend(["--output-last-message", str(output_last_message)])
     if session_id:
-        return [*prefix, "exec", "resume", *shared, "--all", session_id, "-"]
+        return [*prefix, "exec", "resume", *shared, *output_args, "--all", session_id, "-"]
     return [
         *prefix,
         "exec",
         *shared,
+        *output_args,
         "--color",
         "never",
         "--cd",
@@ -344,12 +374,20 @@ def codex_write_lock(cfg: dict[str, Any], owner: str) -> Iterator[dict[str, Any]
                 json.dump({"owner": owner, "pid": os.getpid(), "acquired_at": _utc_now()}, handle)
             break
         except FileExistsError:
+            lock_owner: dict[str, Any] = {}
+            try:
+                lock_owner = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
             try:
                 age = time.time() - path.stat().st_mtime
             except OSError:
                 age = 0
-            if age <= stale_seconds:
+            if _pid_alive(lock_owner.get("pid")):
                 yield {"acquired": False, "reason": "codex_writer_busy", "lock_path": str(path)}
+                return
+            if age <= 5:
+                yield {"acquired": False, "reason": "codex_writer_lock_race", "lock_path": str(path)}
                 return
             try:
                 path.unlink()
@@ -404,6 +442,8 @@ def run_codex_repo_agent(
             env=_child_environment(cfg, key),
             input=prompt,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=int(cfg.get("timeout_seconds", 1800)),
             check=False,
@@ -451,6 +491,157 @@ def run_codex_repo_agent(
             "event_log": str(log_path),
             "event_summary": parsed,
             "stderr_tail": stderr[-4000:],
+        }
+    except OSError as exc:
+        return {"status": "unavailable", "reason": "codex_process_start_failed", "error": str(exc), "runtime": runtime_meta}
+
+
+def run_structured_codex_turn(
+    *,
+    task_id: str,
+    prompt: str,
+    output_schema: dict[str, Any],
+    worktree_root: pathlib.Path,
+    settings: dict,
+    runs_dir: pathlib.Path,
+    session_id: str | None = None,
+    process_started: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """Run a resumable, schema-constrained Codex reasoning turn.
+
+    This is intentionally separate from patch generation. A strategy owner can
+    return a validated experiment contract without manufacturing a code diff.
+    """
+
+    cfg = codex_repo_agent_config(settings, runs_dir)
+    if not cfg.get("enabled", True):
+        return {"status": "unavailable", "reason": "codex_repo_agent_disabled"}
+    runtime = ensure_codex_runtime(cfg)
+    if not runtime.get("available"):
+        return {"status": "unavailable", "reason": runtime.get("reason"), "runtime": runtime}
+    source_env, key = _api_key(cfg)
+    if not key:
+        return {"status": "unavailable", "reason": "missing_codex_api_key", "runtime": runtime}
+
+    safe_id = task_id.replace(":", "_").replace("/", "_")
+    session_dir = pathlib.Path(str(cfg["session_log_dir"]))
+    session_dir.mkdir(parents=True, exist_ok=True)
+    schema_path = session_dir / f"{safe_id}.schema.json"
+    message_path = session_dir / f"{safe_id}.last_message.json"
+    log_path = session_dir / f"{safe_id}.jsonl"
+    schema_path.write_text(json.dumps(output_schema, indent=2, sort_keys=True), encoding="utf-8")
+    command = _command(
+        runtime,
+        cfg,
+        worktree_root.resolve(),
+        session_id,
+        output_schema=schema_path,
+        output_last_message=message_path,
+    )
+    started_at = _utc_now()
+    runtime_meta = {name: value for name, value in runtime.items() if name != "command_prefix"}
+    try:
+        with codex_write_lock(cfg, f"strategy-owner:{task_id}") as lock:
+            if not lock.get("acquired"):
+                return {"status": "implementation_paused", "reason": lock.get("reason"), **lock}
+            if process_started is None:
+                completed = subprocess.run(
+                    command,
+                    cwd=str(worktree_root),
+                    env=_child_environment(cfg, key),
+                    input=prompt,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    timeout=int(cfg.get("timeout_seconds", 1800)),
+                    check=False,
+                )
+            else:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(worktree_root),
+                    env=_child_environment(cfg, key),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                pathlib.Path(str(cfg["lock_path"])).write_text(
+                    json.dumps(
+                        {
+                            "owner": f"strategy-owner:{task_id}",
+                            "pid": process.pid,
+                            "host_pid": os.getpid(),
+                            "acquired_at": started_at,
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                process_started(process.pid)
+                try:
+                    stdout, stderr = process.communicate(
+                        input=prompt, timeout=int(cfg.get("timeout_seconds", 1800))
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    exc.stdout = stdout
+                    exc.stderr = stderr
+                    raise
+                completed = subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+        stdout = _scrub_secret_text(completed.stdout or "", key)
+        stderr = _scrub_secret_text(completed.stderr or "", key)
+        parsed = _parse_events(stdout)
+        _write_event_log(log_path, stdout)
+        decision: dict[str, Any] | None = None
+        parse_error = None
+        try:
+            decision_raw = message_path.read_text(encoding="utf-8")
+            candidate = json.loads(decision_raw)
+            decision = candidate if isinstance(candidate, dict) else None
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            parse_error = str(exc)
+        status = "completed" if completed.returncode == 0 and parsed["turn_completed"] and decision else "implementation_paused"
+        return {
+            "status": status,
+            "reason": None if status == "completed" else "structured_output_missing_or_turn_incomplete",
+            "started_at": started_at,
+            "finished_at": _utc_now(),
+            "returncode": completed.returncode,
+            "session_id": parsed.get("session_id") or session_id,
+            "resumed": bool(session_id),
+            "model": str(cfg["model"]),
+            "reasoning_effort": str(cfg["reasoning_effort"]),
+            "api_key_source": source_env,
+            "runtime": runtime_meta,
+            "event_log": str(log_path),
+            "last_message_artifact": str(message_path),
+            "event_summary": parsed,
+            "decision": decision,
+            "parse_error": parse_error,
+            "stderr_tail": stderr[-4000:],
+        }
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+        _write_event_log(log_path, _scrub_secret_text(stdout, key))
+        parsed = _parse_events(stdout)
+        return {
+            "status": "implementation_paused",
+            "reason": "codex_turn_timeout",
+            "started_at": started_at,
+            "finished_at": _utc_now(),
+            "session_id": parsed.get("session_id") or session_id,
+            "resumed": bool(session_id),
+            "model": str(cfg["model"]),
+            "reasoning_effort": str(cfg["reasoning_effort"]),
+            "runtime": runtime_meta,
+            "event_log": str(log_path),
+            "last_message_artifact": str(message_path),
+            "event_summary": parsed,
         }
     except OSError as exc:
         return {"status": "unavailable", "reason": "codex_process_start_failed", "error": str(exc), "runtime": runtime_meta}

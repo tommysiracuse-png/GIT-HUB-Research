@@ -218,6 +218,59 @@ class CodexRepoAgentTests(unittest.TestCase):
                     self.assertFalse(second["acquired"])
                     self.assertEqual("codex_writer_busy", second["reason"])
 
+    def test_structured_turn_uses_schema_and_last_message_artifact(self) -> None:
+        events = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "strategy-thread-1"}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10}}),
+            ]
+        )
+
+        def fake_run(command, **kwargs):
+            message_path = pathlib.Path(command[command.index("--output-last-message") + 1])
+            message_path.write_text(json.dumps({"decision": "completed"}), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout=events, stderr="")
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"decision": {"type": "string"}},
+            "required": ["decision"],
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            codex_repo_agent,
+            "ensure_codex_runtime",
+            return_value={"available": True, "command_prefix": ["codex-test"], "source": "test"},
+        ), mock.patch.object(codex_repo_agent.subprocess, "run", side_effect=fake_run) as run, mock.patch.dict(
+            os.environ, {"CODEX_API_KEY": "test-key"}, clear=True
+        ):
+            result = codex_repo_agent.run_structured_codex_turn(
+                task_id="strategy:one",
+                prompt="Analyze only",
+                output_schema=schema,
+                worktree_root=pathlib.Path(tmp),
+                settings=self._settings(tmp),
+                runs_dir=pathlib.Path(tmp),
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual({"decision": "completed"}, result["decision"])
+        command = run.call_args.args[0]
+        self.assertIn("--output-schema", command)
+        self.assertIn("--output-last-message", command)
+        self.assertEqual("utf-8", run.call_args.kwargs["encoding"])
+        self.assertEqual("replace", run.call_args.kwargs["errors"])
+
+    def test_dead_pid_writer_lock_is_reclaimed_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = codex_repo_agent.codex_repo_agent_config(self._settings(tmp), pathlib.Path(tmp))
+            lock_path = pathlib.Path(cfg["lock_path"])
+            lock_path.write_text(json.dumps({"owner": "dead", "pid": 99999999}), encoding="utf-8")
+            old = lock_path.stat().st_mtime - 10
+            os.utime(lock_path, (old, old))
+            with codex_repo_agent.codex_write_lock(cfg, "replacement") as lock:
+                self.assertTrue(lock["acquired"])
+
 
 if __name__ == "__main__":
     unittest.main()

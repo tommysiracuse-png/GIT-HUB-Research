@@ -15,16 +15,19 @@ import pathlib
 import sqlite3
 import sys
 import time
+import uuid
 from typing import Any
 
 from adapter_implementation_owner import run_once as run_adapter_implementation_owner
 from autonomous_builder import run_autonomous_builder
+from evolution_owner_scheduler import lane_order, record_turn, scheduler_summary
 from llm_bridge import STATE_JSON, ingest_llm_recommendations
 from llm_swarm_runner import run_once as run_llm_swarm_once
 from research_worker import run_once as run_research_worker_once
 from self_improvement import run_auto_improvement
 from settings import load_settings
 from storage import RUNS_DIR, connect, llm_cost_summary, llm_inbox_summary
+from strategy_implementation_owner import run_once as run_strategy_implementation_owner
 
 
 REPORT_JSON = RUNS_DIR / "evolution_worker_report.json"
@@ -97,6 +100,8 @@ def _write_report(report: dict) -> dict:
         f"- Inbox ingested: `{len(report.get('llm_recommendations_ingested') or [])}`",
         f"- Auto-improvement consumed: `{len((report.get('self_improvement') or {}).get('consumed') or [])}`",
         f"- Adapter owner status: `{(report.get('adapter_implementation_owner') or {}).get('status')}`",
+        f"- Strategy owner status: `{((report.get('strategy_implementation_owner') or {}).get('last_cycle') or {}).get('status')}`",
+        f"- Writer lane: `{(report.get('owner_scheduler') or {}).get('last_lane')}`",
         f"- Autonomous builder status: `{(report.get('autonomous_builder') or {}).get('status')}`",
     ]
     if report.get("reason"):
@@ -125,51 +130,92 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         )
 
     worker_settings = _worker_settings(settings)
+    cycle_id = str(uuid.uuid4())
     # Existing executable work gets the first claim on model budget. Research
     # and new recommendations are generated afterward for the next cycle.
     ingested, ingest_error = _run_db_stage("ingest_llm_recommendations", lambda conn: ingest_llm_recommendations(conn, settings))
     ingested = ingested or []
-    adapter_owner, adapter_error = _run_db_stage(
-        "adapter_implementation_owner",
-        lambda conn: run_adapter_implementation_owner(conn, worker_settings),
-    )
-    adapter_owner = adapter_owner or {"status": "database_busy_retry_later"}
-    adapter_code_attempted = str(adapter_owner.get("status") or "") not in {
-        "disabled",
-        "not_due",
-        "no_eligible_adapter_spec",
-        "database_busy_retry_later",
-    }
-    self_improvement, improvement_error = _run_db_stage(
-        "self_improvement",
-        lambda conn: run_auto_improvement(
-            conn,
-            worker_settings,
-            include_code_changes=not adapter_code_attempted,
+    strategy_owner, strategy_error = _run_db_stage(
+        "strategy_implementation_owner_sync",
+        lambda conn: run_strategy_implementation_owner(
+            conn, worker_settings, execute_turn=False, cycle_id=cycle_id,
+            scheduler=scheduler_summary(conn),
         ),
     )
-    self_improvement = self_improvement or {"status": "database_busy_retry_later", "consumed": []}
-
-    code_attempted = any(
-        str(item.get("task_type") or "") == "code_change"
-        for item in (self_improvement.get("consumed") or [])
-        if isinstance(item, dict)
-    ) or adapter_code_attempted
-    defer_generic = bool(
-        settings.get("evolution_worker", {}).get("defer_generic_builder_when_targeted_code_attempted", True)
-    )
-    if code_attempted and defer_generic and not force_builder:
-        autonomous_builder = {
-            "status": "deferred_for_targeted_code_attempt",
-            "reason": "A concrete recommendation or adapter implementation already used this cycle's code budget.",
-        }
-        builder_error = None
+    strategy_owner = strategy_owner or {"status": "database_busy_retry_later", "last_cycle": {}}
+    order_state, scheduler_error = _run_db_stage("owner_scheduler", lambda conn: lane_order(conn))
+    if order_state:
+        lanes, _initial_scheduler = order_state
     else:
-        autonomous_builder, builder_error = _run_db_stage(
-            "autonomous_builder",
-            lambda conn: run_autonomous_builder(settings=settings, conn=conn, force=force_builder),
-        )
-        autonomous_builder = autonomous_builder or {"status": "database_busy_retry_later"}
+        lanes, _initial_scheduler = ["strategy", "adapter", "general"], {}
+
+    adapter_owner = {"status": "deferred_by_scheduler"}
+    self_improvement = {"status": "deferred_by_scheduler", "consumed": []}
+    autonomous_builder = {"status": "deferred_by_scheduler"}
+    adapter_error = improvement_error = builder_error = None
+    selected_lane = None
+    lane_status = "no_lane_consumed"
+    for lane in lanes:
+        consumed_writer = False
+        if lane == "strategy":
+            strategy_owner, strategy_error = _run_db_stage(
+                "strategy_implementation_owner",
+                lambda conn: run_strategy_implementation_owner(
+                    conn, worker_settings, execute_turn=True, cycle_id=cycle_id,
+                    scheduler=scheduler_summary(conn),
+                ),
+            )
+            strategy_owner = strategy_owner or {"status": "database_busy_retry_later", "last_cycle": {}}
+            lane_status = str((strategy_owner.get("last_cycle") or {}).get("status") or strategy_owner.get("status") or "unknown")
+            consumed_writer = lane_status not in {"disabled", "monitor_only", "no_eligible_strategy_task", "database_busy_retry_later"}
+        elif lane == "adapter":
+            adapter_owner, adapter_error = _run_db_stage(
+                "adapter_implementation_owner",
+                lambda conn: run_adapter_implementation_owner(conn, worker_settings),
+            )
+            adapter_owner = adapter_owner or {"status": "database_busy_retry_later"}
+            lane_status = str(adapter_owner.get("status") or "unknown")
+            consumed_writer = lane_status not in {"disabled", "not_due", "no_eligible_adapter_spec", "database_busy_retry_later"}
+        else:
+            self_improvement, improvement_error = _run_db_stage(
+                "self_improvement",
+                lambda conn: run_auto_improvement(conn, worker_settings, include_code_changes=True),
+            )
+            self_improvement = self_improvement or {"status": "database_busy_retry_later", "consumed": []}
+            code_attempted = any(
+                str(item.get("task_type") or "") == "code_change"
+                for item in (self_improvement.get("consumed") or []) if isinstance(item, dict)
+            )
+            if code_attempted and not force_builder:
+                autonomous_builder = {"status": "deferred_for_targeted_code_attempt"}
+                lane_status = "targeted_code_attempt"
+                consumed_writer = True
+            else:
+                autonomous_builder, builder_error = _run_db_stage(
+                    "autonomous_builder",
+                    lambda conn: run_autonomous_builder(settings=settings, conn=conn, force=force_builder),
+                )
+                autonomous_builder = autonomous_builder or {"status": "database_busy_retry_later"}
+                lane_status = str(autonomous_builder.get("status") or "unknown")
+                consumed_writer = lane_status not in {
+                    "disabled", "not_due", "no_action", "no_actionable_plan", "database_busy_retry_later",
+                }
+        if consumed_writer:
+            selected_lane = lane
+            _turn, turn_error = _run_db_stage(
+                "owner_scheduler_record",
+                lambda conn, chosen=lane, status=lane_status: record_turn(
+                    conn, chosen, cycle_id=cycle_id, status=status, consumed_writer=True,
+                ),
+            )
+            scheduler_error = scheduler_error or turn_error
+            break
+
+    owner_scheduler, scheduler_summary_error = _run_db_stage("owner_scheduler_summary", scheduler_summary)
+    scheduler_error = scheduler_error or scheduler_summary_error
+    owner_scheduler = owner_scheduler or {"next_lane": lanes[0] if lanes else "strategy"}
+    owner_scheduler["selected_lane"] = selected_lane
+    owner_scheduler["cycle_lane_status"] = lane_status
 
     research_worker_report = {}
     research_error = None
@@ -196,9 +242,11 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         error
         for error in (
             ingest_error,
+            strategy_error,
             improvement_error,
             adapter_error,
             builder_error,
+            scheduler_error,
             research_error,
             new_ingest_error,
             cost_error,
@@ -215,8 +263,10 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         "llm_swarm_generated": llm_swarm_generated,
         "llm_recommendations_ingested": ingested,
         "self_improvement": self_improvement,
+        "strategy_implementation_owner": strategy_owner,
         "adapter_implementation_owner": adapter_owner,
         "autonomous_builder": autonomous_builder,
+        "owner_scheduler": owner_scheduler,
         "llm_inbox": inbox_summary or {},
         "llm_cost_summary": cost_summary or {},
         "database_errors": database_errors,

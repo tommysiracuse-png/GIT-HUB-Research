@@ -162,6 +162,55 @@ class CodeEvolutionCodexAgentTests(unittest.TestCase):
             self.assertFalse((app / "src" / "guessed_and_missing.py").exists())
             self.assertEqual(1, run.call_count)
 
+    def test_strategy_owner_prepared_worktree_and_session_are_promoted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, app = self._repo(tmp)
+            owner_worktree = pathlib.Path(tmp) / "owner-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "-b", "strategy-owner/test", str(owner_worktree), "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            owner_app = owner_worktree / "agentic_trading_swarm_mvp"
+            parent = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=owner_worktree, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            conn = sqlite3.connect(pathlib.Path(tmp) / "radar.sqlite")
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            old_runs, old_ledger = code_evolution.RUNS_DIR, code_evolution.LEDGER_JSONL
+            code_evolution.RUNS_DIR = pathlib.Path(tmp) / "runs"
+            code_evolution.LEDGER_JSONL = code_evolution.RUNS_DIR / "evolution_ledger.jsonl"
+            rec = self._proposal("rec-strategy-owner")
+            rec["payload"]["strategy_owner_codex_session_id"] = "owner-thread"
+            rec["payload"]["strategy_owner_release"] = {
+                "parent_commit": parent,
+                "branch_name": "strategy-owner/test",
+                "worktree_path": str(owner_worktree),
+                "app_worktree_path": str(owner_app),
+                "status": "implementing",
+            }
+
+            def agent(**kwargs):
+                self.assertEqual(owner_app, pathlib.Path(kwargs["worktree_root"]))
+                self.assertEqual("owner-thread", kwargs["session_id"])
+                return self._completed_agent(owner_app, session="owner-thread")
+
+            try:
+                with mock.patch.object(code_evolution, "run_codex_repo_agent", side_effect=agent):
+                    created = code_evolution.process_code_change_recommendation(
+                        conn, rec, self._settings(tmp), root=app
+                    )
+            finally:
+                code_evolution.RUNS_DIR, code_evolution.LEDGER_JSONL = old_runs, old_ledger
+                conn.close()
+
+            self.assertEqual("promoted", created[0]["status"])
+            self.assertTrue((app / "src" / "actual_runtime.py").exists())
+            self.assertFalse(owner_worktree.exists())
+
     def test_supplied_unified_diff_is_only_a_codex_hint_when_agent_enabled(self) -> None:
         legacy_diff = """diff --git a/src/existing.py b/src/existing.py
 --- a/src/existing.py

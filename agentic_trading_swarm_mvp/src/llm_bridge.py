@@ -35,6 +35,7 @@ from self_improvement_open_pack import is_duplicate_open_pack_text
 from recommendation_registry import registry_summary
 from strategy_lab import strategy_lab_summary
 from dynamic_agents import dynamic_agent_summary, ingest_spawn_agent_recommendation
+from strategy_implementation_owner import summary as strategy_owner_summary
 
 
 _strategy_lab_summary_original = strategy_lab_summary
@@ -1261,6 +1262,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "strategy_reliability": _compact_strategy_reliability(payload.get("strategy_reliability", {})),
         "yahoo_counterfactual": payload.get("yahoo_counterfactual", {}),
         "strategy_lab": payload.get("strategy_lab") or strategy_lab_summary(conn),
+        "strategy_implementation_owner": strategy_owner_summary(conn, limit=40),
         "dynamic_agents": dynamic_agent_summary(conn),
         "market_admission_bridge": payload.get("market_admission_bridge", {}),
         "autonomous_builder": payload.get("autonomous_builder", {}),
