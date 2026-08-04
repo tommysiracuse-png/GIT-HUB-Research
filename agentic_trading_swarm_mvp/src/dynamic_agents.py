@@ -26,6 +26,124 @@ VALID_NAMESPACES = {
     "recommendations", "system",
 }
 
+BOOTSTRAP_AGENT_SPECS = [
+    {
+        "name": "global_market_expansion_specialist",
+        "objective": (
+            "Continuously turn global market discoveries and stalled admission stages into "
+            "new priceable markets, complete public adapters, and paper-testable market surfaces."
+        ),
+        "parent_agent_id": "market_scout",
+        "triggers": {
+            "any_packet_paths": ["expansion_map", "frontier_crypto_venues"],
+            "cooldown_minutes": 180,
+        },
+        "evidence_inputs": [
+            "expansion_map", "frontier_crypto_venues", "improvement_tasks",
+            "growth_experiments", "route_intelligence",
+        ],
+        "memory_policy": {
+            "namespaces": ["markets", "routes", "recommendations", "outcomes"],
+            "keywords": ["global discovery", "market admission", "adapter", "new venue"],
+            "retrieval_limit": 36,
+        },
+        "model_tier": "standard",
+        "allowed_actions": [
+            "request_market_adapter", "propose_growth_experiment", "propose_code_change", "spawn_agent",
+        ],
+        "success_measure": {
+            "primary": "new_markets_reaching_paper_eligible",
+            "supporting": ["verified_market_coverage", "adapter_promotions", "reliable_outcomes"],
+        },
+        "metadata": {"bootstrap_seed": True, "bootstrap_key": "global_market_expansion", "version": 1},
+    },
+    {
+        "name": "novel_strategy_discovery_specialist",
+        "objective": (
+            "Invent reusable observation-native trading hypotheses, diagnose why experiments produce no candidates, "
+            "and advance genuinely novel Strategy Lab programs toward reliable paper evidence."
+        ),
+        "parent_agent_id": "strategy_lab",
+        "triggers": {
+            "any_packet_paths": ["strategy_lab", "horizon_outcomes"],
+            "cooldown_minutes": 120,
+        },
+        "evidence_inputs": [
+            "strategy_lab", "horizon_outcomes", "contextual_stats", "market_discovery",
+            "signal_redesign", "current_cycle_agent_outputs",
+        ],
+        "memory_policy": {
+            "namespaces": ["strategies", "outcomes", "markets", "recommendations"],
+            "keywords": ["strategy lab", "observation program", "promotion", "reliable outcome"],
+            "retrieval_limit": 40,
+        },
+        "model_tier": "standard",
+        "allowed_actions": [
+            "propose_strategy_lab_experiment", "propose_diagnostic_hypothesis", "propose_code_change", "spawn_agent",
+        ],
+        "success_measure": {
+            "primary": "novel_strategies_with_reliable_labels",
+            "supporting": ["paper_candidates_generated", "promoted_strategy_plugins", "positive_paired_uplift"],
+        },
+        "metadata": {"bootstrap_seed": True, "bootstrap_key": "novel_strategy_discovery", "version": 1},
+    },
+    {
+        "name": "code_evolution_reliability_specialist",
+        "objective": (
+            "Diagnose recurring autonomous coding failures, improve useful promotion throughput, and propose "
+            "repository-integrated repairs without weakening paper-only safety or auditability."
+        ),
+        "parent_agent_id": "build_planner",
+        "triggers": {"any_packet_paths": ["code_evolution"], "cooldown_minutes": 60},
+        "evidence_inputs": [
+            "code_evolution", "self_improvement", "repository_grounding",
+            "improvement_tasks", "current_cycle_critiques",
+        ],
+        "memory_policy": {
+            "namespaces": ["code", "recommendations", "outcomes", "system"],
+            "keywords": ["code evolution", "implementation paused", "test failure", "promotion"],
+            "retrieval_limit": 32,
+        },
+        "model_tier": "fast",
+        "allowed_actions": ["propose_code_change", "propose_diagnostic_hypothesis", "spawn_agent"],
+        "success_measure": {
+            "primary": "useful_merge_rate",
+            "supporting": ["repair_success_rate", "cost_per_kept_change", "post_promotion_health"],
+        },
+        "metadata": {"bootstrap_seed": True, "bootstrap_key": "code_evolution_reliability", "version": 1},
+    },
+    {
+        "name": "market_data_quality_specialist",
+        "objective": (
+            "Continuously identify weak, stale, malformed, or under-enriched public market data and turn "
+            "repeated quality failures into adapter, parser, and admission-stage repairs."
+        ),
+        "parent_agent_id": "cross_market_researcher",
+        "triggers": {
+            "any_packet_paths": ["frontier_crypto_venues", "expansion_map"],
+            "cooldown_minutes": 120,
+        },
+        "evidence_inputs": [
+            "frontier_crypto_venues", "crypto_venue_health", "expansion_map",
+            "contextual_stats", "improvement_tasks",
+        ],
+        "memory_policy": {
+            "namespaces": ["markets", "outcomes", "system", "recommendations"],
+            "keywords": ["data quality", "depth parser", "stale", "degraded", "normalization"],
+            "retrieval_limit": 36,
+        },
+        "model_tier": "fast",
+        "allowed_actions": [
+            "request_market_adapter", "propose_diagnostic_hypothesis", "propose_code_change", "spawn_agent",
+        ],
+        "success_measure": {
+            "primary": "verified_quality_coverage",
+            "supporting": ["parser_recovery_rate", "new_depth_snapshots", "admission_stage_advances"],
+        },
+        "metadata": {"bootstrap_seed": True, "bootstrap_key": "market_data_quality", "version": 1},
+    },
+]
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
@@ -276,6 +394,53 @@ def ingest_spawn_agent_recommendation(conn: sqlite3.Connection, item: dict, *, r
     return register_agent_spec(conn, spec, source_recommendation_id=recommendation_id, source_agent=source_agent)
 
 
+def bootstrap_seed_agents(conn: sqlite3.Connection, settings: dict) -> dict:
+    """Register the first specialist generation through the normal persistent-agent contract."""
+
+    cfg = settings.get("dynamic_agents", {})
+    if not cfg.get("bootstrap_seed_agents", False):
+        return {"status": "disabled", "configured": 0, "created": 0, "existing": 0, "superseded": 0}
+    configured = cfg.get("bootstrap_agent_specs")
+    raw_specs = configured if isinstance(configured, list) and configured else BOOTSTRAP_AGENT_SPECS
+    result = {"status": "ok", "configured": len(raw_specs), "created": 0, "existing": 0, "superseded": 0, "agent_ids": []}
+    ensure_dynamic_agent_schema(conn)
+    for raw in raw_specs:
+        if not isinstance(raw, dict):
+            continue
+        spec = normalize_agent_spec(raw, source_agent=str(raw.get("parent_agent_id") or "build_planner"))
+        current = conn.execute(
+            "select agent_id from agent_specs where canonical_hash=?",
+            (spec["canonical_hash"],),
+        ).fetchone()
+        if current:
+            result["existing"] += 1
+            result["agent_ids"].append(str(current["agent_id"]))
+            continue
+        bootstrap_key = str((spec.get("metadata") or {}).get("bootstrap_key") or "")
+        if bootstrap_key:
+            for row in conn.execute(
+                "select agent_id, metadata_json from agent_specs where name=? and status='active'",
+                (spec["name"],),
+            ).fetchall():
+                metadata = _decode(row["metadata_json"], {})
+                if metadata.get("bootstrap_seed") and str(metadata.get("bootstrap_key") or "") == bootstrap_key:
+                    conn.execute(
+                        "update agent_specs set status='superseded', updated_at=? where agent_id=?",
+                        (utc_now(), row["agent_id"]),
+                    )
+                    result["superseded"] += 1
+        registered = register_agent_spec(
+            conn,
+            raw,
+            source_recommendation_id=f"bootstrap_agent:{bootstrap_key or spec['canonical_hash']}",
+            source_agent=spec["parent_agent_id"],
+        )
+        result["created"] += int(registered.get("status") == "created")
+        result["agent_ids"].append(str(registered["agent_id"]))
+    conn.commit()
+    return result
+
+
 def _row_to_spec(row: sqlite3.Row | dict) -> dict:
     item = dict(row)
     for source, target, default in (
@@ -389,6 +554,7 @@ def prepare_dynamic_agent_cycle(conn: sqlite3.Connection, packet: dict, settings
     ensure_dynamic_agent_schema(conn)
     if not settings.get("dynamic_agents", {}).get("enabled", True):
         return {"status": "disabled", "matched_agents": [], "evaluated": [], "concurrency": {"configured": 0, "effective": 0}}
+    bootstrap = bootstrap_seed_agents(conn, settings)
     rows = conn.execute("select * from agent_specs where status='active' order by generation, created_at").fetchall()
     matched, evaluated = [], []
     now = utc_now()
@@ -410,7 +576,7 @@ def prepare_dynamic_agent_cycle(conn: sqlite3.Connection, packet: dict, settings
     return {
         "status": "ready", "matched_agents": matched, "evaluated": evaluated,
         "active_count": len(rows), "matched_count": len(matched), "dormant_count": len(rows) - len(matched),
-        "concurrency": adaptive_concurrency(conn, settings),
+        "concurrency": adaptive_concurrency(conn, settings), "bootstrap": bootstrap,
     }
 
 

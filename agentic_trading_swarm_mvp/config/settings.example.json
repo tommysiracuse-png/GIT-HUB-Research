@@ -341,6 +341,7 @@
   },
   "dynamic_agents": {
     "enabled": true,
+    "bootstrap_seed_agents": true,
     "adaptive_concurrency": 8,
     "minimum_concurrency": 1,
     "latency_backoff_seconds": 120,

@@ -343,6 +343,7 @@ DEFAULT_SETTINGS = {
     },
     "dynamic_agents": {
         "enabled": True,
+        "bootstrap_seed_agents": True,
         "adaptive_concurrency": 8,
         "minimum_concurrency": 1,
         "latency_backoff_seconds": 120,

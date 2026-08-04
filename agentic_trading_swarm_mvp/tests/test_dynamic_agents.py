@@ -68,6 +68,56 @@ class DynamicAgentPersistenceTests(unittest.TestCase):
         parents = {row[0] for row in self.conn.execute("select parent_agent_id from agent_lineage")}
         self.assertEqual(parents, {"market_scout", "agent_parent_2"})
 
+    def test_bootstrap_creates_first_generation_once_through_normal_registry(self):
+        settings = {"dynamic_agents": {"enabled": True, "bootstrap_seed_agents": True}}
+
+        first = dynamic_agents.bootstrap_seed_agents(self.conn, settings)
+        second = dynamic_agents.bootstrap_seed_agents(self.conn, settings)
+
+        self.assertEqual(first["created"], 4)
+        self.assertEqual(second["created"], 0)
+        self.assertEqual(second["existing"], 4)
+        self.assertEqual(self.conn.execute("select count(*) from agent_specs").fetchone()[0], 4)
+        self.assertEqual(self.conn.execute("select coalesce(sum(merged_count),0) from agent_specs").fetchone()[0], 0)
+        parents = {row[0] for row in self.conn.execute("select parent_agent_id from agent_lineage")}
+        self.assertEqual(
+            parents,
+            {"market_scout", "strategy_lab", "build_planner", "cross_market_researcher"},
+        )
+
+    def test_bootstrap_agents_trigger_on_relevant_live_packet_surfaces(self):
+        cycle = dynamic_agents.prepare_dynamic_agent_cycle(
+            self.conn,
+            {
+                "expansion_map": {"markets": 2},
+                "frontier_crypto_venues": {"observations": 10},
+                "strategy_lab": {"active": 3},
+                "horizon_outcomes": [{"horizon": "60m"}],
+                "code_evolution": {"implementation_paused": 1},
+            },
+            {"dynamic_agents": {"enabled": True, "bootstrap_seed_agents": True}},
+            "swarm:bootstrap",
+        )
+
+        self.assertEqual(cycle["bootstrap"]["created"], 4)
+        self.assertEqual(cycle["active_count"], 4)
+        self.assertEqual(cycle["matched_count"], 4)
+        self.assertEqual({item["display_name"] for item in cycle["matched_agents"]}, {
+            "global_market_expansion_specialist",
+            "novel_strategy_discovery_specialist",
+            "code_evolution_reliability_specialist",
+            "market_data_quality_specialist",
+        })
+
+    def test_bootstrap_can_be_disabled(self):
+        report = dynamic_agents.bootstrap_seed_agents(
+            self.conn,
+            {"dynamic_agents": {"bootstrap_seed_agents": False}},
+        )
+
+        self.assertEqual(report["status"], "disabled")
+        self.assertEqual(self.conn.execute("select count(*) from agent_specs").fetchone()[0], 0)
+
     def test_child_generation_and_next_cycle_activation(self):
         parent = dynamic_agents.register_agent_spec(
             self.conn,
