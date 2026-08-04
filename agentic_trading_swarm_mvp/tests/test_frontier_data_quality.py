@@ -217,6 +217,8 @@ class QualityMathTests(unittest.TestCase):
                 received_at=dt.datetime.now(dt.timezone.utc).isoformat(),
             )
         )
+        row["venue_health_score"] = 90.0
+        row["venue_health"] = {"venue_quality_score": 90.0}
 
         candidate = frontier._candidate_from_observation(row, cfg, 99.0, 4)
 
@@ -251,6 +253,8 @@ class QualityMathTests(unittest.TestCase):
             {
                 "quality_status": "degraded",
                 "quality_score": 50.0,
+                "venue_health_score": 90.0,
+                "venue_health": {"venue_quality_score": 90.0},
                 "freshness_age_seconds": 5.0,
                 "simulated_fills": {
                     "buy": {"1000": {"filled": True, "slippage_bps": 2.0}},
@@ -294,6 +298,32 @@ class QualityPersistenceTests(unittest.TestCase):
         self.assertEqual(result["snapshot_rows_deleted"], 1)
         self.assertEqual(leaderboard[0]["venue"], "GATE")
         self.assertGreater(leaderboard[0]["venue_quality_score"], 0)
+
+    def test_unstable_venue_spreads_stay_below_paper_health_floor(self) -> None:
+        conn = memory_conn()
+        cfg = settings()
+        rows = []
+        for index, spread in enumerate((1.0, 20.0)):
+            row = observation()
+            row["instrument_id"] = f"GATE:SPREAD{index}_USDT"
+            row.update(
+                quality.analyze_book(
+                    row,
+                    healthy_book(),
+                    latency_ms=20.0,
+                    received_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                )
+            )
+            row["spread_bps"] = spread
+            rows.append(row)
+
+        quality.persist_quality_snapshots(conn, rows, cfg)
+        venue_health = quality.venue_quality_scores(conn)[0]
+        quality.annotate_venue_quality_scores(rows, [venue_health])
+
+        self.assertLess(venue_health["spread_stability_score"], 0.5)
+        self.assertLess(venue_health["venue_quality_score"], 60.0)
+        self.assertEqual(venue_health["venue_quality_score"], rows[0]["venue_health_score"])
 
     def test_market_testing_progress_counts_recent_depth_snapshots(self) -> None:
         conn = memory_conn()

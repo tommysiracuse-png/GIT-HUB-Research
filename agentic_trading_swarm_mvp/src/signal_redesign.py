@@ -17,6 +17,7 @@ from frontier_crypto_adapter import (
     write_outputs as write_frontier_outputs,
 )
 from frontier_data_quality import (
+    annotate_venue_quality_scores,
     enrich_observations,
     market_testing_progress,
     persist_quality_snapshots,
@@ -1683,6 +1684,9 @@ def run_frontier_redesign(
         settings,
         load_venue_registry(),
     )
+    snapshot_summary = persist_quality_snapshots(conn, enriched_observations, settings)
+    venue_quality_leaderboard = venue_quality_scores(conn)
+    annotate_venue_quality_scores(enriched_observations, venue_quality_leaderboard)
     # Keep the caller-owned selected observation list synchronized so the
     # Strategy Lab snapshot path receives the same depth-quality evidence used
     # by the paper-only frontier variants.
@@ -1697,7 +1701,6 @@ def run_frontier_redesign(
         for variant in variants
         if variant["status"] in {"active", "shadow", "retired"}
     }
-    snapshot_summary = persist_quality_snapshots(conn, enriched_observations, settings)
     trial_activity = record_variant_trials(
         conn,
         variants,
@@ -1712,7 +1715,7 @@ def run_frontier_redesign(
     quality_summary = {
         **enrichment_summary,
         **snapshot_summary,
-        "venue_quality_leaderboard": venue_quality_scores(conn),
+        "venue_quality_leaderboard": venue_quality_leaderboard,
         "quality_outcome_relationship_60m": quality_outcome_relationship(conn),
         "market_testing_progress": market_testing_progress(conn),
     }

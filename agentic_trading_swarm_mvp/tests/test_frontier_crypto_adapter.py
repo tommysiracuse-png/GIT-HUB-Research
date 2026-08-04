@@ -278,6 +278,8 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             {
                 "quality_status": "verified",
                 "quality_score": 90.0,
+                "venue_health_score": 90.0,
+                "venue_health": {"venue_quality_score": 90.0},
                 "verified_depth_snapshot_count": 1,
                 "simulated_fills": {
                     "buy": {"1000": {"filled": True, "slippage_bps": 1.0}},
@@ -687,6 +689,47 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             candidate["marketability_gate"]["failed_checks"],
         )
 
+    def test_marketability_gate_requires_healthy_venue_telemetry(self) -> None:
+        cfg = settings()
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
+        unhealthy = self._quality_obs("UNHEALTHY", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        unhealthy["venue_health_score"] = 59.0
+        unhealthy["venue_health"]["venue_quality_score"] = 59.0
+
+        candidate = frontier._candidate_from_observation(
+            unhealthy,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[unhealthy, peer],
+        )
+
+        check = candidate["marketability_gate"]["checks"]["venue_health_score"]
+        self.assertFalse(check["passed"])
+        self.assertTrue(check["telemetry_present"])
+        self.assertEqual("marketability_venue_health_score", candidate["candidate_reject_reason"])
+        self.assertTrue(candidate["paper_entry_blocked"])
+
+    def test_marketability_gate_fails_closed_when_venue_telemetry_is_missing(self) -> None:
+        cfg = settings()
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
+        local = self._quality_obs("NO_HEALTH", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        local.pop("venue_health_score")
+        local.pop("venue_health")
+
+        candidate = frontier._candidate_from_observation(
+            local,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[local, peer],
+        )
+
+        check = candidate["marketability_gate"]["checks"]["venue_health_score"]
+        self.assertFalse(check["telemetry_present"])
+        self.assertEqual("watch_only", candidate["direction"])
+        self.assertTrue(candidate["paper_entry_blocked"])
+
     def _obs(
         self,
         venue: str,
@@ -756,6 +799,13 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             {
                 "quality_status": "verified",
                 "quality_score": quality_score,
+                "venue_health_score": quality_score,
+                "venue_health": {
+                    "venue": venue,
+                    "venue_quality_score": quality_score,
+                    "snapshot_count": 4,
+                    "spread_stability_score": 1.0,
+                },
                 "usd_normalized_last": last if quote in {"USD", "USDT", "USDC"} else None,
                 "comparison_price": last if quote in {"USD", "USDT", "USDC"} else row.get("comparison_price"),
                 "quote_normalization_status": "usd_like" if quote in {"USD", "USDT", "USDC"} else row.get("quote_normalization_status"),

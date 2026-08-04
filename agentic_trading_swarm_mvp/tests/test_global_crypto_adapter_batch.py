@@ -324,6 +324,8 @@ class DerivativesAdapterTests(unittest.TestCase):
             "verified_depth_snapshot_count": 3,
             "quality_status": "verified",
             "quality_score": 80.0,
+            "venue_health_score": 80.0,
+            "venue_health": {"venue_quality_score": 80.0},
             "freshness_age_seconds": 1.0,
             "anomaly_flags": [],
             "critical_anomaly_flags": [],

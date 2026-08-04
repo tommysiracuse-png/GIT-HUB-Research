@@ -173,6 +173,7 @@ DEFAULT_SETTINGS = {
             "max_cross_venue_deviation_bps": 250.0,
             "min_reference_venues": 1,
             "min_route_confidence": 0.70,
+            "min_venue_health_score": 60.0,
             "known_paper_route_statuses": ["standard"],
         },
     },

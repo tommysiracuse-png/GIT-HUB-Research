@@ -4570,7 +4570,7 @@ def venue_quality_scores(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """
         select venue, quality_status, quality_score, latency_ms,
-               freshness_age_seconds, anomaly_json
+               freshness_age_seconds, spread_bps, anomaly_json
         from frontier_quality_snapshots
         where observed_at >= ?
         """,
@@ -4606,13 +4606,35 @@ def venue_quality_scores(conn: sqlite3.Connection) -> list[dict]:
         else:
             median_latency = None
             latency_stability = 0.0
+        spreads = [
+            float(item["spread_bps"])
+            for item in items
+            if item["spread_bps"] is not None and float(item["spread_bps"]) >= 0.0
+        ]
+        if spreads:
+            median_spread = statistics.median(spreads)
+            spread_dispersion = statistics.pstdev(spreads) if len(spreads) > 1 else 0.0
+            spread_stability = max(
+                0.0,
+                1.0 - spread_dispersion / max(median_spread, 1.0),
+            )
+            spread_sanity = max(0.0, 1.0 - median_spread / 20.0)
+            spread_health = (spread_stability + spread_sanity) / 2.0
+        else:
+            median_spread = None
+            spread_dispersion = None
+            spread_stability = 0.0
+            spread_health = 0.0
         score = (
-            reachable * 30.0
-            + freshness * 25.0
+            reachable * 25.0
+            + freshness * 20.0
             + median_quality * 20.0
-            + anomaly_free * 15.0
+            + anomaly_free * 10.0
             + latency_stability * 10.0
+            + spread_health * 15.0
         )
+        if len(spreads) > 1 and spread_stability < 0.5:
+            score = min(score, 59.0)
         output.append(
             {
                 "venue": venue,
@@ -4624,10 +4646,36 @@ def venue_quality_scores(conn: sqlite3.Connection) -> list[dict]:
                 "anomaly_free_rate": round(anomaly_free, 3),
                 "median_latency_ms": round(median_latency, 3) if median_latency is not None else None,
                 "latency_stability": round(latency_stability, 3),
+                "median_spread_bps": round(median_spread, 3) if median_spread is not None else None,
+                "spread_dispersion_bps": (
+                    round(spread_dispersion, 3) if spread_dispersion is not None else None
+                ),
+                "spread_stability_score": round(spread_stability, 3),
+                "spread_health_score": round(spread_health, 3),
             }
         )
     output.sort(key=lambda item: item["venue_quality_score"], reverse=True)
     return output
+
+
+def annotate_venue_quality_scores(
+    observations: list[dict],
+    leaderboard: list[dict],
+) -> list[dict]:
+    """Attach rolling venue-health telemetry to frontier observations."""
+
+    by_venue = {
+        str(item.get("venue") or "").upper(): item
+        for item in leaderboard
+        if item.get("venue")
+    }
+    for observation in observations:
+        health = by_venue.get(str(observation.get("venue") or "").upper())
+        observation["venue_health"] = dict(health) if health else None
+        observation["venue_health_score"] = (
+            health.get("venue_quality_score") if health else None
+        )
+    return observations
 
 
 def market_testing_progress(conn: sqlite3.Connection) -> dict:

@@ -6910,6 +6910,7 @@ DEFAULT_FRONTIER_MARKETABILITY_GATES = {
     "max_cross_venue_deviation_bps": 250.0,
     "min_reference_venues": 1,
     "min_route_confidence": 0.70,
+    "min_venue_health_score": 60.0,
     "known_paper_route_statuses": ["standard"],
 }
 STABLE_OR_FIAT_BASES = {
@@ -9488,6 +9489,7 @@ def frontier_marketability_gate_review(
     max_reference_deviation = float(policy["max_cross_venue_deviation_bps"])
     min_reference_venues = int(policy["min_reference_venues"])
     min_route_confidence = float(policy["min_route_confidence"])
+    min_venue_health_score = float(policy["min_venue_health_score"])
 
     age = as_float(observation.get("freshness_age_seconds"), None)
     spread = _effective_spread_bps(observation)
@@ -9518,6 +9520,7 @@ def frontier_marketability_gate_review(
     if route_confidence is None:
         route_confidence = 1.0 if candidate.get("route_id") and route_status == "standard" else 0.0
     route_passed = bool(known_paper_route or route_confidence >= min_route_confidence)
+    venue_health_score = as_float(observation.get("venue_health_score"), None)
 
     checks = {
         "book_freshness": {
@@ -9560,6 +9563,16 @@ def frontier_marketability_gate_review(
             "observed_confidence": round(route_confidence, 6),
             "minimum_confidence": min_route_confidence,
         },
+        "venue_health_score": {
+            "passed": bool(
+                venue_health_score is not None
+                and venue_health_score >= min_venue_health_score
+            ),
+            "observed_score": venue_health_score,
+            "minimum_score": min_venue_health_score,
+            "telemetry_present": venue_health_score is not None,
+            "health": observation.get("venue_health"),
+        },
     }
     failed = [name for name, check in checks.items() if not check["passed"]]
     return {
@@ -9592,6 +9605,7 @@ def _apply_frontier_marketability_gate(
         review.get("applicable")
         and not review.get("passed")
         and candidate.get("direction") != "watch_only"
+        and not candidate.get("paper_entry_blocked")
     ):
         failed = list(review.get("failed_checks") or [])
         candidate["direction"] = "watch_only"
@@ -9823,6 +9837,8 @@ def _candidate_from_observation(
         "candidate_reject_reason": reject_reason,
         "quality_status": quality_status,
         "quality_score": quality_score,
+        "venue_health_score": observation.get("venue_health_score"),
+        "venue_health": observation.get("venue_health"),
         "quality_components": observation.get("quality_components") or {},
         "quality_action": quality_action,
         "quality_allocation_multiplier": quality_allocation_multiplier,
