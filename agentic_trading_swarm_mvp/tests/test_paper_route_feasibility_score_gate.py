@@ -132,6 +132,24 @@ class PaperRouteFeasibilityScoreGateTests(unittest.TestCase):
         self.assertTrue(venue_api["applies"])
         self.assertFalse(unrelated["applies"])
 
+    def test_nested_route_requirements_mark_and_scope_venue_prerequisite(self) -> None:
+        review = paper_route_feasibility_gate_review(
+            {
+                "route_status": "conditional",
+                "trade_type": "venue_specific_event",
+                "route_feasibility_score": 0.4,
+                "route_requirements": {
+                    "route_sensitivity_reasons": ["venue_api_or_margin_prerequisite"],
+                    "missing_prerequisites": ["venue_api_access"],
+                },
+            }
+        )
+
+        self.assertTrue(review["route_sensitive"])
+        self.assertIn("venue_api_or_margin_prerequisite", review["scope_reasons"])
+        self.assertTrue(review["applies"])
+        self.assertFalse(review["eligible"])
+
     def test_resolver_marks_and_scores_conditional_short_spot_route(self) -> None:
         enriched = enrich_candidate_with_route(
             {
@@ -178,6 +196,30 @@ class PaperRouteFeasibilityScoreGateTests(unittest.TestCase):
         self.assertEqual("shadow_filtered", result["order"]["status"])
         row = conn.execute("select status from execution_orders").fetchone()
         self.assertEqual("shadow_filtered", row["status"])
+
+    def test_enriched_candidate_is_attributed_to_score_gate_at_execution_boundary(self) -> None:
+        candidate = enrich_candidate_with_route(
+            {
+                "venue": "OKX",
+                "inst_id": "BTC-USDT-SWAP",
+                "asset_class": "crypto_derivatives",
+                "direction": "long_perp_short_spot",
+                "trade_type": "perp_funding_basis",
+                "signal_key": "OKX|perp_funding_basis|long_perp_short_spot|conditional",
+                "last": 50000.0,
+                "score": 80.0,
+            },
+            copy.deepcopy(DEFAULT_SETTINGS),
+        )
+
+        guarded = apply_frontier_paper_guard(candidate, copy.deepcopy(DEFAULT_SETTINGS))
+
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertTrue(guarded["paper_route_feasibility_gate"]["applies"])
+        self.assertEqual(
+            "paper_route_feasibility_score_gate",
+            guarded["candidate_reject_detail"]["guard"],
+        )
 
 
 if __name__ == "__main__":

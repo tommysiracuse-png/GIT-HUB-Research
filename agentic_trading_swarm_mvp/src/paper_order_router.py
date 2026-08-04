@@ -154,6 +154,8 @@ def _route_sensitive_marker(candidate: Mapping[str, Any]) -> bool:
         for field in _ROUTE_SENSITIVITY_FIELDS:
             if field in container and _as_bool(container.get(field), False):
                 return True
+        if _coerce_flags(container.get("route_sensitivity_reasons")):
+            return True
     return False
 
 
@@ -366,16 +368,15 @@ def _coerce_flags(value: Any) -> set[str]:
 
 def _route_blockers(candidate: Mapping[str, Any]) -> set[str]:
     blockers: set[str] = set()
-    for field in ("route_blockers", "missing_requirements", "missing_permissions"):
-        blockers.update(_coerce_flags(candidate.get(field)))
-    route = candidate.get("execution_route")
-    if isinstance(route, Mapping):
-        for field in ("route_blockers", "missing_requirements", "missing_permissions"):
-            blockers.update(_coerce_flags(route.get(field)))
-    feasibility = candidate.get("execution_feasibility")
-    if isinstance(feasibility, Mapping):
-        for field in ("route_blockers", "missing_requirements", "missing_permissions"):
-            blockers.update(_coerce_flags(feasibility.get(field)))
+    for container in _candidate_containers(candidate):
+        for field in (
+            "route_blockers",
+            "missing_requirements",
+            "missing_permissions",
+            "missing_prerequisites",
+            "eligibility_missing_prerequisites",
+        ):
+            blockers.update(_coerce_flags(container.get(field)))
     return {item for item in blockers if item}
 
 
@@ -1034,15 +1035,6 @@ def apply_frontier_paper_guard(
     route_guard_enabled = frontier_route_feasibility_guard_enabled(config)
     guarded = dict(candidate)
     existing_route_reason = frontier_shadow_filter_reason(guarded, config)
-    if (
-        isinstance(existing_route_reason, Mapping)
-        and existing_route_reason.get("guard") == "paper_route_eligibility_gate"
-    ):
-        return _annotate_shadow_filtered_candidate(
-            guarded,
-            existing_route_reason,
-            "frontier_paper_guard",
-        )
     score_gate = paper_route_feasibility_gate_review(guarded, config)
     guarded["paper_route_feasibility_gate"] = score_gate
     if score_gate["applies"] and not score_gate["eligible"]:
@@ -1057,10 +1049,25 @@ def apply_frontier_paper_guard(
             "candidate": _candidate_reference(guarded),
             "route_feasibility": score_gate,
         }
-        return _annotate_shadow_filtered_candidate(
+        guarded = _annotate_shadow_filtered_candidate(
             guarded,
             reason,
             "paper_route_feasibility_guard",
+        )
+        if (
+            isinstance(existing_route_reason, Mapping)
+            and existing_route_reason.get("guard") == "paper_route_eligibility_gate"
+        ):
+            guarded["frontier_paper_guard"] = dict(existing_route_reason)
+        return guarded
+    if (
+        isinstance(existing_route_reason, Mapping)
+        and existing_route_reason.get("guard") == "paper_route_eligibility_gate"
+    ):
+        return _annotate_shadow_filtered_candidate(
+            guarded,
+            existing_route_reason,
+            "frontier_paper_guard",
         )
     alignment_guard = _paper_yahoo_proxy_cross_surface_alignment_guard(guarded, config)
     if isinstance(alignment_guard, Mapping) and alignment_guard.get("applies"):
