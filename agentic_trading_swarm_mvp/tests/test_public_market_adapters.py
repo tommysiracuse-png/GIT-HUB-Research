@@ -26,6 +26,13 @@ from adapters.venues import common as venue_common
 from adapters.registry import discover_adapters
 from adapters.venues.bahrain_cross_listings import cross_listing_observations
 from adapters.venues.bursa_derivatives import contract_observations
+from adapters.venues.european_energy_exchange_eex import (
+    AUCTION_URL as EEX_AUCTION_URL,
+    SALES_URL as EEX_SALES_URL,
+    EexGermanNehsAdapter,
+    parse_eex_nehs_auction,
+    parse_eex_nehs_sales,
+)
 from adapters.venues.kase_futures import parse_kase_futures
 from adapters.venues.nzx_dairy import parse_nzx_gdt
 from adapters.venues.twse_daily import parse_twse_daily
@@ -73,6 +80,7 @@ class PublicAdapterParserTests(unittest.TestCase):
             "nzx_gdt_event_reference",
             "bursa_derivatives_contract_catalog",
             "bahrain_cross_listings_catalog",
+            "eex_german_nehs_public",
         }
         self.assertTrue(expected <= set(discover_adapters()))
 
@@ -118,6 +126,71 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual("NZX_GDT:WHOLE_MILK_POWDER", rows[0]["inst_id"])
         self.assertEqual(3900.0, rows[0]["last"])
         self.assertEqual("Event 401", rows[0]["event_id"])
+
+    def test_eex_nehs_auction_parser_normalizes_official_result(self) -> None:
+        report = """\ufeffDatum/Date;Zeit/Time (UTC);Versteigerung/Auction;Fälligkeit/Vintage;Zuschlagspreis/Auction clearing price (EUR/nEZ);versteigerte Menge/Volume allocated in the auction (in nEZ);verbleibende Gesamtversteigerungsmenge/Total remaining auction volume (in nEZ);Gesamtgebotsmenge/Total volume of bids (in nEZ);Gesamtzahl der Bieter/Total number of bidders;Gesamtzahl erfolgreicher Bieter/Total number of successful bidders;Zertifikatserlöse/Revenues (in EUR);Cover ratio/cover ratio;Cover ratio (basierend auf der tatsächlich zugeteilten Menge)/Cover ratio (based on actual allocated volume);Information über potenzielle Annullierung der Versteigerung/Information on potential cancellation of an auction
+29.07.2026;13:00;nEZ;2026;65.00;21341544;85377434;515902199;110;110;1387200360.00;48.35;24.17;
+"""
+        rows = parse_eex_nehs_auction(
+            report,
+            received_at="2026-07-30T13:00:00+00:00",
+        )
+        self.assertEqual("EEX:NEZ_2026:AUCTION:2026-07-29", rows[0]["inst_id"])
+        self.assertEqual(65.0, rows[0]["last"])
+        self.assertEqual(21_341_544.0, rows[0]["allocated_volume"])
+        self.assertEqual(24.17, rows[0]["allocated_volume_cover_ratio"])
+        self.assertEqual("fresh", rows[0]["freshness_state"])
+        self.assertEqual("closed", rows[0]["session_status"])
+        self.assertEqual(EEX_AUCTION_URL, rows[0]["source_url"])
+
+    def test_eex_nehs_sales_parser_skips_disclaimer_preamble(self) -> None:
+        report = """\ufeff"Disclaimer: Results marked with * are preliminary."
+
+Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tCO2;Verkaufsvolumen/Volume tCO2;Anzahl der Handelsgeschäfte/Number of trades;Anzahl der Käufer/Number of Buyers;Zertifikatserlös/Certificate-revenue €;Disclaimer
+28.07.2026;13:15;nEZ;2025;55;216421;37;17;11903155;
+"""
+        rows = parse_eex_nehs_sales(
+            report,
+            received_at="2026-07-29T13:15:00+00:00",
+        )
+        self.assertEqual("EEX:NEZ_2025:SALE:2026-07-28", rows[0]["inst_id"])
+        self.assertEqual(216_421.0, rows[0]["sold_volume"])
+        self.assertEqual(37, rows[0]["transaction_count"])
+        self.assertEqual(17, rows[0]["buyer_count"])
+        self.assertEqual("final", rows[0]["result_finality"])
+        self.assertEqual(EEX_SALES_URL, rows[0]["source_url"])
+
+    def test_eex_adapter_preserves_parser_failure_and_source_health(self) -> None:
+        auction_result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "not,the,documented,schema",
+            "received_at": "2026-07-30T13:00:00+00:00",
+            "latency_ms": 5.0,
+        }
+        sales_result = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-07-30T13:00:01+00:00",
+            "latency_ms": 6.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch(
+            "adapters.venues.european_energy_exchange_eex.fetch_text",
+            side_effect=[auction_result, sales_result],
+        ):
+            batch = EexGermanNehsAdapter().scan({})
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["auction"]["fetch_status"])
+        self.assertEqual("blocked", batch.metadata["fetch_status"]["sales"]["fetch_status"])
+        self.assertIn("header", batch.metadata["parser_failures"][0]["error"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        self.assertTrue(any(row.get("parser_failure") for row in batch.observations))
 
     def test_catalog_adapters_never_invent_prices(self) -> None:
         rows = contract_observations("blocked") + cross_listing_observations("reachable")
