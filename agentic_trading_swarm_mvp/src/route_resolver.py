@@ -47,6 +47,10 @@ ROUTE_STATUSES = {
 }
 PAPER_ROUTE_ASSUMPTION_SCORE_MULTIPLIER = 0.20
 PAPER_ROUTE_UNKNOWN_RANK_CAP = 0.20
+PAPER_PROXY_EXECUTION_SEMANTICS = "proxy_not_live_equivalent"
+PAPER_PROXY_STATS_SCOPE = "paper_proxy"
+OKX_DERIVATIVES_PAPER_ROUTE = "okx_derivatives_paper"
+PAPER_PROXY_ROUTE_FEASIBILITY_SCORE = 0.75
 
 VENUE_CAPABILITY_ALIASES = {
     "supports_spot_short": ("spot_short_supported", "supports_spot_short_margin"),
@@ -2115,10 +2119,212 @@ def enrich_candidate_with_route(
     return enriched
 
 
+def _activatable_okx_paper_proxy(candidate: dict, settings: dict) -> dict | None:
+    """Return the explicit OKX paper proxy that fully replaces a borrow blocker."""
+
+    if str(settings.get("mode") or "paper").strip().lower() != "paper":
+        return None
+    if not _route_unblocker_enabled(settings):
+        return None
+    if candidate.get("paper_proxy_activated"):
+        return None
+
+    route = candidate.get("execution_route") or {}
+    if not isinstance(route, dict) or route.get("route_status") != "conditional":
+        return None
+    direction = str(candidate.get("direction") or "").strip().lower()
+    if direction not in {"long_perp_short_spot", "short_frontier_spot", "short_spot"}:
+        return None
+
+    missing = {str(value) for value in route.get("missing_permissions", []) if value}
+    alternative = route.get("best_route_alternative") or {}
+    if not isinstance(alternative, dict):
+        return None
+    replaced = {str(value) for value in alternative.get("replaces_blockers", []) if value}
+    alternative_missing = {
+        str(value)
+        for field in ("missing_permissions", "missing_requirements", "route_blockers")
+        for value in (alternative.get(field) or [])
+        if value
+    }
+    if (
+        missing != {"spot_borrow"}
+        or not missing.issubset(replaced)
+        or alternative_missing
+        or alternative.get("status") != "paper_testable_proxy"
+        or alternative.get("route_id") != OKX_DERIVATIVES_PAPER_ROUTE
+        or alternative.get("execution_semantics") != PAPER_PROXY_EXECUTION_SEMANTICS
+        or not settings.get("account_capabilities", {}).get("crypto_derivatives", False)
+    ):
+        return None
+    return dict(alternative)
+
+
+def _direct_candidate_signal_key(candidate: dict, feasibility: dict) -> str:
+    """Mirror the persisted direct signal identity without importing storage."""
+
+    status = str(feasibility.get("status") or "unknown")
+    if candidate.get("strategy_lab_id"):
+        parts = (
+            "STRATEGY_LAB",
+            candidate.get("strategy_lab_id"),
+            candidate.get("venue", "unknown"),
+            candidate.get("direction", "unknown"),
+            status,
+        )
+    elif candidate.get("signal_lineage_key"):
+        parts = (
+            candidate.get("signal_lineage_key"),
+            candidate.get("venue", "unknown"),
+            candidate.get("direction", "unknown"),
+            status,
+        )
+    else:
+        parts = (
+            candidate.get("venue", "unknown"),
+            candidate.get("trade_type", "unknown"),
+            candidate.get("direction", "unknown"),
+            status,
+        )
+    return "|".join(str(value) for value in parts)
+
+
+def activate_paper_proxy_candidate(candidate: dict, settings: dict) -> dict:
+    """Replace one borrow-blocked direct attempt with its labeled paper proxy.
+
+    The direct route remains attached as route-intelligence evidence.  Runtime
+    scoring, policies, orders, and outcomes use a separate proxy identity so the
+    simulated derivative result cannot update the short-spot family.
+    """
+
+    activated = dict(candidate)
+    alternative = _activatable_okx_paper_proxy(activated, settings)
+    if alternative is None:
+        return activated
+
+    route = activated.get("execution_route") or {}
+    feasibility = dict(activated.get("execution_feasibility") or {})
+    direct_eligibility = dict(activated.get("paper_route_eligibility") or {})
+    source_signal_key = activated.get("signal_key")
+    direct_signal_key = _direct_candidate_signal_key(activated, feasibility)
+    proxy_signal_key = "|".join(
+        ("PAPER_PROXY", OKX_DERIVATIVES_PAPER_ROUTE, direct_signal_key)
+    )
+    allocation_multiplier = max(
+        0.0,
+        min(1.0, float(alternative.get("paper_allocation_multiplier") or 0.25)),
+    )
+    direct_score = activated.get("pre_route_eligibility_score")
+    if direct_score is None:
+        direct_score = activated.get("score", 0.0)
+
+    proxy_eligibility = dict(direct_eligibility)
+    proxy_eligibility.update(
+        {
+            "paper_only": True,
+            "route_decision": "executable_proxy",
+            "feasibility_status": "feasible_for_paper_proxy",
+            "execution_eligibility": "eligible",
+            "route_eligible": True,
+            "eligible_for_scoring": True,
+            "suppressed": False,
+            "proxy_used": True,
+            "selected_proxy_id": OKX_DERIVATIVES_PAPER_ROUTE,
+            "missing_prerequisites": [],
+            "blocker_reasons": [],
+            "blocking_reason": None,
+            "route_status": "paper_testable_proxy",
+            "candidate_status": "paper_proxy_active",
+            "rank_contribution_cap": 1.0,
+            "rank_contribution": round(max(0.0, float(direct_score)), 6),
+            "assumption_penalty_applied": False,
+            "paper_score_multiplier": 1.0,
+            "execution_semantics": PAPER_PROXY_EXECUTION_SEMANTICS,
+            "direct_missing_prerequisites": direct_eligibility.get("missing_prerequisites", []),
+            "direct_blocker_reasons": direct_eligibility.get("blocker_reasons", []),
+        }
+    )
+    proxy_eligibility["capability_checks"] = [
+        {
+            **check,
+            "critical": False,
+            "replaced_by_proxy": OKX_DERIVATIVES_PAPER_ROUTE,
+        }
+        if isinstance(check, dict)
+        else check
+        for check in direct_eligibility.get("capability_checks", [])
+    ]
+
+    feasibility.update(
+        {
+            "paper_route_eligibility": proxy_eligibility,
+            "paper_feasibility_status": "feasible_for_paper_proxy",
+            "execution_eligibility": "eligible",
+            "paper_score_multiplier": 1.0,
+            "route_intelligence_status": "paper_testable_proxy",
+            "candidate_status": "paper_proxy_active",
+            "blocking_reason": None,
+            "route_feasibility_score": max(
+                PAPER_PROXY_ROUTE_FEASIBILITY_SCORE,
+                float(feasibility.get("route_feasibility_score") or 0.0),
+            ),
+        }
+    )
+
+    activated.update(
+        {
+            "score": float(direct_score),
+            "signal_key": proxy_signal_key,
+            "direct_signal_key": direct_signal_key,
+            "direct_source_signal_key": source_signal_key,
+            "signal_stats_scope": PAPER_PROXY_STATS_SCOPE,
+            "paper_proxy_stats_isolated": True,
+            "paper_proxy_activated": True,
+            "proxy_replaces_direct_candidate": True,
+            "paper_only": True,
+            "paper_proxy_used": True,
+            "paper_proxy_route": alternative,
+            "paper_proxy_source_route_id": route.get("route_id"),
+            "paper_proxy_source_route_status": route.get("route_status"),
+            "paper_proxy_direct_missing_requirements": list(route.get("missing_permissions", [])),
+            "paper_route_status": "paper_testable_proxy",
+            "paper_route_type": "proxy",
+            "paper_execution_semantics": PAPER_PROXY_EXECUTION_SEMANTICS,
+            "execution_semantics": PAPER_PROXY_EXECUTION_SEMANTICS,
+            "proxy_not_live_equivalent": True,
+            "paper_proxy_not_live_equivalent": True,
+            "paper_fill_allowed_by_route": True,
+            "paper_allocation_multiplier": allocation_multiplier,
+            "paper_route_allocation_multiplier": allocation_multiplier,
+            "route_feasibility_score": feasibility["route_feasibility_score"],
+            "paper_route_eligibility": proxy_eligibility,
+            "paper_feasibility_status": "feasible_for_paper_proxy",
+            "execution_eligibility": "eligible",
+            "route_intelligence_status": "paper_testable_proxy",
+            "candidate_status": "paper_proxy_active",
+            "blocking_reason": None,
+            "paper_entry_blocked": False,
+            "promotion_eligible": False,
+            "direct_route_promotion_eligible": False,
+            "execution_feasibility": feasibility,
+            "direct_paper_route_eligibility": direct_eligibility,
+        }
+    )
+    activated.pop("paper_route_score_clamped", None)
+    activated.pop("paper_route_block_reasons", None)
+    return activated
+
+
+def activate_paper_proxy_candidates(candidates: Iterable[dict], settings: dict) -> list[dict]:
+    """Activate eligible alternatives one-for-one without appending duplicates."""
+
+    return [activate_paper_proxy_candidate(candidate, settings) for candidate in candidates]
+
+
 def enrich_candidates(candidates: Iterable[dict], settings: dict) -> list[dict]:
     registry = load_route_registry()
     venue_capability_registry = load_venue_capability_registry()
-    return [
+    enriched = [
         enrich_candidate_with_route(
             candidate,
             settings,
@@ -2127,6 +2333,7 @@ def enrich_candidates(candidates: Iterable[dict], settings: dict) -> list[dict]:
         )
         for candidate in candidates
     ]
+    return activate_paper_proxy_candidates(enriched, settings)
 
 
 def _requirement_counter_to_dict(counter: collections.Counter[tuple[str, str]]) -> dict:

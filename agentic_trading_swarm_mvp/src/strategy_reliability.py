@@ -2420,7 +2420,7 @@ def _repair_okx_candidate(candidate: dict) -> dict | None:
 
     if direction == "long_perp_short_spot":
         reasons = []
-        if route_status != "standard":
+        if route_status not in {"standard", "paper_testable_proxy"}:
             reasons.append(f"borrow_or_route_status={route_status}")
         if funding < 8.0 and basis < 75.0:
             reasons.append("reverse_basis_not_extreme")

@@ -85,15 +85,17 @@ def update_contextual_stats(conn: sqlite3.Connection) -> None:
             context = json.loads(row["context_json"] or "{}")
         except json.JSONDecodeError:
             context = {}
+        stats_scope = str(context.get("signal_stats_scope") or "direct")
+        context_prefix = "paper_proxy|" if stats_scope == "paper_proxy" else ""
         keys = [
-            f"venue:{context.get('venue')}",
-            f"trade_type:{context.get('trade_type')}",
-            f"direction:{context.get('direction')}",
-            f"feasibility:{context.get('feasibility_status')}",
-            f"liquidity:{context.get('liquidity_bucket')}",
-            f"spread:{context.get('spread_bucket')}",
-            f"region:{context.get('region')}",
-            f"asset_class:{context.get('asset_class')}",
+            f"{context_prefix}venue:{context.get('venue')}",
+            f"{context_prefix}trade_type:{context.get('trade_type')}",
+            f"{context_prefix}direction:{context.get('direction')}",
+            f"{context_prefix}feasibility:{context.get('feasibility_status')}",
+            f"{context_prefix}liquidity:{context.get('liquidity_bucket')}",
+            f"{context_prefix}spread:{context.get('spread_bucket')}",
+            f"{context_prefix}region:{context.get('region')}",
+            f"{context_prefix}asset_class:{context.get('asset_class')}",
         ]
         for key in keys:
             grouped.setdefault(key, []).append(float(row["pnl_bps"]))

@@ -19,6 +19,7 @@ FRONTIER_SHADOW_REASON = "frontier_shadow_filtered"
 SPOT_BORROW_SHADOW_CODE = "spot_borrow_unconfirmed"
 ROUTE_FEASIBILITY_SCORE_SHADOW_REASON = "paper_route_feasibility_score_below_threshold"
 DEFAULT_ROUTE_FEASIBILITY_THRESHOLD = 0.65
+PROXY_NOT_LIVE_EQUIVALENT = "proxy_not_live_equivalent"
 
 _ROUTE_FLAG_KEYS = (
     "frontier_route_feasibility_guard_enabled",
@@ -439,6 +440,9 @@ def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str,
     proxy_available = alternative_status in _ROUTE_PROXY_STATUSES and not alternative_missing
     if proxy_available:
         execution_semantics = "proxy"
+        proxy_execution_semantics = str(
+            alternative.get("execution_semantics") or PROXY_NOT_LIVE_EQUIVALENT
+        )
         paper_route_status = "paper_testable_proxy"
         paper_fill_allowed = True
         multiplier = (
@@ -449,6 +453,7 @@ def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str,
         )
     elif _paper_assumption_route_allowed(candidate):
         execution_semantics = "simulation_assumption"
+        proxy_execution_semantics = None
         paper_route_status = "feasible_with_simulation_assumptions"
         paper_fill_allowed = True
         multiplier = (
@@ -461,6 +466,7 @@ def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str,
         )
     elif direct_status in _ROUTE_RESEARCH_ONLY_STATUSES:
         execution_semantics = "research_only"
+        proxy_execution_semantics = None
         paper_route_status = direct_status
         paper_fill_allowed = False
         multiplier = 0.0
@@ -468,16 +474,19 @@ def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str,
         blockers and _is_short_frontier_spot(candidate) and not _is_confirmed_borrow(candidate)
     ):
         execution_semantics = "blocked"
+        proxy_execution_semantics = None
         paper_route_status = direct_status or "blocked"
         paper_fill_allowed = False
         multiplier = 0.0
     elif direct_status in _ROUTE_EXECUTABLE_STATUSES or not blockers:
         execution_semantics = "direct"
+        proxy_execution_semantics = None
         paper_route_status = direct_status or "executable"
         paper_fill_allowed = True
         multiplier = 1.0
     else:
         execution_semantics = "unknown"
+        proxy_execution_semantics = None
         paper_route_status = direct_status or "unknown"
         paper_fill_allowed = True
         multiplier = 1.0
@@ -495,6 +504,8 @@ def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str,
     return {
         "paper_route_status": paper_route_status,
         "execution_semantics": execution_semantics,
+        "proxy_execution_semantics": proxy_execution_semantics,
+        "proxy_not_live_equivalent": proxy_execution_semantics == PROXY_NOT_LIVE_EQUIVALENT,
         "paper_fill_allowed": paper_fill_allowed,
         "paper_proxy_used": proxy_available,
         "paper_allocation_multiplier": _merged_paper_allocation_multiplier(candidate, multiplier),
@@ -513,7 +524,11 @@ def _apply_route_feasibility_metadata(candidate: Mapping[str, Any]) -> dict[str,
     annotated["frontier_route_feasibility"] = record
     annotated["paper_route_status"] = record["paper_route_status"]
     annotated["paper_route_type"] = record["execution_semantics"]
-    annotated["paper_execution_semantics"] = record["execution_semantics"]
+    annotated["paper_execution_semantics"] = (
+        record.get("proxy_execution_semantics") or record["execution_semantics"]
+    )
+    annotated["proxy_not_live_equivalent"] = bool(record.get("proxy_not_live_equivalent"))
+    annotated["paper_proxy_not_live_equivalent"] = bool(record.get("proxy_not_live_equivalent"))
     annotated["paper_fill_allowed_by_route"] = record["paper_fill_allowed"]
     annotated["paper_proxy_used"] = record["paper_proxy_used"]
     annotated["paper_allocation_multiplier"] = record["paper_allocation_multiplier"]
@@ -558,6 +573,16 @@ def _apply_paper_route_eligibility_metadata(candidate: Mapping[str, Any]) -> dic
 
     annotated = dict(candidate)
     upstream_verdict = annotated.get("paper_route_eligibility")
+    if (
+        annotated.get("paper_proxy_activated") is True
+        and annotated.get("paper_proxy_not_live_equivalent") is True
+        and annotated.get("paper_execution_semantics") == PROXY_NOT_LIVE_EQUIVALENT
+        and (annotated.get("paper_proxy_route") or {}).get("route_id") == "okx_derivatives_paper"
+        and isinstance(upstream_verdict, Mapping)
+        and not upstream_verdict.get("suppressed", False)
+        and upstream_verdict.get("route_decision") == "executable_proxy"
+    ):
+        return annotated
     if isinstance(upstream_verdict, Mapping) and upstream_verdict.get("suppressed"):
         annotated.setdefault(
             "paper_feasibility_status",

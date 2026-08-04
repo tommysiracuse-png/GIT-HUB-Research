@@ -1120,6 +1120,31 @@ def _migrate_paper_trade_outcomes(conn: sqlite3.Connection) -> None:
 
 def signal_key(candidate: dict) -> str:
     status = candidate.get("execution_feasibility", {}).get("status", "unknown")
+    if (
+        candidate.get("signal_stats_scope") == "paper_proxy"
+        or candidate.get("paper_proxy_activated") is True
+        or candidate.get("paper_proxy_not_live_equivalent") is True
+    ):
+        explicit = str(candidate.get("signal_key") or "")
+        if explicit.startswith("PAPER_PROXY|"):
+            return explicit
+        route_id = str(
+            (candidate.get("paper_proxy_route") or {}).get("route_id")
+            or candidate.get("effective_route_id")
+            or "unknown_proxy_route"
+        )
+        direct_key = str(
+            candidate.get("direct_signal_key")
+            or "|".join(
+                (
+                    str(candidate.get("venue") or "unknown"),
+                    str(candidate.get("trade_type") or "unknown"),
+                    str(candidate.get("direction") or "unknown"),
+                    str(status),
+                )
+            )
+        )
+        return f"PAPER_PROXY|{route_id}|{direct_key}"
     if candidate.get("strategy_lab_id"):
         return "|".join(
             [
@@ -1234,9 +1259,13 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "strategy_lab_version": candidate.get("strategy_lab_version"),
         "region": candidate.get("region"),
         "asset_class": candidate.get("asset_class"),
-        "route_id": (review or {}).get("route_id") or candidate.get("route_id") or route.get("route_id"),
-        "route_status": (review or {}).get("route_status") or candidate.get("route_status") or route.get("route_status"),
+        "route_id": (review or {}).get("effective_route_id") or (review or {}).get("route_id") or candidate.get("route_id") or route.get("route_id"),
+        "route_status": candidate.get("paper_route_status") or (review or {}).get("route_status") or candidate.get("route_status") or route.get("route_status"),
         "missing_requirements": (review or {}).get("missing_requirements") or route.get("missing_permissions", []),
+        "signal_stats_scope": candidate.get("signal_stats_scope") or "direct",
+        "paper_execution_semantics": candidate.get("paper_execution_semantics"),
+        "paper_proxy_not_live_equivalent": bool(candidate.get("paper_proxy_not_live_equivalent")),
+        "direct_signal_key": candidate.get("direct_signal_key"),
         "liquidity_bucket": _bucket(candidate.get("liquidity_score", 0), [0.35, 0.65, 0.85]),
         "spread_bucket": _bucket(candidate.get("spread_bps", 999), [3, 8, 20], reverse=True),
         "feasibility_status": (review or {}).get("feasibility_status") or feasibility.get("status"),

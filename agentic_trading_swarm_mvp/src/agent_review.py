@@ -94,6 +94,12 @@ def review_candidate(
         _route_alternative_covers_missing(missing_requirements, route_alternative)
         and not paper_route_eligibility.get("suppressed", False)
     )
+    proxy_not_live_equivalent = bool(
+        candidate.get("paper_proxy_activated")
+        and candidate.get("paper_proxy_not_live_equivalent")
+        and candidate.get("paper_execution_semantics") == "proxy_not_live_equivalent"
+        and route_alternative_usable
+    )
     net_edge_bps = estimate_net_edge_bps(candidate, settings)
     context_cost_gate = paper_context_cost_gate(candidate, settings)
     context_features = build_context_features(candidate, {}, net_edge_bps=net_edge_bps)
@@ -166,6 +172,8 @@ def review_candidate(
                 f"paper route alternative {route_alternative.get('alternative_id')} "
                 f"status {route_alternative.get('status')}"
             )
+            if proxy_not_live_equivalent:
+                evidence.append("proxy_not_live_equivalent paper execution isolated from direct-route statistics")
         elif missing_requirements:
             hard_blocks.append(f"trade requires unconfirmed route capability: {', '.join(missing_requirements)}")
         else:
@@ -322,6 +330,15 @@ def review_candidate(
         "direct_missing_requirements": missing_requirements if route_alternative_usable else [],
         "route_alternative": route_alternative if route_alternative_usable else {},
         "route_alternative_used": bool(route_alternative_usable),
+        "paper_proxy_activated": bool(candidate.get("paper_proxy_activated")),
+        "execution_semantics": (
+            "proxy_not_live_equivalent"
+            if proxy_not_live_equivalent
+            else candidate.get("paper_execution_semantics") or "direct_live_equivalent"
+        ),
+        "proxy_not_live_equivalent": proxy_not_live_equivalent,
+        "signal_stats_scope": candidate.get("signal_stats_scope") or "direct",
+        "direct_signal_key": candidate.get("direct_signal_key"),
         "route_confidence": feasibility.get("route_confidence") or route.get("confidence"),
         "route_notes": feasibility.get("route_notes") or route.get("route_notes", []),
         "evidence": evidence,

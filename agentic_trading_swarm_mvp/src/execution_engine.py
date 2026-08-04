@@ -66,6 +66,20 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
     if mode == "live":
         notional = min(notional, float(risk.get("max_live_notional_usd", 0.0)))
 
+    route_alternative = review.get("route_alternative") or {}
+    proxy_route_requested = bool(
+        review.get("route_alternative_used")
+        and route_alternative.get("status") == "paper_testable_proxy"
+    )
+    proxy_not_live_equivalent = bool(
+        mode == "paper"
+        and proxy_route_requested
+        and candidate.get("paper_proxy_activated")
+        and candidate.get("paper_proxy_not_live_equivalent")
+        and review.get("proxy_not_live_equivalent")
+        and review.get("effective_route_id") == "okx_derivatives_paper"
+    )
+
     side = _side_for_direction(candidate["direction"])
     price = float(candidate["last"])
     quantity = 0.0 if price <= 0 else notional / price
@@ -85,6 +99,8 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
     status = "ready_for_paper_execution"
     if side == "hold":
         status = "blocked_no_side"
+    if proxy_route_requested and not proxy_not_live_equivalent:
+        status = "blocked_invalid_paper_proxy_metadata"
     if mode == "live":
         status = "blocked_live_not_enabled"
 
@@ -100,7 +116,19 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         "missing_requirements": review.get("missing_requirements", []),
         "direct_missing_requirements": review.get("direct_missing_requirements", []),
         "route_alternative_used": bool(review.get("route_alternative_used")),
-        "route_alternative": review.get("route_alternative", {}),
+        "route_alternative": route_alternative,
+        "proxy_route_requested": proxy_route_requested,
+        "execution_semantics": (
+            "proxy_not_live_equivalent"
+            if proxy_not_live_equivalent
+            else review.get("execution_semantics") or "direct_live_equivalent"
+        ),
+        "proxy_not_live_equivalent": proxy_not_live_equivalent,
+        "paper_proxy_not_live_equivalent": proxy_not_live_equivalent,
+        "signal_stats_scope": "paper_proxy" if proxy_not_live_equivalent else "direct",
+        "signal_key": review.get("signal_key"),
+        "direct_signal_key": candidate.get("direct_signal_key"),
+        "direct_route_id": candidate.get("paper_proxy_source_route_id"),
         "legs": [leg],
         "risk": {
             "confidence": review.get("confidence"),
@@ -110,7 +138,14 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         "notes": [
             "Paper order ticket generated from approved opportunity.",
             "Live execution is blocked until explicit mode, route, credentials, and limits are configured.",
-        ],
+        ] + (
+            [
+                "proxy_not_live_equivalent: OKX derivatives paper exposure replaces a borrow-blocked direct short-spot attempt.",
+                "Proxy outcomes use an isolated paper-proxy signal statistics scope.",
+            ]
+            if proxy_not_live_equivalent
+            else []
+        ),
     }
 
 

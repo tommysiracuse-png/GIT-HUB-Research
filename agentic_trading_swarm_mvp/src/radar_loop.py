@@ -607,6 +607,9 @@ def run_once(settings: dict) -> dict:
                     "effective_route_id": review.get("effective_route_id"),
                     "route_status": review.get("route_status"),
                     "route_alternative_used": review.get("route_alternative_used"),
+                    "execution_semantics": execution["order"].get("execution_semantics"),
+                    "proxy_not_live_equivalent": execution["order"].get("proxy_not_live_equivalent", False),
+                    "signal_stats_scope": execution["order"].get("signal_stats_scope", "direct"),
                     "strategy_lab_id": candidate.get("strategy_lab_id"),
                 }
             )
