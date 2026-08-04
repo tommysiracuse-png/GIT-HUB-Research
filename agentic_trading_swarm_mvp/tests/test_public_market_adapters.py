@@ -33,6 +33,12 @@ from adapters.venues.european_energy_exchange_eex import (
     parse_eex_nehs_auction,
     parse_eex_nehs_sales,
 )
+from adapters.venues.e_auksion_district_hokimiyat_notices import (
+    API_URL as E_AUKSION_API_URL,
+    NOTICE_URL as E_AUKSION_NOTICE_URL,
+    EAuksionDistrictHokimiyatNoticesAdapter,
+    parse_e_auksion_lots,
+)
 from adapters.venues.kase_futures import parse_kase_futures
 from adapters.venues.nzx_dairy import parse_nzx_gdt
 from adapters.venues.twse_daily import parse_twse_daily
@@ -73,6 +79,37 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual(2, urlopen.call_count)
         self.assertIs(system_context, urlopen.call_args_list[1].kwargs["context"])
 
+    def test_public_fetch_supports_no_key_json_post(self) -> None:
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read() -> bytes:
+                return b'{"rows": []}'
+
+        with mock.patch.object(
+            venue_common.urllib.request,
+            "urlopen",
+            return_value=Response(),
+        ) as urlopen:
+            result = venue_common.fetch_text(
+                "https://official.example.test/lots",
+                method="POST",
+                json_body={"category": 46},
+            )
+
+        request = urlopen.call_args.args[0]
+        self.assertTrue(result["ok"])
+        self.assertEqual("POST", request.get_method())
+        self.assertEqual(b'{"category":46}', request.data)
+        self.assertEqual("application/json", request.get_header("Content-type"))
+
     def test_registered_batch_is_discoverable(self) -> None:
         expected = {
             "twse_daily_public",
@@ -81,6 +118,7 @@ class PublicAdapterParserTests(unittest.TestCase):
             "bursa_derivatives_contract_catalog",
             "bahrain_cross_listings_catalog",
             "eex_german_nehs_public",
+            "e_auksion_district_hokimiyat_notices",
         }
         self.assertTrue(expected <= set(discover_adapters()))
 
@@ -191,6 +229,78 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
         self.assertIn("header", batch.metadata["parser_failures"][0]["error"])
         self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
         self.assertTrue(any(row.get("parser_failure") for row in batch.observations))
+
+    def test_e_auksion_parser_normalizes_land_lot_schedule_and_price_terms(self) -> None:
+        payload = {
+            "totalPages": 16,
+            "totalRows": 188,
+            "currentPage": 1,
+            "rows": [
+                {
+                    "id": 24649756,
+                    "lot_number": "24649756",
+                    "name": "MG1735228008/27 yer uchastkasi",
+                    "full_address": (
+                        "Qoraqalpog`iston Respublikasi, Taxiatosh tumani, Oydin yo'l MFY"
+                    ),
+                    "confiscant_categories_name": "Tadbirkorlik va shaharsozlik uchun",
+                    "category_id": 46,
+                    "start_price": 4_215_000.0,
+                    "zaklad_summa": 1_053_750.0,
+                    "auction_date_str": "10.08.2026 10:00",
+                    "order_end_time_str": "10.08.2026 09:00",
+                    "zaklad_percent": 25.0,
+                    "lot_statuses_id": 2,
+                    "is_term_payment": 1,
+                    "term_month": 60,
+                    "baholangan_narx": 6_804_402.0,
+                    "user_orders_apply_cnt": 3,
+                    "view_count": 9,
+                }
+            ],
+        }
+        rows = parse_e_auksion_lots(
+            payload,
+            received_at="2026-08-04T05:30:00+00:00",
+        )
+
+        row = rows[0]
+        self.assertEqual("E_AUKSION_UZ:LAND_LEASE:24649756", row["inst_id"])
+        self.assertEqual(4_215_000.0, row["last"])
+        self.assertEqual(1_053_750.0, row["deposit_uzs"])
+        self.assertEqual("Taxiatosh tumani", row["district"])
+        self.assertEqual("2026-08-10T10:00:00+05:00", row["auction_at"])
+        self.assertEqual("applications_open", row["session_status"])
+        self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual(E_AUKSION_API_URL, row["source_url"])
+        self.assertEqual(E_AUKSION_NOTICE_URL, row["source_notice_url"])
+        self.assertEqual("watch_only", row["direction"])
+        self.assertEqual("land_lease_auction_not_order_routable", row["candidate_reject_reason"])
+
+    def test_e_auksion_adapter_preserves_parser_failure_and_fetch_evidence(self) -> None:
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": '{"unexpected": []}',
+            "received_at": "2026-08-04T05:30:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.e_auksion_district_hokimiyat_notices.fetch_text",
+            return_value=result,
+        ) as fetch:
+            batch = EAuksionDistrictHokimiyatNoticesAdapter().scan({})
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["lots"]["fetch_status"])
+        self.assertIn("rows array", batch.metadata["parser_failures"][0]["error"])
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        self.assertEqual("public_reference_parser_failure", batch.observations[0]["candidate_reject_reason"])
+        self.assertIn("rows array", batch.observations[0]["parser_failure"])
+        self.assertEqual("POST", fetch.call_args.kwargs["method"])
+        self.assertEqual(46, fetch.call_args.kwargs["json_body"]["confiscant_categories_id"])
 
     def test_catalog_adapters_never_invent_prices(self) -> None:
         rows = contract_observations("blocked") + cross_listing_observations("reachable")

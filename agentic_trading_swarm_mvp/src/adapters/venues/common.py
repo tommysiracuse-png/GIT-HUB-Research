@@ -32,14 +32,26 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def fetch_text(url: str, timeout: int = 15) -> dict[str, Any]:
+def fetch_text(
+    url: str,
+    timeout: int = 15,
+    *,
+    method: str = "GET",
+    json_body: Any | None = None,
+) -> dict[str, Any]:
     started = time.perf_counter()
+    body = None if json_body is None else json.dumps(json_body, separators=(",", ":")).encode("utf-8")
+    headers = {
+        "Accept": "application/json,text/html;q=0.9,*/*;q=0.5",
+        "User-Agent": "agentic-trading-swarm-paper-research/1.0",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
     request = urllib.request.Request(
         url,
-        headers={
-            "Accept": "application/json,text/html;q=0.9,*/*;q=0.5",
-            "User-Agent": "agentic-trading-swarm-paper-research/1.0",
-        },
+        data=body,
+        headers=headers,
+        method=str(method or "GET").upper(),
     )
 
     def _fetch(context: ssl.SSLContext | None = None) -> dict[str, Any]:
