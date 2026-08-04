@@ -96,6 +96,11 @@ from adapters.venues.stock_exchange_of_thailand_yuanta_securities_thailand impor
     StockExchangeOfThailandYuantaSecuritiesThailandAdapter,
     parse_set_yuanta_dr_announcement,
 )
+from adapters.venues.suruhanjaya_tenaga_energy_commission import (
+    SOURCE_URL as ENEGEM_SOURCE_URL,
+    SuruhanjayaTenagaEnergyCommissionAdapter,
+    parse_enegem_programme,
+)
 from adapters.venues.twse_daily import parse_twse_daily
 from adapters.venues.vietnam_securities_depository_and_clearing_corporation_hanoi_sto import (
     GUIDELINE_URL as VSDC_CARBON_GUIDELINE_URL,
@@ -1741,6 +1746,118 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
         self.assertIn("rows array", batch.observations[0]["parser_failure"])
         self.assertEqual("POST", fetch.call_args.kwargs["method"])
         self.assertEqual(46, fetch.call_args.kwargs["json_body"]["confiscant_categories_id"])
+
+    def test_enegem_parser_normalizes_official_cross_border_programme(self) -> None:
+        document = """
+        <html><body>
+          <h1>Energy Exchange Malaysia ENEGEM</h1>
+          <p>Energy Exchange Malaysia (ENEGEM) is a platform developed to support
+          cross-border trading of renewable energy. It enables Malaysia to export
+          excess green electricity under the Cross-Border Electricity Sales for
+          Renewable Energy (CBES RE) initiative, approved by the Government in
+          October 2023 with a capacity of up to 300 MW.</p>
+          <p>The platform is operated by the Single Buyer under the oversight of the
+          Energy Commission. Its implementation is guided by the Guide for
+          Cross-Border Electricity Sales (CBES), Third Edition released in April 2024.</p>
+          <p>The first phase used the Malaysia Singapore interconnection for a one
+          year supply period.</p>
+        </body></html>
+        """
+
+        rows = parse_enegem_programme(
+            document,
+            received_at="2026-08-04T16:30:00+00:00",
+        )
+
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        self.assertEqual("ST_ENEGEM:CBES_RE:MYS_SGP", row["inst_id"])
+        self.assertEqual(300.0, row["export_capacity_limit_mw"])
+        self.assertEqual("2023-10-01", row["approval_month"])
+        self.assertEqual("2024-04-01", row["guide_release_month"])
+        self.assertEqual("official_programme_reference", row["session_status"])
+        self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual(ENEGEM_SOURCE_URL, row["source_url"])
+        self.assertEqual("watch_only", row["direction"])
+        self.assertEqual(0.0, row["last"])
+        self.assertEqual(
+            "official_programme_page_has_no_clearing_price",
+            row["candidate_reject_reason"],
+        )
+
+        reachable_result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": document,
+            "received_at": "2026-08-04T16:30:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.suruhanjaya_tenaga_energy_commission.fetch_text",
+            return_value=reachable_result,
+        ):
+            batch = SuruhanjayaTenagaEnergyCommissionAdapter().scan({})
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("fresh", batch.metadata["freshness_state"])
+        self.assertEqual("official_programme_reference", batch.metadata["session_state"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertEqual("official_programme_reference", batch.observations[0]["quality_status"])
+
+    def test_enegem_plugin_is_runtime_discoverable_and_preserves_failures(self) -> None:
+        self.assertIn("suruhanjaya_tenaga_energy_commission", discover_adapters())
+        discovered = get_adapter("suruhanjaya_tenaga_energy_commission")
+        self.assertIsInstance(discovered, SuruhanjayaTenagaEnergyCommissionAdapter)
+        self.assertEqual(ENEGEM_SOURCE_URL, discovered.info.docs_url)
+        self.assertIn("export_capacity", discovered.info.capabilities)
+
+        parser_result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>replacement page</body></html>",
+            "received_at": "2026-08-04T16:30:00+00:00",
+            "latency_ms": 5.0,
+        }
+        with mock.patch(
+            "adapters.venues.suruhanjaya_tenaga_energy_commission.fetch_text",
+            return_value=parser_result,
+        ):
+            parser_batch = SuruhanjayaTenagaEnergyCommissionAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable", parser_batch.metadata["fetch_status"]["enegem"]["fetch_status"]
+        )
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual("watch_only", parser_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_programme_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+
+        unavailable_result = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "error": "blocked",
+            "text": "",
+            "received_at": "2026-08-04T16:31:00+00:00",
+            "latency_ms": 7.0,
+        }
+        with mock.patch(
+            "adapters.venues.suruhanjaya_tenaga_energy_commission.fetch_text",
+            return_value=unavailable_result,
+        ):
+            unavailable_batch = SuruhanjayaTenagaEnergyCommissionAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("unknown", unavailable_batch.metadata["freshness_state"])
+        self.assertEqual("unknown", unavailable_batch.metadata["session_state"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_programme_source_unavailable",
+            unavailable_batch.observations[0]["candidate_reject_reason"],
+        )
 
     def test_catalog_adapters_never_invent_prices(self) -> None:
         rows = contract_observations("blocked") + cross_listing_observations("reachable")
