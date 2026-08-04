@@ -69,6 +69,11 @@ from adapters.venues.polymarket import (
     fetch_sports_messages,
     parse_polymarket_sports_message,
 )
+from adapters.venues.stock_exchange_of_thailand_yuanta_securities_thailand import (
+    SOURCE_URL as SET_YUANTA_SOURCE_URL,
+    StockExchangeOfThailandYuantaSecuritiesThailandAdapter,
+    parse_set_yuanta_dr_announcement,
+)
 from adapters.venues.twse_daily import parse_twse_daily
 from scan_batch import ScanBatch
 from settings import DEFAULT_SETTINGS
@@ -151,8 +156,136 @@ class PublicAdapterParserTests(unittest.TestCase):
             "kalshi_public_prediction_markets",
             "polymarket_sports_websocket",
             "b3_public_data_hub",
+            "stock_exchange_of_thailand_yuanta_securities_thailand",
         }
         self.assertTrue(expected <= set(discover_adapters()))
+
+    def test_set_yuanta_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "stock_exchange_of_thailand_yuanta_securities_thailand"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsNotNone(adapter)
+        self.assertEqual("SET", adapter.info.venue)
+        self.assertEqual(SET_YUANTA_SOURCE_URL, adapter.info.docs_url)
+        self.assertIn("underlying_identity", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+
+    def test_set_yuanta_parser_normalizes_all_official_dr_references(self) -> None:
+        announcement = """
+        <html><body>
+          <script>record={date:"2026-07-06T18:23:00+07:00",symbol:setSymbol}</script>
+          <h1>11 New DRs issued by Yuanta</h1>
+          <p>11 new depositary receipts issued by Yuanta Securities (Thailand).</p>
+          <p>Trading will commence on July 7, 2026.</p>
+          <ul>
+            <li>"BABA19" on shares of Alibaba Group Holding Limited (9988)</li>
+            <li>"SHINCHEM19" on shares of Shin-Etsu Chemical Co., Ltd. (4063)</li>
+            <li>"AMAT19" on shares of Applied Materials, Inc. (AMAT)</li>
+            <li>"AMZN19" on shares of Amazon.com, Inc. (AMZN)</li>
+            <li>"GOOGL19" on shares of Alphabet Inc. Class A (GOOGL)</li>
+            <li>"INTEL19" on shares of Intel Corporation (INTC)</li>
+            <li>"KLAC19" on shares of KLA Corporation (KLAC)</li>
+            <li>"LRCX19" on shares of Lam Research Corporation (LRCX)</li>
+            <li>"PANW19" on shares of Palo Alto Networks, Inc. (PANW)</li>
+            <li>"CAT19" on shares of Caterpillar Inc. (CAT)</li>
+            <li>"DEAM19" on Invesco MDAX UCITS ETF Acc (DEAM)</li>
+          </ul>
+        </body></html>
+        """
+        rows = parse_set_yuanta_dr_announcement(
+            announcement,
+            received_at="2026-07-07T03:00:00+00:00",
+        )
+
+        self.assertEqual(11, len(rows))
+        by_symbol = {row["symbol"]: row for row in rows}
+        self.assertEqual("9988", by_symbol["BABA19"]["underlying_symbol"])
+        self.assertEqual("HKEX", by_symbol["BABA19"]["underlying_venue"])
+        self.assertEqual("INTC", by_symbol["INTEL19"]["underlying_symbol"])
+        self.assertEqual("DEUTSCHE_BOERSE", by_symbol["DEAM19"]["underlying_venue"])
+        self.assertEqual("listed", by_symbol["AMZN19"]["session_status"])
+        self.assertEqual("fresh", by_symbol["AMZN19"]["freshness_state"])
+        self.assertEqual("reachable", by_symbol["AMZN19"]["fetch_status"])
+        self.assertEqual(SET_YUANTA_SOURCE_URL, by_symbol["AMZN19"]["source_url"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in rows))
+        self.assertTrue(all(row["last"] == 0.0 for row in rows))
+
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": announcement,
+            "received_at": "2026-07-07T03:00:00+00:00",
+            "latency_ms": 3.0,
+        }
+        with mock.patch(
+            "adapters.venues.stock_exchange_of_thailand_yuanta_securities_thailand.fetch_text",
+            return_value=result,
+        ):
+            batch = StockExchangeOfThailandYuantaSecuritiesThailandAdapter().scan({})
+        self.assertEqual([], batch.candidates)
+        self.assertEqual(11, len(batch.observations))
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("fresh", batch.metadata["freshness_state"])
+        self.assertEqual("listed", batch.metadata["session_state"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertTrue(batch.metadata["paper_only"])
+
+    def test_set_yuanta_adapter_preserves_reachable_parser_failure(self) -> None:
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html>an unrelated SET page</html>",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.stock_exchange_of_thailand_yuanta_securities_thailand.fetch_text",
+            return_value=result,
+        ):
+            batch = StockExchangeOfThailandYuantaSecuritiesThailandAdapter().scan({})
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable", batch.metadata["fetch_status"]["announcement"]["fetch_status"]
+        )
+        self.assertEqual("unknown", batch.metadata["freshness_state"])
+        self.assertEqual("unknown", batch.metadata["session_state"])
+        self.assertIn("marker", batch.metadata["parser_failures"][0]["error"])
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_listing_parser_failure",
+            batch.observations[0]["candidate_reject_reason"],
+        )
+        self.assertTrue(batch.observations[0]["parser_failure"])
+
+    def test_set_yuanta_adapter_emits_watch_only_fetch_evidence_when_unavailable(self) -> None:
+        result = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T12:01:00+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch(
+            "adapters.venues.stock_exchange_of_thailand_yuanta_securities_thailand.fetch_text",
+            return_value=result,
+        ):
+            batch = StockExchangeOfThailandYuantaSecuritiesThailandAdapter().scan({})
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("blocked", batch.metadata["source_status"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertEqual("blocked", batch.metadata["fetch_status"]["announcement"]["fetch_status"])
+        self.assertEqual("unknown", batch.metadata["freshness_state"])
+        self.assertEqual("unknown", batch.metadata["session_state"])
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        self.assertEqual("blocked", batch.observations[0]["fetch_status"])
+        self.assertEqual(SET_YUANTA_SOURCE_URL, batch.observations[0]["source_url"])
 
     def test_b3_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
         self.assertIn("b3_public_data_hub", discover_adapters())
