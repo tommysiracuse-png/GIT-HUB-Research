@@ -86,7 +86,12 @@ def update_contextual_stats(conn: sqlite3.Connection) -> None:
         except json.JSONDecodeError:
             context = {}
         stats_scope = str(context.get("signal_stats_scope") or "direct")
-        context_prefix = "paper_proxy|" if stats_scope == "paper_proxy" else ""
+        if stats_scope == "paper_proxy":
+            context_prefix = "paper_proxy|"
+        elif stats_scope == "synthetic_research":
+            context_prefix = "synthetic_research|"
+        else:
+            context_prefix = ""
         keys = [
             f"{context_prefix}venue:{context.get('venue')}",
             f"{context_prefix}trade_type:{context.get('trade_type')}",

@@ -28,6 +28,15 @@
     "max_new_paper_trades": 50,
     "hold_minutes": 60
   },
+  "paper_exploration": {
+    "enabled": true,
+    "synthetic_route_id": "synthetic_research_paper",
+    "synthetic_allocation_multiplier": 0.25,
+    "diagnose_allocation_multiplier": 0.25,
+    "max_stale_minutes": 90.0,
+    "zero_admission_revert_loops": 3,
+    "guard_value_horizon_minutes": 60
+  },
   "paper_route_feasibility_gate": {
     "enabled": true,
     "min_score": 0.65

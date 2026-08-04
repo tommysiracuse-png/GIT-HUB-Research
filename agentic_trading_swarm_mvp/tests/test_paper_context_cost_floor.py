@@ -353,7 +353,7 @@ class PaperContextCostFloorTests(unittest.TestCase):
         self.assertLess(annotated["score"], 80.0)
         self.assertIn("paper_context_cost_gate", annotated)
 
-    def test_review_rejects_low_gross_edge_even_when_net_edge_minimum_passes(self) -> None:
+    def test_review_tags_low_gross_edge_without_blocking_exploration(self) -> None:
         candidate = frontier_candidate(
             gross_edge_bps_estimate=24.0,
             edge_bps_estimate=18.0,
@@ -361,10 +361,11 @@ class PaperContextCostFloorTests(unittest.TestCase):
 
         review = review_candidate(candidate, copy.deepcopy(DEFAULT_SETTINGS), {})
 
-        self.assertEqual(review["decision"], "reject")
+        self.assertEqual(review["decision"], "approve_paper_trade")
         self.assertTrue(
-            any("paper context cost floor not cleared" in block for block in review["hard_blocks"])
+            any("paper context cost floor not cleared" in block for block in review["would_block_reasons"])
         )
+        self.assertEqual([], review["hard_blocks"])
         self.assertFalse(review["paper_context_cost_gate"]["eligible"])
 
     def test_discovery_proxy_short_has_hard_liquidity_and_freshness_floor(self) -> None:
@@ -437,7 +438,7 @@ class PaperContextCostFloorTests(unittest.TestCase):
         self.assertFalse(live_gate["enabled"])
         self.assertTrue(live_gate["eligible"])
 
-    def test_fill_boundary_prioritizes_proxy_family_quarantine(self) -> None:
+    def test_fill_boundary_records_proxy_quarantine_but_allows_exploration(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         init_db(conn)
@@ -465,16 +466,9 @@ class PaperContextCostFloorTests(unittest.TestCase):
 
         result = execute_order(conn, candidate, approved_review, DEFAULT_SETTINGS)
 
-        self.assertFalse(result["paper_filled"])
-        self.assertEqual(result["order"]["status"], "shadow_filtered")
-        self.assertEqual(
-            result["order"]["shadow_filter"]["reason"],
-            "quarantined_family_decay",
-        )
-        self.assertEqual(
-            result["order"]["shadow_filter"]["family_key"],
-            "YAHOO_PROXY|global_proxy_momentum",
-        )
+        self.assertTrue(result["paper_filled"])
+        self.assertEqual(result["order"]["status"], "paper_filled")
+        self.assertEqual(result["order"]["signal_stats_scope"], "direct")
 
     def test_new_outcome_persists_realized_cost_backfill_audit(self) -> None:
         conn = sqlite3.connect(":memory:")

@@ -41,6 +41,8 @@ from memory_graph import ingest_radar_memory, memory_summary
 from okx_perp_scanner import build_scan_batch as build_okx_scan_batch
 from paper_context_cost import paper_context_cost_report
 from okx_signal_research import run_okx_signal_research
+from paper_exploration import exploration_enabled, fair_lineage_order, prepare_candidate_for_exploration
+from paper_exploration_report import write_paper_exploration_report
 from prediction_market_scanner import build_scan_batch as build_prediction_market_scan_batch
 from route_resolver import enrich_candidates, write_route_resolver_report
 from scan_batch import merge_observations, normalize_observation
@@ -82,6 +84,7 @@ from storage import (
     performance_summary,
     record_due_horizon_outcomes,
     save_opportunity,
+    update_opportunity_decision,
 )
 from yahoo_counterfactual import run_yahoo_counterfactual_analysis
 
@@ -499,6 +502,7 @@ def run_once(settings: dict) -> dict:
             candidates.extend(enrich_candidates(selected_strategy_lab_candidates, settings))
             candidates.sort(key=lambda row: row["score"], reverse=True)
         candidates, strategy_reliability = apply_strategy_reliability(candidates, settings, conn=conn)
+        candidates = [prepare_candidate_for_exploration(candidate, settings) for candidate in candidates]
         route_resolver_report = write_route_resolver_report(candidates, settings)
         expansion_map = _build_expansion_map(
             frontier_crypto_venues,
@@ -542,7 +546,11 @@ def run_once(settings: dict) -> dict:
             settings,
             review_limit,
         )
-        non_lab_candidates = [candidate for candidate in candidates if not candidate.get("strategy_lab_id")]
+        non_lab_candidates = fair_lineage_order(
+            [candidate for candidate in candidates if not candidate.get("strategy_lab_id")],
+            int(time.time() // 60),
+            settings,
+        )
         hunter_review_slots = max(0, review_limit - len(reserved_lab_candidates))
         hunter_cfg = settings.get("hunter_allocation", {})
         if hunter_cfg.get("enabled", True) and hunter_cfg.get("apply_to_candidate_review", True):
@@ -574,20 +582,49 @@ def run_once(settings: dict) -> dict:
         opened = []
         for candidate in review_candidates:
             review = review_candidate(candidate, settings, adjustments, policies=policies)
-            save_opportunity(conn, candidate, review)
+            opportunity_id = save_opportunity(conn, candidate, review)
             record_review_policy_effects(conn, review)
-            reviewed.append({"candidate": candidate, "review": review})
+            reviewed.append({"candidate": candidate, "review": review, "opportunity_id": opportunity_id})
 
-        for item in reviewed:
+        execution_queue = reviewed
+        if exploration_enabled(settings) and reviewed:
+            # Rotate the starting lineage each minute so a stable top-ranked set
+            # cannot permanently monopolize a bounded paper-execution budget.
+            offset = int(time.time() // 60) % len(reviewed)
+            execution_queue = reviewed[offset:] + reviewed[:offset]
+
+        for item in execution_queue:
             candidate = item["candidate"]
             review = item["review"]
             if len(opened) >= int(scan_cfg["max_new_paper_trades"]):
+                if exploration_enabled(settings):
+                    deferred = dict(review, decision="deferred_capacity", deferral_reason="max_new_paper_trades")
+                    update_opportunity_decision(conn, item["opportunity_id"], "deferred_capacity", deferred)
+                    item["review"] = deferred
+                    continue
                 break
             if count_open_trades(conn) >= int(risk_cfg["max_open_paper_trades"]):
+                if exploration_enabled(settings):
+                    deferred = dict(review, decision="deferred_capacity", deferral_reason="max_open_paper_trades")
+                    update_opportunity_decision(conn, item["opportunity_id"], "deferred_capacity", deferred)
+                    item["review"] = deferred
+                    continue
                 break
             if review["decision"] not in {"approve_paper_trade", "approve_conditional_paper_trade"}:
                 continue
             if has_open_trade(conn, candidate["inst_id"], candidate["direction"]):
+                duplicate = dict(
+                    review,
+                    decision="reject_duplicate_open_exposure",
+                    hard_blocks=list(review.get("hard_blocks") or []) + ["duplicate open exposure"],
+                )
+                update_opportunity_decision(
+                    conn,
+                    item["opportunity_id"],
+                    "reject_duplicate_open_exposure",
+                    duplicate,
+                )
+                item["review"] = duplicate
                 continue
             execution = execute_order(conn, candidate, review, settings)
             if not execution["paper_filled"]:
@@ -621,6 +658,7 @@ def run_once(settings: dict) -> dict:
             )
 
         signal_safety_governor = run_signal_safety_governor(conn, settings)
+        paper_exploration = write_paper_exploration_report(conn, settings, reviewed=reviewed)
         market_admission = run_market_admission_monitor(
             conn,
             settings,
@@ -644,6 +682,7 @@ def run_once(settings: dict) -> dict:
         auto_improvement["market_admission_bridge"] = market_admission_bridge.get("summary", {})
         auto_improvement["expansion_map"] = expansion_map
         auto_improvement["self_improvement_open_pack"] = self_improvement_open_pack
+        auto_improvement["paper_exploration"] = paper_exploration
         auto_improvement = write_self_improvement_reports(conn, auto_improvement)
         summary = performance_summary(conn)
         maintenance = perform_maintenance(conn, settings)
@@ -665,6 +704,7 @@ def run_once(settings: dict) -> dict:
             "market_admission": market_admission,
             "market_admission_bridge": market_admission_bridge,
             "opened": opened,
+            "paper_exploration": paper_exploration,
             "summary": summary,
             "execution_summary": execution_summary(conn),
             "maintenance": maintenance,

@@ -15,6 +15,7 @@ import json
 import math
 import sqlite3
 
+from paper_exploration import exploration_enabled
 from storage import RUNS_DIR, add_memory_fact, add_self_improvement_experiment, add_signal_policy, utc_now
 
 
@@ -286,6 +287,7 @@ def _policy_for(mode: str, reason: str, stats: dict, recent: dict, settings: dic
     if probation_reason and not severe:
         allocation_multiplier = _signal_key_probation_weight(cfg)
     probation_detail = _signal_key_probation_detail(stats, cfg) if probation_reason else None
+    exploration = exploration_enabled(settings)
     return {
         "governor_mode": mode,
         "reason": reason,
@@ -294,7 +296,8 @@ def _policy_for(mode: str, reason: str, stats: dict, recent: dict, settings: dic
         "min_net_edge_bps": max(float(risk.get("min_net_edge_bps", 2.0)) + (10.0 if severe else 4.0), 8.0 if severe else 5.0),
         "max_spread_bps": min(float(risk.get("max_spread_bps", 8.0)), 3.5 if severe else 5.0),
         "allocation_multiplier": allocation_multiplier,
-        "pause_entries": severe,
+        "pause_entries": severe and not exploration,
+        "would_pause_outside_exploration": severe and exploration,
         "expires_after_trades": None,
         "expires_at": probation_detail["expires_at"] if probation_detail else None,
         "allow_recovery_probes": True,

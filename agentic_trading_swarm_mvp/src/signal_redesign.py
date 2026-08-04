@@ -1278,6 +1278,7 @@ def _reliable_paper_metrics(conn: sqlite3.Connection, horizon: int = 60) -> dict
           and o.measurement_status = 'valid'
           and o.pnl_bps is not null
           and p.trade_type = 'frontier_crypto_venue_map'
+          and coalesce(json_extract(p.context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
         """,
         (horizon,),
     ).fetchall()
@@ -1307,6 +1308,7 @@ def _diagnostic_groups(conn: sqlite3.Connection) -> dict:
         from paper_trade_outcomes o
         join paper_trades p on p.id = o.trade_id
         where p.trade_type = 'frontier_crypto_venue_map'
+          and coalesce(json_extract(p.context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
         order by o.horizon_minutes, p.id
         """
     ).fetchall()

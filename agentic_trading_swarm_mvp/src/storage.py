@@ -25,6 +25,8 @@ _PAPER_LONG_DIRECTIONS = frozenset(
         "long_frontier_perp",
         "buy_yes_event",
         "buy_no_event",
+        "yes",
+        "no",
     }
 )
 _PAPER_SHORT_DIRECTIONS = frozenset(
@@ -1191,6 +1193,22 @@ def _migrate_paper_trade_outcomes(conn: sqlite3.Connection) -> None:
 
 def signal_key(candidate: dict) -> str:
     status = candidate.get("execution_feasibility", {}).get("status", "unknown")
+    if candidate.get("signal_stats_scope") == "synthetic_research" or candidate.get("synthetic_research_paper"):
+        explicit = str(candidate.get("signal_key") or "")
+        if explicit.startswith("SYNTHETIC_RESEARCH|"):
+            return explicit
+        direct_key = str(
+            candidate.get("direct_signal_key")
+            or "|".join(
+                (
+                    str(candidate.get("venue") or "unknown"),
+                    str(candidate.get("trade_type") or "unknown"),
+                    str(candidate.get("direction") or "unknown"),
+                    str(status),
+                )
+            )
+        )
+        return f"SYNTHETIC_RESEARCH|{direct_key}"
     if (
         candidate.get("signal_stats_scope") == "paper_proxy"
         or candidate.get("paper_proxy_activated") is True
@@ -1245,8 +1263,8 @@ def signal_key(candidate: dict) -> str:
     )
 
 
-def save_opportunity(conn: sqlite3.Connection, candidate: dict, review: dict) -> None:
-    conn.execute(
+def save_opportunity(conn: sqlite3.Connection, candidate: dict, review: dict) -> int:
+    cur = conn.execute(
         """
         insert into opportunities (
             seen_at, venue, inst_id, direction, trade_type, base_score, learned_score,
@@ -1267,6 +1285,20 @@ def save_opportunity(conn: sqlite3.Connection, candidate: dict, review: dict) ->
             candidate.get("strategy_lab_id"),
             int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
         ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def update_opportunity_decision(
+    conn: sqlite3.Connection,
+    opportunity_id: int,
+    decision: str,
+    review: dict,
+) -> None:
+    conn.execute(
+        "update opportunities set decision = ?, review_json = ? where id = ?",
+        (str(decision), json.dumps(review, sort_keys=True), int(opportunity_id)),
     )
     conn.commit()
 
@@ -1334,6 +1366,7 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "route_status": candidate.get("paper_route_status") or (review or {}).get("route_status") or candidate.get("route_status") or route.get("route_status"),
         "missing_requirements": (review or {}).get("missing_requirements") or route.get("missing_permissions", []),
         "signal_stats_scope": candidate.get("signal_stats_scope") or "direct",
+        "synthetic_research_paper": bool(candidate.get("synthetic_research_paper")),
         "paper_execution_semantics": candidate.get("paper_execution_semantics"),
         "paper_proxy_not_live_equivalent": bool(candidate.get("paper_proxy_not_live_equivalent")),
         "direct_signal_key": candidate.get("direct_signal_key"),
@@ -2218,11 +2251,43 @@ def record_due_horizon_outcomes(
 
 
 def performance_summary(conn: sqlite3.Connection) -> dict:
-    rows = conn.execute("select pnl_bps from paper_trades where status = 'closed'").fetchall()
+    rows = conn.execute(
+        """
+        select pnl_bps
+        from paper_trades
+        where status = 'closed'
+          and coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
+        """
+    ).fetchall()
     pnls = [float(row["pnl_bps"]) for row in rows if row["pnl_bps"] is not None]
-    open_count = count_open_trades(conn)
+    open_count = int(
+        conn.execute(
+            """
+            select count(*) as n
+            from paper_trades
+            where status = 'open'
+              and coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
+            """
+        ).fetchone()["n"]
+    )
+    synthetic_row = conn.execute(
+        """
+        select count(*) as total,
+               sum(case when status = 'open' then 1 else 0 end) as open_count,
+               sum(case when status = 'closed' and pnl_bps is not null then 1 else 0 end) as closed_count,
+               avg(case when status = 'closed' then pnl_bps end) as avg_pnl_bps
+        from paper_trades
+        where json_extract(context_json, '$.signal_stats_scope') = 'synthetic_research'
+        """
+    ).fetchone()
+    synthetic = {
+        "total": int(synthetic_row["total"] or 0),
+        "open": int(synthetic_row["open_count"] or 0),
+        "closed": int(synthetic_row["closed_count"] or 0),
+        "avg_pnl_bps": round(float(synthetic_row["avg_pnl_bps"]), 3) if synthetic_row["avg_pnl_bps"] is not None else None,
+    }
     if not pnls:
-        return {"closed": 0, "open": open_count, "avg_pnl_bps": None, "win_rate": None}
+        return {"closed": 0, "open": open_count, "avg_pnl_bps": None, "win_rate": None, "synthetic_research": synthetic}
     wins = sum(1 for pnl in pnls if pnl > 0)
     return {
         "closed": len(pnls),
@@ -2231,6 +2296,7 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
         "win_rate": round(wins / len(pnls), 3),
         "best_bps": round(max(pnls), 3),
         "worst_bps": round(min(pnls), 3),
+        "synthetic_research": synthetic,
     }
 
 

@@ -4740,6 +4740,91 @@ def _run_candidate_tests(payload: dict, cfg: dict, app_root: pathlib.Path) -> di
     return {"passed": True, "stage": "passed", "commands": commands}
 
 
+_PAPER_ADMISSION_SENSITIVE_FILES = {
+    "src/agent_review.py",
+    "src/execution_engine.py",
+    "src/paper_context_cost.py",
+    "src/paper_exploration.py",
+    "src/paper_order_router.py",
+    "src/paper_route_registry.py",
+    "src/route_resolver.py",
+    "src/signal_safety.py",
+    "src/strategy_reliability.py",
+}
+
+
+def _run_paper_admission_replay_gate(
+    payload: dict,
+    safety: dict,
+    root: pathlib.Path,
+    candidate_root: pathlib.Path,
+    cfg: dict,
+) -> dict:
+    changed = {str(item).replace("\\", "/") for item in (safety.get("changed_files") or [])}
+    if not changed.intersection(_PAPER_ADMISSION_SENSITIVE_FILES):
+        return {"passed": True, "status": "not_applicable", "reason": "no_admission_sensitive_files"}
+    db_path = root / "runs" / "radar.sqlite"
+    if not db_path.exists():
+        return {"passed": True, "status": "skipped", "reason": "runtime_database_unavailable"}
+    timeout = int(cfg.get("sandbox_timeout_seconds", 120))
+    with tempfile.TemporaryDirectory(prefix="paper-admission-replay-") as temp_dir:
+        before_path = pathlib.Path(temp_dir) / "before.json"
+        after_path = pathlib.Path(temp_dir) / "after.json"
+        before_command = [
+            sys.executable,
+            "src/paper_admission_replay.py",
+            "--db",
+            str(db_path),
+            "--output",
+            str(before_path),
+        ]
+        after_command = [
+            sys.executable,
+            "src/paper_admission_replay.py",
+            "--db",
+            str(db_path),
+            "--output",
+            str(after_path),
+        ]
+        before_run = _run(before_command, root, timeout)
+        after_run = _run(after_command, candidate_root, timeout)
+        if before_run["returncode"] != 0 or after_run["returncode"] != 0:
+            return {
+                "passed": False,
+                "status": "paper_admission_replay_failed",
+                "reason": "replay_process_failed",
+                "before_command": before_run,
+                "after_command": after_run,
+            }
+        before = json.loads(before_path.read_text(encoding="utf-8"))
+        after = json.loads(after_path.read_text(encoding="utf-8"))
+    allowed_zero = {
+        str(item)
+        for item in (
+            payload.get("allow_zero_admission_lineages")
+            or (payload.get("code_change") or {}).get("allow_zero_admission_lineages")
+            or []
+        )
+    }
+    collapsed = [
+        lineage
+        for lineage, count in (before.get("admitted_by_lineage") or {}).items()
+        if int(count or 0) > 0
+        and int((after.get("admitted_by_lineage") or {}).get(lineage) or 0) == 0
+        and lineage not in allowed_zero
+    ]
+    passed = not collapsed and not after.get("errors") and not after.get("route_contradictions")
+    return {
+        "passed": passed,
+        "status": "passed" if passed else "paper_admission_replay_failed",
+        "reason": "candidate_preserves_priceable_lineages" if passed else "candidate_eliminates_or_breaks_priceable_lineage",
+        "collapsed_lineages": collapsed,
+        "allowed_zero_lineages": sorted(allowed_zero),
+        "before": before,
+        "after": after,
+    }
+
+
 def _run_git_release_pipeline(
     proposal_id: str,
     diff_text: str,
@@ -4849,6 +4934,27 @@ def _run_git_release_pipeline(
             "release": archived,
             "tests": tests,
             "evaluation": {"release": release.as_metadata(), "reason": "candidate_tests_failed"},
+        }
+
+    admission_replay = _run_paper_admission_replay_gate(payload, safety, root, app_root, cfg)
+    tests["paper_admission_replay"] = admission_replay
+    if not admission_replay.get("passed"):
+        release.status = "archived_failed"
+        if preserve_failed_candidate:
+            archived = archive("implementation_paused", reason="paper_admission_replay_failed")
+            return {
+                "status": "implementation_paused",
+                "release": archived,
+                "tests": tests,
+                "evaluation": {"release": release.as_metadata(), "reason": "paper_admission_replay_failed"},
+            }
+        cleanup = cleanup_worktree(release, root)
+        archived = archive("archived_failed", cleanup=cleanup, reason="paper_admission_replay_failed")
+        return {
+            "status": "archived_failed",
+            "release": archived,
+            "tests": tests,
+            "evaluation": {"release": release.as_metadata(), "reason": "paper_admission_replay_failed"},
         }
 
     category = str(safety.get("category") or "")
@@ -5786,6 +5892,27 @@ def _evaluate_promoted_codex_health(conn: Any, settings: dict, root: pathlib.Pat
         for name, path in existing_artifacts.items():
             if not _runtime_artifact_advanced(path, applied_at):
                 failures.append(f"{name}_not_advanced")
+        changed_files = {
+            str(item).replace("\\", "/")
+            for item in (row.get("changed_files") or safety.get("changed_files") or [])
+        }
+        zero_admission_lineages: dict[str, int] = {}
+        exploration_report_path = RUNS_DIR / "paper_exploration_report.json"
+        if changed_files.intersection(_PAPER_ADMISSION_SENSITIVE_FILES) and exploration_report_path.exists():
+            try:
+                exploration_report = json.loads(exploration_report_path.read_text(encoding="utf-8"))
+                threshold = int(
+                    (settings.get("paper_exploration") or {}).get("zero_admission_revert_loops", 3)
+                )
+                zero_admission_lineages = {
+                    str(lineage): int(streak)
+                    for lineage, streak in (exploration_report.get("admission_zero_streaks") or {}).items()
+                    if int(streak) >= threshold
+                }
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                zero_admission_lineages = {}
+            if zero_admission_lineages:
+                failures.append("active_priceable_lineage_zero_admissions")
         health = {
             "checked_at": _utc_now(),
             "applied_at": applied_at.isoformat(),
@@ -5793,6 +5920,7 @@ def _evaluate_promoted_codex_health(conn: Any, settings: dict, root: pathlib.Pat
             "required_loops": required_loops,
             "failures": failures,
             "artifacts_checked": {name: str(path) for name, path in existing_artifacts.items()},
+            "zero_admission_lineages": zero_admission_lineages,
         }
         if failures:
             promotion = evaluation.get("promotion") if isinstance(evaluation.get("promotion"), dict) else {}

@@ -3058,6 +3058,9 @@ def _experiment_outcomes(
         item = dict(row)
         status = str(item.get("measurement_status") or "missing")
         candidate = _json_loads(item.get("candidate_json"), {})
+        if str(candidate.get("signal_stats_scope") or "direct") == "synthetic_research":
+            status_counts["synthetic_research_excluded"] += 1
+            continue
         if experiment is not None:
             compatibility = _surface_compatibility(experiment, candidate)
             if not compatibility["eligible"]:

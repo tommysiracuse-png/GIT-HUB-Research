@@ -40,6 +40,15 @@ DEFAULT_SETTINGS = {
         "enable_frontier_crypto_adapter_scan": True,
         "frontier_crypto_review_top": 120,
     },
+    "paper_exploration": {
+        "enabled": True,
+        "synthetic_route_id": "synthetic_research_paper",
+        "synthetic_allocation_multiplier": 0.25,
+        "diagnose_allocation_multiplier": 0.25,
+        "max_stale_minutes": 90.0,
+        "zero_admission_revert_loops": 3,
+        "guard_value_horizon_minutes": 60,
+    },
     "paper_route_feasibility_gate": {
         "enabled": True,
         "min_score": 0.65,

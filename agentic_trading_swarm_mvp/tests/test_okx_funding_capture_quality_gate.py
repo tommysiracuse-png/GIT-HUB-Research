@@ -188,7 +188,7 @@ class TestOkxFundingCaptureQualityGate(unittest.TestCase):
         self.assertEqual([], rejected)
         self.assertTrue(generated[0]["strategy_lab_id"].startswith("okx_funding_capture_quality_gate_"))
 
-    def test_missing_hedge_contract_is_rejected_before_strategy_lab_scoring(self):
+    def test_single_perpetual_funding_capture_does_not_require_hedge_contract(self):
         settings = copy.deepcopy(DEFAULT_SETTINGS)
         settings["allow_live_trading"] = False
         candidate = {
@@ -212,12 +212,9 @@ class TestOkxFundingCaptureQualityGate(unittest.TestCase):
             self_improvement.ingest_strategy_lab_recommendation(conn, self._recommendation())
             generated, report = generate_strategy_lab_candidates(conn, settings, [candidate])
 
-        self.assertEqual([], generated)
-        self.assertEqual(1, report["route_ineligible_candidate_count"])
-        self.assertEqual(
-            1,
-            report["route_ineligible_missing_prerequisite_counts"]["hedge_venue"],
-        )
+        self.assertEqual(1, len(generated))
+        self.assertEqual(0, report["route_ineligible_candidate_count"])
+        self.assertEqual({}, report["route_ineligible_missing_prerequisite_counts"])
 
 
 if __name__ == "__main__":

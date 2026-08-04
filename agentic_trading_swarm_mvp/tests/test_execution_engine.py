@@ -18,7 +18,7 @@ from storage import init_db  # noqa: E402
 
 
 class ExecutionEnginePaperGuardTests(unittest.TestCase):
-    def test_unconfirmed_frontier_spot_borrow_creates_shadow_ticket_no_fill(self) -> None:
+    def test_unconfirmed_frontier_spot_borrow_creates_isolated_synthetic_fill(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         init_db(conn)
@@ -55,14 +55,17 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
 
         result = execute_order(conn, candidate, review, DEFAULT_SETTINGS)
 
-        self.assertFalse(result["paper_filled"])
-        self.assertEqual(result["order"]["status"], "shadow_filtered")
-        self.assertEqual(result["fills"], [])
+        self.assertTrue(result["paper_filled"])
+        self.assertEqual(result["order"]["status"], "paper_filled")
+        self.assertEqual(result["order"]["route_id"], "synthetic_research_paper")
+        self.assertEqual(result["order"]["signal_stats_scope"], "synthetic_research")
+        self.assertEqual(len(result["fills"]), 1)
         row = conn.execute("select status, order_json, candidate_json from execution_orders").fetchone()
-        self.assertEqual(row["status"], "shadow_filtered")
-        self.assertIn("spot_borrow_unconfirmed", row["order_json"])
+        self.assertEqual(row["status"], "paper_filled")
+        self.assertIn("synthetic_research_paper", row["order_json"])
         saved_candidate = json.loads(row["candidate_json"])
-        self.assertTrue(saved_candidate["shadow_filtered"])
+        self.assertTrue(saved_candidate["synthetic_research_paper"])
+        self.assertIn("spot_borrow", saved_candidate["synthetic_route_blockers"])
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import pathlib
 import sqlite3
 from typing import Iterable
 
+from paper_exploration import exploration_enabled
 from storage import (
     RUNS_DIR,
     add_memory_fact,
@@ -625,13 +626,16 @@ def _policy_payload(group: dict, settings: dict) -> dict:
     cfg = settings.get("contextual_failure_filters", {})
     risk = settings.get("risk", {})
     severe = float(group.get("avg_pnl_bps") or 0.0) <= -100.0 or float(group.get("worst_bps") or 0.0) <= -1000.0
+    exploration = exploration_enabled(settings)
+    would_pause = bool(severe and group["dimension"] not in {"instrument", "hour_utc"})
     return {
         "context_filter": group["context_filter"],
         "min_score_delta": 10.0 if severe else 6.0,
         "min_net_edge_bps": max(float(risk.get("min_net_edge_bps", 2.0)) + (8.0 if severe else 4.0), 6.0),
         "max_spread_bps": min(float(risk.get("max_spread_bps", 8.0)), 4.0 if severe else 5.0),
         "allocation_multiplier": 0.1 if severe else 0.25,
-        "pause_entries": bool(severe and group["dimension"] not in {"instrument", "hour_utc"}),
+        "pause_entries": would_pause and not exploration,
+        "would_pause_outside_exploration": would_pause and exploration,
         "expires_after_trades": int(cfg.get("default_policy_trade_ttl", 30)),
         "allow_recovery_probes": True,
         "recovery_probe_every_n_reviews": int(cfg.get("recovery_probe_every_reviews", 25)),

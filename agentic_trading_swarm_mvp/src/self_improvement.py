@@ -15,6 +15,7 @@ import re
 import shlex
 import sqlite3
 
+from paper_exploration import exploration_enabled
 from storage import (
     RUNS_DIR,
     active_signal_policies,
@@ -1725,12 +1726,14 @@ def _policy_for_signal(stats: dict, settings: dict) -> dict:
     moderate_loss = avg <= -20 or win_rate < 0.4
     min_edge = max(float(risk.get("min_net_edge_bps", 2.0)) + (6.0 if severe_loss else 3.0), 5.0)
     max_spread = min(float(risk.get("max_spread_bps", 8.0)), 4.0 if severe_loss else 5.0)
+    exploration = exploration_enabled(settings)
     return {
         "min_score_delta": 12.0 if severe_loss else 7.0 if moderate_loss else 4.0,
         "min_net_edge_bps": round(min_edge, 3),
         "max_spread_bps": round(max_spread, 3),
-        "allocation_multiplier": 0.0 if severe_loss else 0.25 if moderate_loss else 0.5,
-        "pause_entries": severe_loss,
+        "allocation_multiplier": 0.25 if severe_loss and exploration else 0.0 if severe_loss else 0.25 if moderate_loss else 0.5,
+        "pause_entries": severe_loss and not exploration,
+        "would_pause_outside_exploration": severe_loss and exploration,
         "expires_after_trades": int(improvement_cfg.get("default_policy_trade_ttl", 30)),
         "allow_recovery_probes": True,
         "recovery_probe_every_n_reviews": int(
@@ -2631,6 +2634,15 @@ def _report_markdown(report: dict) -> str:
             f"- Already-deployed artifacts closed this loop: `{reconciliation.get('closed_count', 0)}` "
             f"across `{reconciliation.get('closed_by_category', {})}`; "
             f"reconciled total `{reconciliation.get('reconciled_total_count', 0)}`"
+        )
+    exploration = report.get("paper_exploration") or {}
+    if exploration:
+        exploration_summary = exploration.get("summary") or {}
+        lines.append(
+            f"- Paper exploration: direct `{exploration_summary.get('direct_paper_trades', 0)}`, "
+            f"synthetic `{exploration_summary.get('synthetic_paper_trades', 0)}`, "
+            f"capacity deferred (24h) `{exploration_summary.get('capacity_deferrals_24h', 0)}`, "
+            f"true invalid-data rejections (24h) `{exploration_summary.get('true_invalid_data_rejections_24h', 0)}`"
         )
     lines.extend(
         [

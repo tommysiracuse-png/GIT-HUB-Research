@@ -13,10 +13,13 @@ import sqlite3
 
 from paper_order_router import apply_frontier_paper_guard
 from paper_context_cost import enforce_paper_context_cost_gate
+from paper_exploration import exploration_enabled, prepare_candidate_for_exploration
 from storage import save_execution_fill, save_execution_order
 
 
 def _side_for_direction(direction: str) -> str:
+    if direction in {"yes", "no"}:
+        return "buy"
     if direction.startswith("buy_") or direction.startswith("long_"):
         return "buy"
     if direction.startswith("sell_") or direction.startswith("short_"):
@@ -36,6 +39,8 @@ def _side_for_direction(direction: str) -> str:
 
 
 def _route_for_candidate(candidate: dict, review: dict) -> str:
+    if candidate.get("synthetic_research_paper"):
+        return str(candidate.get("route_id") or "synthetic_research_paper")
     resolved_route = (
         review.get("effective_route_id")
         or review.get("route_id")
@@ -73,6 +78,8 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
                 float(candidate.get("paper_route_registry_allocation_multiplier", 1.0)),
             ),
         )
+        if exploration_enabled(settings):
+            registry_multiplier = max(registry_multiplier, review_multiplier)
         notional *= min(review_multiplier, registry_multiplier)
     if mode == "live":
         notional = min(notional, float(risk.get("max_live_notional_usd", 0.0)))
@@ -132,11 +139,13 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         "execution_semantics": (
             "proxy_not_live_equivalent"
             if proxy_not_live_equivalent
-            else review.get("execution_semantics") or "direct_live_equivalent"
+            else candidate.get("paper_execution_semantics") or review.get("execution_semantics") or "direct_live_equivalent"
         ),
         "proxy_not_live_equivalent": proxy_not_live_equivalent,
         "paper_proxy_not_live_equivalent": proxy_not_live_equivalent,
-        "signal_stats_scope": "paper_proxy" if proxy_not_live_equivalent else "direct",
+        "signal_stats_scope": candidate.get("signal_stats_scope") or review.get("signal_stats_scope") or (
+            "paper_proxy" if proxy_not_live_equivalent else "direct"
+        ),
         "signal_key": review.get("signal_key"),
         "direct_signal_key": candidate.get("direct_signal_key"),
         "direct_route_id": candidate.get("paper_proxy_source_route_id"),
@@ -155,6 +164,13 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
                 "Proxy outcomes use an isolated paper-proxy signal statistics scope.",
             ]
             if proxy_not_live_equivalent
+            else []
+        ) + (
+            [
+                "synthetic_research_paper: priceable research exposure is isolated from executable-strategy statistics.",
+                "This fill is not evidence that the direct route, account, or jurisdiction is available.",
+            ]
+            if candidate.get("synthetic_research_paper")
             else []
         ),
     }
@@ -190,24 +206,30 @@ def _paper_fill_for_leg(leg: dict, settings: dict) -> dict:
 
 
 def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
-    candidate = apply_frontier_paper_guard(candidate, settings)
-    recovery_probe = bool(
-        settings.get("mode") == "paper"
-        and not settings.get("allow_live_trading")
-        and review.get("paper_context_recovery_probe")
-        and 0.0 < float(review.get("paper_allocation_multiplier") or 0.0) <= 0.1
-        and any(
-            item.get("recovery_probe") and not item.get("blocks")
-            for item in (review.get("applied_policies") or [])
-            if isinstance(item, dict)
+    if exploration_enabled(settings):
+        candidate = prepare_candidate_for_exploration(dict(candidate), settings)
+        candidate["shadow_filtered"] = False
+        candidate["paper_fill_allowed"] = True
+        candidate["paper_entry_blocked"] = False
+    else:
+        candidate = apply_frontier_paper_guard(candidate, settings)
+        recovery_probe = bool(
+            settings.get("mode") == "paper"
+            and not settings.get("allow_live_trading")
+            and review.get("paper_context_recovery_probe")
+            and 0.0 < float(review.get("paper_allocation_multiplier") or 0.0) <= 0.1
+            and any(
+                item.get("recovery_probe") and not item.get("blocks")
+                for item in (review.get("applied_policies") or [])
+                if isinstance(item, dict)
+            )
         )
-    )
-    if not candidate.get("shadow_filtered") and not recovery_probe:
-        candidate = enforce_paper_context_cost_gate(candidate, settings)
-    elif not candidate.get("shadow_filtered") and recovery_probe:
-        candidate = dict(candidate)
-        candidate["paper_context_recovery_probe"] = True
-        candidate["gating_reason"] = "bounded_paper_recovery_probe_below_cost_floor"
+        if not candidate.get("shadow_filtered") and not recovery_probe:
+            candidate = enforce_paper_context_cost_gate(candidate, settings)
+        elif not candidate.get("shadow_filtered") and recovery_probe:
+            candidate = dict(candidate)
+            candidate["paper_context_recovery_probe"] = True
+            candidate["gating_reason"] = "bounded_paper_recovery_probe_below_cost_floor"
     order = build_order_ticket(candidate, review, settings)
     if candidate.get("shadow_filtered"):
         order["status"] = "shadow_filtered"

@@ -181,7 +181,8 @@ class SmartFailureFilterTests(unittest.TestCase):
             settings(),
         )
 
-        self.assertTrue(policy["pause_entries"])
+        self.assertFalse(policy["pause_entries"])
+        self.assertTrue(policy["would_pause_outside_exploration"])
         self.assertTrue(policy["allow_recovery_probes"])
         self.assertEqual(policy["recovery_probe_every_n_reviews"], 25)
         self.assertIn("release_criteria", policy)
@@ -191,21 +192,23 @@ class SmartFailureFilterTests(unittest.TestCase):
         candidate = {
             "venue": "OKX",
             "inst_id": "BTC-USDT-SWAP",
-            "direction": "short_perp_long_spot",
+            "direction": "funding_capture_short_perp",
             "trade_type": "perp_funding_basis",
             "score": 60.0,
             "funding_bps": 10.0,
             "basis_bps": 20.0,
             "edge_bps_estimate": 20.0,
+            "gross_edge_bps_estimate": 5.0,
             "liquidity_score": 0.9,
             "spread_bps": 1.0,
             "signal_age_seconds": 0.0,
             "change_24h_pct": 0.0,
+            "last": 100.0,
             "execution_feasibility": {"status": "standard", "route_status": "standard"},
         }
         policy = {
             "policy_id": "p1",
-            "signal_key": "OKX|perp_funding_basis|short_perp_long_spot|standard",
+            "signal_key": "OKX|perp_funding_basis|funding_capture_short_perp|standard",
             "market_key": "OKX|perp_funding_basis",
             "policy_type": "failure_filter",
             "allocation_multiplier": 0.0,

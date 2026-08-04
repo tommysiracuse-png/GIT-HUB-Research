@@ -9,6 +9,13 @@ from __future__ import annotations
 
 from contextual_failure_filters import build_context_features, context_matches
 from paper_context_cost import paper_context_cost_gate
+from paper_exploration import (
+    exploration_config,
+    exploration_enabled,
+    limit_matched_policies,
+    prepare_candidate_for_exploration,
+    split_exploration_blocks,
+)
 from storage import signal_key
 
 
@@ -78,6 +85,7 @@ def review_candidate(
     adjustments: dict[str, float],
     policies: list[dict] | None = None,
 ) -> dict:
+    candidate = prepare_candidate_for_exploration(candidate, settings)
     risk = settings["risk"]
     key = signal_key(candidate)
     adjustment = adjustments.get(key, 0.0)
@@ -103,7 +111,10 @@ def review_candidate(
     net_edge_bps = estimate_net_edge_bps(candidate, settings)
     context_cost_gate = paper_context_cost_gate(candidate, settings)
     context_features = build_context_features(candidate, {}, net_edge_bps=net_edge_bps)
-    matched_policies = _matching_policies(key, policies, context_features)
+    matched_policies = limit_matched_policies(
+        _matching_policies(key, policies, context_features),
+        settings,
+    )
     context_recovery_probe_due = any(_recovery_probe_due(policy) for policy in matched_policies)
 
     evidence = []
@@ -112,7 +123,15 @@ def review_candidate(
     applied_policies = []
     allocation_multiplier = max(
         0.0,
-        min(1.0, float(candidate.get("quality_allocation_multiplier", 1.0))),
+        min(
+            1.0,
+            float(
+                candidate.get(
+                    "paper_allocation_multiplier",
+                    candidate.get("quality_allocation_multiplier", 1.0),
+                )
+            ),
+        ),
     )
     if context_cost_gate.get("applicable") and context_cost_gate.get("enabled"):
         allocation_multiplier = min(
@@ -267,13 +286,21 @@ def review_candidate(
                 "policy_id": policy_id,
                 "policy_type": policy.get("policy_type"),
                 "allocation_multiplier": allocation_multiplier,
-                "filtered": bool(policy_blocks),
+                "filtered": bool(policy_blocks) and not exploration_enabled(settings),
+                "would_block": bool(policy_blocks),
                 "recovery_probe": bool(is_recovery_probe and not policy_blocks),
                 "context_filter": context_filter,
                 "matched_context": {key: context_features.get(key) for key in context_filter},
                 "blocks": policy_blocks,
             }
         )
+
+    hard_blocks, would_block_reasons = split_exploration_blocks(candidate, hard_blocks, settings)
+    if would_block_reasons:
+        candidate["paper_exploration_would_block_reasons"] = list(would_block_reasons)
+        candidate["_hunter_bucket"] = "diagnose"
+        floor = float(exploration_config(settings).get("diagnose_allocation_multiplier", 0.25))
+        allocation_multiplier = max(allocation_multiplier, max(0.01, min(1.0, floor)))
 
     route_research_blocks = (
         "trade route unknown",
@@ -294,6 +321,8 @@ def review_candidate(
     if decision == "approve_paper_trade" and candidate.get("quality_action") == "conditional":
         decision = "approve_conditional_paper_trade"
     if decision == "approve_paper_trade" and route_alternative_usable:
+        decision = "approve_conditional_paper_trade"
+    if not hard_blocks and candidate.get("synthetic_research_paper"):
         decision = "approve_conditional_paper_trade"
 
     confidence = 0.5
@@ -341,7 +370,10 @@ def review_candidate(
         "rank_contribution_cap": paper_route_eligibility.get("rank_contribution_cap"),
         "rank_contribution": paper_route_eligibility.get("rank_contribution"),
         "missing_requirements": missing_requirements,
-        "direct_missing_requirements": missing_requirements if route_alternative_usable else [],
+        "direct_missing_requirements": (
+            candidate.get("direct_missing_requirements")
+            or (missing_requirements if route_alternative_usable else [])
+        ),
         "route_alternative": route_alternative if route_alternative_usable else {},
         "route_alternative_used": bool(route_alternative_usable),
         "paper_proxy_activated": bool(candidate.get("paper_proxy_activated")),
@@ -358,6 +390,11 @@ def review_candidate(
         "evidence": evidence,
         "warnings": warnings,
         "hard_blocks": hard_blocks,
+        "would_block_reasons": would_block_reasons,
+        "exploration_mode": exploration_enabled(settings),
+        "paper_admission_authority": "agent_review",
+        "synthetic_research_paper": bool(candidate.get("synthetic_research_paper")),
+        "synthetic_route_blockers": candidate.get("synthetic_route_blockers", []),
         "agent_votes": {
             "hunter": "pass" if evidence else "fail",
             "microstructure": "pass" if candidate["spread_bps"] <= risk["max_spread_bps"] else "fail",

@@ -224,7 +224,7 @@ class DerivativesAdapterTests(unittest.TestCase):
         self.assertEqual(10.0, book["bids"][0][1])
         self.assertEqual(20.0, book["asks"][0][1])
 
-    def test_under_specified_public_funding_candidate_is_blocked_before_paper_trade(self) -> None:
+    def test_single_perpetual_public_funding_candidate_does_not_infer_a_hedge(self) -> None:
         settings = copy.deepcopy(DEFAULT_SETTINGS)
         observation = {
             "venue": "DERIBIT",
@@ -259,23 +259,14 @@ class DerivativesAdapterTests(unittest.TestCase):
         self.assertEqual("standard", candidate["execution_feasibility"]["status"])
         self.assertEqual("public_crypto_derivatives_paper", candidate["route_id"])
         self.assertTrue(signal_key(candidate).startswith("public_perpetual_funding_capture_v1|DERIBIT|"))
-        self.assertEqual(0.0, candidate["score"])
-        self.assertFalse(candidate["paper_route_eligibility"]["route_eligible"])
-        self.assertEqual(
-            {
-                "hedge_venue",
-                "hedge_instrument",
-                "paper_leg_mapping_valid",
-                "venue_capabilities",
-            },
-            set(candidate["paper_route_eligibility"]["missing_prerequisites"]),
-        )
+        self.assertGreater(candidate["score"], 0.0)
+        self.assertTrue(candidate["paper_route_eligibility"]["route_eligible"])
+        self.assertFalse(candidate["paper_route_eligibility"]["hedged_structure_required"])
+        self.assertEqual([], candidate["paper_route_eligibility"]["missing_prerequisites"])
 
         review = review_candidate(candidate, settings, adjustments={})
-        self.assertEqual("reject", review["decision"])
-        self.assertTrue(
-            any("paper route eligibility blocked" in block for block in review["hard_blocks"])
-        )
+        self.assertIn(review["decision"], {"approve_paper_trade", "approve_conditional_paper_trade"})
+        self.assertEqual([], review["hard_blocks"])
 
     def test_long_perpetual_funding_does_not_require_spot_borrow(self) -> None:
         settings = copy.deepcopy(DEFAULT_SETTINGS)

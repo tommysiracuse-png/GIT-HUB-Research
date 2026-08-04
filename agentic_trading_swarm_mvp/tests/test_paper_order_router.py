@@ -151,7 +151,7 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
 
         self.assertNotIn("shadow_filtered", guarded)
 
-    def test_carry_candidate_without_route_capabilities_is_filtered(self) -> None:
+    def test_single_perpetual_funding_candidate_does_not_infer_route_dependencies(self) -> None:
         candidate = frontier_candidate(
             trade_type="perp_funding_basis",
             market_surface="funding_basis",
@@ -163,12 +163,8 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
 
         guarded = router.apply_frontier_paper_guard(candidate)
 
-        self.assertTrue(router.should_shadow_filter_frontier_candidate(guarded))
-        self.assertEqual(guarded["status"], "shadow_filtered")
-        self.assertIn(
-            "venue_capability_metadata_missing",
-            guarded["candidate_reject_detail"]["blocker_reasons"],
-        )
+        self.assertFalse(router.should_shadow_filter_frontier_candidate(guarded))
+        self.assertNotIn("shadow_filtered", guarded)
 
     def test_feature_flag_can_disable_guard_for_paper_rollback(self) -> None:
         candidate = frontier_candidate(edge_bps_estimate=0.0)

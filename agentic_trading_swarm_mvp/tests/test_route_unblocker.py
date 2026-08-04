@@ -49,12 +49,13 @@ class RouteUnblockerTests(unittest.TestCase):
 
         review = agent_review.review_candidate(enriched, cfg, {})
 
-        self.assertEqual(review["decision"], "conditional_review")
+        self.assertEqual(review["decision"], "approve_conditional_paper_trade")
         self.assertFalse(review["route_alternative_used"])
-        self.assertEqual(review["effective_route_id"], "conditional_crypto_route_paper")
+        self.assertEqual(review["effective_route_id"], "synthetic_research_paper")
         self.assertTrue(
-            any("paper route eligibility blocked" in block for block in review["hard_blocks"])
+            any("direct route unavailable" in block for block in review["would_block_reasons"])
         )
+        self.assertEqual([], review["hard_blocks"])
         self.assertIn(
             "borrowable",
             enriched["paper_route_eligibility"]["missing_prerequisites"],
@@ -82,10 +83,10 @@ class RouteUnblockerTests(unittest.TestCase):
         review = agent_review.review_candidate(enriched, cfg, {})
 
         self.assertEqual(review["decision"], "approve_conditional_paper_trade")
-        self.assertTrue(review["route_alternative_used"])
-        self.assertEqual(review["effective_route_id"], "prediction_market_public_research_paper")
-        self.assertEqual(review["route_alternative"]["status"], "paper_testable_research")
-        self.assertEqual(review["paper_allocation_multiplier"], 0.1)
+        self.assertFalse(review["route_alternative_used"])
+        self.assertEqual(review["effective_route_id"], "synthetic_research_paper")
+        self.assertEqual({}, review["route_alternative"])
+        self.assertEqual(review["paper_allocation_multiplier"], 0.25)
         self.assertIn("jurisdiction_eligibility", review["direct_missing_requirements"])
 
 

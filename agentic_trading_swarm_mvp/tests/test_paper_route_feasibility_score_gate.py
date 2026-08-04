@@ -171,7 +171,7 @@ class PaperRouteFeasibilityScoreGateTests(unittest.TestCase):
             enriched["execution_feasibility"]["route_feasibility_score"],
         )
 
-    def test_execution_boundary_suppresses_fill_and_persists_shadow_ticket(self) -> None:
+    def test_execution_boundary_uses_synthetic_research_when_route_score_is_low(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         init_db(conn)
@@ -186,16 +186,20 @@ class PaperRouteFeasibilityScoreGateTests(unittest.TestCase):
 
         result = execute_order(
             conn,
-            route_sensitive_candidate(route_feasibility_score=0.5),
+            route_sensitive_candidate(
+                route_feasibility_score=0.5,
+                explicit_synthetic_proxy=True,
+            ),
             review,
             copy.deepcopy(DEFAULT_SETTINGS),
         )
 
-        self.assertFalse(result["paper_filled"])
-        self.assertEqual([], result["fills"])
-        self.assertEqual("shadow_filtered", result["order"]["status"])
+        self.assertTrue(result["paper_filled"])
+        self.assertEqual(1, len(result["fills"]))
+        self.assertEqual("paper_filled", result["order"]["status"])
+        self.assertEqual("synthetic_research_paper", result["order"]["route_id"])
         row = conn.execute("select status from execution_orders").fetchone()
-        self.assertEqual("shadow_filtered", row["status"])
+        self.assertEqual("paper_filled", row["status"])
 
     def test_enriched_candidate_is_attributed_to_score_gate_at_execution_boundary(self) -> None:
         candidate = enrich_candidate_with_route(

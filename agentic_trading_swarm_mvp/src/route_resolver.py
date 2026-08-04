@@ -866,27 +866,21 @@ def _spot_short_dependency(candidate: dict) -> bool:
 
 
 def _hedged_structure_dependency(candidate: dict) -> bool:
-    descriptor = " ".join(
-        _paper_gate_text(_eligibility_value(candidate, key))
-        for key in (
-            "trade_type",
-            "strategy",
-            "strategy_id",
-            "strategy_profile",
-            "signal",
-            "signal_key",
-            "direction",
-            "route_type",
-            "tags",
-            "strategy_tags",
-        )
-    )
     requires_hedge = _eligibility_bool(
         _eligibility_value(candidate, "requires_hedge", "hedge_required")
     )
-    return requires_hedge is True or any(
-        token in descriptor for token in ("basis", "funding", "carry", "hedge_offset")
+    if requires_hedge is not None:
+        return requires_hedge
+    structure = _paper_gate_text(
+        _eligibility_value(candidate, "execution_structure", "position_structure", "leg_structure")
     )
+    if structure in {"perpetual_spot_pair", "multi_leg", "two_leg", "hedged_pair"}:
+        return True
+    direction = _paper_gate_text(_eligibility_value(candidate, "direction"))
+    if direction in {"short_perp_long_spot", "long_perp_short_spot"}:
+        return True
+    legs = candidate.get("paper_legs") or candidate.get("legs") or []
+    return isinstance(legs, list) and len(legs) >= 2
 
 
 def _route_dependency_flag(candidate: dict, *keys: str) -> bool:
