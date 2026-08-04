@@ -40,6 +40,14 @@ from adapters.venues.e_auksion_district_hokimiyat_notices import (
     parse_e_auksion_lots,
 )
 from adapters.venues.kase_futures import parse_kase_futures
+from adapters.venues.kalshi import (
+    DOCS_URL as KALSHI_DOCS_URL,
+    KalshiPublicPredictionMarketsAdapter,
+    market_order_book_url as kalshi_order_book_url,
+    markets_url as kalshi_markets_url,
+    parse_kalshi_markets,
+    parse_kalshi_order_book,
+)
 from adapters.venues.norwegian_block_exchange_nbx import (
     DOCS_URL as NBX_DOCS_URL,
     NorwegianBlockExchangeNbxAdapter,
@@ -127,8 +135,206 @@ class PublicAdapterParserTests(unittest.TestCase):
             "eex_german_nehs_public",
             "e_auksion_district_hokimiyat_notices",
             "norwegian_block_exchange_nbx_public",
+            "kalshi_public_prediction_markets",
         }
         self.assertTrue(expected <= set(discover_adapters()))
+
+    def test_kalshi_plugin_is_runtime_discoverable_and_public_watch_only(self) -> None:
+        self.assertIn("kalshi_public_prediction_markets", discover_adapters())
+        adapter = get_adapter("kalshi_public_prediction_markets")
+        self.assertIsNotNone(adapter)
+        self.assertEqual("KALSHI", adapter.info.venue)
+        self.assertIn("market_catalog", adapter.info.capabilities)
+        self.assertIn("order_book", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+        self.assertEqual(KALSHI_DOCS_URL, adapter.info.docs_url)
+
+    def test_kalshi_market_parser_normalizes_open_binary_contract(self) -> None:
+        source_url = kalshi_markets_url(10)
+        rows = parse_kalshi_markets(
+            {
+                "markets": [
+                    {
+                        "ticker": "KXCPI-26AUG-T3.0",
+                        "event_ticker": "KXCPI-26AUG",
+                        "series_ticker": "KXCPI",
+                        "title": "Will CPI inflation be above 3.0%?",
+                        "category": "Economics",
+                        "status": "open",
+                        "yes_bid_dollars": "0.4200",
+                        "yes_ask_dollars": "0.4600",
+                        "no_bid_dollars": "0.5400",
+                        "no_ask_dollars": "0.5800",
+                        "last_price_dollars": "0.4400",
+                        "volume_fp": "1234.00",
+                        "volume_24h_fp": "321.00",
+                        "open_interest_fp": "875.00",
+                        "liquidity_dollars": "950.50",
+                        "close_time": "2026-08-31T14:00:00Z",
+                        "updated_time": "2026-08-04T11:59:00Z",
+                    }
+                ],
+                "cursor": "next-page",
+            },
+            received_at="2026-08-04T12:00:00+00:00",
+            source_url=source_url,
+        )
+
+        row = rows[0]
+        self.assertEqual("KALSHI:KXCPI-26AUG-T3.0", row["inst_id"])
+        self.assertEqual("prediction_market", row["market_type"])
+        self.assertEqual("Economics", row["category"])
+        self.assertEqual(0.44, row["last"])
+        self.assertEqual(0.42, row["yes_bid"])
+        self.assertEqual(0.46, row["yes_ask"])
+        self.assertEqual(400.0, row["spread_bps_of_payout"])
+        self.assertEqual(321.0, row["volume_24h_contracts"])
+        self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual("open", row["session_status"])
+        self.assertEqual("watch_only", row["direction"])
+        self.assertEqual(source_url, row["source_url"])
+
+    def test_kalshi_order_book_parser_derives_implied_asks_and_depth(self) -> None:
+        market = parse_kalshi_markets(
+            {
+                "markets": [
+                    {
+                        "ticker": "KXTECH-26DEC-TYES",
+                        "title": "Will a technology milestone occur?",
+                        "yes_bid_dollars": "0.4100",
+                        "yes_ask_dollars": "0.4700",
+                        "last_price_dollars": "0.4400",
+                    }
+                ]
+            },
+            received_at="2026-08-04T12:00:00+00:00",
+        )[0]
+        source_url = kalshi_order_book_url(market["ticker"])
+        row = parse_kalshi_order_book(
+            {
+                "orderbook_fp": {
+                    "yes_dollars": [["0.3000", "5.00"], ["0.4200", "10.00"], ["0.4200", "2.00"]],
+                    "no_dollars": [["0.2000", "4.00"], ["0.5400", "8.00"]],
+                }
+            },
+            market=market,
+            received_at="2026-08-04T12:00:01+00:00",
+            source_url=source_url,
+        )
+
+        self.assertEqual(0.42, row["yes_bid"])
+        self.assertEqual(0.46, row["yes_ask"])
+        self.assertEqual(0.44, row["last"])
+        self.assertEqual([0.42, 12.0], row["book_levels"]["yes_bids"][0])
+        self.assertEqual(17.0, row["yes_depth_contracts"])
+        self.assertEqual(12.0, row["no_depth_contracts"])
+        self.assertEqual("official_order_book", row["quality_status"])
+        self.assertEqual(source_url, row["source_url"])
+        self.assertIn("status=open", row["contract_source_url"])
+        self.assertEqual("watch_only", row["direction"])
+
+    def test_kalshi_order_book_parser_accepts_schema_valid_empty_book(self) -> None:
+        market = parse_kalshi_markets(
+            {
+                "markets": [
+                    {
+                        "ticker": "KXENTERTAINMENT-26-TYES",
+                        "title": "Will the film win?",
+                        "yes_bid_dollars": "0.20",
+                        "yes_ask_dollars": "0.30",
+                    }
+                ]
+            },
+            received_at="2026-08-04T12:00:00+00:00",
+        )[0]
+        row = parse_kalshi_order_book(
+            {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}},
+            market=market,
+            received_at="2026-08-04T12:00:01+00:00",
+        )
+
+        self.assertEqual("empty", row["order_book_state"])
+        self.assertEqual("official_order_book_empty", row["quality_status"])
+        self.assertEqual(0.25, row["last"])
+        self.assertEqual(market["source_url"], row["source_url"])
+        self.assertIn("/orderbook", row["order_book_source_url"])
+        self.assertEqual("watch_only", row["direction"])
+
+    def test_kalshi_adapter_preserves_book_parser_failure_and_paper_safety(self) -> None:
+        catalog = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": json.dumps(
+                {
+                    "markets": [
+                        {
+                            "ticker": "KXCLIMATE-26-T1",
+                            "title": "Will the climate threshold be crossed?",
+                            "status": "open",
+                            "yes_bid_dollars": "0.35",
+                            "yes_ask_dollars": "0.40",
+                            "volume_24h_fp": "200",
+                        }
+                    ]
+                }
+            ),
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 3.0,
+        }
+        malformed_book = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": '{"orderbook": {"yes": []}}',
+            "received_at": "2026-08-04T12:00:01+00:00",
+            "latency_ms": 2.0,
+        }
+
+        def fake_fetch(url, _timeout):
+            return catalog if "?status=open" in url else malformed_book
+
+        with mock.patch("adapters.venues.kalshi.fetch_text", side_effect=fake_fetch):
+            batch = KalshiPublicPredictionMarketsAdapter().scan(
+                {
+                    "public_market_adapters": {
+                        "kalshi_public_prediction_markets": {"market_limit": 10, "max_order_books": 1}
+                    }
+                }
+            )
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual(1, batch.metadata["real_observation_count"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["catalog"]["fetch_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["KXCLIMATE-26-T1"]["fetch_status"])
+        self.assertIn("orderbook_fp", batch.metadata["parser_failures"][0]["error"])
+        self.assertTrue(batch.metadata["paper_only"])
+        row = batch.observations[0]
+        self.assertEqual("watch_only", row["direction"])
+        self.assertEqual("public_order_book_parser_failure", row["candidate_reject_reason"])
+        self.assertIn("orderbook_fp", row["parser_failure"])
+
+    def test_kalshi_adapter_emits_watch_only_health_evidence_when_unreachable(self) -> None:
+        blocked = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch("adapters.venues.kalshi.fetch_text", return_value=blocked):
+            batch = KalshiPublicPredictionMarketsAdapter().scan({})
+
+        self.assertEqual("blocked", batch.metadata["source_status"])
+        self.assertEqual(0, batch.metadata["real_observation_count"])
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        self.assertEqual("unknown", batch.observations[0]["freshness_state"])
+        self.assertEqual("public_prediction_market_source_unavailable", batch.observations[0]["candidate_reject_reason"])
+        self.assertIn("status=open", batch.observations[0]["source_url"])
 
     def test_nbx_plugin_is_runtime_discoverable_and_public_watch_only(self) -> None:
         self.assertIn("norwegian_block_exchange_nbx_public", discover_adapters())
