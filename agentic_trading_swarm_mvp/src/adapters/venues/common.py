@@ -112,6 +112,83 @@ def fetch_text(
         }
 
 
+def fetch_bytes(url: str, timeout: int = 15, *, max_bytes: int = 10_000_000) -> dict[str, Any]:
+    """Fetch a bounded public binary document while retaining source-health evidence."""
+
+    started = time.perf_counter()
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream,*/*;q=0.5",
+            "User-Agent": "agentic-trading-swarm-paper-research/1.0",
+        },
+        method="GET",
+    )
+
+    def _fetch(context: ssl.SSLContext | None = None) -> dict[str, Any]:
+        kwargs = {"timeout": timeout}
+        if context is not None:
+            kwargs["context"] = context
+        with urllib.request.urlopen(request, **kwargs) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > max_bytes:
+                raise ValueError(f"public document exceeds {max_bytes} byte limit")
+            content = response.read(max_bytes + 1)
+            if len(content) > max_bytes:
+                raise ValueError(f"public document exceeds {max_bytes} byte limit")
+            return {
+                "ok": True,
+                "status": "reachable",
+                "http_status": int(getattr(response, "status", 200)),
+                "content": content,
+                "content_type": response.headers.get_content_type(),
+                "received_at": utc_now(),
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                "tls_trust_source": "system" if context is not None else "python_default",
+            }
+
+    try:
+        return _fetch()
+    except urllib.error.HTTPError as exc:
+        return {
+            "ok": False,
+            "status": "blocked" if exc.code in {401, 403, 451} else "unavailable",
+            "http_status": int(exc.code),
+            "error": str(exc)[:300],
+            "content": b"",
+            "received_at": utc_now(),
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        }
+    except Exception as exc:  # noqa: BLE001 - scanner health must survive source outages.
+        if _is_certificate_verification_error(exc):
+            context = _system_trust_context()
+            if context is not None:
+                try:
+                    return _fetch(context)
+                except urllib.error.HTTPError as retry_exc:
+                    return {
+                        "ok": False,
+                        "status": "blocked" if retry_exc.code in {401, 403, 451} else "unavailable",
+                        "http_status": int(retry_exc.code),
+                        "error": str(retry_exc)[:300],
+                        "content": b"",
+                        "received_at": utc_now(),
+                        "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                        "tls_trust_source": "system",
+                    }
+                except Exception as retry_exc:  # noqa: BLE001 - retain source health evidence.
+                    exc = retry_exc
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "http_status": None,
+            "error": str(exc)[:300],
+            "content": b"",
+            "received_at": utc_now(),
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        }
+
+
 def parse_json(text: str) -> Any:
     return json.loads(text)
 

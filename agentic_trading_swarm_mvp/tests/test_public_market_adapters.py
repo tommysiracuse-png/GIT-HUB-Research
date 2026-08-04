@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import datetime as dt
+import io
 import json
 import pathlib
 import ssl
@@ -10,6 +12,7 @@ import tempfile
 import types
 import unittest
 import urllib.error
+import zipfile
 from unittest import mock
 
 
@@ -43,7 +46,13 @@ from adapters.venues.dc_department_of_energy_environment import (
 from adapters.venues.european_energy_exchange_eex import (
     AUCTION_URL as EEX_AUCTION_URL,
     SALES_URL as EEX_SALES_URL,
+    EexEuaPrimaryAuctionSpotAdapter,
     EexGermanNehsAdapter,
+    datasource_auction_url,
+    datasource_spot_url,
+    parse_eex_emissions_spot,
+    parse_eex_eu_ets_auction,
+    parse_eex_eua_auction_workbook,
     parse_eex_nehs_auction,
     parse_eex_nehs_sales,
 )
@@ -90,6 +99,75 @@ from adapters.venues.stock_exchange_of_thailand_yuanta_securities_thailand impor
 from adapters.venues.twse_daily import parse_twse_daily
 from scan_batch import ScanBatch
 from settings import DEFAULT_SETTINGS
+
+
+def _eex_auction_workbook_fixture() -> bytes:
+    headers = [
+        "Date",
+        "Time",
+        "Auction Name",
+        "Contract",
+        "Status",
+        "Auction Price €/tCO2",
+        "Auction Volume tCO2",
+        "Total Amount of Bids",
+        "Cover Ratio",
+        "Number of bids submitted",
+        "Number of successful bids",
+        "Total Number of Bidders",
+        "Number of Successful Bidders",
+        "Total Revenue €",
+        "Zone",
+    ]
+    text_values = {
+        3: "EEX EUAA Primary Auction Spot",
+        4: "T3AA",
+        5: "successful",
+        15: "EU",
+    }
+
+    def column_name(index: int) -> str:
+        name = ""
+        while index:
+            index, remainder = divmod(index - 1, 26)
+            name = chr(65 + remainder) + name
+        return name
+
+    header_cells = "".join(
+        f'<c r="{column_name(index)}1" t="inlineStr"><is><t>{value}</t></is></c>'
+        for index, value in enumerate(headers, 1)
+    )
+    excel_date = (dt.date(2026, 8, 4) - dt.date(1899, 12, 30)).days
+    numeric_values = {
+        1: excel_date,
+        2: 11 / 24,
+        6: 80.86,
+        7: 2_246_500,
+        8: 4_013_000,
+        9: 1.79,
+        10: 116,
+        11: 20,
+        12: 22,
+        13: 14,
+        14: 181_651_990,
+    }
+    data_cells = "".join(
+        f'<c r="{column_name(index)}2"><v>{value}</v></c>'
+        for index, value in numeric_values.items()
+    ) + "".join(
+        f'<c r="{column_name(index)}2" t="inlineStr"><is><t>{value}</t></is></c>'
+        for index, value in text_values.items()
+    )
+    worksheet = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData><row r="1">{header_cells}</row><row r="2">{data_cells}</row></sheetData>'
+        '</worksheet>'
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+    return output.getvalue()
 
 
 class PublicAdapterParserTests(unittest.TestCase):
@@ -164,6 +242,7 @@ class PublicAdapterParserTests(unittest.TestCase):
             "bursa_derivatives_contract_catalog",
             "bahrain_cross_listings_catalog",
             "eex_german_nehs_public",
+            "eex_eua_primary_auction_spot_public",
             "e_auksion_district_hokimiyat_notices",
             "ethiopian_securities_exchange",
             "norwegian_block_exchange_nbx_public",
@@ -1237,6 +1316,191 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual("NZX_GDT:WHOLE_MILK_POWDER", rows[0]["inst_id"])
         self.assertEqual(3900.0, rows[0]["last"])
         self.assertEqual("Event 401", rows[0]["event_id"])
+
+    def test_eex_eu_ets_plugin_is_runtime_discoverable_and_watch_only(self) -> None:
+        self.assertIn("eex_eua_primary_auction_spot_public", discover_adapters())
+        adapter = get_adapter("eex_eua_primary_auction_spot_public")
+        self.assertIsNotNone(adapter)
+        self.assertEqual("EEX", adapter.info.venue)
+        self.assertIn("datasource_getAuction", adapter.info.capabilities)
+        self.assertIn("datasource_getSpot", adapter.info.capabilities)
+        self.assertIn("public_market_data_file", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+
+    def test_eex_get_auction_parser_normalizes_documented_json(self) -> None:
+        source_url = datasource_auction_url("2026-08-04")
+        rows = parse_eex_eu_ets_auction(
+            {
+                "results": [
+                    {
+                        "result": [
+                            {
+                                "Time": "11:00:35",
+                                "AuctionName": "EEX EUA Primary Auction Spot",
+                                "Contract": "T3PA",
+                                "Status": "Successful",
+                                "AuctionClearingPrice": "80,86",
+                                "MinimumBid": "0,01",
+                                "MaximumBid": "85,00",
+                                "Mean": "79,75",
+                                "Median": "80,43",
+                                "AuctionVolume": 2_246_500,
+                                "TotalVolumeOfBidsSubmitted": 4_013_000,
+                                "NumberOfBidsSubmitted": 116,
+                                "NumberOfSuccessfulBids": 20,
+                                "CoverRatio": "1,79",
+                                "TotalNumberOfBidders": 22,
+                                "NumberOfSuccessfulBidders": 14,
+                                "TotalRevenue": 181_651_990,
+                                "CountryRevenue": "EU",
+                            }
+                        ]
+                    }
+                ]
+            },
+            trade_date="2026-08-04",
+            source_url=source_url,
+            received_at="2026-08-04T10:00:00+00:00",
+        )
+
+        row = rows[0]
+        self.assertEqual("EEX:EUA:PRIMARY_AUCTION:2026-08-04:EU", row["inst_id"])
+        self.assertEqual(80.86, row["last"])
+        self.assertEqual(2_246_500.0, row["auction_volume"])
+        self.assertEqual(4_013_000.0, row["total_volume_of_bids"])
+        self.assertEqual(1_766_500.0, row["bid_volume_excess"])
+        self.assertEqual(1.79, row["cover_ratio"])
+        self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual("closed", row["session_status"])
+        self.assertEqual("watch_only", row["direction"])
+        self.assertEqual(source_url, row["source_url"])
+
+    def test_eex_public_workbook_parser_supports_euaa(self) -> None:
+        rows = parse_eex_eua_auction_workbook(
+            _eex_auction_workbook_fixture(),
+            source_url="https://public.eex-group.com/example-2026.xlsx",
+            received_at="2026-08-04T10:00:00+00:00",
+        )
+
+        row = rows[0]
+        self.assertEqual("EUAA", row["allowance_type"])
+        self.assertEqual("EEX:EUAA:PRIMARY_AUCTION:2026-08-04:EU", row["inst_id"])
+        self.assertEqual(80.86, row["auction_clearing_price"])
+        self.assertEqual(116, row["bid_count"])
+        self.assertEqual(14, row["successful_bidder_count"])
+        self.assertEqual("public_xlsx_market_data_file", row["source_record_type"])
+        self.assertEqual("watch_only", row["direction"])
+
+    def test_eex_get_spot_parser_normalizes_euaa_trade(self) -> None:
+        source_url = datasource_spot_url("2026-08-04")
+        rows = parse_eex_emissions_spot(
+            {
+                "results": [
+                    {
+                        "result": [
+                            {
+                                "Product": "/E.SEMAZ29",
+                                "Root": "SEMA",
+                                "LongName": "EEX EUAA Spot",
+                                "MarketArea": "EU",
+                                "TradeTimestamp": "2026-08-04T09:11:05Z",
+                                "TradeID": "691200",
+                                "ValidTrade": "Yes",
+                                "Price": "80,500",
+                                "TradedVolume": 1_000,
+                                "UnitOfVolumes": "tCO2",
+                                "TradedType": "EXCHANGE",
+                            }
+                        ]
+                    }
+                ]
+            },
+            source_url=source_url,
+            received_at="2026-08-04T10:00:00+00:00",
+        )
+
+        row = rows[0]
+        self.assertEqual("EEX:EUAA:SPOT:691200", row["inst_id"])
+        self.assertEqual(80.5, row["last"])
+        self.assertEqual(1_000.0, row["traded_volume"])
+        self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual("watch_only", row["direction"])
+        self.assertEqual(source_url, row["source_url"])
+
+    def test_eex_eu_ets_adapter_uses_public_file_when_apis_require_auth(self) -> None:
+        blocked = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 401,
+            "received_at": "2026-08-04T10:00:00+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 401",
+        }
+        workbook = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "content": _eex_auction_workbook_fixture(),
+            "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "received_at": "2026-08-04T10:00:01+00:00",
+            "latency_ms": 8.0,
+        }
+        with mock.patch(
+            "adapters.venues.european_energy_exchange_eex.fetch_text",
+            side_effect=[blocked, blocked],
+        ), mock.patch(
+            "adapters.venues.european_energy_exchange_eex.fetch_bytes",
+            return_value=workbook,
+        ):
+            batch = EexEuaPrimaryAuctionSpotAdapter().scan(
+                {"public_market_adapters": {"eex_eua_primary_auction_spot_public": {"trade_date": "2026-08-04"}}}
+            )
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual("blocked", batch.metadata["fetch_status"]["auction_api"]["fetch_status"])
+        self.assertEqual("blocked", batch.metadata["fetch_status"]["spot_api"]["fetch_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["auction_file"]["fetch_status"])
+        self.assertEqual(1, batch.metadata["real_observation_count"])
+        self.assertEqual(1, batch.metadata["auction_observation_count"])
+        self.assertEqual(0, batch.metadata["spot_observation_count"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        self.assertEqual(2, sum(row.get("quality_status") == "source_health" for row in batch.observations))
+
+    def test_eex_eu_ets_adapter_preserves_workbook_parser_failure(self) -> None:
+        blocked = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 401,
+            "received_at": "2026-08-04T10:00:00+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 401",
+        }
+        malformed_workbook = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "content": b"not an xlsx archive",
+            "received_at": "2026-08-04T10:00:01+00:00",
+            "latency_ms": 8.0,
+        }
+        with mock.patch(
+            "adapters.venues.european_energy_exchange_eex.fetch_text",
+            side_effect=[blocked, blocked],
+        ), mock.patch(
+            "adapters.venues.european_energy_exchange_eex.fetch_bytes",
+            return_value=malformed_workbook,
+        ):
+            batch = EexEuaPrimaryAuctionSpotAdapter().scan(
+                {"public_market_adapters": {"eex_eua_primary_auction_spot_public": {"trade_date": "2026-08-04"}}}
+            )
+
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual(0, batch.metadata["real_observation_count"])
+        self.assertIn("invalid XLSX", batch.metadata["parser_failures"][0]["error"])
+        parser_health = [row for row in batch.observations if row.get("parser_failure")]
+        self.assertEqual(1, len(parser_health))
+        self.assertEqual("public_reference_parser_failure", parser_health[0]["candidate_reject_reason"])
 
     def test_eex_nehs_auction_parser_normalizes_official_result(self) -> None:
         report = """\ufeffDatum/Date;Zeit/Time (UTC);Versteigerung/Auction;Fälligkeit/Vintage;Zuschlagspreis/Auction clearing price (EUR/nEZ);versteigerte Menge/Volume allocated in the auction (in nEZ);verbleibende Gesamtversteigerungsmenge/Total remaining auction volume (in nEZ);Gesamtgebotsmenge/Total volume of bids (in nEZ);Gesamtzahl der Bieter/Total number of bidders;Gesamtzahl erfolgreicher Bieter/Total number of successful bidders;Zertifikatserlöse/Revenues (in EUR);Cover ratio/cover ratio;Cover ratio (basierend auf der tatsächlich zugeteilten Menge)/Cover ratio (based on actual allocated volume);Information über potenzielle Annullierung der Versteigerung/Information on potential cancellation of an auction
