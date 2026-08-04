@@ -63,6 +63,26 @@ def _worker_settings(settings: dict) -> dict:
     return output
 
 
+def _run_research_stage(settings: dict) -> tuple[dict, dict | None]:
+    """Treat a long radar write as a deferred research stage, not a worker crash."""
+
+    try:
+        return run_research_worker_once(settings=settings), None
+    except sqlite3.OperationalError as exc:
+        if not _database_locked(exc):
+            raise
+        return {
+            "status": "database_busy_retry_later",
+            "summary": {},
+            "reason": str(exc),
+        }, {
+            "status": "database_busy_retry_later",
+            "stage": "research_worker",
+            "attempts": 1,
+            "reason": str(exc),
+        }
+
+
 def _write_report(report: dict) -> dict:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_JSON.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
@@ -152,10 +172,11 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         autonomous_builder = autonomous_builder or {"status": "database_busy_retry_later"}
 
     research_worker_report = {}
+    research_error = None
     if settings.get("research_worker", {}).get("enabled", True) and settings.get("research_worker", {}).get(
         "run_every_evolution_cycle", True
     ):
-        research_worker_report = run_research_worker_once(settings=worker_settings)
+        research_worker_report, research_error = _run_research_stage(worker_settings)
     llm_swarm_generated = run_llm_swarm_once(settings=settings, force=force_swarm)
     newly_ingested, new_ingest_error = _run_db_stage(
         "ingest_new_llm_recommendations",
@@ -178,6 +199,7 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
             improvement_error,
             adapter_error,
             builder_error,
+            research_error,
             new_ingest_error,
             cost_error,
             inbox_error,

@@ -112,7 +112,8 @@ class CodexRepoAgentTests(unittest.TestCase):
         child_env = run.call_args.kwargs["env"]
         self.assertIn("exec", command)
         self.assertIn("--json", command)
-        self.assertIn("workspace-write", command)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertIn("--ignore-rules", command)
         self.assertEqual("test-secret-value", child_env["CODEX_API_KEY"])
         self.assertNotIn("OPENAI_API_KEY", child_env)
         self.assertNotIn("test-secret-value", run.call_args.kwargs["input"])
@@ -150,6 +151,8 @@ class CodexRepoAgentTests(unittest.TestCase):
         self.assertIn("resume", command)
         self.assertIn("thread-123", command)
         self.assertNotIn("--cd", command)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertIn("--ignore-rules", command)
         self.assertIn("host_tests", run.call_args.kwargs["input"])
 
     def test_timeout_with_thread_becomes_resumable_pause(self) -> None:
