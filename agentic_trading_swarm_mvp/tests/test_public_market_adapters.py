@@ -23,7 +23,7 @@ import adapter_runtime
 import code_evolution
 import storage
 from adapters.venues import common as venue_common
-from adapters.registry import discover_adapters
+from adapters.registry import discover_adapters, get_adapter
 from adapters.venues.bahrain_cross_listings import cross_listing_observations
 from adapters.venues.bursa_derivatives import contract_observations
 from adapters.venues.european_energy_exchange_eex import (
@@ -40,6 +40,13 @@ from adapters.venues.e_auksion_district_hokimiyat_notices import (
     parse_e_auksion_lots,
 )
 from adapters.venues.kase_futures import parse_kase_futures
+from adapters.venues.norwegian_block_exchange_nbx import (
+    DOCS_URL as NBX_DOCS_URL,
+    NorwegianBlockExchangeNbxAdapter,
+    market_order_book_url,
+    parse_nbx_order_book,
+    parse_nbx_markets,
+)
 from adapters.venues.nzx_dairy import parse_nzx_gdt
 from adapters.venues.twse_daily import parse_twse_daily
 from scan_batch import ScanBatch
@@ -119,8 +126,141 @@ class PublicAdapterParserTests(unittest.TestCase):
             "bahrain_cross_listings_catalog",
             "eex_german_nehs_public",
             "e_auksion_district_hokimiyat_notices",
+            "norwegian_block_exchange_nbx_public",
         }
         self.assertTrue(expected <= set(discover_adapters()))
+
+    def test_nbx_plugin_is_runtime_discoverable_and_public_watch_only(self) -> None:
+        self.assertIn("norwegian_block_exchange_nbx_public", discover_adapters())
+        adapter = get_adapter("norwegian_block_exchange_nbx_public")
+        self.assertIsNotNone(adapter)
+        self.assertEqual("NBX", adapter.info.venue)
+        self.assertIn("order_book", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+        self.assertEqual(NBX_DOCS_URL, adapter.info.docs_url)
+
+    def test_nbx_order_book_parser_aggregates_depth_and_preserves_freshness(self) -> None:
+        rows = [
+            {"id": "public-1", "price": "1200.00", "quantity": "0.25", "side": "BUY"},
+            {"id": "public-2", "price": "1200.00", "quantity": "0.75", "side": "BUY"},
+            {"id": "public-3", "price": "1199.00", "quantity": "2", "side": "BUY"},
+            {"id": "public-4", "price": "1202.00", "quantity": "0.5", "side": "SELL"},
+            {"id": "public-5", "price": "1203.00", "quantity": "1", "side": "SELL"},
+            {"id": "ignored", "price": "0", "quantity": "1", "side": "BUY"},
+        ]
+        source_url = market_order_book_url("FGLD-NOK")
+        row = parse_nbx_order_book(
+            rows,
+            market="fGLD/NOK",
+            received_at="2026-08-04T12:00:00+00:00",
+            source_url=source_url,
+        )
+
+        self.assertEqual("NBX:FGLD-NOK", row["inst_id"])
+        self.assertEqual("tokenized_precious_metal", row["asset_class"])
+        self.assertEqual(1201.0, row["last"])
+        self.assertEqual(1200.0, row["bid"])
+        self.assertEqual(1202.0, row["ask"])
+        self.assertAlmostEqual(16.653, row["spread_bps"], places=3)
+        self.assertEqual([1200.0, 1.0], row["book_levels"]["bids"][0])
+        self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual("response_received", row["freshness_basis"])
+        self.assertEqual("open_24_7", row["session_status"])
+        self.assertEqual("watch_only", row["direction"])
+        self.assertEqual(source_url, row["source_url"])
+
+    def test_nbx_market_catalog_parser_selects_active_nordic_fiat_pairs(self) -> None:
+        payload = [
+            {"id": "BTC-NOK", "quoteAsset": "NOK", "status": "OK", "disabled": False},
+            {"id": "ADA-DKK", "quoteAsset": "DKK", "status": "OK", "disabled": False},
+            {"id": "FGLD-EUR", "quoteAsset": "EUR", "status": "OK", "disabled": False},
+            {"id": "BTC-USDM", "quoteAsset": "USDM", "status": "OK", "disabled": False},
+            {"id": "OLD-SEK", "quoteAsset": "SEK", "status": "OK", "disabled": True},
+            {"id": "MATIC-EUR", "quoteAsset": "EUR", "status": "OK", "cancelOnly": True},
+        ]
+
+        self.assertEqual(["ADA-DKK", "BTC-NOK", "FGLD-EUR"], parse_nbx_markets(payload))
+
+    def test_nbx_adapter_emits_real_books_and_watch_only_unavailable_evidence(self) -> None:
+        reachable = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": json.dumps(
+                [
+                    {"price": "1200", "quantity": "1", "side": "BUY"},
+                    {"price": "1202", "quantity": "1", "side": "SELL"},
+                ]
+            ),
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        blocked = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T12:00:01+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 403",
+        }
+
+        def fake_fetch(url, _timeout):
+            return reachable if "FGLD-NOK" in url else blocked
+
+        settings = {
+            "public_market_adapters": {
+                "norwegian_block_exchange_nbx_public": {
+                    "markets": ["FGLD-NOK", "BTC-NOK"],
+                    "workers": 1,
+                }
+            }
+        }
+        with mock.patch(
+            "adapters.venues.norwegian_block_exchange_nbx.fetch_text",
+            side_effect=fake_fetch,
+        ):
+            batch = NorwegianBlockExchangeNbxAdapter().scan(settings)
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual(1, batch.metadata["real_observation_count"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["FGLD-NOK"]["fetch_status"])
+        self.assertEqual("blocked", batch.metadata["fetch_status"]["BTC-NOK"]["fetch_status"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        real = next(row for row in batch.observations if row["inst_id"] == "NBX:FGLD-NOK")
+        health = next(row for row in batch.observations if row["inst_id"] == "NBX:BTC-NOK:ADAPTER_HEALTH")
+        self.assertEqual("https://api.nbx.com/markets/FGLD-NOK/orders", real["source_url"])
+        self.assertEqual("public_order_book_source_unavailable", health["candidate_reject_reason"])
+
+    def test_nbx_adapter_preserves_reachable_parser_failure(self) -> None:
+        malformed = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": '{"orders": []}',
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        settings = {
+            "public_market_adapters": {
+                "adapters": {
+                    "norwegian_block_exchange_nbx_public": {"markets": ["FSLVR-EUR"]}
+                }
+            }
+        }
+        with mock.patch(
+            "adapters.venues.norwegian_block_exchange_nbx.fetch_text",
+            return_value=malformed,
+        ):
+            batch = NorwegianBlockExchangeNbxAdapter().scan(settings)
+
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["FSLVR-EUR"]["fetch_status"])
+        self.assertIn("must be an array", batch.metadata["parser_failures"][0]["error"])
+        self.assertEqual("public_order_book_parser_failure", batch.observations[0]["candidate_reject_reason"])
+        self.assertIn("must be an array", batch.observations[0]["parser_failure"])
 
     def test_twse_daily_parser_normalizes_official_row(self) -> None:
         rows = parse_twse_daily(
