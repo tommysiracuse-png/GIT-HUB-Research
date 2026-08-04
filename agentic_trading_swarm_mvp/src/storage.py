@@ -14,6 +14,29 @@ RUNS_DIR = ROOT / "runs"
 DB_PATH = RUNS_DIR / "radar.sqlite"
 SQLITE_BUSY_TIMEOUT_MS = 60_000
 
+_PAPER_LONG_DIRECTIONS = frozenset(
+    {
+        "long_perp_short_spot",
+        "basis_mean_reversion_long_perp",
+        "funding_capture_long_perp",
+        "long_proxy",
+        "long_frontier_spot",
+        "long_frontier_perp",
+        "buy_yes_event",
+        "buy_no_event",
+    }
+)
+_PAPER_SHORT_DIRECTIONS = frozenset(
+    {
+        "short_perp_long_spot",
+        "basis_mean_reversion_short_perp",
+        "funding_capture_short_perp",
+        "short_proxy",
+        "short_frontier_spot",
+        "short_frontier_perp",
+    }
+)
+
 
 class ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
@@ -50,6 +73,15 @@ def _storage_json_object(value: object) -> dict:
 def _parse_storage_iso(value: str) -> dt.datetime:
     parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def _paper_direction_sign(direction: object) -> int:
+    normalized = str(direction or "").strip().lower()
+    if normalized in _PAPER_LONG_DIRECTIONS:
+        return 1
+    if normalized in _PAPER_SHORT_DIRECTIONS:
+        return -1
+    return 0
 
 
 def _is_memory_db(db_path: pathlib.Path | str) -> bool:
@@ -1653,6 +1685,51 @@ def close_due_trades(
             if isinstance(nested_latest, dict):
                 current.update(nested_latest)
             current.update({key: value for key, value in latest.items() if key != "candidate"})
+            refreshed_trend = None
+            refreshed_trend_found = False
+            readiness_reported = False
+            for payload in (latest, nested_latest):
+                if not isinstance(payload, dict):
+                    continue
+                for key in (
+                    "local_short_horizon_trend_bps",
+                    "destination_short_horizon_trend_bps",
+                ):
+                    if payload.get(key) not in (None, ""):
+                        refreshed_trend = payload[key]
+                        refreshed_trend_found = True
+                        break
+                if refreshed_trend_found:
+                    break
+                ready_value = payload.get(
+                    "local_short_horizon_trend_ready",
+                    payload.get("microstructure_history_ready"),
+                )
+                if ready_value is None:
+                    continue
+                readiness_reported = True
+                try:
+                    trend_ready = float(ready_value) >= 1.0
+                except (TypeError, ValueError):
+                    trend_ready = str(ready_value).strip().lower() in {
+                        "true",
+                        "yes",
+                        "ready",
+                    }
+                if trend_ready:
+                    for key in ("return_1m_bps", "return_5m_bps", "short_horizon_return_bps"):
+                        if payload.get(key) not in (None, ""):
+                            refreshed_trend = payload[key]
+                            refreshed_trend_found = True
+                            break
+                if refreshed_trend_found:
+                    break
+            if refreshed_trend_found:
+                current["local_short_horizon_trend_bps"] = refreshed_trend
+            elif readiness_reported:
+                # Do not reuse the entry snapshot when this refresh explicitly
+                # reports that venue-local intraday confirmation is unavailable.
+                current["local_short_horizon_trend_bps"] = None
             current["yahoo_proxy_cross_surface_alignment_guard"] = prior_alignment
             try:
                 from frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
@@ -1660,12 +1737,7 @@ def close_due_trades(
                 from src.frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
             alignment = paper_only_yahoo_proxy_cross_surface_alignment_guard(current, settings or {})
             if alignment.get("force_paper_exit"):
-                try:
-                    from paper_loop import direction_sign
-                except ImportError:  # pragma: no cover - package import fallback
-                    from src.paper_loop import direction_sign
-
-                sign = direction_sign(row["direction"])
+                sign = _paper_direction_sign(row["direction"])
                 if sign:
                     exit_px = float(latest["last"])
                     pnl_bps = (exit_px / float(row["entry"]) - 1.0) * 10_000.0 * sign
@@ -1847,8 +1919,6 @@ def record_due_horizon_outcomes(
     latest_by_inst: dict[str, dict],
     settings: dict,
 ) -> list[dict]:
-    from paper_loop import direction_sign, parse_iso
-
     horizons = settings.get("learning", {}).get("horizon_minutes", [5, 15, 60, 240, 1440])
     max_delay_seconds = float(settings.get("learning", {}).get("max_outcome_delay_seconds", 300))
     now = dt.datetime.now(dt.timezone.utc)
@@ -1884,8 +1954,8 @@ def record_due_horizon_outcomes(
         )
         family_cutoffs[trade_type] = _parse_storage_iso(cutoff_row["tracking_started_at"])
     for row in rows:
-        opened_at = parse_iso(row["opened_at"])
-        sign = direction_sign(row["direction"])
+        opened_at = _parse_storage_iso(row["opened_at"])
+        sign = _paper_direction_sign(row["direction"])
         if sign == 0:
             continue
         for horizon in horizons:
@@ -1910,7 +1980,7 @@ def record_due_horizon_outcomes(
             if latest:
                 raw_observed = latest.get("observed_at") or latest.get("seen_at") or latest.get("last_checked_at")
                 try:
-                    observed_at = parse_iso(raw_observed) if raw_observed else now
+                    observed_at = _parse_storage_iso(raw_observed) if raw_observed else now
                 except (TypeError, ValueError):
                     observed_at = now
             if observed_at and observed_at < target:

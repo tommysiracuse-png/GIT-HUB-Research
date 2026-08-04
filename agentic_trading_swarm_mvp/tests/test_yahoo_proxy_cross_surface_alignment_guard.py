@@ -76,6 +76,44 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertTrue(native["eligible"])
         self.assertTrue(live["eligible"])
 
+    def test_destination_context_is_not_masked_by_yahoo_source_venue(self) -> None:
+        review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            {
+                "source_context": {
+                    "venue": "YAHOO_PROXY",
+                    "source_family": "yahoo_proxy",
+                    "signal_family": "global_proxy_momentum",
+                },
+                "destination_context": {
+                    "venue": "OKX",
+                    "asset_class": "crypto_spot",
+                    "market_surface": "spot",
+                    "local_short_horizon_trend_bps": 2.0,
+                    "spread_bps": 3.0,
+                },
+                "direction": "long_frontier_spot",
+                "execution_mode": "paper",
+            }
+        )
+
+        self.assertTrue(review["applies"])
+        self.assertTrue(review["eligible"])
+        self.assertEqual("okx", review["destination_venue"])
+
+    def test_crypto_scope_uses_destination_fields_not_substring_collisions(self) -> None:
+        review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                venue="DELEGATE",
+                inst_id="DELEGATE:ABC",
+                asset_class="equity",
+                market_surface="spotlight_research",
+                trade_type="research_candidate",
+            )
+        )
+
+        self.assertFalse(review["applies"])
+        self.assertTrue(review["eligible"])
+
     def test_paper_order_guard_shadow_filters_unconfirmed_transfer(self) -> None:
         guarded = apply_frontier_paper_guard(
             cross_surface_candidate(local_short_horizon_trend_bps=-2.0)
@@ -137,6 +175,50 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("closed", row["status"])
         self.assertEqual("forced_local_confirmation_flip", row["close_measurement_status"])
+        self.assertEqual("local_confirmation_flipped_adverse", row["close_reason"])
+
+    def test_refreshed_scanner_payload_replaces_entry_trend_for_exit(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        candidate = cross_surface_candidate()
+        candidate["yahoo_proxy_cross_surface_alignment_guard"] = (
+            paper_only_yahoo_proxy_cross_surface_alignment_guard(candidate)
+        )
+        trade_id = storage.open_paper_trade(
+            conn,
+            candidate,
+            {"learned_score": 70.0, "route_status": "standard"},
+            settings={"scanner": {"hold_minutes": 60}},
+        )
+
+        closed = storage.close_due_trades(
+            conn,
+            {
+                "OKX:BTC-USDT-SWAP": {
+                    "inst_id": "OKX:BTC-USDT-SWAP",
+                    "venue": "OKX",
+                    "last": 99.5,
+                    "observed_at": storage.utc_now(),
+                    "price_source": "OKX public REST",
+                    "candidate": {
+                        "return_1m_bps": -2.0,
+                        "microstructure_history_ready": 1.0,
+                        "spread_bps": 3.0,
+                    },
+                }
+            },
+            60,
+            settings={"risk": {}},
+        )
+
+        self.assertEqual(1, len(closed))
+        self.assertTrue(closed[0]["forced_exit"])
+        row = conn.execute(
+            "select status, close_reason from paper_trades where id = ?",
+            (trade_id,),
+        ).fetchone()
+        self.assertEqual("closed", row["status"])
         self.assertEqual("local_confirmation_flipped_adverse", row["close_reason"])
 
 

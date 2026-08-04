@@ -610,6 +610,16 @@ _PAPER_ONLY_CRYPTO_ROUTE_TOKENS = frozenset(
     }
 )
 
+_PAPER_ONLY_FAST_CRYPTO_SURFACE_TOKENS = frozenset(
+    {"crypto", "spot", "perp", "perpetual", "swap", "derivative", "derivatives"}
+)
+
+_PAPER_ONLY_CRYPTO_VENUES = frozenset(
+    token
+    for token in _PAPER_ONLY_CRYPTO_ROUTE_TOKENS
+    if token not in {"crypto", "frontier", "spot", "perp", "perpetual", "swap"}
+)
+
 
 def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
     """Require venue-local confirmation for Yahoo momentum transferred to crypto.
@@ -623,22 +633,30 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
 
     record = record if isinstance(record, dict) else {}
     profile = profile if isinstance(profile, dict) else {}
+    nested_keys = (
+        "candidate",
+        "destination_context",
+        "route_context",
+        "local_confirmation",
+        "intraday_features",
+        "recommendation_lineage",
+        "lineage_context",
+        "proxy_context",
+        "source_context",
+    )
     containers = [record]
-    for container in tuple(containers):
-        for key in (
-            "source_context",
-            "lineage_context",
-            "recommendation_lineage",
-            "proxy_context",
-            "route_context",
-            "destination_context",
-            "local_confirmation",
-            "intraday_features",
-            "candidate",
-        ):
-            nested = container.get(key)
-            if isinstance(nested, dict):
-                containers.append(nested)
+    for key in nested_keys:
+        nested = record.get(key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+
+    # Generic fields such as ``venue`` must come from the candidate/destination,
+    # never from a source context that happens to be traversed first.
+    destination_containers = [record]
+    for key in ("candidate", "destination_context", "route_context", "local_confirmation", "intraday_features"):
+        nested = record.get(key)
+        if isinstance(nested, dict):
+            destination_containers.append(nested)
 
     def _lookup(*keys):
         for container in containers:
@@ -739,10 +757,44 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
     )
 
     destination_venue = _paper_only_route_intelligence_tag(
-        _lookup("target_venue", "execution_venue", "destination_venue", "venue")
+        _lookup("target_venue", "execution_venue", "destination_venue")
     )
+    if destination_venue is None:
+        for container in destination_containers:
+            destination_venue = _paper_only_route_intelligence_tag(container.get("venue"))
+            if destination_venue:
+                break
     destination_is_native_proxy = destination_venue in {"yahoo", "yahoo_proxy"}
-    destination_is_fast_crypto = any(token in scope_text for token in _PAPER_ONLY_CRYPTO_ROUTE_TOKENS)
+    destination_fields = (
+        "target_surface",
+        "destination_surface",
+        "candidate_surface",
+        "execution_surface",
+        "market_surface",
+        "market_type",
+        "asset_class",
+        "trade_type",
+        "venue",
+        "target_venue",
+        "execution_venue",
+        "destination_venue",
+    )
+    destination_values = [
+        str(container.get(key) or "").strip().lower().replace("-", "_")
+        for container in destination_containers
+        for key in destination_fields
+        if container.get(key) not in (None, "", [], {}, ())
+    ]
+    destination_scope_text = "|".join(destination_values)
+    destination_tokens = set(re.findall(r"[a-z0-9]+", destination_scope_text))
+    destination_is_fast_crypto = bool(
+        "crypto" in destination_tokens
+        or "frontier_crypto_venue_map" in destination_values
+        or (
+            destination_venue in _PAPER_ONLY_CRYPTO_VENUES
+            and destination_tokens.intersection(_PAPER_ONLY_FAST_CRYPTO_SURFACE_TOKENS)
+        )
+    )
     execution_mode = _paper_only_route_intelligence_tag(
         _lookup("execution_mode", "trading_mode", "mode", "destination_mode", "runner_mode")
     )

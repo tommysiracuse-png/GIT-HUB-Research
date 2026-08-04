@@ -338,6 +338,36 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual(directions["C"], "short_frontier_spot")
         self.assertEqual(directions["A"], "watch_only")
 
+    def test_candidate_preserves_ready_local_trend_for_cross_surface_confirmation(self) -> None:
+        cfg = settings()
+        ready_observation = self._obs("OKX", "ABC-USDT", "ABC", "USDT", 90, 100000)
+        ready_observation.update(
+            {
+                "return_1m_bps": 6.25,
+                "microstructure_history_ready": 1.0,
+                "microstructure_status": "ready",
+            }
+        )
+
+        ready = frontier._candidate_from_observation(ready_observation, cfg, 100, 3)
+        unavailable = frontier._candidate_from_observation(
+            {
+                **ready_observation,
+                "return_1m_bps": -9.0,
+                "microstructure_history_ready": 0.0,
+                "microstructure_status": "insufficient_closed_candles",
+            },
+            cfg,
+            100,
+            3,
+        )
+
+        self.assertEqual(6.25, ready["local_short_horizon_trend_bps"])
+        self.assertTrue(ready["local_short_horizon_trend_ready"])
+        self.assertEqual("1m", ready["local_short_horizon_trend_window"])
+        self.assertIsNone(unavailable["local_short_horizon_trend_bps"])
+        self.assertFalse(unavailable["local_short_horizon_trend_ready"])
+
     def test_blocked_observation_is_health_evidence_not_candidate(self) -> None:
         cfg = settings()
         observations = [

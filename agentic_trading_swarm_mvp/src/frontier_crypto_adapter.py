@@ -9334,6 +9334,14 @@ def _candidate_from_observation(observation: dict, settings: dict, reference_pri
     recent_volatility_bps = as_float(observation.get("realized_volatility_bps"), None)
     if recent_volatility_bps is None:
         recent_volatility_bps = abs(change_24h_pct) * 100.0
+    microstructure_history_ready = as_float(
+        observation.get("microstructure_history_ready"), 0.0
+    ) or 0.0
+    local_short_horizon_trend_bps = (
+        as_float(observation.get("return_1m_bps"), None)
+        if microstructure_history_ready >= 1.0
+        else None
+    )
     candidate = {
         "seen_at": observation["last_checked_at"],
         "venue": observation["venue"],
@@ -9379,6 +9387,11 @@ def _candidate_from_observation(observation: dict, settings: dict, reference_pri
         "liquidity_score": liq,
         "depth_liquidity_score": observation.get("depth_liquidity_score"),
         "spread_bps": spread,
+        "local_short_horizon_trend_bps": local_short_horizon_trend_bps,
+        "local_short_horizon_trend_window": "1m",
+        "local_short_horizon_trend_ready": microstructure_history_ready >= 1.0,
+        "microstructure_history_ready": microstructure_history_ready,
+        "microstructure_status": observation.get("microstructure_status"),
         "recent_volatility_bps": round(float(recent_volatility_bps), 3),
         "score": round(max(0.0, score), 3),
         "data_status": observation["data_status"],
