@@ -17,6 +17,7 @@ try:
         _paper_only_yahoo_proxy_crypto_freshness_review,
         _paper_only_family_decay_guard_review,
         _paper_only_parse_timestamp,
+        paper_only_yahoo_proxy_okx_target_review,
         paper_only_yahoo_proxy_cross_surface_alignment_guard,
         paper_only_shadow_direction_inversion_review,
         paper_only_route_requirement_profile,
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
             _paper_only_cross_surface_seed_guard_review,
             _paper_only_yahoo_proxy_crypto_freshness_review,
             _paper_only_parse_timestamp,
+            paper_only_yahoo_proxy_okx_target_review,
             paper_only_yahoo_proxy_cross_surface_alignment_guard,
             paper_only_shadow_direction_inversion_review,
             paper_only_route_requirement_profile,
@@ -134,6 +136,16 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "entry_allowed": True,
                 "reason": "guard_disabled",
                 "force_paper_exit": False,
+            }
+
+        def paper_only_yahoo_proxy_okx_target_review(record, profile=None):
+            return {
+                "destination_venue": None,
+                "target_surface": None,
+                "quarantined": False,
+                "quarantined_target_surfaces": ["OKX_SPOT", "OKX_PERP"],
+                "allow_native_proxy_monitoring": True,
+                "reenable_condition": "native_crypto_confirmation_with_positive_closed_signal_performance",
             }
 
         def _paper_only_family_decay_guard_review(record, config=None):
@@ -5675,7 +5687,8 @@ def paper_only_yahoo_proxy_crypto_momentum_gate(
     max_source_quote_age_seconds: float = 90.0,
     max_destination_proxy_age_seconds: float = 90.0,
     execution_mode: str = "paper",
-    destination_surface: str = "crypto",
+    destination_surface: str = "perp",
+    destination_venue: str = "OKX",
     source_family: str = "yahoo_proxy",
     feature_family: str = "global_proxy_momentum",
     proxy_valid_for_reuse: bool | None = None,
@@ -5693,6 +5706,7 @@ def paper_only_yahoo_proxy_crypto_momentum_gate(
             "source_family": source_family,
             "feature_family": feature_family,
             "target_surface": destination_surface,
+            "target_venue": destination_venue,
             "source_quote_timestamp": source_quote_timestamp,
             "evaluated_at": evaluated_at,
             "source_session_status": source_session_status,
@@ -5851,10 +5865,17 @@ def paper_only_proxy_signal_freshness_gate(
             fail_closed_reasons.append("stale_destination_proxy")
 
     normalized_market_key = str(market_key or "").strip().upper()
+    target_review = paper_only_yahoo_proxy_okx_target_review(
+        {
+            "destination_surface": destination_market,
+            "target_venue": destination_market,
+        }
+    )
     quarantined_cross_surface = bool(
         crypto_destination
         and "YAHOO_PROXY" in normalized_market_key
         and "MOMENTUM" in normalized_market_key
+        and target_review.get("quarantined")
     )
     if quarantined_cross_surface:
         fail_closed_reasons.append("yahoo_proxy_cross_surface_quarantined")
@@ -5884,6 +5905,10 @@ def paper_only_proxy_signal_freshness_gate(
         "execution_mode": normalized_mode,
         "crypto_destination": crypto_destination,
         "quarantined_cross_surface": quarantined_cross_surface,
+        "target_surface": target_review.get("target_surface"),
+        "quarantined_target_surfaces": target_review.get("quarantined_target_surfaces"),
+        "allow_native_proxy_monitoring": target_review.get("allow_native_proxy_monitoring"),
+        "reenable_condition": target_review.get("reenable_condition"),
         "source_session_status": normalized_session or None,
         "source_session_open": session_open,
         "delayed_mode_allowed": bool(allow_delayed_mode),

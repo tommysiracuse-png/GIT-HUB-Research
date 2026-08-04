@@ -78,6 +78,49 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertFalse(live["applies"])
         self.assertTrue(native["eligible"])
         self.assertTrue(live["eligible"])
+        self.assertTrue(native["allow_native_proxy_monitoring"])
+        self.assertEqual(["OKX_SPOT", "OKX_PERP"], native["quarantined_target_surfaces"])
+
+    def test_quarantine_is_bounded_to_okx_spot_and_perp(self) -> None:
+        spot = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                venue="OKX",
+                inst_id="OKX:BTC-USDT",
+                asset_class="crypto_spot",
+                market_surface="spot",
+                direction="long_frontier_spot",
+            )
+        )
+        perp = paper_only_yahoo_proxy_cross_surface_alignment_guard(cross_surface_candidate())
+        route_family_spot = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                inst_id=None,
+                asset_class=None,
+                market_surface=None,
+                direction="long_frontier_spot",
+            )
+        )
+        other_crypto = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                venue="BITGET",
+                inst_id="BITGET:BTCUSDT",
+                asset_class="crypto_derivatives",
+                market_surface="perp",
+            )
+        )
+
+        self.assertEqual("OKX_SPOT", spot["target_surface"])
+        self.assertEqual("OKX_PERP", perp["target_surface"])
+        self.assertEqual("OKX_SPOT", route_family_spot["target_surface"])
+        self.assertTrue(spot["blocked"])
+        self.assertTrue(perp["blocked"])
+        self.assertTrue(route_family_spot["blocked"])
+        self.assertFalse(other_crypto["applies"])
+        self.assertTrue(other_crypto["emit_route"])
+        self.assertEqual(
+            "native_crypto_confirmation_with_positive_closed_signal_performance",
+            spot["reenable_condition"],
+        )
 
     def test_scope_excludes_non_momentum_yahoo_lineage(self) -> None:
         reversal = paper_only_yahoo_proxy_cross_surface_alignment_guard(

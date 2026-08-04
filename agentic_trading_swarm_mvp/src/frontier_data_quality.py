@@ -587,48 +587,114 @@ _PAPER_ONLY_YAHOO_CRYPTO_FRESHNESS_POLICY = {
 _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY = {
     "enabled": True,
     "max_destination_spread_bps": 8.0,
+    "quarantined_target_surfaces": ("OKX_SPOT", "OKX_PERP"),
+    "allow_native_proxy_monitoring": True,
+    "reenable_condition": "native_crypto_confirmation_with_positive_closed_signal_performance",
 }
 
-_PAPER_ONLY_CRYPTO_ROUTE_TOKENS = frozenset(
-    {
-        "crypto",
-        "frontier",
-        "spot",
-        "perp",
-        "perpetual",
-        "swap",
-        "okx",
-        "bitget",
-        "binance_us",
-        "valr",
-        "gate",
-        "bybit",
-        "indodax",
-        "bitso",
-        "mercado_bitcoin",
-        "mercadobitcoin",
+def paper_only_yahoo_proxy_okx_target_review(record, profile=None):
+    """Classify the destination for the bounded Yahoo-to-OKX quarantine.
+
+    Only destination fields are inspected.  Source lineage is deliberately
+    excluded so a native Yahoo observation cannot be mistaken for an OKX
+    candidate merely because both contexts are present in one packet.
+    """
+
+    destination_containers = []
+    for root in (record, profile):
+        if not isinstance(root, dict):
+            continue
+        destination_containers.append(root)
+        for key in (
+            "candidate",
+            "destination_context",
+            "route_context",
+            "local_confirmation",
+            "intraday_features",
+        ):
+            nested = root.get(key)
+            if isinstance(nested, dict):
+                destination_containers.append(nested)
+
+    def _values(*keys):
+        return [
+            str(container.get(key) or "").strip().lower().replace("-", "_")
+            for container in destination_containers
+            for key in keys
+            if container.get(key) not in (None, "", [], {}, ())
+        ]
+
+    explicit_venues = _values("target_venue", "execution_venue", "destination_venue")
+    venue_values = explicit_venues or _values("venue")
+    surface_values = _values(
+        "target_surface",
+        "destination_surface",
+        "candidate_surface",
+        "execution_surface",
+        "market_surface",
+        "market_type",
+        "asset_class",
+        "product_type",
+        "trade_type",
+        "direction",
+    )
+    instrument_values = _values("inst_id", "instrument_id", "symbol")
+    route_values = _values("route_id", "market_key")
+    all_destination_values = venue_values + surface_values + instrument_values + route_values
+    destination_tokens = {
+        token
+        for value in all_destination_values
+        for token in re.findall(r"[a-z0-9]+", value)
     }
-)
+    destination_is_okx = "okx" in destination_tokens
 
-_PAPER_ONLY_FAST_CRYPTO_SURFACE_TOKENS = frozenset(
-    {"crypto", "spot", "perp", "perpetual", "swap", "derivative", "derivatives"}
-)
+    perp_tokens = {"perp", "perpetual", "swap", "derivative", "derivatives"}
+    spot_evidence = "spot" in destination_tokens
+    perp_evidence = bool(destination_tokens.intersection(perp_tokens))
+    if destination_is_okx and not spot_evidence and not perp_evidence:
+        # Public OKX instrument ids use the SWAP suffix for perpetuals; a
+        # conventional base/quote id without that suffix is a spot surface.
+        normalized_instruments = "|".join(instrument_values)
+        if "swap" in normalized_instruments:
+            perp_evidence = True
+        elif instrument_values and any(
+            quote in destination_tokens for quote in ("usdt", "usdc", "btc", "eth")
+        ):
+            spot_evidence = True
+        elif "frontier_crypto_venue_map" in surface_values:
+            spot_evidence = True
 
-_PAPER_ONLY_CRYPTO_VENUES = frozenset(
-    token
-    for token in _PAPER_ONLY_CRYPTO_ROUTE_TOKENS
-    if token not in {"crypto", "frontier", "spot", "perp", "perpetual", "swap"}
-)
+    if destination_is_okx and perp_evidence:
+        target_surface = "OKX_PERP"
+    elif destination_is_okx and spot_evidence:
+        target_surface = "OKX_SPOT"
+    else:
+        target_surface = None
+    quarantined = target_surface in _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY[
+        "quarantined_target_surfaces"
+    ]
+    return {
+        "destination_venue": "okx" if destination_is_okx else (venue_values[0] if venue_values else None),
+        "target_surface": target_surface,
+        "quarantined": quarantined,
+        "quarantined_target_surfaces": list(
+            _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY["quarantined_target_surfaces"]
+        ),
+        "allow_native_proxy_monitoring": True,
+        "reenable_condition": _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY[
+            "reenable_condition"
+        ],
+    }
 
 
 def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
-    """Quarantine Yahoo momentum transferred to a paper crypto surface.
+    """Quarantine Yahoo momentum transferred to paper OKX spot or perp.
 
     Local trend and spread measurements are retained for diagnostics, but they
     cannot make a cross-surface route eligible.  The source signal has not
-    demonstrated enough native robustness to justify transfer into faster spot
-    or derivatives markets.  Native Yahoo evaluation and non-paper contexts do
-    not enter this policy.
+    demonstrated enough native robustness to justify transfer into the faster
+    OKX targets.  Native Yahoo evaluation and non-paper contexts do not enter
+    this policy.
     """
 
     record = record if isinstance(record, dict) else {}
@@ -765,36 +831,8 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
             if destination_venue:
                 break
     destination_is_native_proxy = destination_venue in {"yahoo", "yahoo_proxy"}
-    destination_fields = (
-        "target_surface",
-        "destination_surface",
-        "candidate_surface",
-        "execution_surface",
-        "market_surface",
-        "market_type",
-        "asset_class",
-        "trade_type",
-        "venue",
-        "target_venue",
-        "execution_venue",
-        "destination_venue",
-    )
-    destination_values = [
-        str(container.get(key) or "").strip().lower().replace("-", "_")
-        for container in destination_containers
-        for key in destination_fields
-        if container.get(key) not in (None, "", [], {}, ())
-    ]
-    destination_scope_text = "|".join(destination_values)
-    destination_tokens = set(re.findall(r"[a-z0-9]+", destination_scope_text))
-    destination_is_fast_crypto = bool(
-        "crypto" in destination_tokens
-        or "frontier_crypto_venue_map" in destination_values
-        or (
-            destination_venue in _PAPER_ONLY_CRYPTO_VENUES
-            and destination_tokens.intersection(_PAPER_ONLY_FAST_CRYPTO_SURFACE_TOKENS)
-        )
-    )
+    target_review = paper_only_yahoo_proxy_okx_target_review(record, profile)
+    destination_venue = target_review.get("destination_venue") or destination_venue
     execution_mode = _paper_only_route_intelligence_tag(
         _lookup("execution_mode", "trading_mode", "mode", "destination_mode", "runner_mode")
     )
@@ -808,7 +846,7 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         and paper_mode
         and source_is_yahoo
         and momentum_family
-        and destination_is_fast_crypto
+        and target_review.get("quarantined")
         and not destination_is_native_proxy
     )
 
@@ -924,7 +962,7 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
     spread_evidence_present = destination_spread_bps is not None or explicit_spread_ok is not None
 
     # Alignment used to be sufficient to release this route.  It is now only
-    # diagnostic evidence: every in-scope cross-surface paper route is
+    # diagnostic evidence: every in-scope OKX spot/perp paper route is
     # quarantined regardless of destination quality.
     eligible = False if applies else True
     if not applies:
@@ -966,6 +1004,10 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "source_family": "yahoo_proxy" if source_is_yahoo else None,
         "signal_family": "global_proxy_momentum" if momentum_family else None,
         "destination_venue": destination_venue,
+        "target_surface": target_review.get("target_surface"),
+        "quarantined_target_surfaces": target_review.get("quarantined_target_surfaces"),
+        "allow_native_proxy_monitoring": target_review.get("allow_native_proxy_monitoring"),
+        "reenable_condition": target_review.get("reenable_condition"),
         "destination_direction": direction,
         "local_direction": local_direction,
         "local_short_horizon_trend_bps": local_trend_bps,
@@ -1214,9 +1256,11 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
     elif destination_age > max_destination_age:
         reasons.append("stale_destination_proxy")
 
-    # Freshness remains useful telemetry, but it can no longer release Yahoo
-    # proxy momentum into a non-native crypto paper route.
-    reasons.append("yahoo_proxy_cross_surface_quarantined")
+    # Freshness remains useful telemetry for every crypto destination.  The
+    # hard emission quarantine is intentionally bounded to OKX spot/perp.
+    target_review = paper_only_yahoo_proxy_okx_target_review(record, profile)
+    if target_review.get("quarantined"):
+        reasons.append("yahoo_proxy_cross_surface_quarantined")
 
     blocked = bool(reasons)
     return {
@@ -1225,8 +1269,8 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
         "applies": True,
         "eligible": not blocked,
         "blocked": blocked,
-        "emit_recommendation": False,
-        "emit_route": False,
+        "emit_recommendation": not blocked,
+        "emit_route": not blocked,
         "reason": reasons[0] if reasons else "fresh_proxy_session_allowed",
         "gate_reason": reasons[0] if reasons else None,
         "gate_reasons": reasons,
@@ -1245,6 +1289,10 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
         "propagated_momentum_contribution": 0.0 if blocked else raw_contribution,
         "momentum_state": "neutral" if blocked else "propagated",
         "proxy_valid_for_reuse": False if blocked else explicit_reuse_valid,
+        "target_surface": target_review.get("target_surface"),
+        "quarantined_target_surfaces": target_review.get("quarantined_target_surfaces"),
+        "allow_native_proxy_monitoring": target_review.get("allow_native_proxy_monitoring"),
+        "reenable_condition": target_review.get("reenable_condition"),
     }
 
 
@@ -1341,9 +1389,15 @@ def _paper_only_cross_surface_seed_guard_review(record, profile=None):
         "candidate_surface": candidate_surface,
         "native_proxy_variant": native_proxy_variant,
         "cross_surface_target": cross_surface_target,
-        "emit_recommendation": not bool(applies or alignment_guard.get("applies")),
-        "emit_route": not bool(applies or alignment_guard.get("applies")),
-        "policy": "yahoo_proxy_cross_surface_paper_quarantine" if applies or alignment_guard.get("applies") else "allow",
+        "emit_recommendation": not blocked,
+        "emit_route": not blocked,
+        "policy": (
+            "yahoo_proxy_okx_cross_surface_paper_quarantine"
+            if alignment_guard.get("applies")
+            else "yahoo_proxy_crypto_freshness_gate"
+            if applies
+            else "allow"
+        ),
         "gate_reason": reason if blocked else None,
         "gate_reasons": list(
             dict.fromkeys(

@@ -80,6 +80,9 @@ DEFAULT_SETTINGS = {
     "yahoo_proxy_cross_surface_alignment_guard": {
         "enabled": True,
         "max_destination_spread_bps": 8.0,
+        "quarantined_target_surfaces": ["OKX_SPOT", "OKX_PERP"],
+        "allow_native_proxy_monitoring": True,
+        "reenable_condition": "native_crypto_confirmation_with_positive_closed_signal_performance",
     },
     "paper_cell_policy": {
         "min_closed_trades": 3,
