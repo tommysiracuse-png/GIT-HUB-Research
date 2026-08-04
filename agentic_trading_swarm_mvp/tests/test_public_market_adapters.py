@@ -274,6 +274,7 @@ class PublicAdapterParserTests(unittest.TestCase):
             "republican_stock_exchange_toshkent_public",
             "dc_department_of_energy_environment",
             "vietnam_securities_depository_and_clearing_corporation_hanoi_sto",
+            "abu_dhabi_securities_exchange_adx_etf",
         }
         self.assertTrue(expected <= set(discover_adapters()))
 

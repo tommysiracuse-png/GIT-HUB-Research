@@ -119,7 +119,7 @@ def fetch_bytes(url: str, timeout: int = 15, *, max_bytes: int = 10_000_000) -> 
     request = urllib.request.Request(
         url,
         headers={
-            "Accept": "application/octet-stream,*/*;q=0.5",
+            "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.5",
             "User-Agent": "agentic-trading-swarm-paper-research/1.0",
         },
         method="GET",
