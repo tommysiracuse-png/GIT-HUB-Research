@@ -289,6 +289,10 @@ class StrategyLabTest(unittest.TestCase):
             liquidity_score=0.8,
             spread_bps=2.0,
             seen_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            hedge_venue="OKX_SPOT",
+            hedge_instrument="BTC-USDT",
+            fee_model="paper_conservative_v1",
+            paper_leg_mapping_valid=True,
         )
 
         with memory_db() as conn:

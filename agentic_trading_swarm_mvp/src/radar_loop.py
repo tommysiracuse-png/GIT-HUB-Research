@@ -452,6 +452,7 @@ def run_once(settings: dict) -> dict:
         if promoted_signal_candidates:
             candidates.extend(promoted_signal_candidates)
             candidates.sort(key=lambda row: row["score"], reverse=True)
+        candidates = enrich_candidates(candidates, settings)
         strategy_lab_candidates, strategy_lab_generation = generate_strategy_lab_candidates(
             conn,
             settings,
@@ -464,9 +465,8 @@ def run_once(settings: dict) -> dict:
             settings,
         )
         if selected_strategy_lab_candidates:
-            candidates.extend(selected_strategy_lab_candidates)
+            candidates.extend(enrich_candidates(selected_strategy_lab_candidates, settings))
             candidates.sort(key=lambda row: row["score"], reverse=True)
-        candidates = enrich_candidates(candidates, settings)
         candidates, strategy_reliability = apply_strategy_reliability(candidates, settings, conn=conn)
         route_resolver_report = write_route_resolver_report(candidates, settings)
         expansion_map = _build_expansion_map(

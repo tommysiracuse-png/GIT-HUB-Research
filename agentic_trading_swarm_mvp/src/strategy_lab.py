@@ -15,6 +15,7 @@ import sqlite3
 from collections import Counter, defaultdict
 from typing import Any
 
+from route_resolver import evaluate_route_intelligence
 from signals.registry import discover_signals, known_strategy_signatures, promoted_strategy_lab_ids
 from storage import RUNS_DIR, add_llm_recommendation, utc_now
 from strategy_program import (
@@ -1729,6 +1730,41 @@ def _compile_strategy_lab_contracts(
     }
 
 
+def _paper_route_eligible_candidates(
+    candidates: list[dict],
+) -> tuple[list[dict], list[dict], Counter, Counter]:
+    eligible: list[dict] = []
+    blocked: list[dict] = []
+    missing_counts: Counter = Counter()
+    blocker_counts: Counter = Counter()
+    for candidate in candidates:
+        annotated = dict(candidate)
+        verdict = annotated.get("paper_route_eligibility")
+        if not isinstance(verdict, dict):
+            verdict = evaluate_route_intelligence(annotated)
+        if verdict.get("applies"):
+            annotated["paper_route_eligibility"] = verdict
+        if not verdict.get("suppressed"):
+            eligible.append(annotated)
+            continue
+        missing = list(verdict.get("missing_prerequisites") or [])
+        reasons = list(verdict.get("blocker_reasons") or [])
+        missing_counts.update(str(item) for item in missing)
+        blocker_counts.update(str(item) for item in reasons)
+        blocked.append(
+            {
+                "inst_id": candidate.get("inst_id"),
+                "venue": candidate.get("venue"),
+                "trade_type": candidate.get("trade_type"),
+                "direction": candidate.get("direction"),
+                "score": candidate.get("score"),
+                "missing_prerequisites": missing,
+                "blocker_reasons": reasons,
+            }
+        )
+    return eligible, blocked, missing_counts, blocker_counts
+
+
 def generate_strategy_lab_candidates(
     conn: sqlite3.Connection,
     settings: dict,
@@ -1759,7 +1795,10 @@ def generate_strategy_lab_candidates(
         )
     else:
         observation_frames, snapshot_summary = [], {"enabled": False}
-    compilation = _compile_strategy_lab_contracts(conn, candidates, observation_frames)
+    eligible_candidates, route_blocked, route_missing_counts, route_blocker_counts = (
+        _paper_route_eligible_candidates(candidates)
+    )
+    compilation = _compile_strategy_lab_contracts(conn, eligible_candidates, observation_frames)
     experiments = _active_experiments(conn)
     max_total = int(cfg.get("max_candidates_per_loop", 25))
     max_per_experiment = int(cfg.get("max_candidates_per_experiment", 5))
@@ -1771,7 +1810,10 @@ def generate_strategy_lab_candidates(
     nearest_candidates: dict[str, list[dict]] = defaultdict(list)
     status_by_experiment: dict[str, str] = {}
 
-    pool = sorted(candidates, key=lambda row: (_paper_route_rank(row), -_as_float(row.get("score"))))
+    pool = sorted(
+        eligible_candidates,
+        key=lambda row: (_paper_route_rank(row), -_as_float(row.get("score"))),
+    )
     runtime_vocabulary = _runtime_strategy_vocabulary(pool)
     for experiment_id, diagnostic in (compilation.get("diagnostics") or {}).items():
         if diagnostic.get("compile_status") == "compiled":
@@ -1787,6 +1829,7 @@ def generate_strategy_lab_candidates(
             break
         raw_logic = experiment.get("strategy_logic") or {}
         if str(raw_logic.get("type") or "") == OBSERVATION_PROGRAM:
+            experiment_id = experiment["strategy_lab_id"]
             remaining = max(0, max_total - len(generated))
             program_candidates, program_diagnostic = generate_program_candidates(
                 experiment,
@@ -1794,8 +1837,18 @@ def generate_strategy_lab_candidates(
                 settings,
                 max_candidates=min(max_per_experiment, remaining),
             )
+            (
+                program_candidates,
+                program_route_blocked,
+                program_missing_counts,
+                program_blocker_counts,
+            ) = _paper_route_eligible_candidates(program_candidates)
+            route_blocked.extend(program_route_blocked)
+            route_missing_counts.update(program_missing_counts)
+            route_blocker_counts.update(program_blocker_counts)
+            for reason, count in program_blocker_counts.items():
+                rejects[experiment_id][f"paper_route:{reason}"] += int(count)
             generated.extend(program_candidates)
-            experiment_id = experiment["strategy_lab_id"]
             per_experiment[experiment_id] += len(program_candidates)
             for reason, count in (program_diagnostic.get("reject_reasons") or {}).items():
                 rejects[experiment_id][str(reason)] += int(count)
@@ -1949,6 +2002,11 @@ def generate_strategy_lab_candidates(
         "generated_at": _utc(),
         "active_experiments": len(experiments),
         "source_candidate_count": len(candidates),
+        "route_eligible_source_candidate_count": len(eligible_candidates),
+        "route_ineligible_candidate_count": len(route_blocked),
+        "route_ineligible_missing_prerequisite_counts": dict(route_missing_counts),
+        "route_ineligible_blocker_counts": dict(route_blocker_counts),
+        "route_ineligible_examples": route_blocked[:20],
         "price_observation_count": len(price_observations or []),
         "generated_candidates": len(generated),
         "generated_by_experiment": dict(per_experiment),
@@ -2524,6 +2582,9 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         f"- Runtime contract compilation: `{summary.get('compile_status_counts', {})}`",
         f"- Program novelty: `{summary.get('novelty_status_counts', {})}`",
         f"- Candidates generated this loop: `{(generation or {}).get('generated_candidates', 0)}`",
+        f"- Route-ineligible candidates filtered: `{(generation or {}).get('route_ineligible_candidate_count', 0)}`",
+        f"- Missing route prerequisites: `{(generation or {}).get('route_ineligible_missing_prerequisite_counts', {})}`",
+        f"- Route eligibility blockers: `{(generation or {}).get('route_ineligible_blocker_counts', {})}`",
         f"- Feature snapshots: `{(generation or {}).get('feature_snapshots', {})}`",
         "",
         "## Market Strategy Experiments",

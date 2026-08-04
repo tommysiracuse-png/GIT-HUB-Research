@@ -84,6 +84,10 @@ class TestOkxFundingCaptureQualityGate(unittest.TestCase):
             "seen_at": now,
             "last": 100.0,
             "route_status": "standard",
+            "hedge_venue": "OKX_SPOT",
+            "hedge_instrument": "BTC-USDT",
+            "fee_model": "paper_conservative_v1",
+            "paper_leg_mapping_valid": True,
         }
         with self._connection() as conn:
             self_improvement.ingest_strategy_lab_recommendation(conn, self._recommendation())
@@ -98,6 +102,36 @@ class TestOkxFundingCaptureQualityGate(unittest.TestCase):
         self.assertEqual(1, report["generated_candidates"])
         self.assertEqual([], rejected)
         self.assertTrue(generated[0]["strategy_lab_id"].startswith("okx_funding_capture_quality_gate_"))
+
+    def test_missing_hedge_contract_is_rejected_before_strategy_lab_scoring(self):
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+        settings["allow_live_trading"] = False
+        candidate = {
+            "venue": "OKX",
+            "inst_id": "BTC-USDT-SWAP",
+            "direction": "funding_capture_short_perp",
+            "trade_type": "perp_funding_basis",
+            "score": 80.0,
+            "liquidity_score": 0.85,
+            "quote_volume_24h": 1000000.0,
+            "spread_bps": 2.0,
+            "funding_bps": 12.0,
+            "basis_bps": 3.0,
+            "carry_alignment_status": "carry_aligned_positive",
+            "seen_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "last": 100.0,
+            "route_status": "standard",
+        }
+        with self._connection() as conn:
+            self_improvement.ingest_strategy_lab_recommendation(conn, self._recommendation())
+            generated, report = generate_strategy_lab_candidates(conn, settings, [candidate])
+
+        self.assertEqual([], generated)
+        self.assertEqual(1, report["route_ineligible_candidate_count"])
+        self.assertEqual(
+            1,
+            report["route_ineligible_missing_prerequisite_counts"]["hedge_venue"],
+        )
 
 
 if __name__ == "__main__":
