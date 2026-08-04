@@ -34,6 +34,12 @@ from adapters.venues.b3 import (
     parse_b3_public_data_hub,
 )
 from adapters.venues.bahrain_cross_listings import cross_listing_observations
+from adapters.venues.bank_of_canada import (
+    API_URL as BANK_OF_CANADA_TBILL_API_URL,
+    SOURCE_URL as BANK_OF_CANADA_TBILL_SOURCE_URL,
+    BankOfCanadaRegularTreasuryBillsAdapter,
+    parse_bank_of_canada_treasury_bill_auctions,
+)
 from adapters.venues.bursa_derivatives import contract_observations
 from adapters.venues.dc_department_of_energy_environment import (
     FINAL_SALES_URL as DC_SRC_FINAL_SALES_URL,
@@ -263,12 +269,145 @@ class PublicAdapterParserTests(unittest.TestCase):
             "kalshi_public_prediction_markets",
             "polymarket_sports_websocket",
             "b3_public_data_hub",
+            "bank_of_canada_regular_treasury_bills",
             "stock_exchange_of_thailand_yuanta_securities_thailand",
             "republican_stock_exchange_toshkent_public",
             "dc_department_of_energy_environment",
             "vietnam_securities_depository_and_clearing_corporation_hanoi_sto",
         }
         self.assertTrue(expected <= set(discover_adapters()))
+
+    def test_bank_of_canada_tbill_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "bank_of_canada_regular_treasury_bills"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsNotNone(adapter)
+        self.assertEqual("BANK_OF_CANADA", adapter.info.venue)
+        self.assertEqual(BANK_OF_CANADA_TBILL_SOURCE_URL, adapter.info.docs_url)
+        self.assertIn("stop_out_yield", adapter.info.capabilities)
+        self.assertIn("award_size", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+
+    def test_bank_of_canada_tbill_parser_normalizes_calls_and_results(self) -> None:
+        payload = {
+            "seriesDetail": {
+                "AUC_TBILL_ISIN": {"label": "ISIN"},
+                "AUC_TBILL_AVG_YIELD": {"label": "Avg yield (%)"},
+            },
+            "observations": [
+                {
+                    "tbill_id": "19002063094-1",
+                    "AUC_TBILL_KEY": {"v": "19002063094-1"},
+                    "AUC_TBILL_AUCTION_DATE": {"v": "2026-07-28"},
+                    "AUC_TBILL_BID_DEADLINE": {"v": "10:30"},
+                    "AUC_TBILL_ISSUE_DATE": {"v": "2026-07-29"},
+                    "AUC_TBILL_TERM_DAYS": {"v": "98"},
+                    "AUC_TBILL_MATURITY_DATE": {"v": "2026-11-04"},
+                    "AUC_TBILL_ISIN": {"v": "CA1350Z7EM25"},
+                    "AUC_TBILL_AMOUNT": {"v": "16400.000"},
+                    "AUC_TBILL_STATUS": {"v": "Results"},
+                    "AUC_TBILL_AVG_PRICE": {"v": "99.38891"},
+                    "AUC_TBILL_AVG_YIELD": {"v": "2.290"},
+                    "AUC_TBILL_LOW_YIELD": {"v": "2.285"},
+                    "AUC_TBILL_HIGH_YIELD": {"v": "2.298"},
+                    "AUC_TBILL_COVERAGE": {"v": "1.667"},
+                    "AUC_TBILL_TAIL": {"v": "0.790"},
+                    "AUC_TBILL_ALLOTMENT_RATIO": {"v": "76.74580"},
+                    "AUC_TBILL_BOC_PURCHASE": {"v": "164"},
+                    "AUC_TBILL_TOTAL_SUBMITTED": {"v": "27337.600"},
+                    "AUC_TBILL_OUTSTANDING_AFTER": {"v": "25800.000"},
+                },
+                {
+                    "tbill_id": "19002064000-2",
+                    "AUC_TBILL_AUCTION_DATE": {"v": "2026-08-11"},
+                    "AUC_TBILL_BID_DEADLINE": {"v": "10:30"},
+                    "AUC_TBILL_ISSUE_DATE": {"v": "2026-08-12"},
+                    "AUC_TBILL_TERM_DAYS": {"v": "154"},
+                    "AUC_TBILL_MATURITY_DATE": {"v": "2027-01-13"},
+                    "AUC_TBILL_ISIN": {"v": "CA1350Z7FC34"},
+                    "AUC_TBILL_AMOUNT": {"v": "5800.000"},
+                    "AUC_TBILL_STATUS": {"v": "Final CFT"},
+                    "AUC_TBILL_BOC_MIN_PURCHASE": {"v": "58.000"},
+                },
+                {
+                    "tbill_id": "19002064000",
+                    "AUC_TBILL_AUCTION_DATE": {"v": "2026-08-11"},
+                    "AUC_TBILL_TOTAL_AMOUNT": {"v": "28000"},
+                },
+            ],
+        }
+
+        rows = parse_bank_of_canada_treasury_bill_auctions(
+            payload,
+            received_at="2026-08-04T16:00:00+00:00",
+        )
+
+        self.assertEqual(2, len(rows))
+        result = next(row for row in rows if row["session_status"] == "results_published")
+        call = next(row for row in rows if row["session_status"] == "auction_scheduled")
+        self.assertEqual("BANK_OF_CANADA:CA1350Z7EM25:AUCTION:2026-07-28", result["inst_id"])
+        self.assertEqual(99.38891, result["last"])
+        self.assertEqual(2.298, result["stop_out_yield_pct"])
+        self.assertEqual(16400.0, result["awarded_amount_millions_cad"])
+        self.assertEqual(164.0, result["bank_of_canada_purchase_millions_cad"])
+        self.assertEqual(1.667, result["coverage_ratio"])
+        self.assertEqual("fresh", result["freshness_state"])
+        self.assertEqual(BANK_OF_CANADA_TBILL_API_URL, result["source_url"])
+        self.assertEqual("watch_only", result["direction"])
+        self.assertEqual(0.0, call["last"])
+        self.assertIsNone(call["awarded_amount_millions_cad"])
+        self.assertEqual("official_call_for_tender", call["quality_status"])
+        self.assertEqual("watch_only", call["direction"])
+
+    def test_bank_of_canada_adapter_preserves_parser_and_fetch_evidence(self) -> None:
+        reachable_bad_schema = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": '{"observations": [{"tbill_id": "overview-only"}]}',
+            "received_at": "2026-08-04T16:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.bank_of_canada.fetch_text",
+            return_value=reachable_bad_schema,
+        ):
+            parser_batch = BankOfCanadaRegularTreasuryBillsAdapter().scan({})
+
+        self.assertEqual([], parser_batch.candidates)
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable",
+            parser_batch.metadata["fetch_status"]["regular_treasury_bills"]["fetch_status"],
+        )
+        self.assertIn("no usable", parser_batch.metadata["parser_failures"][0]["error"])
+        self.assertTrue(parser_batch.metadata["paper_only"])
+        parser_row = parser_batch.observations[0]
+        self.assertEqual("watch_only", parser_row["direction"])
+        self.assertEqual("public_treasury_bill_parser_failure", parser_row["candidate_reject_reason"])
+
+        unavailable = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T16:01:00+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch(
+            "adapters.venues.bank_of_canada.fetch_text",
+            return_value=unavailable,
+        ):
+            unavailable_batch = BankOfCanadaRegularTreasuryBillsAdapter().scan({})
+
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual(
+            "public_treasury_bill_source_unavailable",
+            unavailable_batch.observations[0]["candidate_reject_reason"],
+        )
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
 
     def test_vsdc_hnx_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
         adapter_id = "vietnam_securities_depository_and_clearing_corporation_hanoi_sto"
