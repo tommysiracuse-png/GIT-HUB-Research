@@ -40,6 +40,10 @@ DEFAULT_SETTINGS = {
         "enable_frontier_crypto_adapter_scan": True,
         "frontier_crypto_review_top": 120,
     },
+    "paper_route_feasibility_gate": {
+        "enabled": True,
+        "min_score": 0.65,
+    },
     "paper_context_cost_floor": {
         "enabled": True,
         "safety_multiplier": 1.25,

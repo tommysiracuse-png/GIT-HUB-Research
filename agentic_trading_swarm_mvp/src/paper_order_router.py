@@ -17,6 +17,8 @@ from typing import Any
 FRONTIER_MARKER = "frontier_crypto_venue_map"
 FRONTIER_SHADOW_REASON = "frontier_shadow_filtered"
 SPOT_BORROW_SHADOW_CODE = "spot_borrow_unconfirmed"
+ROUTE_FEASIBILITY_SCORE_SHADOW_REASON = "paper_route_feasibility_score_below_threshold"
+DEFAULT_ROUTE_FEASIBILITY_THRESHOLD = 0.65
 
 _ROUTE_FLAG_KEYS = (
     "frontier_route_feasibility_guard_enabled",
@@ -36,6 +38,17 @@ _FLAG_KEYS = (
 _FLAG_SCOPES = ("paper_order_router", "paper", "frontier_crypto_adapter", "frontier")
 _FALSE_VALUES = {"0", "false", "f", "no", "n", "off", "disabled"}
 _TRUE_VALUES = {"1", "true", "t", "yes", "y", "on", "enabled"}
+
+_ROUTE_FEASIBILITY_SCORE_FIELDS = (
+    "route_feasibility_score",
+    "paper_route_feasibility_score",
+)
+_ROUTE_SENSITIVITY_FIELDS = (
+    "route_sensitive",
+    "is_route_sensitive",
+    "paper_route_sensitive",
+)
+_CONDITIONAL_ROUTE_STATUSES = {"conditional", "paper_conditional"}
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -98,6 +111,182 @@ def frontier_route_feasibility_guard_enabled(config: Mapping[str, Any] | bool | 
             if key in scoped:
                 return _as_bool(scoped.get(key), True)
     return True
+
+
+def _paper_route_feasibility_gate_config(
+    config: Mapping[str, Any] | bool | None,
+) -> tuple[bool, float]:
+    """Return the paper-only score-gate toggle and bounded threshold."""
+    if isinstance(config, bool):
+        return config, DEFAULT_ROUTE_FEASIBILITY_THRESHOLD
+    profile: Mapping[str, Any] = {}
+    if isinstance(config, Mapping):
+        configured = config.get("paper_route_feasibility_gate")
+        if isinstance(configured, Mapping):
+            profile = configured
+        elif configured is not None:
+            profile = {"enabled": configured}
+    enabled = _as_bool(profile.get("enabled"), True)
+    threshold = _finite_float(profile.get("min_score"))
+    if threshold is None:
+        threshold = _finite_float(profile.get("threshold"))
+    if threshold is None:
+        threshold = DEFAULT_ROUTE_FEASIBILITY_THRESHOLD
+    return enabled, max(0.0, min(1.0, threshold))
+
+
+def _candidate_containers(candidate: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    containers: list[Mapping[str, Any]] = [candidate]
+    for field in (
+        "execution_feasibility",
+        "execution_route",
+        "route_requirements",
+        "paper_route_requirements",
+    ):
+        value = candidate.get(field)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    return tuple(containers)
+
+
+def _route_sensitive_marker(candidate: Mapping[str, Any]) -> bool:
+    for container in _candidate_containers(candidate):
+        for field in _ROUTE_SENSITIVITY_FIELDS:
+            if field in container and _as_bool(container.get(field), False):
+                return True
+    return False
+
+
+def _route_feasibility_score(candidate: Mapping[str, Any]) -> tuple[str | None, float | None]:
+    for container in _candidate_containers(candidate):
+        for field in _ROUTE_FEASIBILITY_SCORE_FIELDS:
+            score = _finite_float(container.get(field))
+            if score is not None and 0.0 <= score <= 1.0:
+                return field, score
+    return None, None
+
+
+def _route_statuses(candidate: Mapping[str, Any]) -> set[str]:
+    statuses: set[str] = set()
+    for container in _candidate_containers(candidate):
+        for field in ("route_status", "status", "feasibility_status"):
+            status = _normalize_route_status(container.get(field))
+            if status:
+                statuses.add(status)
+    return statuses
+
+
+def _route_sensitivity_scope(candidate: Mapping[str, Any]) -> list[str]:
+    """Identify the conditional route prerequisites covered by this policy."""
+    descriptor_fields = (
+        "direction",
+        "trade_type",
+        "strategy",
+        "strategy_id",
+        "strategy_profile",
+        "signal_key",
+        "market_key",
+        "route_type",
+        "route_id",
+        "market_surface",
+        "execution_surface",
+    )
+    descriptor_parts: list[str] = []
+    for container in _candidate_containers(candidate):
+        descriptor_parts.extend(str(container.get(field) or "") for field in descriptor_fields)
+    descriptor = " ".join(descriptor_parts).lower().replace("-", "_")
+    blockers = {item.lower().replace("-", "_") for item in _route_blockers(candidate)}
+    reasons: list[str] = []
+
+    short_spot = (
+        "short_frontier_spot" in descriptor
+        or "long_perp_short_spot" in descriptor
+        or "short_spot" in descriptor
+        or ("short" in descriptor and "spot" in descriptor)
+    )
+    if short_spot:
+        reasons.append("short_spot")
+    if any("borrow" in item for item in blockers) or any(
+        _as_bool(container.get(field), False)
+        for container in _candidate_containers(candidate)
+        for field in ("borrow_required", "requires_spot_borrow", "borrow_dependent")
+    ):
+        reasons.append("borrow_dependency")
+    cross_venue = "cross_venue" in descriptor or "cross venue" in descriptor
+    basis = "basis" in descriptor or "multi_leg" in descriptor or "multi leg" in descriptor
+    if cross_venue and basis:
+        reasons.append("cross_venue_basis")
+    prerequisite_tokens = ("api", "margin", "permission", "venue_access", "jurisdiction")
+    if any(any(token in item for token in prerequisite_tokens) for item in blockers) or any(
+        _as_bool(container.get(field), False)
+        for container in _candidate_containers(candidate)
+        for field in ("margin_required", "venue_api_required", "venue_permission_required")
+    ):
+        reasons.append("venue_api_or_margin_prerequisite")
+    return list(dict.fromkeys(reasons))
+
+
+def paper_route_feasibility_gate_review(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any]:
+    """Evaluate the minimum route-feasibility score for paper admission.
+
+    The gate is deliberately inactive outside paper mode and only applies to
+    candidates explicitly marked route-sensitive after route enrichment.
+    """
+    enabled, threshold = _paper_route_feasibility_gate_config(config)
+    mode = str(config.get("mode", "paper") if isinstance(config, Mapping) else "paper").strip().lower()
+    route_sensitive = _route_sensitive_marker(candidate)
+    statuses = _route_statuses(candidate)
+    explicit_route_statuses = {
+        _normalize_route_status(container.get("route_status"))
+        for container in _candidate_containers(candidate)
+        if container.get("route_status") not in (None, "")
+    }
+    explicit_route_statuses.discard("")
+    conditional = bool(
+        (explicit_route_statuses or statuses) & _CONDITIONAL_ROUTE_STATUSES
+    )
+    if not conditional and not explicit_route_statuses:
+        descriptor = " ".join(
+            str(candidate.get(field) or "")
+            for field in ("signal_key", "market_key", "trade_type", "strategy_profile")
+        ).lower()
+        conditional = "conditional" in descriptor
+    scope_reasons = _route_sensitivity_scope(candidate)
+    score_source, score = _route_feasibility_score(candidate)
+    applies = bool(enabled and mode == "paper" and route_sensitive and conditional and scope_reasons)
+    eligible = not applies or (score is not None and score >= threshold)
+    if not applies:
+        action = "not_applicable"
+        reason = None
+    elif eligible:
+        action = "admit"
+        reason = None
+    else:
+        action = "shadow_filter"
+        reason = (
+            "route_feasibility_score_missing"
+            if score is None
+            else ROUTE_FEASIBILITY_SCORE_SHADOW_REASON
+        )
+    return {
+        "enabled": enabled,
+        "paper_only": True,
+        "mode": mode,
+        "applies": applies,
+        "route_sensitive": route_sensitive,
+        "conditional": conditional,
+        "scope_reasons": scope_reasons,
+        "route_feasibility_score": score,
+        "score_source": score_source,
+        "threshold": threshold,
+        "eligible": eligible,
+        "paper_fill_allowed": eligible,
+        "action": action,
+        "reason": reason,
+    }
 
 def _text_contains_frontier_marker(value: Any) -> bool:
     if value is None:
@@ -844,6 +1033,35 @@ def apply_frontier_paper_guard(
     """Return a copy of ``candidate`` annotated as shadow-filtered when needed."""
     route_guard_enabled = frontier_route_feasibility_guard_enabled(config)
     guarded = dict(candidate)
+    existing_route_reason = frontier_shadow_filter_reason(guarded, config)
+    if (
+        isinstance(existing_route_reason, Mapping)
+        and existing_route_reason.get("guard") == "paper_route_eligibility_gate"
+    ):
+        return _annotate_shadow_filtered_candidate(
+            guarded,
+            existing_route_reason,
+            "frontier_paper_guard",
+        )
+    score_gate = paper_route_feasibility_gate_review(guarded, config)
+    guarded["paper_route_feasibility_gate"] = score_gate
+    if score_gate["applies"] and not score_gate["eligible"]:
+        guarded["paper_entry_blocked"] = True
+        guarded["promotion_eligible"] = False
+        guarded["paper_allocation_multiplier"] = 0.0
+        reason = {
+            "reason": score_gate["reason"],
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "paper_route_feasibility_score_gate",
+            "candidate": _candidate_reference(guarded),
+            "route_feasibility": score_gate,
+        }
+        return _annotate_shadow_filtered_candidate(
+            guarded,
+            reason,
+            "paper_route_feasibility_guard",
+        )
     alignment_guard = _paper_yahoo_proxy_cross_surface_alignment_guard(guarded, config)
     if isinstance(alignment_guard, Mapping) and alignment_guard.get("applies"):
         guarded["yahoo_proxy_cross_surface_alignment_guard"] = dict(alignment_guard)

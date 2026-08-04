@@ -1411,6 +1411,73 @@ def _base_route(
     }
 
 
+def _paper_route_sensitivity_reasons(candidate: dict, route: dict) -> list[str]:
+    """Return the paper policy scopes that make a conditional route sensitive."""
+    descriptor = " ".join(
+        str(value or "")
+        for value in (
+            candidate.get("direction"),
+            candidate.get("trade_type"),
+            candidate.get("strategy"),
+            candidate.get("strategy_profile"),
+            candidate.get("signal_key"),
+            candidate.get("market_key"),
+            candidate.get("market_surface"),
+            route.get("route_id"),
+            route.get("instrument_type"),
+        )
+    ).lower().replace("-", "_")
+    requirements = {
+        str(item or "").strip().lower().replace("-", "_")
+        for item in (
+            list(route.get("required_permissions") or [])
+            + list(route.get("missing_permissions") or [])
+        )
+        if str(item or "").strip()
+    }
+    reasons: list[str] = []
+    if (
+        "short_frontier_spot" in descriptor
+        or "long_perp_short_spot" in descriptor
+        or "short_spot" in descriptor
+        or ("short" in descriptor and "spot" in descriptor)
+    ):
+        reasons.append("short_spot")
+    if route.get("borrow_required") or any("borrow" in item for item in requirements):
+        reasons.append("borrow_dependency")
+    if (
+        ("cross_venue" in descriptor or "cross venue" in descriptor)
+        and ("basis" in descriptor or "multi_leg" in descriptor or "multi leg" in descriptor)
+    ):
+        reasons.append("cross_venue_basis")
+    prerequisite_tokens = ("api", "margin", "permission", "venue_access", "jurisdiction")
+    if route.get("margin_required") or any(
+        any(token in item for token in prerequisite_tokens) for item in requirements
+    ):
+        reasons.append("venue_api_or_margin_prerequisite")
+    return list(dict.fromkeys(reasons))
+
+
+def _paper_route_feasibility_score(candidate: dict, route: dict, eligibility: dict) -> float:
+    """Produce a bounded, auditable score from the resolved paper route."""
+    explicit = _eligibility_number(
+        candidate,
+        "route_feasibility_score",
+        "paper_route_feasibility_score",
+    )
+    if explicit is not None and 0.0 <= explicit <= 1.0:
+        return round(explicit, 3)
+    score = max(0.0, min(1.0, float(route.get("confidence") or 0.0)))
+    status = str(route.get("route_status") or "").strip().lower()
+    if eligibility.get("suppressed") or status == "blocked":
+        score = 0.0
+    elif eligibility.get("assumption_penalty_applied"):
+        score = min(score, 0.5)
+    elif route.get("missing_permissions") or status in {"route_unknown", "unknown"}:
+        score = min(score, 0.5)
+    return round(score, 3)
+
+
 def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | None = None) -> dict:
     registry = registry or load_route_registry()
     caps = settings.get("account_capabilities", {})
@@ -1699,6 +1766,12 @@ def enrich_candidate_with_route(
     eligibility_input = dict(enriched)
     eligibility_input.setdefault("route_id", route.get("route_id"))
     eligibility = evaluate_route_intelligence(eligibility_input)
+    route_sensitivity_reasons = _paper_route_sensitivity_reasons(enriched, route)
+    route_sensitive = bool(route_sensitivity_reasons)
+    route_feasibility_score = _paper_route_feasibility_score(enriched, route, eligibility)
+    route["route_sensitive"] = route_sensitive
+    route["route_sensitivity_reasons"] = route_sensitivity_reasons
+    route["route_feasibility_score"] = route_feasibility_score
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
     existing = dict(enriched.get("execution_feasibility") or {})
@@ -1723,6 +1796,9 @@ def enrich_candidate_with_route(
             "best_route_alternative": route.get("best_route_alternative"),
             "route_probe_priority": route["route_probe_priority"],
             "route_confidence": route["confidence"],
+            "route_sensitive": route_sensitive,
+            "route_sensitivity_reasons": route_sensitivity_reasons,
+            "route_feasibility_score": route_feasibility_score,
             "route_notes": route["route_notes"],
             "borrow_required": route["borrow_required"],
             "borrow_status": route["borrow_status"],
@@ -1741,6 +1817,9 @@ def enrich_candidate_with_route(
     enriched["execution_route"] = route
     enriched["route_id"] = route["route_id"]
     enriched["route_status"] = route["route_status"]
+    enriched["route_sensitive"] = route_sensitive
+    enriched["route_sensitivity_reasons"] = route_sensitivity_reasons
+    enriched["route_feasibility_score"] = route_feasibility_score
     enriched["paper_route_eligibility"] = eligibility
     enriched["paper_feasibility_status"] = eligibility["feasibility_status"]
     enriched["execution_eligibility"] = eligibility["execution_eligibility"]
