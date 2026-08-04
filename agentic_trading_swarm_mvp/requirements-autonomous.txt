@@ -1,5 +1,6 @@
 # Python packages added by autonomous paper-only code evolution.
 # Keep this file limited to PyPI packages needed by repo code/tests.
+websocket-client>=1.8.0,<2
 openai-codex==0.144.4
 # @openai/codex remains an optional configured/npm fallback when the bundled
 # codex_cli_bin executable is unavailable.

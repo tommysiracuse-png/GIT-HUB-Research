@@ -7,6 +7,7 @@ import ssl
 import sqlite3
 import sys
 import tempfile
+import types
 import unittest
 import urllib.error
 from unittest import mock
@@ -56,6 +57,13 @@ from adapters.venues.norwegian_block_exchange_nbx import (
     parse_nbx_markets,
 )
 from adapters.venues.nzx_dairy import parse_nzx_gdt
+from adapters.venues.polymarket import (
+    DOCS_URL as POLYMARKET_SPORTS_DOCS_URL,
+    SPORTS_WS_URL as POLYMARKET_SPORTS_WS_URL,
+    PolymarketSportsWebSocketAdapter,
+    fetch_sports_messages,
+    parse_polymarket_sports_message,
+)
 from adapters.venues.twse_daily import parse_twse_daily
 from scan_batch import ScanBatch
 from settings import DEFAULT_SETTINGS
@@ -136,8 +144,251 @@ class PublicAdapterParserTests(unittest.TestCase):
             "e_auksion_district_hokimiyat_notices",
             "norwegian_block_exchange_nbx_public",
             "kalshi_public_prediction_markets",
+            "polymarket_sports_websocket",
         }
         self.assertTrue(expected <= set(discover_adapters()))
+
+    def test_polymarket_sports_plugin_is_runtime_discoverable_and_watch_only(self) -> None:
+        self.assertIn("polymarket_sports_websocket", discover_adapters())
+        adapter = get_adapter("polymarket_sports_websocket")
+        self.assertIsNotNone(adapter)
+        self.assertEqual("POLYMARKET", adapter.info.venue)
+        self.assertIn("live_score", adapter.info.capabilities)
+        self.assertIn("websocket", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+        self.assertEqual(POLYMARKET_SPORTS_DOCS_URL, adapter.info.docs_url)
+
+    def test_polymarket_sports_parser_normalizes_live_game_state(self) -> None:
+        row = parse_polymarket_sports_message(
+            {
+                "gameId": 5127839,
+                "sportradarGameId": "sr:match:5127839",
+                "slug": "lal-bos-2026-08-04",
+                "leagueAbbreviation": "NBA",
+                "homeTeam": "Los Angeles Lakers",
+                "awayTeam": "Boston Celtics",
+                "status": "InProgress",
+                "live": True,
+                "ended": False,
+                "score": "98-94",
+                "period": "Q4",
+                "elapsed": "05:12",
+            },
+            received_at="2026-08-04T12:00:00+00:00",
+        )
+
+        self.assertEqual("POLYMARKET:SPORTS:NBA:5127839", row["inst_id"])
+        self.assertEqual(98, row["home_score"])
+        self.assertEqual(94, row["away_score"])
+        self.assertEqual(98.0, row["last"])
+        self.assertEqual("basketball", row["sport_family"])
+        self.assertEqual("live", row["session_status"])
+        self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual("watch_only", row["direction"])
+        self.assertEqual(POLYMARKET_SPORTS_WS_URL, row["source_url"])
+
+    def test_polymarket_sports_parser_accepts_sdk_envelope_and_source_freshness(self) -> None:
+        row = parse_polymarket_sports_message(
+            {
+                "topic": "sports",
+                "type": "sport_result",
+                "payload": {
+                    "game_id": 88,
+                    "league_abbreviation": "NFL",
+                    "home_team": "New York Jets",
+                    "away_team": "Buffalo Bills",
+                    "status": "Final",
+                    "live": False,
+                    "ended": True,
+                    "score": "17-24",
+                    "period": "FT",
+                    "last_update": "2026-08-04T11:58:00Z",
+                },
+            },
+            received_at="2026-08-04T12:00:00+00:00",
+            stale_after_seconds=30,
+        )
+
+        self.assertEqual("american_football", row["sport_family"])
+        self.assertEqual("ended", row["session_status"])
+        self.assertEqual("stale", row["freshness_state"])
+        self.assertEqual(120.0, row["freshness_age_seconds"])
+
+    def test_polymarket_sports_parser_preserves_esports_composite_score(self) -> None:
+        row = parse_polymarket_sports_message(
+            {
+                "gameId": 1596503,
+                "leagueAbbreviation": "cs2",
+                "homeTeam": "Team Alpha",
+                "awayTeam": "Team Bravo",
+                "status": "running",
+                "live": True,
+                "ended": False,
+                "score": "12-11|1-0|Bo3",
+                "period": "2/3",
+            },
+            received_at="2026-08-04T12:00:00+00:00",
+        )
+
+        self.assertEqual("esports", row["sport_family"])
+        self.assertEqual(12, row["home_score"])
+        self.assertEqual(11, row["away_score"])
+        self.assertEqual(
+            [{"home": 12, "away": 11}, {"home": 1, "away": 0}],
+            row["score_components"],
+        )
+        self.assertEqual("Bo3", row["series_format"])
+
+    def test_polymarket_sports_parser_covers_documented_sport_families(self) -> None:
+        leagues = {
+            "NFL": "american_football",
+            "NHL": "ice_hockey",
+            "MLB": "baseball",
+            "NBA": "basketball",
+            "CBB": "basketball",
+            "CFB": "american_football",
+            "EPL": "soccer",
+            "CS2": "esports",
+            "ATP": "tennis",
+        }
+        for game_id, (league, family) in enumerate(leagues.items(), start=1):
+            with self.subTest(league=league):
+                row = parse_polymarket_sports_message(
+                    {
+                        "gameId": game_id,
+                        "leagueAbbreviation": league,
+                        "status": "InProgress",
+                        "live": True,
+                        "ended": False,
+                        "score": "1-0",
+                    },
+                    received_at="2026-08-04T12:00:00+00:00",
+                )
+                self.assertEqual(family, row["sport_family"])
+
+    def test_polymarket_sports_transport_replies_to_heartbeat_without_subscription(self) -> None:
+        class FakeTimeout(Exception):
+            pass
+
+        class FakeConnection:
+            status = 101
+
+            def __init__(self) -> None:
+                self.frames = iter(
+                    [
+                        "ping",
+                        json.dumps(
+                            {
+                                "gameId": 9,
+                                "leagueAbbreviation": "MLB",
+                                "status": "InProgress",
+                                "live": True,
+                                "ended": False,
+                                "score": "3-2",
+                            }
+                        ),
+                    ]
+                )
+                self.sent = []
+                self.closed = False
+
+            def settimeout(self, _timeout) -> None:
+                return None
+
+            def recv(self):
+                try:
+                    return next(self.frames)
+                except StopIteration as exc:
+                    raise FakeTimeout from exc
+
+            def send(self, message) -> None:
+                self.sent.append(message)
+
+            def close(self) -> None:
+                self.closed = True
+
+        connection = FakeConnection()
+        fake_websocket = types.SimpleNamespace(
+            WebSocketTimeoutException=FakeTimeout,
+            create_connection=mock.Mock(return_value=connection),
+        )
+        with mock.patch.dict(sys.modules, {"websocket": fake_websocket}):
+            result = fetch_sports_messages(listen_seconds=1, max_messages=1)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, len(result["messages"]))
+        self.assertEqual(1, result["heartbeat_count"])
+        self.assertEqual(["pong"], connection.sent)
+        self.assertTrue(connection.closed)
+        fake_websocket.create_connection.assert_called_once_with(
+            POLYMARKET_SPORTS_WS_URL,
+            timeout=8.0,
+        )
+
+    def test_polymarket_adapter_keeps_real_rows_and_parser_failure_evidence(self) -> None:
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 101,
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 8.0,
+            "connection_state": "connected",
+            "heartbeat_count": 1,
+            "messages": [
+                {
+                    "gameId": 42,
+                    "leagueAbbreviation": "NHL",
+                    "homeTeam": "Rangers",
+                    "awayTeam": "Bruins",
+                    "status": "InProgress",
+                    "live": True,
+                    "ended": False,
+                    "score": "2-1",
+                    "period": "2Q",
+                },
+                {"unexpected": "schema"},
+            ],
+        }
+        with mock.patch(
+            "adapters.venues.polymarket.fetch_sports_messages",
+            return_value=result,
+        ):
+            batch = PolymarketSportsWebSocketAdapter().scan({})
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual(1, len(batch.observations))
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual(1, batch.metadata["real_observation_count"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["sports_stream"]["fetch_status"])
+        self.assertIn("gameId or slug", batch.metadata["parser_failures"][0]["error"])
+        self.assertTrue(batch.metadata["paper_only"])
+
+    def test_polymarket_adapter_emits_watch_only_health_when_stream_is_unavailable(self) -> None:
+        result = {
+            "ok": False,
+            "status": "unavailable",
+            "http_status": None,
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 25.0,
+            "connection_state": "connection_failed",
+            "heartbeat_count": 0,
+            "messages": [],
+            "error": "connection refused",
+        }
+        with mock.patch(
+            "adapters.venues.polymarket.fetch_sports_messages",
+            return_value=result,
+        ):
+            batch = PolymarketSportsWebSocketAdapter().scan({})
+
+        self.assertEqual("unavailable", batch.metadata["source_status"])
+        self.assertEqual(0, batch.metadata["real_observation_count"])
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_sports_stream_unavailable",
+            batch.observations[0]["candidate_reject_reason"],
+        )
+        self.assertEqual(POLYMARKET_SPORTS_WS_URL, batch.observations[0]["source_url"])
 
     def test_kalshi_plugin_is_runtime_discoverable_and_public_watch_only(self) -> None:
         self.assertIn("kalshi_public_prediction_markets", discover_adapters())
