@@ -1741,6 +1741,11 @@ def close_due_trades(
                 from src.frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
             alignment = paper_only_yahoo_proxy_cross_surface_alignment_guard(current, settings or {})
             if alignment.get("force_paper_exit"):
+                forced_measurement_status = (
+                    "forced_yahoo_proxy_cross_surface_quarantine"
+                    if alignment.get("exit_reason") == "yahoo_proxy_cross_surface_quarantined"
+                    else "forced_local_confirmation_flip"
+                )
                 sign = _paper_direction_sign(row["direction"])
                 if sign:
                     exit_px = float(latest["last"])
@@ -1817,7 +1822,7 @@ def close_due_trades(
                             round(pnl_bps, 3),
                             now,
                             observed_at,
-                            "forced_local_confirmation_flip",
+                            forced_measurement_status,
                             price_source,
                             alignment.get("exit_reason"),
                             row["id"],
@@ -1829,7 +1834,7 @@ def close_due_trades(
                             "inst_id": row["inst_id"],
                             "direction": row["direction"],
                             "pnl_bps": round(pnl_bps, 3),
-                            "measurement_status": "forced_local_confirmation_flip",
+                            "measurement_status": forced_measurement_status,
                             "hold_minutes": 0,
                             "forced_exit": True,
                             "exit_reason": alignment.get("exit_reason"),

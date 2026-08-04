@@ -622,13 +622,13 @@ _PAPER_ONLY_CRYPTO_VENUES = frozenset(
 
 
 def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
-    """Require venue-local confirmation for Yahoo momentum transferred to crypto.
+    """Quarantine Yahoo momentum transferred to a paper crypto surface.
 
-    The guard is deliberately limited to paper candidates whose lineage names
-    Yahoo proxy momentum and whose destination is a non-Yahoo crypto spot or
-    derivatives surface.  Missing local trend or spread evidence fails closed.
-    ``force_paper_exit`` is only raised when a position that passed this guard
-    at entry now has an explicitly adverse local trend.
+    Local trend and spread measurements are retained for diagnostics, but they
+    cannot make a cross-surface route eligible.  The source signal has not
+    demonstrated enough native robustness to justify transfer into faster spot
+    or derivatives markets.  Native Yahoo evaluation and non-paper contexts do
+    not enter this policy.
     """
 
     record = record if isinstance(record, dict) else {}
@@ -923,39 +923,46 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         spread_non_adverse = explicit_spread_ok is True
     spread_evidence_present = destination_spread_bps is not None or explicit_spread_ok is not None
 
-    eligible = bool(applies and direction and local_direction_confirmed and spread_non_adverse)
+    # Alignment used to be sufficient to release this route.  It is now only
+    # diagnostic evidence: every in-scope cross-surface paper route is
+    # quarantined regardless of destination quality.
+    eligible = False if applies else True
     if not applies:
         reason = "disabled" if not enabled else "non_paper_mode" if not paper_mode else "not_applicable"
-    elif direction is None:
-        reason = "missing_destination_direction"
-    elif local_trend_state == "missing":
-        reason = "missing_local_short_horizon_trend"
-    elif local_trend_state == "adverse":
-        reason = "local_short_horizon_trend_adverse"
-    elif not local_direction_confirmed:
-        reason = "local_direction_not_confirmed"
-    elif not spread_evidence_present:
-        reason = "missing_destination_spread"
-    elif not spread_non_adverse:
-        reason = "destination_spread_adverse"
     else:
-        reason = "local_alignment_confirmed"
+        reason = "yahoo_proxy_cross_surface_quarantined"
+
+    if direction is None:
+        alignment_reason = "missing_destination_direction"
+    elif local_trend_state == "missing":
+        alignment_reason = "missing_local_short_horizon_trend"
+    elif local_trend_state == "adverse":
+        alignment_reason = "local_short_horizon_trend_adverse"
+    elif not local_direction_confirmed:
+        alignment_reason = "local_direction_not_confirmed"
+    elif not spread_evidence_present:
+        alignment_reason = "missing_destination_spread"
+    elif not spread_non_adverse:
+        alignment_reason = "destination_spread_adverse"
+    else:
+        alignment_reason = "local_alignment_confirmed"
 
     prior_review = record.get("yahoo_proxy_cross_surface_alignment_guard")
     entry_was_confirmed = _bool(
         _lookup("entry_local_confirmation_passed", "entry_alignment_confirmed")
     ) is True or bool(isinstance(prior_review, dict) and prior_review.get("eligible"))
-    force_paper_exit = bool(
-        applies and entry_was_confirmed and local_trend_state == "adverse"
-    )
+    force_paper_exit = bool(applies and entry_was_confirmed)
     return {
         "enabled": bool(enabled),
         "paper_only": True,
         "applies": applies,
-        "eligible": eligible if applies else True,
-        "blocked": bool(applies and not eligible),
-        "entry_allowed": eligible if applies else True,
+        "eligible": eligible,
+        "blocked": bool(applies),
+        "entry_allowed": not applies,
+        "emit_recommendation": not applies,
+        "emit_route": not applies,
         "reason": reason,
+        "alignment_reason": alignment_reason,
         "source_family": "yahoo_proxy" if source_is_yahoo else None,
         "signal_family": "global_proxy_momentum" if momentum_family else None,
         "destination_venue": destination_venue,
@@ -969,7 +976,7 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "spread_non_adverse": spread_non_adverse,
         "entry_was_confirmed": entry_was_confirmed,
         "force_paper_exit": force_paper_exit,
-        "exit_reason": "local_confirmation_flipped_adverse" if force_paper_exit else None,
+        "exit_reason": "yahoo_proxy_cross_surface_quarantined" if force_paper_exit else None,
     }
 
 
@@ -1207,6 +1214,10 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
     elif destination_age > max_destination_age:
         reasons.append("stale_destination_proxy")
 
+    # Freshness remains useful telemetry, but it can no longer release Yahoo
+    # proxy momentum into a non-native crypto paper route.
+    reasons.append("yahoo_proxy_cross_surface_quarantined")
+
     blocked = bool(reasons)
     return {
         "enabled": True,
@@ -1214,6 +1225,8 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
         "applies": True,
         "eligible": not blocked,
         "blocked": blocked,
+        "emit_recommendation": False,
+        "emit_route": False,
         "reason": reasons[0] if reasons else "fresh_proxy_session_allowed",
         "gate_reason": reasons[0] if reasons else None,
         "gate_reasons": reasons,
@@ -1328,7 +1341,9 @@ def _paper_only_cross_surface_seed_guard_review(record, profile=None):
         "candidate_surface": candidate_surface,
         "native_proxy_variant": native_proxy_variant,
         "cross_surface_target": cross_surface_target,
-        "policy": "freshness_session_and_local_alignment_gated_propagation" if applies else "allow",
+        "emit_recommendation": not bool(applies or alignment_guard.get("applies")),
+        "emit_route": not bool(applies or alignment_guard.get("applies")),
+        "policy": "yahoo_proxy_cross_surface_paper_quarantine" if applies or alignment_guard.get("applies") else "allow",
         "gate_reason": reason if blocked else None,
         "gate_reasons": list(
             dict.fromkeys(

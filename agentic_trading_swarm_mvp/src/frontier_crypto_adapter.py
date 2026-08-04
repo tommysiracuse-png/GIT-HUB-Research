@@ -1857,6 +1857,8 @@ def _paper_only_route_requirements_packet(route_status, profile):
         ),
         "paper_only_route_blocked": paper_only_route_blocked,
         "paper_only_block_reason": paper_only_block_reason,
+        "emit_recommendation": not bool(cross_surface_seed_guard_review.get("blocked")),
+        "emit_route": not bool(cross_surface_seed_guard_review.get("blocked")),
     }
 
 
@@ -1920,6 +1922,17 @@ def _paper_only_annotate_route_intelligence(route_status):
             route_status["route_requirement_summary"] = (
                 f"paper_only_blocked:{route_packet.get('paper_only_block_reason') or 'carry_alignment'}"
             )
+    cross_surface_seed_review = (
+        (route_packet.get("carry_alignment_review") or {}).get("cross_surface_seed_guard_review")
+        if isinstance(route_packet.get("carry_alignment_review"), dict)
+        else None
+    )
+    if isinstance(cross_surface_seed_review, dict) and cross_surface_seed_review.get("blocked"):
+        route_status["emit_recommendation"] = False
+        route_status["emit_route"] = False
+        route_status["paper_entry_blocked"] = True
+        route_status["promotion_eligible"] = False
+        route_status["paper_allocation_multiplier"] = 0.0
     existing_capabilities = route_status.get("venue_capabilities")
     if isinstance(existing_capabilities, dict):
         merged_capabilities = dict(existing_capabilities)
@@ -5667,7 +5680,7 @@ def paper_only_yahoo_proxy_crypto_momentum_gate(
     feature_family: str = "global_proxy_momentum",
     proxy_valid_for_reuse: bool | None = None,
 ) -> dict:
-    """Return the effective Yahoo momentum contribution for a crypto route.
+    """Return the quarantined Yahoo momentum contribution for a crypto route.
 
     This is a paper-policy boundary only.  Live/non-paper inputs are left
     untouched so this diagnostic helper can never make live execution more
@@ -5837,6 +5850,15 @@ def paper_only_proxy_signal_freshness_gate(
         elif destination_age > threshold_destination_proxy_age_ms:
             fail_closed_reasons.append("stale_destination_proxy")
 
+    normalized_market_key = str(market_key or "").strip().upper()
+    quarantined_cross_surface = bool(
+        crypto_destination
+        and "YAHOO_PROXY" in normalized_market_key
+        and "MOMENTUM" in normalized_market_key
+    )
+    if quarantined_cross_surface:
+        fail_closed_reasons.append("yahoo_proxy_cross_surface_quarantined")
+
     eligible = not fail_closed_reasons
     raw_contribution = _paper_only_float_or_none(momentum_contribution)
     return {
@@ -5861,6 +5883,7 @@ def paper_only_proxy_signal_freshness_gate(
         "paper_only": True,
         "execution_mode": normalized_mode,
         "crypto_destination": crypto_destination,
+        "quarantined_cross_surface": quarantined_cross_surface,
         "source_session_status": normalized_session or None,
         "source_session_open": session_open,
         "delayed_mode_allowed": bool(allow_delayed_mode),

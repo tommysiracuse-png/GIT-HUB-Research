@@ -797,23 +797,23 @@ def frontier_shadow_filter_reason(
     verified positive-net candidates with no slippage or quality blocker remain
     eligible for paper fills.
     """
-    alignment_guard = candidate.get("yahoo_proxy_cross_surface_alignment_guard")
-    if not isinstance(alignment_guard, Mapping):
-        alignment_guard = _paper_yahoo_proxy_cross_surface_alignment_guard(candidate, config)
+    # Recompute this policy at the routing boundary.  Cached reviews created
+    # before the quarantine may still say that local alignment was eligible.
+    alignment_guard = _paper_yahoo_proxy_cross_surface_alignment_guard(candidate, config)
     if (
         isinstance(alignment_guard, Mapping)
         and _as_bool(alignment_guard.get("applies"), False)
         and not _as_bool(alignment_guard.get("eligible"), False)
     ):
         return {
-            "reason": "paper_yahoo_proxy_cross_surface_alignment_blocked",
+            "reason": "paper_yahoo_proxy_cross_surface_quarantined",
             "paper_only": True,
             "paper_fill_allowed": False,
             "guard": "yahoo_proxy_cross_surface_alignment_guard",
             "candidate": _candidate_reference(candidate),
             "checks": [
                 {
-                    "code": alignment_guard.get("reason") or "local_alignment_not_confirmed",
+                    "code": alignment_guard.get("reason") or "yahoo_proxy_cross_surface_quarantined",
                     "field": "yahoo_proxy_cross_surface_alignment_guard",
                 }
             ],
@@ -1017,6 +1017,12 @@ def _annotate_shadow_filtered_candidate(
     guarded["candidate_reject_reason"] = guarded.get("candidate_reject_reason") or reason.get("reason") or FRONTIER_SHADOW_REASON
     guarded["candidate_reject_detail"] = dict(reason)
     guarded[detail_field] = dict(reason)
+    if reason.get("guard") == "yahoo_proxy_cross_surface_alignment_guard":
+        guarded["paper_entry_blocked"] = True
+        guarded["promotion_eligible"] = False
+        guarded["paper_allocation_multiplier"] = 0.0
+        guarded["emit_recommendation"] = False
+        guarded["emit_route"] = False
 
     for boolean_field in ("paper_filled", "filled"):
         if guarded.get(boolean_field) is True:
@@ -1079,6 +1085,8 @@ def apply_frontier_paper_guard(
             guarded["paper_entry_blocked"] = True
             guarded["promotion_eligible"] = False
             guarded["paper_allocation_multiplier"] = 0.0
+            guarded["emit_recommendation"] = False
+            guarded["emit_route"] = False
     guarded = _apply_paper_route_eligibility_metadata(guarded) if route_guard_enabled else guarded
     guarded = _apply_route_feasibility_metadata(guarded) if (
         is_frontier_crypto_candidate(guarded) and route_guard_enabled

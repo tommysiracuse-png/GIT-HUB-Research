@@ -35,7 +35,7 @@ def cross_surface_candidate(**overrides: object) -> dict[str, object]:
 
 
 class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
-    def test_requires_local_direction_and_non_adverse_spread(self) -> None:
+    def test_local_quality_is_diagnostic_but_cannot_release_route(self) -> None:
         aligned = paper_only_yahoo_proxy_cross_surface_alignment_guard(cross_surface_candidate())
         adverse_trend = paper_only_yahoo_proxy_cross_surface_alignment_guard(
             cross_surface_candidate(local_short_horizon_trend_bps=-1.0)
@@ -47,10 +47,12 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
             cross_surface_candidate(local_short_horizon_trend_bps=None)
         )
 
-        self.assertTrue(aligned["eligible"])
-        self.assertEqual("local_short_horizon_trend_adverse", adverse_trend["reason"])
-        self.assertEqual("destination_spread_adverse", adverse_spread["reason"])
-        self.assertEqual("missing_local_short_horizon_trend", missing_trend["reason"])
+        self.assertTrue(all(row["blocked"] for row in (aligned, adverse_trend, adverse_spread, missing_trend)))
+        self.assertEqual("yahoo_proxy_cross_surface_quarantined", aligned["reason"])
+        self.assertEqual("local_alignment_confirmed", aligned["alignment_reason"])
+        self.assertEqual("local_short_horizon_trend_adverse", adverse_trend["alignment_reason"])
+        self.assertEqual("destination_spread_adverse", adverse_spread["alignment_reason"])
+        self.assertEqual("missing_local_short_horizon_trend", missing_trend["alignment_reason"])
 
     def test_negative_local_trend_confirms_a_short_destination(self) -> None:
         review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
@@ -60,8 +62,9 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(review["eligible"])
+        self.assertFalse(review["eligible"])
         self.assertEqual("aligned", review["local_trend_state"])
+        self.assertEqual("local_alignment_confirmed", review["alignment_reason"])
 
     def test_scope_excludes_native_yahoo_and_live_contexts(self) -> None:
         native = paper_only_yahoo_proxy_cross_surface_alignment_guard(
@@ -75,6 +78,15 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertFalse(live["applies"])
         self.assertTrue(native["eligible"])
         self.assertTrue(live["eligible"])
+
+    def test_scope_excludes_non_momentum_yahoo_lineage(self) -> None:
+        reversal = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(signal_family="global_proxy_shock_reversal")
+        )
+
+        self.assertFalse(reversal["applies"])
+        self.assertTrue(reversal["eligible"])
+        self.assertTrue(reversal["emit_route"])
 
     def test_destination_context_is_not_masked_by_yahoo_source_venue(self) -> None:
         review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
@@ -97,7 +109,7 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         )
 
         self.assertTrue(review["applies"])
-        self.assertTrue(review["eligible"])
+        self.assertFalse(review["eligible"])
         self.assertEqual("okx", review["destination_venue"])
 
     def test_crypto_scope_uses_destination_fields_not_substring_collisions(self) -> None:
@@ -122,27 +134,32 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertTrue(guarded["shadow_filtered"])
         self.assertFalse(guarded["paper_fill_allowed"])
         self.assertEqual(
-            "paper_yahoo_proxy_cross_surface_alignment_blocked",
+            "paper_yahoo_proxy_cross_surface_quarantined",
             guarded["candidate_reject_reason"],
         )
 
-    def test_confirmed_transfer_remains_available_to_other_paper_policies(self) -> None:
+    def test_confirmed_transfer_is_quarantined_even_when_family_gate_is_disabled(self) -> None:
         guarded = apply_frontier_paper_guard(
             cross_surface_candidate(),
             {"paper_family_quarantine_enabled": False, "mode": "paper"},
         )
 
-        self.assertFalse(guarded.get("shadow_filtered", False))
-        self.assertTrue(guarded["yahoo_proxy_cross_surface_alignment_guard"]["eligible"])
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertFalse(guarded["yahoo_proxy_cross_surface_alignment_guard"]["eligible"])
+        self.assertFalse(guarded["emit_route"])
+        self.assertEqual(0.0, guarded["paper_allocation_multiplier"])
 
-    def test_confirmed_entry_exits_before_hold_when_local_trend_flips(self) -> None:
+    def test_legacy_confirmed_entry_exits_under_quarantine(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         storage.init_db(conn)
         candidate = cross_surface_candidate()
-        candidate["yahoo_proxy_cross_surface_alignment_guard"] = (
-            paper_only_yahoo_proxy_cross_surface_alignment_guard(candidate)
-        )
+        candidate["yahoo_proxy_cross_surface_alignment_guard"] = {
+            **paper_only_yahoo_proxy_cross_surface_alignment_guard(candidate),
+            "eligible": True,
+            "blocked": False,
+            "entry_allowed": True,
+        }
         trade_id = storage.open_paper_trade(
             conn,
             candidate,
@@ -174,17 +191,23 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
             (trade_id,),
         ).fetchone()
         self.assertEqual("closed", row["status"])
-        self.assertEqual("forced_local_confirmation_flip", row["close_measurement_status"])
-        self.assertEqual("local_confirmation_flipped_adverse", row["close_reason"])
+        self.assertEqual(
+            "forced_yahoo_proxy_cross_surface_quarantine",
+            row["close_measurement_status"],
+        )
+        self.assertEqual("yahoo_proxy_cross_surface_quarantined", row["close_reason"])
 
-    def test_refreshed_scanner_payload_replaces_entry_trend_for_exit(self) -> None:
+    def test_legacy_entry_exit_does_not_require_refreshed_local_trend(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         storage.init_db(conn)
         candidate = cross_surface_candidate()
-        candidate["yahoo_proxy_cross_surface_alignment_guard"] = (
-            paper_only_yahoo_proxy_cross_surface_alignment_guard(candidate)
-        )
+        candidate["yahoo_proxy_cross_surface_alignment_guard"] = {
+            **paper_only_yahoo_proxy_cross_surface_alignment_guard(candidate),
+            "eligible": True,
+            "blocked": False,
+            "entry_allowed": True,
+        }
         trade_id = storage.open_paper_trade(
             conn,
             candidate,
@@ -219,7 +242,7 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
             (trade_id,),
         ).fetchone()
         self.assertEqual("closed", row["status"])
-        self.assertEqual("local_confirmation_flipped_adverse", row["close_reason"])
+        self.assertEqual("yahoo_proxy_cross_surface_quarantined", row["close_reason"])
 
 
 if __name__ == "__main__":
