@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dt
+import os
 import pathlib
 import shutil
 import sqlite3
@@ -218,6 +220,97 @@ class CodeEvolutionCodexAgentTests(unittest.TestCase):
             self.assertTrue(any(item["status"] == "promoted" for item in evaluated))
             self.assertEqual("promoted", final["status"])
             self.assertTrue((app / "src" / "actual_runtime.py").exists())
+
+    def test_stale_runtime_after_promotion_reverts_and_requeues_same_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, app = self._repo(tmp)
+            conn = sqlite3.connect(pathlib.Path(tmp) / "radar.sqlite")
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            old_runs, old_ledger = code_evolution.RUNS_DIR, code_evolution.LEDGER_JSONL
+            code_evolution.RUNS_DIR = pathlib.Path(tmp) / "runs"
+            code_evolution.LEDGER_JSONL = code_evolution.RUNS_DIR / "evolution_ledger.jsonl"
+            code_evolution.RUNS_DIR.mkdir(parents=True)
+
+            def agent(**kwargs):
+                return self._completed_agent(pathlib.Path(kwargs["worktree_root"]), session="thread-health")
+
+            config = self._settings(tmp)
+            config["codex_repo_agent"].update(
+                {"post_promotion_health_grace_seconds": 0, "post_promotion_health_loops": 3}
+            )
+            try:
+                with mock.patch.object(code_evolution, "run_codex_repo_agent", side_effect=agent):
+                    code_evolution.process_code_change_recommendation(
+                        conn, self._proposal("rec-health-fail"), config, root=app
+                    )
+                old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+                conn.execute(
+                    "update code_evolution_proposals set applied_at=? where proposal_id like 'code_%'",
+                    (old,),
+                )
+                for name in ("radar_heartbeat.json", "llm_state_packet.json", "self_improvement_report.md"):
+                    path = code_evolution.RUNS_DIR / name
+                    path.write_text("stale", encoding="utf-8")
+                    timestamp = (dt.datetime.now().timestamp() - 7200)
+                    os.utime(path, (timestamp, timestamp))
+                evaluated = code_evolution.evaluate_code_evolution(conn, config, root=app)
+                row = storage.code_evolution_recent(conn)[0]
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+                ).stdout.strip()
+                champion = subprocess.run(
+                    ["git", "rev-parse", "champion/latest"], cwd=repo, check=True, capture_output=True, text=True
+                ).stdout.strip()
+            finally:
+                code_evolution.RUNS_DIR, code_evolution.LEDGER_JSONL = old_runs, old_ledger
+                conn.close()
+
+            self.assertEqual("implementation_paused", row["status"])
+            self.assertEqual("thread-health", row["safety"]["codex_repo_agent"]["session_id"])
+            self.assertEqual(head, champion)
+            self.assertFalse((app / "src" / "actual_runtime.py").exists())
+            self.assertTrue(any(item["decision"] == "revert_and_resume" for item in evaluated))
+
+    def test_fresh_runtime_marks_promoted_codex_change_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _repo, app = self._repo(tmp)
+            conn = sqlite3.connect(pathlib.Path(tmp) / "radar.sqlite")
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            old_runs, old_ledger = code_evolution.RUNS_DIR, code_evolution.LEDGER_JSONL
+            code_evolution.RUNS_DIR = pathlib.Path(tmp) / "runs"
+            code_evolution.LEDGER_JSONL = code_evolution.RUNS_DIR / "evolution_ledger.jsonl"
+            code_evolution.RUNS_DIR.mkdir(parents=True)
+
+            def agent(**kwargs):
+                return self._completed_agent(pathlib.Path(kwargs["worktree_root"]), session="thread-healthy")
+
+            config = self._settings(tmp)
+            config["codex_repo_agent"].update(
+                {"post_promotion_health_grace_seconds": 0, "post_promotion_health_loops": 2}
+            )
+            try:
+                with mock.patch.object(code_evolution, "run_codex_repo_agent", side_effect=agent):
+                    code_evolution.process_code_change_recommendation(
+                        conn, self._proposal("rec-health-pass"), config, root=app
+                    )
+                old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+                conn.execute("update code_evolution_proposals set applied_at=?", (old,))
+                conn.commit()
+                for name in ("radar_heartbeat.json", "llm_state_packet.json", "self_improvement_report.md"):
+                    (code_evolution.RUNS_DIR / name).write_text("fresh", encoding="utf-8")
+                code_evolution.evaluate_code_evolution(conn, config, root=app)
+                evaluated = code_evolution.evaluate_code_evolution(conn, config, root=app)
+                row = storage.code_evolution_recent(conn)[0]
+            finally:
+                code_evolution.RUNS_DIR, code_evolution.LEDGER_JSONL = old_runs, old_ledger
+                conn.close()
+
+            self.assertEqual("promoted", row["status"])
+            self.assertEqual(2, row["probation_loops_observed"])
+            self.assertEqual("healthy", row["evaluation"]["post_promotion_health"]["status"])
+            self.assertTrue(any(item["decision"] == "healthy" for item in evaluated))
 
 
 if __name__ == "__main__":

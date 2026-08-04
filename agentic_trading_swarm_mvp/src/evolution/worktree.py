@@ -236,7 +236,7 @@ def promote_candidate(release: CandidateRelease, app_root: pathlib.Path, *, time
     if tag["returncode"] != 0:
         return release, {"ok": False, "reason": "champion_tag_failed", "tag": tag}
     release.status = "promoted"
-    release.promotion_reason = "candidate passed sandbox and canary gates"
+    release.promotion_reason = "candidate passed deterministic sandbox gates"
     return release, {
         "ok": True,
         "status": "promoted",

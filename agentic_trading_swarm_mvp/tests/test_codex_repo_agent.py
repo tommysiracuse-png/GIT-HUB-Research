@@ -175,6 +175,37 @@ class CodexRepoAgentTests(unittest.TestCase):
         self.assertEqual("thread-timeout", result["session_id"])
         self.assertEqual("codex_turn_timeout", result["reason"])
 
+    def test_api_key_is_scrubbed_from_cli_output_and_event_log(self) -> None:
+        secret = "test-secret-value"
+        events = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-secret"}),
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": secret}}),
+                json.dumps({"type": "turn.completed", "usage": {}}),
+            ]
+        )
+        completed = subprocess.CompletedProcess(["codex"], 0, stdout=events, stderr=secret)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            codex_repo_agent,
+            "ensure_codex_runtime",
+            return_value={"available": True, "command_prefix": ["codex-test"], "source": "test"},
+        ), mock.patch.object(codex_repo_agent.subprocess, "run", return_value=completed), mock.patch.dict(
+            os.environ, {"CODEX_API_KEY": secret}, clear=True
+        ):
+            result = codex_repo_agent.run_codex_repo_agent(
+                proposal_id="proposal:secret",
+                payload={"title": "Secret scrub"},
+                preflight_hints={},
+                worktree_root=pathlib.Path(tmp),
+                settings=self._settings(tmp),
+                runs_dir=pathlib.Path(tmp),
+            )
+            event_log = pathlib.Path(result["event_log"]).read_text(encoding="utf-8")
+
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertNotIn(secret, event_log)
+        self.assertIn("[REDACTED]", event_log)
+
     def test_single_writer_lock_rejects_concurrent_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = codex_repo_agent.codex_repo_agent_config(self._settings(tmp), pathlib.Path(tmp))

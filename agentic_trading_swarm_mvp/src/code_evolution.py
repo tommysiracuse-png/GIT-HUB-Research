@@ -5051,6 +5051,7 @@ def _codex_failure_context(row: dict | None, extra: dict | None = None) -> dict:
             "safety_reasons": safety.get("reasons") or [],
             "host_tests": tests,
             "evaluation_reason": evaluation.get("reason"),
+            "post_promotion_health": evaluation.get("post_promotion_health") or {},
         }
     if extra:
         context.update(extra)
@@ -5645,6 +5646,145 @@ def _resume_paused_codex_candidates(conn: Any, settings: dict, root: pathlib.Pat
     return resumed
 
 
+def _parse_utc(value: Any) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _runtime_artifact_advanced(path: pathlib.Path, applied_at: dt.datetime) -> bool:
+    try:
+        modified = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
+    except OSError:
+        return False
+    return modified > applied_at
+
+
+def _tail_text(path: pathlib.Path, limit: int = 12000) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit), os.SEEK_SET)
+            output = handle.read().decode("utf-8", errors="replace")[-limit:]
+            for name, value in os.environ.items():
+                if value and any(token in name.upper() for token in ("KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL")):
+                    output = output.replace(value, "[REDACTED]")
+            return output
+    except OSError:
+        return ""
+
+
+def _revert_promoted_commit(root: pathlib.Path, promoted_commit: str, timeout: int) -> dict:
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", promoted_commit):
+        return {"reverted": False, "reason": "invalid_promoted_commit"}
+    ancestor = _run(["git", "merge-base", "--is-ancestor", promoted_commit, "HEAD"], root, timeout)
+    if ancestor["returncode"] != 0:
+        return {"reverted": False, "reason": "promoted_commit_not_in_head", "ancestor": ancestor}
+    revert = _run(["git", "revert", "--no-edit", promoted_commit], root, timeout)
+    if revert["returncode"] != 0:
+        abort = _run(["git", "revert", "--abort"], root, timeout)
+        return {"reverted": False, "reason": "git_revert_failed", "revert": revert, "abort": abort}
+    head = _run(["git", "rev-parse", "HEAD"], root, timeout)
+    promoted_head = head.get("stdout_tail", "").strip()
+    tag = _run(["git", "tag", "-f", "champion/latest", promoted_head], root, timeout)
+    return {
+        "reverted": tag["returncode"] == 0,
+        "reason": "post_promotion_health_failure",
+        "reverted_commit": promoted_commit,
+        "recovery_commit": promoted_head,
+        "revert": revert,
+        "champion_tag": tag,
+    }
+
+
+def _evaluate_promoted_codex_health(conn: Any, settings: dict, root: pathlib.Path) -> list[dict]:
+    """Audit recent Codex promotions without delaying their initial promotion."""
+
+    if not _codex_agent_enabled(settings):
+        return []
+    cfg = _cfg(settings)
+    agent_cfg = codex_repo_agent_config(settings, RUNS_DIR)
+    grace_seconds = max(0, int(agent_cfg.get("post_promotion_health_grace_seconds", 600)))
+    required_loops = max(1, int(agent_cfg.get("post_promotion_health_loops", 3)))
+    now = dt.datetime.now(dt.timezone.utc)
+    results: list[dict] = []
+    for row in code_evolution_by_status(conn, ["promoted"], limit=100):
+        safety = row.get("safety") if isinstance(row.get("safety"), dict) else {}
+        if not isinstance(safety.get("codex_repo_agent"), dict):
+            continue
+        loops = int(row.get("probation_loops_observed") or 0)
+        if loops >= required_loops:
+            continue
+        applied_at = _parse_utc(row.get("applied_at"))
+        if applied_at is None or (now - applied_at).total_seconds() < grace_seconds:
+            continue
+        evaluation = dict(row.get("evaluation") or {})
+        failures: list[str] = []
+        if bool(settings.get("allow_live_trading", False)):
+            failures.append("live_trading_enabled")
+        artifacts = {
+            "radar_heartbeat": RUNS_DIR / "radar_heartbeat.json",
+            "llm_state_packet": RUNS_DIR / "llm_state_packet.json",
+            "self_improvement_report": RUNS_DIR / "self_improvement_report.md",
+        }
+        existing_artifacts = {name: path for name, path in artifacts.items() if path.exists()}
+        for name, path in existing_artifacts.items():
+            if not _runtime_artifact_advanced(path, applied_at):
+                failures.append(f"{name}_not_advanced")
+        health = {
+            "checked_at": _utc_now(),
+            "applied_at": applied_at.isoformat(),
+            "loops_before": loops,
+            "required_loops": required_loops,
+            "failures": failures,
+            "artifacts_checked": {name: str(path) for name, path in existing_artifacts.items()},
+        }
+        if failures:
+            promotion = evaluation.get("promotion") if isinstance(evaluation.get("promotion"), dict) else {}
+            promoted_commit = str(promotion.get("promoted_commit") or row.get("candidate_commit") or "")
+            recovery = _revert_promoted_commit(
+                root,
+                promoted_commit,
+                int(cfg.get("sandbox_timeout_seconds", 120)),
+            )
+            health.update(
+                {
+                    "recovery": recovery,
+                    "radar_log_tail": _tail_text(RUNS_DIR / "radar_forever.log"),
+                    "evolution_log_tail": _tail_text(RUNS_DIR / "evolution_worker_forever.log"),
+                }
+            )
+            evaluation.update({"reason": "post_promotion_health_failure", "post_promotion_health": health})
+            status = "implementation_paused" if recovery.get("reverted") else "post_promotion_revert_failed"
+            update_code_evolution_proposal(
+                conn,
+                row["proposal_id"],
+                status=status,
+                evaluation=evaluation,
+                probation_loops_observed=loops,
+            )
+            _append_ledger(conn, row["proposal_id"], status)
+            results.append({"proposal_id": row["proposal_id"], "status": status, "decision": "revert_and_resume"})
+            continue
+        loops += 1
+        health.update({"status": "healthy" if loops >= required_loops else "observing", "loops_after": loops})
+        evaluation["post_promotion_health"] = health
+        update_code_evolution_proposal(
+            conn,
+            row["proposal_id"],
+            status="promoted",
+            evaluation=evaluation,
+            probation_loops_observed=loops,
+        )
+        results.append({"proposal_id": row["proposal_id"], "status": "promoted", "decision": health["status"]})
+    return results
+
+
 def evaluate_code_evolution(
     conn: Any,
     settings: dict,
@@ -5653,7 +5793,9 @@ def evaluate_code_evolution(
     resume_paused: bool = False,
 ) -> list[dict]:
     cfg = _cfg(settings)
-    evaluated = _resume_paused_codex_candidates(conn, settings, root) if resume_paused else []
+    evaluated = _evaluate_promoted_codex_health(conn, settings, root)
+    if resume_paused:
+        evaluated.extend(_resume_paused_codex_candidates(conn, settings, root))
     for row in code_evolution_by_status(conn, sorted(PROBATION_STATUSES), limit=20):
         loops = int(row.get("probation_loops_observed") or 0) + 1
         evaluation = dict(row.get("evaluation") or {})

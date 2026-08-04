@@ -18,7 +18,8 @@ import time
 from typing import Any, Iterator
 
 
-PINNED_CODEX_PACKAGE = "@openai/codex@0.146.0"
+PINNED_CODEX_PACKAGE = "openai-codex==0.144.4"
+PINNED_CODEX_NPM_FALLBACK = "@openai/codex@0.146.0"
 DEFAULT_MODEL = "gpt-5.6-sol"
 SECRET_ENV_NAMES = (
     "CODEX_API_KEY",
@@ -42,7 +43,10 @@ def codex_repo_agent_config(settings: dict, runs_dir: pathlib.Path) -> dict[str,
         "timeout_seconds": 1800,
         "resume_cooldown_seconds": 300,
         "max_resumes_per_cycle": 1,
+        "post_promotion_health_grace_seconds": 600,
+        "post_promotion_health_loops": 3,
         "runtime_package": PINNED_CODEX_PACKAGE,
+        "npm_runtime_package": PINNED_CODEX_NPM_FALLBACK,
         "npm_fallback_enabled": True,
         "auto_install_npm_fallback": False,
         "runtime_dir": str(runs_dir / "codex_runtime"),
@@ -116,7 +120,7 @@ def ensure_codex_runtime(cfg: dict[str, Any]) -> dict[str, Any]:
             "available": True,
             "command_prefix": [str(bundled)],
             "source": "bundled_python_package",
-            "runtime_package": "openai-codex==0.144.4",
+            "runtime_package": str(cfg["runtime_package"]),
         }
     if not cfg.get("npm_fallback_enabled", True):
         return {"available": False, "reason": "bundled_codex_runtime_missing"}
@@ -128,7 +132,7 @@ def ensure_codex_runtime(cfg: dict[str, Any]) -> dict[str, Any]:
             "available": True,
             "command_prefix": [str(node), str(script)],
             "source": "pinned_runtime",
-            "runtime_package": str(cfg["runtime_package"]),
+            "runtime_package": str(cfg["npm_runtime_package"]),
         }
     if not cfg.get("auto_install_npm_fallback", False):
         return {"available": False, "reason": "codex_runtime_missing", "runtime_dir": str(runtime_dir)}
@@ -145,7 +149,7 @@ def ensure_codex_runtime(cfg: dict[str, Any]) -> dict[str, Any]:
     install_env["PATH"] = os.pathsep.join([str(node.parent), install_env.get("PATH", "")])
     try:
         completed = subprocess.run(
-            [str(pnpm), "--dir", str(runtime_dir), "add", "--save-exact", str(cfg["runtime_package"])],
+            [str(pnpm), "--dir", str(runtime_dir), "add", "--save-exact", str(cfg["npm_runtime_package"])],
             cwd=str(runtime_dir),
             env=install_env,
             text=True,
@@ -167,7 +171,7 @@ def ensure_codex_runtime(cfg: dict[str, Any]) -> dict[str, Any]:
         "available": True,
         "command_prefix": [str(node), str(script)],
         "source": "pinned_runtime_bootstrap",
-        "runtime_package": str(cfg["runtime_package"]),
+        "runtime_package": str(cfg["npm_runtime_package"]),
     }
 
 
@@ -324,6 +328,14 @@ def _write_event_log(path: pathlib.Path, output: str) -> None:
             handle.write("\n")
 
 
+def _scrub_secret_text(value: str, *secrets: str | None) -> str:
+    scrubbed = value
+    for secret in secrets:
+        if secret:
+            scrubbed = scrubbed.replace(secret, "[REDACTED]")
+    return scrubbed
+
+
 @contextlib.contextmanager
 def codex_write_lock(cfg: dict[str, Any], owner: str) -> Iterator[dict[str, Any]]:
     path = pathlib.Path(str(cfg["lock_path"])).expanduser().resolve()
@@ -400,7 +412,8 @@ def run_codex_repo_agent(
             timeout=int(cfg.get("timeout_seconds", 1800)),
             check=False,
         )
-        stdout, stderr = completed.stdout or "", completed.stderr or ""
+        stdout = _scrub_secret_text(completed.stdout or "", key)
+        stderr = _scrub_secret_text(completed.stderr or "", key)
         parsed = _parse_events(stdout)
         _write_event_log(log_path, stdout)
         status = "completed" if completed.returncode == 0 and parsed["turn_completed"] else "failed"
@@ -424,6 +437,8 @@ def run_codex_repo_agent(
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
         stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+        stdout = _scrub_secret_text(stdout, key)
+        stderr = _scrub_secret_text(stderr, key)
         parsed = _parse_events(stdout)
         _write_event_log(log_path, stdout)
         return {
