@@ -309,6 +309,7 @@ QUARANTINED_STRATEGY_LAB_PREFIXES = (
     "lab_yahoo_proxy_momentum_freshness_quality_gate_v1",
     "red_team_yahoo_proxy_momentum_sanity_check_c6d14fc0",
     "route_rich_frontier_long_filter_2942c975",
+    "tighten_entry_confirmation_and_add_paper_only_cooldown_65825268",
 )
 QUARANTINE_RELEASE_CONDITION = (
     "Lift only after the source family and its immediate descendants each show "
@@ -319,6 +320,26 @@ SOURCE_VETO_POLICY_KEY = "yahoo_proxy_momentum_source_veto"
 SOURCE_VETO_DEFAULT_MIN_WINDOWS = 3
 SOURCE_VETO_DEFAULT_MIN_SAMPLES_PER_WINDOW = 10
 SOURCE_VETO_DEFAULT_MIN_DIAGNOSTIC_PASS_RATE = 0.90
+LINEAGE_SOURCE_HEALTH_POLICY_KEY = "lineage_source_health_guard"
+LINEAGE_SOURCE_HEALTH_DEFAULT_MIN_CLOSED_COUNT = 10
+LINEAGE_SOURCE_HEALTH_DEFAULT_PENALTY_MIN_CLOSED_COUNT = 3
+LINEAGE_SOURCE_HEALTH_DEFAULT_PENALTY_MULTIPLIER = 0.50
+LINEAGE_SOURCE_HEALTH_FIELDS = (
+    "lineage_source_health",
+    "parent_signal_health",
+    "source_signal_health",
+    "upstream_signal_health",
+    "parent_signal_stats",
+    "source_signal_stats",
+    "upstream_signal_stats",
+)
+LINEAGE_SOURCE_SIGNAL_KEY_FIELDS = (
+    "parent_signal_key",
+    "source_signal_key",
+    "strategy_lab_source_signal_key",
+    "upstream_signal_key",
+    "origin_signal_key",
+)
 
 COVERED_IMPROVEMENT_TASK_IDS = [
     68036,
@@ -1916,6 +1937,245 @@ def paper_source_veto_recovery_status(
     }
 
 
+def _lineage_source_health_policy_config(
+    config: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    if not isinstance(config, Mapping):
+        return {}
+    containers = (
+        config,
+        config.get("paper_policy"),
+        config.get("strategy_lab"),
+        config.get("strategy_reliability"),
+    )
+    for container in containers:
+        if not isinstance(container, Mapping):
+            continue
+        policy = container.get(LINEAGE_SOURCE_HEALTH_POLICY_KEY)
+        if isinstance(policy, Mapping):
+            return policy
+        source_veto = container.get(SOURCE_VETO_POLICY_KEY)
+        if isinstance(source_veto, Mapping):
+            nested = source_veto.get(LINEAGE_SOURCE_HEALTH_POLICY_KEY)
+            if isinstance(nested, Mapping):
+                return nested
+    return {}
+
+
+def _lineage_source_health_enabled(config: Mapping[str, Any] | bool | None) -> bool:
+    if not _paper_family_quarantine_applies_in_context(config):
+        return False
+    if isinstance(config, bool):
+        return config
+    policy = _lineage_source_health_policy_config(config if isinstance(config, Mapping) else None)
+    return _as_bool(policy.get("enabled"), True)
+
+
+def _lineage_source_keys(candidate: Mapping[str, Any]) -> list[tuple[str, str]]:
+    keys: list[tuple[str, str]] = []
+    for container_name, container in _paper_family_containers(candidate):
+        for field in LINEAGE_SOURCE_SIGNAL_KEY_FIELDS:
+            value = str(container.get(field) or "").strip()
+            if value and (f"{container_name}.{field}", value) not in keys:
+                keys.append((f"{container_name}.{field}", value))
+    return keys
+
+
+def _lineage_source_health_evidence(candidate: Mapping[str, Any]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    source_keys = _lineage_source_keys(candidate)
+    fallback_source_key = source_keys[0][1] if source_keys else None
+    for container_name, container in _paper_family_containers(candidate):
+        for field in LINEAGE_SOURCE_HEALTH_FIELDS:
+            raw = container.get(field)
+            if not isinstance(raw, Mapping):
+                continue
+            expectancy = _maybe_float(
+                raw.get(
+                    "after_cost_expectancy_bps",
+                    raw.get(
+                        "expectancy_net_bps",
+                        raw.get(
+                            "realized_edge_bps",
+                            raw.get("net_edge_bps", raw.get("avg_pnl_bps")),
+                        ),
+                    ),
+                )
+            )
+            closed_count = _as_int(
+                raw.get("closed_count", raw.get("sample_count", raw.get("count"))),
+                0,
+            )
+            status = str(raw.get("status") or raw.get("health_status") or "").strip().lower()
+            persistent_negative = _as_bool(raw.get("persistent_negative"), False) or status in {
+                "persistent_negative",
+                "negative_edge",
+                "degraded_negative_edge",
+                "quarantined_negative_edge",
+            }
+            if expectancy is None and not persistent_negative:
+                continue
+            evidence.append(
+                {
+                    "source_field": f"{container_name}.{field}",
+                    "source_signal_key": str(raw.get("source_signal_key") or fallback_source_key or ""),
+                    "closed_count": closed_count,
+                    "after_cost_expectancy_bps": expectancy,
+                    "win_rate": _maybe_float(raw.get("win_rate")),
+                    "updated_at": raw.get("updated_at") or raw.get("observed_at"),
+                    "evidence_source": raw.get("evidence_source") or "candidate_lineage_metadata",
+                    "cost_basis": raw.get("cost_basis") or "realized_paper_after_cost",
+                    "persistent_negative": persistent_negative,
+                }
+            )
+    return evidence
+
+
+def paper_lineage_source_health_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    """Penalize or quarantine paper descendants of negative-edge source signals."""
+    if not isinstance(candidate, Mapping) or not _lineage_source_health_enabled(config):
+        return None
+    evidence = _lineage_source_health_evidence(candidate)
+    if not evidence:
+        return None
+
+    policy = _lineage_source_health_policy_config(config if isinstance(config, Mapping) else None)
+    quarantine_min_count = max(
+        1,
+        _as_int(
+            policy.get("min_closed_count"),
+            LINEAGE_SOURCE_HEALTH_DEFAULT_MIN_CLOSED_COUNT,
+        ),
+    )
+    penalty_min_count = max(
+        1,
+        min(
+            quarantine_min_count,
+            _as_int(
+                policy.get("penalty_min_closed_count"),
+                LINEAGE_SOURCE_HEALTH_DEFAULT_PENALTY_MIN_CLOSED_COUNT,
+            ),
+        ),
+    )
+    negative_edge_floor = _as_float(policy.get("negative_edge_floor_bps"), 0.0)
+    penalty_multiplier = max(
+        0.0,
+        min(
+            1.0,
+            _as_float(
+                policy.get("penalty_score_multiplier"),
+                LINEAGE_SOURCE_HEALTH_DEFAULT_PENALTY_MULTIPLIER,
+            ),
+        ),
+    )
+    negative = [
+        item
+        for item in evidence
+        if item["persistent_negative"]
+        or (
+            item["after_cost_expectancy_bps"] is not None
+            and item["after_cost_expectancy_bps"] < negative_edge_floor
+        )
+    ]
+    if not negative:
+        return None
+    selected = sorted(
+        negative,
+        key=lambda item: (
+            bool(item["persistent_negative"]),
+            int(item["closed_count"]),
+            -_as_float(item["after_cost_expectancy_bps"], negative_edge_floor),
+        ),
+        reverse=True,
+    )[0]
+    persistent = bool(
+        selected["persistent_negative"]
+        or int(selected["closed_count"]) >= quarantine_min_count
+    )
+    if not persistent and int(selected["closed_count"]) < penalty_min_count:
+        return None
+    action = "quarantine" if persistent else "penalize"
+    multiplier = 0.0 if persistent else penalty_multiplier
+    return {
+        "reason": (
+            "paper_lineage_source_negative_edge_quarantine"
+            if persistent
+            else "paper_lineage_source_negative_edge_penalty"
+        ),
+        "guard": "paper_lineage_source_health",
+        "policy_key": LINEAGE_SOURCE_HEALTH_POLICY_KEY,
+        "paper_only": True,
+        "action": action,
+        "eligible": not persistent,
+        "paper_score_eligible": not persistent,
+        "paper_rank_eligible": not persistent,
+        "paper_fill_allowed": not persistent,
+        "paper_score_multiplier": multiplier,
+        "paper_allocation_multiplier": multiplier,
+        "promotion_eligible": False,
+        "source_health": selected,
+        "thresholds": {
+            "negative_edge_floor_bps": negative_edge_floor,
+            "penalty_min_closed_count": penalty_min_count,
+            "quarantine_min_closed_count": quarantine_min_count,
+        },
+        "release_condition": QUARANTINE_RELEASE_CONDITION,
+    }
+
+
+def hydrate_paper_lineage_source_health(
+    candidates: list[dict],
+    conn: Any | None,
+) -> None:
+    """Attach read-only persisted source statistics to explicit paper lineages."""
+    if conn is None:
+        return
+    requested: dict[str, list[dict]] = collections.defaultdict(list)
+    for candidate in candidates:
+        for _field, source_key in _lineage_source_keys(candidate):
+            requested[source_key].append(candidate)
+            break
+    if not requested:
+        return
+    placeholders = ",".join("?" for _ in requested)
+    try:
+        rows = conn.execute(
+            f"""
+            select signal_key, closed_count, avg_pnl_bps, win_rate, updated_at
+            from signal_stats
+            where signal_key in ({placeholders})
+            """,
+            tuple(requested),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - optional read-only runtime evidence
+        return
+    for raw in rows:
+        try:
+            row = dict(raw)
+        except (TypeError, ValueError):
+            row = {
+                "signal_key": raw[0],
+                "closed_count": raw[1],
+                "avg_pnl_bps": raw[2],
+                "win_rate": raw[3],
+                "updated_at": raw[4],
+            }
+        source_key = str(row.get("signal_key") or "")
+        for candidate in requested.get(source_key, []):
+            candidate["lineage_source_health"] = {
+                "source_signal_key": source_key,
+                "closed_count": row.get("closed_count"),
+                "after_cost_expectancy_bps": row.get("avg_pnl_bps"),
+                "win_rate": row.get("win_rate"),
+                "updated_at": row.get("updated_at"),
+                "evidence_source": "persisted_paper_signal_stats",
+                "cost_basis": "realized_paper_pnl_bps",
+            }
+
+
 def paper_source_veto_record(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | None = None,
@@ -2944,6 +3204,63 @@ def _apply_family_quarantine(
     return reliability
 
 
+def _apply_lineage_source_health(
+    candidate: dict,
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict | None:
+    if not _lineage_source_health_enabled(config):
+        return None
+    already_rank_applied = _as_bool(
+        candidate.get("paper_lineage_source_health_rank_applied"),
+        False,
+    )
+    existing_review = candidate.get("paper_lineage_source_health")
+    review = (
+        dict(existing_review)
+        if already_rank_applied and isinstance(existing_review, Mapping)
+        else paper_lineage_source_health_record(candidate, config=config)
+    )
+    if review is None:
+        return None
+
+    pre_guard_score = _as_float(
+        candidate.get("pre_lineage_source_health_score", candidate.get("score")),
+        0.0,
+    )
+    multiplier = _as_float(review.get("paper_score_multiplier"), 0.0)
+    quarantined = review.get("action") == "quarantine"
+    action = "lineage_source_negative_edge_shadow_only" if quarantined else "lineage_source_negative_edge_penalty"
+    reliability = _annotate(
+        candidate,
+        profile="lineage_source_health_guard",
+        action=action,
+        reasons=[review["reason"]],
+        allocation_multiplier=multiplier,
+        shadow_only=quarantined,
+    )
+    candidate["paper_lineage_source_health"] = dict(review)
+    candidate["pre_lineage_source_health_score"] = pre_guard_score
+    if not already_rank_applied:
+        candidate["score"] = round(max(0.0, pre_guard_score * multiplier), 3)
+    candidate["paper_score_multiplier"] = multiplier
+    candidate["paper_score_eligible"] = bool(review["paper_score_eligible"])
+    candidate["paper_rank_eligible"] = bool(review["paper_rank_eligible"])
+    candidate["promotion_eligible"] = False
+    candidate["paper_allocation_multiplier"] = min(
+        _as_float(candidate.get("paper_allocation_multiplier"), 1.0),
+        multiplier,
+    )
+    reliability["paper_lineage_source_health"] = dict(review)
+    reliability["pre_guard_score"] = pre_guard_score
+    reliability["paper_score_multiplier"] = multiplier
+    reliability["paper_rank_eligible"] = bool(review["paper_rank_eligible"])
+    if quarantined:
+        candidate["paper_fill_allowed"] = False
+        candidate["candidate_reject_reason"] = review["reason"]
+    _append_note(candidate, f"paper_lineage_source_health:{review['action']}")
+    return reliability
+
+
 def _apply_portability_quarantine(
     candidate: dict,
     config: Mapping[str, Any] | bool | None = None,
@@ -2996,6 +3313,9 @@ def _apply_one(
     quarantined = _apply_family_quarantine(candidate, config=config)
     if quarantined is not None:
         return quarantined
+    lineage_source_health = _apply_lineage_source_health(candidate, config=config)
+    if lineage_source_health is not None:
+        return lineage_source_health
     trade_type = candidate.get("trade_type")
     if trade_type == "frontier_crypto_venue_map":
         return _repair_frontier_candidate(candidate)
@@ -3020,6 +3340,9 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
     portability_quarantined = sum(
         1 for item in items if item.get("profile") == "cross_family_portability_quarantine"
     )
+    lineage_source_health_guarded = sum(
+        1 for item in items if item.get("profile") == "lineage_source_health_guard"
+    )
     by_quality_failure = collections.Counter(
         reason
         for candidate in candidates
@@ -3031,6 +3354,7 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         "shadow_or_blocked_count": blocked,
         "family_quarantine_count": quarantined,
         "portability_quarantine_count": portability_quarantined,
+        "lineage_source_health_guard_count": lineage_source_health_guarded,
         "by_quality_failure": dict(by_quality_failure),
         "protected_working_slice_count": protected,
         "by_action": dict(by_action),
@@ -3119,6 +3443,7 @@ def _report_markdown(report: dict) -> str:
         f"- Candidates reviewed: `{summary.get('candidate_count', 0)}`",
         f"- Annotated candidates: `{summary.get('annotated_count', 0)}`",
         f"- Shadow/blocked by reliability layer: `{summary.get('shadow_or_blocked_count', 0)}`",
+        f"- Lineage source-health guards: `{summary.get('lineage_source_health_guard_count', 0)}`",
         f"- Cross-family portability quarantines: `{summary.get('portability_quarantine_count', 0)}`",
         f"- Protected working slices: `{summary.get('protected_working_slice_count', 0)}`",
         f"- Actions: `{summary.get('by_action', {})}`",
@@ -3223,6 +3548,7 @@ def apply_strategy_reliability(
 ) -> tuple[list[dict], dict]:
     """Annotate candidates with bounded paper-only reliability controls."""
 
+    hydrate_paper_lineage_source_health(candidates, conn)
     _hydrate_portability_paper_evidence(candidates, conn)
     for candidate in candidates:
         _remove_invalid_proxy_confirmation(candidate)
@@ -3234,6 +3560,7 @@ def apply_strategy_reliability(
             for record in [
                 _apply_portability_quarantine(candidate, config=settings)
                 or _apply_family_quarantine(candidate, config=settings)
+                or _apply_lineage_source_health(candidate, config=settings)
             ]
             if record is not None
         ]

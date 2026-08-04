@@ -732,6 +732,24 @@ def _paper_family_quarantine_reason(
         return None
 
 
+def _paper_lineage_source_health_reason(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    try:
+        from strategy_reliability import paper_lineage_source_health_record
+    except Exception:
+        return None
+
+    try:
+        record = paper_lineage_source_health_record(candidate, config=config)
+    except Exception:
+        return None
+    if isinstance(record, Mapping) and not _as_bool(record.get("paper_fill_allowed"), True):
+        return dict(record)
+    return None
+
+
 def _paper_portability_quarantine_reason(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -878,6 +896,24 @@ def frontier_shadow_filter_reason(
                 }
             ],
             "alignment_guard": dict(alignment_guard),
+        }
+
+    lineage_source_health = _paper_lineage_source_health_reason(candidate, config=config)
+    if lineage_source_health is not None:
+        return {
+            **lineage_source_health,
+            "reason": lineage_source_health.get("reason")
+            or "paper_lineage_source_negative_edge_quarantine",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "paper_lineage_source_health",
+            "candidate": _candidate_reference(candidate),
+            "checks": [
+                {
+                    "code": lineage_source_health.get("reason"),
+                    "field": "lineage_source_health",
+                }
+            ],
         }
 
     portability_reason = _paper_portability_quarantine_reason(candidate, config=config)
@@ -1097,6 +1133,7 @@ def _annotate_shadow_filtered_candidate(
     guarded[detail_field] = dict(reason)
     if reason.get("guard") in {
         "yahoo_proxy_cross_surface_alignment_guard",
+        "paper_lineage_source_health",
         "paper_cross_family_portability_quarantine",
     }:
         guarded["paper_entry_blocked"] = True

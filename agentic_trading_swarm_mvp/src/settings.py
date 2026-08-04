@@ -432,6 +432,13 @@ DEFAULT_SETTINGS = {
             "min_diagnostic_pass_rate": 0.90,
             "recovery_evidence": {},
         },
+        "lineage_source_health_guard": {
+            "enabled": True,
+            "negative_edge_floor_bps": 0.0,
+            "penalty_min_closed_count": 3,
+            "min_closed_count": 10,
+            "penalty_score_multiplier": 0.50,
+        },
     },
     "okx_signal_research": {
         "enabled": True,

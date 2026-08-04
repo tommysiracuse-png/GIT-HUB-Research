@@ -19,8 +19,19 @@ from route_resolver import evaluate_route_intelligence
 from paper_context_cost import realized_paper_cost_audit
 from frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
 from signals.registry import discover_signals, known_strategy_signatures, promoted_strategy_lab_ids
-from storage import RUNS_DIR, add_llm_recommendation, link_recommendation_artifact, utc_now
-from strategy_reliability import paper_source_veto_record, paper_source_veto_recovery_status
+from storage import (
+    RUNS_DIR,
+    add_llm_recommendation,
+    link_recommendation_artifact,
+    signal_key,
+    utc_now,
+)
+from strategy_reliability import (
+    hydrate_paper_lineage_source_health,
+    paper_lineage_source_health_record,
+    paper_source_veto_record,
+    paper_source_veto_recovery_status,
+)
 from strategy_program import (
     LOGIC_TYPE as OBSERVATION_PROGRAM,
     PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS,
@@ -2415,6 +2426,44 @@ def _observation_program_inputs(
     return rows
 
 
+def _lineage_source_health_rank_guard(
+    candidate: dict,
+    conn: sqlite3.Connection,
+    settings: dict,
+) -> tuple[dict | None, dict | None]:
+    """Apply source-health evidence before a paper candidate enters a rank pool."""
+    annotated = dict(candidate)
+    prior_review = annotated.get("paper_lineage_source_health")
+    if annotated.get("paper_lineage_source_health_rank_applied") and isinstance(
+        prior_review,
+        dict,
+    ):
+        return (annotated if prior_review.get("paper_rank_eligible") else None), None
+    hydrate_paper_lineage_source_health([annotated], conn)
+    review = paper_lineage_source_health_record(annotated, settings)
+    if review is None:
+        return annotated, None
+    annotated["paper_lineage_source_health"] = review
+    annotated["paper_lineage_source_health_rank_applied"] = True
+    annotated["promotion_eligible"] = False
+    multiplier = max(0.0, min(1.0, _as_float(review.get("paper_score_multiplier"))))
+    annotated["pre_lineage_source_health_score"] = _as_float(annotated.get("score"))
+    annotated["score"] = round(
+        annotated["pre_lineage_source_health_score"] * multiplier,
+        3,
+    )
+    annotated["paper_score_multiplier"] = multiplier
+    annotated["paper_allocation_multiplier"] = min(
+        _as_float(annotated.get("paper_allocation_multiplier"), 1.0),
+        multiplier,
+    )
+    if not review.get("paper_rank_eligible"):
+        annotated["paper_entry_blocked"] = True
+        annotated["paper_fill_allowed"] = False
+        return None, review
+    return annotated, review
+
+
 def generate_strategy_lab_candidates(
     conn: sqlite3.Connection,
     settings: dict,
@@ -2437,7 +2486,9 @@ def generate_strategy_lab_candidates(
             [(_utc(), strategy_lab_id) for strategy_lab_id in promoted_plugins],
         )
         conn.commit()
+    hydrate_paper_lineage_source_health(candidates, conn)
     source_vetoed_candidates: list[dict] = []
+    lineage_source_health_guarded_candidates: list[dict] = []
     proxy_frontier_quarantined_candidates: list[dict] = []
     source_rank_candidates: list[dict] = []
     for candidate in candidates:
@@ -2456,6 +2507,25 @@ def generate_strategy_lab_candidates(
                 }
             )
             continue
+        ranked_candidate, source_health = _lineage_source_health_rank_guard(
+            candidate,
+            conn,
+            settings,
+        )
+        if source_health is not None:
+            lineage_source_health_guarded_candidates.append(
+                {
+                    "inst_id": candidate.get("inst_id"),
+                    "venue": candidate.get("venue"),
+                    "strategy_lab_id": candidate.get("strategy_lab_id"),
+                    "reason": source_health.get("reason"),
+                    "action": source_health.get("action"),
+                    "source_health": source_health.get("source_health"),
+                }
+            )
+        if ranked_candidate is None:
+            continue
+        candidate = ranked_candidate
         transplant_review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
             candidate, settings
         )
@@ -2769,7 +2839,9 @@ def generate_strategy_lab_candidates(
             lab_candidate["strategy_lab_hypothesis"] = experiment["hypothesis"]
             lab_candidate["strategy_lab_logic_type"] = logic.get("type", "candidate_filter")
             lab_candidate["strategy_lab_source_trade_type"] = candidate.get("trade_type")
-            lab_candidate["strategy_lab_source_signal_key"] = candidate.get("signal_key")
+            lab_candidate["strategy_lab_source_signal_key"] = (
+                candidate.get("signal_key") or signal_key(candidate)
+            )
             lab_candidate["strategy_lab_candidate"] = True
             lab_candidate["source_surface"] = experiment.get("source_surface")
             lab_candidate["permitted_target_surface"] = list(
@@ -2787,7 +2859,26 @@ def generate_strategy_lab_candidates(
             lab_candidate["thesis"] = (
                 f"Strategy Lab {experiment['strategy_lab_id']}: {experiment['hypothesis']}"
             )[:1000]
-            generated.append(lab_candidate)
+            ranked_lab_candidate, source_health = _lineage_source_health_rank_guard(
+                lab_candidate,
+                conn,
+                settings,
+            )
+            if source_health is not None:
+                lineage_source_health_guarded_candidates.append(
+                    {
+                        "inst_id": lab_candidate.get("inst_id"),
+                        "venue": lab_candidate.get("venue"),
+                        "strategy_lab_id": lab_candidate.get("strategy_lab_id"),
+                        "reason": source_health.get("reason"),
+                        "action": source_health.get("action"),
+                        "source_health": source_health.get("source_health"),
+                    }
+                )
+            if ranked_lab_candidate is None:
+                rejects[experiment["strategy_lab_id"]]["lineage_source_negative_edge"] += 1
+                continue
+            generated.append(ranked_lab_candidate)
             per_experiment[experiment["strategy_lab_id"]] += 1
 
         experiment_id = experiment["strategy_lab_id"]
@@ -2870,6 +2961,10 @@ def generate_strategy_lab_candidates(
         "source_vetoed_candidates": source_vetoed_candidates[:20],
         "source_vetoed_experiment_count": len(source_vetoed_experiments),
         "source_vetoed_experiments": source_vetoed_experiments[:20],
+        "lineage_source_health_guarded_candidate_count": len(
+            lineage_source_health_guarded_candidates
+        ),
+        "lineage_source_health_guarded_candidates": lineage_source_health_guarded_candidates[:20],
         "proxy_frontier_quarantined_candidate_count": len(
             proxy_frontier_quarantined_candidates
         ),
