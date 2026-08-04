@@ -5012,13 +5012,15 @@ def _candidate_worktree_diff(release: CandidateRelease, timeout: int) -> tuple[s
         timeout=timeout,
         check=False,
     )
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
     diff = {
         "args": list(completed.args),
         "returncode": completed.returncode,
-        "stdout_tail": completed.stdout[-2000:],
-        "stderr_tail": completed.stderr[-2000:],
+        "stdout_tail": stdout[-2000:],
+        "stderr_tail": stderr[-2000:],
     }
-    return completed.stdout if completed.returncode == 0 else "", {"intent_to_add": intent, "diff": diff}
+    return stdout if completed.returncode == 0 else "", {"intent_to_add": intent, "diff": diff}
 
 
 def _codex_patch_generation(agent: dict) -> dict:

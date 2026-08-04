@@ -27,6 +27,32 @@ def git_available() -> bool:
 
 @unittest.skipUnless(git_available(), "git executable is required")
 class CodeEvolutionCodexAgentTests(unittest.TestCase):
+    def test_candidate_diff_handles_missing_subprocess_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release = code_evolution.CandidateRelease(
+                proposal_id="proposal:null-output",
+                parent_commit="abc123",
+                branch_name="evolution/null-output",
+                worktree_path=tmp,
+                app_worktree_path=tmp,
+            )
+            completed = subprocess.CompletedProcess(
+                ["git", "diff"],
+                1,
+                stdout=None,
+                stderr=None,
+            )
+            with mock.patch.object(code_evolution, "_run", return_value={"returncode": 0}), mock.patch.object(
+                code_evolution.subprocess,
+                "run",
+                return_value=completed,
+            ):
+                diff_text, metadata = code_evolution._candidate_worktree_diff(release, 10)
+
+        self.assertEqual(diff_text, "")
+        self.assertEqual(metadata["diff"]["stdout_tail"], "")
+        self.assertEqual(metadata["diff"]["stderr_tail"], "")
+
     def _repo(self, tmp: str) -> tuple[pathlib.Path, pathlib.Path]:
         repo = pathlib.Path(tmp) / "repo"
         app = repo / "agentic_trading_swarm_mvp"
