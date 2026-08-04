@@ -118,6 +118,29 @@ class StrategyFeasibilityTests(unittest.TestCase):
         self.assertEqual(0.10, candidates[0]["strategy_reliability_allocation_multiplier"])
         self.assertEqual("impossible_quality", row["parent_strategy_lab_id"])
 
+    def test_unresolved_safety_or_feature_gate_prevents_useless_relaxed_child(self):
+        safety_experiment = dict(self.experiment)
+        safety_experiment["strategy_logic"] = {
+            **program(),
+            "entry_expression": "quality_score >= 60 and stale_minutes <= 5",
+        }
+        stale_frames = [{**frame, "stale_minutes": 20} for frame in frames()]
+        profile = profile_observation_program(safety_experiment, stale_frames, self.settings)
+        self.assertEqual("blocked_observation_safety", profile["feasibility_status"])
+        self.assertFalse(profile["relaxation"]["complete_repair"])
+        record_contract_evaluation(self.conn, self.experiment, profile, cycle_id="safety-cycle")
+        self.assertIsNone(maybe_create_relaxed_child(self.conn, safety_experiment, profile, self.settings))
+
+        feature_experiment = dict(self.experiment)
+        feature_experiment["strategy_logic"] = {
+            **program(),
+            "entry_expression": "quality_score >= 60 and return_5m_bps * return_60m_bps < 0",
+        }
+        profile = profile_observation_program(feature_experiment, frames(), self.settings)
+        self.assertEqual("missing_feature_history", profile["feasibility_status"])
+        self.assertIn("missing_feature_history", {item["reason"] for item in profile["blocking_gates"]})
+        self.assertFalse(profile["relaxation"]["complete_repair"])
+
     def test_architect_creates_a_child_after_repeated_gap(self):
         now = storage.utc_now()
         for index in range(3):

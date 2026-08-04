@@ -12,6 +12,7 @@ from typing import Any
 
 from strategy_program import (
     ProgramValidationError,
+    SAFE_FUNCTIONS,
     _program_values,
     _universe_matches,
     compile_observation_program,
@@ -60,7 +61,10 @@ def _top_level_gates(expression: str) -> list[ast.expr]:
 
 
 def _gate_names(node: ast.AST) -> set[str]:
-    return {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
+    return {
+        item.id for item in ast.walk(node)
+        if isinstance(item, ast.Name) and item.id not in SAFE_FUNCTIONS
+    }
 
 
 def _numeric_compare(node: ast.AST) -> tuple[ast.expr, ast.cmpop, float] | None:
@@ -113,6 +117,8 @@ def _relaxable_gate(
         if number is not None:
             observed.append(number)
     if not observed:
+        return None
+    if min(observed) == 0 and max(observed) == 0:
         return None
     cfg = settings.get("strategy_lab", {}).get("adaptive_relaxation", {})
     if isinstance(operator, (ast.Gt, ast.GtE)):
@@ -211,6 +217,7 @@ def profile_observation_program(experiment: dict, frames: list[dict], settings: 
                 "failed_gates": failed,
             })
 
+    feature_profile = _feature_profile(values_rows)
     relaxations = []
     for gate, gate_profile in zip(gates, gate_rows):
         proposed = _relaxable_gate(gate, values_rows, float(gate_profile["pass_rate"]), settings)
@@ -220,8 +227,37 @@ def profile_observation_program(experiment: dict, frames: list[dict], settings: 
     relaxations.sort(key=lambda item: (item["pass_rate"], item["gate"]))
     relaxations = relaxations[:max_gates]
 
-    impossible = any(item["pass_rate"] == 0 for item in relaxations)
-    status = "feasible_active" if candidates else "impossible_threshold" if impossible else "feasible_rare"
+    relaxation_gates = {item["gate"] for item in relaxations}
+    blocking_gates = []
+    for gate, gate_profile in zip(gates, gate_rows):
+        if gate_profile["pass_rate"] > 0 or gate_profile["gate"] in relaxation_gates:
+            continue
+        names = _gate_names(gate)
+        if names & IMMUTABLE_GATE_FIELDS:
+            reason = "observation_safety_gate"
+        elif any(
+            name not in feature_profile or (
+                feature_profile[name].get("min") == 0
+                and feature_profile[name].get("max") == 0
+            )
+            for name in names
+        ):
+            reason = "missing_feature_history"
+        else:
+            reason = "unrelaxable_expression"
+        blocking_gates.append({**gate_profile, "names": sorted(names), "reason": reason})
+    if candidates:
+        status = "feasible_active"
+    elif any(item["reason"] == "observation_safety_gate" for item in blocking_gates):
+        status = "blocked_observation_safety"
+    elif any(item["reason"] == "missing_feature_history" for item in blocking_gates):
+        status = "missing_feature_history"
+    elif blocking_gates:
+        status = "unrelaxable_contract"
+    elif relaxations:
+        status = "impossible_threshold"
+    else:
+        status = "feasible_rare"
     return {
         "feasibility_status": status,
         "observation_count": len(frames),
@@ -229,10 +265,15 @@ def profile_observation_program(experiment: dict, frames: list[dict], settings: 
         "eligible_observation_count": len(eligible_frames),
         "candidate_count": candidates,
         "entry_pass_rate": round(candidates / len(values_rows), 6) if values_rows else 0.0,
-        "feature_profile": _feature_profile(values_rows),
+        "feature_profile": feature_profile,
         "gate_profile": {item["gate"]: item for item in gate_rows},
+        "blocking_gates": blocking_gates,
         "nearest_candidates": sorted(nearest, key=lambda item: item["failed_gate_count"])[:10],
-        "relaxation": {"eligible": bool(relaxations), "changes": relaxations},
+        "relaxation": {
+            "eligible": bool(relaxations) and not blocking_gates,
+            "complete_repair": bool(relaxations) and not blocking_gates,
+            "changes": relaxations,
+        },
         "runtime_error_count": runtime_errors,
         "program": program,
     }
@@ -277,8 +318,9 @@ def maybe_create_relaxed_child(
     cfg = settings.get("strategy_lab", {}).get("adaptive_relaxation", {})
     if not cfg.get("enabled", True) or profile.get("candidate_count"):
         return None
-    changes = list((profile.get("relaxation") or {}).get("changes") or [])
-    if not changes:
+    relaxation = profile.get("relaxation") or {}
+    changes = list(relaxation.get("changes") or [])
+    if not changes or not relaxation.get("complete_repair"):
         return None
     aggregate = conn.execute(
         """

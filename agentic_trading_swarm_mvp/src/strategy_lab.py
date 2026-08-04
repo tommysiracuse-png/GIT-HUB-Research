@@ -2510,6 +2510,12 @@ def generate_strategy_lab_candidates(
                 diagnostic_status = "active_testing"
             elif relaxed_child and relaxed_child.get("status") == "created":
                 diagnostic_status = "needs_contract_revision"
+            elif feasibility.get("feasibility_status") in {
+                "missing_feature_history", "blocked_observation_safety", "missing_surface_data"
+            }:
+                diagnostic_status = "needs_data"
+            elif feasibility.get("feasibility_status") == "unrelaxable_contract":
+                diagnostic_status = "needs_contract_revision"
             elif not observation_frames or (
                 program_diagnostic.get("reject_reasons")
                 and set(program_diagnostic.get("reject_reasons") or {}) == {"universe_mismatch"}
