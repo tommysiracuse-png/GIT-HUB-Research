@@ -358,22 +358,193 @@ def strategy_lab_surface_activation_eligible(candidate: dict) -> bool:
     policy = candidate.get("strategy_lab_surface_policy")
     if not isinstance(policy, dict) or policy.get("eligible") is not True:
         return False
-    source_surface = _normalize_surface(
-        candidate.get("source_surface") or policy.get("source_surface")
-    )
+    candidate_source = _normalize_surface(candidate.get("source_surface"))
+    policy_source = _normalize_surface(policy.get("source_surface"))
+    if candidate_source and policy_source and candidate_source != policy_source:
+        return False
+    source_surface = policy_source or candidate_source
     if source_surface != YAHOO_PROXY_SURFACE:
         return True
+    candidate_permitted = _surface_values(candidate.get("permitted_target_surface"))
+    policy_permitted = _surface_values(policy.get("permitted_target_surface"))
+    if candidate_permitted and policy_permitted and candidate_permitted != policy_permitted:
+        return False
+    candidate_target = _candidate_target_surface(candidate)
+    policy_target = _normalize_surface(policy.get("target_surface"))
+    if candidate_target and policy_target and candidate_target != policy_target:
+        return False
     experiment = {
         "source_surface": source_surface,
-        "permitted_target_surface": (
-            candidate.get("permitted_target_surface")
-            or policy.get("permitted_target_surface")
-        ),
+        "permitted_target_surface": policy_permitted or candidate_permitted,
     }
     activation_candidate = dict(candidate)
-    if _candidate_target_surface(activation_candidate) is None:
-        activation_candidate["target_surface"] = policy.get("target_surface")
+    if candidate_target is None:
+        activation_candidate["target_surface"] = policy_target
     return _surface_compatibility(experiment, activation_candidate)["eligible"]
+
+
+def enforce_promoted_strategy_lab_surface_policy(
+    conn: sqlite3.Connection,
+    candidates: list[dict],
+) -> tuple[list[dict], dict]:
+    """Block promoted Yahoo-derived plugins that escape their source surface.
+
+    Promoted signal plugins run before the ordinary Strategy Lab candidate
+    selector.  Rebuild their activation verdict from the persisted experiment
+    so generated code cannot broaden its own permitted target surfaces.
+    """
+    strategy_ids = _unique(
+        [
+            str(candidate.get("strategy_lab_id") or "").strip()
+            for candidate in candidates
+            if str(candidate.get("strategy_lab_id") or "").strip()
+        ]
+    )
+    if not strategy_ids:
+        return list(candidates), {
+            "checked_candidate_count": 0,
+            "blocked_candidate_count": 0,
+            "quarantined_artifact_count": 0,
+            "quarantined_strategy_lab_ids": [],
+            "paper_only": True,
+        }
+
+    placeholders = ",".join("?" for _ in strategy_ids)
+    rows = conn.execute(
+        f"""
+        select strategy_lab_id, status, source_surface,
+               permitted_target_surfaces_json, surface_policy_json
+        from strategy_lab_experiments
+        where strategy_lab_id in ({placeholders})
+        """,
+        strategy_ids,
+    ).fetchall()
+    experiments = {str(row["strategy_lab_id"]): dict(row) for row in rows}
+    reviews: dict[str, list[dict]] = defaultdict(list)
+
+    for candidate in candidates:
+        strategy_lab_id = str(candidate.get("strategy_lab_id") or "").strip()
+        if not strategy_lab_id:
+            continue
+        row = experiments.get(strategy_lab_id)
+        stored_policy = _json_loads(row.get("surface_policy_json"), {}) if row else {}
+        if not isinstance(stored_policy, dict):
+            stored_policy = {}
+        row_source = _normalize_surface(row.get("source_surface")) if row else None
+        candidate_source = _normalize_surface(candidate.get("source_surface"))
+        policy_source = _normalize_surface(stored_policy.get("source_surface"))
+        declared_sources = {value for value in (row_source, candidate_source, policy_source) if value}
+        if YAHOO_PROXY_SURFACE not in declared_sources:
+            continue
+
+        source_conflict = len(declared_sources) > 1
+        if row is not None:
+            permitted = _surface_values(
+                _json_loads(row.get("permitted_target_surfaces_json"), [])
+            )
+        else:
+            permitted = _surface_values(
+                stored_policy.get("permitted_target_surface")
+                or candidate.get("permitted_target_surface")
+            )
+        candidate_target = _candidate_target_surface(candidate)
+        policy_target = _normalize_surface(stored_policy.get("target_surface"))
+        target_conflict = bool(
+            candidate_target and policy_target and candidate_target != policy_target
+        )
+        activation_candidate = dict(candidate)
+        if candidate_target is None:
+            activation_candidate["target_surface"] = policy_target
+        compatibility = _surface_compatibility(
+            {
+                "source_surface": YAHOO_PROXY_SURFACE,
+                "permitted_target_surface": permitted,
+            },
+            activation_candidate,
+        )
+        requested_target = _normalize_surface(stored_policy.get("requested_target_surface"))
+        contract_review = _yahoo_proxy_surface_review(
+            YAHOO_PROXY_SURFACE,
+            permitted,
+            requested_target,
+        )
+        status_quarantined = bool(
+            row and row.get("status") == "quarantined_surface_policy"
+        )
+        eligible = bool(
+            compatibility["eligible"]
+            and contract_review["eligible"]
+            and not source_conflict
+            and not target_conflict
+            and not status_quarantined
+        )
+        reason = (
+            "surface_metadata_conflict"
+            if source_conflict or target_conflict
+            else "artifact_already_surface_quarantined"
+            if status_quarantined
+            else contract_review["reason"]
+            if not contract_review["eligible"]
+            else compatibility["reason"]
+        )
+        reviews[strategy_lab_id].append(
+            {
+                **compatibility,
+                "eligible": eligible,
+                "reason": reason,
+                "requested_target_surface": requested_target,
+                "source_metadata_conflict": source_conflict,
+                "target_metadata_conflict": target_conflict,
+                "activation_blocked": not eligible,
+            }
+        )
+
+    blocked_ids = {
+        strategy_lab_id
+        for strategy_lab_id, artifact_reviews in reviews.items()
+        if any(not review["eligible"] for review in artifact_reviews)
+    }
+    now = _utc()
+    for strategy_lab_id in sorted(blocked_ids):
+        row = experiments.get(strategy_lab_id)
+        if row is None:
+            continue
+        artifact_reviews = reviews[strategy_lab_id]
+        persisted_review = next(
+            review for review in artifact_reviews if not review["eligible"]
+        )
+        persisted_review = {
+            **persisted_review,
+            "artifact_candidate_count": len(artifact_reviews),
+            "quarantined_at_activation": True,
+        }
+        conn.execute(
+            """
+            update strategy_lab_experiments
+            set status = 'quarantined_surface_policy',
+                compile_status = 'surface_quarantined',
+                surface_policy_json = ?, updated_at = ?
+            where strategy_lab_id = ?
+            """,
+            (json.dumps(persisted_review, sort_keys=True), now, strategy_lab_id),
+        )
+    if blocked_ids:
+        conn.commit()
+
+    filtered = [
+        candidate
+        for candidate in candidates
+        if str(candidate.get("strategy_lab_id") or "").strip() not in blocked_ids
+    ]
+    checked_count = sum(len(items) for items in reviews.values())
+    blocked_count = len(candidates) - len(filtered)
+    return filtered, {
+        "checked_candidate_count": checked_count,
+        "blocked_candidate_count": blocked_count,
+        "quarantined_artifact_count": len(blocked_ids),
+        "quarantined_strategy_lab_ids": sorted(blocked_ids),
+        "paper_only": True,
+    }
 
 
 def _runtime_strategy_vocabulary(candidates: list[dict]) -> dict:

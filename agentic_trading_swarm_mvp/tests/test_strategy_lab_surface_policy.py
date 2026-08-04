@@ -7,6 +7,7 @@ import pathlib
 import sqlite3
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -15,6 +16,7 @@ if str(SRC) not in sys.path:
 
 from radar_loop import _select_runtime_strategy_lab_candidates
 from settings import DEFAULT_SETTINGS
+from signals.runtime import run_signal_plugins
 from storage import init_db, open_paper_trade
 from strategy_lab import (
     _experiment_outcomes,
@@ -188,6 +190,83 @@ class StrategyLabSurfacePolicyTests(unittest.TestCase):
 
         self.assertEqual(["YAHOO_PROXY:EWZ"], [row["inst_id"] for row in selected])
         self.assertEqual(1, summary["accepted_count"])
+
+    def test_promoted_plugin_cross_surface_candidate_quarantines_artifact(self) -> None:
+        rec = recommendation()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "promoted_yahoo_momentum"
+        experiment["source_surface"] = "YAHOO_PROXY"
+        experiment["permitted_target_surface"] = ["YAHOO_PROXY"]
+        promoted_candidate = {
+            **candidate("BTC-USDT", "OKX_SPOT"),
+            "strategy_lab_id": experiment["strategy_lab_id"],
+            "strategy_lab_logic_type": "generated_signal_plugin",
+            "signal_plugin_id": "strategy_lab_promoted_yahoo_momentum",
+        }
+
+        with connection() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            conn.execute(
+                "update strategy_lab_experiments set status = 'promoted_to_code'"
+            )
+            conn.commit()
+            with patch("signals.runtime.discover_signals", return_value={}), patch(
+                "signals.runtime.build_feature_frames", return_value=[]
+            ), patch(
+                "signals.runtime.generate_registered_signal_candidates",
+                return_value=([promoted_candidate], {"generated_candidate_count": 1}),
+            ):
+                generated, report = run_signal_plugins(conn, [], self.settings())
+            row = conn.execute(
+                "select status, compile_status, surface_policy_json "
+                "from strategy_lab_experiments"
+            ).fetchone()
+
+        policy = json.loads(row["surface_policy_json"])
+        self.assertEqual([], generated)
+        self.assertEqual("quarantined_surface_policy", row["status"])
+        self.assertEqual("surface_quarantined", row["compile_status"])
+        self.assertTrue(policy["activation_blocked"])
+        self.assertEqual(1, report["surface_policy"]["blocked_candidate_count"])
+        self.assertEqual(
+            [experiment["strategy_lab_id"]],
+            report["surface_policy"]["quarantined_strategy_lab_ids"],
+        )
+
+    def test_promoted_plugin_same_surface_candidate_remains_paper_eligible(self) -> None:
+        rec = recommendation()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = "promoted_yahoo_same_surface"
+        experiment["source_surface"] = "YAHOO_PROXY"
+        experiment["permitted_target_surface"] = ["YAHOO_PROXY"]
+        promoted_candidate = {
+            **candidate("YAHOO_PROXY:EWZ", "YAHOO_PROXY"),
+            "venue": "YAHOO_PROXY",
+            "strategy_lab_id": experiment["strategy_lab_id"],
+            "strategy_lab_logic_type": "generated_signal_plugin",
+            "signal_plugin_id": "strategy_lab_promoted_yahoo_same_surface",
+        }
+
+        with connection() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            conn.execute(
+                "update strategy_lab_experiments set status = 'promoted_to_code'"
+            )
+            conn.commit()
+            with patch("signals.runtime.discover_signals", return_value={}), patch(
+                "signals.runtime.build_feature_frames", return_value=[]
+            ), patch(
+                "signals.runtime.generate_registered_signal_candidates",
+                return_value=([promoted_candidate], {"generated_candidate_count": 1}),
+            ):
+                generated, report = run_signal_plugins(conn, [], self.settings())
+            status = conn.execute(
+                "select status from strategy_lab_experiments"
+            ).fetchone()["status"]
+
+        self.assertEqual(["YAHOO_PROXY:EWZ"], [row["inst_id"] for row in generated])
+        self.assertEqual("promoted_to_code", status)
+        self.assertEqual(0, report["surface_policy"]["blocked_candidate_count"])
 
     def test_preexisting_active_yahoo_cross_surface_artifact_is_quarantined(self) -> None:
         rec = recommendation()

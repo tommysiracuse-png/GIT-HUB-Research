@@ -28,9 +28,18 @@ def run_signal_plugins(
             "feature_frames": feature_frames,
         },
     )
+    # Import lazily because strategy_lab discovers this package while loading.
+    from strategy_lab import enforce_promoted_strategy_lab_surface_policy
+
+    candidates, surface_policy = enforce_promoted_strategy_lab_surface_policy(
+        conn,
+        candidates,
+    )
     return candidates, {
         "enabled": True,
         "discovery": discovery,
         "feature_frame_count": len(feature_frames),
+        "activated_candidate_count": len(candidates),
+        "surface_policy": surface_policy,
         **generation,
     }
