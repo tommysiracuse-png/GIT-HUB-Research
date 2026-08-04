@@ -165,7 +165,7 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
         self.assertFalse(guarded["promotion_eligible"])
         self.assertEqual(0.0, guarded["paper_allocation_multiplier"])
 
-    def test_proxy_momentum_can_rank_in_sandbox_but_needs_fresh_exact_surface_proof(self) -> None:
+    def test_proxy_momentum_is_hard_quarantined_until_source_and_local_checks_pass(self) -> None:
         candidate = translated_candidate(
             venue="OKX",
             inst_id="OKX:BTC-USDT-SWAP",
@@ -180,11 +180,11 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
         rows, _report = apply_strategy_reliability([candidate])
         review = rows[0]["paper_portability_quarantine"]
 
-        self.assertEqual(75.0, rows[0]["score"])
-        self.assertTrue(rows[0]["paper_rank_eligible"])
+        self.assertEqual(0.0, rows[0]["score"])
+        self.assertFalse(rows[0]["paper_rank_eligible"])
         self.assertFalse(rows[0]["promotion_eligible"])
         self.assertFalse(rows[0]["paper_fill_allowed"])
-        self.assertEqual("sandbox_ranking", review["maximum_stage"])
+        self.assertEqual("quarantined", review["maximum_stage"])
 
         candidate.pop("destination_family_paper_stats")
         candidate["target_surface_paper_evidence"] = {
@@ -195,6 +195,14 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
             "quality_pass_rate": 0.6,
             "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
+        candidate["native_yahoo_proxy_regime"] = {
+            "momentum_bps": 8.0,
+            "regime_stable": True,
+            "regime_state": "stable_positive",
+        }
+        candidate["local_short_horizon_trend_bps"] = 3.0
+        candidate["spread_bps"] = 3.0
+        candidate["liquidity_score"] = 0.8
         proven = paper_portability_quarantine_record(candidate)
 
         self.assertTrue(proven["promotion_eligible"])

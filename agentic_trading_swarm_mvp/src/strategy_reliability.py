@@ -18,7 +18,10 @@ from typing import Any
 from paper_context_cost import realized_paper_cost_audit
 from proxy_signal_quality import PROXY_TRADE_TYPES, proxy_short_quality_review
 from storage import RUNS_DIR, signal_key
-from frontier_data_quality import paper_only_proxy_frontier_target_evidence_review
+from frontier_data_quality import (
+    paper_only_proxy_frontier_target_evidence_review,
+    paper_only_yahoo_proxy_cross_surface_alignment_guard,
+)
 
 
 REPORT_JSON = RUNS_DIR / "strategy_reliability_report.json"
@@ -1529,11 +1532,16 @@ def paper_portability_quarantine_record(
         and target_surface_review.get("applies")
     )
     if proxy_momentum_frontier_transfer:
-        proven = bool(proven and target_surface_review.get("eligible"))
+        transplant_review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            dict(candidate), dict(config) if isinstance(config, Mapping) else {}
+        )
+        proven = bool(proven and transplant_review.get("eligible"))
+    else:
+        transplant_review = None
 
-    if proxy_momentum_frontier_transfer and not target_surface_review.get("eligible"):
-        reason = target_surface_review.get("reason") or "target_surface_paper_evidence_required"
-        state = "sandbox_only_pending_target_surface_proof"
+    if proxy_momentum_frontier_transfer and not transplant_review.get("eligible"):
+        reason = transplant_review.get("reason") or "proxy_frontier_transplant_quarantined"
+        state = "hard_quarantine_pending_source_and_local_confirmation"
     elif not sufficient:
         reason = "insufficient_destination_family_paper_evidence"
         state = "pending_destination_family_proof"
@@ -1562,16 +1570,10 @@ def paper_portability_quarantine_record(
         "sufficient_closed_count": sufficient,
         "positive_destination_expectancy": positive,
         "destination_family_proof": proven,
-        "rank_above_neutral_allowed": proven or proxy_momentum_frontier_transfer,
-        "paper_rank_eligible": proven or proxy_momentum_frontier_transfer,
-        "sandbox_rank_eligible": proxy_momentum_frontier_transfer,
-        "maximum_stage": (
-            "paper_promotion"
-            if proven
-            else "sandbox_ranking"
-            if proxy_momentum_frontier_transfer
-            else "quarantined"
-        ),
+        "rank_above_neutral_allowed": proven,
+        "paper_rank_eligible": proven,
+        "sandbox_rank_eligible": False,
+        "maximum_stage": "paper_promotion" if proven else "quarantined",
         "promotion_eligible": proven,
         "promotion_blocked": not proven,
         "paper_fill_allowed": proven,
@@ -1581,6 +1583,7 @@ def paper_portability_quarantine_record(
         "target_surface_paper_evidence_review": (
             target_surface_review if proxy_momentum_frontier_transfer else None
         ),
+        "proxy_frontier_transplant_review": transplant_review,
     }
 
 

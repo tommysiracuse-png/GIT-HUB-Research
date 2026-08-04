@@ -145,7 +145,10 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "quarantined": False,
                 "quarantined_target_surfaces": ["OKX_SPOT", "OKX_PERP"],
                 "allow_native_proxy_monitoring": True,
-                "reenable_condition": "fresh_target_surface_paper_evidence_meeting_quality_thresholds",
+                "reenable_condition": (
+                    "decisively_positive_stable_native_proxy_regime_and_independent_local_"
+                    "frontier_spread_liquidity_trend_confirmation"
+                ),
             }
 
         def _paper_only_family_decay_guard_review(record, config=None):
@@ -5693,6 +5696,13 @@ def paper_only_yahoo_proxy_crypto_momentum_gate(
     feature_family: str = "global_proxy_momentum",
     proxy_valid_for_reuse: bool | None = None,
     target_surface_paper_evidence: dict | None = None,
+    native_proxy_momentum_bps: float | None = None,
+    native_proxy_regime_stable: bool | None = None,
+    native_proxy_regime_state: str | None = None,
+    destination_direction: str | None = None,
+    local_short_horizon_trend_bps: float | None = None,
+    destination_spread_bps: float | None = None,
+    destination_liquidity_score: float | None = None,
 ) -> dict:
     """Return the quarantined Yahoo momentum contribution for a crypto route.
 
@@ -5719,6 +5729,13 @@ def paper_only_yahoo_proxy_crypto_momentum_gate(
             "momentum_contribution": momentum_contribution,
             "proxy_valid_for_reuse": proxy_valid_for_reuse,
             "target_surface_paper_evidence": target_surface_paper_evidence,
+            "native_proxy_momentum_bps": native_proxy_momentum_bps,
+            "native_proxy_regime_stable": native_proxy_regime_stable,
+            "native_proxy_regime_state": native_proxy_regime_state,
+            "destination_direction": destination_direction,
+            "local_short_horizon_trend_bps": local_short_horizon_trend_bps,
+            "destination_spread_bps": destination_spread_bps,
+            "destination_liquidity_score": destination_liquidity_score,
         },
         now=evaluated_at,
     )

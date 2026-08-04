@@ -86,6 +86,13 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
             destination_proxy_age_seconds=15.0,
             destination_surface="perp",
             destination_venue="BITGET",
+            native_proxy_momentum_bps=8.0,
+            native_proxy_regime_stable=True,
+            native_proxy_regime_state="stable_positive",
+            destination_direction="long_frontier_perp",
+            local_short_horizon_trend_bps=3.0,
+            destination_spread_bps=3.0,
+            destination_liquidity_score=0.8,
             target_surface_paper_evidence={
                 "paper_only": True,
                 "target_surface": "BITGET_PERP",

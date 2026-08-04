@@ -587,13 +587,20 @@ _PAPER_ONLY_YAHOO_CRYPTO_FRESHNESS_POLICY = {
 _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY = {
     "enabled": True,
     "max_destination_spread_bps": 8.0,
+    "min_destination_liquidity_score": 0.65,
+    "min_native_proxy_momentum_bps": 5.0,
+    "min_native_proxy_regime_windows": 3,
+    "min_native_proxy_positive_window_rate": 0.67,
     "quarantined_target_surfaces": ("OKX_SPOT", "OKX_PERP"),
     "allow_native_proxy_monitoring": True,
     "min_target_surface_closed_count": 20,
     "min_target_surface_expectancy_net_bps": 0.0,
     "min_target_surface_quality_rate": 0.5,
     "max_target_surface_evidence_age_hours": 168.0,
-    "reenable_condition": "fresh_target_surface_paper_evidence_meeting_quality_thresholds",
+    "reenable_condition": (
+        "decisively_positive_stable_native_proxy_regime_and_independent_local_frontier_"
+        "spread_liquidity_trend_confirmation"
+    ),
 }
 
 def paper_only_yahoo_proxy_okx_target_review(record, profile=None):
@@ -1011,6 +1018,10 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "route_context",
         "local_confirmation",
         "intraday_features",
+        "native_yahoo_proxy_regime",
+        "native_proxy_regime",
+        "proxy_source_regime",
+        "source_regime",
         "recommendation_lineage",
         "lineage_context",
         "proxy_context",
@@ -1235,6 +1246,104 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         local_trend_state = "missing"
     local_direction_confirmed = local_trend_state == "aligned"
 
+    native_momentum_bps = _float(
+        _lookup(
+            "native_yahoo_proxy_momentum_bps",
+            "native_proxy_momentum_bps",
+            "native_momentum_bps",
+            "source_momentum_bps",
+            "proxy_regime_momentum_bps",
+            "momentum_bps",
+        )
+    )
+    native_regime_state = _paper_only_route_intelligence_tag(
+        _lookup(
+            "native_yahoo_proxy_regime_state",
+            "native_proxy_regime_state",
+            "source_regime_state",
+            "proxy_regime_state",
+            "regime_state",
+        )
+    )
+    explicit_native_stability = _bool(
+        _lookup(
+            "native_yahoo_proxy_regime_stable",
+            "native_proxy_regime_stable",
+            "source_regime_stable",
+            "proxy_regime_stable",
+            "regime_stable",
+        )
+    )
+    native_regime_windows = _float(
+        _lookup(
+            "native_yahoo_proxy_regime_windows",
+            "native_proxy_regime_windows",
+            "source_regime_windows",
+            "regime_window_count",
+            "window_count",
+        )
+    )
+    native_positive_window_rate = _float(
+        _lookup(
+            "native_yahoo_proxy_positive_window_rate",
+            "native_proxy_positive_window_rate",
+            "source_positive_window_rate",
+            "positive_window_rate",
+        )
+    )
+    min_native_momentum_bps = _float(_profile_lookup("min_native_proxy_momentum_bps"))
+    if min_native_momentum_bps is None or min_native_momentum_bps <= 0.0:
+        min_native_momentum_bps = _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY[
+            "min_native_proxy_momentum_bps"
+        ]
+    min_native_regime_windows = _float(_profile_lookup("min_native_proxy_regime_windows"))
+    if min_native_regime_windows is None or min_native_regime_windows < 1.0:
+        min_native_regime_windows = _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY[
+            "min_native_proxy_regime_windows"
+        ]
+    min_native_positive_window_rate = _float(
+        _profile_lookup("min_native_proxy_positive_window_rate")
+    )
+    if min_native_positive_window_rate is None:
+        min_native_positive_window_rate = _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY[
+            "min_native_proxy_positive_window_rate"
+        ]
+    min_native_positive_window_rate = max(0.0, min(1.0, min_native_positive_window_rate))
+
+    stable_state = native_regime_state in {
+        "stable_positive",
+        "decisively_positive_stable",
+        "positive_stable",
+        "risk_on_stable",
+    }
+    unstable_state = native_regime_state in {
+        "unstable",
+        "mixed",
+        "choppy",
+        "indeterminate",
+        "non_positive",
+        "negative",
+    }
+    window_stability = bool(
+        native_regime_windows is not None
+        and native_regime_windows >= min_native_regime_windows
+        and native_positive_window_rate is not None
+        and native_positive_window_rate >= min_native_positive_window_rate
+    )
+    native_regime_stable = bool(
+        not unstable_state
+        and explicit_native_stability is not False
+        and (
+            explicit_native_stability is True
+            or stable_state
+            or window_stability
+        )
+    )
+    native_regime_decisively_positive = bool(
+        native_momentum_bps is not None
+        and native_momentum_bps >= min_native_momentum_bps
+    )
+
     max_spread_bps = _float(
         _lookup("max_destination_spread_bps", "maximum_spread_bps", "max_spread_bps")
     )
@@ -1272,12 +1381,67 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         spread_non_adverse = explicit_spread_ok is True
     spread_evidence_present = destination_spread_bps is not None or explicit_spread_ok is not None
 
-    # Current alignment remains diagnostic.  Release requires independent,
-    # fresh paper outcomes from this exact OKX surface.
-    eligible = bool(not applies or target_surface_evidence.get("eligible"))
+    min_destination_liquidity_score = _float(
+        _profile_lookup("min_destination_liquidity_score")
+    )
+    if min_destination_liquidity_score is None or min_destination_liquidity_score <= 0.0:
+        min_destination_liquidity_score = _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY[
+            "min_destination_liquidity_score"
+        ]
+    explicit_liquidity_ok = _bool(
+        _lookup(
+            "local_liquidity_ok",
+            "destination_liquidity_ok",
+            "liquidity_acceptable",
+            "liquidity_check_passed",
+        )
+    )
+    destination_liquidity_score = _float(
+        _lookup(
+            "destination_liquidity_score",
+            "local_liquidity_score",
+            "depth_liquidity_score",
+            "liquidity_score",
+        )
+    )
+    liquidity_evidence_present = (
+        destination_liquidity_score is not None or explicit_liquidity_ok is not None
+    )
+    liquidity_acceptable = bool(
+        explicit_liquidity_ok is True
+        or (
+            destination_liquidity_score is not None
+            and destination_liquidity_score >= min_destination_liquidity_score
+        )
+    )
+    local_confirmation_checks = {
+        "short_horizon_trend": local_direction_confirmed,
+        "spread": bool(spread_evidence_present and spread_non_adverse),
+        "liquidity": bool(liquidity_evidence_present and liquidity_acceptable),
+    }
+    local_confirmation_passed = all(local_confirmation_checks.values())
+
+    # The transplant is released only when the source itself is robust and a
+    # separate destination observation confirms executable local conditions.
+    # Exact-surface paper outcomes remain an additional portability safeguard.
+    eligible = bool(
+        not applies
+        or (
+            target_surface_evidence.get("eligible")
+            and native_regime_decisively_positive
+            and native_regime_stable
+            and local_confirmation_passed
+        )
+    )
     blocked = bool(applies and not eligible)
     if not applies:
         reason = "disabled" if not enabled else "non_paper_mode" if not paper_mode else "not_applicable"
+    elif not native_regime_decisively_positive:
+        reason = "native_yahoo_proxy_regime_non_positive"
+    elif not native_regime_stable:
+        reason = "native_yahoo_proxy_regime_unstable"
+    elif not local_confirmation_passed:
+        reason = "local_frontier_confirmation_failed"
     elif eligible:
         reason = "fresh_target_surface_paper_evidence_validated"
     else:
@@ -1295,6 +1459,10 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         alignment_reason = "missing_destination_spread"
     elif not spread_non_adverse:
         alignment_reason = "destination_spread_adverse"
+    elif not liquidity_evidence_present:
+        alignment_reason = "missing_destination_liquidity"
+    elif not liquidity_acceptable:
+        alignment_reason = "destination_liquidity_below_floor"
     else:
         alignment_reason = "local_alignment_confirmed"
 
@@ -1317,8 +1485,15 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "emit_recommendation": eligible,
         "emit_route": eligible,
         "promotion_eligible": eligible,
-        "sandbox_rank_eligible": True,
-        "maximum_stage": target_surface_evidence.get("maximum_stage") if applies else None,
+        "creation_allowed": eligible,
+        "paper_score_eligible": eligible,
+        "paper_rank_eligible": eligible,
+        "sandbox_rank_eligible": eligible,
+        "activation_allowed": eligible,
+        "paper_allocation_multiplier": 1.0 if eligible else 0.0,
+        "maximum_stage": (
+            target_surface_evidence.get("maximum_stage") if eligible else "quarantined"
+        ) if applies else None,
         "reason": reason,
         "alignment_reason": alignment_reason,
         "source_family": (
@@ -1340,9 +1515,23 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "local_short_horizon_trend_bps": local_trend_bps,
         "local_trend_state": local_trend_state,
         "local_direction_confirmed": local_direction_confirmed,
+        "native_proxy_momentum_bps": native_momentum_bps,
+        "min_native_proxy_momentum_bps": min_native_momentum_bps,
+        "native_proxy_regime_state": native_regime_state,
+        "native_proxy_regime_stable": native_regime_stable,
+        "native_proxy_regime_decisively_positive": native_regime_decisively_positive,
+        "native_proxy_regime_windows": native_regime_windows,
+        "min_native_proxy_regime_windows": int(min_native_regime_windows),
+        "native_proxy_positive_window_rate": native_positive_window_rate,
+        "min_native_proxy_positive_window_rate": min_native_positive_window_rate,
         "destination_spread_bps": destination_spread_bps,
         "max_destination_spread_bps": max_spread_bps,
         "spread_non_adverse": spread_non_adverse,
+        "destination_liquidity_score": destination_liquidity_score,
+        "min_destination_liquidity_score": min_destination_liquidity_score,
+        "liquidity_acceptable": liquidity_acceptable,
+        "local_confirmation_checks": local_confirmation_checks,
+        "local_confirmation_passed": local_confirmation_passed,
         "entry_was_confirmed": entry_was_confirmed,
         "force_paper_exit": force_paper_exit,
         "exit_reason": "yahoo_proxy_cross_surface_quarantined" if force_paper_exit else None,

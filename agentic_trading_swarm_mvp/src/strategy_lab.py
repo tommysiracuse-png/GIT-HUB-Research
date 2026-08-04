@@ -17,6 +17,7 @@ from typing import Any
 
 from route_resolver import evaluate_route_intelligence
 from paper_context_cost import realized_paper_cost_audit
+from frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
 from signals.registry import discover_signals, known_strategy_signatures, promoted_strategy_lab_ids
 from storage import RUNS_DIR, add_llm_recommendation, link_recommendation_artifact, utc_now
 from strategy_reliability import paper_source_veto_record, paper_source_veto_recovery_status
@@ -2437,24 +2438,53 @@ def generate_strategy_lab_candidates(
         )
         conn.commit()
     source_vetoed_candidates: list[dict] = []
+    proxy_frontier_quarantined_candidates: list[dict] = []
     source_rank_candidates: list[dict] = []
     for candidate in candidates:
         source_veto = paper_source_veto_record(candidate, settings)
-        if source_veto is None:
-            source_rank_candidates.append(candidate)
+        if source_veto is not None:
+            source_vetoed_candidates.append(
+                {
+                    "inst_id": candidate.get("inst_id"),
+                    "venue": candidate.get("venue"),
+                    "trade_type": candidate.get("trade_type"),
+                    "direction": candidate.get("direction"),
+                    "market_key": candidate.get("market_key"),
+                    "strategy_lab_id": candidate.get("strategy_lab_id"),
+                    "reason": source_veto["reason"],
+                    "matched_on": source_veto["matched_on"],
+                }
+            )
             continue
-        source_vetoed_candidates.append(
-            {
-                "inst_id": candidate.get("inst_id"),
-                "venue": candidate.get("venue"),
-                "trade_type": candidate.get("trade_type"),
-                "direction": candidate.get("direction"),
-                "market_key": candidate.get("market_key"),
-                "strategy_lab_id": candidate.get("strategy_lab_id"),
-                "reason": source_veto["reason"],
-                "matched_on": source_veto["matched_on"],
-            }
+        transplant_review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            candidate, settings
         )
+        yahoo_lineage = paper_source_veto_record(candidate, {"mode": "paper"})
+        if (
+            yahoo_lineage is not None
+            and transplant_review.get("applies")
+            and not transplant_review.get("eligible")
+        ):
+            proxy_frontier_quarantined_candidates.append(
+                {
+                    "inst_id": candidate.get("inst_id"),
+                    "venue": candidate.get("venue"),
+                    "trade_type": candidate.get("trade_type"),
+                    "direction": candidate.get("direction"),
+                    "market_key": candidate.get("market_key"),
+                    "strategy_lab_id": candidate.get("strategy_lab_id"),
+                    "reason": transplant_review.get("reason"),
+                    "failed_local_checks": [
+                        key
+                        for key, passed in (
+                            transplant_review.get("local_confirmation_checks") or {}
+                        ).items()
+                        if not passed
+                    ],
+                }
+            )
+            continue
+        source_rank_candidates.append(candidate)
     eligible_candidates, route_blocked, route_missing_counts, route_blocker_counts = (
         _paper_route_eligible_candidates(source_rank_candidates)
     )
@@ -2563,6 +2593,39 @@ def generate_strategy_lab_candidates(
                     }
                 )
             program_candidates = compatible_program_candidates
+            admitted_program_candidates: list[dict] = []
+            for candidate in program_candidates:
+                transplant_subject = dict(candidate)
+                transplant_subject["recommendation_lineage"] = {
+                    "strategy_lab_id": experiment.get("strategy_lab_id"),
+                    "parent_strategy_lab_id": experiment.get("parent_strategy_lab_id"),
+                    "source_surface": experiment.get("source_surface"),
+                    "strategy_logic": experiment.get("strategy_logic"),
+                    "data_requirements": experiment.get("data_requirements"),
+                }
+                transplant_review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+                    transplant_subject, settings
+                )
+                yahoo_lineage = paper_source_veto_record(
+                    transplant_subject, {"mode": "paper"}
+                )
+                if (
+                    yahoo_lineage is not None
+                    and transplant_review.get("applies")
+                    and not transplant_review.get("eligible")
+                ):
+                    rejects[experiment_id]["proxy_frontier_quarantine"] += 1
+                    proxy_frontier_quarantined_candidates.append(
+                        {
+                            "strategy_lab_id": experiment_id,
+                            "inst_id": candidate.get("inst_id"),
+                            "venue": candidate.get("venue"),
+                            "reason": transplant_review.get("reason"),
+                        }
+                    )
+                    continue
+                admitted_program_candidates.append(candidate)
+            program_candidates = admitted_program_candidates
             (
                 program_candidates,
                 program_route_blocked,
@@ -2636,6 +2699,35 @@ def generate_strategy_lab_candidates(
             if compatibility["eligible"]:
                 annotated = dict(candidate)
                 annotated["strategy_lab_surface_policy"] = compatibility
+                transplant_subject = dict(annotated)
+                transplant_subject["recommendation_lineage"] = {
+                    "strategy_lab_id": experiment.get("strategy_lab_id"),
+                    "parent_strategy_lab_id": experiment.get("parent_strategy_lab_id"),
+                    "source_surface": experiment.get("source_surface"),
+                    "strategy_logic": experiment.get("strategy_logic"),
+                    "data_requirements": experiment.get("data_requirements"),
+                }
+                transplant_review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+                    transplant_subject, settings
+                )
+                yahoo_lineage = paper_source_veto_record(
+                    transplant_subject, {"mode": "paper"}
+                )
+                if (
+                    yahoo_lineage is not None
+                    and transplant_review.get("applies")
+                    and not transplant_review.get("eligible")
+                ):
+                    rejects[experiment["strategy_lab_id"]]["proxy_frontier_quarantine"] += 1
+                    proxy_frontier_quarantined_candidates.append(
+                        {
+                            "strategy_lab_id": experiment.get("strategy_lab_id"),
+                            "inst_id": candidate.get("inst_id"),
+                            "venue": candidate.get("venue"),
+                            "reason": transplant_review.get("reason"),
+                        }
+                    )
+                    continue
                 surface_rank_pool.append(annotated)
                 continue
             surface_quarantine_reasons[compatibility["reason"]] += 1
@@ -2778,6 +2870,10 @@ def generate_strategy_lab_candidates(
         "source_vetoed_candidates": source_vetoed_candidates[:20],
         "source_vetoed_experiment_count": len(source_vetoed_experiments),
         "source_vetoed_experiments": source_vetoed_experiments[:20],
+        "proxy_frontier_quarantined_candidate_count": len(
+            proxy_frontier_quarantined_candidates
+        ),
+        "proxy_frontier_quarantined_candidates": proxy_frontier_quarantined_candidates[:20],
         "paper_source_veto_recovery": paper_source_veto_recovery_status(settings),
         "route_eligible_source_candidate_count": len(eligible_candidates),
         "route_ineligible_candidate_count": len(route_blocked),

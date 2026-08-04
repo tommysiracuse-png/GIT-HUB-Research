@@ -102,13 +102,20 @@ DEFAULT_SETTINGS = {
     "yahoo_proxy_cross_surface_alignment_guard": {
         "enabled": True,
         "max_destination_spread_bps": 8.0,
+        "min_destination_liquidity_score": 0.65,
+        "min_native_proxy_momentum_bps": 5.0,
+        "min_native_proxy_regime_windows": 3,
+        "min_native_proxy_positive_window_rate": 0.67,
         "quarantined_target_surfaces": ["OKX_SPOT", "OKX_PERP"],
         "allow_native_proxy_monitoring": True,
         "min_target_surface_closed_count": 20,
         "min_target_surface_expectancy_net_bps": 0.0,
         "min_target_surface_quality_rate": 0.5,
         "max_target_surface_evidence_age_hours": 168.0,
-        "reenable_condition": "fresh_target_surface_paper_evidence_meeting_quality_thresholds",
+        "reenable_condition": (
+            "decisively_positive_stable_native_proxy_regime_and_independent_local_frontier_"
+            "spread_liquidity_trend_confirmation"
+        ),
     },
     "paper_portability_quarantine": {
         "enabled": True,

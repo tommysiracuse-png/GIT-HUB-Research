@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import pathlib
 import sqlite3
 import sys
@@ -218,6 +219,71 @@ class YahooProxySourceVetoTests(unittest.TestCase):
         self.assertEqual("created", created[0]["action_status"])
         self.assertEqual([], generated)
         self.assertEqual(1, report["source_vetoed_experiment_count"])
+
+    def test_recovered_source_still_requires_proxy_regime_and_local_frontier_confirmation(self) -> None:
+        cfg = self._recovered_settings()
+        rec = recommendation(
+            market_key="OKX_SPOT|frontier_crypto_venue_map",
+            lab_id="okx_transport_child",
+            parent="lab_yahoo_proxy_momentum_freshness_quality_gate_v1",
+        )
+        proof = {
+            "paper_only": True,
+            "target_surface": "OKX_SPOT",
+            "closed_count": 24,
+            "expectancy_net_bps": 2.0,
+            "quality_pass_rate": 0.6,
+            "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        candidate = {
+            "market_key": "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
+            "source_family": "yahoo_proxy",
+            "signal_family": "global_proxy_momentum",
+            "venue": "OKX_SPOT",
+            "inst_id": "ABC-USDT",
+            "trade_type": "frontier_crypto_venue_map",
+            "direction": "long_frontier_spot",
+            "target_surface": "frontier_spot",
+            "score": 80.0,
+            "liquidity_score": 0.8,
+            "spread_bps": 2.0,
+            "local_short_horizon_trend_bps": 3.0,
+            "last": 10.0,
+            "edge_bps_estimate": 12.0,
+            "execution_feasibility": {"status": "standard"},
+            "target_surface_paper_evidence": proof,
+        }
+        with memory_db() as conn:
+            created = ingest_strategy_lab_recommendation(conn, rec, cfg)
+            blocked, blocked_report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [{**candidate, "native_yahoo_proxy_regime": {"momentum_bps": -4.0, "regime_stable": True}}],
+            )
+            admitted, admitted_report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [
+                    {
+                        **candidate,
+                        "native_yahoo_proxy_regime": {
+                            "momentum_bps": 8.0,
+                            "regime_stable": True,
+                            "regime_state": "stable_positive",
+                        },
+                    }
+                ],
+            )
+
+        self.assertEqual("created", created[0]["action_status"])
+        self.assertEqual([], blocked)
+        self.assertEqual(1, blocked_report["proxy_frontier_quarantined_candidate_count"])
+        self.assertEqual(
+            "native_yahoo_proxy_regime_non_positive",
+            blocked_report["proxy_frontier_quarantined_candidates"][0]["reason"],
+        )
+        self.assertEqual(1, len(admitted))
+        self.assertEqual(0, admitted_report["proxy_frontier_quarantined_candidate_count"])
 
     def test_recovery_requires_both_scopes_and_all_sustained_windows(self) -> None:
         passing_window = {

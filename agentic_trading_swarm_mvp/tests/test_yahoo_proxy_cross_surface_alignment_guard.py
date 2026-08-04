@@ -30,6 +30,12 @@ def cross_surface_candidate(**overrides: object) -> dict[str, object]:
         "signal_family": "global_proxy_momentum",
         "local_short_horizon_trend_bps": 3.0,
         "spread_bps": 4.0,
+        "liquidity_score": 0.8,
+        "native_yahoo_proxy_regime": {
+            "momentum_bps": 8.0,
+            "regime_stable": True,
+            "regime_state": "stable_positive",
+        },
         "execution_mode": "paper",
         "last": 100.0,
         "score": 70.0,
@@ -102,6 +108,59 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
             review["reason"],
         )
 
+    def test_source_regime_must_be_decisively_positive_and_stable(self) -> None:
+        non_positive = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                native_yahoo_proxy_regime={"momentum_bps": 0.0, "regime_stable": True},
+                target_surface_paper_evidence=self.target_proof(),
+            )
+        )
+        unstable = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                native_yahoo_proxy_regime={
+                    "momentum_bps": 9.0,
+                    "regime_stable": False,
+                    "regime_state": "stable_positive",
+                },
+                target_surface_paper_evidence=self.target_proof(),
+            )
+        )
+
+        self.assertFalse(non_positive["eligible"])
+        self.assertEqual("native_yahoo_proxy_regime_non_positive", non_positive["reason"])
+        self.assertFalse(unstable["eligible"])
+        self.assertEqual("native_yahoo_proxy_regime_unstable", unstable["reason"])
+        self.assertFalse(unstable["paper_rank_eligible"])
+        self.assertFalse(unstable["activation_allowed"])
+
+    def test_local_spread_liquidity_and_trend_are_all_required_for_release(self) -> None:
+        low_liquidity = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                liquidity_score=0.64,
+                target_surface_paper_evidence=self.target_proof(),
+            )
+        )
+        adverse_spread = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                spread_bps=8.1,
+                target_surface_paper_evidence=self.target_proof(),
+            )
+        )
+        adverse_trend = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                local_short_horizon_trend_bps=-1.0,
+                target_surface_paper_evidence=self.target_proof(),
+            )
+        )
+
+        self.assertTrue(all(row["blocked"] for row in (low_liquidity, adverse_spread, adverse_trend)))
+        self.assertEqual("destination_liquidity_below_floor", low_liquidity["alignment_reason"])
+        self.assertEqual(
+            {"short_horizon_trend": True, "spread": True, "liquidity": False},
+            low_liquidity["local_confirmation_checks"],
+        )
+        self.assertTrue(all(not row["paper_rank_eligible"] for row in (low_liquidity, adverse_spread, adverse_trend)))
+
     def test_stale_wrong_surface_or_low_quality_proof_stays_in_sandbox(self) -> None:
         stale = paper_only_yahoo_proxy_cross_surface_alignment_guard(
             cross_surface_candidate(
@@ -122,7 +181,7 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         )
 
         self.assertTrue(all(row["blocked"] for row in (stale, wrong_surface, low_quality)))
-        self.assertTrue(all(row["sandbox_rank_eligible"] for row in (stale, wrong_surface, low_quality)))
+        self.assertTrue(all(not row["sandbox_rank_eligible"] for row in (stale, wrong_surface, low_quality)))
         self.assertIn(
             "fresh_observations",
             stale["target_surface_paper_evidence_review"]["failed_checks"],
@@ -190,7 +249,7 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertFalse(other_crypto["emit_route"])
         self.assertEqual("BITGET_PERP", other_crypto["target_surface"])
         self.assertEqual(
-            "fresh_target_surface_paper_evidence_meeting_quality_thresholds",
+            "decisively_positive_stable_native_proxy_regime_and_independent_local_frontier_spread_liquidity_trend_confirmation",
             spot["reenable_condition"],
         )
 
@@ -214,7 +273,7 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertTrue(review["applies"])
         self.assertTrue(review["blocked"])
         self.assertEqual("proxy_derived", review["source_family"])
-        self.assertEqual("sandbox_ranking", review["maximum_stage"])
+        self.assertEqual("quarantined", review["maximum_stage"])
 
         routed = apply_frontier_paper_guard(
             cross_surface_candidate(
@@ -233,8 +292,10 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertEqual(0.0, policy["min_target_surface_expectancy_net_bps"])
         self.assertEqual(0.5, policy["min_target_surface_quality_rate"])
         self.assertEqual(168.0, policy["max_target_surface_evidence_age_hours"])
+        self.assertEqual(5.0, policy["min_native_proxy_momentum_bps"])
+        self.assertEqual(0.65, policy["min_destination_liquidity_score"])
         self.assertEqual(
-            "fresh_target_surface_paper_evidence_meeting_quality_thresholds",
+            "decisively_positive_stable_native_proxy_regime_and_independent_local_frontier_spread_liquidity_trend_confirmation",
             policy["reenable_condition"],
         )
 
