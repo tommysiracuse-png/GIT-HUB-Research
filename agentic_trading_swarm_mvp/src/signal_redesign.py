@@ -1683,6 +1683,10 @@ def run_frontier_redesign(
         settings,
         load_venue_registry(),
     )
+    # Keep the caller-owned selected observation list synchronized so the
+    # Strategy Lab snapshot path receives the same depth-quality evidence used
+    # by the paper-only frontier variants.
+    selected_observations[:] = enriched_observations
     candidates_by_variant = {
         variant["variant_id"]: build_variant_candidates(
             enriched_observations,

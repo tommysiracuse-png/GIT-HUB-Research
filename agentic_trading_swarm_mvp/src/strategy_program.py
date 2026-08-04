@@ -40,6 +40,7 @@ BASE_FEATURES = {
     "cross_venue_dislocation_bps",
     "stale_minutes",
     "change_24h_pct",
+    "return_1m_bps",
     "return_5m_bps",
     "return_15m_bps",
     "return_60m_bps",
@@ -54,6 +55,9 @@ BASE_FEATURES = {
     "price_zscore_4h",
     "relative_strength_60m_bps",
     "relative_strength_4h_bps",
+    "quote_volume_1m",
+    "relative_volume_1m_60m",
+    "microstructure_history_ready",
 }
 METADATA_NAMES = {
     "venue",
@@ -245,8 +249,12 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
         "basis_bps": _float(row.get("basis_bps")),
         "dislocation_bps": _float(row.get("dislocation_bps", row.get("edge_bps_estimate"))),
         "cross_venue_dislocation_bps": dislocation,
-        "stale_minutes": _float(row.get("stale_minutes")),
+        "stale_minutes": _float(
+            row.get("stale_minutes"),
+            _float(row.get("freshness_age_seconds")) / 60.0,
+        ),
         "change_24h_pct": _float(row.get("change_24h_pct"), return_1d / 100.0),
+        "return_1m_bps": _float(row.get("return_1m_bps")),
         "return_5m_bps": _return_bps(last, history, 1),
         "return_15m_bps": return_15m,
         "return_60m_bps": return_60m,
@@ -261,6 +269,9 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
         "price_zscore_4h": _zscore(last, recent_4h),
         "relative_strength_60m_bps": return_60m,
         "relative_strength_4h_bps": return_4h,
+        "quote_volume_1m": max(0.0, _float(row.get("quote_volume_1m"))),
+        "relative_volume_1m_60m": max(0.0, _float(row.get("relative_volume_1m_60m"))),
+        "microstructure_history_ready": 1.0 if _float(row.get("microstructure_history_ready")) >= 1.0 else 0.0,
     }
 
 

@@ -108,6 +108,11 @@ DEFAULT_SETTINGS = {
         "timeout_seconds": 8,
         "min_dislocation_bps": 12.0,
         "bybit_region_blocked_probe_interval_seconds": 300,
+        "intraday_features_enabled": True,
+        "intraday_feature_timeout_seconds": 4,
+        "intraday_feature_workers": 6,
+        "intraday_feature_max_observations": 24,
+        "intraday_feature_max_per_venue": 6,
     },
     "frontier_data_quality": {
         "enabled": True,

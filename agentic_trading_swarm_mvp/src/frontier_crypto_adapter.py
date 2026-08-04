@@ -7013,6 +7013,10 @@ DEFAULT_REGISTRY = {
             "route_id": "gate_spot_public",
             "url": "https://api.gateio.ws/api/v4/spot/tickers",
             "parser": "gate_spot_tickers",
+            "intraday": {
+                "url_template": "https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair={symbol}&interval=1m&limit=62",
+                "parser": "gate_1m_candles",
+            },
             "depth": {
                 "url_template": "https://api.gateio.ws/api/v4/spot/order_book?currency_pair={symbol}&limit={limit}&with_id=true",
                 "parser": "gate_order_book",
@@ -7027,6 +7031,10 @@ DEFAULT_REGISTRY = {
             "route_id": "mexc_spot_public",
             "url": "https://api.mexc.com/api/v3/ticker/24hr",
             "parser": "mexc_24hr",
+            "intraday": {
+                "url_template": "https://api.mexc.com/api/v3/klines?symbol={symbol}&interval=1m&limit=62",
+                "parser": "binance_style_1m_klines",
+            },
             "depth": {
                 "url_template": "https://api.mexc.com/api/v3/depth?symbol={symbol}&limit={limit}",
                 "parser": "mexc_depth",
@@ -7055,6 +7063,10 @@ DEFAULT_REGISTRY = {
             "route_id": "binance_us_spot_public",
             "url": "https://api.binance.us/api/v3/ticker/24hr",
             "parser": "binance_24hr",
+            "intraday": {
+                "url_template": "https://api.binance.us/api/v3/klines?symbol={symbol}&interval=1m&limit=62",
+                "parser": "binance_style_1m_klines",
+            },
             "depth": {
                 "url_template": "https://api.binance.us/api/v3/depth?symbol={symbol}&limit={limit}",
                 "parser": "binance_depth",
@@ -7115,6 +7127,10 @@ DEFAULT_REGISTRY = {
             "route_id": "okx_spot_public",
             "url": "https://www.okx.com/api/v5/market/tickers?instType=SPOT",
             "parser": "okx_spot_tickers",
+            "intraday": {
+                "url_template": "https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=1m&limit=62",
+                "parser": "okx_1m_candles",
+            },
             "depth": {
                 "url_template": "https://www.okx.com/api/v5/market/books?instId={symbol}&sz={limit}",
                 "parser": "okx_books",
@@ -7791,7 +7807,157 @@ def _finalize_observation(row: dict) -> dict:
         row["quote"] = row.get("quote") or quote
     row["base"] = _canonical_asset(row.get("base"))
     row["comparison_key"] = row.get("base")
+    row["liquidity_score"] = liquidity_score(row.get("quote_volume_24h"))
+    row.setdefault("return_1m_bps", 0.0)
+    row.setdefault("quote_volume_1m", 0.0)
+    row.setdefault("relative_volume_1m_60m", 0.0)
+    row.setdefault("microstructure_history_ready", 0.0)
+    row.setdefault("microstructure_status", "not_requested")
     return _apply_paper_only_review_policy(row)
+
+
+def _intraday_candle_rows(config: dict, result: dict) -> list[dict]:
+    """Normalize closed one-minute public candles without accepting partial bars."""
+
+    parser = str(config.get("parser") or "")
+    payload = result.get("payload")
+    raw_rows = (payload or {}).get("data") or [] if parser == "okx_1m_candles" else payload or []
+    rows: list[dict] = []
+    for raw in raw_rows:
+        if not isinstance(raw, (list, tuple)):
+            continue
+        if parser == "okx_1m_candles" and len(raw) >= 9:
+            if str(raw[8]) != "1":
+                continue
+            timestamp, close, quote_volume = raw[0], raw[4], raw[7]
+        elif parser == "binance_style_1m_klines" and len(raw) >= 8:
+            timestamp, close, quote_volume = raw[0], raw[4], raw[7]
+        elif parser == "gate_1m_candles" and len(raw) >= 3:
+            timestamp, quote_volume, close = raw[0], raw[1], raw[2]
+        else:
+            continue
+        timestamp_value = as_float(timestamp, None)
+        close_value = as_float(close, None)
+        volume_value = as_float(quote_volume, None)
+        if timestamp_value is None or close_value is None or close_value <= 0 or volume_value is None or volume_value < 0:
+            continue
+        rows.append(
+            {
+                "timestamp": float(timestamp_value),
+                "close": float(close_value),
+                "quote_volume": float(volume_value),
+            }
+        )
+    rows.sort(key=lambda item: item["timestamp"])
+    # OKX exposes an explicit completion flag. The other public endpoints include
+    # the currently forming candle, so conservatively exclude their newest row.
+    if parser != "okx_1m_candles" and rows:
+        rows = rows[:-1]
+    return rows
+
+
+def _intraday_features(config: dict, result: dict) -> dict:
+    rows = _intraday_candle_rows(config, result) if result.get("ok") else []
+    if len(rows) < 61:
+        return {
+            "return_1m_bps": 0.0,
+            "quote_volume_1m": 0.0,
+            "relative_volume_1m_60m": 0.0,
+            "microstructure_history_ready": 0.0,
+            "microstructure_status": "insufficient_closed_candles" if result.get("ok") else "unavailable",
+        }
+    recent = rows[-61:]
+    latest = recent[-1]
+    previous = recent[-2]
+    baseline_volumes = [item["quote_volume"] for item in recent[:-1] if item["quote_volume"] > 0]
+    baseline = statistics.median(baseline_volumes) if len(baseline_volumes) == 60 else 0.0
+    if baseline <= 0:
+        return {
+            "return_1m_bps": 0.0,
+            "quote_volume_1m": 0.0,
+            "relative_volume_1m_60m": 0.0,
+            "microstructure_history_ready": 0.0,
+            "microstructure_status": "invalid_volume_baseline",
+        }
+    return {
+        "return_1m_bps": round(bps(latest["close"], previous["close"]), 6),
+        "quote_volume_1m": round(latest["quote_volume"], 6),
+        "relative_volume_1m_60m": round(latest["quote_volume"] / baseline, 6),
+        "microstructure_history_ready": 1.0,
+        "microstructure_status": "ready",
+    }
+
+
+def enrich_intraday_features(
+    observations: list[dict],
+    settings: dict,
+    registry: dict | None = None,
+) -> tuple[list[dict], dict]:
+    """Add bounded public-candle features to a liquid, venue-diverse spot subset."""
+
+    cfg = settings.get("frontier_crypto_adapter", {})
+    output = [dict(row) for row in observations]
+    if not cfg.get("intraday_features_enabled", True):
+        return output, {"enabled": False, "selected_count": 0, "ready_count": 0}
+    targets = {
+        str(item.get("venue") or "").upper(): item
+        for item in (registry or load_venue_registry()).get("venues", [])
+        if isinstance(item.get("intraday"), dict)
+    }
+    ranked = sorted(
+        (
+            row
+            for row in output
+            if str(row.get("venue") or "").upper() in targets
+            and row.get("market_type") == "spot"
+            and row.get("data_status") == "reachable"
+            and str(row.get("quote") or "").upper() in USD_LIKE_QUOTES
+            and float(row.get("last") or 0.0) > 0
+        ),
+        key=lambda row: float(row.get("quote_volume_24h") or 0.0),
+        reverse=True,
+    )
+    total_limit = max(0, int(cfg.get("intraday_feature_max_observations", 24)))
+    venue_limit = max(1, int(cfg.get("intraday_feature_max_per_venue", 6)))
+    selected: list[dict] = []
+    venue_counts: collections.Counter = collections.Counter()
+    for row in ranked:
+        venue = str(row.get("venue") or "").upper()
+        if len(selected) >= total_limit:
+            break
+        if venue_counts[venue] >= venue_limit:
+            continue
+        selected.append(row)
+        venue_counts[venue] += 1
+
+    def fetch_one(row: dict) -> tuple[str, dict]:
+        inst_id = str(row.get("instrument_id") or "")
+        target = targets[str(row.get("venue") or "").upper()]
+        intraday = target["intraday"]
+        try:
+            url = str(intraday["url_template"]).format(symbol=str(row.get("symbol") or ""))
+            result = fetch_json(url, timeout=int(cfg.get("intraday_feature_timeout_seconds", 4)))
+            return inst_id, _intraday_features(intraday, result)
+        except Exception:  # noqa: BLE001 - one public venue must not fail the scan
+            return inst_id, _intraday_features(intraday, {"ok": False, "payload": None})
+
+    features_by_id: dict[str, dict] = {}
+    workers = max(1, min(int(cfg.get("intraday_feature_workers", 6)), len(selected) or 1))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fetch_one, row) for row in selected]
+        for future in concurrent.futures.as_completed(futures):
+            inst_id, features = future.result()
+            features_by_id[inst_id] = features
+    for row in output:
+        features = features_by_id.get(str(row.get("instrument_id") or ""))
+        if features:
+            row.update(features)
+    return output, {
+        "enabled": True,
+        "selected_count": len(selected),
+        "ready_count": sum(1 for item in features_by_id.values() if item["microstructure_history_ready"] >= 1),
+        "selected_by_venue": dict(venue_counts),
+    }
 
 
 def _max_product_tickers(target: dict, default: int = 50) -> int:
@@ -9239,18 +9405,29 @@ def build_scan_batch(
     *,
     write_preliminary_report: bool = True,
 ) -> ScanBatch:
+    registry = load_venue_registry()
     all_observations = scan_venues(
         settings,
         selected_only=False,
         required_inst_ids=required_inst_ids,
         conn=conn,
     )
-    observations = _select_observations(all_observations, load_venue_registry())
+    observations = _select_observations(all_observations, registry)
     selected_ids = {row.get("instrument_id") for row in observations}
     for row in all_observations:
         if row.get("instrument_id") in (required_inst_ids or set()) and row.get("instrument_id") not in selected_ids:
             observations.append(row)
             selected_ids.add(row.get("instrument_id"))
+    observations, intraday_summary = enrich_intraday_features(observations, settings, registry)
+    enriched_by_id = {
+        str(row.get("instrument_id")): row
+        for row in observations
+        if row.get("instrument_id")
+    }
+    all_observations = [
+        enriched_by_id.get(str(row.get("instrument_id") or ""), row)
+        for row in all_observations
+    ]
     refs = _reference_prices(observations, settings)
     venue_counts = collections.Counter(
         row.get("comparison_key")
@@ -9279,6 +9456,7 @@ def build_scan_batch(
         metadata={
             "selected_observations": observations,
             "all_observation_count": len(all_observations),
+            "intraday_features": intraday_summary,
             "report": str(REPORT_JSON),
         },
     )

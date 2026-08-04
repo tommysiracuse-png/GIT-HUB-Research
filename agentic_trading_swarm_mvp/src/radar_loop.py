@@ -42,7 +42,7 @@ from okx_perp_scanner import build_scan_batch as build_okx_scan_batch
 from okx_signal_research import run_okx_signal_research
 from prediction_market_scanner import build_scan_batch as build_prediction_market_scan_batch
 from route_resolver import enrich_candidates, write_route_resolver_report
-from scan_batch import merge_observations
+from scan_batch import merge_observations, normalize_observation
 from signals.runtime import run_signal_plugins
 from self_improvement import (
     record_open_policy_effects,
@@ -435,6 +435,14 @@ def run_once(settings: dict) -> dict:
                     price_observations,
                     active_limit=frontier_limit,
                     scan_id=frontier_batch.generated_at,
+                )
+                frontier_batch.observations.extend(
+                    normalize_observation(
+                        row,
+                        source=f"{row.get('venue')} public REST + depth quality",
+                    )
+                    for row in frontier_batch.metadata.get("selected_observations", [])
+                    if row.get("data_status") == "reachable" and float(row.get("last") or 0.0) > 0
                 )
             else:
                 frontier_candidates = frontier_batch.candidates
