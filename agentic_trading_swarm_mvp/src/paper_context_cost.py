@@ -13,9 +13,24 @@ from typing import Any
 
 DEFAULT_PAPER_CONTEXT_COST_POLICY = {
     "enabled": True,
+    "min_net_edge_buffer_bps": 2.0,
     "safety_multiplier": 1.25,
     "base_cost_bps": 1.0,
     "spread_weight": 1.0,
+    "default_half_spread_bps": 2.0,
+    "default_slippage_bps": 3.0,
+    "default_latency_decay_bps": 0.0,
+    "latency_decay_bps_per_window": 1.0,
+    "max_latency_decay_bps": 12.0,
+    "default_carry_bps_horizon": 0.0,
+    "missing_carry_bps_horizon": 2.0,
+    "carry_horizon_hours": 8.0,
+    "default_volatility_tail_buffer_bps": 1.0,
+    "frontier_tail_buffer_bps": 2.0,
+    "gap_risk_weight": 0.10,
+    "max_gap_risk_buffer_bps": 10.0,
+    "funding_instability_weight": 0.50,
+    "max_funding_instability_buffer_bps": 8.0,
     "max_liquidity_penalty_bps": 6.0,
     "volatility_weight": 0.08,
     "max_volatility_penalty_bps": 12.0,
@@ -23,6 +38,10 @@ DEFAULT_PAPER_CONTEXT_COST_POLICY = {
     "max_freshness_penalty_bps": 12.0,
     "frontier_freshness_window_seconds": 30.0,
     "proxy_freshness_window_seconds": 900.0,
+    "carry_freshness_window_seconds": 30.0,
+    "frontier_max_signal_age_seconds": 90.0,
+    "proxy_max_signal_age_seconds": 900.0,
+    "carry_max_signal_age_seconds": 30.0,
     "extra_leg_cost_bps": 4.0,
     "missing_spread_penalty_bps": 4.0,
     "missing_liquidity_penalty_bps": 3.0,
@@ -42,6 +61,7 @@ _PAPER_CONTEXT_FAMILIES = {
     "global_market_discovery_proxy": "proxy",
     "global_proxy_shock_reversal": "proxy",
     "frontier_crypto_venue_map": "frontier",
+    "perp_funding_basis": "carry",
 }
 _BLOCKED_ROUTE_STATUSES = {
     "blocked",
@@ -103,6 +123,7 @@ def _freshness_age_seconds(candidate: Mapping[str, Any]) -> tuple[str | None, fl
         "provider_age_seconds",
         "quote_age_seconds",
         "data_age_seconds",
+        "signal_age_seconds",
     )
     if age is not None:
         return field, max(0.0, age)
@@ -110,6 +131,44 @@ def _freshness_age_seconds(candidate: Mapping[str, Any]) -> tuple[str | None, fl
     if stale_minutes is not None:
         return "stale_minutes", max(0.0, stale_minutes * 60.0)
     return None, None
+
+
+def _funding_drag_bps(candidate: Mapping[str, Any], policy: Mapping[str, Any]) -> float:
+    """Return conservative funding/borrow drag over the configured horizon."""
+    explicit_field, explicit = _first_number(
+        candidate,
+        "carry_bps_horizon",
+        "expected_carry_cost_bps",
+        "funding_drag_bps_horizon",
+        "borrow_cost_bps_horizon",
+    )
+    if explicit_field is not None and explicit is not None:
+        return max(0.0, explicit)
+
+    funding = _finite_float(candidate.get("funding_bps"))
+    if funding is None:
+        return float(policy["missing_carry_bps_horizon"])
+    direction = str(candidate.get("direction") or "").lower()
+    pays_funding = ("long_perp" in direction and funding > 0.0) or (
+        "short_perp" in direction and funding < 0.0
+    )
+    if not pays_funding:
+        return 0.0
+    interval_hours = max(0.001, _finite_float(candidate.get("funding_interval_hours")) or 8.0)
+    horizon_hours = max(0.0, float(policy["carry_horizon_hours"]))
+    return abs(funding) * horizon_hours / interval_hours
+
+
+def _funding_instability_bps(candidate: Mapping[str, Any]) -> float:
+    explicit = _finite_float(candidate.get("funding_instability_bps"))
+    if explicit is not None:
+        return max(0.0, explicit)
+    low = _finite_float(candidate.get("funding_history_min_bps"))
+    high = _finite_float(candidate.get("funding_history_max_bps"))
+    if low is not None and high is not None:
+        return abs(high - low)
+    slope = _finite_float(candidate.get("funding_history_slope_bps"))
+    return abs(slope) if slope is not None else 0.0
 
 
 def _leg_count(candidate: Mapping[str, Any]) -> int:
@@ -231,6 +290,7 @@ def paper_context_cost_gate(
 
     gross_field, gross_edge = _first_number(
         candidate,
+        "predicted_edge_bps",
         "gross_edge_bps_estimate",
         "expected_gross_edge_bps",
         "gross_edge_bps",
@@ -274,41 +334,28 @@ def paper_context_cost_gate(
         "total_cost_bps",
     )
 
-    spread_component = (
-        max(0.0, spread) * float(policy["spread_weight"])
-        if spread is not None
-        else float(policy["missing_spread_penalty_bps"])
+    half_spread_field, explicit_half_spread = _first_number(candidate, "half_spread_bps")
+    if explicit_half_spread is not None:
+        half_spread_component = max(0.0, explicit_half_spread)
+    elif spread is not None:
+        half_spread_component = max(0.0, spread) * 0.5 * float(policy["spread_weight"])
+    else:
+        half_spread_component = float(policy["default_half_spread_bps"])
+
+    slippage_field, explicit_slippage = _first_number(
+        candidate,
+        "slippage_bps",
+        "estimated_slippage_bps",
+        "entry_slippage_bps_estimate",
+        "expected_slippage_bps",
     )
-    execution_component = max(
-        float(policy["base_cost_bps"]) + spread_component,
-        max(0.0, modeled_cost or 0.0),
-    )
-    liquidity_component = (
+    liquidity_penalty = (
         max(0.0, min(1.0, 1.0 - liquidity)) * float(policy["max_liquidity_penalty_bps"])
         if liquidity is not None
         else float(policy["missing_liquidity_penalty_bps"])
     )
-    freshness_window = float(
-        policy["proxy_freshness_window_seconds"]
-        if family_kind == "proxy"
-        else policy["frontier_freshness_window_seconds"]
-    )
-    if freshness_age is None:
-        freshness_component = float(policy["missing_freshness_penalty_bps"])
-    else:
-        overdue_windows = max(0.0, (freshness_age / max(freshness_window, 1.0)) - 1.0)
-        freshness_component = min(
-            float(policy["max_freshness_penalty_bps"]),
-            overdue_windows * float(policy["freshness_penalty_bps_per_window"]),
-        )
-    volatility_component = min(
-        float(policy["max_volatility_penalty_bps"]),
-        max(0.0, volatility or 0.0) * float(policy["volatility_weight"]),
-    )
     leg_count = _leg_count(candidate)
-    complexity_component = max(0, leg_count - 1) * float(policy["extra_leg_cost_bps"])
     route_status, route_cost_field, route_cost = _route_context(candidate)
-    route_cost_increment = max(0.0, (route_cost or 0.0) - execution_component)
     if route_status in _CONDITIONAL_ROUTE_STATUSES:
         route_status_penalty = float(policy["conditional_route_penalty_bps"])
     elif route_status in _PAPER_PROXY_ROUTE_STATUSES:
@@ -317,17 +364,113 @@ def paper_context_cost_gate(
         route_status_penalty = float(policy["unknown_route_penalty_bps"])
     else:
         route_status_penalty = 0.0
-    route_component = route_cost_increment + route_status_penalty
-    floor = (
-        execution_component
-        + liquidity_component
-        + freshness_component
-        + volatility_component
-        + complexity_component
-        + route_component
+    slippage_component = (
+        max(0.0, explicit_slippage)
+        if explicit_slippage is not None
+        else float(policy["default_slippage_bps"]) + float(policy["base_cost_bps"])
     )
+    slippage_component += liquidity_penalty
+    complexity_component = max(0, leg_count - 1) * float(policy["extra_leg_cost_bps"])
+    slippage_component += complexity_component
+    modeled_slippage_floor = max(0.0, (modeled_cost or 0.0) - half_spread_component)
+    slippage_component = max(slippage_component, modeled_slippage_floor)
+    route_cost_increment = max(
+        0.0,
+        (route_cost or 0.0) - half_spread_component - slippage_component,
+    )
+    route_component = route_cost_increment + route_status_penalty
+    slippage_component += route_component
+
+    freshness_key = {
+        "proxy": "proxy_freshness_window_seconds",
+        "carry": "carry_freshness_window_seconds",
+    }.get(family_kind, "frontier_freshness_window_seconds")
+    freshness_window = max(1.0, float(policy[freshness_key]))
+    latency_field, explicit_latency = _first_number(
+        candidate,
+        "latency_decay_bps",
+        "expected_latency_decay_bps",
+    )
+    if explicit_latency is not None:
+        latency_decay_component = max(0.0, explicit_latency)
+    else:
+        latency_decay_component = float(policy["default_latency_decay_bps"])
+        if freshness_age is None:
+            latency_decay_component += float(policy["missing_freshness_penalty_bps"])
+        else:
+            latency_decay_component += min(
+                float(policy["max_latency_decay_bps"]),
+                (freshness_age / freshness_window) * float(policy["latency_decay_bps_per_window"]),
+            )
+
+    carry_component = (
+        _funding_drag_bps(candidate, policy)
+        if family_kind == "carry"
+        else max(
+            0.0,
+            _finite_float(candidate.get("carry_bps_horizon"))
+            or float(policy["default_carry_bps_horizon"]),
+        )
+    )
+    tail_field, explicit_tail = _first_number(
+        candidate,
+        "volatility_tail_buffer_bps",
+        "tail_risk_buffer_bps",
+    )
+    volatility_tail_component = (
+        max(0.0, explicit_tail)
+        if explicit_tail is not None
+        else max(
+            float(policy["default_volatility_tail_buffer_bps"]),
+            min(
+                float(policy["max_volatility_penalty_bps"]),
+                max(0.0, volatility or 0.0) * float(policy["volatility_weight"]),
+            ),
+        )
+    )
+    gap_field, gap_risk = _first_number(
+        candidate,
+        "recent_gap_bps",
+        "max_recent_gap_bps",
+        "gap_risk_bps",
+    )
+    gap_buffer = min(
+        float(policy["max_gap_risk_buffer_bps"]),
+        abs(gap_risk or 0.0) * float(policy["gap_risk_weight"]),
+    )
+    funding_instability = _funding_instability_bps(candidate) if family_kind == "carry" else 0.0
+    funding_instability_buffer = min(
+        float(policy["max_funding_instability_buffer_bps"]),
+        funding_instability * float(policy["funding_instability_weight"]),
+    )
+    frontier_buffer = float(policy["frontier_tail_buffer_bps"]) if family_kind == "frontier" else 0.0
+    volatility_tail_component += gap_buffer + funding_instability_buffer + frontier_buffer
+
     safety_multiplier = max(1.0, float(policy["safety_multiplier"]))
-    required_edge = floor * safety_multiplier
+    pre_safety_cost = (
+        half_spread_component
+        + slippage_component
+        + latency_decay_component
+        + carry_component
+        + volatility_tail_component
+    )
+    volatility_tail_component += pre_safety_cost * (safety_multiplier - 1.0)
+    effective_cost = (
+        half_spread_component
+        + slippage_component
+        + latency_decay_component
+        + carry_component
+        + volatility_tail_component
+    )
+    min_net_edge_buffer = max(0.0, float(policy["min_net_edge_buffer_bps"]))
+    required_edge = effective_cost + min_net_edge_buffer
+    gate_margin = None if gross_edge is None else gross_edge - required_edge
+    max_age_key = {
+        "proxy": "proxy_max_signal_age_seconds",
+        "carry": "carry_max_signal_age_seconds",
+    }.get(family_kind, "frontier_max_signal_age_seconds")
+    max_signal_age = max(0.0, float(policy[max_age_key]))
+    age_passed = freshness_age is not None and freshness_age < max_signal_age
     quality_floor = _quality_floor(candidate, family_kind or "", policy, liquidity, freshness_age)
     route_blocked = route_status in _BLOCKED_ROUTE_STATUSES
     eligible = bool(
@@ -335,8 +478,7 @@ def paper_context_cost_gate(
         or (
             gross_edge is not None
             and gross_edge > required_edge
-            and quality_floor["passed"]
-            and not route_blocked
+            and age_passed
         )
     )
 
@@ -353,19 +495,32 @@ def paper_context_cost_gate(
         reasons.append("thin_liquidity_proxy")
     if freshness_age is None:
         reasons.append("missing_freshness_age")
+    elif freshness_age >= max_signal_age:
+        reasons.append("signal_age_limit_exceeded")
     elif freshness_age > freshness_window:
         reasons.append("stale_market_context")
     reasons.extend(quality_floor["reasons"])
     if route_blocked:
         reasons.append("route_status_not_paper_promotable")
 
+    if gross_edge is None:
+        veto_reason = "missing_predicted_edge"
+    elif freshness_age is None:
+        veto_reason = "missing_signal_age"
+    elif not age_passed:
+        veto_reason = "signal_too_old"
+    elif gross_edge <= required_edge:
+        veto_reason = "effective_cost_exceeds_edge"
+    else:
+        veto_reason = None
+
     if not enabled:
         score_multiplier = 1.0
     elif not eligible:
         score_multiplier = float(policy["minimum_score_multiplier"])
     else:
-        edge_ratio = gross_edge / max(required_edge, 0.001)
-        edge_multiplier = min(1.0, 0.75 + 0.25 * max(0.0, edge_ratio - 1.0))
+        edge_ratio = max(0.0, gate_margin or 0.0) / max(required_edge, 0.001)
+        edge_multiplier = min(1.0, 0.75 + 0.25 * edge_ratio)
         liquidity_multiplier = (
             1.0
             if liquidity is None
@@ -386,9 +541,19 @@ def paper_context_cost_gate(
         "family": family,
         "family_kind": family_kind,
         "eligible": eligible,
+        "paper_eligible": eligible,
+        "predicted_edge_bps": round(gross_edge, 3) if gross_edge is not None else None,
+        "effective_cost_bps": round(effective_cost, 3),
+        "min_net_edge_buffer_bps": round(min_net_edge_buffer, 3),
+        "gate_margin_bps": round(gate_margin, 3) if gate_margin is not None else None,
+        "signal_age_seconds": round(freshness_age, 3) if freshness_age is not None else None,
+        "max_signal_age_seconds": round(max_signal_age, 3),
+        "carry_bps_horizon": round(carry_component, 3),
+        "spread_proxy_bps": round(spread, 3) if spread is not None else None,
+        "veto_reason": veto_reason,
         "gross_edge_field": gross_field,
         "gross_edge_bps": round(gross_edge, 3) if gross_edge is not None else None,
-        "context_cost_floor_bps": round(floor, 3),
+        "context_cost_floor_bps": round(effective_cost, 3),
         "safety_multiplier": round(safety_multiplier, 4),
         "required_gross_edge_bps": round(required_edge, 3),
         "score_multiplier": round(score_multiplier, 4),
@@ -402,6 +567,7 @@ def paper_context_cost_gate(
             "freshness_field": freshness_field,
             "freshness_age_seconds": freshness_age,
             "freshness_window_seconds": freshness_window,
+            "max_signal_age_seconds": max_signal_age,
             "volatility_field": volatility_field,
             "recent_volatility_bps": volatility,
             "modeled_cost_field": cost_field,
@@ -410,12 +576,24 @@ def paper_context_cost_gate(
             "route_cost_field": route_cost_field,
             "route_cost_bps": route_cost,
             "leg_count": leg_count,
+            "half_spread_field": half_spread_field,
+            "slippage_field": slippage_field,
+            "latency_decay_field": latency_field,
+            "volatility_tail_buffer_field": tail_field,
+            "gap_risk_field": gap_field,
+            "recent_gap_risk_bps": gap_risk,
+            "funding_instability_bps": funding_instability,
         },
         "components_bps": {
-            "execution": round(execution_component, 3),
-            "liquidity": round(liquidity_component, 3),
-            "freshness": round(freshness_component, 3),
-            "volatility": round(volatility_component, 3),
+            "half_spread_bps": round(half_spread_component, 3),
+            "slippage_bps": round(slippage_component, 3),
+            "latency_decay_bps": round(latency_decay_component, 3),
+            "carry_bps_horizon": round(carry_component, 3),
+            "volatility_tail_buffer_bps": round(volatility_tail_component, 3),
+            "execution": round(half_spread_component + slippage_component, 3),
+            "liquidity": round(liquidity_penalty, 3),
+            "freshness": round(latency_decay_component, 3),
+            "volatility": round(volatility_tail_component, 3),
             "complexity": round(complexity_component, 3),
             "route": round(route_component, 3),
         },
@@ -472,6 +650,24 @@ def annotate_paper_context_cost(
     if not gate.get("applicable"):
         return annotated
     annotated["paper_context_cost_gate"] = gate
+    annotated["paper_effective_cost_log"] = {
+        field: gate.get(field)
+        for field in (
+            "predicted_edge_bps",
+            "effective_cost_bps",
+            "gate_margin_bps",
+            "signal_age_seconds",
+            "max_signal_age_seconds",
+            "carry_bps_horizon",
+            "spread_proxy_bps",
+            "veto_reason",
+            "paper_eligible",
+        )
+    }
+    annotated["paper_eligible"] = bool(gate["eligible"])
+    annotated["effective_cost_bps"] = gate["effective_cost_bps"]
+    annotated["gate_margin_bps"] = gate["gate_margin_bps"]
+    annotated["veto_reason"] = gate["veto_reason"]
     annotated["context_cost_floor_bps"] = gate["context_cost_floor_bps"]
     annotated["required_gross_edge_bps"] = gate["required_gross_edge_bps"]
     annotated["paper_context_score_multiplier"] = gate["score_multiplier"]
@@ -498,6 +694,7 @@ def enforce_paper_context_cost_gate(
         return annotated
     detail = {
         "reason": "paper_context_cost_floor_not_cleared",
+        "veto_reason": gate.get("veto_reason"),
         "paper_only": True,
         "paper_fill_allowed": False,
         "guard": "paper_context_cost_floor",

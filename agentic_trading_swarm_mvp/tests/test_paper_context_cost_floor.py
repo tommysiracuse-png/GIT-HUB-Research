@@ -50,6 +50,140 @@ def frontier_candidate(**overrides: object) -> dict:
 
 
 class PaperContextCostFloorTests(unittest.TestCase):
+    def test_effective_cost_is_additive_and_buffer_comparison_is_strict(self) -> None:
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+        settings["paper_context_cost_floor"].update(
+            {
+                "safety_multiplier": 1.0,
+                "min_net_edge_buffer_bps": 2.0,
+                "frontier_tail_buffer_bps": 0.0,
+            }
+        )
+        candidate = frontier_candidate(
+            predicted_edge_bps=17.0,
+            gross_edge_bps_estimate=None,
+            estimated_round_trip_cost_bps=None,
+            half_spread_bps=2.0,
+            slippage_bps=3.0,
+            latency_decay_bps=1.0,
+            carry_bps_horizon=4.0,
+            volatility_tail_buffer_bps=5.0,
+            liquidity_score=1.0,
+            signal_age_seconds=1.0,
+            freshness_age_seconds=None,
+        )
+
+        gate = paper_context_cost_gate(candidate, settings)
+
+        self.assertEqual(15.0, gate["effective_cost_bps"])
+        self.assertEqual(17.0, gate["required_gross_edge_bps"])
+        self.assertEqual(0.0, gate["gate_margin_bps"])
+        self.assertFalse(gate["paper_eligible"])
+        self.assertEqual("effective_cost_exceeds_edge", gate["veto_reason"])
+        self.assertEqual(
+            gate["effective_cost_bps"],
+            round(sum(gate["components_bps"][field] for field in (
+                "half_spread_bps",
+                "slippage_bps",
+                "latency_decay_bps",
+                "carry_bps_horizon",
+                "volatility_tail_buffer_bps",
+            )), 3),
+        )
+
+        candidate["predicted_edge_bps"] = 17.001
+        self.assertTrue(paper_context_cost_gate(candidate, settings)["paper_eligible"])
+
+    def test_signal_age_must_be_strictly_below_context_limit(self) -> None:
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+        settings["paper_context_cost_floor"]["frontier_max_signal_age_seconds"] = 10.0
+
+        gate = paper_context_cost_gate(
+            frontier_candidate(predicted_edge_bps=100.0, freshness_age_seconds=10.0),
+            settings,
+        )
+
+        self.assertFalse(gate["eligible"])
+        self.assertEqual("signal_too_old", gate["veto_reason"])
+        self.assertIn("signal_age_limit_exceeded", gate["reasons"])
+
+        missing_age = paper_context_cost_gate(
+            frontier_candidate(predicted_edge_bps=100.0, freshness_age_seconds=None),
+            settings,
+        )
+        self.assertFalse(missing_age["eligible"])
+        self.assertEqual("missing_signal_age", missing_age["veto_reason"])
+
+    def test_thin_gap_prone_frontier_and_unstable_funding_raise_cost(self) -> None:
+        healthy = paper_context_cost_gate(
+            frontier_candidate(predicted_edge_bps=100.0, liquidity_score=1.0),
+            DEFAULT_SETTINGS,
+        )
+        thin_gap = paper_context_cost_gate(
+            frontier_candidate(
+                predicted_edge_bps=100.0,
+                liquidity_score=0.1,
+                recent_gap_bps=80.0,
+            ),
+            DEFAULT_SETTINGS,
+        )
+        stable_carry = paper_context_cost_gate(
+            frontier_candidate(
+                trade_type="perp_funding_basis",
+                direction="funding_capture_short_perp",
+                predicted_edge_bps=100.0,
+                liquidity_score=1.0,
+                funding_history_min_bps=4.0,
+                funding_history_max_bps=4.0,
+            ),
+            DEFAULT_SETTINGS,
+        )
+        unstable_carry = paper_context_cost_gate(
+            frontier_candidate(
+                trade_type="perp_funding_basis",
+                direction="funding_capture_short_perp",
+                predicted_edge_bps=100.0,
+                liquidity_score=0.2,
+                funding_history_min_bps=-8.0,
+                funding_history_max_bps=12.0,
+            ),
+            DEFAULT_SETTINGS,
+        )
+
+        self.assertGreater(thin_gap["effective_cost_bps"], healthy["effective_cost_bps"])
+        self.assertGreater(
+            unstable_carry["effective_cost_bps"],
+            stable_carry["effective_cost_bps"],
+        )
+        self.assertGreater(
+            unstable_carry["inputs"]["funding_instability_bps"],
+            stable_carry["inputs"]["funding_instability_bps"],
+        )
+
+    def test_annotation_emits_structured_effective_cost_log(self) -> None:
+        annotated = annotate_paper_context_cost(
+            frontier_candidate(predicted_edge_bps=1.0),
+            DEFAULT_SETTINGS,
+        )
+
+        log = annotated["paper_effective_cost_log"]
+        self.assertEqual(
+            {
+                "predicted_edge_bps",
+                "effective_cost_bps",
+                "gate_margin_bps",
+                "signal_age_seconds",
+                "max_signal_age_seconds",
+                "carry_bps_horizon",
+                "spread_proxy_bps",
+                "veto_reason",
+                "paper_eligible",
+            },
+            set(log),
+        )
+        self.assertFalse(log["paper_eligible"])
+        self.assertEqual("effective_cost_exceeds_edge", log["veto_reason"])
+
     def test_gross_edge_must_clear_safety_adjusted_context_floor(self) -> None:
         gate = paper_context_cost_gate(
             frontier_candidate(gross_edge_bps_estimate=24.0),
@@ -167,12 +301,22 @@ class PaperContextCostFloorTests(unittest.TestCase):
         candidate = frontier_candidate(gross_edge_bps_estimate=1.0)
 
         self.assertTrue(paper_context_cost_gate(candidate, disabled)["eligible"])
+        carry = paper_context_cost_gate(
+            {
+                "trade_type": "perp_funding_basis",
+                "predicted_edge_bps": 1.0,
+                "signal_age_seconds": 1.0,
+                "execution_feasibility": {"status": "standard"},
+            },
+            DEFAULT_SETTINGS,
+        )
+        self.assertTrue(carry["applicable"])
+        self.assertEqual("carry", carry["family_kind"])
         unrelated = paper_context_cost_gate(
-            {"trade_type": "perp_funding_basis", "gross_edge_bps_estimate": 1.0},
+            {"trade_type": "prediction_market_dislocation", "gross_edge_bps_estimate": 1.0},
             DEFAULT_SETTINGS,
         )
         self.assertFalse(unrelated["applicable"])
-        self.assertTrue(unrelated["eligible"])
         live_settings = copy.deepcopy(DEFAULT_SETTINGS)
         live_settings["mode"] = "live"
         live_gate = paper_context_cost_gate(candidate, live_settings)

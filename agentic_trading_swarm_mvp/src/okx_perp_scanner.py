@@ -21,6 +21,7 @@ import urllib.parse
 import urllib.request
 
 from scan_batch import ScanBatch
+from paper_context_cost import annotate_paper_context_cost
 
 
 BASE_URL = "https://www.okx.com"
@@ -238,6 +239,7 @@ def build_scan_batch(
     allow_short_spot: bool = False,
     required_inst_ids: set[str] | None = None,
     enrichment_limit: int = 30,
+    settings: dict | None = None,
 ) -> ScanBatch:
     tickers = fetch_json("/api/v5/market/tickers", {"instType": "SWAP"})["data"]
     index_rows = fetch_json("/api/v5/market/index-tickers", {"quoteCcy": "USDT"})["data"]
@@ -306,7 +308,8 @@ def build_scan_batch(
                 history_by_inst[inst_id] = {"funding_history_error": str(exc)[:180]}
 
     candidates = []
-    seen_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    decision_time = dt.datetime.now(dt.timezone.utc)
+    seen_at = decision_time.isoformat()
     direction_counts: collections.Counter[str] = collections.Counter()
     for row in selected:
         inst_id = row["instId"]
@@ -321,6 +324,12 @@ def build_scan_batch(
         ask = as_float(row.get("askPx"))
         open_24h = as_float(row.get("open24h"))
         quote_volume = as_float(row.get("volCcy24h"))
+        ticker_timestamp_ms = as_float(row.get("ts"), None)
+        signal_age_seconds = (
+            max(0.0, decision_time.timestamp() - ticker_timestamp_ms / 1000.0)
+            if ticker_timestamp_ms is not None and ticker_timestamp_ms > 0.0
+            else None
+        )
         mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else last
         spread_bps = ((ask - bid) / mid * 10_000.0) if ask > bid and mid > 0 else 999.0
         basis_bps = bps(last, idx_px) if idx_px > 0 else 0.0
@@ -360,6 +369,7 @@ def build_scan_batch(
             "basis_mark_last_delta_bps": round(basis_bps - mark_basis_bps, 3),
             "funding_rate": funding_rate,
             "funding_bps": round(funding_bps, 3),
+            "predicted_edge_bps": round(abs(funding_bps) + min(abs(basis_bps) * 0.45, 30.0), 3),
             "funding_interval_hours": funding_interval_hours,
             "next_funding_time": next_funding_time,
             "change_24h_pct": round(change_24h_pct, 3),
@@ -382,8 +392,10 @@ def build_scan_batch(
                 "fees, borrow, spot leg availability, and venue risk are not fully modeled",
             ],
         }
+        if signal_age_seconds is not None:
+            candidate["signal_age_seconds"] = round(signal_age_seconds, 3)
         candidate["score"] = score_candidate(candidate)
-        candidates.append(candidate)
+        candidates.append(annotate_paper_context_cost(candidate, settings or {"mode": "paper"}))
         direction_counts[direction] += 1
 
     candidates.sort(key=lambda item: item["score"], reverse=True)
@@ -420,8 +432,16 @@ def build_scan_batch(
     )
 
 
-def build_candidates(scan_universe: int, allow_short_spot: bool = False) -> list[dict]:
-    return build_scan_batch(scan_universe, allow_short_spot=allow_short_spot).candidates
+def build_candidates(
+    scan_universe: int,
+    allow_short_spot: bool = False,
+    settings: dict | None = None,
+) -> list[dict]:
+    return build_scan_batch(
+        scan_universe,
+        allow_short_spot=allow_short_spot,
+        settings=settings,
+    ).candidates
 
 
 def write_outputs(candidates: list[dict]) -> pathlib.Path:

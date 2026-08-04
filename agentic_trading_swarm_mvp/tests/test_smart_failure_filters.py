@@ -199,6 +199,7 @@ class SmartFailureFilterTests(unittest.TestCase):
             "edge_bps_estimate": 20.0,
             "liquidity_score": 0.9,
             "spread_bps": 1.0,
+            "signal_age_seconds": 0.0,
             "change_24h_pct": 0.0,
             "execution_feasibility": {"status": "standard", "route_status": "standard"},
         }

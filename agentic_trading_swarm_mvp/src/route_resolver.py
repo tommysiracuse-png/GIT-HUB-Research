@@ -2100,6 +2100,7 @@ def enrich_candidate_with_route(
         "global_proxy_momentum",
         "global_market_discovery_proxy",
         "global_proxy_shock_reversal",
+        "perp_funding_basis",
     }
     if refresh_context_cost:
         enriched = annotate_paper_context_cost(enriched, settings, adjust_score=False)

@@ -16,6 +16,7 @@ import sys
 import time
 
 from okx_perp_scanner import build_candidates
+from settings import load_settings
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -161,7 +162,12 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
 
 
 def run_iteration(conn: sqlite3.Connection, args: argparse.Namespace) -> dict:
-    candidates = build_candidates(args.scan_universe, allow_short_spot=args.allow_short_spot)
+    settings = load_settings()
+    candidates = build_candidates(
+        args.scan_universe,
+        allow_short_spot=args.allow_short_spot,
+        settings=settings,
+    )
     latest_by_inst = {row["inst_id"]: row for row in candidates}
     closed = close_due_trades(conn, latest_by_inst, args.hold_minutes)
     opened = []
@@ -171,6 +177,8 @@ def run_iteration(conn: sqlite3.Connection, args: argparse.Namespace) -> dict:
         if candidate["score"] < args.min_score:
             continue
         if candidate["direction"] == "watch_only":
+            continue
+        if candidate.get("paper_eligible") is False:
             continue
         if direction_sign(candidate["direction"]) == 0:
             continue

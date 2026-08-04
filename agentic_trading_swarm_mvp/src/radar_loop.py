@@ -372,6 +372,7 @@ def run_once(settings: dict) -> dict:
             scan_cfg["scan_universe"],
             allow_short_spot=allow_short_spot,
             required_inst_ids=required_okx,
+            settings=settings,
         )
         okx_signal_research = {}
         okx_candidates = okx_batch.candidates
