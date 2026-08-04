@@ -191,8 +191,23 @@ def _paper_fill_for_leg(leg: dict, settings: dict) -> dict:
 
 def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
     candidate = apply_frontier_paper_guard(candidate, settings)
-    if not candidate.get("shadow_filtered"):
+    recovery_probe = bool(
+        settings.get("mode") == "paper"
+        and not settings.get("allow_live_trading")
+        and review.get("paper_context_recovery_probe")
+        and 0.0 < float(review.get("paper_allocation_multiplier") or 0.0) <= 0.1
+        and any(
+            item.get("recovery_probe") and not item.get("blocks")
+            for item in (review.get("applied_policies") or [])
+            if isinstance(item, dict)
+        )
+    )
+    if not candidate.get("shadow_filtered") and not recovery_probe:
         candidate = enforce_paper_context_cost_gate(candidate, settings)
+    elif not candidate.get("shadow_filtered") and recovery_probe:
+        candidate = dict(candidate)
+        candidate["paper_context_recovery_probe"] = True
+        candidate["gating_reason"] = "bounded_paper_recovery_probe_below_cost_floor"
     order = build_order_ticket(candidate, review, settings)
     if candidate.get("shadow_filtered"):
         order["status"] = "shadow_filtered"

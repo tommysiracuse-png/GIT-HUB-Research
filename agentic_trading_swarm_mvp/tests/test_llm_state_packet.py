@@ -11,9 +11,34 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from llm_state_packet import build_route_intelligence_packet_fragment  # noqa: E402
+from llm_bridge import _compact_frontier_crypto  # noqa: E402
 
 
 class LLMStatePacketTests(unittest.TestCase):
+    def test_frontier_packet_preserves_net_edge_gate_diagnostics(self) -> None:
+        diagnostics = {
+            "gross_edge_bps": 12.0,
+            "modeled_cost_bps": 14.0,
+            "net_edge_bps": -2.0,
+            "freshness_minutes": 0.25,
+            "gating_reason": "effective_cost_exceeds_edge",
+        }
+        packet = _compact_frontier_crypto(
+            {
+                "summary": {"candidate_count": 1},
+                "candidates": [
+                    {
+                        "inst_id": "GATE:ABC-USDT",
+                        "venue": "GATE",
+                        "direction": "long_frontier_spot",
+                        **diagnostics,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(diagnostics, {key: packet["candidates"][0][key] for key in diagnostics})
+
     def test_route_playbooks_are_nested_in_packet_without_credentials(self) -> None:
         opportunities = [
             {

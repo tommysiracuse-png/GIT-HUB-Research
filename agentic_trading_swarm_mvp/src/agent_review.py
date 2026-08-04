@@ -104,6 +104,7 @@ def review_candidate(
     context_cost_gate = paper_context_cost_gate(candidate, settings)
     context_features = build_context_features(candidate, {}, net_edge_bps=net_edge_bps)
     matched_policies = _matching_policies(key, policies, context_features)
+    context_recovery_probe_due = any(_recovery_probe_due(policy) for policy in matched_policies)
 
     evidence = []
     warnings = []
@@ -152,11 +153,15 @@ def review_candidate(
                 f"{context_cost_gate.get('required_gross_edge_bps')} bps"
             )
         else:
-            hard_blocks.append(
+            context_cost_message = (
                 "paper context cost floor not cleared: gross edge "
                 f"{context_cost_gate.get('gross_edge_bps')} bps must exceed "
                 f"{context_cost_gate.get('required_gross_edge_bps')} bps"
             )
+            if context_recovery_probe_due:
+                warnings.append(f"{context_cost_message}; bounded recovery probe review only")
+            else:
+                hard_blocks.append(context_cost_message)
     if feasibility_status == "conditional":
         if missing_requirements and route_alternative_usable:
             allocation_multiplier = min(
@@ -311,6 +316,15 @@ def review_candidate(
         "learned_score": learned_score,
         "confidence": confidence,
         "net_edge_bps_estimate": net_edge_bps,
+        "gross_edge_bps": context_cost_gate.get("gross_edge_bps"),
+        "modeled_cost_bps": context_cost_gate.get("modeled_cost_bps"),
+        "net_edge_bps": context_cost_gate.get("net_edge_bps"),
+        "freshness_minutes": context_cost_gate.get("freshness_minutes"),
+        "gating_reason": context_cost_gate.get("gating_reason"),
+        "paper_context_recovery_probe": bool(
+            not context_cost_gate.get("eligible")
+            and any(item.get("recovery_probe") for item in applied_policies)
+        ),
         "paper_context_cost_gate": context_cost_gate,
         "paper_allocation_multiplier": round(allocation_multiplier, 4),
         "applied_policies": applied_policies,

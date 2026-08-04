@@ -55,6 +55,11 @@ DEFAULT_SETTINGS = {
         "spread_weight": 1.0,
         "default_half_spread_bps": 2.0,
         "default_slippage_bps": 3.0,
+        "surface_costs": {
+            "proxy": {"slippage_bps_per_side": 1.5, "fee_bps_per_side": 0.5},
+            "frontier": {"slippage_bps_per_side": 3.0, "fee_bps_per_side": 1.0},
+            "carry": {"slippage_bps_per_side": 2.0, "fee_bps_per_side": 1.0},
+        },
         "default_latency_decay_bps": 0.0,
         "latency_decay_bps_per_window": 1.0,
         "max_latency_decay_bps": 12.0,

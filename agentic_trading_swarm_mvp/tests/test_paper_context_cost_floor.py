@@ -19,6 +19,7 @@ from execution_engine import execute_order  # noqa: E402
 from paper_context_cost import (  # noqa: E402
     annotate_paper_context_cost,
     paper_context_cost_gate,
+    paper_context_cost_report,
     realized_paper_cost_audit,
 )
 from settings import DEFAULT_SETTINGS  # noqa: E402
@@ -183,6 +184,119 @@ class PaperContextCostFloorTests(unittest.TestCase):
         )
         self.assertFalse(log["paper_eligible"])
         self.assertEqual("effective_cost_exceeds_edge", log["veto_reason"])
+
+    def test_surface_defaults_charge_round_trip_spread_slippage_fees_and_carry(self) -> None:
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+        settings["paper_context_cost_floor"].update(
+            {
+                "safety_multiplier": 1.0,
+                "min_net_edge_buffer_bps": 0.0,
+                "default_volatility_tail_buffer_bps": 0.0,
+                "frontier_tail_buffer_bps": 0.0,
+            }
+        )
+        common = {
+            "predicted_edge_bps": 100.0,
+            "spread_bps": 4.0,
+            "liquidity_score": 1.0,
+            "freshness_age_seconds": 1.0,
+            "latency_decay_bps": 0.0,
+            "volatility_tail_buffer_bps": 0.0,
+            "execution_feasibility": {"status": "standard"},
+        }
+
+        proxy = paper_context_cost_gate(
+            {**common, "trade_type": "global_proxy_momentum", "direction": "long_proxy"},
+            settings,
+        )
+        frontier = paper_context_cost_gate(
+            {**common, "trade_type": "frontier_crypto_venue_map", "direction": "long_frontier_spot"},
+            settings,
+        )
+        carry = paper_context_cost_gate(
+            {
+                **common,
+                "trade_type": "perp_funding_basis",
+                "direction": "long_perp_short_spot",
+                "funding_bps": 4.0,
+                "funding_interval_hours": 8.0,
+            },
+            settings,
+        )
+
+        self.assertEqual(4.0, proxy["components_bps"]["round_trip_spread_bps"])
+        self.assertEqual(3.0, proxy["components_bps"]["slippage_bps"])
+        self.assertEqual(1.0, proxy["components_bps"]["fees_bps"])
+        self.assertEqual(6.0, frontier["components_bps"]["slippage_bps"])
+        self.assertEqual(2.0, frontier["components_bps"]["fees_bps"])
+        self.assertEqual(2, carry["inputs"]["leg_count"])
+        self.assertEqual(12.0, carry["components_bps"]["slippage_bps"])
+        self.assertEqual(4.0, carry["components_bps"]["fees_bps"])
+        self.assertEqual(4.0, carry["components_bps"]["carry_bps_horizon"])
+
+        settings["paper_context_cost_floor"]["surface_costs"]["frontier"] = {
+            "slippage_bps_per_side": 7.0,
+            "fee_bps_per_side": 2.0,
+        }
+        configured_frontier = paper_context_cost_gate(
+            {**common, "trade_type": "frontier_crypto_venue_map", "direction": "long_frontier_spot"},
+            settings,
+        )
+        self.assertEqual(14.0, configured_frontier["components_bps"]["slippage_bps"])
+        self.assertEqual(4.0, configured_frontier["components_bps"]["fees_bps"])
+
+    def test_annotation_exposes_canonical_runtime_diagnostics(self) -> None:
+        annotated = annotate_paper_context_cost(
+            frontier_candidate(
+                gross_edge_bps_estimate=24.0,
+                freshness_age_seconds=30.0,
+            ),
+            DEFAULT_SETTINGS,
+        )
+
+        self.assertEqual(24.0, annotated["gross_edge_bps"])
+        self.assertEqual(0.5, annotated["freshness_minutes"])
+        self.assertEqual(
+            round(annotated["gross_edge_bps"] - annotated["modeled_cost_bps"], 3),
+            annotated["net_edge_bps"],
+        )
+        self.assertEqual("effective_cost_exceeds_edge", annotated["gating_reason"])
+        self.assertFalse(annotated["paper_eligible"])
+
+    def test_cross_surface_runtime_report_prioritizes_gated_candidates(self) -> None:
+        proxy = annotate_paper_context_cost(
+            frontier_candidate(
+                venue="YAHOO_PROXY",
+                trade_type="global_proxy_momentum",
+                direction="long_proxy",
+                gross_edge_bps_estimate=5.0,
+            ),
+            DEFAULT_SETTINGS,
+        )
+        carry = annotate_paper_context_cost(
+            frontier_candidate(
+                venue="OKX",
+                trade_type="perp_funding_basis",
+                direction="short_perp_long_spot",
+                gross_edge_bps_estimate=100.0,
+            ),
+            DEFAULT_SETTINGS,
+        )
+
+        report = paper_context_cost_report([carry, proxy])
+
+        self.assertTrue(report["paper_only"])
+        self.assertEqual(2, report["candidate_count"])
+        self.assertEqual("YAHOO_PROXY", report["candidates"][0]["venue"])
+        self.assertTrue(
+            {
+                "gross_edge_bps",
+                "modeled_cost_bps",
+                "net_edge_bps",
+                "freshness_minutes",
+                "gating_reason",
+            }.issubset(report["candidates"][0])
+        )
 
     def test_gross_edge_must_clear_safety_adjusted_context_floor(self) -> None:
         gate = paper_context_cost_gate(

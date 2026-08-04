@@ -490,6 +490,15 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual(summary["venue_count"], 3)
         self.assertEqual(summary["symbol_count"], 1)
         self.assertTrue(summary["top_dislocations"])
+        self.assertTrue(
+            {
+                "gross_edge_bps",
+                "modeled_cost_bps",
+                "net_edge_bps",
+                "freshness_minutes",
+                "gating_reason",
+            }.issubset(summary["top_dislocations"][0])
+        )
         self.assertIn("spot_borrow", summary["by_route_blocker"])
         self.assertIn("candidate_activity", summary)
         self.assertEqual(summary["expansion_map"]["worker_count"], 16)

@@ -7,7 +7,7 @@ public market context into an auditable hurdle and never places an order.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 
@@ -19,6 +19,11 @@ DEFAULT_PAPER_CONTEXT_COST_POLICY = {
     "spread_weight": 1.0,
     "default_half_spread_bps": 2.0,
     "default_slippage_bps": 3.0,
+    "surface_costs": {
+        "proxy": {"slippage_bps_per_side": 1.5, "fee_bps_per_side": 0.5},
+        "frontier": {"slippage_bps_per_side": 3.0, "fee_bps_per_side": 1.0},
+        "carry": {"slippage_bps_per_side": 2.0, "fee_bps_per_side": 1.0},
+    },
     "default_latency_decay_bps": 0.0,
     "latency_decay_bps_per_window": 1.0,
     "max_latency_decay_bps": 12.0,
@@ -116,6 +121,39 @@ def _policy(settings: Mapping[str, Any] | None) -> dict[str, Any]:
     return merged
 
 
+def _surface_cost_policy(policy: Mapping[str, Any], family_kind: str | None) -> dict[str, float]:
+    """Return conservative per-side defaults for the candidate surface."""
+    defaults = DEFAULT_PAPER_CONTEXT_COST_POLICY["surface_costs"].get(family_kind or "", {})
+    configured_surfaces = policy.get("surface_costs")
+    configured = (
+        configured_surfaces.get(family_kind or "", {})
+        if isinstance(configured_surfaces, Mapping)
+        else {}
+    )
+    configured_slippage = _finite_float(configured.get("slippage_bps_per_side"))
+    configured_fee = _finite_float(configured.get("fee_bps_per_side"))
+    default_slippage = _finite_float(defaults.get("slippage_bps_per_side"))
+    default_fee = _finite_float(defaults.get("fee_bps_per_side"))
+    return {
+        "slippage_bps_per_side": max(
+            0.0,
+            configured_slippage
+            if configured_slippage is not None
+            else default_slippage
+            if default_slippage is not None
+            else float(policy["default_slippage_bps"]) / 2.0,
+        ),
+        "fee_bps_per_side": max(
+            0.0,
+            configured_fee
+            if configured_fee is not None
+            else default_fee
+            if default_fee is not None
+            else float(policy["base_cost_bps"]) / 2.0,
+        ),
+    }
+
+
 def _freshness_age_seconds(candidate: Mapping[str, Any]) -> tuple[str | None, float | None]:
     field, age = _first_number(
         candidate,
@@ -183,6 +221,9 @@ def _leg_count(candidate: Mapping[str, Any]) -> int:
         legs = feasibility.get("legs")
         if isinstance(legs, (list, tuple)) and legs:
             return len(legs)
+    direction = str(candidate.get("direction") or "").lower()
+    if "perp" in direction and "spot" in direction:
+        return 2
     return 1
 
 
@@ -334,20 +375,36 @@ def paper_context_cost_gate(
         "total_cost_bps",
     )
 
-    half_spread_field, explicit_half_spread = _first_number(candidate, "half_spread_bps")
+    half_spread_field, explicit_half_spread = _first_number(
+        candidate,
+        "round_trip_spread_bps",
+        "half_spread_bps",
+    )
     if explicit_half_spread is not None:
-        half_spread_component = max(0.0, explicit_half_spread)
+        spread_component = max(0.0, explicit_half_spread)
     elif spread is not None:
-        half_spread_component = max(0.0, spread) * 0.5 * float(policy["spread_weight"])
+        # Crossing into and out of a position consumes two half-spreads.
+        spread_component = max(0.0, spread) * float(policy["spread_weight"])
     else:
-        half_spread_component = float(policy["default_half_spread_bps"])
+        spread_component = float(policy["default_half_spread_bps"]) * 2.0
 
+    surface_costs = _surface_cost_policy(policy, family_kind)
     slippage_field, explicit_slippage = _first_number(
         candidate,
+        "round_trip_slippage_bps",
         "slippage_bps",
         "estimated_slippage_bps",
-        "entry_slippage_bps_estimate",
         "expected_slippage_bps",
+    )
+    entry_slippage_field, entry_slippage = _first_number(
+        candidate,
+        "entry_slippage_bps_estimate",
+        "entry_slippage_bps",
+    )
+    exit_slippage_field, exit_slippage = _first_number(
+        candidate,
+        "exit_slippage_bps_estimate",
+        "exit_slippage_bps",
     )
     liquidity_penalty = (
         max(0.0, min(1.0, 1.0 - liquidity)) * float(policy["max_liquidity_penalty_bps"])
@@ -355,6 +412,32 @@ def paper_context_cost_gate(
         else float(policy["missing_liquidity_penalty_bps"])
     )
     leg_count = _leg_count(candidate)
+    fee_field, explicit_round_trip_fee = _first_number(
+        candidate,
+        "round_trip_fee_bps",
+        "estimated_round_trip_fee_bps",
+        "total_fee_bps",
+    )
+    fee_per_side_field, explicit_fee_per_side = _first_number(
+        candidate,
+        "estimated_fee_bps_per_side",
+        "fee_bps_per_side",
+        "taker_fee_bps",
+    )
+    entry_fee_field, entry_fee = _first_number(candidate, "entry_fee_bps_estimate", "entry_fee_bps")
+    exit_fee_field, exit_fee = _first_number(candidate, "exit_fee_bps_estimate", "exit_fee_bps")
+    if explicit_round_trip_fee is not None:
+        fee_component = max(0.0, explicit_round_trip_fee)
+    elif entry_fee is not None or exit_fee is not None:
+        fee_component = max(0.0, entry_fee or 0.0) + max(0.0, exit_fee or 0.0)
+    elif explicit_fee_per_side is not None:
+        fee_component = max(0.0, explicit_fee_per_side) * 2.0 * leg_count
+    elif explicit_half_spread is not None and explicit_slippage is not None:
+        # Legacy callers that provide both execution components have already
+        # specified their complete cost fixture; retain that contract.
+        fee_component = 0.0
+    else:
+        fee_component = surface_costs["fee_bps_per_side"] * 2.0 * leg_count
     route_status, route_cost_field, route_cost = _route_context(candidate)
     if route_status in _CONDITIONAL_ROUTE_STATUSES:
         route_status_penalty = float(policy["conditional_route_penalty_bps"])
@@ -364,19 +447,26 @@ def paper_context_cost_gate(
         route_status_penalty = float(policy["unknown_route_penalty_bps"])
     else:
         route_status_penalty = 0.0
-    slippage_component = (
-        max(0.0, explicit_slippage)
-        if explicit_slippage is not None
-        else float(policy["default_slippage_bps"]) + float(policy["base_cost_bps"])
-    )
+    if explicit_slippage is not None:
+        slippage_component = max(0.0, explicit_slippage)
+    elif entry_slippage is not None or exit_slippage is not None:
+        slippage_component = (
+            max(0.0, entry_slippage if entry_slippage is not None else surface_costs["slippage_bps_per_side"])
+            + max(0.0, exit_slippage if exit_slippage is not None else surface_costs["slippage_bps_per_side"])
+        )
+    else:
+        slippage_component = surface_costs["slippage_bps_per_side"] * 2.0 * leg_count
     slippage_component += liquidity_penalty
     complexity_component = max(0, leg_count - 1) * float(policy["extra_leg_cost_bps"])
     slippage_component += complexity_component
-    modeled_slippage_floor = max(0.0, (modeled_cost or 0.0) - half_spread_component)
+    modeled_slippage_floor = max(
+        0.0,
+        (modeled_cost or 0.0) - spread_component - fee_component,
+    )
     slippage_component = max(slippage_component, modeled_slippage_floor)
     route_cost_increment = max(
         0.0,
-        (route_cost or 0.0) - half_spread_component - slippage_component,
+        (route_cost or 0.0) - spread_component - slippage_component - fee_component,
     )
     route_component = route_cost_increment + route_status_penalty
     slippage_component += route_component
@@ -448,16 +538,18 @@ def paper_context_cost_gate(
 
     safety_multiplier = max(1.0, float(policy["safety_multiplier"]))
     pre_safety_cost = (
-        half_spread_component
+        spread_component
         + slippage_component
+        + fee_component
         + latency_decay_component
         + carry_component
         + volatility_tail_component
     )
     volatility_tail_component += pre_safety_cost * (safety_multiplier - 1.0)
     effective_cost = (
-        half_spread_component
+        spread_component
         + slippage_component
+        + fee_component
         + latency_decay_component
         + carry_component
         + volatility_tail_component
@@ -515,6 +607,18 @@ def paper_context_cost_gate(
         veto_reason = None
 
     if not enabled:
+        gating_reason = "paper_context_cost_gate_disabled"
+    elif veto_reason is not None:
+        gating_reason = veto_reason
+    elif route_blocked:
+        gating_reason = "route_status_not_paper_promotable"
+    else:
+        gating_reason = "gross_edge_clears_modeled_cost_and_buffer"
+
+    net_edge = None if gross_edge is None else gross_edge - effective_cost
+    freshness_minutes = None if freshness_age is None else freshness_age / 60.0
+
+    if not enabled:
         score_multiplier = 1.0
     elif not eligible:
         score_multiplier = float(policy["minimum_score_multiplier"])
@@ -553,6 +657,10 @@ def paper_context_cost_gate(
         "veto_reason": veto_reason,
         "gross_edge_field": gross_field,
         "gross_edge_bps": round(gross_edge, 3) if gross_edge is not None else None,
+        "modeled_cost_bps": round(effective_cost, 3),
+        "net_edge_bps": round(net_edge, 3) if net_edge is not None else None,
+        "freshness_minutes": round(freshness_minutes, 3) if freshness_minutes is not None else None,
+        "gating_reason": gating_reason,
         "context_cost_floor_bps": round(effective_cost, 3),
         "safety_multiplier": round(safety_multiplier, 4),
         "required_gross_edge_bps": round(required_edge, 3),
@@ -578,6 +686,13 @@ def paper_context_cost_gate(
             "leg_count": leg_count,
             "half_spread_field": half_spread_field,
             "slippage_field": slippage_field,
+            "entry_slippage_field": entry_slippage_field,
+            "exit_slippage_field": exit_slippage_field,
+            "fee_field": fee_field,
+            "fee_per_side_field": fee_per_side_field,
+            "entry_fee_field": entry_fee_field,
+            "exit_fee_field": exit_fee_field,
+            "surface_cost_defaults": surface_costs,
             "latency_decay_field": latency_field,
             "volatility_tail_buffer_field": tail_field,
             "gap_risk_field": gap_field,
@@ -585,12 +700,14 @@ def paper_context_cost_gate(
             "funding_instability_bps": funding_instability,
         },
         "components_bps": {
-            "half_spread_bps": round(half_spread_component, 3),
+            "half_spread_bps": round(spread_component, 3),
+            "round_trip_spread_bps": round(spread_component, 3),
             "slippage_bps": round(slippage_component, 3),
+            "fees_bps": round(fee_component, 3),
             "latency_decay_bps": round(latency_decay_component, 3),
             "carry_bps_horizon": round(carry_component, 3),
             "volatility_tail_buffer_bps": round(volatility_tail_component, 3),
-            "execution": round(half_spread_component + slippage_component, 3),
+            "execution": round(spread_component + slippage_component + fee_component, 3),
             "liquidity": round(liquidity_penalty, 3),
             "freshness": round(latency_decay_component, 3),
             "volatility": round(volatility_tail_component, 3),
@@ -617,9 +734,23 @@ def realized_paper_cost_audit(
     observed = _finite_float(observed_pnl_bps)
     charged = max(0.0, _finite_float(charged_cost_bps) or 0.0)
     stored_gate = candidate.get("paper_context_cost_gate")
-    gate = dict(stored_gate) if isinstance(stored_gate, Mapping) else paper_context_cost_gate(candidate, settings)
+    has_stored_gate = isinstance(stored_gate, Mapping)
+    gate = dict(stored_gate) if has_stored_gate else paper_context_cost_gate(candidate, settings)
     applicable = bool(gate.get("applicable")) and observed is not None
-    modeled_floor = max(0.0, _finite_float(gate.get("context_cost_floor_bps")) or 0.0)
+    legacy_entry_cost = None
+    if not has_stored_gate:
+        _, legacy_entry_cost = _first_number(
+            candidate,
+            "estimated_round_trip_cost_bps",
+            "round_trip_cost_bps",
+            "total_cost_bps",
+        )
+    modeled_floor = max(
+        0.0,
+        legacy_entry_cost
+        if legacy_entry_cost is not None
+        else (_finite_float(gate.get("context_cost_floor_bps")) or 0.0),
+    )
     backfill = 0.0 if already_backfilled or not applicable else max(0.0, modeled_floor - charged)
     adjusted = None if observed is None else observed - backfill
     return {
@@ -629,6 +760,13 @@ def realized_paper_cost_audit(
         "observed_pnl_bps": round(observed, 3) if observed is not None else None,
         "charged_cost_bps": round(charged, 3),
         "modeled_context_cost_bps": round(modeled_floor, 3),
+        "modeled_cost_source": (
+            "stored_paper_context_cost_gate"
+            if has_stored_gate
+            else "legacy_entry_round_trip_cost"
+            if legacy_entry_cost is not None
+            else "current_policy_fallback"
+        ),
         "realized_cost_backfill_bps": round(backfill, 3),
         "adjusted_pnl_bps": round(adjusted, 3) if adjusted is not None else None,
         "backfill_applied": backfill > 0.0,
@@ -668,6 +806,11 @@ def annotate_paper_context_cost(
     annotated["effective_cost_bps"] = gate["effective_cost_bps"]
     annotated["gate_margin_bps"] = gate["gate_margin_bps"]
     annotated["veto_reason"] = gate["veto_reason"]
+    annotated["gross_edge_bps"] = gate["gross_edge_bps"]
+    annotated["modeled_cost_bps"] = gate["modeled_cost_bps"]
+    annotated["net_edge_bps"] = gate["net_edge_bps"]
+    annotated["freshness_minutes"] = gate["freshness_minutes"]
+    annotated["gating_reason"] = gate["gating_reason"]
     annotated["context_cost_floor_bps"] = gate["context_cost_floor_bps"]
     annotated["required_gross_edge_bps"] = gate["required_gross_edge_bps"]
     annotated["paper_context_score_multiplier"] = gate["score_multiplier"]
@@ -681,6 +824,58 @@ def annotate_paper_context_cost(
         notes.append(marker)
     annotated["risk_notes"] = notes
     return annotated
+
+
+def paper_context_cost_report(
+    candidates: Iterable[Mapping[str, Any]],
+    *,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Build a compact cross-surface audit for runtime reports and agents."""
+    rows: list[dict[str, Any]] = []
+    reason_counts: dict[str, int] = {}
+    family_counts: dict[str, int] = {}
+    for candidate in candidates:
+        stored = candidate.get("paper_context_cost_gate")
+        gate = dict(stored) if isinstance(stored, Mapping) else paper_context_cost_gate(candidate)
+        if not gate.get("applicable"):
+            continue
+        reason = str(gate.get("gating_reason") or "unknown")
+        family_kind = str(gate.get("family_kind") or "unknown")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        family_counts[family_kind] = family_counts.get(family_kind, 0) + 1
+        rows.append(
+            {
+                "venue": candidate.get("venue"),
+                "inst_id": candidate.get("inst_id"),
+                "trade_type": candidate.get("trade_type"),
+                "direction": candidate.get("direction"),
+                "family_kind": family_kind,
+                "score": candidate.get("score"),
+                "paper_eligible": bool(gate.get("eligible")),
+                "gross_edge_bps": gate.get("gross_edge_bps"),
+                "modeled_cost_bps": gate.get("modeled_cost_bps"),
+                "net_edge_bps": gate.get("net_edge_bps"),
+                "freshness_minutes": gate.get("freshness_minutes"),
+                "gating_reason": reason,
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            bool(row["paper_eligible"]),
+            row["net_edge_bps"] if row["net_edge_bps"] is not None else float("-inf"),
+        )
+    )
+    gated_count = sum(not row["paper_eligible"] for row in rows)
+    return {
+        "paper_only": True,
+        "candidate_count": len(rows),
+        "gated_candidate_count": gated_count,
+        "eligible_candidate_count": len(rows) - gated_count,
+        "by_family_kind": family_counts,
+        "by_gating_reason": reason_counts,
+        "candidates": rows[: max(0, int(limit))],
+    }
 
 
 def enforce_paper_context_cost_gate(

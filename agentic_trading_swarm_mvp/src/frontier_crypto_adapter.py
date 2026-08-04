@@ -10211,6 +10211,11 @@ def summarize(
             "edge_bps_estimate": row.get("edge_bps_estimate"),
             "gross_edge_bps_estimate": row.get("gross_edge_bps_estimate"),
             "estimated_round_trip_cost_bps": row.get("estimated_round_trip_cost_bps"),
+            "gross_edge_bps": row.get("gross_edge_bps"),
+            "modeled_cost_bps": row.get("modeled_cost_bps"),
+            "net_edge_bps": row.get("net_edge_bps"),
+            "freshness_minutes": row.get("freshness_minutes"),
+            "gating_reason": row.get("gating_reason"),
             "quality_score": row.get("quality_score"),
             "quality_status": row.get("quality_status"),
             "quality_action": row.get("quality_action"),
@@ -10278,6 +10283,10 @@ def summarize(
                 "inst_id": row.get("inst_id"),
                 "gross_edge_bps": row.get("gross_edge_bps_estimate"),
                 "round_trip_cost_bps": row.get("estimated_round_trip_cost_bps"),
+                "modeled_cost_bps": row.get("modeled_cost_bps"),
+                "net_edge_bps": row.get("net_edge_bps"),
+                "freshness_minutes": row.get("freshness_minutes"),
+                "gating_reason": row.get("gating_reason"),
                 "quality_score": row.get("quality_score"),
             }
             for row in candidates

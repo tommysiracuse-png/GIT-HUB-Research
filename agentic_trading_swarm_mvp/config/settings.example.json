@@ -40,6 +40,13 @@
     "safety_multiplier": 1.25,
     "base_cost_bps": 1.0,
     "spread_weight": 1.0,
+    "default_half_spread_bps": 2.0,
+    "default_slippage_bps": 3.0,
+    "surface_costs": {
+      "proxy": {"slippage_bps_per_side": 1.5, "fee_bps_per_side": 0.5},
+      "frontier": {"slippage_bps_per_side": 3.0, "fee_bps_per_side": 1.0},
+      "carry": {"slippage_bps_per_side": 2.0, "fee_bps_per_side": 1.0}
+    },
     "max_liquidity_penalty_bps": 6.0,
     "volatility_weight": 0.08,
     "max_volatility_penalty_bps": 12.0,

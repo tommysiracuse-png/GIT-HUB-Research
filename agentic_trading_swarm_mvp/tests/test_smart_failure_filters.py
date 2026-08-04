@@ -225,6 +225,8 @@ class SmartFailureFilterTests(unittest.TestCase):
 
         self.assertEqual(review["decision"], "approve_paper_trade")
         self.assertEqual(review["paper_allocation_multiplier"], 0.1)
+        self.assertTrue(review["paper_context_recovery_probe"])
+        self.assertEqual("effective_cost_exceeds_edge", review["gating_reason"])
         self.assertTrue(review["applied_policies"][0]["recovery_probe"])
 
     def test_implemented_manual_categories_do_not_reopen_duplicate_tasks(self) -> None:

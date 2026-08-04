@@ -39,6 +39,7 @@ from llm_swarm_runner import run_once as run_llm_swarm_once
 from market_hunter import run_market_hunter
 from memory_graph import ingest_radar_memory, memory_summary
 from okx_perp_scanner import build_scan_batch as build_okx_scan_batch
+from paper_context_cost import paper_context_cost_report
 from okx_signal_research import run_okx_signal_research
 from prediction_market_scanner import build_scan_batch as build_prediction_market_scan_batch
 from route_resolver import enrich_candidates, write_route_resolver_report
@@ -603,6 +604,11 @@ def run_once(settings: dict) -> dict:
                     "learned_score": review["learned_score"],
                     "confidence": review["confidence"],
                     "net_edge_bps_estimate": review["net_edge_bps_estimate"],
+                    "gross_edge_bps": review.get("gross_edge_bps"),
+                    "modeled_cost_bps": review.get("modeled_cost_bps"),
+                    "net_edge_bps": review.get("net_edge_bps"),
+                    "freshness_minutes": review.get("freshness_minutes"),
+                    "gating_reason": review.get("gating_reason"),
                     "route_id": review.get("route_id"),
                     "effective_route_id": review.get("effective_route_id"),
                     "route_status": review.get("route_status"),
@@ -670,6 +676,11 @@ def run_once(settings: dict) -> dict:
                     "learned_score": item["review"]["learned_score"],
                     "decision": item["review"]["decision"],
                     "confidence": item["review"]["confidence"],
+                    "gross_edge_bps": item["review"].get("gross_edge_bps"),
+                    "modeled_cost_bps": item["review"].get("modeled_cost_bps"),
+                    "net_edge_bps": item["review"].get("net_edge_bps"),
+                    "freshness_minutes": item["review"].get("freshness_minutes"),
+                    "gating_reason": item["review"].get("gating_reason"),
                     "blocks": item["review"]["hard_blocks"],
                     "route_id": item["review"].get("route_id"),
                     "effective_route_id": item["review"].get("effective_route_id"),
@@ -682,6 +693,7 @@ def run_once(settings: dict) -> dict:
                 }
                 for item in reviewed[:10]
             ],
+            "paper_net_edge_gates": paper_context_cost_report(candidates),
             "route_resolver": route_resolver_report,
             "expansion_map": expansion_map,
             "self_improvement_open_pack": self_improvement_open_pack,
