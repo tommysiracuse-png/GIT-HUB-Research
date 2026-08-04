@@ -18,7 +18,7 @@ from typing import Any
 from route_resolver import evaluate_route_intelligence
 from paper_context_cost import realized_paper_cost_audit
 from signals.registry import discover_signals, known_strategy_signatures, promoted_strategy_lab_ids
-from storage import RUNS_DIR, add_llm_recommendation, utc_now
+from storage import RUNS_DIR, add_llm_recommendation, link_recommendation_artifact, utc_now
 from strategy_reliability import paper_source_veto_record, paper_source_veto_recovery_status
 from strategy_program import (
     LOGIC_TYPE as OBSERVATION_PROGRAM,
@@ -26,6 +26,11 @@ from strategy_program import (
     generate_program_candidates,
     novelty_signature,
     record_feature_snapshots,
+)
+from strategy_feasibility import (
+    maybe_create_relaxed_child,
+    profile_observation_program,
+    record_contract_evaluation,
 )
 
 
@@ -1383,6 +1388,14 @@ def ingest_strategy_lab_recommendation(
             contract["strategy_lab_id"],
         ),
     )
+    link_recommendation_artifact(
+        conn,
+        rec.get("recommendation_id"),
+        "strategy_lab_experiment",
+        contract["strategy_lab_id"],
+        "materialized_as" if created else "linked_existing",
+        {"status": contract["status"], "experiment_type": contract["experiment_type"]},
+    )
     conn.commit()
 
     return [
@@ -2409,6 +2422,11 @@ def generate_strategy_lab_candidates(
     status_by_experiment: dict[str, str] = {}
     surface_quarantined_applications: list[dict] = []
     surface_quarantine_reasons: Counter = Counter()
+    feasibility_by_experiment: dict[str, dict] = {}
+    relaxed_children: list[dict] = []
+    max_relaxations = int(
+        cfg.get("adaptive_relaxation", {}).get("max_new_children_per_loop", 3)
+    )
 
     pool = sorted(
         eligible_candidates,
@@ -2430,6 +2448,18 @@ def generate_strategy_lab_candidates(
         raw_logic = experiment.get("strategy_logic") or {}
         if str(raw_logic.get("type") or "") == OBSERVATION_PROGRAM:
             experiment_id = experiment["strategy_lab_id"]
+            feasibility = profile_observation_program(experiment, observation_frames, settings)
+            record_contract_evaluation(conn, experiment, feasibility)
+            feasibility_by_experiment[experiment_id] = {
+                key: value for key, value in feasibility.items() if key != "program"
+            }
+            relaxed_child = None
+            if len(relaxed_children) < max_relaxations:
+                relaxed_child = maybe_create_relaxed_child(
+                    conn, experiment, feasibility, settings
+                )
+                if relaxed_child and relaxed_child.get("status") == "created":
+                    relaxed_children.append(relaxed_child)
             remaining = max(0, max_total - len(generated))
             program_candidates, program_diagnostic = generate_program_candidates(
                 experiment,
@@ -2478,6 +2508,8 @@ def generate_strategy_lab_candidates(
                 rejects[experiment_id][str(reason)] += int(count)
             if program_candidates:
                 diagnostic_status = "active_testing"
+            elif relaxed_child and relaxed_child.get("status") == "created":
+                diagnostic_status = "needs_contract_revision"
             elif not observation_frames or (
                 program_diagnostic.get("reject_reasons")
                 and set(program_diagnostic.get("reject_reasons") or {}) == {"universe_mismatch"}
@@ -2494,6 +2526,10 @@ def generate_strategy_lab_candidates(
                 "generated_candidate_count": len(program_candidates),
                 "dominant_reject_reasons": dict(rejects[experiment_id].most_common(8)),
                 "novelty_signature": program_diagnostic.get("novelty_signature"),
+                "feasibility": {
+                    key: value for key, value in feasibility.items() if key != "program"
+                },
+                "relaxed_child": relaxed_child,
             }
             prior_evaluation = experiment.get("evaluation") or {}
             conn.execute(
@@ -2686,6 +2722,8 @@ def generate_strategy_lab_candidates(
             for key, rows in nearest_candidates.items()
         },
         "contract_compilation": compilation,
+        "strategy_feasibility": feasibility_by_experiment,
+        "adaptive_relaxed_children": relaxed_children,
         "feature_snapshots": snapshot_summary,
         "observation_program_count": sum(
             1 for experiment in experiments if str((experiment.get("strategy_logic") or {}).get("type")) == OBSERVATION_PROGRAM
@@ -3470,6 +3508,7 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         f"- Missing route prerequisites: `{(generation or {}).get('route_ineligible_missing_prerequisite_counts', {})}`",
         f"- Route eligibility blockers: `{(generation or {}).get('route_ineligible_blocker_counts', {})}`",
         f"- Feature snapshots: `{(generation or {}).get('feature_snapshots', {})}`",
+        f"- Adaptive relaxed children this loop: `{len((generation or {}).get('adaptive_relaxed_children', []))}`",
         "",
         "## Market Strategy Experiments",
         "",
@@ -3488,6 +3527,16 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
             f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
             f"win=`{metrics.get('win_rate')}` cost_backfills=`{cost_backfill.get('applied_count', 0)}` "
             f"hypothesis={item.get('hypothesis')}"
+        )
+    lines.extend(["", "## Contract Feasibility", ""])
+    feasibility = (generation or {}).get("strategy_feasibility", {})
+    if not feasibility:
+        lines.append("No observation-program feasibility profiles were produced this loop.")
+    for strategy_lab_id, profile in list(feasibility.items())[:30]:
+        lines.append(
+            f"- `{strategy_lab_id}` status=`{profile.get('feasibility_status')}` "
+            f"observations=`{profile.get('universe_match_count', 0)}` candidates=`{profile.get('candidate_count', 0)}` "
+            f"entry_rate=`{profile.get('entry_pass_rate', 0)}` relaxable=`{bool((profile.get('relaxation') or {}).get('changes'))}`"
         )
     lines.extend(["", "## Contract Repair Queue", ""])
     if not summary.get("contract_repair_queue"):

@@ -162,6 +162,58 @@ class DynamicAgentPersistenceTests(unittest.TestCase):
         self.assertEqual(cycle["dormant_count"], 1)
         self.assertEqual(cycle["evaluated"][0]["reason"], "trigger_not_matched")
 
+    def test_term_trigger_runs_again_only_when_matching_evidence_changes(self):
+        created = dynamic_agents.register_agent_spec(
+            self.conn,
+            agent_spec(triggers={"any_terms": ["spot_borrow"], "cooldown_minutes": 0}),
+        )
+        settings = {"dynamic_agents": {"enabled": True, "evidence_delta_triggers": True}}
+        first = dynamic_agents.prepare_dynamic_agent_cycle(
+            self.conn, {"routes": [{"blocker": "spot_borrow", "count": 2}]}, settings, "cycle-1"
+        )
+        self.conn.execute("update agent_specs set last_run_at=? where agent_id=?", (storage.utc_now(), created["agent_id"]))
+        self.conn.commit()
+        unchanged = dynamic_agents.prepare_dynamic_agent_cycle(
+            self.conn, {"routes": [{"blocker": "spot_borrow", "count": 2}]}, settings, "cycle-2"
+        )
+        changed = dynamic_agents.prepare_dynamic_agent_cycle(
+            self.conn, {"routes": [{"blocker": "spot_borrow", "count": 7}]}, settings, "cycle-3"
+        )
+
+        self.assertEqual(1, first["matched_count"])
+        self.assertEqual("evidence_unchanged", unchanged["evaluated"][0]["reason"])
+        self.assertEqual(1, changed["matched_count"])
+
+    def test_agent_architect_discovers_arbitrary_recurring_recommendation_cluster(self):
+        for index in range(3):
+            storage.add_llm_recommendation(
+                self.conn,
+                f"rec-adapter-{index}",
+                "request_market_adapter",
+                f"Add public auction venue parser {index}",
+                "A recurring public auction market has priceable data but no runtime adapter.",
+                {"market_key": "public_auction_surface", "priority": 86},
+            )
+        settings = {
+            "dynamic_agents": {
+                "agent_architect_enabled": True,
+                "spawn_cluster_min_count": 3,
+                "spawn_objective_overlap_threshold": 0.82,
+            }
+        }
+        first = dynamic_agents.prepare_agent_architect(self.conn, {"market_discovery": {}}, settings, "cycle-a")
+        second = dynamic_agents.prepare_agent_architect(self.conn, {"market_discovery": {}}, settings, "cycle-b")
+        recommendation = dynamic_agents.architect_recommendation({"agent_architect": second})
+        result = dynamic_agents.ingest_spawn_agent_recommendation(
+            self.conn, recommendation, recommendation_id="spawn-rec-1"
+        )
+
+        self.assertIsNone(first["spawn_candidate"])
+        self.assertEqual("spawn_agent", recommendation["action"])
+        self.assertEqual("created", result["status"])
+        self.assertEqual(1, self.conn.execute("select count(*) from agent_specs").fetchone()[0])
+        self.assertEqual("spawned", self.conn.execute("select status from agent_spawn_candidates").fetchone()[0])
+
     def test_role_specific_memory_policy_is_forwarded(self):
         created = dynamic_agents.register_agent_spec(self.conn, agent_spec(triggers={"always": True}))
         cycle = dynamic_agents.prepare_dynamic_agent_cycle(

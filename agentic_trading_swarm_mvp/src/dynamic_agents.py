@@ -9,7 +9,7 @@ import re
 import sqlite3
 from typing import Any, Iterable
 
-from storage import RUNS_DIR, utc_now
+from storage import RUNS_DIR, link_recommendation_artifact, utc_now
 
 
 REPORT_JSON = RUNS_DIR / "dynamic_agents_latest.json"
@@ -242,6 +242,35 @@ def ensure_dynamic_agent_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        create table if not exists agent_spawn_candidates (
+            candidate_id text primary key,
+            created_at text not null,
+            updated_at text not null,
+            objective_cluster text not null,
+            parent_agent_id text not null,
+            evidence_json text not null,
+            proposed_spec_json text not null,
+            trigger_replay_json text not null default '{}',
+            overlap_score real not null default 0,
+            status text not null,
+            source_cycle_id text,
+            resulting_agent_id text,
+            source_recommendation_id text
+        )
+        """
+    )
+    columns = {row["name"] for row in conn.execute("pragma table_info(agent_specs)").fetchall()}
+    for column, ddl in (
+        ("last_trigger_fingerprint", "text"),
+        ("code_promotions_count", "integer not null default 0"),
+        ("strategy_materializations_count", "integer not null default 0"),
+        ("paper_trades_count", "integer not null default 0"),
+        ("reliable_outcomes_count", "integer not null default 0"),
+    ):
+        if column not in columns:
+            conn.execute(f"alter table agent_specs add column {column} {ddl}")
     conn.execute("create index if not exists idx_agent_specs_status on agent_specs(status, last_run_at)")
     conn.execute("create index if not exists idx_agent_runs_agent_time on agent_runs(agent_id, started_at)")
     conn.execute("create index if not exists idx_agent_runs_recommendation on agent_runs(recommendation_id)")
@@ -391,7 +420,25 @@ def ingest_spawn_agent_recommendation(conn: sqlite3.Connection, item: dict, *, r
     spec = item.get("agent_spec") if isinstance(item.get("agent_spec"), dict) else {}
     source_agent = str(item.get("dynamic_agent_id") or item.get("agent_name") or "build_planner")
     recommendation_id = recommendation_id or hashlib.sha256(json.dumps(item, sort_keys=True).encode("utf-8")).hexdigest()
-    return register_agent_spec(conn, spec, source_recommendation_id=recommendation_id, source_agent=source_agent)
+    result = register_agent_spec(conn, spec, source_recommendation_id=recommendation_id, source_agent=source_agent)
+    candidate_id = str(
+        ((item.get("evidence") or {}).get("spawn_candidate_id") if isinstance(item.get("evidence"), dict) else "")
+        or ((spec.get("metadata") or {}).get("spawn_candidate_id") if isinstance(spec.get("metadata"), dict) else "")
+    )
+    if candidate_id:
+        conn.execute(
+            """
+            update agent_spawn_candidates set status='spawned', resulting_agent_id=?,
+                source_recommendation_id=?, updated_at=? where candidate_id=?
+            """,
+            (result.get("agent_id"), recommendation_id, utc_now(), candidate_id),
+        )
+    link_recommendation_artifact(
+        conn, recommendation_id, "agent_spec", result.get("agent_id"), "spawned_as",
+        {"spawn_candidate_id": candidate_id, "registration_status": result.get("status")},
+    )
+    conn.commit()
+    return result
 
 
 def bootstrap_seed_agents(conn: sqlite3.Connection, settings: dict) -> dict:
@@ -477,7 +524,81 @@ def _compare(value: Any, operator: str, expected: Any) -> bool:
     return {"gt": left > right, "gte": left >= right, "lt": left < right, "lte": left <= right}.get(operator, False)
 
 
-def evaluate_agent_trigger(spec: dict, packet: dict, now: dt.datetime | None = None) -> dict:
+def _stable_evidence(value: Any) -> Any:
+    volatile = {
+        "generated_at", "updated_at", "created_at", "checked_at", "heartbeat_at",
+        "last_seen_at", "last_checked_at", "cycle_id", "scan_id",
+    }
+    if isinstance(value, dict):
+        return {
+            key: _stable_evidence(item)
+            for key, item in sorted(value.items())
+            if str(key).lower() not in volatile
+        }
+    if isinstance(value, list):
+        return [_stable_evidence(item) for item in value]
+    return value
+
+
+def _term_evidence(value: Any, terms: set[str], *, path: str = "packet", limit: int = 80) -> list[dict]:
+    """Return bounded packet fragments that actually caused a term trigger to match."""
+
+    matches: list[dict] = []
+
+    def visit(item: Any, current_path: str) -> None:
+        if len(matches) >= limit:
+            return
+        if isinstance(item, dict):
+            if current_path != path:
+                compact = _json(_stable_evidence(item))
+                matched = sorted(term for term in terms if term in compact.lower())
+                if matched:
+                    matches.append({"path": current_path, "terms": matched, "value": compact[:1200]})
+                    if len(matches) >= limit:
+                        return
+            for key, child in sorted(item.items(), key=lambda pair: str(pair[0])):
+                if str(key).lower() in {
+                    "generated_at", "updated_at", "created_at", "checked_at", "heartbeat_at",
+                    "last_seen_at", "last_checked_at", "cycle_id", "scan_id",
+                }:
+                    continue
+                visit(child, f"{current_path}.{key}")
+            return
+        if isinstance(item, list):
+            for index, child in enumerate(item[:100]):
+                visit(child, f"{current_path}[{index}]")
+            return
+        text = str(item or "")
+        lowered = text.lower()
+        matched = sorted(term for term in terms if term in lowered)
+        if matched:
+            matches.append({"path": current_path, "terms": matched, "value": text[:500]})
+
+    visit(value, path)
+    return matches
+
+
+def _trigger_fingerprint(trigger: dict, packet: dict) -> str:
+    paths = list(trigger.get("any_packet_paths") or []) + list(trigger.get("all_packet_paths") or [])
+    paths.extend(
+        str(item.get("path") or "")
+        for item in trigger.get("conditions") or []
+        if isinstance(item, dict) and item.get("path")
+    )
+    evidence = {path: _stable_evidence(_packet_value(packet, path)) for path in sorted(set(paths))}
+    if not evidence:
+        terms = set(trigger.get("any_terms") or []) | set(trigger.get("all_terms") or [])
+        evidence = {"term_matches": _term_evidence(packet, {str(term).lower() for term in terms})}
+    return _hash(evidence, 40)
+
+
+def evaluate_agent_trigger(
+    spec: dict,
+    packet: dict,
+    now: dt.datetime | None = None,
+    *,
+    require_evidence_delta: bool = False,
+) -> dict:
     trigger = spec.get("triggers") or {}
     now = now or dt.datetime.now(dt.timezone.utc)
     cooldown = float(trigger.get("cooldown_minutes", 0) or 0)
@@ -503,9 +624,24 @@ def evaluate_agent_trigger(spec: dict, packet: dict, now: dt.datetime | None = N
             _packet_value(packet, str(condition.get("path") or "")),
             str(condition.get("operator") or "exists"), condition.get("value"))))
     matched = bool(trigger.get("always")) or (bool(checks) and all(result for _name, result in checks))
+    fingerprint = _trigger_fingerprint(trigger, packet)
+    if (
+        matched
+        and require_evidence_delta
+        and not trigger.get("always")
+        and spec.get("last_run_at")
+        and str(spec.get("last_trigger_fingerprint") or "") == fingerprint
+    ):
+        return {
+            "matched": False,
+            "reason": "evidence_unchanged",
+            "failed_checks": [],
+            "evidence_fingerprint": fingerprint,
+        }
     return {
         "matched": matched, "reason": "matched" if matched else "trigger_not_matched",
         "failed_checks": [name for name, result in checks if not result],
+        "evidence_fingerprint": fingerprint,
     }
 
 
@@ -550,22 +686,290 @@ def runtime_agent(spec: dict) -> dict:
     }
 
 
+def _objective_tokens(text: Any) -> set[str]:
+    stop = {"agent", "specialist", "continuously", "paper", "system", "current", "using", "into"}
+    return {
+        token for token in re.findall(r"[a-z][a-z0-9_]{2,}", str(text or "").lower())
+        if token not in stop
+    }
+
+
+def _objective_overlap(left: Any, right: Any) -> float:
+    a, b = _objective_tokens(left), _objective_tokens(right)
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+def _recommendation_gap_candidates(conn: sqlite3.Connection) -> list[dict]:
+    """Discover recurring work clusters without assuming a fixed market or asset class."""
+
+    if not _table_exists(conn, "llm_recommendations"):
+        return []
+    rows = conn.execute(
+        """
+        select action,title,rationale,payload_json,status from llm_recommendations
+        where status in (
+            'accepted','owner_queued','linked_existing_task','implementation_paused',
+            'patch_generation_unavailable_retry_later','blocked_model_quota'
+        )
+        order by created_at desc limit 1000
+        """
+    ).fetchall()
+    groups: dict[str, dict] = {}
+    for row in rows:
+        action = str(row["action"] or "propose_diagnostic_hypothesis")
+        payload = _decode(row["payload_json"], {})
+        market_key = str(payload.get("market_key") or payload.get("signal_key") or "").strip().lower()
+        subject_tokens = sorted(_objective_tokens(" ".join((str(row["title"] or ""), str(row["rationale"] or "")))))
+        subject = market_key or "_".join(subject_tokens[:5]) or "unclassified"
+        cluster_key = f"recommendation:{action}:{subject}"[:300]
+        group = groups.setdefault(cluster_key, {
+            "action": action, "subject": subject, "count": 0, "titles": [], "statuses": set(),
+        })
+        group["count"] += 1
+        group["statuses"].add(str(row["status"] or ""))
+        if row["title"] and str(row["title"]) not in group["titles"]:
+            group["titles"].append(str(row["title"])[:240])
+
+    result = []
+    for cluster_key, group in groups.items():
+        if group["count"] < 2:
+            continue
+        action = group["action"]
+        if action == "propose_strategy_lab_experiment":
+            parent, paths = "strategy_lab", ["strategy_lab", "horizon_outcomes"]
+            allowed = ["propose_strategy_lab_experiment", "propose_diagnostic_hypothesis", "propose_code_change", "spawn_agent"]
+        elif action in {"request_market_adapter", "request_data_source", "propose_growth_experiment"}:
+            parent, paths = "market_scout", ["expansion_map", "market_discovery"]
+            allowed = ["request_market_adapter", "request_data_source", "propose_growth_experiment", "propose_code_change", "spawn_agent"]
+        elif action == "propose_code_change":
+            parent, paths = "build_planner", ["code_evolution", "self_improvement"]
+            allowed = ["propose_code_change", "propose_diagnostic_hypothesis", "spawn_agent"]
+        else:
+            parent, paths = "red_team", ["self_improvement", "contextual_stats"]
+            allowed = [action] if action in DEFAULT_ALLOWED_ACTIONS else ["propose_diagnostic_hypothesis"]
+            allowed.extend(item for item in ("propose_code_change", "spawn_agent") if item not in allowed)
+        examples = "; ".join(group["titles"][:3])
+        result.append({
+            "cluster": "recurring_" + _hash(cluster_key, 16),
+            "count": int(group["count"]),
+            "priority": min(94, 72 + int(group["count"])),
+            "parent_agent_id": parent,
+            "name": _safe_name(f"{action}_{group['subject']}_specialist"),
+            "objective": (
+                f"Own the recurring {action} work for {group['subject']}; consolidate its evidence, "
+                f"remove repeated dead ends, and advance it to measurable runtime artifacts. "
+                f"Representative requests: {examples}"
+            )[:4000],
+            "triggers": {"any_packet_paths": paths, "cooldown_minutes": 60},
+            "evidence_inputs": list(dict.fromkeys([*paths, "improvement_tasks", "current_cycle_agent_outputs"])),
+            "allowed_actions": list(dict.fromkeys(allowed)),
+            "success_measure": {"primary": "recurring_recommendations_advanced_to_measurable_artifacts"},
+        })
+    return result
+
+
+def _spawn_gap_candidates(conn: sqlite3.Connection) -> list[dict]:
+    gaps: list[dict] = []
+    if _table_exists(conn, "strategy_lab_experiments"):
+        count = int(conn.execute(
+            """
+            select count(*) from strategy_lab_experiments
+            where status in (
+                'rejected_invalid','quarantined_surface_policy','needs_contract_revision','needs_data'
+            )
+            """
+        ).fetchone()[0])
+        if count:
+            gaps.append({
+                "cluster": "strategy_contract_feasibility",
+                "count": count,
+                "priority": 96,
+                "parent_agent_id": "strategy_lab",
+                "name": "strategy_contract_feasibility_specialist",
+                "objective": (
+                    "Continuously diagnose impossible, quarantined, or data-starved Strategy Lab contracts; "
+                    "calibrate them against observed feature distributions and advance feasible paper experiments."
+                ),
+                "triggers": {"any_packet_paths": ["strategy_lab"], "cooldown_minutes": 60},
+                "evidence_inputs": ["strategy_lab", "horizon_outcomes", "contextual_stats", "current_cycle_agent_outputs"],
+                "allowed_actions": ["propose_strategy_lab_experiment", "propose_diagnostic_hypothesis", "propose_code_change", "spawn_agent"],
+                "success_measure": {"primary": "starved_strategies_reaching_paper_candidates"},
+            })
+    if _table_exists(conn, "code_evolution_proposals"):
+        count = int(conn.execute(
+            """
+            select count(*) from code_evolution_proposals
+            where status in (
+                'implementation_paused','discarded_test_failure','discarded_patch_apply_failure',
+                'invalid_patch_format','no_changed_files'
+            )
+            """
+        ).fetchone()[0])
+        if count:
+            gaps.append({
+                "cluster": "code_promotion_recovery",
+                "count": count,
+                "priority": 88,
+                "parent_agent_id": "build_planner",
+                "name": "code_promotion_recovery_specialist",
+                "objective": "Recover recurring autonomous coding failures by tracing paused proposals through repository-aware implementation and promotion.",
+                "triggers": {"any_packet_paths": ["code_evolution"], "cooldown_minutes": 60},
+                "evidence_inputs": ["code_evolution", "repository_grounding", "self_improvement"],
+                "allowed_actions": ["propose_code_change", "propose_diagnostic_hypothesis", "spawn_agent"],
+                "success_measure": {"primary": "paused_proposals_recovered_to_promoted_commits"},
+            })
+    if _table_exists(conn, "market_admission_states"):
+        count = int(conn.execute(
+            "select count(*) from market_admission_states where current_stage not in ('paper_eligible','paper_evaluated')"
+        ).fetchone()[0])
+        if count:
+            gaps.append({
+                "cluster": "market_admission_advancement",
+                "count": count,
+                "priority": 84,
+                "parent_agent_id": "market_scout",
+                "name": "market_admission_advancement_specialist",
+                "objective": "Advance globally discovered markets from reachable public data through normalization, quality verification, strategy candidates, and paper eligibility.",
+                "triggers": {"any_packet_paths": ["expansion_map"], "cooldown_minutes": 90},
+                "evidence_inputs": ["expansion_map", "market_discovery", "route_intelligence", "improvement_tasks"],
+                "allowed_actions": ["request_market_adapter", "propose_growth_experiment", "propose_code_change", "spawn_agent"],
+                "success_measure": {"primary": "markets_advancing_to_paper_eligible"},
+            })
+    gaps.extend(_recommendation_gap_candidates(conn))
+    return sorted(gaps, key=lambda item: (item["priority"], item["count"]), reverse=True)
+
+
+def prepare_agent_architect(
+    conn: sqlite3.Connection,
+    packet: dict,
+    settings: dict,
+    cycle_id: str,
+) -> dict:
+    cfg = settings.get("dynamic_agents", {})
+    if not cfg.get("agent_architect_enabled", True):
+        return {"status": "disabled"}
+    minimum = int(cfg.get("spawn_cluster_min_count", 3))
+    overlap_limit = float(cfg.get("spawn_objective_overlap_threshold", 0.82))
+    existing = [dict(row) for row in conn.execute("select agent_id, objective from agent_specs where status='active'")]
+    now = utc_now()
+    observed = []
+    for gap in _spawn_gap_candidates(conn):
+        if int(gap["count"]) < minimum:
+            continue
+        overlap = max((_objective_overlap(gap["objective"], row["objective"]) for row in existing), default=0.0)
+        candidate_id = "spawn_" + _hash({"cluster": gap["cluster"], "parent": gap["parent_agent_id"]}, 24)
+        previous = conn.execute(
+            "select evidence_json, status from agent_spawn_candidates where candidate_id=?",
+            (candidate_id,),
+        ).fetchone()
+        evidence = _decode(previous["evidence_json"], {}) if previous else {}
+        cycles = list(evidence.get("observed_cycle_ids") or [])
+        if cycle_id not in cycles:
+            cycles.append(cycle_id)
+        cycles = cycles[-12:]
+        spec = {
+            "name": gap["name"], "objective": gap["objective"],
+            "parent_agent_id": gap["parent_agent_id"], "triggers": gap["triggers"],
+            "evidence_inputs": gap["evidence_inputs"],
+            "memory_policy": {
+                "namespaces": ["strategies", "outcomes", "recommendations", "code"],
+                "keywords": sorted(_objective_tokens(gap["objective"]))[:16],
+                "retrieval_limit": 48,
+            },
+            "model_tier": "standard", "allowed_actions": gap["allowed_actions"],
+            "success_measure": gap["success_measure"],
+            "metadata": {"spawn_candidate_id": candidate_id, "objective_cluster": gap["cluster"]},
+        }
+        ready = len(cycles) >= 2 and overlap < overlap_limit
+        status = "ready" if ready else "duplicate_covered" if overlap >= overlap_limit else "observing"
+        evidence.update({
+            "count": gap["count"], "priority": gap["priority"],
+            "observed_cycle_ids": cycles, "packet_paths_present": [
+                path for path in gap["triggers"].get("any_packet_paths", []) if _packet_value(packet, path) is not None
+            ],
+        })
+        conn.execute(
+            """
+            insert into agent_spawn_candidates(
+                candidate_id,created_at,updated_at,objective_cluster,parent_agent_id,
+                evidence_json,proposed_spec_json,trigger_replay_json,overlap_score,status,source_cycle_id
+            ) values(?,?,?,?,?,?,?,?,?,?,?)
+            on conflict(candidate_id) do update set
+                updated_at=excluded.updated_at,evidence_json=excluded.evidence_json,
+                proposed_spec_json=excluded.proposed_spec_json,
+                trigger_replay_json=excluded.trigger_replay_json,
+                overlap_score=excluded.overlap_score,status=case
+                    when agent_spawn_candidates.status='spawned' then 'spawned' else excluded.status end,
+                source_cycle_id=excluded.source_cycle_id
+            """,
+            (
+                candidate_id, now, now, gap["cluster"], gap["parent_agent_id"],
+                _json(evidence), _json(spec), _json({"matched_cycles": len(cycles), "required": 2}),
+                overlap, status, cycle_id,
+            ),
+        )
+        observed.append({"candidate_id": candidate_id, "status": status, "overlap_score": round(overlap, 3), **gap})
+    conn.commit()
+    ready_rows = conn.execute(
+        "select * from agent_spawn_candidates where status='ready' order by updated_at asc limit 1"
+    ).fetchone()
+    ready_candidate = dict(ready_rows) if ready_rows else None
+    if ready_candidate:
+        ready_candidate["evidence"] = _decode(ready_candidate.pop("evidence_json"), {})
+        ready_candidate["proposed_spec"] = _decode(ready_candidate.pop("proposed_spec_json"), {})
+        ready_candidate["trigger_replay"] = _decode(ready_candidate.pop("trigger_replay_json"), {})
+    return {"status": "ready", "observed": observed, "spawn_candidate": ready_candidate}
+
+
+def architect_recommendation(dynamic_cycle: dict) -> dict | None:
+    candidate = (dynamic_cycle.get("agent_architect") or {}).get("spawn_candidate")
+    if not isinstance(candidate, dict):
+        return None
+    evidence = dict(candidate.get("evidence") or {})
+    evidence["spawn_candidate_id"] = candidate["candidate_id"]
+    return {
+        "action": "spawn_agent",
+        "priority": int(evidence.get("priority") or 80),
+        "title": f"Create {candidate['objective_cluster']} specialist",
+        "rationale": (
+            f"The unresolved {candidate['objective_cluster']} cluster persisted across "
+            f"{len(evidence.get('observed_cycle_ids') or [])} cycles and is not covered by an equivalent agent."
+        ),
+        "market_key": candidate["objective_cluster"],
+        "evidence": evidence,
+        "proposed_change": "Register the persistent specialist for the next evolution cycle.",
+        "agent_spec": candidate["proposed_spec"],
+        "agent_name": "agent_architect",
+        "parse_status": "deterministic_valid",
+        "model": {"status": "deterministic", "tier": "none", "estimated_cost_usd": 0.0},
+    }
+
+
 def prepare_dynamic_agent_cycle(conn: sqlite3.Connection, packet: dict, settings: dict, cycle_id: str) -> dict:
     ensure_dynamic_agent_schema(conn)
     if not settings.get("dynamic_agents", {}).get("enabled", True):
         return {"status": "disabled", "matched_agents": [], "evaluated": [], "concurrency": {"configured": 0, "effective": 0}}
     bootstrap = bootstrap_seed_agents(conn, settings)
+    architect = prepare_agent_architect(conn, packet, settings, cycle_id)
     rows = conn.execute("select * from agent_specs where status='active' order by generation, created_at").fetchall()
     matched, evaluated = [], []
     now = utc_now()
     for row in rows:
         spec = _row_to_spec(row)
-        trigger = evaluate_agent_trigger(spec, packet)
+        trigger = evaluate_agent_trigger(
+            spec,
+            packet,
+            require_evidence_delta=bool(settings.get("dynamic_agents", {}).get("evidence_delta_triggers", True)),
+        )
         conn.execute(
             """update agent_specs set last_evaluated_at=?, last_trigger_matched=?, last_trigger_reason=?,
+            last_trigger_fingerprint=case when ? then ? else last_trigger_fingerprint end,
             activated_at=coalesce(activated_at, ?), activation_cycle_id=coalesce(activation_cycle_id, ?)
             where agent_id=?""",
-            (now, int(trigger["matched"]), trigger["reason"], now, cycle_id, spec["agent_id"]),
+            (
+                now, int(trigger["matched"]), trigger["reason"], int(trigger["matched"]),
+                trigger.get("evidence_fingerprint"), now, cycle_id, spec["agent_id"],
+            ),
         )
         evaluated.append({"agent_id": spec["agent_id"], "name": spec["name"], **trigger})
         if trigger["matched"]:
@@ -577,6 +981,7 @@ def prepare_dynamic_agent_cycle(conn: sqlite3.Connection, packet: dict, settings
         "status": "ready", "matched_agents": matched, "evaluated": evaluated,
         "active_count": len(rows), "matched_count": len(matched), "dormant_count": len(rows) - len(matched),
         "concurrency": adaptive_concurrency(conn, settings), "bootstrap": bootstrap,
+        "agent_architect": architect,
     }
 
 
@@ -703,6 +1108,28 @@ def _artifact_links(conn: sqlite3.Connection, run: dict) -> dict:
     recommendation_ids = list(dict.fromkeys(recommendation_ids))
     if not recommendation_ids: return links
     placeholders = ",".join("?" for _ in recommendation_ids)
+    if _table_exists(conn, "recommendation_artifact_links"):
+        rows = conn.execute(
+            f"""select recommendation_id, artifact_type, artifact_id, relationship,
+                       metadata_json, updated_at
+                from recommendation_artifact_links
+                where recommendation_id in ({placeholders})
+                order by updated_at desc""",
+            recommendation_ids,
+        ).fetchall()
+        if rows:
+            links["artifact_lineage"] = [
+                {**dict(row), "metadata": _decode(row["metadata_json"], {})}
+                for row in rows
+            ]
+            task_ids = [row["artifact_id"] for row in rows if row["artifact_type"] == "strategy_owner_task"]
+            if task_ids and _table_exists(conn, "strategy_owner_tasks"):
+                task_placeholders = ",".join("?" for _ in task_ids)
+                task_rows = conn.execute(
+                    f"select task_id,status,strategy_lab_id,code_proposal_id from strategy_owner_tasks where task_id in ({task_placeholders})",
+                    task_ids,
+                ).fetchall()
+                links["strategy_owner_tasks"] = [dict(row) for row in task_rows]
     if _table_exists(conn, "llm_recommendations"):
         rows = conn.execute(
             f"select recommendation_id, status from llm_recommendations where recommendation_id in ({placeholders})",
@@ -763,11 +1190,57 @@ def reconcile_dynamic_agent_artifacts(conn: sqlite3.Connection) -> int:
                 recommendation_ids,
             ).fetchone()
             strategy_lab_id = match[0] if match else None
+        if _table_exists(conn, "recommendation_artifact_links"):
+            linked = conn.execute(
+                f"""select artifact_type, artifact_id from recommendation_artifact_links
+                    where recommendation_id in ({placeholders})
+                    order by updated_at desc""",
+                recommendation_ids,
+            ).fetchall()
+            if not code_proposal_id:
+                code_proposal_id = next(
+                    (row["artifact_id"] for row in linked if row["artifact_type"] == "code_evolution_proposal"),
+                    None,
+                )
+            if not strategy_lab_id:
+                strategy_lab_id = next(
+                    (row["artifact_id"] for row in linked if row["artifact_type"] == "strategy_lab_experiment"),
+                    None,
+                )
         result = conn.execute(
             "update agent_runs set code_proposal_id=?, strategy_lab_id=? where run_id=?",
             (code_proposal_id, strategy_lab_id, row["run_id"]),
         )
         updated += int(result.rowcount or 0)
+    conn.commit()
+    for agent in conn.execute("select agent_id from agent_specs").fetchall():
+        agent_id = str(agent["agent_id"])
+        promoted = int(conn.execute(
+            """select count(distinct p.proposal_id) from agent_runs r
+               join code_evolution_proposals p on p.proposal_id=r.code_proposal_id
+               where r.agent_id=? and p.status in ('promoted','kept','workspace_kept','candidate_committed')""",
+            (agent_id,),
+        ).fetchone()[0]) if _table_exists(conn, "code_evolution_proposals") else 0
+        materialized = int(conn.execute(
+            "select count(distinct strategy_lab_id) from agent_runs where agent_id=? and strategy_lab_id is not null",
+            (agent_id,),
+        ).fetchone()[0])
+        trades = int(conn.execute(
+            """select count(*) from paper_trades where strategy_lab_id in
+               (select strategy_lab_id from agent_runs where agent_id=? and strategy_lab_id is not null)""",
+            (agent_id,),
+        ).fetchone()[0]) if _table_exists(conn, "paper_trades") else 0
+        outcomes = int(conn.execute(
+            """select count(*) from paper_trade_outcomes o join paper_trades p on p.id=o.trade_id
+               where o.measurement_status='valid' and p.strategy_lab_id in
+               (select strategy_lab_id from agent_runs where agent_id=? and strategy_lab_id is not null)""",
+            (agent_id,),
+        ).fetchone()[0]) if _table_exists(conn, "paper_trade_outcomes") else 0
+        conn.execute(
+            """update agent_specs set code_promotions_count=?, strategy_materializations_count=?,
+               paper_trades_count=?, reliable_outcomes_count=? where agent_id=?""",
+            (promoted, materialized, trades, outcomes, agent_id),
+        )
     conn.commit()
     return updated
 
@@ -802,6 +1275,26 @@ def dynamic_agent_summary(conn: sqlite3.Connection, limit: int = 100) -> dict:
     dormant_count = int(conn.execute(
         "select count(*) from agent_specs where status='active' and last_trigger_matched=0"
     ).fetchone()[0])
+    spawn_counts = {
+        str(row[0]): int(row[1])
+        for row in conn.execute("select status,count(*) from agent_spawn_candidates group by status").fetchall()
+    }
+    spawn_candidates = []
+    for row in conn.execute(
+        "select * from agent_spawn_candidates order by updated_at desc limit ?", (limit,)
+    ).fetchall():
+        item = dict(row)
+        item["evidence"] = _decode(item.pop("evidence_json", None), {})
+        item["proposed_spec"] = _decode(item.pop("proposed_spec_json", None), {})
+        item["trigger_replay"] = _decode(item.pop("trigger_replay_json", None), {})
+        spawn_candidates.append(item)
+    outcomes = conn.execute(
+        """select coalesce(sum(code_promotions_count),0),
+                  coalesce(sum(strategy_materializations_count),0),
+                  coalesce(sum(paper_trades_count),0),
+                  coalesce(sum(reliable_outcomes_count),0)
+           from agent_specs"""
+    ).fetchone()
     return {
         "generated_at": utc_now(), "counts_by_status": counts, "persistent_agents": persistent_count,
         "currently_triggered": currently_triggered,
@@ -809,6 +1302,14 @@ def dynamic_agent_summary(conn: sqlite3.Connection, limit: int = 100) -> dict:
         "total_runs": int(conn.execute("select count(*) from agent_runs").fetchone()[0]),
         "total_estimated_cost_usd": round(total_cost, 6), "agents": specs,
         "lineage": lineage, "latest_runs": latest_runs, "artifact_links_reconciled": reconciled,
+        "spawn_candidates_by_status": spawn_counts,
+        "spawn_candidates": spawn_candidates,
+        "outcome_totals": {
+            "code_promotions": int(outcomes[0] or 0),
+            "strategy_materializations": int(outcomes[1] or 0),
+            "paper_trades": int(outcomes[2] or 0),
+            "reliable_outcomes": int(outcomes[3] or 0),
+        },
     }
 
 
@@ -828,8 +1329,14 @@ def write_dynamic_agent_reports(conn: sqlite3.Connection, settings: dict | None 
         state = "active" if spec.get("last_trigger_matched") else "dormant"
         lines.append(
             f"- `{spec['agent_id']}` {spec['name']} generation={spec['generation']} state={state} "
-            f"runs={spec['runs_count']} cost=${float(spec['total_cost_usd'] or 0):.4f} parents={spec['parent_ids']}"
+            f"runs={spec['runs_count']} cost=${float(spec['total_cost_usd'] or 0):.4f} "
+            f"code={int(spec.get('code_promotions_count') or 0)} strategies={int(spec.get('strategy_materializations_count') or 0)} "
+            f"trades={int(spec.get('paper_trades_count') or 0)} labels={int(spec.get('reliable_outcomes_count') or 0)} "
+            f"parents={spec['parent_ids']}"
         )
+    lines.extend(["", "## Agent Architect", ""])
+    for status, count in sorted(summary["spawn_candidates_by_status"].items()):
+        lines.append(f"- `{status}`: {count}")
     lines.extend(["", "## Recent Runs"])
     for run in summary["latest_runs"][:50]:
         downstream = run.get("downstream") or {}

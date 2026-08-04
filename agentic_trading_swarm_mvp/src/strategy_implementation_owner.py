@@ -17,7 +17,12 @@ from typing import Any
 
 from codex_repo_agent import run_structured_codex_turn
 from code_evolution import process_code_change_recommendation
-from storage import ROOT, RUNS_DIR, update_llm_recommendation_status
+from storage import (
+    ROOT,
+    RUNS_DIR,
+    link_recommendation_artifact,
+    update_llm_recommendation_status,
+)
 from strategy_lab import ingest_strategy_lab_recommendation
 from temporal_memory import retrieve_role_memories, upsert_memory_fact, upsert_memory_link
 
@@ -34,7 +39,7 @@ CLAIMABLE_STATUSES = {
     "queued", "analyzing", "contract_validated", "coding", "waiting_data", "waiting_route",
     "waiting_quota", "waiting_network", "implementation_paused", "promote_candidate",
 }
-TERMINAL_STATUSES = {"completed", "promoted_to_code", "retired_bad_evidence"}
+TERMINAL_STATUSES = {"completed", "promoted_to_code", "retired_bad_evidence", "superseded_duplicate"}
 DECISIONS = {
     "materialize_experiment", "implement_code", "wait_for_data", "wait_for_route",
     "monitor_evidence", "retire", "completed",
@@ -156,6 +161,10 @@ def enqueue_recommendation(conn: sqlite3.Connection, rec: dict, settings: dict) 
         if isinstance(payload.get("strategy_lab_experiment"), dict)
         else ""
     ) or str(payload.get("hypothesis") or payload.get("rationale") or rec.get("rationale") or rec.get("title") or "")
+    existing = conn.execute(
+        "select task_id, status from strategy_owner_tasks where dedupe_key = ?",
+        (dedupe,),
+    ).fetchone()
     conn.execute(
         """
         insert into strategy_owner_tasks (
@@ -179,10 +188,30 @@ def enqueue_recommendation(conn: sqlite3.Connection, rec: dict, settings: dict) 
             json.dumps({"source_payload": payload}, sort_keys=True, default=str),
         ),
     )
-    conn.commit()
+    action_status = "linked_existing" if existing else "created"
+    effective_task_id = str(existing["task_id"] if existing else task_id)
+    link_recommendation_artifact(
+        conn,
+        rec.get("recommendation_id"),
+        "strategy_owner_task",
+        effective_task_id,
+        "owned_by",
+        {"dedupe_key": dedupe, "action_status": action_status},
+    )
     if rec.get("recommendation_id"):
-        update_llm_recommendation_status(conn, str(rec["recommendation_id"]), "owner_queued")
-    return {"action_status": "created", "artifact": "strategy_owner_task", "task_id": task_id, "status": "queued"}
+        update_llm_recommendation_status(
+            conn,
+            str(rec["recommendation_id"]),
+            "linked_existing_task" if existing else "owner_queued",
+        )
+    else:
+        conn.commit()
+    return {
+        "action_status": action_status,
+        "artifact": "strategy_owner_task",
+        "task_id": effective_task_id,
+        "status": str(existing["status"] if existing else "queued"),
+    }
 
 
 def _experiment_payload(row: sqlite3.Row | dict) -> dict:
@@ -227,7 +256,15 @@ def _enqueue_experiment_repair(conn: sqlite3.Connection, experiment: dict, objec
 
 
 def _salvage_score(experiment: dict) -> tuple[float, str]:
-    status_rank = {"promote_candidate": 400.0, "needs_data": 300.0, "active_testing": 250.0, "rejected_invalid": 100.0}
+    status_rank = {
+        "promote_candidate": 400.0,
+        "needs_data": 300.0,
+        "needs_contract_revision": 290.0,
+        "quarantined_surface_policy": 280.0,
+        "active_testing": 250.0,
+        "proposed": 180.0,
+        "rejected_invalid": 100.0,
+    }
     evaluation = experiment.get("evaluation") if isinstance(experiment.get("evaluation"), dict) else {}
     diagnostics = experiment.get("compile_diagnostics") if isinstance(experiment.get("compile_diagnostics"), dict) else {}
     evidence_count = max(
@@ -238,6 +275,135 @@ def _salvage_score(experiment: dict) -> tuple[float, str]:
     )
     repairable = 25.0 if diagnostics.get("nearest_candidates") or diagnostics.get("missing_features") else 0.0
     return status_rank.get(str(experiment.get("status")), 0.0) + min(100.0, evidence_count) + repairable, str(experiment.get("updated_at") or "")
+
+
+def _backfill_artifact_lifecycle(conn: sqlite3.Connection) -> dict:
+    """Repair historical recommendation states and build explicit artifact lineage."""
+
+    linked = 0
+    reopened = 0
+    status_repaired = 0
+    sources = (
+        (
+            "strategy_lab_experiments", "source_recommendation_id", "strategy_lab_experiment",
+            "strategy_lab_id", "materialized_as",
+        ),
+        (
+            "code_evolution_proposals", "source_recommendation_id", "code_evolution_proposal",
+            "proposal_id", "materialized_as",
+        ),
+        (
+            "strategy_owner_tasks", "source_recommendation_id", "strategy_owner_task",
+            "task_id", "owned_by",
+        ),
+        (
+            "agent_specs", "source_recommendation_id", "agent_spec",
+            "agent_id", "spawned_as",
+        ),
+    )
+    tables = {str(row[0]) for row in conn.execute("select name from sqlite_master where type='table'")}
+    for table, source_column, artifact_type, id_column, relationship in sources:
+        if table not in tables:
+            continue
+        rows = conn.execute(
+            f"select {source_column} as recommendation_id,{id_column} as artifact_id from {table} "
+            f"where {source_column} is not null and trim({source_column}) != ''"
+        ).fetchall()
+        for row in rows:
+            existing = conn.execute(
+                """select 1 from recommendation_artifact_links where recommendation_id=?
+                   and artifact_type=? and artifact_id=? and relationship=?""",
+                (str(row["recommendation_id"]), artifact_type, str(row["artifact_id"]), relationship),
+            ).fetchone()
+            if existing is None:
+                link_recommendation_artifact(
+                    conn, row["recommendation_id"], artifact_type, row["artifact_id"], relationship,
+                    {"backfilled": True},
+                )
+                linked += 1
+
+    rows = conn.execute(
+        """
+        select recommendation_id,status from llm_recommendations
+        where action='propose_strategy_lab_experiment'
+          and status in ('auto_executed','owner_queued','linked_existing_task')
+        """
+    ).fetchall()
+    for row in rows:
+        artifacts = conn.execute(
+            """select artifact_type from recommendation_artifact_links
+               where recommendation_id=? order by updated_at desc""",
+            (row["recommendation_id"],),
+        ).fetchall()
+        kinds = {str(item["artifact_type"]) for item in artifacts}
+        if "strategy_lab_experiment" in kinds:
+            desired = "experiment_materialized"
+        elif "strategy_owner_task" in kinds:
+            desired = "owner_queued"
+        else:
+            desired = "accepted"
+            reopened += int(row["status"] != desired)
+        if row["status"] != desired:
+            conn.execute(
+                "update llm_recommendations set status=? where recommendation_id=?",
+                (desired, row["recommendation_id"]),
+            )
+            status_repaired += 1
+    conn.commit()
+    return {"artifact_links_backfilled": linked, "statuses_repaired": status_repaired, "recommendations_reopened": reopened}
+
+
+def _consolidate_duplicate_owner_tasks(conn: sqlite3.Connection) -> dict:
+    """Collapse queued repair work by canonical program structure, preserving every lineage edge."""
+
+    rows = conn.execute(
+        """
+        select t.task_id,t.priority,t.created_at,t.source_recommendation_id,t.strategy_lab_id,
+               e.novelty_signature,e.compiled_strategy_logic_json,e.original_strategy_logic_json,
+               e.source_surface,e.hypothesis
+        from strategy_owner_tasks t
+        join strategy_lab_experiments e on e.strategy_lab_id=t.strategy_lab_id
+        where t.status='queued' and t.code_proposal_id is null and t.codex_session_id is null
+        order by t.priority desc,t.created_at asc
+        """
+    ).fetchall()
+    groups: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        signature = str(row["novelty_signature"] or "").strip()
+        if not signature:
+            logic = _json(row["compiled_strategy_logic_json"], {}) or _json(row["original_strategy_logic_json"], {})
+            material = {
+                "logic": logic,
+                "surface": str(row["source_surface"] or ""),
+                "hypothesis_terms": _normal_text(row["hypothesis"]) if not logic else "",
+            }
+            signature = hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        groups.setdefault(signature, []).append(row)
+    superseded = 0
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+        canonical = items[0]
+        for duplicate in items[1:]:
+            conn.execute(
+                """update strategy_owner_tasks set status='superseded_duplicate',completed_at=?,updated_at=?,
+                   last_result_json=? where task_id=?""",
+                (
+                    _utc_now(), _utc_now(),
+                    json.dumps({"canonical_task_id": canonical["task_id"], "reason": "canonical_program_structure"}, sort_keys=True),
+                    duplicate["task_id"],
+                ),
+            )
+            if duplicate["source_recommendation_id"]:
+                link_recommendation_artifact(
+                    conn, duplicate["source_recommendation_id"], "strategy_owner_task",
+                    canonical["task_id"], "deduplicated_into",
+                    {"superseded_task_id": duplicate["task_id"]},
+                )
+                update_llm_recommendation_status(conn, duplicate["source_recommendation_id"], "linked_existing_task")
+            superseded += 1
+    conn.commit()
+    return {"canonical_groups": sum(1 for items in groups.values() if len(items) > 1), "tasks_superseded": superseded}
 
 
 def sync_backlog(conn: sqlite3.Connection, settings: dict) -> dict:
@@ -251,6 +417,8 @@ def sync_backlog(conn: sqlite3.Connection, settings: dict) -> dict:
         )
         """
     )
+    lifecycle = _backfill_artifact_lifecycle(conn)
+    consolidation = _consolidate_duplicate_owner_tasks(conn)
     rows = conn.execute(
         """
         select recommendation_id, created_at, action, title, rationale, payload_json, status
@@ -272,7 +440,10 @@ def sync_backlog(conn: sqlite3.Connection, settings: dict) -> dict:
         experiment_rows = conn.execute(
             """
             select * from strategy_lab_experiments
-            where status in ('rejected_invalid', 'needs_data', 'promote_candidate')
+            where status in (
+                'rejected_invalid', 'needs_data', 'needs_contract_revision',
+                'quarantined_surface_policy', 'proposed', 'promote_candidate'
+            )
                or (status = 'active_testing' and updated_at <= ?)
             order by case status when 'promote_candidate' then 0 when 'needs_data' then 1 else 2 end,
                      updated_at desc
@@ -294,12 +465,20 @@ def sync_backlog(conn: sqlite3.Connection, settings: dict) -> dict:
             objective = {
                 "rejected_invalid": "repair_invalid_contract",
                 "needs_data": "add_missing_strategy_features",
+                "needs_contract_revision": "repair_impossible_contract",
+                "quarantined_surface_policy": "repair_surface_contract",
+                "proposed": "materialize_hypothesis",
                 "promote_candidate": "promote_proven_experiment",
             }.get(str(experiment.get("status")), "diagnose_zero_output")
             salvaged += _enqueue_experiment_repair(conn, experiment, objective)
             if salvaged >= int(cfg.get("salvage_limit_per_cycle", 12)):
                 break
-    return {"recommendations_queued": queued_recommendations, "historical_experiments_salvaged": salvaged}
+    return {
+        "recommendations_queued": queued_recommendations,
+        "historical_experiments_salvaged": salvaged,
+        "artifact_lifecycle": lifecycle,
+        "duplicate_consolidation": consolidation,
+    }
 
 
 def _reclaim_dead_leases(conn: sqlite3.Connection) -> int:
@@ -651,7 +830,19 @@ def _handle_materialize(
     )
     conn.commit()
     if task.get("source_recommendation_id"):
-        update_llm_recommendation_status(conn, task["source_recommendation_id"], "auto_executed")
+        link_recommendation_artifact(
+            conn,
+            task["source_recommendation_id"],
+            "strategy_lab_experiment",
+            strategy_id,
+            "materialized_as",
+            {"strategy_owner_task_id": task["task_id"]},
+        )
+        update_llm_recommendation_status(
+            conn,
+            task["source_recommendation_id"],
+            "experiment_materialized",
+        )
     upsert_memory_link(conn, "strategy_owner_task", task["task_id"], "materialized", "strategy_lab_experiment", str(strategy_id))
     conn.commit()
     return "active_testing", {"artifacts": artifacts, "strategy_lab_id": strategy_id}
@@ -709,6 +900,14 @@ def _handle_code(conn: sqlite3.Connection, task: dict, decision: dict, settings:
     )
     conn.commit()
     if proposal_id:
+        link_recommendation_artifact(
+            conn,
+            task.get("source_recommendation_id"),
+            "code_evolution_proposal",
+            proposal_id,
+            "implemented_by",
+            {"strategy_owner_task_id": task["task_id"]},
+        )
         upsert_memory_link(conn, "strategy_owner_task", task["task_id"], "implemented_by", "code_evolution_proposal", str(proposal_id))
         conn.commit()
     if proposal_status in {"promoted", "candidate_committed", "workspace_kept", "kept"}:
@@ -736,18 +935,39 @@ def _handle_code(conn: sqlite3.Connection, task: dict, decision: dict, settings:
 
 def monitor_tasks(conn: sqlite3.Connection) -> dict:
     rows = conn.execute(
-        "select * from strategy_owner_tasks where status in ('active_testing','monitoring_evidence','promoted_to_runtime','promote_candidate')"
+        "select * from strategy_owner_tasks where status not in ('completed','promoted_to_code','retired_bad_evidence','superseded_duplicate')"
     ).fetchall()
     transitions = []
     for raw in rows:
         task = _row_dict(raw)
         experiment = conn.execute(
-            "select status, evaluation_json from strategy_lab_experiments where strategy_lab_id = ?",
+            "select status, compile_status, evaluation_json from strategy_lab_experiments where strategy_lab_id = ?",
             (task.get("strategy_lab_id"),),
         ).fetchone() if task.get("strategy_lab_id") else None
+        proposal = conn.execute(
+            "select status from code_evolution_proposals where proposal_id = ?",
+            (task.get("code_proposal_id"),),
+        ).fetchone() if task.get("code_proposal_id") else None
+        proposal_status = str(proposal["status"] if proposal else "")
+        proposal_promoted = proposal_status in {
+            "promoted", "candidate_committed", "workspace_kept", "kept",
+        }
         if not experiment:
+            if proposal_promoted and task["status"] in {
+                "implementation_paused", "waiting_data", "coding", "promoted_to_runtime",
+            }:
+                next_status = "analyzing"
+                conn.execute(
+                    "update strategy_owner_tasks set status=?, claimed_by=null, claimed_pid=null, next_retry_at=null, updated_at=? where task_id=?",
+                    (next_status, _utc_now(), task["task_id"]),
+                )
+                transitions.append({
+                    "task_id": task["task_id"], "from": task["status"], "to": next_status,
+                    "reason": "promoted_dependency_ready_for_materialization",
+                })
             continue
         experiment_status = str(experiment["status"])
+        compile_status = str(experiment["compile_status"] or "")
         next_status = {
             "promote_candidate": "promote_candidate",
             "promotion_queued": "coding",
@@ -756,7 +976,13 @@ def monitor_tasks(conn: sqlite3.Connection) -> dict:
             "retired_no_activity": "retired_bad_evidence",
             "needs_data": "waiting_data",
             "needs_route": "waiting_route",
-        }.get(experiment_status, "monitoring_evidence")
+            "needs_contract_revision": "analyzing",
+            "quarantined_surface_policy": "analyzing",
+            "proposed": "analyzing",
+        }.get(
+            experiment_status,
+            "monitoring_evidence" if compile_status == "compiled" else task["status"],
+        )
         if next_status != task["status"]:
             conn.execute(
                 "update strategy_owner_tasks set status = ?, updated_at = ?, completed_at = case when ? in ('completed','retired_bad_evidence') then ? else completed_at end where task_id = ?",

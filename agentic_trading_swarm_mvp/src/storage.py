@@ -522,6 +522,39 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists recommendation_artifact_links (
+            recommendation_id text not null,
+            artifact_type text not null,
+            artifact_id text not null,
+            relationship text not null,
+            created_at text not null,
+            updated_at text not null,
+            metadata_json text not null default '{}',
+            primary key(recommendation_id, artifact_type, artifact_id, relationship)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists agent_spawn_candidates (
+            candidate_id text primary key,
+            created_at text not null,
+            updated_at text not null,
+            objective_cluster text not null,
+            parent_agent_id text not null,
+            evidence_json text not null,
+            proposed_spec_json text not null,
+            trigger_replay_json text not null default '{}',
+            overlap_score real not null default 0,
+            status text not null,
+            source_cycle_id text,
+            resulting_agent_id text,
+            source_recommendation_id text
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists signal_stats (
             signal_key text primary key,
             closed_count integer not null,
@@ -763,6 +796,27 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "strategy_lab_experiments", "surface_policy_json", "text not null default '{}'")
     conn.execute(
         """
+        create table if not exists strategy_contract_evaluations (
+            id integer primary key autoincrement,
+            strategy_lab_id text not null,
+            strategy_lab_version integer not null,
+            evaluated_at text not null,
+            feasibility_status text not null,
+            observation_count integer not null default 0,
+            universe_match_count integer not null default 0,
+            candidate_count integer not null default 0,
+            entry_pass_rate real not null default 0,
+            feature_profile_json text not null default '{}',
+            gate_profile_json text not null default '{}',
+            nearest_candidates_json text not null default '[]',
+            relaxation_json text not null default '{}',
+            source_cycle_id text,
+            foreign key(strategy_lab_id) references strategy_lab_experiments(strategy_lab_id)
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists strategy_owner_tasks (
             task_id text primary key,
             created_at text not null,
@@ -862,6 +916,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "agent_specs", "last_trigger_fingerprint", "text")
+    _ensure_column(conn, "agent_specs", "code_promotions_count", "integer not null default 0")
+    _ensure_column(conn, "agent_specs", "strategy_materializations_count", "integer not null default 0")
+    _ensure_column(conn, "agent_specs", "paper_trades_count", "integer not null default 0")
+    _ensure_column(conn, "agent_specs", "reliable_outcomes_count", "integer not null default 0")
     conn.execute(
         """
         create table if not exists market_admission_states (
@@ -998,11 +1057,23 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_agent_runs_agent_time on agent_runs(agent_id, started_at)")
     conn.execute("create index if not exists idx_agent_runs_recommendation on agent_runs(recommendation_id)")
     conn.execute("create index if not exists idx_agent_lineage_child on agent_lineage(child_agent_id)")
+    conn.execute(
+        "create index if not exists idx_recommendation_artifacts "
+        "on recommendation_artifact_links(recommendation_id, artifact_type, updated_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_agent_spawn_status "
+        "on agent_spawn_candidates(status, updated_at)"
+    )
     conn.execute("create index if not exists idx_signal_policies_active on signal_policies(status, signal_key)")
     conn.execute("create index if not exists idx_self_improvement_status on self_improvement_experiments(status)")
     conn.execute("create index if not exists idx_code_evolution_status on code_evolution_proposals(status, updated_at)")
     conn.execute("create index if not exists idx_signal_variants_status on signal_variants(signal_family, status)")
     conn.execute("create index if not exists idx_strategy_lab_status on strategy_lab_experiments(status, updated_at)")
+    conn.execute(
+        "create index if not exists idx_strategy_contract_evaluations "
+        "on strategy_contract_evaluations(strategy_lab_id, evaluated_at desc)"
+    )
     conn.execute(
         "create index if not exists idx_strategy_feature_instrument_time "
         "on strategy_feature_snapshots(venue, inst_id, bucket_at)"
@@ -2528,6 +2599,41 @@ def update_llm_recommendation_status(conn: sqlite3.Connection, recommendation_id
         (status, recommendation_id),
     )
     conn.commit()
+
+
+def link_recommendation_artifact(
+    conn: sqlite3.Connection,
+    recommendation_id: str | None,
+    artifact_type: str,
+    artifact_id: str | int | None,
+    relationship: str,
+    metadata: dict | None = None,
+) -> bool:
+    """Persist a many-to-many recommendation lineage edge."""
+
+    if not recommendation_id or artifact_id is None:
+        return False
+    now = utc_now()
+    conn.execute(
+        """
+        insert into recommendation_artifact_links(
+            recommendation_id, artifact_type, artifact_id, relationship,
+            created_at, updated_at, metadata_json
+        ) values(?,?,?,?,?,?,?)
+        on conflict(recommendation_id, artifact_type, artifact_id, relationship)
+        do update set updated_at=excluded.updated_at, metadata_json=excluded.metadata_json
+        """,
+        (
+            str(recommendation_id),
+            str(artifact_type),
+            str(artifact_id),
+            str(relationship),
+            now,
+            now,
+            json.dumps(metadata or {}, sort_keys=True, default=_json_default),
+        ),
+    )
+    return True
 
 
 def add_self_improvement_experiment(

@@ -56,6 +56,49 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual("owner_queued", status)
 
+    def test_historical_auto_executed_without_artifact_is_reopened_and_queued(self) -> None:
+        self._recommendation("rec-orphaned")
+        self.conn.execute(
+            "update llm_recommendations set status='auto_executed' where recommendation_id='rec-orphaned'"
+        )
+        self.conn.commit()
+
+        result = owner.sync_backlog(self.conn, self.settings)
+
+        self.assertEqual(1, result["artifact_lifecycle"]["recommendations_reopened"])
+        self.assertEqual("owner_queued", self.conn.execute(
+            "select status from llm_recommendations where recommendation_id='rec-orphaned'"
+        ).fetchone()[0])
+        self.assertEqual(1, self.conn.execute(
+            "select count(*) from recommendation_artifact_links where recommendation_id='rec-orphaned'"
+        ).fetchone()[0])
+
+    def test_historical_materialized_experiment_repairs_recommendation_status(self) -> None:
+        self._recommendation("rec-materialized")
+        self.conn.execute(
+            "update llm_recommendations set status='auto_executed' where recommendation_id='rec-materialized'"
+        )
+        now = owner._utc_now()
+        self.conn.execute(
+            """
+            insert into strategy_lab_experiments(
+                strategy_lab_id,version,experiment_type,status,hypothesis,strategy_logic_json,
+                data_requirements_json,risk_gates_json,promotion_rules_json,source_agent,
+                source_recommendation_id,created_at,updated_at
+            ) values('lab-materialized',1,'market_strategy','active_testing','test','{}','{}','{}','{}',
+                     'strategy_owner','rec-materialized',?,?)
+            """,
+            (now, now),
+        )
+        self.conn.commit()
+
+        result = owner.sync_backlog(self.conn, self.settings)
+
+        self.assertGreaterEqual(result["artifact_lifecycle"]["artifact_links_backfilled"], 1)
+        self.assertEqual("experiment_materialized", self.conn.execute(
+            "select status from llm_recommendations where recommendation_id='rec-materialized'"
+        ).fetchone()[0])
+
     def test_decision_schema_is_strict_and_decodes_flexible_contract_json(self) -> None:
         schema = owner._decision_schema()
         self.assertFalse(schema["additionalProperties"])
@@ -131,7 +174,7 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
             "select status from strategy_lab_experiments where strategy_lab_id='lab_relative_strength_general'"
         ).fetchone()
         self.assertIsNotNone(experiment)
-        self.assertEqual("auto_executed", self.conn.execute(
+        self.assertEqual("experiment_materialized", self.conn.execute(
             "select status from llm_recommendations where recommendation_id='rec-strategy-1'"
         ).fetchone()[0])
         self.assertEqual(0, self.conn.execute("select count(*) from code_evolution_proposals").fetchone()[0])

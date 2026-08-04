@@ -367,6 +367,18 @@
     "retire_max_avg_pnl_bps": -8.0,
     "retire_max_win_rate": 0.43,
     "consecutive_passes_to_promote": 2,
+    "adaptive_relaxation": {
+      "enabled": true,
+      "mode": "aggressive_discovery",
+      "min_eligible_scans": 6,
+      "min_eligible_observations": 250,
+      "max_gates_per_revision": 3,
+      "minimum_gate_percentile": 0.25,
+      "maximum_gate_percentile": 0.75,
+      "critical_max_spread_bps": 50.0,
+      "paper_allocation_multiplier": 0.10,
+      "max_new_children_per_loop": 3
+    },
     "yahoo_proxy_momentum_source_veto": {
       "min_recovery_windows": 3,
       "min_samples_per_window": 10,
@@ -442,6 +454,11 @@
   "dynamic_agents": {
     "enabled": true,
     "bootstrap_seed_agents": true,
+    "agent_architect_enabled": true,
+    "max_new_agents_per_cycle": 1,
+    "spawn_cluster_min_count": 3,
+    "spawn_objective_overlap_threshold": 0.82,
+    "evidence_delta_triggers": true,
     "adaptive_concurrency": 8,
     "minimum_concurrency": 1,
     "latency_backoff_seconds": 120,

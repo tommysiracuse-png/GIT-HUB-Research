@@ -2440,6 +2440,23 @@ def run_auto_improvement(
         elif task_type == "code_change":
             created = process_code_change_recommendation(conn, _normalize_code_change_recommendation(rec), settings)
 
+        if task_type == "strategy_lab_experiment" and created:
+            artifact = created[0]
+            artifact_id = artifact.get("task_id") or rec["recommendation_id"]
+            bind_artifact(conn, topic.topic_key, "strategy_owner_tasks", artifact_id)
+            consumed.append(
+                {
+                    "recommendation_id": rec["recommendation_id"],
+                    "task_type": task_type,
+                    "title": rec["title"],
+                    "status": artifact.get("action_status"),
+                    "created": created,
+                }
+            )
+            # The Strategy Owner sets owner_queued or linked_existing_task. Do
+            # not collapse that durable lifecycle into a premature executed flag.
+            continue
+
         created_artifacts = [item for item in created if item.get("action_status", "created") == "created"]
         if created_artifacts:
             artifact = created_artifacts[0]

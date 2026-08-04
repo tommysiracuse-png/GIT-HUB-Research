@@ -35,6 +35,7 @@ from memory_graph import (
 from settings import load_settings
 from storage import RUNS_DIR, connect
 from dynamic_agents import (
+    architect_recommendation,
     build_dynamic_memory_contexts,
     decorate_dynamic_recommendation,
     normalize_agent_spec,
@@ -995,6 +996,18 @@ def rank_action_package(state: SwarmState, max_items: int | None = None) -> Swar
     }
 
 
+def _run_agent_architect_node(state: SwarmState) -> SwarmState:
+    rec = architect_recommendation(state.get("dynamic_agent_cycle") or {})
+    if rec is None:
+        return {"graph_trace": [{"node": "agent_architect", "status": "no_spawn_candidate"}]}
+    return _record_agent_result(
+        {"name": "agent_architect", "role": "Create persistent specialists for recurring uncovered objectives."},
+        rec,
+        0,
+        [],
+    )
+
+
 def run_sequential(
     packet: dict,
     memory: list[dict] | dict[str, list[dict]],
@@ -1012,6 +1025,7 @@ def run_sequential(
         state = _merge_state(state, _run_agent_node(by_name[name], state))
     for agent in dynamic_agents:
         state = _merge_state(state, _run_agent_node(agent, state))
+    state = _merge_state(state, _run_agent_architect_node(state))
     for name in ("red_team", "execution_route_hunter", "build_planner"):
         state = _merge_state(state, _run_agent_node(by_name[name], state))
     state = _merge_state(state, rank_action_package(state))
@@ -1214,6 +1228,7 @@ def run_langgraph_if_available(
     graph.add_node("research_join", phase_node("research_join"))
     graph.add_node("critique_join", phase_node("critique_join"))
     graph.add_node("ranker", ranker_node)
+    graph.add_node("agent_architect", _run_agent_architect_node)
     graph.add_node("memory_checkpoint", phase_node("memory_checkpoint"))
 
     graph.add_edge(START, "market_scout")
@@ -1245,8 +1260,9 @@ def run_langgraph_if_available(
             specialist_tail = join_name
             offset += len(batch)
             batch_index += 1
-    graph.add_edge(specialist_tail, "red_team")
-    graph.add_edge(specialist_tail, "execution_route_hunter")
+    graph.add_edge(specialist_tail, "agent_architect")
+    graph.add_edge("agent_architect", "red_team")
+    graph.add_edge("agent_architect", "execution_route_hunter")
     graph.add_edge(["red_team", "execution_route_hunter"], "critique_join")
     graph.add_edge("critique_join", "build_planner")
     graph.add_edge("build_planner", "ranker")

@@ -46,6 +46,7 @@ from storage import (
     add_code_evolution_proposal,
     code_evolution_by_status,
     code_evolution_recent,
+    link_recommendation_artifact,
     update_code_evolution_proposal,
 )
 
@@ -5301,6 +5302,15 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         payload,
         evidence,
     )
+    link_recommendation_artifact(
+        conn,
+        rec.get("recommendation_id"),
+        "code_evolution_proposal",
+        proposal_id,
+        "materialized_as",
+        {"category": category or "unknown", "priority": priority},
+    )
+    conn.commit()
     preflight = preflight_proposal(payload, settings, root=root)
     if preflight.get("parsed_tests"):
         payload["_preflight_parsed_tests"] = preflight["parsed_tests"]

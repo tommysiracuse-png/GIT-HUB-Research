@@ -686,6 +686,11 @@ def generate_program_candidates(
     if not program:
         return [], diagnostic
     universe = program.get("universe") if isinstance(program.get("universe"), dict) else {}
+    risk_gates = experiment.get("risk_gates") if isinstance(experiment.get("risk_gates"), dict) else {}
+    experimental_allocation = max(
+        0.0,
+        min(1.0, _float(risk_gates.get("paper_allocation_multiplier"), 1.0)),
+    )
     generated: list[dict] = []
     rejects: dict[str, int] = defaultdict(int)
     limit = max_candidates or int(settings.get("strategy_lab", {}).get("max_candidates_per_experiment", 10))
@@ -718,6 +723,9 @@ def generate_program_candidates(
             score = max(0.0, min(100.0, _float(evaluate_expression(program["score_expression"], values), 50.0)))
         except (ProgramValidationError, ArithmeticError, ValueError, TypeError, OverflowError):
             rejects["expression_runtime_error"] += 1
+            continue
+        if edge <= 0:
+            rejects["non_positive_cost_adjusted_edge"] += 1
             continue
         target_surface = _route_surface(frame, program)
         source_trade_type = str(frame.get("trade_type") or "")
@@ -773,6 +781,8 @@ def generate_program_candidates(
             "strategy_lab_source_trade_type": source_trade_type,
             "strategy_lab_output_trade_type": trade_type,
             "strategy_lab_program_signature": signature,
+            "strategy_reliability_allocation_multiplier": experimental_allocation,
+            "strategy_lab_relaxation": risk_gates.get("adaptive_relaxation") or {},
             "strategy_lab_program_features": {
                 key: values.get(key)
                 for key in sorted(set(program.get("calculated_features") or {}) | BASE_FEATURES)
