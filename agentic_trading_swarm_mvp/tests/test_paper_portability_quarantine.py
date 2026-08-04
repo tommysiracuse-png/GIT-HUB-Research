@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import pathlib
 import sqlite3
 import sys
@@ -163,6 +164,41 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
         self.assertFalse(guarded["paper_fill_allowed"])
         self.assertFalse(guarded["promotion_eligible"])
         self.assertEqual(0.0, guarded["paper_allocation_multiplier"])
+
+    def test_proxy_momentum_can_rank_in_sandbox_but_needs_fresh_exact_surface_proof(self) -> None:
+        candidate = translated_candidate(
+            venue="OKX",
+            inst_id="OKX:BTC-USDT-SWAP",
+            source_family="yahoo_proxy",
+            signal_family="global_proxy_momentum",
+            destination_family_paper_stats={
+                "closed_count": 24,
+                "expectancy_net_bps": 3.0,
+            },
+        )
+
+        rows, _report = apply_strategy_reliability([candidate])
+        review = rows[0]["paper_portability_quarantine"]
+
+        self.assertEqual(75.0, rows[0]["score"])
+        self.assertTrue(rows[0]["paper_rank_eligible"])
+        self.assertFalse(rows[0]["promotion_eligible"])
+        self.assertFalse(rows[0]["paper_fill_allowed"])
+        self.assertEqual("sandbox_ranking", review["maximum_stage"])
+
+        candidate.pop("destination_family_paper_stats")
+        candidate["target_surface_paper_evidence"] = {
+            "paper_only": True,
+            "target_surface": "OKX_PERP",
+            "closed_count": 24,
+            "expectancy_net_bps": 3.0,
+            "quality_pass_rate": 0.6,
+            "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        proven = paper_portability_quarantine_record(candidate)
+
+        self.assertTrue(proven["promotion_eligible"])
+        self.assertEqual("paper_promotion", proven["maximum_stage"])
 
 
 if __name__ == "__main__":

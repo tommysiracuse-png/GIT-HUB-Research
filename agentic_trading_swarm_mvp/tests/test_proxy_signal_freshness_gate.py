@@ -60,7 +60,7 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
         self.assertEqual("stale_destination_proxy", gate["gate_reason"])
         self.assertEqual(0.0, gate["propagated_momentum_contribution"])
 
-    def test_fresh_non_okx_crypto_route_keeps_freshness_telemetry_without_quarantine(self):
+    def test_fresh_non_okx_crypto_route_still_requires_target_surface_proof(self):
         gate = fca.paper_only_yahoo_proxy_crypto_momentum_gate(
             momentum_contribution=0.4,
             source_quote_timestamp="2026-08-04T14:00:45+00:00",
@@ -72,10 +72,33 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
         )
 
         self.assertTrue(gate["applies"])
+        self.assertFalse(gate["eligible"])
+        self.assertFalse(gate["emit_route"])
+        self.assertEqual(0.0, gate["propagated_momentum_contribution"])
+        self.assertIn("yahoo_proxy_cross_surface_quarantined", gate["gate_reasons"])
+
+    def test_fresh_non_okx_crypto_route_releases_with_exact_surface_paper_proof(self):
+        gate = fca.paper_only_yahoo_proxy_crypto_momentum_gate(
+            momentum_contribution=0.4,
+            source_quote_timestamp="2026-08-04T14:00:45+00:00",
+            evaluated_at="2026-08-04T14:01:00+00:00",
+            source_session_open=True,
+            destination_proxy_age_seconds=15.0,
+            destination_surface="perp",
+            destination_venue="BITGET",
+            target_surface_paper_evidence={
+                "paper_only": True,
+                "target_surface": "BITGET_PERP",
+                "closed_count": 24,
+                "expectancy_net_bps": 2.0,
+                "quality_pass_rate": 0.6,
+                "observed_at": "2026-08-04T14:00:00+00:00",
+            },
+        )
+
         self.assertTrue(gate["eligible"])
         self.assertTrue(gate["emit_route"])
         self.assertEqual(0.4, gate["propagated_momentum_contribution"])
-        self.assertNotIn("yahoo_proxy_cross_surface_quarantined", gate["gate_reasons"])
 
     def test_gate_is_not_applied_to_live_mode(self):
         gate = fca.paper_only_yahoo_proxy_crypto_momentum_gate(
@@ -129,7 +152,7 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
         self.assertEqual("stale_source_quote", annotated["proxy_momentum_gate_reason"])
         self.assertTrue(annotated["paper_only_route_blocked"])
 
-    def test_route_seed_review_does_not_turn_eligible_non_okx_freshness_into_a_block(self):
+    def test_route_seed_review_blocks_unproven_non_okx_transfer(self):
         review = fca._paper_only_cross_surface_seed_guard_review(
             {
                 "execution_mode": "paper",
@@ -146,10 +169,10 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
         )
 
         self.assertTrue(review["applies"])
-        self.assertTrue(review["eligible"])
-        self.assertTrue(review["emit_route"])
-        self.assertEqual("yahoo_proxy_crypto_freshness_gate", review["policy"])
-        self.assertEqual(0.9, review["propagated_momentum_contribution"])
+        self.assertFalse(review["eligible"])
+        self.assertFalse(review["emit_route"])
+        self.assertEqual("proxy_frontier_cross_surface_paper_quarantine", review["policy"])
+        self.assertEqual(0.0, review["propagated_momentum_contribution"])
 
     def test_stale_proxy_bar_suppresses_yahoo_proxy_context(self):
         gate = fca.paper_only_proxy_signal_freshness_gate(
@@ -207,7 +230,7 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
         self.assertEqual(0.0, gate["propagated_momentum_contribution"])
         self.assertEqual("OKX_SPOT", gate["target_surface"])
 
-    def test_fresh_proxy_momentum_is_not_quarantined_for_other_crypto_venue(self):
+    def test_fresh_proxy_momentum_requires_proof_for_other_frontier_crypto_venue(self):
         gate = fca.paper_only_proxy_signal_freshness_gate(
             market_key="YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM",
             latest_bar_timestamp="2026-07-18T04:47:10+00:00",
@@ -222,10 +245,10 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
             momentum_contribution=0.75,
         )
 
-        self.assertTrue(gate["eligible"])
-        self.assertTrue(gate["emit_recommendation"])
-        self.assertFalse(gate["quarantined_cross_surface"])
-        self.assertEqual(0.75, gate["propagated_momentum_contribution"])
+        self.assertFalse(gate["eligible"])
+        self.assertFalse(gate["emit_recommendation"])
+        self.assertTrue(gate["quarantined_cross_surface"])
+        self.assertEqual(0.0, gate["propagated_momentum_contribution"])
 
     def test_signal_quality_gate_fail_closes_when_proxy_gate_fails(self):
         result = fca.paper_only_cross_market_signal_quality_gate(

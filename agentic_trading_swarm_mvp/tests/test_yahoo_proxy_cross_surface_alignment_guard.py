@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import sqlite3
 import unittest
 
@@ -35,6 +36,18 @@ def cross_surface_candidate(**overrides: object) -> dict[str, object]:
 
 
 class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
+    def target_proof(self, **overrides: object) -> dict[str, object]:
+        proof: dict[str, object] = {
+            "paper_only": True,
+            "target_surface": "OKX_PERP",
+            "closed_count": 24,
+            "expectancy_net_bps": 2.5,
+            "quality_pass_rate": 0.58,
+            "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        proof.update(overrides)
+        return proof
+
     def test_local_quality_is_diagnostic_but_cannot_release_route(self) -> None:
         aligned = paper_only_yahoo_proxy_cross_surface_alignment_guard(cross_surface_candidate())
         adverse_trend = paper_only_yahoo_proxy_cross_surface_alignment_guard(
@@ -66,6 +79,54 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertEqual("aligned", review["local_trend_state"])
         self.assertEqual("local_alignment_confirmed", review["alignment_reason"])
 
+    def test_fresh_exact_surface_paper_proof_releases_paper_promotion(self) -> None:
+        review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(target_surface_paper_evidence=self.target_proof())
+        )
+
+        self.assertTrue(review["eligible"])
+        self.assertFalse(review["blocked"])
+        self.assertTrue(review["promotion_eligible"])
+        self.assertEqual("paper_promotion", review["maximum_stage"])
+        self.assertEqual(
+            "fresh_target_surface_paper_evidence_validated",
+            review["reason"],
+        )
+
+    def test_stale_wrong_surface_or_low_quality_proof_stays_in_sandbox(self) -> None:
+        stale = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                target_surface_paper_evidence=self.target_proof(
+                    observed_at="2020-01-01T00:00:00+00:00"
+                )
+            )
+        )
+        wrong_surface = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                target_surface_paper_evidence=self.target_proof(target_surface="OKX_SPOT")
+            )
+        )
+        low_quality = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                target_surface_paper_evidence=self.target_proof(quality_pass_rate=0.49)
+            )
+        )
+
+        self.assertTrue(all(row["blocked"] for row in (stale, wrong_surface, low_quality)))
+        self.assertTrue(all(row["sandbox_rank_eligible"] for row in (stale, wrong_surface, low_quality)))
+        self.assertIn(
+            "fresh_observations",
+            stale["target_surface_paper_evidence_review"]["failed_checks"],
+        )
+        self.assertIn(
+            "exact_target_surface",
+            wrong_surface["target_surface_paper_evidence_review"]["failed_checks"],
+        )
+        self.assertIn(
+            "quality_rate",
+            low_quality["target_surface_paper_evidence_review"]["failed_checks"],
+        )
+
     def test_scope_excludes_native_yahoo_and_live_contexts(self) -> None:
         native = paper_only_yahoo_proxy_cross_surface_alignment_guard(
             cross_surface_candidate(venue="YAHOO_PROXY", asset_class="equity", market_surface="proxy")
@@ -81,7 +142,7 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertTrue(native["allow_native_proxy_monitoring"])
         self.assertEqual(["OKX_SPOT", "OKX_PERP"], native["quarantined_target_surfaces"])
 
-    def test_quarantine_is_bounded_to_okx_spot_and_perp(self) -> None:
+    def test_quarantine_covers_frontier_crypto_spot_and_perp(self) -> None:
         spot = paper_only_yahoo_proxy_cross_surface_alignment_guard(
             cross_surface_candidate(
                 venue="OKX",
@@ -115,10 +176,12 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertTrue(spot["blocked"])
         self.assertTrue(perp["blocked"])
         self.assertTrue(route_family_spot["blocked"])
-        self.assertFalse(other_crypto["applies"])
-        self.assertTrue(other_crypto["emit_route"])
+        self.assertTrue(other_crypto["applies"])
+        self.assertTrue(other_crypto["blocked"])
+        self.assertFalse(other_crypto["emit_route"])
+        self.assertEqual("BITGET_PERP", other_crypto["target_surface"])
         self.assertEqual(
-            "native_crypto_confirmation_with_positive_closed_signal_performance",
+            "fresh_target_surface_paper_evidence_meeting_quality_thresholds",
             spot["reenable_condition"],
         )
 

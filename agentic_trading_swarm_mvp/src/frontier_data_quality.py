@@ -589,7 +589,11 @@ _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY = {
     "max_destination_spread_bps": 8.0,
     "quarantined_target_surfaces": ("OKX_SPOT", "OKX_PERP"),
     "allow_native_proxy_monitoring": True,
-    "reenable_condition": "native_crypto_confirmation_with_positive_closed_signal_performance",
+    "min_target_surface_closed_count": 20,
+    "min_target_surface_expectancy_net_bps": 0.0,
+    "min_target_surface_quality_rate": 0.5,
+    "max_target_surface_evidence_age_hours": 168.0,
+    "reenable_condition": "fresh_target_surface_paper_evidence_meeting_quality_thresholds",
 }
 
 def paper_only_yahoo_proxy_okx_target_review(record, profile=None):
@@ -687,14 +691,316 @@ def paper_only_yahoo_proxy_okx_target_review(record, profile=None):
     }
 
 
+def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, now=None):
+    """Validate fresh, exact-surface paper proof for a proxy transfer.
+
+    Evidence is accepted only from an explicit nested paper-proof packet.  A
+    candidate's current quote, local alignment, or inherited proxy metrics are
+    not target-surface observations and therefore cannot release quarantine.
+    """
+
+    record = record if isinstance(record, dict) else {}
+    profile = profile if isinstance(profile, dict) else {}
+    target_review = paper_only_yahoo_proxy_okx_target_review(record, profile)
+    target_surface = target_review.get("target_surface")
+    scope_containers = [record]
+    for field in (
+        "source_context",
+        "lineage_context",
+        "recommendation_lineage",
+        "proxy_context",
+        "destination_context",
+        "candidate",
+    ):
+        nested = record.get(field)
+        if isinstance(nested, dict):
+            scope_containers.append(nested)
+    scope_text = "|".join(
+        str(container.get(field) or "").strip().lower().replace("-", "_")
+        for container in scope_containers
+        for field in (
+            "source_family",
+            "source_market_family",
+            "origin_market_family",
+            "data_source_family",
+            "observation_source_family",
+            "origin_surface",
+            "source_surface",
+            "signal_family",
+            "feature_family",
+            "strategy_family",
+            "trade_type",
+            "market_key",
+            "lineage_tags",
+        )
+        if container.get(field) not in (None, "", [], {}, ())
+    )
+    source_is_proxy = "proxy" in scope_text or "yahoo" in scope_text
+    momentum_family = "momentum" in scope_text
+    execution_mode = _paper_only_route_intelligence_tag(
+        _paper_only_route_intelligence_first(
+            record, ("execution_mode", "trading_mode", "mode", "runner_mode")
+        )
+    )
+    paper_mode = execution_mode in {None, "paper", "paper_only", "simulation", "sim", "review"}
+    if target_surface is None:
+        destination = record.get("destination_context")
+        destination = destination if isinstance(destination, dict) else record
+        venue = _paper_only_route_intelligence_tag(
+            _paper_only_route_intelligence_first(
+                destination, ("target_venue", "execution_venue", "destination_venue", "venue")
+            )
+        )
+        raw_surface = _paper_only_route_intelligence_tag(
+            _paper_only_route_intelligence_first(
+                destination,
+                (
+                    "target_surface",
+                    "destination_surface",
+                    "market_surface",
+                    "execution_surface",
+                    "market_type",
+                    "asset_class",
+                ),
+            )
+        )
+        direction = _paper_only_route_intelligence_tag(record.get("direction")) or ""
+        crypto_text = "|".join(
+            str(destination.get(field) or "").strip().lower()
+            for field in ("asset_class", "market_surface", "trade_type", "market_family")
+        )
+        composite_spot = str(raw_surface or "").endswith("_spot")
+        composite_perp = str(raw_surface or "").endswith(("_perp", "_swap"))
+        if raw_surface in {"spot", "cash", "crypto_spot"} or composite_spot or (
+            raw_surface is None and "frontier_spot" in direction
+        ):
+            surface_kind = "SPOT"
+        elif raw_surface in {"perp", "perpetual", "swap", "crypto_derivatives"} or composite_perp or (
+            raw_surface is None
+            and any(token in direction for token in ("frontier_perp", "perp", "swap"))
+        ):
+            surface_kind = "PERP"
+        else:
+            surface_kind = None
+        crypto_target = bool(
+            surface_kind
+            and venue not in {None, "yahoo", "yahoo_proxy"}
+            and (
+                "crypto" in crypto_text
+                or "frontier" in direction
+                or composite_spot
+                or composite_perp
+                or raw_surface in {"spot", "cash", "perp", "perpetual", "swap"}
+            )
+        )
+        if crypto_target:
+            venue_token = str(venue).upper()
+            for suffix in ("_SPOT", "_PERP", "_SWAP"):
+                if venue_token.endswith(suffix):
+                    venue_token = venue_token[: -len(suffix)]
+                    break
+            target_surface = f"{venue_token}_{surface_kind}"
+    applies = bool(
+        paper_mode
+        and source_is_proxy
+        and momentum_family
+        and target_surface is not None
+    )
+
+    policy = dict(_PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY)
+    for container in (
+        profile,
+        profile.get("paper") if isinstance(profile.get("paper"), dict) else None,
+        profile.get("frontier_crypto_adapter")
+        if isinstance(profile.get("frontier_crypto_adapter"), dict)
+        else None,
+        profile.get("yahoo_proxy_cross_surface_alignment_guard")
+        if isinstance(profile.get("yahoo_proxy_cross_surface_alignment_guard"), dict)
+        else None,
+    ):
+        if not isinstance(container, dict):
+            continue
+        for key in (
+            "min_target_surface_closed_count",
+            "min_target_surface_expectancy_net_bps",
+            "min_target_surface_quality_rate",
+            "max_target_surface_evidence_age_hours",
+        ):
+            if container.get(key) is not None:
+                policy[key] = container[key]
+
+    evidence = None
+    evidence_field = None
+    for container in (record, profile):
+        if not isinstance(container, dict):
+            continue
+        for field in (
+            "target_surface_paper_evidence",
+            "target_surface_paper_proof",
+            "destination_surface_paper_evidence",
+            "destination_surface_paper_stats",
+        ):
+            candidate = container.get(field)
+            if isinstance(candidate, dict):
+                evidence = candidate
+                evidence_field = field
+                break
+        if evidence is not None:
+            break
+
+    def _number(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    def _first(mapping, *keys):
+        if not isinstance(mapping, dict):
+            return None
+        for key in keys:
+            value = mapping.get(key)
+            if value not in (None, "", [], {}, ()):
+                return value
+        return None
+
+    def _paper_evidence(mapping):
+        explicit = _first(mapping, "paper_only", "is_paper", "paper_evidence")
+        if isinstance(explicit, bool):
+            return explicit
+        mode = _paper_only_route_intelligence_tag(
+            _first(mapping, "execution_mode", "mode", "evidence_mode", "observation_mode")
+        )
+        source = _paper_only_route_intelligence_tag(_first(mapping, "evidence_source", "source"))
+        return mode in {"paper", "paper_only", "simulation", "sim"} or source in {
+            "persisted_paper_signal_stats",
+            "paper_trade_outcomes",
+            "target_surface_paper_observations",
+        }
+
+    def _surface(mapping):
+        raw = _paper_only_route_intelligence_tag(
+            _first(mapping, "target_surface", "market_surface", "execution_surface", "surface")
+        )
+        venue = _paper_only_route_intelligence_tag(
+            _first(mapping, "target_venue", "execution_venue", "venue")
+        )
+        if raw in {"okx_spot", "okx_cash"}:
+            return "OKX_SPOT"
+        if raw in {"okx_perp", "okx_perpetual", "okx_swap"}:
+            return "OKX_PERP"
+        if venue == "okx" and raw in {"spot", "cash"}:
+            return "OKX_SPOT"
+        if venue == "okx" and raw in {"perp", "perpetual", "swap"}:
+            return "OKX_PERP"
+        if venue and raw in {"spot", "cash", "crypto_spot"}:
+            return f"{venue.upper()}_SPOT"
+        if venue and raw in {"perp", "perpetual", "swap", "crypto_derivatives"}:
+            return f"{venue.upper()}_PERP"
+        return str(raw or "").upper() or None
+
+    def _timestamp(value):
+        if isinstance(value, dt.datetime):
+            parsed = value
+        else:
+            try:
+                parsed = dt.datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+
+    evaluated_at = _timestamp(now) or dt.datetime.now(dt.timezone.utc)
+    evidence_surface = _surface(evidence)
+    closed_count = _number(
+        _first(evidence, "closed_count", "closed_trades", "paper_observation_count", "sample_size")
+    )
+    expectancy = _number(
+        _first(
+            evidence,
+            "expectancy_net_bps",
+            "net_expectancy_bps",
+            "avg_pnl_bps",
+            "destination_expectancy_net_bps",
+        )
+    )
+    quality_rate = _number(
+        _first(evidence, "quality_pass_rate", "paper_quality_rate", "win_rate", "positive_rate")
+    )
+    observed_at = _timestamp(
+        _first(evidence, "observed_at", "updated_at", "latest_observation_at", "measured_at")
+    )
+    raw_age_hours = (
+        (evaluated_at - observed_at).total_seconds() / 3600.0
+        if observed_at is not None
+        else None
+    )
+    age_hours = max(0.0, raw_age_hours) if raw_age_hours is not None else None
+
+    min_closed_count = max(1, int(_number(policy["min_target_surface_closed_count"]) or 20))
+    min_expectancy = _number(policy["min_target_surface_expectancy_net_bps"])
+    min_expectancy = 0.0 if min_expectancy is None else min_expectancy
+    min_quality_rate = _number(policy["min_target_surface_quality_rate"])
+    min_quality_rate = 0.5 if min_quality_rate is None else min_quality_rate
+    max_age_hours = _number(policy["max_target_surface_evidence_age_hours"])
+    max_age_hours = 168.0 if max_age_hours is None or max_age_hours <= 0.0 else max_age_hours
+
+    checks = {
+        "paper_observations": bool(evidence is not None and _paper_evidence(evidence)),
+        "exact_target_surface": bool(target_surface and evidence_surface == target_surface),
+        "minimum_closed_count": bool(closed_count is not None and closed_count >= min_closed_count),
+        "positive_net_expectancy": bool(expectancy is not None and expectancy > min_expectancy),
+        "quality_rate": bool(quality_rate is not None and quality_rate >= min_quality_rate),
+        "fresh_observations": bool(
+            raw_age_hours is not None and -(5.0 / 60.0) <= raw_age_hours <= max_age_hours
+        ),
+    }
+    failed_checks = [name for name, passed in checks.items() if not passed]
+    proof_valid = bool(target_surface and not failed_checks)
+    eligible = bool(not applies or proof_valid)
+    return {
+        "paper_only": True,
+        "applies": applies,
+        "eligible": eligible,
+        "promotion_eligible": eligible,
+        "promotion_blocked": bool(applies and not proof_valid),
+        "sandbox_rank_eligible": True,
+        "maximum_stage": "paper_promotion" if eligible else "sandbox_ranking",
+        "reason": (
+            "not_applicable"
+            if not applies
+            else "fresh_target_surface_paper_evidence_validated"
+            if proof_valid
+            else "target_surface_paper_evidence_required"
+        ),
+        "failed_checks": failed_checks,
+        "checks": checks,
+        "evidence_field": evidence_field,
+        "target_surface": target_surface,
+        "evidence_surface": evidence_surface,
+        "closed_count": int(closed_count) if closed_count is not None else None,
+        "min_closed_count": min_closed_count,
+        "expectancy_net_bps": expectancy,
+        "min_expectancy_net_bps": min_expectancy,
+        "quality_rate": quality_rate,
+        "min_quality_rate": min_quality_rate,
+        "observed_at": observed_at.isoformat() if observed_at is not None else None,
+        "evidence_age_hours": round(age_hours, 6) if age_hours is not None else None,
+        "max_evidence_age_hours": max_age_hours,
+    }
+
+
 def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
-    """Quarantine Yahoo momentum transferred to paper OKX spot or perp.
+    """Quarantine Yahoo momentum transferred to frontier crypto spot or perp.
 
     Local trend and spread measurements are retained for diagnostics, but they
     cannot make a cross-surface route eligible.  The source signal has not
     demonstrated enough native robustness to justify transfer into the faster
-    OKX targets.  Native Yahoo evaluation and non-paper contexts do not enter
-    this policy.
+    crypto targets. Native Yahoo evaluation and non-paper contexts do not
+    enter this policy.
     """
 
     record = record if isinstance(record, dict) else {}
@@ -832,6 +1138,7 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
                 break
     destination_is_native_proxy = destination_venue in {"yahoo", "yahoo_proxy"}
     target_review = paper_only_yahoo_proxy_okx_target_review(record, profile)
+    target_surface_evidence = paper_only_proxy_frontier_target_evidence_review(record, profile)
     destination_venue = target_review.get("destination_venue") or destination_venue
     execution_mode = _paper_only_route_intelligence_tag(
         _lookup("execution_mode", "trading_mode", "mode", "destination_mode", "runner_mode")
@@ -846,7 +1153,7 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         and paper_mode
         and source_is_yahoo
         and momentum_family
-        and target_review.get("quarantined")
+        and target_surface_evidence.get("applies")
         and not destination_is_native_proxy
     )
 
@@ -961,12 +1268,14 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         spread_non_adverse = explicit_spread_ok is True
     spread_evidence_present = destination_spread_bps is not None or explicit_spread_ok is not None
 
-    # Alignment used to be sufficient to release this route.  It is now only
-    # diagnostic evidence: every in-scope OKX spot/perp paper route is
-    # quarantined regardless of destination quality.
-    eligible = False if applies else True
+    # Current alignment remains diagnostic.  Release requires independent,
+    # fresh paper outcomes from this exact OKX surface.
+    eligible = bool(not applies or target_surface_evidence.get("eligible"))
+    blocked = bool(applies and not eligible)
     if not applies:
         reason = "disabled" if not enabled else "non_paper_mode" if not paper_mode else "not_applicable"
+    elif eligible:
+        reason = "fresh_target_surface_paper_evidence_validated"
     else:
         reason = "yahoo_proxy_cross_surface_quarantined"
 
@@ -989,25 +1298,33 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
     entry_was_confirmed = _bool(
         _lookup("entry_local_confirmation_passed", "entry_alignment_confirmed")
     ) is True or bool(isinstance(prior_review, dict) and prior_review.get("eligible"))
-    force_paper_exit = bool(applies and entry_was_confirmed)
+    force_paper_exit = bool(blocked and entry_was_confirmed)
+    quarantined_target_surfaces = list(target_review.get("quarantined_target_surfaces") or ())
+    reviewed_target_surface = target_surface_evidence.get("target_surface")
+    if reviewed_target_surface and reviewed_target_surface not in quarantined_target_surfaces:
+        quarantined_target_surfaces.append(reviewed_target_surface)
     return {
         "enabled": bool(enabled),
         "paper_only": True,
         "applies": applies,
         "eligible": eligible,
-        "blocked": bool(applies),
-        "entry_allowed": not applies,
-        "emit_recommendation": not applies,
-        "emit_route": not applies,
+        "blocked": blocked,
+        "entry_allowed": eligible,
+        "emit_recommendation": eligible,
+        "emit_route": eligible,
+        "promotion_eligible": eligible,
+        "sandbox_rank_eligible": True,
+        "maximum_stage": target_surface_evidence.get("maximum_stage") if applies else None,
         "reason": reason,
         "alignment_reason": alignment_reason,
         "source_family": "yahoo_proxy" if source_is_yahoo else None,
         "signal_family": "global_proxy_momentum" if momentum_family else None,
         "destination_venue": destination_venue,
-        "target_surface": target_review.get("target_surface"),
-        "quarantined_target_surfaces": target_review.get("quarantined_target_surfaces"),
+        "target_surface": target_surface_evidence.get("target_surface") or target_review.get("target_surface"),
+        "quarantined_target_surfaces": quarantined_target_surfaces,
         "allow_native_proxy_monitoring": target_review.get("allow_native_proxy_monitoring"),
         "reenable_condition": target_review.get("reenable_condition"),
+        "target_surface_paper_evidence_review": target_surface_evidence,
         "destination_direction": direction,
         "local_direction": local_direction,
         "local_short_horizon_trend_bps": local_trend_bps,
@@ -1257,9 +1574,11 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
         reasons.append("stale_destination_proxy")
 
     # Freshness remains useful telemetry for every crypto destination.  The
-    # hard emission quarantine is intentionally bounded to OKX spot/perp.
+    # hard emission quarantine covers frontier crypto spot/perp and releases
+    # only on fresh, exact-surface paper proof.
+    alignment_guard = paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile)
     target_review = paper_only_yahoo_proxy_okx_target_review(record, profile)
-    if target_review.get("quarantined"):
+    if alignment_guard.get("blocked"):
         reasons.append("yahoo_proxy_cross_surface_quarantined")
 
     blocked = bool(reasons)
@@ -1293,6 +1612,9 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
         "quarantined_target_surfaces": target_review.get("quarantined_target_surfaces"),
         "allow_native_proxy_monitoring": target_review.get("allow_native_proxy_monitoring"),
         "reenable_condition": target_review.get("reenable_condition"),
+        "target_surface_paper_evidence_review": alignment_guard.get(
+            "target_surface_paper_evidence_review"
+        ),
     }
 
 
@@ -1392,7 +1714,7 @@ def _paper_only_cross_surface_seed_guard_review(record, profile=None):
         "emit_recommendation": not blocked,
         "emit_route": not blocked,
         "policy": (
-            "yahoo_proxy_okx_cross_surface_paper_quarantine"
+            "proxy_frontier_cross_surface_paper_quarantine"
             if alignment_guard.get("applies")
             else "yahoo_proxy_crypto_freshness_gate"
             if applies

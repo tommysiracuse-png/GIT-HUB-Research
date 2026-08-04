@@ -18,6 +18,7 @@ from typing import Any
 from paper_context_cost import realized_paper_cost_audit
 from proxy_signal_quality import PROXY_TRADE_TYPES, proxy_short_quality_review
 from storage import RUNS_DIR, signal_key
+from frontier_data_quality import paper_only_proxy_frontier_target_evidence_review
 
 
 REPORT_JSON = RUNS_DIR / "strategy_reliability_report.json"
@@ -1420,6 +1421,10 @@ def _portability_families(candidate: Mapping[str, Any]) -> dict[str, Any]:
 def _portability_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
     containers: list[tuple[str, Mapping[str, Any]]] = []
     for field in (
+        "target_surface_paper_evidence",
+        "target_surface_paper_proof",
+        "destination_surface_paper_evidence",
+        "destination_surface_paper_stats",
         "destination_family_paper_proof",
         "destination_family_paper_stats",
         "destination_paper_stats",
@@ -1514,7 +1519,22 @@ def paper_portability_quarantine_record(
     sufficient = closed_count is not None and closed_count >= min_closed_count
     positive = expectancy is not None and expectancy > min_expectancy
     proven = bool(sufficient and positive)
-    if not sufficient:
+
+    target_surface_review = paper_only_proxy_frontier_target_evidence_review(
+        dict(candidate), dict(config) if isinstance(config, Mapping) else {}
+    )
+    proxy_momentum_frontier_transfer = bool(
+        source_family == "proxy"
+        and destination_family == "crypto"
+        and target_surface_review.get("applies")
+    )
+    if proxy_momentum_frontier_transfer:
+        proven = bool(proven and target_surface_review.get("eligible"))
+
+    if proxy_momentum_frontier_transfer and not target_surface_review.get("eligible"):
+        reason = target_surface_review.get("reason") or "target_surface_paper_evidence_required"
+        state = "sandbox_only_pending_target_surface_proof"
+    elif not sufficient:
         reason = "insufficient_destination_family_paper_evidence"
         state = "pending_destination_family_proof"
     elif expectancy is None:
@@ -1542,14 +1562,25 @@ def paper_portability_quarantine_record(
         "sufficient_closed_count": sufficient,
         "positive_destination_expectancy": positive,
         "destination_family_proof": proven,
-        "rank_above_neutral_allowed": proven,
-        "paper_rank_eligible": proven,
+        "rank_above_neutral_allowed": proven or proxy_momentum_frontier_transfer,
+        "paper_rank_eligible": proven or proxy_momentum_frontier_transfer,
+        "sandbox_rank_eligible": proxy_momentum_frontier_transfer,
+        "maximum_stage": (
+            "paper_promotion"
+            if proven
+            else "sandbox_ranking"
+            if proxy_momentum_frontier_transfer
+            else "quarantined"
+        ),
         "promotion_eligible": proven,
         "promotion_blocked": not proven,
         "paper_fill_allowed": proven,
         "paper_score_multiplier": 1.0 if proven else 0.0,
         "paper_allocation_multiplier": 1.0 if proven else 0.0,
         "neutral_score": _as_float(policy.get("neutral_score"), 0.0),
+        "target_surface_paper_evidence_review": (
+            target_surface_review if proxy_momentum_frontier_transfer else None
+        ),
     }
 
 
@@ -2930,19 +2961,22 @@ def _apply_portability_quarantine(
         allocation_multiplier=0.0,
         shadow_only=True,
     )
+    sandbox_rank_eligible = bool(quarantine.get("sandbox_rank_eligible"))
     neutral_score = _as_float(quarantine.get("neutral_score"), 0.0)
     candidate["pre_portability_quarantine_score"] = pre_quarantine_score
-    candidate["score"] = min(pre_quarantine_score, neutral_score)
-    candidate["paper_score_multiplier"] = 0.0
-    candidate["paper_score_eligible"] = False
-    candidate["paper_rank_eligible"] = False
+    candidate["score"] = pre_quarantine_score if sandbox_rank_eligible else min(pre_quarantine_score, neutral_score)
+    candidate["paper_score_multiplier"] = 1.0 if sandbox_rank_eligible else 0.0
+    candidate["paper_score_eligible"] = sandbox_rank_eligible
+    candidate["paper_rank_eligible"] = sandbox_rank_eligible
+    candidate["promotion_eligible"] = False
     candidate["paper_fill_allowed"] = False
     candidate["paper_allocation_multiplier"] = 0.0
     candidate["candidate_reject_reason"] = "paper_cross_family_portability_quarantine"
     reliability["paper_portability_quarantine"] = dict(quarantine)
     reliability["pre_quarantine_score"] = pre_quarantine_score
-    reliability["paper_score_multiplier"] = 0.0
-    reliability["paper_rank_eligible"] = False
+    reliability["paper_score_multiplier"] = candidate["paper_score_multiplier"]
+    reliability["paper_rank_eligible"] = sandbox_rank_eligible
+    reliability["maximum_stage"] = quarantine.get("maximum_stage")
     candidate["strategy_reliability"] = reliability
     _append_note(candidate, f"paper_portability_quarantine:{quarantine['reason']}")
     return reliability
@@ -3167,6 +3201,16 @@ def _hydrate_portability_paper_evidence(candidates: list[dict], conn: Any | None
             "evidence_source": "persisted_paper_signal_stats",
             "cost_basis": "realized_paper_pnl_bps",
         }
+        target_review = paper_only_proxy_frontier_target_evidence_review(candidate)
+        if target_review.get("applies"):
+            target_surface = target_review.get("target_surface")
+            candidate["target_surface_paper_evidence"] = {
+                **candidate["destination_family_paper_stats"],
+                "paper_only": True,
+                "target_surface": target_surface,
+                "target_venue": str(candidate.get("venue") or "").strip(),
+                "quality_pass_rate": stats.get("win_rate"),
+            }
 
 
 def apply_strategy_reliability(
