@@ -1505,6 +1505,73 @@ def _set_score(candidate: dict, delta: float) -> None:
     candidate["score"] = round(max(0.0, min(100.0, original + delta)), 3)
 
 
+def _remove_invalid_proxy_confirmation(candidate: dict) -> dict[str, Any] | None:
+    """Remove invalid Yahoo proxy influence while retaining the candidate."""
+
+    if candidate.get("proxy_valid_for_reuse") is not False:
+        return None
+    original_score = _as_float(candidate.get("score"), 0.0)
+    score_before = _maybe_float(candidate.get("score_before_proxy_confirmation"))
+    contribution_fields = (
+        "proxy_confirmation_score_boost",
+        "proxy_confirmation_boost",
+        "yahoo_proxy_score_contribution",
+        "proxy_momentum_score_contribution",
+        "proxy_score_contribution",
+    )
+    removed_contribution = sum(
+        max(0.0, numeric)
+        for field in contribution_fields
+        for numeric in [_maybe_float(candidate.get(field))]
+        if numeric is not None
+    )
+    adjusted_score = score_before if score_before is not None else original_score - removed_contribution
+    if "score" in candidate:
+        candidate["score"] = round(max(0.0, min(original_score, adjusted_score)), 3)
+    raw_proxy_confirmation = {
+        field: candidate.get(field)
+        for field in (
+            "proxy_confirmed",
+            "proxy_confirmation_score",
+            "yahoo_proxy_confirmed",
+            "yahoo_proxy_confirmation_score",
+            "proxy_momentum_confirmed",
+            "proxy_momentum_confirmation_score",
+            *contribution_fields,
+        )
+        if field in candidate
+    }
+    for field in ("proxy_confirmed", "yahoo_proxy_confirmed", "proxy_momentum_confirmed"):
+        if field in candidate:
+            candidate[field] = False
+    for field in (
+        "proxy_confirmation_score",
+        "yahoo_proxy_confirmation_score",
+        "proxy_momentum_confirmation_score",
+        *contribution_fields,
+    ):
+        if field in candidate:
+            candidate[field] = 0.0
+    candidate["effective_proxy_confirmation_weight"] = 0.0
+    candidate["propagated_momentum_contribution"] = 0.0
+    candidate["proxy_confirmation_used"] = False
+    detail = {
+        "paper_only": True,
+        "applied": True,
+        "reason": "proxy_invalid_for_reuse",
+        "original_score": original_score,
+        "final_score": candidate.get("score", original_score),
+        "removed_score_contribution": round(
+            max(0.0, original_score - _as_float(candidate.get("score"), original_score)), 3
+        ),
+        "effective_proxy_confirmation_weight": 0.0,
+        "raw_proxy_confirmation": raw_proxy_confirmation,
+    }
+    candidate["paper_proxy_reuse_scoring_gate"] = detail
+    _append_note(candidate, "paper_proxy_reuse_gate:confirmation_removed")
+    return detail
+
+
 def _maybe_float(value: Any) -> float | None:
     try:
         if value in (None, ""):
@@ -2384,6 +2451,8 @@ def apply_strategy_reliability(
 ) -> tuple[list[dict], dict]:
     """Annotate candidates with bounded paper-only reliability controls."""
 
+    for candidate in candidates:
+        _remove_invalid_proxy_confirmation(candidate)
     if settings is not None and not settings.get("strategy_reliability", {}).get("enabled", True):
         quarantined = [
             record

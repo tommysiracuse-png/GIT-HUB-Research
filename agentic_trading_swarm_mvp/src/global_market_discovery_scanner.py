@@ -26,6 +26,7 @@ from global_proxy_scanner import (
 )
 from research_worker import DEFAULT_GLOBAL_DISCOVERY_SEEDS, normalize_market_candidate
 from scan_batch import ScanBatch, observation_from_candidate
+from yahoo_proxy_reuse import evaluate_yahoo_proxy_reuse
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -611,6 +612,7 @@ def _surface_signal(
 def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], settings: dict | None = None) -> dict[str, Any] | None:
     symbol = str(proxy["symbol"])
     chart = _cached_chart(symbol)
+    reuse_gate = evaluate_yahoo_proxy_reuse(chart, settings)
     meta = chart.get("meta", {})
     quote = chart.get("indicators", {}).get("quote", [{}])[0]
     pairs = valid_pairs(quote.get("close") or [], quote.get("volume") or [])
@@ -642,7 +644,10 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
         strategy_variant = "legacy_global_discovery_momentum_v1"
         reject_reason = None
         benchmark_context = {}
-    if session_status == "closed":
+    if not reuse_gate["proxy_valid_for_reuse"]:
+        direction = "watch_only"
+        reject_reason = f"proxy_invalid_for_reuse:{reuse_gate['reason'] or 'unknown'}"
+    elif session_status == "closed":
         direction = "watch_only"
         reject_reason = "market_closed"
     elif stale_minutes > float(_cfg(settings).get("watch_only_stale_minutes", 180)):
@@ -706,6 +711,8 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
         "session_status": session_status,
         "max_entry_stale_minutes": 90.0,
         "proxy_quality_status": "verified_proxy" if session_status in {"open", "unknown"} and stale_minutes <= 90.0 else "unavailable",
+        "proxy_valid_for_reuse": reuse_gate["proxy_valid_for_reuse"],
+        "proxy_reuse_gate": reuse_gate,
         "benchmark_context": benchmark_context,
         "score": score,
         "market_key": f"global_discovery|{_venue_key(venue)}",

@@ -22,6 +22,7 @@ import urllib.request
 
 from scan_batch import ScanBatch, observation_from_candidate
 from paper_context_cost import annotate_paper_context_cost
+from yahoo_proxy_reuse import evaluate_yahoo_proxy_reuse
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -109,6 +110,8 @@ def feasibility(direction: str, settings: dict) -> dict:
 
 def build_candidate(item: dict, settings: dict) -> dict | None:
     chart = fetch_chart(item["symbol"])
+    decision_time = dt.datetime.now(dt.timezone.utc)
+    reuse_gate = evaluate_yahoo_proxy_reuse(chart, settings, now=decision_time)
     meta = chart.get("meta", {})
     quote = chart.get("indicators", {}).get("quote", [{}])[0]
     closes = quote.get("close") or []
@@ -126,7 +129,6 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
     recent_dollar_volume = sum(price * volume for price, volume in pairs[-27:])
     liq = liquidity_score(recent_dollar_volume)
     spread = estimated_spread_bps(liq)
-    decision_time = dt.datetime.now(dt.timezone.utc)
     last_ts = timestamps[-1] if timestamps else int(time.time())
     last_seen = dt.datetime.fromtimestamp(last_ts, tz=dt.timezone.utc)
     stale_minutes = (decision_time - last_seen).total_seconds() / 60.0
@@ -173,6 +175,8 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
         "provider_age_seconds": round(max(0.0, (decision_time - last_seen).total_seconds()), 3),
         "entry_price_convention": "decision_time_last_bar_price",
         "stale_minutes": round(stale_minutes, 1),
+        "proxy_valid_for_reuse": reuse_gate["proxy_valid_for_reuse"],
+        "proxy_reuse_gate": reuse_gate,
         "score": score,
         "risk_notes": [
             "paper-trade only",

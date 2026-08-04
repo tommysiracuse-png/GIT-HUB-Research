@@ -615,6 +615,9 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
     """
 
     containers = [item for item in (record, profile) if isinstance(item, dict)]
+    for item in tuple(containers):
+        if isinstance(item.get("proxy_reuse_gate"), dict):
+            containers.append(item["proxy_reuse_gate"])
 
     def _lookup(*keys):
         for container in containers:
@@ -823,6 +826,9 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
     session_allowed = source_session_open is True or delayed_mode_allowed
 
     reasons = []
+    explicit_reuse_valid = _bool(_lookup("proxy_valid_for_reuse"))
+    if explicit_reuse_valid is False:
+        reasons.append("proxy_invalid_for_reuse")
     if source_age is None:
         reasons.append("missing_source_quote_timestamp")
     elif source_age > max_source_age:
@@ -858,6 +864,7 @@ def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now
         "input_momentum_contribution": raw_contribution,
         "propagated_momentum_contribution": 0.0 if blocked else raw_contribution,
         "momentum_state": "neutral" if blocked else "propagated",
+        "proxy_valid_for_reuse": False if blocked else explicit_reuse_valid,
     }
 
 

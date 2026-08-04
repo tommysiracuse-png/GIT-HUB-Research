@@ -1157,6 +1157,8 @@ def _matches_logic(candidate: dict, logic: dict, risk_gates: dict, settings: dic
     if candidate.get("strategy_lab_id"):
         return False, ["already_strategy_lab_candidate"]
     reasons = []
+    if candidate.get("proxy_valid_for_reuse") is False:
+        reasons.append("proxy_invalid_for_reuse")
     allowed_trade_types = _as_list(logic.get("trade_types") or logic.get("source_trade_types"))
     allowed_venues = _as_list(logic.get("venues") or logic.get("allowed_venues"))
     allowed_directions = _as_list(logic.get("directions") or logic.get("allowed_directions"))

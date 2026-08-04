@@ -5641,6 +5641,7 @@ def paper_only_yahoo_proxy_crypto_momentum_gate(
     destination_surface: str = "crypto",
     source_family: str = "yahoo_proxy",
     feature_family: str = "global_proxy_momentum",
+    proxy_valid_for_reuse: bool | None = None,
 ) -> dict:
     """Return the effective Yahoo momentum contribution for a crypto route.
 
@@ -5664,6 +5665,7 @@ def paper_only_yahoo_proxy_crypto_momentum_gate(
             "max_source_quote_age_seconds": max_source_quote_age_seconds,
             "max_destination_proxy_age_seconds": max_destination_proxy_age_seconds,
             "momentum_contribution": momentum_contribution,
+            "proxy_valid_for_reuse": proxy_valid_for_reuse,
         },
         now=evaluated_at,
     )
@@ -5692,6 +5694,7 @@ def paper_only_proxy_signal_freshness_gate(
     destination_proxy_age_ms: float | None = None,
     max_destination_proxy_age_ms: float | None = None,
     momentum_contribution: float | None = None,
+    proxy_valid_for_reuse: bool | None = None,
 ) -> dict:
     """Fail-closed paper-only freshness gate for proxy-backed signal contexts."""
 
@@ -5756,6 +5759,8 @@ def paper_only_proxy_signal_freshness_gate(
         }
 
     fail_closed_reasons = []
+    if proxy_valid_for_reuse is False:
+        fail_closed_reasons.append("proxy_invalid_for_reuse")
     proxy_bar_age_ms = None
     if latest_bar_timestamp_ms is None:
         fail_closed_reasons.append("missing_latest_bar_timestamp")
@@ -5840,6 +5845,7 @@ def paper_only_proxy_signal_freshness_gate(
         "input_momentum_contribution": raw_contribution,
         "propagated_momentum_contribution": 0.0 if not eligible else raw_contribution,
         "momentum_state": "neutral" if not eligible else "propagated",
+        "proxy_valid_for_reuse": eligible if proxy_valid_for_reuse is None else bool(proxy_valid_for_reuse and eligible),
         "require_monotonic_updates": require_monotonic,
         "monotonic_updates": monotonic_updates,
         "latest_bar_timestamp_ms": latest_bar_timestamp_ms,
