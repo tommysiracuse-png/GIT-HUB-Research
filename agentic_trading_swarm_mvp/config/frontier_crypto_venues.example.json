@@ -14,7 +14,11 @@
     "frontier_symbols_per_venue": 40,
     "frontier_max_listing_count": 3,
     "min_frontier_quote_volume_usd": 25000,
-    "min_cross_venue_count": 2
+    "min_cross_venue_count": 2,
+    "regional_fx_normalization_enabled": true,
+    "regional_fx_require_fresh_reference": true,
+    "regional_fx_max_age_seconds": 21600,
+    "regional_fx_stale_confidence_haircut": 0.35
   },
   "paper_only_rules": {
     "watchlist_promotion": "two_step_confirm",

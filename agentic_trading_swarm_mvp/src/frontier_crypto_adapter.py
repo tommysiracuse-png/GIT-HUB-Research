@@ -7872,6 +7872,12 @@ def _base_observation(target: dict, result: dict, symbol: str | None = None) -> 
         "quote_volume_24h": None,
         "spread_bps": None,
         "usd_normalized_last": None,
+        "native_quote_currency": quote,
+        "canonical_quote_currency": None,
+        "canonical_normalized_price": None,
+        "fx_source": None,
+        "fx_age_seconds": None,
+        "suppression_reason": None,
         "quote_normalization_status": "not_normalized",
         "quote_normalization_source": None,
         "local_quote_observe_only": False,
@@ -8838,16 +8844,53 @@ def _is_supported_observation(row: dict, registry: dict) -> bool:
 
 
 def _comparison_price(row: dict) -> float:
+    if row.get("canonical_normalized_price") not in (None, ""):
+        return float(row.get("canonical_normalized_price") or 0.0)
     if row.get("usd_normalized_last") not in (None, ""):
         return float(row.get("usd_normalized_last") or 0.0)
-    return float(row.get("last") or 0.0)
+    # Native prices are directly comparable only for canonical USD-like quotes.
+    # A local-fiat or unknown quote must never leak into dislocation scoring.
+    if str(row.get("quote") or "").upper() in USD_LIKE_QUOTES:
+        return float(row.get("last") or 0.0)
+    return 0.0
+
+
+def _reference_age_seconds(row: dict) -> float | None:
+    age = as_float(row.get("freshness_age_seconds"), None)
+    if age is not None:
+        return max(0.0, float(age))
+    timestamp = row.get("exchange_timestamp") or row.get("last_checked_at")
+    if not timestamp:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds())
+
+
+def _set_quote_suppression(output: dict, status: str, reason: str) -> None:
+    output["usd_normalized_last"] = None
+    output["canonical_normalized_price"] = None
+    output["canonical_quote_currency"] = None
+    output["comparison_price"] = None
+    output["quote_normalization_status"] = status
+    output["local_quote_observe_only"] = True
+    output["suppression_reason"] = reason
 
 
 def _normalize_regional_quotes(
     observations: list[dict],
     fx_references: dict[str, dict] | None = None,
+    policy: dict | None = None,
 ) -> list[dict]:
     fx_references = fx_references or {}
+    policy = policy or DEFAULT_REGISTRY["filters"]
+    normalization_enabled = bool(policy.get("regional_fx_normalization_enabled", True))
+    require_fresh_reference = bool(policy.get("regional_fx_require_fresh_reference", True))
+    max_fx_age_seconds = float(policy.get("regional_fx_max_age_seconds", 21_600))
     by_venue_quote: dict[tuple[str, str], dict] = {}
     for row in observations:
         if row.get("data_status") != "reachable":
@@ -8864,23 +8907,67 @@ def _normalize_regional_quotes(
     normalized = []
     for row in observations:
         output = dict(row)
-        quote = str(output.get("quote") or "")
-        base = str(output.get("base") or "")
+        quote = str(output.get("quote") or "").upper()
+        base = str(output.get("base") or "").upper()
         last = float(output.get("last") or 0.0)
-        output["comparison_price"] = last
+        output.update(
+            {
+                "native_quote_currency": quote or None,
+                "canonical_quote_currency": None,
+                "canonical_normalized_price": None,
+                "fx_source": None,
+                "fx_age_seconds": None,
+                "suppression_reason": None,
+                "paper_only_quote_normalization": True,
+                "conversion_path_validated": False,
+                "product_metadata_validated": bool(
+                    base
+                    and quote
+                    and base != quote
+                    and output.get("symbol")
+                    and output.get("instrument_id")
+                    and last > 0
+                ),
+            }
+        )
+        output["comparison_price"] = None
+        if not output["product_metadata_validated"]:
+            _set_quote_suppression(output, "invalid_product_metadata", "invalid_product_metadata")
+            normalized.append(output)
+            continue
         if quote in USD_LIKE_QUOTES:
             output["usd_normalized_last"] = last
+            output["canonical_normalized_price"] = last
+            output["canonical_quote_currency"] = "USD"
+            output["comparison_price"] = last
             output["quote_normalization_status"] = "usd_like"
             output["quote_normalization_source"] = quote
+            output["fx_source"] = f"identity:{quote}"
+            output["fx_age_seconds"] = 0.0
+            output["conversion_path_validated"] = True
             output["local_quote_observe_only"] = False
         elif quote in REGIONAL_FIAT_QUOTES:
+            if not normalization_enabled:
+                _set_quote_suppression(output, "normalization_disabled", "fx_normalization_disabled")
+                normalized.append(output)
+                continue
             fx = by_venue_quote.get((str(output.get("venue")), quote))
             if fx and last > 0 and float(fx.get("last") or 0.0) > 0:
                 fx_price = float(fx["last"])
+                fx_age = _reference_age_seconds(fx)
+                output["quote_normalization_source"] = fx.get("instrument_id")
+                output["fx_source"] = fx.get("instrument_id")
+                output["fx_age_seconds"] = round(fx_age, 3) if fx_age is not None else None
+                if require_fresh_reference and (fx_age is None or fx_age > max_fx_age_seconds):
+                    _set_quote_suppression(output, "stale_fx_reference", "stale_fx_reference")
+                    normalized.append(output)
+                    continue
                 output["usd_normalized_last"] = round(last / fx_price, 12)
+                output["canonical_normalized_price"] = output["usd_normalized_last"]
+                output["canonical_quote_currency"] = "USD"
                 output["comparison_price"] = output["usd_normalized_last"]
                 output["quote_normalization_status"] = "same_venue_stablecoin_reference"
-                output["quote_normalization_source"] = fx.get("instrument_id")
+                output["conversion_path_validated"] = True
                 output["local_quote_observe_only"] = base in STABLE_OR_FIAT_BASES
                 if output.get("quote_volume_24h") is not None:
                     output["local_quote_volume_24h"] = output.get("quote_volume_24h")
@@ -8888,30 +8975,45 @@ def _normalize_regional_quotes(
             elif quote in fx_references and last > 0 and float(fx_references[quote].get("rate") or 0.0) > 0:
                 ref = fx_references[quote]
                 fx_price = float(ref["rate"])
-                output["usd_normalized_last"] = round(last / fx_price, 12)
-                output["comparison_price"] = output["usd_normalized_last"]
-                output["quote_normalization_status"] = "external_fx_reference"
+                fx_age = as_float(ref.get("age_seconds"), None)
                 output["quote_normalization_source"] = f"{ref.get('provider')}:USD/{quote}"
+                output["fx_source"] = output["quote_normalization_source"]
+                output["fx_age_seconds"] = round(float(fx_age), 3) if fx_age is not None else None
                 output["fx_reference_rate"] = fx_price
                 output["fx_reference_provider"] = ref.get("provider")
-                output["fx_reference_age_seconds"] = ref.get("age_seconds")
+                output["fx_reference_age_seconds"] = output["fx_age_seconds"]
                 output["fx_reference_source_url"] = ref.get("source_url")
+                if require_fresh_reference and (
+                    bool(ref.get("stale"))
+                    or fx_age is None
+                    or float(fx_age) > max_fx_age_seconds
+                ):
+                    _set_quote_suppression(output, "stale_fx_reference", "stale_fx_reference")
+                    normalized.append(output)
+                    continue
+                output["usd_normalized_last"] = round(last / fx_price, 12)
+                output["canonical_normalized_price"] = output["usd_normalized_last"]
+                output["canonical_quote_currency"] = "USD"
+                output["comparison_price"] = output["usd_normalized_last"]
+                output["quote_normalization_status"] = "external_fx_reference"
+                output["conversion_path_validated"] = True
                 output["local_quote_observe_only"] = base in STABLE_OR_FIAT_BASES
                 if output.get("quote_volume_24h") is not None:
                     output["local_quote_volume_24h"] = output.get("quote_volume_24h")
                     output["quote_volume_24h"] = round(float(output["quote_volume_24h"]) / fx_price, 3)
             else:
-                output["usd_normalized_last"] = None
-                output["quote_normalization_status"] = "missing_same_venue_stablecoin_reference"
                 output["quote_normalization_source"] = None
-                output["local_quote_observe_only"] = True
+                _set_quote_suppression(
+                    output,
+                    "missing_same_venue_stablecoin_reference",
+                    "missing_fx_conversion_path",
+                )
                 output["notes"] = [
                     *list(output.get("notes") or []),
                     "Regional fiat quote observed, but no same-venue stablecoin/fiat reference was available.",
                 ]
         else:
-            output["quote_normalization_status"] = "unsupported_quote"
-            output["local_quote_observe_only"] = True
+            _set_quote_suppression(output, "unsupported_quote", "unmatched_quote_currency")
         normalized.append(output)
     return normalized
 
@@ -9026,7 +9128,11 @@ def scan_venues(
                     parsed[0]["notes"].append("Public endpoint blocked from this machine; captured as access evidence.")
         observations.extend(_finalize_observation(row) for row in parsed)
     fx_references = get_regional_fx_references(conn, settings or {})
-    observations = _normalize_regional_quotes(observations, fx_references=fx_references)
+    observations = _normalize_regional_quotes(
+        observations,
+        fx_references=fx_references,
+        policy=registry.get("filters", {}),
+    )
     required_inst_ids = required_inst_ids or set()
     supported = [
         row
@@ -9666,10 +9772,19 @@ def _candidate_from_observation(
         "thesis": "frontier crypto venue map price/funding dislocation candidate",
         "last": round(last, 8),
         "usd_normalized_last": observation.get("usd_normalized_last"),
+        "native_quote_currency": observation.get("native_quote_currency") or observation.get("quote"),
+        "canonical_quote_currency": observation.get("canonical_quote_currency"),
+        "canonical_normalized_price": observation.get("canonical_normalized_price"),
         "comparison_price": round(comparison_price, 8) if comparison_price else None,
         "reference_price": round(float(reference_price or 0.0), 8),
         "quote_normalization_status": observation.get("quote_normalization_status"),
         "quote_normalization_source": observation.get("quote_normalization_source"),
+        "fx_source": observation.get("fx_source"),
+        "fx_age_seconds": observation.get("fx_age_seconds"),
+        "suppression_reason": observation.get("suppression_reason"),
+        "product_metadata_validated": bool(observation.get("product_metadata_validated")),
+        "conversion_path_validated": bool(observation.get("conversion_path_validated")),
+        "paper_only_quote_normalization": bool(observation.get("paper_only_quote_normalization")),
         "fx_reference_rate": observation.get("fx_reference_rate"),
         "fx_reference_provider": observation.get("fx_reference_provider"),
         "fx_reference_age_seconds": observation.get("fx_reference_age_seconds"),
@@ -9895,6 +10010,11 @@ def summarize(
     by_quote_normalization = collections.Counter(
         row.get("quote_normalization_status", "unknown") for row in observations
     )
+    by_quote_suppression = collections.Counter(
+        row.get("suppression_reason")
+        for row in observations
+        if row.get("suppression_reason")
+    )
     route_status = collections.Counter((row.get("execution_feasibility") or {}).get("status", "unknown") for row in candidates)
     route_blockers: collections.Counter[str] = collections.Counter()
     quality_statuses = collections.Counter(row.get("quality_status", "unknown") for row in observations)
@@ -9958,6 +10078,7 @@ def summarize(
         "by_region": dict(by_region),
         "by_quote": dict(by_quote),
         "by_quote_normalization": dict(by_quote_normalization),
+        "by_quote_suppression": dict(by_quote_suppression),
         "by_route_blocker": dict(route_blockers),
         "known_quality_by_region": _quality_rates(observations, "region"),
         "known_quality_by_venue": _quality_rates(observations, "venue"),
@@ -10054,6 +10175,11 @@ def summarize(
             "route_status": (row.get("execution_feasibility") or {}).get("status"),
             "route_blockers": (row.get("execution_feasibility") or {}).get("route_blockers", []),
             "quote_normalization_status": row.get("quote_normalization_status"),
+            "native_quote_currency": row.get("native_quote_currency") or row.get("quote"),
+            "canonical_normalized_price": row.get("canonical_normalized_price"),
+            "fx_source": row.get("fx_source"),
+            "fx_age_seconds": row.get("fx_age_seconds"),
+            "suppression_reason": row.get("suppression_reason"),
             "marketability_gate_status": row.get("marketability_gate_status"),
             "marketability_failed_checks": (row.get("marketability_gate") or {}).get("failed_checks", []),
         }
@@ -10073,6 +10199,7 @@ def summarize(
         "by_region": dict(by_region),
         "by_quote": dict(by_quote),
         "by_quote_normalization": dict(by_quote_normalization),
+        "by_quote_suppression": dict(by_quote_suppression),
         "regional_observation_count": sum(1 for row in observations if row.get("quote") in REGIONAL_FIAT_QUOTES),
         "regional_candidate_count": sum(1 for row in candidates if row.get("quote") in REGIONAL_FIAT_QUOTES),
         "active_paper_review_candidate_count": active_candidate_count,
@@ -10171,6 +10298,7 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Regions: `{summary.get('by_region', {})}`")
     lines.append(f"- Quotes: `{summary.get('by_quote', {})}`")
     lines.append(f"- Quote normalization: `{summary.get('by_quote_normalization', {})}`")
+    lines.append(f"- Quote suppression: `{summary.get('by_quote_suppression', {})}`")
     lines.extend(["", "## Route Blockers", ""])
     blockers = summary.get("by_route_blocker", {})
     if not blockers:
@@ -10235,6 +10363,8 @@ def _markdown(report: dict) -> str:
             f"dev=`{row.get('venue_deviation_bps')}`bps edge=`{row.get('edge_bps_estimate')}`bps "
             f"quality=`{row.get('quality_score')}` action=`{row.get('quality_action')}` "
             f"quote_norm=`{row.get('quote_normalization_status')}` "
+            f"native_quote=`{row.get('native_quote_currency')}` canonical_price=`{row.get('canonical_normalized_price')}` "
+            f"fx_source=`{row.get('fx_source')}` fx_age=`{row.get('fx_age_seconds')}` suppress=`{row.get('suppression_reason')}` "
             f"route=`{row.get('route_status')}` blockers={row.get('route_blockers')}"
         )
     lines.extend(["", "## Venue Health Sample", ""])
@@ -10243,6 +10373,8 @@ def _markdown(report: dict) -> str:
             f"- `{row['venue']}` `{row['symbol']}` `{row['market_type']}` "
             f"status=`{row['data_status']}` http=`{row['http_status']}` latency=`{row['latency_ms']}`ms "
             f"last=`{row.get('last')}` spread=`{row.get('spread_bps')}`bps volume=`{row.get('quote_volume_24h')}` "
+            f"native_quote=`{row.get('native_quote_currency')}` canonical_price=`{row.get('canonical_normalized_price')}` "
+            f"fx_source=`{row.get('fx_source')}` fx_age=`{row.get('fx_age_seconds')}` suppress=`{row.get('suppression_reason')}` "
             f"quality=`{row.get('quality_score')}` qstatus=`{row.get('quality_status')}` anomalies={row.get('anomaly_flags', [])}"
         )
     return "\n".join(lines) + "\n"

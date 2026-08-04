@@ -293,11 +293,66 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         ready = frontier._candidate_from_observation(luno, cfg, 99_000.0, 2)
 
         self.assertAlmostEqual(luno["usd_normalized_last"], 100_000.0)
+        self.assertEqual(luno["native_quote_currency"], "ZAR")
+        self.assertEqual(luno["canonical_quote_currency"], "USD")
+        self.assertAlmostEqual(luno["canonical_normalized_price"], 100_000.0)
+        self.assertEqual(luno["fx_source"], "ExchangeRate-API Open:USD/ZAR")
+        self.assertEqual(luno["fx_age_seconds"], 10.0)
+        self.assertIsNone(luno["suppression_reason"])
+        self.assertTrue(luno["product_metadata_validated"])
+        self.assertTrue(luno["conversion_path_validated"])
         self.assertEqual(luno["quote_normalization_status"], "external_fx_reference")
         self.assertEqual(candidate["regional_candidate_gate_status"], "insufficient_verified_depth_snapshots")
         self.assertTrue(candidate["paper_entry_blocked"])
         self.assertEqual(ready["regional_candidate_gate_status"], "passed")
         self.assertFalse(ready["paper_entry_blocked"])
+
+    def test_stale_external_fx_is_quarantined_before_reference_scoring(self) -> None:
+        cfg = settings()
+        local = self._obs("BUDA", "BTC-CLP", "BTC", "CLP", 90_000_000.0, 180_000_000, region="LATAM")
+        peer = self._obs("COINBASE", "BTC-USD", "BTC", "USD", 100_000.0, 10_000_000)
+
+        normalized = frontier._normalize_regional_quotes(
+            [local, peer],
+            fx_references={
+                "CLP": {
+                    "rate": 900.0,
+                    "provider": "public_fx",
+                    "age_seconds": 61.0,
+                    "source_url": "https://example.test/fx",
+                }
+            },
+            policy={
+                "regional_fx_normalization_enabled": True,
+                "regional_fx_require_fresh_reference": True,
+                "regional_fx_max_age_seconds": 60.0,
+            },
+        )
+        buda = next(row for row in normalized if row["venue"] == "BUDA")
+        candidate = frontier._candidate_from_observation(buda, cfg, 100_000.0, 2)
+
+        self.assertEqual(buda["quote_normalization_status"], "stale_fx_reference")
+        self.assertEqual(buda["suppression_reason"], "stale_fx_reference")
+        self.assertEqual(buda["fx_age_seconds"], 61.0)
+        self.assertIsNone(buda["canonical_normalized_price"])
+        self.assertEqual(frontier._comparison_price(buda), 0.0)
+        self.assertNotIn("BTC", frontier._reference_prices(normalized, cfg))
+        self.assertEqual(candidate["direction"], "watch_only")
+        self.assertEqual(candidate["suppression_reason"], "stale_fx_reference")
+        self.assertTrue(candidate["paper_entry_blocked"])
+
+    def test_unmatched_quote_and_invalid_product_metadata_fail_closed(self) -> None:
+        unmatched = self._obs("LOCAL", "BTC-XYZ", "BTC", "XYZ", 100_000.0, 1_000_000)
+        invalid = self._obs("LOCAL", "BROKEN", "", "ZAR", 1_800_000.0, 1_000_000)
+
+        unmatched_row, invalid_row = frontier._normalize_regional_quotes([unmatched, invalid])
+
+        self.assertEqual(unmatched_row["suppression_reason"], "unmatched_quote_currency")
+        self.assertEqual(unmatched_row["quote_normalization_status"], "unsupported_quote")
+        self.assertEqual(frontier._comparison_price(unmatched_row), 0.0)
+        self.assertEqual(invalid_row["suppression_reason"], "invalid_product_metadata")
+        self.assertFalse(invalid_row["product_metadata_validated"])
+        self.assertTrue(invalid_row["local_quote_observe_only"])
 
     def test_selection_filters_stables_and_unsupported_quotes(self) -> None:
         registry = {
