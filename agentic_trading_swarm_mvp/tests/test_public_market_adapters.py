@@ -157,6 +157,7 @@ class PublicAdapterParserTests(unittest.TestCase):
             "polymarket_sports_websocket",
             "b3_public_data_hub",
             "stock_exchange_of_thailand_yuanta_securities_thailand",
+            "republican_stock_exchange_toshkent_public",
         }
         self.assertTrue(expected <= set(discover_adapters()))
 
