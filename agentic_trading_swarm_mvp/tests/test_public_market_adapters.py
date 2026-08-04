@@ -45,6 +45,11 @@ from adapters.venues.e_auksion_district_hokimiyat_notices import (
     EAuksionDistrictHokimiyatNoticesAdapter,
     parse_e_auksion_lots,
 )
+from adapters.venues.ethiopian_securities_exchange import (
+    LISTED_COMPANIES_URL as ESX_LISTED_COMPANIES_URL,
+    EthiopianSecuritiesExchangeAdapter,
+    parse_esx_equity_listings,
+)
 from adapters.venues.kase_futures import parse_kase_futures
 from adapters.venues.kalshi import (
     DOCS_URL as KALSHI_DOCS_URL,
@@ -152,6 +157,7 @@ class PublicAdapterParserTests(unittest.TestCase):
             "bahrain_cross_listings_catalog",
             "eex_german_nehs_public",
             "e_auksion_district_hokimiyat_notices",
+            "ethiopian_securities_exchange",
             "norwegian_block_exchange_nbx_public",
             "kalshi_public_prediction_markets",
             "polymarket_sports_websocket",
@@ -160,6 +166,116 @@ class PublicAdapterParserTests(unittest.TestCase):
             "republican_stock_exchange_toshkent_public",
         }
         self.assertTrue(expected <= set(discover_adapters()))
+
+    def test_esx_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "ethiopian_securities_exchange"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsNotNone(adapter)
+        self.assertEqual("ESX", adapter.info.venue)
+        self.assertEqual(ESX_LISTED_COMPANIES_URL, adapter.info.docs_url)
+        self.assertIn("equity_listing_catalog", adapter.info.capabilities)
+        self.assertNotIn("ticker", adapter.info.capabilities)
+
+    def test_esx_parser_normalizes_specified_official_equity_listings(self) -> None:
+        document = """
+        <html><body><table>
+          <thead><tr>
+            <th>Name</th><th>Symbol</th><th>Sector</th>
+            <th>Date Listed</th><th>Date Incorporated</th>
+          </tr></thead>
+          <tbody>
+            <tr><td><a href="/directory/bank-of-abyssinia-share-company/">Bank of Abyssinia Share Company</a></td><td>BOAX</td><td>Financial Services</td><td>2026-07-28</td><td>1996-02-16</td></tr>
+            <tr><td>Abay Bank Share Company</td><td>ABAYB</td><td>Financial Services</td><td>2026-06-25</td><td>2010-07-14</td></tr>
+            <tr><td>Ethio Telecom Share Company</td><td>TELE</td><td>Telecom Servicess</td><td>2026-05-26</td><td>2024-07-01</td></tr>
+            <tr><td>Awash Bank Share Company</td><td>AWAB</td><td>Financial Services</td><td>2026-04-23</td><td>1994-11-10</td></tr>
+            <tr><td>Older Issuer</td><td>OLDX</td><td>Other</td><td>2025-01-10</td><td>1997-06-11</td></tr>
+          </tbody>
+        </table></body></html>
+        """
+        rows = parse_esx_equity_listings(
+            document,
+            received_at="2026-08-04T12:00:00+00:00",
+        )
+
+        self.assertEqual(["BOAX", "ABAYB", "TELE", "AWAB"], [row["symbol"] for row in rows])
+        by_symbol = {row["symbol"]: row for row in rows}
+        self.assertEqual("ESX:EQUITY:BOAX", by_symbol["BOAX"]["inst_id"])
+        self.assertEqual("2026-07-28", by_symbol["BOAX"]["listed_date"])
+        self.assertEqual("Financial Services", by_symbol["ABAYB"]["sector"])
+        self.assertEqual("fresh", by_symbol["BOAX"]["freshness_state"])
+        self.assertEqual("stale", by_symbol["TELE"]["freshness_state"])
+        self.assertEqual("listed", by_symbol["AWAB"]["session_status"])
+        self.assertEqual("reachable", by_symbol["AWAB"]["fetch_status"])
+        self.assertEqual(ESX_LISTED_COMPANIES_URL, by_symbol["AWAB"]["source_url"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in rows))
+        self.assertTrue(all(row["last"] == 0.0 for row in rows))
+
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": document,
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 3.0,
+        }
+        with mock.patch(
+            "adapters.venues.ethiopian_securities_exchange.fetch_text",
+            return_value=result,
+        ):
+            batch = EthiopianSecuritiesExchangeAdapter().scan({})
+        self.assertEqual([], batch.candidates)
+        self.assertEqual(4, len(batch.observations))
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("fresh", batch.metadata["freshness_state"])
+        self.assertEqual(["fresh", "stale"], batch.metadata["freshness_states"])
+        self.assertEqual("listed", batch.metadata["session_state"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertTrue(batch.metadata["paper_only"])
+
+    def test_esx_adapter_preserves_parser_and_unavailable_fetch_evidence(self) -> None:
+        reachable = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>an unrelated ESX page</body></html>",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        unavailable = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T12:01:00+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 403",
+        }
+
+        with mock.patch(
+            "adapters.venues.ethiopian_securities_exchange.fetch_text",
+            return_value=reachable,
+        ):
+            parser_batch = EthiopianSecuritiesExchangeAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable",
+            parser_batch.metadata["fetch_status"]["listed_companies"]["fetch_status"],
+        )
+        self.assertIn("required headers", parser_batch.metadata["parser_failures"][0]["error"])
+        self.assertEqual("public_listing_parser_failure", parser_batch.observations[0]["candidate_reject_reason"])
+        self.assertTrue(parser_batch.observations[0]["parser_failure"])
+
+        with mock.patch(
+            "adapters.venues.ethiopian_securities_exchange.fetch_text",
+            return_value=unavailable,
+        ):
+            unavailable_batch = EthiopianSecuritiesExchangeAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual("blocked", unavailable_batch.observations[0]["fetch_status"])
+        self.assertEqual(ESX_LISTED_COMPANIES_URL, unavailable_batch.observations[0]["source_url"])
 
     def test_set_yuanta_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
         adapter_id = "stock_exchange_of_thailand_yuanta_securities_thailand"
@@ -1180,6 +1296,26 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
 
 
 class AdapterCapabilityTests(unittest.TestCase):
+    def test_esx_adapter_closes_listing_spec_without_quote_claims(self) -> None:
+        spec = {
+            "title": "Implement public adapter #1295: Ethiopian Securities Exchange",
+            "market_key": "global_discovery|Ethiopian Securities Exchange",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "Ethiopian Securities Exchange",
+                    "public_docs_url": ESX_LISTED_COMPANIES_URL,
+                    "asset_or_event": "ESX equity listings BOAX ABAYB TELE AWAB",
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("ethiopian_securities_exchange", match["adapter_id"])
+        self.assertNotIn("entry_quality_quote", match["available_capabilities"])
+        self.assertNotIn("ticker", match["available_capabilities"])
+
     def test_b3_adapter_closes_public_surface_spec_without_quote_claims(self) -> None:
         spec = {
             "title": "Implement public adapter #622: B3",
