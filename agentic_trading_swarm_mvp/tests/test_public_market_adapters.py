@@ -32,6 +32,14 @@ from adapters.venues.b3 import (
 )
 from adapters.venues.bahrain_cross_listings import cross_listing_observations
 from adapters.venues.bursa_derivatives import contract_observations
+from adapters.venues.dc_department_of_energy_environment import (
+    FINAL_SALES_URL as DC_SRC_FINAL_SALES_URL,
+    FOR_SALE_URL as DC_SRC_FOR_SALE_URL,
+    PROGRAM_RESOURCES_URL as DC_SRC_PROGRAM_RESOURCES_URL,
+    DcDepartmentOfEnergyEnvironmentAdapter,
+    parse_dc_src_final_sales,
+    parse_dc_src_for_sale,
+)
 from adapters.venues.european_energy_exchange_eex import (
     AUCTION_URL as EEX_AUCTION_URL,
     SALES_URL as EEX_SALES_URL,
@@ -164,8 +172,125 @@ class PublicAdapterParserTests(unittest.TestCase):
             "b3_public_data_hub",
             "stock_exchange_of_thailand_yuanta_securities_thailand",
             "republican_stock_exchange_toshkent_public",
+            "dc_department_of_energy_environment",
         }
         self.assertTrue(expected <= set(discover_adapters()))
+
+    def test_dc_doee_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "dc_department_of_energy_environment"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsNotNone(adapter)
+        self.assertEqual("DC_DOEE", adapter.info.venue)
+        self.assertEqual(DC_SRC_PROGRAM_RESOURCES_URL, adapter.info.docs_url)
+        self.assertIn("event_price_reference", adapter.info.capabilities)
+        self.assertIn("watershed", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+
+    def test_dc_doee_parsers_normalize_public_sale_and_listing_reports(self) -> None:
+        final_sales_xml = """
+        <qdbapi><errcode>0</errcode><errtext>No error</errtext><table>
+          <fields>
+            <field id="15"><label>Transfer Date</label></field>
+            <field id="51"><label>Watershed where SRCs are generated</label></field>
+            <field id="55"><label>Sewershed where SRCs are generated</label></field>
+            <field id="21"><label>Number of SRCs</label></field>
+            <field id="16"><label>Purchase price per SRC</label></field>
+            <field id="32"><label>Value of transfer (paid by buyer)</label></field>
+            <field id="90"><label>Transferred SRCs - BMP - Installation Date</label></field>
+            <field id="89"><label>Transferred SRCs - Type of Activity</label></field>
+            <field id="19"><label>Start serial number</label></field>
+            <field id="26"><label>End serial number</label></field>
+          </fields>
+          <records><record rid="734">
+            <f id="15">1785196800000</f><f id="51">Anacostia</f><f id="55">MS4</f>
+            <f id="21">12,500</f><f id="16">1.82</f><f id="32">22750</f>
+            <f id="90">1640995200000</f><f id="89">Voluntary</f>
+            <f id="19">SRC-2022-0001</f><f id="26">SRC-2022-12500</f>
+          </record></records>
+        </table></qdbapi>
+        """
+        for_sale_xml = """
+        <qdbapi><errcode>0</errcode><errtext>No error</errtext><table>
+          <fields>
+            <field id="10"><label>Number of SRCs for sale</label></field>
+            <field id="21"><label>Buyer's price</label></field>
+            <field id="100"><label>SRC Type</label></field>
+            <field id="16"><label>SRC Watershed</label></field>
+          </fields>
+          <records><record rid="91">
+            <f id="10">321884</f><f id="21">2.03</f><f id="100">High-Impact</f>
+            <f id="16">Anacostia, Rock Creek</f>
+          </record></records>
+        </table></qdbapi>
+        """
+
+        sales = parse_dc_src_final_sales(
+            final_sales_xml,
+            received_at="2026-08-04T12:00:00+00:00",
+        )
+        listings = parse_dc_src_for_sale(
+            for_sale_xml,
+            received_at="2026-08-04T12:00:00+00:00",
+        )
+
+        sale = sales[0]
+        self.assertEqual("DC_DOEE:SRC_SALE:734", sale["inst_id"])
+        self.assertEqual(1.82, sale["last"])
+        self.assertEqual(12500.0, sale["quantity_src"])
+        self.assertEqual("Anacostia", sale["watershed"])
+        self.assertEqual("MS4", sale["sewershed"])
+        self.assertEqual("2026-07-28", sale["transfer_date"])
+        self.assertEqual("fresh", sale["freshness_state"])
+        self.assertEqual("closed", sale["session_status"])
+        self.assertEqual(DC_SRC_FINAL_SALES_URL, sale["source_url"])
+        self.assertEqual("watch_only", sale["direction"])
+
+        listing = listings[0]
+        self.assertEqual("DC_DOEE:SRC_FOR_SALE:91", listing["inst_id"])
+        self.assertEqual(2.03, listing["buyer_price_per_src"])
+        self.assertEqual(321884.0, listing["quantity_src_for_sale"])
+        self.assertEqual(["Anacostia", "Rock Creek"], listing["watersheds"])
+        self.assertEqual("seller_listing_active", listing["session_status"])
+        self.assertEqual(DC_SRC_FOR_SALE_URL, listing["source_url"])
+        self.assertEqual("watch_only", listing["direction"])
+
+    def test_dc_doee_adapter_preserves_parser_and_fetch_evidence(self) -> None:
+        reachable_bad_schema = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<qdbapi><errcode>0</errcode><table /></qdbapi>",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        blocked = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T12:00:01+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch(
+            "adapters.venues.dc_department_of_energy_environment.fetch_text",
+            side_effect=[reachable_bad_schema, blocked],
+        ) as fetch:
+            batch = DcDepartmentOfEnergyEnvironmentAdapter().scan({})
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["final_sales"]["fetch_status"])
+        self.assertEqual("blocked", batch.metadata["fetch_status"]["for_sale"]["fetch_status"])
+        self.assertIn("required report fields", batch.metadata["parser_failures"][0]["error"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertFalse(batch.metadata["contact_fields_requested"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        self.assertTrue(any(row.get("parser_failure") for row in batch.observations))
+        requested_urls = [call.args[0] for call in fetch.call_args_list]
+        self.assertIn("clist=10.21.100.16", requested_urls[1])
+        self.assertTrue(all("token" not in url.lower() for url in requested_urls))
 
     def test_esx_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
         adapter_id = "ethiopian_securities_exchange"
@@ -1296,6 +1421,25 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
 
 
 class AdapterCapabilityTests(unittest.TestCase):
+    def test_dc_doee_adapter_closes_src_registry_price_spec(self) -> None:
+        spec = {
+            "title": "Implement public adapter #1254: DC DOEE SRC sale prices",
+            "market_key": "global_discovery|DC Department of Energy & Environment",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "DC Department of Energy & Environment",
+                    "public_docs_url": DC_SRC_PROGRAM_RESOURCES_URL,
+                    "asset_or_event": "SRC sale prices, quantity, watershed, and sewershed",
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("dc_department_of_energy_environment", match["adapter_id"])
+        self.assertIn("event_price_reference", match["available_capabilities"])
+
     def test_esx_adapter_closes_listing_spec_without_quote_claims(self) -> None:
         spec = {
             "title": "Implement public adapter #1295: Ethiopian Securities Exchange",
