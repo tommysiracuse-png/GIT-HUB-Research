@@ -328,6 +328,7 @@ DEFAULT_SETTINGS = {
             "propose_diagnostic_hypothesis",
             "propose_strategy_lab_experiment",
             "propose_code_change",
+            "spawn_agent",
         ],
     },
     "llm_swarm": {
@@ -339,6 +340,14 @@ DEFAULT_SETTINGS = {
         "write_fallback_recommendations_to_inbox": False,
         "cooldown_on_model_unavailable": True,
         "model_failure_cooldown_minutes": 60,
+    },
+    "dynamic_agents": {
+        "enabled": True,
+        "adaptive_concurrency": 8,
+        "minimum_concurrency": 1,
+        "latency_backoff_seconds": 120,
+        "memory_backoff_percent": 85,
+        "report_limit": 100,
     },
     "evolution_worker": {
         "enabled": True,

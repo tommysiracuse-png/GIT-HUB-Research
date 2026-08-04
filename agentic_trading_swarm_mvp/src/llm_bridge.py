@@ -34,6 +34,7 @@ from self_improvement_open_pack import IMPLEMENTED_STATUS as OPEN_PACK_IMPLEMENT
 from self_improvement_open_pack import is_duplicate_open_pack_text
 from recommendation_registry import registry_summary
 from strategy_lab import strategy_lab_summary
+from dynamic_agents import dynamic_agent_summary, ingest_spawn_agent_recommendation
 
 
 _strategy_lab_summary_original = strategy_lab_summary
@@ -1134,6 +1135,18 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             ),
             "paper_only_rule": "This creates experimental paper candidates only; deterministic outcomes decide promotion.",
         },
+        "agent_spec": {
+            "required_only_for": "spawn_agent",
+            "required_fields": [
+                "name", "objective", "triggers", "evidence_inputs", "memory_policy",
+                "model_tier", "allowed_actions", "success_measure",
+            ],
+            "trigger_fields": [
+                "always", "any_packet_paths", "all_packet_paths", "any_terms",
+                "all_terms", "conditions", "cooldown_minutes",
+            ],
+            "activation": "Persistent immediately; first eligible execution is the next swarm cycle.",
+        },
         "code_change": {
             "required_only_for": "propose_code_change",
             "required_actionable_fields": list(CODE_CHANGE_ACTIONABLE_FIELDS),
@@ -1248,6 +1261,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "strategy_reliability": _compact_strategy_reliability(payload.get("strategy_reliability", {})),
         "yahoo_counterfactual": payload.get("yahoo_counterfactual", {}),
         "strategy_lab": payload.get("strategy_lab") or strategy_lab_summary(conn),
+        "dynamic_agents": dynamic_agent_summary(conn),
         "market_admission_bridge": payload.get("market_admission_bridge", {}),
         "autonomous_builder": payload.get("autonomous_builder", {}),
         "recommendation_registry": registry_summary(conn),
@@ -1280,6 +1294,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
             "graphiti_export": str(RUNS_DIR / "graphiti_memory_export.jsonl"),
             "temporal_report": str(RUNS_DIR / "temporal_memory_report.json"),
             "langgraph_checkpoints": str(RUNS_DIR / "langgraph_checkpoints.sqlite"),
+            "dynamic_agents": str(RUNS_DIR / "dynamic_agents_latest.json"),
         },
         "allowed_recommendation_actions": allowed_actions,
         "recommendation_schema": _recommendation_schema(allowed_actions),
@@ -1679,6 +1694,7 @@ def _packet_to_markdown(packet: dict) -> str:
         f"- OKX signal research: `{packet.get('okx_signal_research', {})}`",
         f"- Strategy reliability: `{packet.get('strategy_reliability', {})}`",
         f"- Strategy Lab: `{packet.get('strategy_lab', {})}`",
+        f"- Dynamic agents: `{packet.get('dynamic_agents', {})}`",
         f"- Self-improvement open pack: `{packet.get('self_improvement_open_pack', {})}`",
         f"- Code evolution: `{packet.get('code_evolution', {})}`",
         f"- Temporal agent memory: `{packet.get('agent_memory', {})}`",
@@ -1760,7 +1776,21 @@ def ingest_llm_recommendations(conn: sqlite3.Connection, settings: dict) -> list
         rec_id = hashlib.sha256(json.dumps(item, sort_keys=True).encode("utf-8")).hexdigest()
         if not add_llm_recommendation(conn, rec_id, action, title, rationale, item):
             continue
-        _apply_recommendation(conn, action, title, rationale, priority, item)
+        _apply_recommendation(
+            conn,
+            action,
+            title,
+            rationale,
+            priority,
+            item,
+            recommendation_id=rec_id,
+        )
+        if action == "spawn_agent":
+            conn.execute(
+                "update llm_recommendations set status='agent_spawned' where recommendation_id=?",
+                (rec_id,),
+            )
+            conn.commit()
         accepted.append({"id": rec_id, "action": action, "title": title, "priority": priority})
         with PROCESSED.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({"id": rec_id, "item": item}, sort_keys=True) + "\n")
@@ -1990,6 +2020,7 @@ def _apply_recommendation(
     rationale: str,
     priority: int,
     item: dict,
+    recommendation_id: str | None = None,
 ) -> None:
     evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
     signal_key = item.get("signal_key") or item.get("market_key") or "llm_recommendation"
@@ -2008,3 +2039,9 @@ def _apply_recommendation(
     elif action == "propose_hunter_directive":
         directive = str(item.get("directive") or "llm_research_directive")
         add_hunter_directive(conn, signal_key, directive, priority, rationale, evidence)
+    elif action == "spawn_agent":
+        ingest_spawn_agent_recommendation(
+            conn,
+            item,
+            recommendation_id=recommendation_id,
+        )

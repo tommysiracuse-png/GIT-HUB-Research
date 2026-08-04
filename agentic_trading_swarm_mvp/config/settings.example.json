@@ -325,7 +325,8 @@
       "propose_signal_variant",
       "propose_diagnostic_hypothesis",
       "propose_strategy_lab_experiment",
-      "propose_code_change"
+      "propose_code_change",
+      "spawn_agent"
     ]
   },
   "llm_swarm": {
@@ -337,6 +338,14 @@
     "write_fallback_recommendations_to_inbox": false,
     "cooldown_on_model_unavailable": true,
     "model_failure_cooldown_minutes": 60
+  },
+  "dynamic_agents": {
+    "enabled": true,
+    "adaptive_concurrency": 8,
+    "minimum_concurrency": 1,
+    "latency_backoff_seconds": 120,
+    "memory_backoff_percent": 85,
+    "report_limit": 100
   },
   "evolution_worker": {
     "enabled": true,

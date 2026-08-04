@@ -418,6 +418,76 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists agent_specs (
+            agent_id text primary key,
+            canonical_hash text not null unique,
+            name text not null,
+            objective text not null,
+            primary_parent_agent_id text,
+            parent_ids_json text not null default '[]',
+            trigger_json text not null,
+            evidence_inputs_json text not null,
+            memory_policy_json text not null,
+            model_tier text not null,
+            allowed_actions_json text not null,
+            success_measure_json text not null,
+            status text not null,
+            generation integer not null default 1,
+            source_recommendation_id text,
+            created_at text not null,
+            updated_at text not null,
+            activated_at text,
+            activation_cycle_id text,
+            last_evaluated_at text,
+            last_run_at text,
+            last_trigger_matched integer not null default 0,
+            last_trigger_reason text,
+            runs_count integer not null default 0,
+            successful_runs integer not null default 0,
+            total_cost_usd real not null default 0,
+            merged_count integer not null default 0,
+            metadata_json text not null default '{}'
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists agent_lineage (
+            parent_agent_id text not null,
+            child_agent_id text not null,
+            created_at text not null,
+            source_recommendation_id text,
+            primary key(parent_agent_id, child_agent_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists agent_runs (
+            run_id text primary key,
+            agent_id text not null,
+            cycle_id text not null,
+            started_at text not null,
+            completed_at text,
+            duration_ms integer not null default 0,
+            status text not null,
+            trigger_match_json text not null,
+            memory_ids_json text not null,
+            model_json text not null,
+            recommendation_json text not null,
+            recommendation_id text,
+            action text,
+            priority integer,
+            estimated_cost_usd real not null default 0,
+            code_proposal_id text,
+            strategy_lab_id text,
+            outcome_json text not null default '{}',
+            unique(agent_id, cycle_id)
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists signal_stats (
             signal_key text primary key,
             closed_count integer not null,
@@ -802,6 +872,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         "create index if not exists idx_memory_retrieval_agent_time "
         "on memory_retrieval_events(agent_name, created_at)"
     )
+    conn.execute("create index if not exists idx_agent_specs_status on agent_specs(status, last_run_at)")
+    conn.execute("create index if not exists idx_agent_runs_agent_time on agent_runs(agent_id, started_at)")
+    conn.execute("create index if not exists idx_agent_runs_recommendation on agent_runs(recommendation_id)")
+    conn.execute("create index if not exists idx_agent_lineage_child on agent_lineage(child_agent_id)")
     conn.execute("create index if not exists idx_signal_policies_active on signal_policies(status, signal_key)")
     conn.execute("create index if not exists idx_self_improvement_status on self_improvement_experiments(status)")
     conn.execute("create index if not exists idx_code_evolution_status on code_evolution_proposals(status, updated_at)")

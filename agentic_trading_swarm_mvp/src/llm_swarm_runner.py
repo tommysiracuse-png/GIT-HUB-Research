@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Collaborative six-agent cost-aware LLM swarm.
+"""Collaborative core and persistent dynamic-agent cost-aware LLM swarm.
 
-Uses LangGraph when installed. If it is absent, runs the same five agent nodes
-sequentially. All model calls go through cost_router, which defaults to a
+Uses LangGraph when installed. If it is absent, runs the same nodes sequentially.
+All model calls go through cost_router, which defaults to a
 zero-cost fallback unless RADAR_USE_LITELLM=1 is set. The default policy is
 mini-first with earned standard/frontier escalation.
 """
@@ -34,6 +34,14 @@ from memory_graph import (
 )
 from settings import load_settings
 from storage import RUNS_DIR, connect
+from dynamic_agents import (
+    build_dynamic_memory_contexts,
+    decorate_dynamic_recommendation,
+    normalize_agent_spec,
+    prepare_dynamic_agent_cycle,
+    record_dynamic_agent_runs,
+    write_dynamic_agent_reports,
+)
 
 
 COLLABORATION_MODE = "langgraph_typed_action_package"
@@ -58,6 +66,8 @@ class SwarmState(TypedDict, total=False):
     collaboration_mode: str
     checkpoint: dict
     memory_reflection: dict
+    dynamic_agent_cycle: dict
+    dynamic_agents: dict
 
 
 AGENTS = [
@@ -142,6 +152,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "self_improvement": packet.get("self_improvement", {}),
         "code_evolution": packet.get("code_evolution", {}),
         "agent_memory": packet.get("agent_memory", {}),
+        "dynamic_agents": packet.get("dynamic_agents", {}),
         "relevant_long_term_memory": memory,
         "allowed_actions": packet.get("allowed_recommendation_actions", []),
         "current_cycle_agent_outputs": packet.get("current_cycle_agent_outputs", [])[:10],
@@ -175,8 +186,18 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
             "If a prior generated patch was blocked for malformed diff or test failure, propose a narrower "
             "code change that fixes the failure or makes the previous generated work actually usable.\n"
         )
+    dynamic_instruction = ""
+    if agent.get("dynamic_agent_id"):
+        dynamic_instruction = (
+            f"You are persistent specialist {agent.get('display_name')}. Your durable objective is: {agent['role']}\n"
+            f"Your allowed actions are exactly: {agent.get('allowed_actions', [])}. "
+            f"Use these evidence inputs when present: {agent.get('evidence_inputs', [])}. "
+            f"Your success measure is: {agent.get('success_measure', {})}. "
+            "You may propose code, but all code must go through the normal serialized code-evolution path.\n"
+        )
     return (
         f"You are {agent['name']}. Role: {agent['role']}\n"
+        f"{dynamic_instruction}"
         f"{build_planner_instruction}"
         "Return exactly one JSON object matching this schema:\n"
         "{"
@@ -191,8 +212,13 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "\"proposed_change\": concrete bounded proposal, "
         "\"variant_config\": optional bounded config for propose_signal_variant, "
         "\"strategy_lab_experiment\": optional object for propose_strategy_lab_experiment, "
-        "\"code_change\": optional object for propose_code_change"
+        "\"code_change\": optional object for propose_code_change, "
+        "\"agent_spec\": optional object for spawn_agent"
         "}\n"
+        "For spawn_agent, include agent_spec with name, objective, triggers, evidence_inputs, memory_policy, "
+        "model_tier, allowed_actions, and success_measure. Triggers may use always, any_packet_paths, "
+        "all_packet_paths, any_terms, all_terms, conditions, and cooldown_minutes. Create a persistent "
+        "specialist only when a durable objective deserves repeated attention; exact duplicates are merged.\n"
         "For propose_strategy_lab_experiment, emit a strategy_lab_experiment object with: "
         "strategy_lab_id, experiment_type, hypothesis, strategy_logic, data_requirements, "
         "risk_gates, and promotion_rules. experiment_type must be one of market_strategy, "
@@ -275,6 +301,18 @@ def parse_recommendation(text: str, agent: dict, packet: dict) -> dict:
         )
     if rec.get("action") not in allowed:
         return _reject_recommendation(agent, text, "invalid_action", "action_not_allowed")
+    agent_allowed = set(agent.get("allowed_actions") or [])
+    if agent.get("dynamic_agent_id") and agent_allowed and rec.get("action") not in agent_allowed:
+        return _reject_recommendation(agent, text, "invalid_action", "action_not_allowed_for_dynamic_agent")
+    if rec.get("action") == "spawn_agent":
+        try:
+            normalized_spec = normalize_agent_spec(
+                rec.get("agent_spec"),
+                source_agent=str(agent.get("dynamic_agent_id") or agent["name"]),
+            )
+        except (TypeError, ValueError) as exc:
+            return _reject_recommendation(agent, text, "invalid_schema", f"invalid_agent_spec:{exc}")
+        rec["agent_spec"] = normalized_spec
     if _describes_no_change(rec):
         return _reject_recommendation(
             agent,
@@ -283,7 +321,7 @@ def parse_recommendation(text: str, agent: dict, packet: dict) -> dict:
             "non_actionable_hold_or_rerun",
         )
     if rec.get("action") == "propose_code_change":
-        if agent["name"] != "build_planner":
+        if agent["name"] != "build_planner" and not agent.get("dynamic_agent_id"):
             rec["action"] = agent["default_action"]
             rec.setdefault("evidence", {})["build_planner_required"] = True
             rec["evidence"]["original_action"] = "propose_code_change"
@@ -757,10 +795,16 @@ def _repository_grounding(state: SwarmState) -> dict:
 ADDITIVE_STATE_FIELDS = {"agent_outputs", "critiques", "node_rejections", "graph_trace"}
 
 
-def _coerce_role_memory(memory: list[dict] | dict[str, list[dict]]) -> dict[str, list[dict]]:
+def _coerce_role_memory(
+    memory: list[dict] | dict[str, list[dict]],
+    agent_names: list[str] | None = None,
+) -> dict[str, list[dict]]:
+    names = agent_names or [agent["name"] for agent in AGENTS]
     if isinstance(memory, dict):
-        return {name: list(memory.get(name) or []) for name in [agent["name"] for agent in AGENTS]}
-    return {agent["name"]: list(memory or []) for agent in AGENTS}
+        if agent_names is None:
+            names = list(dict.fromkeys([*names, *memory.keys()]))
+        return {name: list(memory.get(name) or []) for name in names}
+    return {name: list(memory or []) for name in names}
 
 
 def _compact_checkpoint_context(packet: dict, role_memory: dict[str, list[dict]]) -> dict:
@@ -834,6 +878,7 @@ def _record_agent_result(
     model = rec.get("model") if isinstance(rec.get("model"), dict) else {}
     output = {
         "agent_name": agent["name"],
+        "dynamic_agent_id": agent.get("dynamic_agent_id"),
         "accepted": not _is_rejected(rec),
         "parse_status": rec.get("parse_status", "native_valid"),
         "recommendation": rec,
@@ -859,6 +904,7 @@ def _record_agent_result(
         "graph_trace": [
             {
                 "node": agent["name"],
+                "dynamic_agent_id": agent.get("dynamic_agent_id"),
                 "elapsed_ms": elapsed_ms,
                 "accepted": not _is_rejected(rec),
                 "parse_status": rec.get("parse_status", "native_valid"),
@@ -885,11 +931,24 @@ def _run_agent_node(
     agent_packet["current_cycle_agent_outputs"] = state.get("agent_outputs", [])
     agent_packet["current_cycle_critiques"] = state.get("critiques", [])
     agent_packet["current_cycle_ranked_actions"] = state.get("ranked_actions", [])
-    if agent["name"] == "build_planner":
+    if agent["name"] == "build_planner" or (
+        agent.get("dynamic_agent_id") and "propose_code_change" in set(agent.get("allowed_actions") or [])
+    ):
         agent_packet["repository_grounding"] = _repository_grounding(state)
     role_memory = runtime_role_memory if runtime_role_memory is not None else state.get("role_memory") or {}
     memory = list(role_memory.get(agent["name"]) or state.get("memory") or [])
     rec = run_agent(agent, agent_packet, memory)
+    if agent["name"] == "build_planner":
+        upstream_runs = [
+            item.get("recommendation", {}).get("dynamic_agent_run_id")
+            for item in state.get("agent_outputs", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("recommendation"), dict)
+            and item.get("recommendation", {}).get("dynamic_agent_run_id")
+        ]
+        if upstream_runs:
+            rec.setdefault("evidence", {})["upstream_dynamic_agent_runs"] = list(dict.fromkeys(upstream_runs))
+    rec = decorate_dynamic_recommendation(agent, rec, str(state.get("cycle_id") or "unknown_cycle"))
     return _record_agent_result(agent, rec, int((time.perf_counter() - started) * 1000), memory)
 
 
@@ -938,11 +997,20 @@ def run_sequential(
     memory: list[dict] | dict[str, list[dict]],
     settings: dict | None = None,
     cycle_id: str | None = None,
+    dynamic_agents: list[dict] | None = None,
+    dynamic_cycle: dict | None = None,
 ) -> list[dict]:
     global LAST_SWARM_STATE
+    dynamic_agents = list(dynamic_agents or [])
     state = _initial_state(packet, memory, FALLBACK_COLLABORATION_MODE, cycle_id)
-    for agent in AGENTS:
+    state["dynamic_agent_cycle"] = dynamic_cycle or {}
+    by_name = {agent["name"]: agent for agent in AGENTS}
+    for name in ("market_scout", "cross_market_researcher", "strategy_lab"):
+        state = _merge_state(state, _run_agent_node(by_name[name], state))
+    for agent in dynamic_agents:
         state = _merge_state(state, _run_agent_node(agent, state))
+    for name in ("red_team", "execution_route_hunter", "build_planner"):
+        state = _merge_state(state, _run_agent_node(by_name[name], state))
     state = _merge_state(state, rank_action_package(state))
     state["checkpoint"] = {"status": "not_used", "reason": "sequential_fallback"}
     LAST_SWARM_STATE = dict(state)
@@ -1104,14 +1172,17 @@ def run_langgraph_if_available(
     memory: list[dict] | dict[str, list[dict]],
     settings: dict | None = None,
     cycle_id: str | None = None,
+    dynamic_agents: list[dict] | None = None,
+    dynamic_cycle: dict | None = None,
 ) -> list[dict]:
     global LAST_SWARM_STATE
     settings = settings or load_settings()
     try:
         from langgraph.graph import END, START, StateGraph  # type: ignore
     except Exception:
-        return run_sequential(packet, memory, settings, cycle_id)
+        return run_sequential(packet, memory, settings, cycle_id, dynamic_agents, dynamic_cycle)
 
+    dynamic_agents = list(dynamic_agents or [])
     runtime_role_memory = _coerce_role_memory(memory)
 
     def make_node(agent: dict):
@@ -1135,7 +1206,7 @@ def run_langgraph_if_available(
         return node
 
     graph = StateGraph(SwarmState)
-    for agent in AGENTS:
+    for agent in [*AGENTS, *dynamic_agents]:
         graph.add_node(agent["name"], make_node(agent))
     graph.add_node("research_join", phase_node("research_join"))
     graph.add_node("critique_join", phase_node("critique_join"))
@@ -1146,8 +1217,33 @@ def run_langgraph_if_available(
     graph.add_edge(START, "cross_market_researcher")
     graph.add_edge(["market_scout", "cross_market_researcher"], "research_join")
     graph.add_edge("research_join", "strategy_lab")
-    graph.add_edge("strategy_lab", "red_team")
-    graph.add_edge("strategy_lab", "execution_route_hunter")
+    specialist_tail = "strategy_lab"
+    if dynamic_agents:
+        effective = max(1, int((dynamic_cycle or {}).get("concurrency", {}).get("effective", 8)))
+        first_size = max(0, effective - 1)
+        offset = 0
+        if first_size:
+            first_batch = dynamic_agents[:first_size]
+            for agent in first_batch:
+                graph.add_edge("research_join", agent["name"])
+            graph.add_node("dynamic_join_0", phase_node("dynamic_join_0"))
+            graph.add_edge(["strategy_lab", *[agent["name"] for agent in first_batch]], "dynamic_join_0")
+            specialist_tail = "dynamic_join_0"
+            offset = len(first_batch)
+        batch_index = 1
+        while offset < len(dynamic_agents):
+            batch = dynamic_agents[offset : offset + effective]
+            for agent in batch:
+                graph.add_edge(specialist_tail, agent["name"])
+            join_name = f"dynamic_join_{batch_index}"
+            graph.add_node(join_name, phase_node(join_name))
+            sources = [agent["name"] for agent in batch]
+            graph.add_edge(sources if len(sources) > 1 else sources[0], join_name)
+            specialist_tail = join_name
+            offset += len(batch)
+            batch_index += 1
+    graph.add_edge(specialist_tail, "red_team")
+    graph.add_edge(specialist_tail, "execution_route_hunter")
     graph.add_edge(["red_team", "execution_route_hunter"], "critique_join")
     graph.add_edge("critique_join", "build_planner")
     graph.add_edge("build_planner", "ranker")
@@ -1160,6 +1256,7 @@ def run_langgraph_if_available(
         cycle_id,
         persist_runtime_context=False,
     )
+    initial["dynamic_agent_cycle"] = dynamic_cycle or {}
     output, checkpoint = _invoke_graph(graph, initial, settings)
     output["checkpoint"] = {
         **checkpoint,
@@ -1267,6 +1364,8 @@ def write_recommendations(
                     name: len(items)
                     for name, items in (state.get("role_memory") or {}).items()
                 },
+                "dynamic_agent_cycle": state.get("dynamic_agent_cycle", {}),
+                "dynamic_agents": state.get("dynamic_agents", {}),
             },
             indent=2,
         ),
@@ -1315,12 +1414,39 @@ def run_once(settings: dict | None = None, force: bool = False) -> list[dict]:
             fallback = query_memory(conn, limit=40)
             memory = _coerce_role_memory(fallback)
             cycle_id = f"swarm:{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
-    recommendations = run_langgraph_if_available(packet, memory, settings, cycle_id)
+        dynamic_cycle = prepare_dynamic_agent_cycle(conn, packet, settings, cycle_id)
+        dynamic_agents = list(dynamic_cycle.get("matched_agents") or [])
+        dynamic_memory = build_dynamic_memory_contexts(
+            conn,
+            packet,
+            dynamic_agents,
+            settings,
+            cycle_id,
+        )
+        if isinstance(memory, dict):
+            memory.update(dynamic_memory)
+        else:
+            memory = {
+                **_coerce_role_memory(memory),
+                **dynamic_memory,
+            }
+    recommendations = run_langgraph_if_available(
+        packet,
+        memory,
+        settings,
+        cycle_id,
+        dynamic_agents=dynamic_agents,
+        dynamic_cycle=dynamic_cycle,
+    )
     with connect() as conn:
         reflection = reflect_swarm(conn, LAST_SWARM_STATE, cycle_id, settings)
+        dynamic_run_report = record_dynamic_agent_runs(conn, LAST_SWARM_STATE, dynamic_cycle, cycle_id)
+        dynamic_summary = write_dynamic_agent_reports(conn, settings)
         graphiti = sync_graphiti(conn, settings)
         write_memory_exports(conn, settings)
     LAST_SWARM_STATE["memory_reflection"] = {**reflection, "graphiti": graphiti}
+    LAST_SWARM_STATE["dynamic_agent_cycle"] = {**dynamic_cycle, "run_recording": dynamic_run_report}
+    LAST_SWARM_STATE["dynamic_agents"] = dynamic_summary
     write_recommendations(
         recommendations,
         int(settings.get("llm_swarm", {}).get("max_recommendations_per_run", 10)),

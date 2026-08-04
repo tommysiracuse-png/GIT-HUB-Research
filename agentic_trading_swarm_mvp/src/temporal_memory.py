@@ -1199,8 +1199,8 @@ def refresh_evidence_memories(conn: sqlite3.Connection, settings: dict) -> dict:
     return {"status": "ok", "bootstrap": bootstrap, "refreshed": counts}
 
 
-def _collect_packet_terms(packet: dict, agent_name: str) -> list[str]:
-    policy = ROLE_MEMORY_POLICIES.get(agent_name, ROLE_MEMORY_POLICIES["generic"])
+def _collect_packet_terms(packet: dict, agent_name: str, policy_override: dict | None = None) -> list[str]:
+    policy = policy_override or ROLE_MEMORY_POLICIES.get(agent_name, ROLE_MEMORY_POLICIES["generic"])
     fragments = list(policy["keywords"])
     for item in (packet.get("top_reviewed") or [])[:20]:
         fragments.extend([str(item.get("inst_id") or ""), str(item.get("direction") or ""), str(item.get("route_status") or "")])
@@ -1268,18 +1268,19 @@ def retrieve_role_memories(
     settings: dict,
     *,
     cycle_id: str,
+    policy_override: dict | None = None,
 ) -> list[dict]:
     cfg = settings.get("agent_memory", {})
     if not cfg.get("enabled", True):
         return []
     ensure_temporal_schema(conn)
-    limit = max(1, int(cfg.get("retrieval_limit_per_agent", 24)))
+    policy = policy_override or ROLE_MEMORY_POLICIES.get(agent_name, ROLE_MEMORY_POLICIES["generic"])
+    limit = max(1, int(policy.get("retrieval_limit") or cfg.get("retrieval_limit_per_agent", 24)))
     pool_limit = max(limit, int(cfg.get("retrieval_candidate_pool", 160)))
     minimum_importance = float(cfg.get("minimum_importance", 0.15))
     half_life = max(0.25, float(cfg.get("recency_half_life_days", 14.0)))
-    policy = ROLE_MEMORY_POLICIES.get(agent_name, ROLE_MEMORY_POLICIES["generic"])
     preferred_namespaces = set(policy["namespaces"])
-    terms = _collect_packet_terms(packet, agent_name)
+    terms = _collect_packet_terms(packet, agent_name, policy)
     query_text = " ".join(terms)
     graph_relation_bonus = float(cfg.get("graph_relation_bonus", 0.08))
 
