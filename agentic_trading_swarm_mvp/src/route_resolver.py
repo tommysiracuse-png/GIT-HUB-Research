@@ -29,6 +29,7 @@ REPORT_JSON = RUNS_DIR / "route_resolver_report.json"
 REPORT_MD = RUNS_DIR / "route_resolver_report.md"
 ROUTE_INTELLIGENCE_JSON = RUNS_DIR / "route_intelligence_report.json"
 ROUTE_INTELLIGENCE_MD = RUNS_DIR / "route_intelligence_report.md"
+VENUE_CAPABILITIES_PATH = CONFIG_DIR / "paper_route_intelligence" / "crypto_venues.json"
 
 REQUIREMENT_STATUSES = {"confirmed", "missing", "unknown", "not_applicable"}
 HARD_BLOCKING_LEVELS = {"hard", "blocking"}
@@ -53,6 +54,39 @@ def load_route_registry() -> dict:
     if not path.exists():
         return {"routes": []}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_venue_capability_registry() -> dict[str, dict]:
+    """Load read-only paper route capabilities keyed by venue.
+
+    This registry describes modeled route support only. It is not account
+    authorization and is never used to enable live execution.
+    """
+
+    if not VENUE_CAPABILITIES_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(VENUE_CAPABILITIES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(venue).strip().upper(): dict(capabilities)
+        for venue, capabilities in payload.items()
+        if isinstance(capabilities, dict)
+    }
+
+
+def _configured_venue_capabilities(
+    candidate: dict,
+    capability_registry: dict[str, dict] | None = None,
+) -> dict:
+    venue = str(candidate.get("venue") or "").strip().upper()
+    if not venue:
+        return {}
+    capabilities = (capability_registry or load_venue_capability_registry()).get(venue)
+    return dict(capabilities or {})
 
 
 def _route_lookup(registry: dict) -> dict[str, dict]:
@@ -358,6 +392,125 @@ def _eligibility_value(candidate: dict, *keys: str) -> object:
     return None
 
 
+def _venue_capability_metadata(candidate: dict) -> dict:
+    """Return explicitly supplied venue route metadata, if any.
+
+    Nested route packets are accepted because frontier adapters attach their
+    capability evidence there. Candidate-level metadata wins over older nested
+    snapshots.
+    """
+
+    merged: dict = {}
+    containers = (
+        candidate.get("execution_route"),
+        candidate.get("execution_feasibility"),
+        candidate.get("route_requirements_packet"),
+        candidate.get("route_requirements"),
+        candidate,
+    )
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        capabilities = container.get("venue_capabilities")
+        if isinstance(capabilities, dict):
+            merged.update(capabilities)
+        packet = container.get("route_requirements_packet")
+        if isinstance(packet, dict) and isinstance(packet.get("venue_capabilities"), dict):
+            merged.update(packet["venue_capabilities"])
+    return merged
+
+
+def _capability_bool(capabilities: dict, *keys: str) -> bool | None:
+    for key in keys:
+        if key in capabilities:
+            return _eligibility_bool(capabilities.get(key))
+    return None
+
+
+def _append_route_gap(missing: list[str], reasons: list[str], prerequisite: str, reason: str) -> None:
+    if prerequisite not in missing:
+        missing.append(prerequisite)
+    if reason not in reasons:
+        reasons.append(reason)
+
+
+def _enforce_venue_capability_contract(
+    capabilities: dict,
+    *,
+    spot_short_required: bool,
+    hedged_structure_required: bool,
+    missing: list[str],
+    reasons: list[str],
+) -> None:
+    """Fail closed when present venue metadata does not confirm a route.
+
+    Legacy candidates without capability metadata continue through the
+    existing instrument-level checks. Once a venue capability packet is
+    present, however, loose candidate flags cannot override an unsupported or
+    unknown short, margin, borrow, perp, spot-leg, or carry capability.
+    """
+
+    if not capabilities:
+        return
+
+    if spot_short_required:
+        short_supported = _capability_bool(
+            capabilities,
+            "spot_short_supported",
+            "supports_spot_short",
+            "supports_spot_short_margin",
+            "shortability_indication",
+        )
+        margin_supported = _capability_bool(
+            capabilities,
+            "margin_supported",
+            "margin_available",
+            "supports_margin",
+        )
+        borrow_supported = _capability_bool(
+            capabilities,
+            "borrow_supported",
+            "spot_borrow_supported",
+            "borrow_inventory_supported",
+            "borrow_hint_present",
+        )
+        for supported, prerequisite, reason in (
+            (short_supported, "venue_capabilities.spot_short", "venue_spot_short_capability_unconfirmed"),
+            (margin_supported, "venue_capabilities.margin", "venue_margin_capability_unconfirmed"),
+            (borrow_supported, "venue_capabilities.borrow", "venue_borrow_capability_unconfirmed"),
+        ):
+            if supported is not True:
+                _append_route_gap(missing, reasons, prerequisite, reason)
+
+    if hedged_structure_required:
+        carry_supported = _capability_bool(
+            capabilities,
+            "synthetic_carry_supported",
+            "supports_basis_carry",
+            "basis_support",
+            "carry_supported",
+        )
+        perp_supported = _capability_bool(
+            capabilities,
+            "perp_supported",
+            "supports_perpetuals",
+            "perp_available",
+        )
+        spot_supported = _capability_bool(
+            capabilities,
+            "spot_supported",
+            "supports_spot",
+            "supports_spot_long",
+        )
+        for supported, prerequisite, reason in (
+            (carry_supported, "venue_capabilities.synthetic_carry", "venue_synthetic_carry_capability_unconfirmed"),
+            (perp_supported, "venue_capabilities.perp", "venue_perp_capability_unconfirmed"),
+            (spot_supported, "venue_capabilities.spot", "venue_spot_leg_capability_unconfirmed"),
+        ):
+            if supported is not True:
+                _append_route_gap(missing, reasons, prerequisite, reason)
+
+
 def _eligibility_bool(value: object) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -525,6 +678,7 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
     legacy_proxy_id = requirements.get("paper_proxy_id")
     spot_short_required = _spot_short_dependency(item)
     hedged_structure_required = _hedged_structure_dependency(item)
+    venue_capabilities = _venue_capability_metadata(item)
     missing: list[str] = []
     reasons: list[str] = []
 
@@ -540,6 +694,13 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
                 "short_simulation_supported",
             )
         )
+        if paper_short_allowed is None:
+            paper_short_allowed = _capability_bool(
+                venue_capabilities,
+                "paper_short_simulation_allowed",
+                "paper_route_feasible",
+                "route_feasible",
+            )
         borrowable = _eligibility_bool(
             _eligibility_value(
                 item,
@@ -550,6 +711,14 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
                 "spot_borrow_supported",
             )
         )
+        if borrowable is None:
+            borrowable = _capability_bool(
+                venue_capabilities,
+                "borrow_supported",
+                "spot_borrow_supported",
+                "borrow_inventory_supported",
+                "borrow_hint_present",
+            )
         margin_eligible = _eligibility_bool(
             _eligibility_value(
                 item,
@@ -560,6 +729,13 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
                 "venue_supports_margin_or_equivalent",
             )
         )
+        if margin_eligible is None:
+            margin_eligible = _capability_bool(
+                venue_capabilities,
+                "margin_supported",
+                "margin_available",
+                "supports_margin",
+            )
         borrow_cost = _eligibility_number(
             item,
             "borrow_cost_bps",
@@ -570,6 +746,12 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         borrow_cost_model = _eligibility_bool(
             _eligibility_value(item, "borrow_cost_model_present", "borrow_fee_modeled")
         )
+        if borrow_cost_model is None:
+            borrow_cost_model = _capability_bool(
+                venue_capabilities,
+                "borrow_fee_known",
+                "borrow_cost_model_present",
+            )
         borrow_cost_assumption = _eligibility_value(
             item, "borrow_cost_assumption", "borrow_cost_model"
         )
@@ -663,6 +845,14 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
                 missing.append(prerequisite)
                 reasons.append(reason)
 
+    _enforce_venue_capability_contract(
+        venue_capabilities,
+        spot_short_required=spot_short_required,
+        hedged_structure_required=hedged_structure_required,
+        missing=missing,
+        reasons=reasons,
+    )
+
     cost_breakdown, assumed_cost_bps = _paper_route_costs(
         item, spot_short_required=spot_short_required
     )
@@ -695,12 +885,18 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
             "spot_borrow_missing",
             "borrow_cost_assumption_missing",
             "margin_eligibility_unconfirmed",
+            "venue_spot_short_capability_unconfirmed",
+            "venue_margin_capability_unconfirmed",
+            "venue_borrow_capability_unconfirmed",
         }
         direct_short_prerequisites = {
             "paper_short_simulation_allowed",
             "borrowable",
             "borrow_cost_assumption",
             "margin_eligible",
+            "venue_capabilities.spot_short",
+            "venue_capabilities.margin",
+            "venue_capabilities.borrow",
         }
         missing = [value for value in missing if value not in direct_short_prerequisites]
         reasons = [value for value in reasons if value not in direct_short_reasons]
@@ -721,6 +917,8 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         "applies": applies,
         "spot_short_required": spot_short_required,
         "hedged_structure_required": hedged_structure_required,
+        "venue_capability_metadata_present": bool(venue_capabilities),
+        "venue_capabilities": venue_capabilities,
         "route_decision": decision,
         "route_eligible": not suppressed,
         "eligible_for_scoring": not suppressed,
@@ -1161,8 +1359,28 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
     )
 
 
-def enrich_candidate_with_route(candidate: dict, settings: dict, registry: dict | None = None) -> dict:
+def enrich_candidate_with_route(
+    candidate: dict,
+    settings: dict,
+    registry: dict | None = None,
+    venue_capability_registry: dict[str, dict] | None = None,
+) -> dict:
     enriched = dict(candidate)
+    configured_capabilities = _configured_venue_capabilities(
+        enriched,
+        capability_registry=venue_capability_registry,
+    )
+    supplied_capabilities = enriched.get("venue_capabilities")
+    if configured_capabilities:
+        merged_capabilities = dict(configured_capabilities)
+        if isinstance(supplied_capabilities, dict):
+            merged_capabilities.update(supplied_capabilities)
+        enriched["venue_capabilities"] = merged_capabilities
+        enriched["venue_capability_source"] = (
+            "candidate_and_paper_route_registry"
+            if isinstance(supplied_capabilities, dict)
+            else "paper_route_intelligence.crypto_venues"
+        )
     route = resolve_candidate_route(enriched, settings, registry=registry)
     eligibility_input = dict(enriched)
     eligibility_input.setdefault("route_id", route.get("route_id"))
@@ -1221,7 +1439,16 @@ def enrich_candidate_with_route(candidate: dict, settings: dict, registry: dict 
 
 def enrich_candidates(candidates: Iterable[dict], settings: dict) -> list[dict]:
     registry = load_route_registry()
-    return [enrich_candidate_with_route(candidate, settings, registry=registry) for candidate in candidates]
+    venue_capability_registry = load_venue_capability_registry()
+    return [
+        enrich_candidate_with_route(
+            candidate,
+            settings,
+            registry=registry,
+            venue_capability_registry=venue_capability_registry,
+        )
+        for candidate in candidates
+    ]
 
 
 def _requirement_counter_to_dict(counter: collections.Counter[tuple[str, str]]) -> dict:

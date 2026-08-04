@@ -116,6 +116,59 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
         self.assertTrue(verdict["route_eligible"])
         self.assertEqual([], verdict["missing_prerequisites"])
 
+    def test_unsupported_venue_short_capabilities_override_loose_candidate_flags(self):
+        verdict = evaluate_route_intelligence(
+            {
+                "surface": "spot",
+                "direction": "short",
+                "paper_short_simulation_allowed": True,
+                "borrowable": True,
+                "borrow_cost_bps": 4.0,
+                "margin_eligible": True,
+                "venue_capabilities": {
+                    "supports_spot_short_margin": False,
+                    "margin_supported": False,
+                    "borrow_supported": False,
+                },
+            }
+        )
+
+        self.assertTrue(verdict["venue_capability_metadata_present"])
+        self.assertTrue(verdict["suppressed"])
+        self.assertIn(
+            "venue_spot_short_capability_unconfirmed",
+            verdict["blocker_reasons"],
+        )
+        self.assertIn("venue_margin_capability_unconfirmed", verdict["blocker_reasons"])
+        self.assertIn("venue_borrow_capability_unconfirmed", verdict["blocker_reasons"])
+
+    def test_carry_route_requires_supported_spot_perp_and_carry_capabilities(self):
+        candidate = {
+            "trade_type": "perp_funding_basis",
+            "direction": "short_perp_long_spot",
+            "hedge_venue": "OKX_SPOT",
+            "hedge_instrument": "BTC-USDT",
+            "fee_model": "paper_conservative_v1",
+            "paper_leg_mapping_valid": True,
+            "venue_capabilities": {
+                "supports_spot_long": True,
+                "supports_perpetuals": True,
+                "supports_basis_carry": False,
+            },
+        }
+
+        blocked = evaluate_route_intelligence(candidate)
+        self.assertTrue(blocked["suppressed"])
+        self.assertIn(
+            "venue_synthetic_carry_capability_unconfirmed",
+            blocked["blocker_reasons"],
+        )
+
+        candidate["venue_capabilities"]["supports_basis_carry"] = True
+        allowed = evaluate_route_intelligence(candidate)
+        self.assertFalse(allowed["suppressed"])
+        self.assertEqual("executable_standard", allowed["route_decision"])
+
     def test_costs_larger_than_edge_block_scoring(self):
         verdict = evaluate_route_intelligence(
             {
@@ -189,6 +242,36 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
         self.assertEqual(
             1,
             summary["by_paper_route_eligibility_blocker"]["spot_borrow_missing"],
+        )
+
+    def test_venue_registry_blocks_short_even_when_account_borrow_is_enabled(self):
+        cfg = copy.deepcopy(DEFAULT_SETTINGS)
+        cfg["account_capabilities"]["spot_borrow"] = True
+        candidate = {
+            "venue": "GATE",
+            "trade_type": "frontier_crypto_venue_map",
+            "direction": "short_frontier_spot",
+            "asset_class": "crypto_spot",
+            "data_status": "reachable",
+            "score": 88.0,
+            "paper_short_simulation_allowed": True,
+            "borrowable": True,
+            "borrow_cost_bps": 4.0,
+            "margin_eligible": True,
+        }
+
+        enriched = enrich_candidate_with_route(candidate, cfg)
+
+        self.assertEqual("standard", enriched["route_status"])
+        self.assertEqual(
+            "paper_route_intelligence.crypto_venues",
+            enriched["venue_capability_source"],
+        )
+        self.assertTrue(enriched["paper_route_eligibility"]["suppressed"])
+        self.assertEqual(0.0, enriched["score"])
+        self.assertIn(
+            "venue_spot_short_capability_unconfirmed",
+            enriched["paper_route_eligibility"]["blocker_reasons"],
         )
 
     def test_reliability_scoring_cannot_resurrect_blocked_candidate(self):

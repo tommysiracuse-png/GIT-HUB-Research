@@ -333,6 +333,40 @@ def _apply_route_feasibility_metadata(candidate: Mapping[str, Any]) -> dict[str,
     return annotated
 
 
+def _apply_paper_route_eligibility_metadata(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Defensively evaluate explicit venue capabilities before a paper fill.
+
+    Normal scanner candidates already carry this verdict from route enrichment.
+    This fallback closes direct execution/test paths without loading account
+    settings or making any broker call.
+    """
+
+    annotated = dict(candidate)
+    if isinstance(annotated.get("paper_route_eligibility"), Mapping):
+        return annotated
+    try:
+        from route_resolver import evaluate_route_intelligence
+    except ImportError:  # pragma: no cover - package import fallback
+        try:
+            from src.route_resolver import evaluate_route_intelligence
+        except ImportError:
+            return annotated
+
+    verdict = evaluate_route_intelligence(annotated)
+    if not (
+        isinstance(verdict, Mapping)
+        and verdict.get("applies")
+        and verdict.get("venue_capability_metadata_present")
+    ):
+        return annotated
+    annotated["paper_route_eligibility"] = dict(verdict)
+    if verdict.get("suppressed"):
+        annotated["paper_entry_blocked"] = True
+        annotated["promotion_eligible"] = False
+        annotated["paper_route_allocation_multiplier"] = 0.0
+    return annotated
+
+
 def _is_confirmed_borrow(candidate: Mapping[str, Any]) -> bool:
     for field in ("borrow_confirmed", "spot_borrow_confirmed"):
         if _as_bool(candidate.get(field), False):
@@ -695,9 +729,11 @@ def apply_frontier_paper_guard(
     config: Mapping[str, Any] | bool | None = None,
 ) -> dict[str, Any]:
     """Return a copy of ``candidate`` annotated as shadow-filtered when needed."""
-    guarded = _apply_route_feasibility_metadata(candidate) if (
-        is_frontier_crypto_candidate(candidate) and frontier_route_feasibility_guard_enabled(config)
-    ) else dict(candidate)
+    route_guard_enabled = frontier_route_feasibility_guard_enabled(config)
+    guarded = _apply_paper_route_eligibility_metadata(candidate) if route_guard_enabled else dict(candidate)
+    guarded = _apply_route_feasibility_metadata(guarded) if (
+        is_frontier_crypto_candidate(guarded) and route_guard_enabled
+    ) else guarded
     quarantine_reason = _paper_family_quarantine_reason(guarded, config)
     if quarantine_reason is not None:
         return _annotate_shadow_filtered_candidate(guarded, quarantine_reason, "paper_strategy_quarantine")

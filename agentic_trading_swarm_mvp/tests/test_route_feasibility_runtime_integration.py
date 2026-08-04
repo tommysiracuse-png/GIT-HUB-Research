@@ -24,6 +24,34 @@ def _candidate(**overrides):
 
 
 class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
+    def test_direct_pretrade_path_blocks_carry_with_unsupported_venue_metadata(self):
+        candidate = {
+            "venue": "TEST_SPOT",
+            "trade_type": "synthetic_carry",
+            "direction": "short_perp_long_spot",
+            "hedge_venue": "TEST_SPOT",
+            "hedge_instrument": "BTC-USDT",
+            "fee_model": "paper_conservative_v1",
+            "paper_leg_mapping_valid": True,
+            "venue_capabilities": {
+                "supports_spot_long": True,
+                "supports_perpetuals": False,
+                "supports_basis_carry": False,
+            },
+        }
+
+        guarded = apply_frontier_paper_guard(candidate)
+
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual(
+            "paper_route_eligibility_gate",
+            guarded["candidate_reject_detail"]["guard"],
+        )
+        self.assertIn(
+            "venue_synthetic_carry_capability_unconfirmed",
+            guarded["candidate_reject_detail"]["blocker_reasons"],
+        )
+
     def test_blocked_short_without_paper_proxy_is_shadow_filtered(self):
         candidate = _candidate(
             route_blockers=["spot_borrow"],
