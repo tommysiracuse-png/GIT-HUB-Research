@@ -73,7 +73,11 @@
     "max_destination_spread_bps": 8.0,
     "quarantined_target_surfaces": ["OKX_SPOT", "OKX_PERP"],
     "allow_native_proxy_monitoring": true,
-    "reenable_condition": "native_crypto_confirmation_with_positive_closed_signal_performance"
+    "min_target_surface_closed_count": 20,
+    "min_target_surface_expectancy_net_bps": 0.0,
+    "min_target_surface_quality_rate": 0.5,
+    "max_target_surface_evidence_age_hours": 168.0,
+    "reenable_condition": "fresh_target_surface_paper_evidence_meeting_quality_thresholds"
   },
   "paper_cell_policy": {
     "min_closed_trades": 3,

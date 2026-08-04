@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import datetime as dt
+import pathlib
 import sqlite3
+import sys
 import unittest
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from src import storage
 from src.frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
 from src.paper_order_router import apply_frontier_paper_guard
+from src.settings import DEFAULT_SETTINGS
 
 
 def cross_surface_candidate(**overrides: object) -> dict[str, object]:
@@ -193,6 +202,41 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertFalse(reversal["applies"])
         self.assertTrue(reversal["eligible"])
         self.assertTrue(reversal["emit_route"])
+
+    def test_generic_proxy_lineage_cannot_bypass_cross_surface_quarantine(self) -> None:
+        review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                source_family="vendor_proxy_derived",
+                signal_family="proxy_momentum",
+            )
+        )
+
+        self.assertTrue(review["applies"])
+        self.assertTrue(review["blocked"])
+        self.assertEqual("proxy_derived", review["source_family"])
+        self.assertEqual("sandbox_ranking", review["maximum_stage"])
+
+        routed = apply_frontier_paper_guard(
+            cross_surface_candidate(
+                source_family="vendor_proxy_derived",
+                signal_family="proxy_momentum",
+            )
+        )
+        self.assertTrue(routed["shadow_filtered"])
+        self.assertFalse(routed["paper_fill_allowed"])
+        self.assertFalse(routed["promotion_eligible"])
+
+    def test_default_policy_publishes_target_surface_proof_thresholds(self) -> None:
+        policy = DEFAULT_SETTINGS["yahoo_proxy_cross_surface_alignment_guard"]
+
+        self.assertEqual(20, policy["min_target_surface_closed_count"])
+        self.assertEqual(0.0, policy["min_target_surface_expectancy_net_bps"])
+        self.assertEqual(0.5, policy["min_target_surface_quality_rate"])
+        self.assertEqual(168.0, policy["max_target_surface_evidence_age_hours"])
+        self.assertEqual(
+            "fresh_target_surface_paper_evidence_meeting_quality_thresholds",
+            policy["reenable_condition"],
+        )
 
     def test_destination_context_is_not_masked_by_yahoo_source_venue(self) -> None:
         review = paper_only_yahoo_proxy_cross_surface_alignment_guard(

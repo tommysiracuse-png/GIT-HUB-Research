@@ -1121,9 +1121,13 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         for key in token_fields
         if container.get(key) not in (None, "", [], {}, ())
     )
+    # The transfer policy follows research lineage, not a single provider
+    # name.  Yahoo is the common proxy source, but descendants can retain only
+    # a generic ``proxy`` tag after strategy generation or serialization.
     source_is_yahoo = "yahoo_proxy" in scope_text or (
         "yahoo" in scope_text and "proxy" in scope_text
     )
+    source_is_proxy = source_is_yahoo or "proxy" in scope_text
     momentum_family = "global_proxy_momentum" in scope_text or "yahoo_proxy_momentum" in scope_text or (
         "proxy" in scope_text and "momentum" in scope_text
     )
@@ -1151,7 +1155,7 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
     applies = bool(
         enabled
         and paper_mode
-        and source_is_yahoo
+        and source_is_proxy
         and momentum_family
         and target_surface_evidence.get("applies")
         and not destination_is_native_proxy
@@ -1317,7 +1321,13 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "maximum_stage": target_surface_evidence.get("maximum_stage") if applies else None,
         "reason": reason,
         "alignment_reason": alignment_reason,
-        "source_family": "yahoo_proxy" if source_is_yahoo else None,
+        "source_family": (
+            "yahoo_proxy"
+            if source_is_yahoo
+            else "proxy_derived"
+            if source_is_proxy
+            else None
+        ),
         "signal_family": "global_proxy_momentum" if momentum_family else None,
         "destination_venue": destination_venue,
         "target_surface": target_surface_evidence.get("target_surface") or target_review.get("target_surface"),
