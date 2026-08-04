@@ -25,6 +25,11 @@ import code_evolution
 import storage
 from adapters.venues import common as venue_common
 from adapters.registry import discover_adapters, get_adapter
+from adapters.venues.b3 import (
+    HUB_URL as B3_HUB_URL,
+    B3PublicDataHubAdapter,
+    parse_b3_public_data_hub,
+)
 from adapters.venues.bahrain_cross_listings import cross_listing_observations
 from adapters.venues.bursa_derivatives import contract_observations
 from adapters.venues.european_energy_exchange_eex import (
@@ -145,8 +150,104 @@ class PublicAdapterParserTests(unittest.TestCase):
             "norwegian_block_exchange_nbx_public",
             "kalshi_public_prediction_markets",
             "polymarket_sports_websocket",
+            "b3_public_data_hub",
         }
         self.assertTrue(expected <= set(discover_adapters()))
+
+    def test_b3_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        self.assertIn("b3_public_data_hub", discover_adapters())
+        adapter = get_adapter("b3_public_data_hub")
+        self.assertIsNotNone(adapter)
+        self.assertEqual("B3", adapter.info.venue)
+        self.assertEqual(B3_HUB_URL, adapter.info.docs_url)
+        self.assertIn("unsponsored_bdr", adapter.info.capabilities)
+        self.assertIn("cbio", adapter.info.capabilities)
+
+    def test_b3_hub_parser_normalizes_all_documented_surfaces(self) -> None:
+        html = """
+        <section><h3>ESG products and services</h3>
+          <a href="/en_us/b3/esg/otc-market.htm"><span>Decarbonization credits CBIO</span></a>
+        </section>
+        <section><h3>Investment funds</h3>
+          <a href="/pt_br/fi-infra-listados/">FI-Infra</a>
+          <a href="/en_us/fiagro.htm">FIAGRO</a>
+          <a href="/pt_br/fidc.htm">FIDC</a>
+        </section>
+        <section><h3>BDRs e ETFs</h3>
+          <a href="/en_us/stock-etf.htm">Stock Exchange Traded Fund - Stock ETF</a>
+          <a href="/pt_br/bdr-etf.htm">BDRs ETFs</a>
+          <a href="/en_us/unsponsored-bdr.htm">
+            Unsponsored Brazilian Depositary Receipts - BDRs
+          </a>
+        </section>
+        """
+        rows = parse_b3_public_data_hub(
+            html,
+            received_at="2026-08-04T12:00:00+00:00",
+        )
+
+        self.assertEqual(7, len(rows))
+        self.assertEqual(
+            {
+                "b3_unsponsored_bdr_public_data",
+                "b3_bdr_etf_public_data",
+                "b3_stock_etf_public_data",
+                "b3_fi_infra_public_data",
+                "b3_fiagro_public_data",
+                "b3_fidc_public_data",
+                "b3_cbio_public_data",
+            },
+            {row["market_surface"] for row in rows},
+        )
+        cbio = next(row for row in rows if row["symbol"] == "CBIO")
+        self.assertEqual("https://www.b3.com.br/en_us/b3/esg/otc-market.htm", cbio["source_url"])
+        self.assertEqual(B3_HUB_URL, cbio["source_catalog_url"])
+        self.assertEqual("reachable", cbio["fetch_status"])
+        self.assertEqual("fresh", cbio["freshness_state"])
+        self.assertEqual("reference_catalog", cbio["session_status"])
+        self.assertEqual("watch_only", cbio["direction"])
+        self.assertEqual(0.0, cbio["last"])
+
+    def test_b3_adapter_preserves_reachable_parser_failure(self) -> None:
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><a href='/only-one'>FIAGRO</a></html>",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch("adapters.venues.b3.fetch_text", return_value=result):
+            batch = B3PublicDataHubAdapter().scan({})
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["hub"]["fetch_status"])
+        self.assertIn("required B3 public-data surfaces", batch.metadata["parser_failures"][0]["error"])
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        self.assertEqual("public_catalog_parser_failure", batch.observations[0]["candidate_reject_reason"])
+        self.assertIn("required B3 public-data surfaces", batch.observations[0]["parser_failure"])
+
+    def test_b3_adapter_emits_watch_only_fetch_evidence_when_unavailable(self) -> None:
+        result = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch("adapters.venues.b3.fetch_text", return_value=result):
+            batch = B3PublicDataHubAdapter().scan({})
+
+        self.assertEqual("blocked", batch.metadata["source_status"])
+        self.assertEqual("blocked", batch.metadata["fetch_status"]["hub"]["fetch_status"])
+        self.assertEqual("unknown", batch.metadata["freshness_state"])
+        self.assertEqual("unknown", batch.metadata["session_state"])
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        self.assertEqual("public_catalog_source_unavailable", batch.observations[0]["candidate_reject_reason"])
+        self.assertEqual(B3_HUB_URL, batch.observations[0]["source_url"])
 
     def test_polymarket_sports_plugin_is_runtime_discoverable_and_watch_only(self) -> None:
         self.assertIn("polymarket_sports_websocket", discover_adapters())
@@ -945,6 +1046,28 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
 
 
 class AdapterCapabilityTests(unittest.TestCase):
+    def test_b3_adapter_closes_public_surface_spec_without_quote_claims(self) -> None:
+        spec = {
+            "title": "Implement public adapter #622: B3",
+            "market_key": "global_discovery|B3",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "B3",
+                    "public_docs_url": B3_HUB_URL,
+                    "asset_or_event": (
+                        "Unsponsored BDRs, BDR ETFs, stock ETFs, FI-Infra, "
+                        "FIAGRO, FIDC, and CBIO"
+                    ),
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("b3_public_data_hub", match["adapter_id"])
+        self.assertNotIn("entry_quality_quote", match["available_capabilities"])
+
     def test_existing_adapter_is_resolved_but_missing_depth_remains_gap(self) -> None:
         daily = {
             "title": "TWSE public daily price adapter",
