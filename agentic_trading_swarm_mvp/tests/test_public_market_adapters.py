@@ -97,6 +97,15 @@ from adapters.venues.stock_exchange_of_thailand_yuanta_securities_thailand impor
     parse_set_yuanta_dr_announcement,
 )
 from adapters.venues.twse_daily import parse_twse_daily
+from adapters.venues.vietnam_securities_depository_and_clearing_corporation_hanoi_sto import (
+    GUIDELINE_URL as VSDC_CARBON_GUIDELINE_URL,
+    HNX_COORDINATION_URL as VSDC_HNX_COORDINATION_URL,
+    SETTLEMENT_URL as VSDC_CARBON_SETTLEMENT_URL,
+    VietnamSecuritiesDepositoryAndClearingCorporationHanoiStockExchangeAdapter,
+    parse_hnx_carbon_coordination,
+    parse_vsdc_carbon_guideline,
+    parse_vsdc_carbon_settlement_rules,
+)
 from scan_batch import ScanBatch
 from settings import DEFAULT_SETTINGS
 
@@ -252,8 +261,102 @@ class PublicAdapterParserTests(unittest.TestCase):
             "stock_exchange_of_thailand_yuanta_securities_thailand",
             "republican_stock_exchange_toshkent_public",
             "dc_department_of_energy_environment",
+            "vietnam_securities_depository_and_clearing_corporation_hanoi_sto",
         }
         self.assertTrue(expected <= set(discover_adapters()))
+
+    def test_vsdc_hnx_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "vietnam_securities_depository_and_clearing_corporation_hanoi_sto"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsNotNone(adapter)
+        self.assertEqual("VSDC_HNX", adapter.info.venue)
+        self.assertEqual(VSDC_CARBON_GUIDELINE_URL, adapter.info.docs_url)
+        self.assertIn("settlement_cycle", adapter.info.capabilities)
+        self.assertIn("carbon_credit", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+
+    def test_vsdc_hnx_parsers_normalize_settlement_and_operation_evidence(self) -> None:
+        settlement = """
+        <html><body><h3>Payment for Greenhouse Gas Emission Quota and Carbon Credit Transactions</h3>
+        <p>Instant payment is made per transaction with a settlement time of T+0.</p>
+        <p>Greenhouse gas emission quotas and carbon credits are transferred simultaneously
+        with payment. Payment is made through BIDV Bank and transfer is carried out by VSDC.</p>
+        <p>Guidelines issued together with Decision No. 17/QD-HDTV dated 29/04/2026.</p>
+        </body></html>
+        """
+        guideline = """
+        <html><body><h1>VSDC issues the Guideline on the depository and settlement of
+        transactions for greenhouse gas emission allowances and carbon credits</h1>
+        <p>On 29/4/2026, VSDC issued Decision 17/QD-HDTV on the Guideline.</p>
+        </body></html>
+        """
+        coordination = """
+        <html><body><h1>Signing ceremony of Memorandum on Coordination on domestic carbon
+        exchange operations</h1><p>On June 22, 2026, the Hanoi Stock Exchange (HNX) and
+        Vietnam Securities Depository and Clearing Corporation (VSDC) signed the MoU.</p>
+        </body></html>
+        """
+
+        rows = parse_vsdc_carbon_settlement_rules(
+            settlement, received_at="2026-08-04T12:00:00+00:00"
+        )
+        self.assertEqual(2, len(rows))
+        self.assertEqual(
+            {"greenhouse_gas_emission_allowance", "carbon_credit"},
+            {row["asset_class"] for row in rows},
+        )
+        self.assertTrue(all(row["settlement_cycle"] == "T+0" for row in rows))
+        self.assertTrue(all(row["settlement_bank"] == "BIDV" for row in rows))
+        self.assertTrue(all(row["delivery_versus_payment"] for row in rows))
+        self.assertTrue(all(row["source_url"] == VSDC_CARBON_SETTLEMENT_URL for row in rows))
+        self.assertTrue(all(row["fetch_status"] == "reachable" for row in rows))
+        self.assertTrue(all(row["direction"] == "watch_only" for row in rows))
+
+        guideline_row = parse_vsdc_carbon_guideline(
+            guideline, received_at="2026-08-04T12:00:00+00:00"
+        )[0]
+        coordination_row = parse_hnx_carbon_coordination(
+            coordination, received_at="2026-08-04T12:00:00+00:00"
+        )[0]
+        self.assertEqual("settlement_guideline_issued", guideline_row["session_status"])
+        self.assertEqual("operations_coordination_signed", coordination_row["session_status"])
+        self.assertEqual(VSDC_HNX_COORDINATION_URL, coordination_row["source_url"])
+
+    def test_vsdc_hnx_adapter_preserves_partial_fetch_and_parser_evidence(self) -> None:
+        settlement = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html>an unrelated settlement page</html>",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 2.0,
+        }
+        unavailable = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T12:00:01+00:00",
+            "latency_ms": 3.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch(
+            "adapters.venues.vietnam_securities_depository_and_clearing_corporation_hanoi_sto.fetch_text",
+            side_effect=[settlement, unavailable, unavailable],
+        ):
+            batch = (
+                VietnamSecuritiesDepositoryAndClearingCorporationHanoiStockExchangeAdapter().scan({})
+            )
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["settlement"]["fetch_status"])
+        self.assertEqual("blocked", batch.metadata["fetch_status"]["guideline"]["fetch_status"])
+        self.assertIn("required settlement markers", batch.metadata["parser_failures"][0]["error"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        self.assertTrue(any(row.get("parser_failure") for row in batch.observations))
 
     def test_dc_doee_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
         adapter_id = "dc_department_of_energy_environment"
