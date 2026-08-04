@@ -215,18 +215,36 @@ def promote_candidate(release: CandidateRelease, app_root: pathlib.Path, *, time
         return release, {"ok": False, "reason": "ambiguous_repo_root"}
     if not release.candidate_commit:
         return release, {"ok": False, "reason": "missing_candidate_commit"}
-    merge = run_git(["merge", "--ff-only", release.candidate_commit], root, timeout=timeout)
+    source_candidate_commit = release.candidate_commit
+    merge = run_git(["merge", "--ff-only", source_candidate_commit], root, timeout=timeout)
     if merge["returncode"] != 0:
-        cherry = run_git(["cherry-pick", release.candidate_commit], root, timeout=timeout)
+        cherry = run_git(["cherry-pick", source_candidate_commit], root, timeout=timeout)
         if cherry["returncode"] != 0:
-            return release, {"ok": False, "reason": "promotion_failed", "merge": merge, "cherry_pick": cherry}
+            abort = run_git(["cherry-pick", "--abort"], root, timeout=timeout)
+            return release, {
+                "ok": False,
+                "reason": "promotion_failed",
+                "merge": merge,
+                "cherry_pick": cherry,
+                "cherry_pick_abort": abort,
+            }
+    promoted_commit = current_commit(root)
+    if not promoted_commit:
+        return release, {"ok": False, "reason": "promoted_head_missing", "merge": merge}
     tag_name = "champion/latest"
-    tag = run_git(["tag", "-f", tag_name, release.candidate_commit], root, timeout=timeout)
+    tag = run_git(["tag", "-f", tag_name, promoted_commit], root, timeout=timeout)
     if tag["returncode"] != 0:
         return release, {"ok": False, "reason": "champion_tag_failed", "tag": tag}
     release.status = "promoted"
     release.promotion_reason = "candidate passed sandbox and canary gates"
-    return release, {"ok": True, "status": "promoted", "champion_tag": tag_name, "tag": tag}
+    return release, {
+        "ok": True,
+        "status": "promoted",
+        "champion_tag": tag_name,
+        "source_candidate_commit": source_candidate_commit,
+        "promoted_commit": promoted_commit,
+        "tag": tag,
+    }
 
 
 def cleanup_worktree(release: CandidateRelease, app_root: pathlib.Path, *, timeout: int = 120) -> dict[str, Any]:

@@ -18,6 +18,7 @@ from evolution.worktree import (  # noqa: E402
     cleanup_worktree,
     commit_candidate,
     create_candidate_worktree,
+    promote_candidate,
     release_preflight,
     run_git,
 )
@@ -94,6 +95,37 @@ class EvolutionReleaseTests(unittest.TestCase):
             self.assertTrue(created["cleanup"]["fallback_used"])
             self.assertIn("-retry-1", release.worktree_path)
             self.assertTrue(pathlib.Path(release.worktree_path).exists())
+            cleanup = cleanup_worktree(release, app)
+            self.assertTrue(cleanup["ok"], cleanup)
+
+    def test_cherry_pick_promotion_tags_actual_main_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, app = self._repo(tmp)
+            release, created = create_candidate_worktree(app, "proposal:diverged", base_dir=pathlib.Path(tmp) / "worktrees")
+            self.assertIsNotNone(release, created)
+            assert release is not None
+            candidate_app = pathlib.Path(release.app_worktree_path)
+            (candidate_app / "src" / "demo.py").write_text("VALUE = 2\n", encoding="utf-8")
+            release, committed = commit_candidate(release, "candidate")
+            self.assertTrue(committed["ok"], committed)
+            source_candidate = release.candidate_commit
+
+            (app / "src" / "main_only.py").write_text("MAIN_ONLY = True\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "diverge main"], cwd=root, check=True, capture_output=True, text=True)
+
+            release, promotion = promote_candidate(release, app)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            champion = subprocess.run(
+                ["git", "rev-parse", "champion/latest"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            self.assertTrue(promotion["ok"], promotion)
+            self.assertNotEqual(source_candidate, head)
+            self.assertEqual(head, promotion["promoted_commit"])
+            self.assertEqual(head, champion)
             cleanup = cleanup_worktree(release, app)
             self.assertTrue(cleanup["ok"], cleanup)
 

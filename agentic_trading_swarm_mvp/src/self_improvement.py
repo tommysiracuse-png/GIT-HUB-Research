@@ -2368,7 +2368,11 @@ def run_auto_improvement(
 
     expired = expire_signal_policies(conn)
     evaluated = evaluate_active_experiments(conn, settings)
-    code_evolution_evaluated = evaluate_code_evolution(conn, settings)
+    code_evolution_evaluated = evaluate_code_evolution(
+        conn,
+        settings,
+        resume_paused=bool(include_code_changes),
+    )
     registry_backfill = backfill_open_artifacts(conn)
     deployed_reconciliation = reconcile_deployed_artifacts(conn)
     consumed = []

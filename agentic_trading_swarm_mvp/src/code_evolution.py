@@ -22,10 +22,12 @@ import sys
 import tempfile
 from typing import Any
 
+from codex_repo_agent import codex_repo_agent_config, codex_write_lock, run_codex_repo_agent
 from cost_router import complete, completion_preflight_status
 from evolution.archive import write_candidate_archive
 from evolution.builder_context import build_builder_context, render_builder_context, resolve_repo_targets
 from evolution.canary import run_radar_canary, skip_canary
+from evolution.contracts import CandidateRelease
 from evolution.evaluator import (
     benchmark_builder_change,
     classify_sandbox_failure,
@@ -2178,6 +2180,18 @@ BLOCKED_PATH_PREFIXES = [
     "scripts/",
 ]
 
+CODEX_REPO_BLOCKED_PATH_PREFIXES = [
+    ".git/",
+    ".venv/",
+    "node_modules/",
+    "runs/",
+]
+CODEX_REPO_BLOCKED_FILES = {
+    ".env",
+    "config/settings.local.json",
+}
+CODEX_REPO_BLOCKED_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".key", ".pem", ".p12", ".pfx"}
+
 FORBIDDEN_ADDED_PATTERNS = [
     (re.compile(r"allow_live_trading[\"']?\s*[:=]\s*true", re.I), "enables_live_trading"),
     (re.compile(r"[\"']mode[\"']\s*:\s*[\"']live[\"']", re.I), "enables_live_mode"),
@@ -3289,6 +3303,45 @@ def _forbidden_reasons_from_diff(diff_text: str) -> list[str]:
     return sorted(reasons)
 
 
+def _codex_repo_forbidden_reasons(diff_text: str) -> list[str]:
+    """Scan actual runtime additions for the two non-negotiable boundaries."""
+
+    live_patterns = [
+        (re.compile(r"allow_live_trading[\"']?\s*[:=]\s*true", re.I), "enables_live_trading"),
+        (re.compile(r"[\"']mode[\"']\s*:\s*[\"']live[\"']", re.I), "enables_live_mode"),
+        (re.compile(r"max_live_notional_usd[\"']?\s*[:=]\s*(?!0(?:\.0)?\b)\d", re.I), "increases_live_notional"),
+        (re.compile(r"\b(create_order|place_order|submit_order|cancel_order|withdraw|transfer_funds)\s*\(", re.I), "broker_write_or_order_api"),
+    ]
+    secret_patterns = [
+        (re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}"), "secret_literal_added"),
+        (re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"), "secret_literal_added"),
+        (
+            re.compile(
+                r"\b(print|write|write_text|write_bytes|dump|dumps|info|debug|warning|error)\s*\([^\n]*(?:API_KEY|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL)",
+                re.I,
+            ),
+            "secret_leakage_path_added",
+        ),
+    ]
+    reasons: set[str] = set()
+    current_path = ""
+    added_by_path: dict[str, list[str]] = {}
+    for raw in diff_text.splitlines():
+        if raw.startswith("+++ "):
+            current_path = _canonical_path(_diff_file_path(raw[4:].strip()))
+            added_by_path.setdefault(current_path, [])
+        elif raw.startswith("+") and not raw.startswith("+++ "):
+            added_by_path.setdefault(current_path, []).append(raw[1:])
+    for path, lines in added_by_path.items():
+        if not lines or _is_test_or_doc_path(path):
+            continue
+        text = "\n".join(lines)
+        for pattern, reason in [*live_patterns, *secret_patterns]:
+            if pattern.search(text):
+                reasons.add(reason)
+    return sorted(reasons)
+
+
 def _is_test_or_doc_path(path: str) -> bool:
     return (
         path.startswith("tests/")
@@ -3333,6 +3386,8 @@ def _safety_decision(reasons: list[str], patch_generation: dict | None = None, p
         "enables_spot_borrow",
         "enables_prediction_market_account",
         "touches_credentials",
+        "secret_literal_added",
+        "secret_leakage_path_added",
         "broker_write_or_order_api",
         "destructive_database_action",
         "destructive_filesystem_action",
@@ -3370,6 +3425,7 @@ def validate_and_scan(
     *,
     patch_generation: dict | None = None,
     preflight: dict | None = None,
+    repo_agent: bool = False,
 ) -> dict:
     diff_text = rewrite_diff_paths(diff_text)
     cfg = _cfg(settings)
@@ -3379,6 +3435,39 @@ def validate_and_scan(
     changed_files = changed_files_from_diff(diff_text)
     reasons: list[str] = []
     unavailable_reason = _patch_generation_unavailable_reason(patch_generation)
+
+    if repo_agent:
+        if not cfg.get("enabled", True):
+            reasons.append("code_evolution_disabled")
+        if not diff_text.strip():
+            reasons.append("missing_unified_diff")
+        elif not changed_files:
+            reasons.append("invalid_patch_format")
+        for path in changed_files:
+            if _codex_repo_path_blocked(path):
+                reasons.append(f"path_not_allowed:{path}")
+        reasons.extend(_codex_repo_forbidden_reasons(diff_text))
+        reasons = sorted(set(reasons))
+        decision = _safety_decision(reasons, patch_generation=patch_generation)
+        actual_runtime_status = _actual_runtime_integration_status(payload, category, changed_files) if changed_files else None
+        return {
+            "allowed": not reasons,
+            "decision": decision,
+            "reasons": reasons,
+            "category": category,
+            "implementation_mode": implementation_mode,
+            "frontier_required": False,
+            "priority": priority,
+            "changed_files": changed_files,
+            "preflight": preflight or {},
+            "proposal_quality_score": (preflight or {}).get("quality_scorecard", {}).get("proposal_quality_score"),
+            "proposal_scorecard": (preflight or {}).get("quality_scorecard", {}),
+            "actual_runtime_integration_status": actual_runtime_status,
+            "frontier_call_useful": None,
+            "frontier_call_wasted_reason": None,
+            "authority_mode": "repo_agent_actual_diff",
+            "scanned_at": _utc_now(),
+        }
 
     if not cfg.get("enabled", True):
         reasons.append("code_evolution_disabled")
@@ -3648,6 +3737,17 @@ def _path_blocked(path: str, cfg: dict) -> bool:
             return True
     allowed = cfg.get("allowed_path_prefixes", DEFAULT_ALLOWED_PATH_PREFIXES)
     return not any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in allowed)
+
+
+def _codex_repo_path_blocked(path: str) -> bool:
+    normalized = _canonical_path(path)
+    if not normalized or normalized.startswith("../") or "/../" in normalized:
+        return True
+    if normalized in CODEX_REPO_BLOCKED_FILES:
+        return True
+    if pathlib.PurePosixPath(normalized).suffix.lower() in CODEX_REPO_BLOCKED_SUFFIXES:
+        return True
+    return any(normalized == prefix.rstrip("/") or normalized.startswith(prefix) for prefix in CODEX_REPO_BLOCKED_PATH_PREFIXES)
 
 
 def _command_display(command: list[str]) -> str:
@@ -4647,16 +4747,23 @@ def _run_git_release_pipeline(
     safety: dict,
     sandbox: dict,
     root: pathlib.Path,
+    *,
+    prepared_release: CandidateRelease | None = None,
+    prepared_preflight: dict | None = None,
+    candidate_already_applied: bool = False,
+    preserve_failed_candidate: bool = False,
 ) -> dict:
     cfg = _cfg(settings)
     base_dir = pathlib.Path(str(cfg.get("release_worktree_dir") or RUNS_DIR / "evolution_worktrees"))
     base_dir.mkdir(parents=True, exist_ok=True)
-    release, preflight = create_candidate_worktree(
-        root,
-        proposal_id,
-        base_dir=base_dir,
-        timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
-    )
+    release, preflight = prepared_release, dict(prepared_preflight or {})
+    if release is None:
+        release, preflight = create_candidate_worktree(
+            root,
+            proposal_id,
+            base_dir=base_dir,
+            timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+        )
     if release is None:
         return {
             "status": "release_preflight_failed",
@@ -4672,11 +4779,15 @@ def _run_git_release_pipeline(
         write_candidate_archive(RUNS_DIR / "candidate_archive.jsonl", metadata)
         return metadata
 
-    apply_result = apply_patch_to_workspace(
-        diff_text,
-        root=app_root,
-        timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
-        local_context_patch_apply=bool(cfg.get("local_context_patch_apply", True)),
+    apply_result = (
+        {"applied": True, "stage": "codex_repo_agent_worktree", "commands": []}
+        if candidate_already_applied
+        else apply_patch_to_workspace(
+            diff_text,
+            root=app_root,
+            timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+            local_context_patch_apply=bool(cfg.get("local_context_patch_apply", True)),
+        )
     )
     tests: dict[str, Any] = {"sandbox": sandbox, "candidate_apply": apply_result}
     if not apply_result.get("applied"):
@@ -4700,6 +4811,14 @@ def _run_git_release_pipeline(
         tests["candidate_dependency_install"] = dependency_install
     if any(result["returncode"] != 0 for result in dependency_install):
         release.status = "implementation_failed"
+        if preserve_failed_candidate:
+            archived = archive("implementation_paused", reason="candidate_dependency_install_failed")
+            return {
+                "status": "implementation_paused",
+                "release": archived,
+                "tests": tests,
+                "evaluation": {"release": release.as_metadata(), "reason": "candidate_dependency_install_failed"},
+            }
         cleanup = cleanup_worktree(release, root)
         archived = archive("dependency_install_failed", cleanup=cleanup, reason="candidate_dependency_install_failed")
         return {
@@ -4714,6 +4833,14 @@ def _run_git_release_pipeline(
     if not candidate_tests.get("passed"):
         status = classify_sandbox_failure(candidate_tests)
         release.status = "implementation_failed"
+        if preserve_failed_candidate:
+            archived = archive("implementation_paused", reason=status)
+            return {
+                "status": "implementation_paused",
+                "release": archived,
+                "tests": tests,
+                "evaluation": {"release": release.as_metadata(), "reason": status},
+            }
         cleanup = cleanup_worktree(release, root)
         archived = archive(status, cleanup=cleanup, reason="candidate_tests_failed")
         return {
@@ -4740,6 +4867,14 @@ def _run_git_release_pipeline(
         }
         if not after_benchmark.get("passed") or not benchmark_gate.get("passed"):
             release.status = "archived_failed"
+            if preserve_failed_candidate:
+                archived = archive("implementation_paused", reason="builder_failure_benchmark_failed")
+                return {
+                    "status": "implementation_paused",
+                    "release": archived,
+                    "tests": tests,
+                    "evaluation": {"release": release.as_metadata(), "reason": "builder_failure_benchmark_failed"},
+                }
             cleanup = cleanup_worktree(release, root)
             archived = archive("archived_failed", cleanup=cleanup, reason="builder_failure_benchmark_failed")
             return {
@@ -4757,6 +4892,14 @@ def _run_git_release_pipeline(
     tests["candidate_commit"] = commit_result
     if not commit_result.get("ok"):
         release.status = "implementation_failed"
+        if preserve_failed_candidate:
+            archived = archive("implementation_paused", reason=commit_result.get("reason"))
+            return {
+                "status": "implementation_paused",
+                "release": archived,
+                "tests": tests,
+                "evaluation": {"release": release.as_metadata(), "reason": commit_result.get("reason")},
+            }
         cleanup = cleanup_worktree(release, root)
         archived = archive("implementation_failed", cleanup=cleanup, reason=commit_result.get("reason"))
         return {
@@ -4830,6 +4973,271 @@ def _run_git_release_pipeline(
     }
 
 
+def _codex_agent_enabled(settings: dict) -> bool:
+    # Explicit presence keeps legacy/unit-test settings on the exact-edit path;
+    # normal load_settings() always supplies the enabled default.
+    return bool((settings.get("codex_repo_agent") or {}).get("enabled", False))
+
+
+def _candidate_release_from_row(row: dict) -> CandidateRelease | None:
+    evaluation = row.get("evaluation") if isinstance(row.get("evaluation"), dict) else {}
+    metadata = evaluation.get("release") if isinstance(evaluation.get("release"), dict) else {}
+    worktree_path = str(row.get("worktree_path") or metadata.get("worktree_path") or "")
+    app_worktree_path = str(metadata.get("app_worktree_path") or "")
+    parent_commit = str(row.get("parent_commit") or metadata.get("parent_commit") or "")
+    branch_name = str(row.get("branch_name") or metadata.get("branch_name") or "")
+    if not all((worktree_path, app_worktree_path, parent_commit, branch_name)):
+        return None
+    if not pathlib.Path(worktree_path).exists() or not pathlib.Path(app_worktree_path).exists():
+        return None
+    return CandidateRelease(
+        proposal_id=str(row.get("proposal_id") or metadata.get("proposal_id") or ""),
+        parent_commit=parent_commit,
+        branch_name=branch_name,
+        worktree_path=worktree_path,
+        app_worktree_path=app_worktree_path,
+        candidate_commit=row.get("candidate_commit") or metadata.get("candidate_commit"),
+        status="implementing",
+    )
+
+
+def _candidate_worktree_diff(release: CandidateRelease, timeout: int) -> tuple[str, dict]:
+    app_root = pathlib.Path(release.app_worktree_path)
+    intent = _run(["git", "add", "-N", "."], app_root, timeout)
+    completed = subprocess.run(
+        ["git", "diff", "--binary", "--relative", release.parent_commit, "--"],
+        cwd=str(app_root),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    diff = {
+        "args": list(completed.args),
+        "returncode": completed.returncode,
+        "stdout_tail": completed.stdout[-2000:],
+        "stderr_tail": completed.stderr[-2000:],
+    }
+    return completed.stdout if completed.returncode == 0 else "", {"intent_to_add": intent, "diff": diff}
+
+
+def _codex_patch_generation(agent: dict) -> dict:
+    return {
+        "status": f"codex_repo_agent:{agent.get('status')}",
+        "model_name": f"openai/{agent.get('model') or 'gpt-5.6-sol'}",
+        "model_tier": "frontier",
+        "requested_model_tier": "frontier",
+        "reasoning_effort": agent.get("reasoning_effort"),
+        "session_id": agent.get("session_id"),
+        "resumed": bool(agent.get("resumed")),
+        "event_log": agent.get("event_log"),
+        "event_summary": agent.get("event_summary") or {},
+        "runtime": agent.get("runtime") or {},
+        "started_at": agent.get("started_at"),
+        "finished_at": agent.get("finished_at"),
+        "reason": agent.get("reason"),
+        "stderr_tail": agent.get("stderr_tail"),
+    }
+
+
+def _codex_failure_context(row: dict | None, extra: dict | None = None) -> dict:
+    context: dict[str, Any] = {}
+    if row:
+        safety = row.get("safety") if isinstance(row.get("safety"), dict) else {}
+        tests = row.get("tests") if isinstance(row.get("tests"), dict) else {}
+        evaluation = row.get("evaluation") if isinstance(row.get("evaluation"), dict) else {}
+        context = {
+            "prior_status": row.get("status"),
+            "safety_reasons": safety.get("reasons") or [],
+            "host_tests": tests,
+            "evaluation_reason": evaluation.get("reason"),
+        }
+    if extra:
+        context.update(extra)
+    return context
+
+
+def _pause_codex_candidate(
+    conn: Any,
+    proposal_id: str,
+    release: CandidateRelease | None,
+    preflight: dict,
+    agent: dict,
+    diff_text: str,
+    safety: dict,
+    tests: dict | None = None,
+    reason: str | None = None,
+) -> list[dict]:
+    release_meta = release.as_metadata() if release else {}
+    patch_generation = _codex_patch_generation(agent)
+    safety = {**safety, "patch_generation": patch_generation, "codex_repo_agent": patch_generation}
+    evaluation = {
+        "release": {**release_meta, "preflight": preflight, "status": "implementation_paused"},
+        "reason": reason or agent.get("reason") or "codex_implementation_incomplete",
+        "codex_repo_agent": patch_generation,
+    }
+    update_code_evolution_proposal(
+        conn,
+        proposal_id,
+        status="implementation_paused",
+        patch_text=diff_text or None,
+        changed_files=changed_files_from_diff(diff_text),
+        safety=safety,
+        tests=tests or {},
+        evaluation=evaluation,
+        parent_commit=release.parent_commit if release else None,
+        branch_name=release.branch_name if release else None,
+        worktree_path=release.worktree_path if release else None,
+    )
+    _append_ledger(conn, proposal_id, "implementation_paused")
+    return [_artifact(proposal_id, "created", "implementation_paused", [str(evaluation["reason"])])]
+
+
+def _run_codex_candidate(
+    conn: Any,
+    proposal_id: str,
+    payload: dict,
+    settings: dict,
+    preflight: dict,
+    root: pathlib.Path,
+    *,
+    existing_row: dict | None = None,
+) -> dict:
+    cfg = _cfg(settings)
+    agent_cfg = codex_repo_agent_config(settings, RUNS_DIR)
+    with codex_write_lock(agent_cfg, proposal_id) as lock:
+        if not lock.get("acquired"):
+            artifacts = _pause_codex_candidate(
+                conn,
+                proposal_id,
+                _candidate_release_from_row(existing_row or {}),
+                preflight,
+                {"status": "implementation_paused", "reason": lock.get("reason")},
+                str((existing_row or {}).get("patch_text") or ""),
+                {"allowed": False, "reasons": [str(lock.get("reason"))]},
+                reason=str(lock.get("reason")),
+            )
+            return {"handled": True, "artifacts": artifacts}
+
+        release = _candidate_release_from_row(existing_row or {})
+        release_preflight = (existing_row or {}).get("evaluation", {}).get("release", {}).get("preflight", {})
+        if release is None:
+            base_dir = pathlib.Path(str(cfg.get("release_worktree_dir") or RUNS_DIR / "evolution_worktrees"))
+            base_dir.mkdir(parents=True, exist_ok=True)
+            release, release_preflight = create_candidate_worktree(
+                root,
+                proposal_id,
+                base_dir=base_dir,
+                timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+            )
+        if release is None:
+            update_code_evolution_proposal(
+                conn,
+                proposal_id,
+                status="release_preflight_failed",
+                evaluation={"release": release_preflight},
+            )
+            _append_ledger(conn, proposal_id, "release_preflight_failed")
+            return {"handled": True, "artifacts": [_artifact(proposal_id, "created", "release_preflight_failed")]}
+
+        prior_safety = (existing_row or {}).get("safety") or {}
+        prior_agent = prior_safety.get("codex_repo_agent") or prior_safety.get("patch_generation") or {}
+        session_id = str(prior_agent.get("session_id") or "") or None
+        agent = run_codex_repo_agent(
+            proposal_id=proposal_id,
+            payload=payload,
+            preflight_hints=preflight,
+            worktree_root=pathlib.Path(release.app_worktree_path),
+            settings=settings,
+            runs_dir=RUNS_DIR,
+            session_id=session_id,
+            failure_context=_codex_failure_context(existing_row) if existing_row else None,
+        )
+        diff_text, diff_meta = _candidate_worktree_diff(release, int(cfg.get("sandbox_timeout_seconds", 120)))
+        patch_generation = _codex_patch_generation(agent)
+        if agent.get("status") == "unavailable" and not existing_row and not diff_text.strip():
+            cleanup_worktree(release, root)
+            return {"handled": False, "patch_generation": patch_generation}
+        if agent.get("status") != "completed":
+            artifacts = _pause_codex_candidate(
+                conn,
+                proposal_id,
+                release,
+                release_preflight,
+                agent,
+                diff_text,
+                {"allowed": False, "reasons": [str(agent.get("reason") or agent.get("status"))]},
+                tests={"worktree_diff": diff_meta},
+            )
+            return {"handled": True, "artifacts": artifacts}
+
+        safety = validate_and_scan(
+            payload,
+            diff_text,
+            settings,
+            patch_generation=patch_generation,
+            preflight=preflight,
+            repo_agent=True,
+        )
+        if not safety.get("allowed"):
+            artifacts = _pause_codex_candidate(
+                conn,
+                proposal_id,
+                release,
+                release_preflight,
+                agent,
+                diff_text,
+                safety,
+                tests={"worktree_diff": diff_meta},
+                reason="host_safety_scan_requires_repair",
+            )
+            return {"handled": True, "artifacts": artifacts}
+
+        actual_payload = dict(payload)
+        actual_payload["_preflight_parsed_tests"] = _canonical_test_commands_for_files(
+            safety.get("changed_files") or [],
+            str(safety.get("category") or ""),
+            root=pathlib.Path(release.app_worktree_path),
+        )
+        release_result = _run_git_release_pipeline(
+            proposal_id,
+            diff_text,
+            actual_payload,
+            settings,
+            safety,
+            {"passed": True, "stage": "codex_repo_agent_worktree", "commands": []},
+            root,
+            prepared_release=release,
+            prepared_preflight=release_preflight,
+            candidate_already_applied=True,
+            preserve_failed_candidate=True,
+        )
+        release_info = release_result.get("release") or {}
+        status = str(release_result.get("status") or "implementation_paused")
+        safety = _with_frontier_usefulness(safety, status, patch_generation)
+        safety.update({"patch_generation": patch_generation, "codex_repo_agent": patch_generation, "release": release_info})
+        update_code_evolution_proposal(
+            conn,
+            proposal_id,
+            status=status,
+            patch_text=diff_text,
+            changed_files=safety.get("changed_files", []),
+            safety=safety,
+            tests=release_result.get("tests") or {"worktree_diff": diff_meta},
+            evaluation={**(release_result.get("evaluation") or {}), "codex_repo_agent": patch_generation},
+            parent_commit=release_info.get("parent_commit"),
+            candidate_commit=release_info.get("candidate_commit"),
+            branch_name=release_info.get("branch_name"),
+            worktree_path=release_info.get("worktree_path"),
+            canary=release_result.get("canary"),
+            promotion_reason=release_info.get("promotion_reason"),
+            applied_at=_utc_now() if status == "promoted" else None,
+            probation_loops_observed=0,
+        )
+        _append_ledger(conn, proposal_id, status)
+        return {"handled": True, "artifacts": [_artifact(proposal_id, "created", status)]}
+
+
 def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, root: pathlib.Path = ROOT) -> list[dict]:
     payload = dict(rec.get("payload") or {})
     cfg = _cfg(settings)
@@ -4864,6 +5272,18 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
 
     diff_text = rewrite_diff_paths(_extract_patch(payload))
     patch_generation = {}
+    if cfg.get("git_release_enabled", False) and _codex_agent_enabled(settings):
+        codex_result = _run_codex_candidate(
+            conn,
+            proposal_id,
+            payload,
+            settings,
+            preflight,
+            root,
+        )
+        if codex_result.get("handled"):
+            return list(codex_result.get("artifacts") or [])
+        patch_generation = dict(codex_result.get("patch_generation") or {})
     scorecard = preflight.get("quality_scorecard") or {}
     duplicate_guard = _duplicate_failure_guard(conn, payload, preflight, cfg)
     if duplicate_guard:
@@ -5184,9 +5604,56 @@ def _artifact(proposal_id: str, action_status: str, status: str, reasons: list[s
     }
 
 
-def evaluate_code_evolution(conn: Any, settings: dict, root: pathlib.Path = ROOT) -> list[dict]:
+def _resume_paused_codex_candidates(conn: Any, settings: dict, root: pathlib.Path) -> list[dict]:
+    if not _codex_agent_enabled(settings):
+        return []
+    agent_cfg = codex_repo_agent_config(settings, RUNS_DIR)
+    cooldown = int(agent_cfg.get("resume_cooldown_seconds", 300))
+    limit = int(agent_cfg.get("max_resumes_per_cycle", 1))
+    resumed: list[dict] = []
+    now = dt.datetime.now(dt.timezone.utc)
+    for row in code_evolution_by_status(conn, ["implementation_paused"], limit=max(1, limit * 10)):
+        try:
+            updated = dt.datetime.fromisoformat(str(row.get("updated_at") or "").replace("Z", "+00:00"))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=dt.timezone.utc)
+            if (now - updated).total_seconds() < cooldown:
+                continue
+        except ValueError:
+            pass
+        payload = dict(row.get("payload") or {})
+        preflight = preflight_proposal(payload, settings, root=root)
+        result = _run_codex_candidate(
+            conn,
+            str(row["proposal_id"]),
+            payload,
+            settings,
+            preflight,
+            root,
+            existing_row=row,
+        )
+        for artifact in result.get("artifacts") or []:
+            resumed.append(
+                {
+                    "proposal_id": row["proposal_id"],
+                    "status": artifact.get("status"),
+                    "decision": "resume_codex_repo_agent",
+                }
+            )
+        if len(resumed) >= limit:
+            break
+    return resumed
+
+
+def evaluate_code_evolution(
+    conn: Any,
+    settings: dict,
+    root: pathlib.Path = ROOT,
+    *,
+    resume_paused: bool = False,
+) -> list[dict]:
     cfg = _cfg(settings)
-    evaluated = []
+    evaluated = _resume_paused_codex_candidates(conn, settings, root) if resume_paused else []
     for row in code_evolution_by_status(conn, sorted(PROBATION_STATUSES), limit=20):
         loops = int(row.get("probation_loops_observed") or 0) + 1
         evaluation = dict(row.get("evaluation") or {})
