@@ -33,6 +33,9 @@ class PredictionMarketScannerTests(unittest.TestCase):
         self.assertTrue(route["paper_only"])
         self.assertTrue(route["public_data_only"])
         self.assertFalse(route["live_execution_supported"])
+        self.assertTrue(route["execution_disabled"])
+        self.assertTrue(route["order_routing_disabled"])
+        self.assertEqual(route["route_id"], prediction.POLYMARKET_PAPER_ROUTE)
 
     def test_prediction_report_cannot_advertise_live_trading(self) -> None:
         old_runs = prediction.RUNS_DIR
@@ -53,6 +56,9 @@ class PredictionMarketScannerTests(unittest.TestCase):
     def test_build_scan_batch_writes_current_enriched_report(self) -> None:
         old_fetch = prediction.fetch_json
         old_runs = prediction.RUNS_DIR
+        book_timestamp = str(
+            int(prediction.dt.datetime.now(prediction.dt.timezone.utc).timestamp() * 1000)
+        )
 
         def fake_fetch(url: str, timeout: int = 12):
             if "gamma-api.polymarket.com/markets?" in url:
@@ -72,6 +78,7 @@ class PredictionMarketScannerTests(unittest.TestCase):
                 ]
             if "clob.polymarket.com/book" in url:
                 return {
+                    "timestamp": book_timestamp,
                     "bids": [{"price": "0.54", "size": "100"}],
                     "asks": [{"price": "0.56", "size": "120"}],
                 }
@@ -111,6 +118,12 @@ class PredictionMarketScannerTests(unittest.TestCase):
         self.assertIn("verified", report["summary"]["by_orderbook_status"])
         self.assertIn("crypto", report["summary"]["by_event_tag"])
         self.assertIn("prediction_markets_account", report["summary"]["route_blockers"])
+        self.assertEqual(
+            report["summary"]["by_signal_surface"]["prediction_market_probability"],
+            2,
+        )
+        self.assertEqual(report["summary"]["paper_measurement"]["fresh_candidate_count"], 1)
+        self.assertEqual(report["summary"]["paper_measurement"]["order_routing_disabled_count"], 1)
         self.assertEqual(batch.candidates[0]["execution_feasibility"]["status"], "conditional")
 
     def test_kalshi_public_coverage_skips_expired_and_keeps_quote_fields(self) -> None:
@@ -246,6 +259,9 @@ class PredictionMarketScannerTests(unittest.TestCase):
     def test_polymarket_expired_markets_filtered_and_event_review_queue_reported(self) -> None:
         old_fetch = prediction.fetch_json
         old_runs = prediction.RUNS_DIR
+        book_timestamp = str(
+            int(prediction.dt.datetime.now(prediction.dt.timezone.utc).timestamp() * 1000)
+        )
 
         def fake_fetch(url: str, timeout: int = 12):
             if "gamma-api.polymarket.com/markets?" in url:
@@ -271,6 +287,7 @@ class PredictionMarketScannerTests(unittest.TestCase):
                 ]
             if "clob.polymarket.com/book" in url:
                 return {
+                    "timestamp": book_timestamp,
                     "bids": [{"price": "0.54", "size": "100"}],
                     "asks": [{"price": "0.56", "size": "100"}],
                 }
@@ -355,6 +372,8 @@ class PredictionMarketScannerTests(unittest.TestCase):
         self.assertEqual(row["market_id"], "binary-1")
         self.assertEqual(row["title"], "Will the policy rate be cut this month?")
         self.assertEqual(row["probability_mid"], 0.42)
+        self.assertEqual(row["yes_probability"], 0.42)
+        self.assertEqual(row["no_probability"], 0.58)
         self.assertEqual(row["best_bid"], 0.41)
         self.assertEqual(row["best_ask"], 0.43)
         self.assertEqual(row["yes_best_bid"], 0.41)
@@ -368,6 +387,9 @@ class PredictionMarketScannerTests(unittest.TestCase):
         self.assertEqual(row["expiry"], expiry)
         self.assertTrue(row["paper_only"])
         self.assertTrue(row["read_only"])
+        self.assertEqual(row["freshness_status"], "fresh")
+        self.assertTrue(row["execution_disabled"])
+        self.assertTrue(row["order_routing_disabled"])
 
     def test_polymarket_excludes_resolved_and_ambiguous_markets(self) -> None:
         old_fetch = prediction.fetch_json

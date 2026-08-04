@@ -30,9 +30,51 @@ def settings() -> dict:
 
 
 class PredictionMarketScannerPublicGateTests(unittest.TestCase):
+    def test_polymarket_freshness_gate_rejects_stale_missing_and_future_book_times(self) -> None:
+        cfg = settings()
+        now = dt.datetime.now(dt.timezone.utc)
+        row = {"endDate": (now + dt.timedelta(days=5)).isoformat(), "liquidityNum": 5000}
+        base_candidate = {
+            "quote_volume_24h": 2000,
+            "spread_bps": 100,
+            "data_source": {
+                "orderbook_status": "verified",
+                "orderbook_best_bid": 0.5,
+                "orderbook_best_ask": 0.51,
+                "orderbook_depth_usd": 2000,
+                "orderbook_timestamp_complete": True,
+            },
+        }
+        cases = (
+            (
+                "stale_public_quote",
+                {"freshness_timestamp": (now - dt.timedelta(minutes=16)).isoformat(), "stale_minutes": 16},
+            ),
+            (
+                "missing_orderbook_freshness_timestamp",
+                {
+                    "freshness_timestamp": now.isoformat(),
+                    "stale_minutes": 0,
+                    "data_source": {**base_candidate["data_source"], "orderbook_timestamp_complete": False},
+                },
+            ),
+            (
+                "future_public_quote_timestamp",
+                {"freshness_timestamp": (now + dt.timedelta(minutes=6)).isoformat(), "stale_minutes": 0},
+            ),
+        )
+
+        for expected_reason, overrides in cases:
+            with self.subTest(expected_reason=expected_reason):
+                candidate = {**base_candidate, **overrides}
+                allowed, reasons = prediction._polymarket_paper_gate(candidate, row, cfg)
+                self.assertFalse(allowed)
+                self.assertIn(expected_reason, reasons)
+
     def test_polymarket_public_gate_keeps_only_fresh_liquid_markets_with_visible_quotes(self) -> None:
         old_fetch = prediction.fetch_json
         now = dt.datetime.now(dt.timezone.utc)
+        book_timestamp = str(int(now.timestamp() * 1000))
         fresh_end = (now + dt.timedelta(days=5)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         far_end = (now + dt.timedelta(days=60)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -78,16 +120,18 @@ class PredictionMarketScannerPublicGateTests(unittest.TestCase):
                 ]
             if "token-good" in url:
                 return {
+                    "timestamp": book_timestamp,
                     "bids": [{"price": "0.60", "size": "100"}],
                     "asks": [{"price": "0.62", "size": "120"}],
                 }
             if "token-far" in url:
                 return {
+                    "timestamp": book_timestamp,
                     "bids": [{"price": "0.57", "size": "100"}],
                     "asks": [{"price": "0.59", "size": "100"}],
                 }
             if "token-empty" in url:
-                return {"bids": [], "asks": []}
+                return {"timestamp": book_timestamp, "bids": [], "asks": []}
             raise AssertionError(url)
 
         prediction.fetch_json = fake_fetch

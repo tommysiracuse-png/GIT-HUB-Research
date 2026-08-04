@@ -1905,7 +1905,19 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
 
     if venue in {"KALSHI", "POLYMARKET"}:
         venue_key = "kalshi_events" if venue == "KALSHI" else "polymarket_events"
-        allowed = bool(caps.get("prediction_markets", False))
+        feasibility = candidate.get("execution_feasibility") or {}
+        polymarket_research_only = venue == "POLYMARKET" and bool(
+            candidate.get("paper_only")
+            or candidate.get("read_only")
+            or candidate.get("execution_disabled")
+            or candidate.get("order_routing_disabled")
+            or feasibility.get("public_data_only")
+            or feasibility.get("live_execution_supported") is False
+        )
+        # Scanner-created Polymarket rows are deliberately not promotable to a
+        # venue route. Account configuration must never turn public ingestion
+        # into order-routing authorization.
+        allowed = bool(caps.get("prediction_markets", False)) and not polymarket_research_only
         missing = [] if allowed else ["prediction_markets_account", "venue_api_access", "jurisdiction_eligibility"]
         overrides = {}
         if allowed:
@@ -1920,7 +1932,17 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
             candidate=candidate,
             required_permissions=["prediction_markets"],
             missing_permissions=missing,
-            route_notes=["Event-contract execution requires account, jurisdiction, contract eligibility, and API checks."],
+            route_notes=[
+                "Event-contract execution requires account, jurisdiction, contract eligibility, and API checks.",
+                *(
+                    [
+                        "This Polymarket candidate came from an anonymous public-data adapter; direct execution and order routing are disabled.",
+                        "Only the prediction-market public research paper alternative may be used.",
+                    ]
+                    if polymarket_research_only
+                    else []
+                ),
+            ],
             confidence=0.72 if allowed else 0.42,
             registry=registry,
             api_access_status="public_data_only",

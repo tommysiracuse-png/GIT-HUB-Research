@@ -24,6 +24,8 @@ from strict_json_object import coerce_single_json_object
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
 POLYMARKET_MARKET_CAP = 100
+PREDICTION_MARKET_SIGNAL_SURFACE = "prediction_market_probability"
+POLYMARKET_PAPER_ROUTE = "prediction_market_public_research_paper"
 
 
 def fetch_json(url: str, timeout: int = 12):
@@ -268,7 +270,9 @@ def _polymarket_paper_gate(candidate: dict, row: dict, settings: dict) -> tuple[
     max_days = as_float(config.get("polymarket_max_days_to_resolution"), 30.0)
     min_liquidity = as_float(config.get("polymarket_min_liquidity_usd"), 1_000.0)
     max_spread_bps = as_float(config.get("polymarket_max_spread_bps"), 300.0)
-    max_stale_minutes = as_float(config.get("polymarket_max_stale_minutes"), 0.0)
+    max_stale_minutes = as_float(config.get("polymarket_max_stale_minutes"), 15.0)
+    max_future_skew_minutes = as_float(config.get("polymarket_max_future_clock_skew_minutes"), 5.0)
+    require_freshness = _as_bool(config.get("polymarket_require_freshness_timestamp"), True)
     if days_to_end is None:
         reasons.append("missing_outcome_timestamp")
     elif days_to_end < 0:
@@ -281,9 +285,22 @@ def _polymarket_paper_gate(candidate: dict, row: dict, settings: dict) -> tuple[
         if as_float(metadata.get("orderbook_best_bid")) <= 0 or as_float(metadata.get("orderbook_best_ask")) <= 0:
             reasons.append("missing_visible_bid_ask")
     stale_minutes = candidate.get("stale_minutes")
+    freshness_timestamp = _utc_datetime(candidate.get("freshness_timestamp"))
+    if require_freshness:
+        if freshness_timestamp is None:
+            reasons.append("missing_freshness_timestamp")
+        elif metadata.get("orderbook_status") == "verified" and not metadata.get(
+            "orderbook_timestamp_complete"
+        ):
+            reasons.append("missing_orderbook_freshness_timestamp")
+        elif (
+            freshness_timestamp - dt.datetime.now(dt.timezone.utc)
+        ).total_seconds() > max_future_skew_minutes * 60.0:
+            reasons.append("future_public_quote_timestamp")
     if max_stale_minutes > 0:
         if stale_minutes is None:
-            reasons.append("missing_freshness_timestamp")
+            if "missing_freshness_timestamp" not in reasons:
+                reasons.append("missing_freshness_timestamp")
         elif as_float(stale_minutes) > max_stale_minutes:
             reasons.append("stale_public_quote")
     if max_spread_bps > 0 and as_float(candidate.get("spread_bps")) > max_spread_bps:
@@ -357,10 +374,9 @@ def _polymarket_outcome_orderbooks(token_ids: list) -> dict:
         status = "empty"
     else:
         status = "partial"
-    timestamp, stale_minutes = _freshness_fields(
-        yes_book.get("orderbook_timestamp"),
-        no_book.get("orderbook_timestamp"),
-    )
+    yes_timestamp = yes_book.get("orderbook_timestamp")
+    no_timestamp = no_book.get("orderbook_timestamp")
+    timestamp, stale_minutes = _freshness_fields(yes_timestamp, no_timestamp)
     return {
         "orderbook_status": status,
         "orderbook_best_bid": yes_book.get("orderbook_best_bid"),
@@ -372,6 +388,11 @@ def _polymarket_outcome_orderbooks(token_ids: list) -> dict:
             3,
         ),
         "orderbook_timestamp": timestamp,
+        "yes_orderbook_timestamp": yes_timestamp,
+        "no_orderbook_timestamp": no_timestamp,
+        "orderbook_timestamp_complete": bool(
+            _utc_datetime(yes_timestamp) and _utc_datetime(no_timestamp)
+        ),
         "orderbook_stale_minutes": stale_minutes,
         "orderbook_neg_risk": bool(
             yes_book.get("orderbook_neg_risk") or no_book.get("orderbook_neg_risk")
@@ -418,10 +439,13 @@ def _kalshi_orderbook(ticker: object) -> dict:
 def feasibility(settings: dict) -> dict:
     return {
         "status": "conditional",
+        "route_id": POLYMARKET_PAPER_ROUTE,
         "requires_short_spot": False,
         "paper_only": True,
         "public_data_only": True,
         "live_execution_supported": False,
+        "execution_disabled": True,
+        "order_routing_disabled": True,
         "legs": ["buy YES or NO event contract"],
         "notes": [
             "This adapter supports public market-data research only.",
@@ -472,7 +496,8 @@ def _candidate(
         "name": question[:180],
         "region": "prediction_market",
         "asset_class": "event_contract",
-        "trade_type": "prediction_market_probability",
+        "trade_type": PREDICTION_MARKET_SIGNAL_SURFACE,
+        "signal_surface": PREDICTION_MARKET_SIGNAL_SURFACE,
         "direction": direction,
         "execution_feasibility": feasibility(settings),
         "thesis": "prediction market probability movement/liquidity candidate for LLM event-latency review",
@@ -552,11 +577,25 @@ def _polymarket_candidate_from_row(row: dict, settings: dict, orderbook: dict) -
         freshness_timestamp, stale_minutes = _freshness_fields(
             row.get("updatedAt") or row.get("updated_at")
         )
+    scanner_cfg = settings.get("prediction_market_scanner", {}) or {}
+    max_stale_minutes = as_float(scanner_cfg.get("polymarket_max_stale_minutes"), 15.0)
+    parsed_freshness = _utc_datetime(freshness_timestamp)
+    if parsed_freshness is None:
+        freshness_status = "missing"
+    elif parsed_freshness > dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+        minutes=as_float(scanner_cfg.get("polymarket_max_future_clock_skew_minutes"), 5.0)
+    ):
+        freshness_status = "future_timestamp"
+    elif max_stale_minutes > 0 and stale_minutes is not None and stale_minutes > max_stale_minutes:
+        freshness_status = "stale"
+    else:
+        freshness_status = "fresh"
     tag_details = _event_tag_details(row)
     title = row.get("question") or row.get("title") or row.get("slug") or "Polymarket market"
     expiry = row.get("endDate") or row.get("end_date")
     metadata = {
         "provider": "Polymarket Gamma API",
+        "source_access": "anonymous_public_get",
         "slug": row.get("slug"),
         "market_id": str(row.get("id")),
         "endDate": expiry,
@@ -566,6 +605,7 @@ def _polymarket_candidate_from_row(row: dict, settings: dict, orderbook: dict) -
         "event_tag_confidence": tag_details["confidence"],
         "freshness_timestamp": freshness_timestamp,
         "stale_minutes": stale_minutes,
+        "freshness_status": freshness_status,
         **orderbook,
     }
     candidate = _candidate(
@@ -586,6 +626,8 @@ def _polymarket_candidate_from_row(row: dict, settings: dict, orderbook: dict) -
             "market_id": str(row.get("id")),
             "title": str(title),
             "probability_mid": round(max(0.0, min(1.0, yes)), 6),
+            "yes_probability": round(max(0.0, min(1.0, yes)), 6),
+            "no_probability": round(max(0.0, min(1.0, no)), 6),
             "best_bid": round(yes_bid, 6) if yes_bid > 0 else None,
             "best_ask": round(yes_ask, 6) if yes_ask > 0 else None,
             "yes_best_bid": orderbook.get("yes_best_bid"),
@@ -595,9 +637,13 @@ def _polymarket_candidate_from_row(row: dict, settings: dict, orderbook: dict) -
             "depth_usd": as_float(orderbook.get("orderbook_depth_usd")),
             "freshness_timestamp": freshness_timestamp,
             "stale_minutes": stale_minutes,
+            "freshness_status": freshness_status,
             "expiry": expiry,
             "paper_only": True,
             "read_only": True,
+            "live_execution_supported": False,
+            "execution_disabled": True,
+            "order_routing_disabled": True,
         }
     )
     return candidate
@@ -894,7 +940,7 @@ def _required_observation(inst_id: str) -> dict | None:
                 return {
                     "inst_id": inst_id,
                     "venue": "POLYMARKET",
-                    "trade_type": "prediction_market_probability",
+                    "trade_type": PREDICTION_MARKET_SIGNAL_SURFACE,
                     "last": price,
                     "observed_at": observed_at,
                     "price_source": "Polymarket Gamma API direct market",
@@ -1003,9 +1049,13 @@ def summarize(candidates: list[dict], scan_metadata: dict | None = None) -> dict
     by_liquidity = collections.Counter()
     by_confidence = collections.Counter()
     by_resolution_risk = collections.Counter()
+    by_signal_surface = collections.Counter()
+    by_freshness_status = collections.Counter()
     blockers: collections.Counter[str] = collections.Counter()
     for row in candidates:
         source = row.get("data_source") or {}
+        by_signal_surface[row.get("signal_surface") or row.get("trade_type") or "unknown"] += 1
+        by_freshness_status[row.get("freshness_status") or source.get("freshness_status") or "unknown"] += 1
         by_tag.update(source.get("event_tags") or ["uncategorized"])
         by_end_date[source.get("end_date_bucket", "unknown")] += 1
         by_spread[source.get("spread_bucket", "unknown")] += 1
@@ -1084,11 +1134,31 @@ def summarize(candidates: list[dict], scan_metadata: dict | None = None) -> dict
         "by_event_tag_confidence": dict(by_confidence),
         "by_end_date_bucket": dict(by_end_date),
         "by_resolution_risk_status": dict(by_resolution_risk),
+        "by_signal_surface": dict(by_signal_surface),
+        "by_freshness_status": dict(by_freshness_status),
         "by_spread_bucket": dict(by_spread),
         "by_liquidity_bucket": dict(by_liquidity),
         "route_blockers": dict(blockers),
         "prediction_event_review_queue": event_review_queue,
         "prediction_market_research_queue": research_queue,
+        "paper_measurement": {
+            "paper_only": True,
+            "signal_surface": PREDICTION_MARKET_SIGNAL_SURFACE,
+            "surface_candidate_count": by_signal_surface.get(PREDICTION_MARKET_SIGNAL_SURFACE, 0),
+            "fresh_candidate_count": by_freshness_status.get("fresh", 0),
+            "public_read_only_count": sum(
+                bool(row.get("paper_only") and row.get("read_only")) for row in candidates
+            ),
+            "order_routing_disabled_count": sum(
+                bool(row.get("order_routing_disabled")) for row in candidates
+            ),
+            "expectancy_group_fields": [
+                "venue",
+                "trade_type",
+                "direction",
+                "execution_feasibility.status",
+            ],
+        },
         "event_review_shadow_trials": event_review_shadow_trials,
         "top_candidates": [
             {
