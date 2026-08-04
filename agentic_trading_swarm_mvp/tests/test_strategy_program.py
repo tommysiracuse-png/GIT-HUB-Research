@@ -18,6 +18,7 @@ from settings import DEFAULT_SETTINGS  # noqa: E402
 from radar_loop import _select_runtime_strategy_lab_candidates  # noqa: E402
 from storage import init_db  # noqa: E402
 from strategy_lab import (  # noqa: E402
+    _observation_program_inputs,
     _queue_promotion,
     generate_strategy_lab_candidates,
     ingest_strategy_lab_recommendation,
@@ -90,6 +91,75 @@ def shock_reversal_logic() -> dict:
         "score_expression": "clip(30 + 12 * min(shock_sigma, 4) + min(flip_strength_bps, 20), 0, 100)",
         "route_surface": "proxy",
         "output_trade_type": "global_proxy_shock_reversal",
+    }
+
+
+def funding_capture_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["OKX"],
+            "trade_types": ["perp_funding_basis"],
+            "quotes": ["USDT"],
+        },
+        "calculated_features": {
+            "predicted_next_funding_bps": (
+                "min(funding_bps, funding_history_last_bps, funding_history_avg_bps)"
+            ),
+            "basis_instability_bps": (
+                "basis_volatility_60m_bps + abs(basis_change_5m_bps)"
+            ),
+            "cost_adjusted_carry_edge_bps": (
+                "max(0, net_carry_edge_bps - 0.5 * basis_volatility_60m_bps "
+                "- abs(basis_change_5m_bps))"
+            ),
+        },
+        "entry_expression": (
+            "basis_history_ready >= 1 and funding_history_count >= 3 "
+            "and predicted_next_funding_bps > 0 and net_carry_edge_bps > 3 "
+            "and abs(basis_zscore_60m) <= 1 and basis_volatility_60m_bps <= 6 "
+            "and abs(basis_change_5m_bps) <= 3 and spread_bps <= 4 "
+            "and liquidity_score >= 0.7 and quality_score >= 65 and stale_minutes <= 2"
+        ),
+        "invalidation_expression": (
+            "predicted_next_funding_bps <= 0 or abs(basis_zscore_60m) > 1.5 "
+            "or basis_volatility_60m_bps > 10 or abs(basis_change_5m_bps) > 6 "
+            "or spread_bps > 8 or stale_minutes > 5"
+        ),
+        "direction": "short",
+        "edge_expression": "cost_adjusted_carry_edge_bps",
+        "score_expression": (
+            "clip(50 + 3 * cost_adjusted_carry_edge_bps "
+            "- 8 * abs(basis_zscore_60m) - basis_instability_bps - spread_bps, 0, 100)"
+        ),
+        "route_surface": "perp",
+        "output_trade_type": "perp_funding_capture",
+    }
+
+
+def funding_observation(price: float, basis_bps: float, observed_at: str) -> dict:
+    return {
+        "inst_id": "BTC-USDT-SWAP",
+        "venue": "OKX",
+        "trade_type": "perp_funding_basis",
+        "asset_class": "crypto_linked_derivative",
+        "quote": "USDT",
+        "base": "BTC",
+        "last": price,
+        "basis_bps": basis_bps,
+        "funding_bps": 8.0,
+        "funding_history_count": 8,
+        "funding_history_avg_bps": 6.0,
+        "funding_history_last_bps": 7.0,
+        "net_carry_edge_bps": 12.0,
+        "round_trip_cost_bps": 4.0,
+        "spread_bps": 2.0,
+        "liquidity_score": 0.85,
+        "quality_score": 90.0,
+        "quality_status": "verified",
+        "stale_minutes": 1.0,
+        "observed_at": observed_at,
+        "price_source": "fixture",
     }
 
 
@@ -172,6 +242,48 @@ class StrategyProgramTests(unittest.TestCase):
         program, diagnostic = compile_observation_program(mislabeled_continuation)
         self.assertIsNone(program)
         self.assertEqual("shock_reversal_invalid_long_expression", diagnostic["reason"])
+
+    def test_perp_funding_output_is_bounded_to_broad_short_carry_programs(self) -> None:
+        program, diagnostic = compile_observation_program(funding_capture_logic())
+        self.assertIsNotNone(program, diagnostic)
+        self.assertEqual("perp_funding_capture", program["output_trade_type"])
+
+        generated, runtime_diagnostic = generate_program_candidates(
+            {
+                "strategy_lab_id": "missing_basis_history",
+                "version": 1,
+                "hypothesis": "History is mandatory.",
+                "strategy_logic": funding_capture_logic(),
+            },
+            [
+                {
+                    **funding_observation(
+                        100.0,
+                        2.0,
+                        dt.datetime.now(dt.timezone.utc).isoformat(),
+                    ),
+                    "basis_history_ready": 0.0,
+                    "basis_zscore_60m": 0.0,
+                    "basis_volatility_60m_bps": 0.0,
+                    "basis_change_5m_bps": 0.0,
+                }
+            ],
+            settings(),
+        )
+        self.assertEqual([], generated)
+        self.assertEqual(1, runtime_diagnostic["reject_reasons"]["entry_expression_false"])
+
+        pinned = copy.deepcopy(funding_capture_logic())
+        pinned["universe"]["inst_ids"] = ["BTC-USDT-SWAP"]
+        program, diagnostic = compile_observation_program(pinned)
+        self.assertIsNone(program)
+        self.assertEqual("perp_funding_capture_must_not_pin_instruments", diagnostic["reason"])
+
+        wrong_direction = copy.deepcopy(funding_capture_logic())
+        wrong_direction["direction"] = "long"
+        program, diagnostic = compile_observation_program(wrong_direction)
+        self.assertIsNone(program)
+        self.assertEqual("perp_funding_capture_requires_short_direction", diagnostic["reason"])
 
     def test_calculated_feature_dependencies_ignore_serialized_key_order(self) -> None:
         logic = json.loads(json.dumps(shock_reversal_logic(), sort_keys=True))
@@ -258,6 +370,29 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertEqual([101.0, 102.0], [row["last"] for row in rows])
         self.assertTrue(all(dt.datetime.fromisoformat(row["bucket_at"]).minute % 5 == 0 for row in rows))
 
+    def test_missing_basis_snapshots_do_not_become_ready_zero_history(self) -> None:
+        cfg = settings()
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        with memory_db() as conn:
+            for index in range(12):
+                missing_basis = funding_observation(
+                    100.0,
+                    2.0,
+                    (now - dt.timedelta(minutes=60 - index * 5)).isoformat(),
+                )
+                missing_basis.pop("basis_bps")
+                record_feature_snapshots(conn, [missing_basis], cfg)
+            frames, _ = record_feature_snapshots(
+                conn,
+                [funding_observation(100.0, 2.0, now.isoformat())],
+                cfg,
+            )
+
+        self.assertEqual(0.0, frames[0]["basis_history_ready"])
+        self.assertEqual(0.0, frames[0]["basis_zscore_60m"])
+        self.assertEqual(0.0, frames[0]["basis_volatility_60m_bps"])
+
     def test_observation_program_generates_without_existing_scanner_candidate(self) -> None:
         cfg = settings()
         now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
@@ -286,6 +421,103 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertEqual("compiled", row["compile_status"])
         self.assertEqual("novel", row["novelty_status"])
         self.assertEqual(0, report["source_candidate_count"])
+
+    def test_funding_program_uses_basis_history_and_preserves_explicit_route_contract(self) -> None:
+        cfg = settings()
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        recommendation = {
+            "recommendation_id": "rec_okx_observation_funding",
+            "payload": {
+                "action": "propose_strategy_lab_experiment",
+                "strategy_lab_experiment": {
+                    "strategy_lab_id": "okx_observation_funding_stability_v1",
+                    "version": 1,
+                    "experiment_type": "market_strategy",
+                    "hypothesis": "Persistent positive funding with stable basis survives costs.",
+                    "source_surface": "perp_funding_basis",
+                    "permitted_target_surface": ["perp_funding_basis"],
+                    "strategy_logic": funding_capture_logic(),
+                    "data_requirements": {"paper_only": True},
+                    "risk_gates": {"paper_allocation_multiplier": 0.25},
+                    "promotion_rules": {"promote_min_labels": 30},
+                },
+            },
+        }
+        source_candidate = {
+            **funding_observation(100.0, 2.0, now.isoformat()),
+            "seen_at": now.isoformat(),
+            "direction": "funding_capture_short_perp",
+            "score": 80.0,
+            "target_surface": "perp_funding_basis",
+            "hedge_venue": "OKX_SPOT",
+            "hedge_instrument": "BTC-USDT",
+            "fee_model": "paper_conservative_v1",
+            "paper_leg_mapping_valid": True,
+            "route_status": "standard",
+        }
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            for index in range(12):
+                record_feature_snapshots(
+                    conn,
+                    [
+                        funding_observation(
+                            100.0,
+                            2.0,
+                            (now - dt.timedelta(minutes=60 - index * 5)).isoformat(),
+                        )
+                    ],
+                    cfg,
+                )
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [source_candidate],
+                [funding_observation(100.0, 2.0, now.isoformat())],
+            )
+            row = conn.execute(
+                """
+                select status, compile_status, novelty_status
+                from strategy_lab_experiments where strategy_lab_id = ?
+                """,
+                ("okx_observation_funding_stability_v1",),
+            ).fetchone()
+
+        self.assertEqual(1, len(generated), report)
+        candidate = generated[0]
+        self.assertEqual("perp_funding_basis", candidate["trade_type"])
+        self.assertEqual("funding_capture_short_perp", candidate["direction"])
+        self.assertEqual("perp_funding_basis", candidate["target_surface"])
+        self.assertEqual("OKX_SPOT", candidate["hedge_venue"])
+        self.assertEqual("BTC-USDT", candidate["hedge_instrument"])
+        self.assertEqual("paper_conservative_v1", candidate["fee_model"])
+        self.assertTrue(candidate["paper_leg_mapping_valid"])
+        self.assertTrue(candidate["paper_only"])
+        self.assertEqual(1.0, candidate["strategy_lab_program_features"]["basis_history_ready"])
+        self.assertEqual(0.0, candidate["strategy_lab_program_features"]["basis_change_5m_bps"])
+        self.assertEqual("active_testing", row["status"])
+        self.assertEqual("compiled", row["compile_status"])
+        self.assertEqual("novel", row["novelty_status"])
+
+    def test_program_input_join_does_not_copy_cached_route_eligibility(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        source = {
+            **funding_observation(100.0, 2.0, now),
+            "direction": "funding_capture_short_perp",
+            "paper_route_eligibility": {"suppressed": False, "route_eligible": True},
+            "fee_model": "explicit_fixture",
+        }
+        rows = _observation_program_inputs(
+            [funding_observation(100.0, 2.0, now)],
+            [source],
+        )
+
+        embedded = rows[0]["candidate"]
+        self.assertEqual("explicit_fixture", embedded["fee_model"])
+        self.assertNotIn("paper_route_eligibility", embedded)
+        self.assertNotIn("hedge_venue", embedded)
+        self.assertNotIn("paper_leg_mapping_valid", embedded)
 
     def test_sorted_shock_reversal_contract_activates_without_feature_extension(self) -> None:
         cfg = settings()

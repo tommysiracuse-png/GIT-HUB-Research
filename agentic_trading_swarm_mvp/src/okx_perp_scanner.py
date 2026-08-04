@@ -27,6 +27,27 @@ from paper_context_cost import annotate_paper_context_cost
 BASE_URL = "https://www.okx.com"
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
+STRATEGY_OBSERVATION_FIELDS = {
+    "basis_bps",
+    "mark_basis_bps",
+    "basis_mark_last_delta_bps",
+    "funding_bps",
+    "funding_interval_hours",
+    "next_funding_time",
+    "time_to_next_funding_minutes",
+    "funding_history_count",
+    "funding_history_avg_bps",
+    "funding_history_last_bps",
+    "funding_history_min_bps",
+    "funding_history_max_bps",
+    "funding_history_slope_bps",
+    "spread_bps",
+    "liquidity_score",
+    "quality_score",
+    "quality_status",
+    "quote_volume_24h",
+    "change_24h_pct",
+}
 
 
 def fetch_json(path: str, params: dict[str, str] | None = None, timeout: int = 12) -> dict:
@@ -234,6 +255,71 @@ def _basis_bucket(value: float) -> str:
     return "extreme"
 
 
+def _minutes_until(value: str | None, now: dt.datetime) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return round(max(0.0, (parsed.astimezone(dt.timezone.utc) - now).total_seconds() / 60.0), 3)
+
+
+def _market_data_quality(
+    *,
+    index_price: float,
+    funding_rate: float | None,
+    bid: float,
+    ask: float,
+    spread_bps: float,
+    signal_age_seconds: float | None,
+    funding_history_count: int,
+) -> tuple[float, str]:
+    """Score only explicit public-data completeness and freshness."""
+
+    score = 100.0
+    if index_price <= 0:
+        score -= 40.0
+    if funding_rate is None:
+        score -= 30.0
+    if bid <= 0 or ask <= bid:
+        score -= 25.0
+    elif spread_bps > 0:
+        score -= min(20.0, spread_bps / 2.0)
+    if signal_age_seconds is None:
+        score -= 10.0
+    elif signal_age_seconds > 120.0:
+        score -= min(30.0, (signal_age_seconds - 120.0) / 30.0)
+    if funding_history_count < 3:
+        score -= 10.0
+    bounded = round(max(0.0, min(100.0, score)), 3)
+    status = "verified" if bounded >= 75.0 else "degraded" if bounded >= 60.0 else "unavailable"
+    return bounded, status
+
+
+def _strategy_observation(row: dict, candidate: dict | None, instrument: dict | None, seen_at: str) -> dict:
+    observation = {
+        "inst_id": row.get("instId"),
+        "venue": "OKX",
+        "trade_type": "perp_funding_basis",
+        **instrument_asset_context(str(row.get("instId") or ""), instrument),
+        "last": as_float(row.get("last")),
+        "observed_at": seen_at,
+        "price_source": "OKX public REST market tickers",
+    }
+    if not candidate:
+        return observation
+    for field in STRATEGY_OBSERVATION_FIELDS:
+        if candidate.get(field) is not None:
+            observation[field] = candidate[field]
+    if candidate.get("signal_age_seconds") is not None:
+        observation["freshness_age_seconds"] = candidate["signal_age_seconds"]
+        observation["stale_minutes"] = round(float(candidate["signal_age_seconds"]) / 60.0, 3)
+    return observation
+
+
 def build_scan_batch(
     scan_universe: int,
     allow_short_spot: bool = False,
@@ -337,14 +423,23 @@ def build_scan_batch(
         change_24h_pct = bps(last, open_24h) / 100.0 if open_24h > 0 else 0.0
 
         funding = funding_by_inst.get(inst_id, {})
-        funding_rate = as_float(funding.get("fundingRate"))
-        funding_bps = funding_rate * 10_000.0
+        funding_rate = as_float(funding.get("fundingRate"), None)
+        funding_bps = funding_rate * 10_000.0 if funding_rate is not None else 0.0
         next_funding_time = unix_ms_to_iso(funding.get("nextFundingTime") or funding.get("fundingTime"))
         funding_interval_hours = _funding_interval_hours(funding)
         direction, thesis = classify_direction(funding_bps, basis_bps)
         feasibility = execution_feasibility(direction, allow_short_spot)
         oi = open_interest_by_inst.get(inst_id, {})
         history = history_by_inst.get(inst_id, {"funding_history_count": 0})
+        quality_score, quality_status = _market_data_quality(
+            index_price=idx_px,
+            funding_rate=funding_rate,
+            bid=bid,
+            ask=ask,
+            spread_bps=spread_bps,
+            signal_age_seconds=signal_age_seconds,
+            funding_history_count=int(history.get("funding_history_count") or 0),
+        )
         basis_same_sign = basis_bps == 0.0 or mark_basis_bps == 0.0 or basis_bps * mark_basis_bps > 0.0
         basis_momentum_cooling = basis_same_sign and abs(mark_basis_bps) < abs(basis_bps)
         basis_persistence_status = "same_asset_persistent" if basis_same_sign else "mark_last_conflict"
@@ -372,6 +467,7 @@ def build_scan_batch(
             "predicted_edge_bps": round(abs(funding_bps) + min(abs(basis_bps) * 0.45, 30.0), 3),
             "funding_interval_hours": funding_interval_hours,
             "next_funding_time": next_funding_time,
+            "time_to_next_funding_minutes": _minutes_until(next_funding_time, decision_time),
             "change_24h_pct": round(change_24h_pct, 3),
             "quote_volume_24h": quote_volume,
             "open_interest_contracts": as_float(oi.get("oi"), None),
@@ -385,6 +481,8 @@ def build_scan_batch(
             **history,
             "liquidity_score": round(liquidity_score(quote_volume), 3),
             "spread_bps": round(spread_bps, 3),
+            "quality_score": quality_score,
+            "quality_status": quality_status,
             "risk_notes": [
                 "paper-trade only",
                 "funding can change before settlement",
@@ -399,19 +497,14 @@ def build_scan_batch(
         direction_counts[direction] += 1
 
     candidates.sort(key=lambda item: item["score"], reverse=True)
+    candidate_by_inst = {str(item.get("inst_id")): item for item in candidates}
     observations = [
-        {
-            "inst_id": row.get("instId"),
-            "venue": "OKX",
-            "trade_type": "perp_funding_basis",
-            **instrument_asset_context(
-                str(row.get("instId") or ""),
-                instrument_by_inst.get(str(row.get("instId") or ""), {}),
-            ),
-            "last": as_float(row.get("last")),
-            "observed_at": seen_at,
-            "price_source": "OKX public REST market tickers",
-        }
+        _strategy_observation(
+            row,
+            candidate_by_inst.get(str(row.get("instId") or "")),
+            instrument_by_inst.get(str(row.get("instId") or ""), {}),
+            seen_at,
+        )
         for _, row in usdt_swaps
         if as_float(row.get("last")) > 0
     ]

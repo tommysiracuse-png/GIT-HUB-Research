@@ -4,6 +4,7 @@ import pathlib
 import sqlite3
 import sys
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -12,6 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import self_improvement  # noqa: E402
+import okx_perp_scanner  # noqa: E402
 from settings import DEFAULT_SETTINGS  # noqa: E402
 from storage import init_db  # noqa: E402
 from strategy_lab import generate_strategy_lab_candidates  # noqa: E402
@@ -64,6 +66,88 @@ class TestOkxFundingCaptureQualityGate(unittest.TestCase):
         self.assertEqual("proposed", row["status"])
         self.assertIn("funding_capture_short_perp", row["strategy_logic_json"])
         self.assertIn("allowed_field_values", row["risk_gates_json"])
+
+    def test_okx_strategy_observation_preserves_public_carry_features(self):
+        candidate = {
+            "inst_id": "BTC-USDT-SWAP",
+            "basis_bps": 2.5,
+            "funding_bps": 8.0,
+            "funding_interval_hours": 8.0,
+            "next_funding_time": "2026-08-05T00:00:00+00:00",
+            "time_to_next_funding_minutes": 120.0,
+            "funding_history_count": 8,
+            "funding_history_avg_bps": 6.0,
+            "funding_history_last_bps": 7.0,
+            "spread_bps": 2.0,
+            "liquidity_score": 0.9,
+            "quality_score": 95.0,
+            "quality_status": "verified",
+            "signal_age_seconds": 30.0,
+        }
+        observation = okx_perp_scanner._strategy_observation(
+            {"instId": "BTC-USDT-SWAP", "last": "100"},
+            candidate,
+            {"baseCcy": "BTC", "quoteCcy": "USDT", "settleCcy": "USDT"},
+            "2026-08-04T22:00:00+00:00",
+        )
+
+        self.assertEqual(8.0, observation["funding_bps"])
+        self.assertEqual(2.5, observation["basis_bps"])
+        self.assertEqual(8, observation["funding_history_count"])
+        self.assertEqual(6.0, observation["funding_history_avg_bps"])
+        self.assertEqual(7.0, observation["funding_history_last_bps"])
+        self.assertEqual(120.0, observation["time_to_next_funding_minutes"])
+        self.assertEqual(0.5, observation["stale_minutes"])
+        self.assertEqual("USDT", observation["quote"])
+
+    def test_okx_scan_batch_emits_enriched_strategy_observation(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        timestamp_ms = str(int(now.timestamp() * 1000))
+        next_funding_ms = str(int((now + dt.timedelta(hours=8)).timestamp() * 1000))
+
+        def public_response(path, _params=None):
+            payloads = {
+                "/api/v5/market/tickers": [{
+                    "instId": "BTC-USDT-SWAP", "last": "100", "bidPx": "99.99",
+                    "askPx": "100.01", "open24h": "99", "volCcy24h": "10000000",
+                    "ts": timestamp_ms,
+                }],
+                "/api/v5/market/index-tickers": [{"instId": "BTC-USDT", "idxPx": "99.98"}],
+                "/api/v5/public/mark-price": [{"instId": "BTC-USDT-SWAP", "markPx": "100", "ts": timestamp_ms}],
+                "/api/v5/public/open-interest": [{"instId": "BTC-USDT-SWAP", "oi": "10", "oiUsd": "1000"}],
+                "/api/v5/public/instruments": [{
+                    "instId": "BTC-USDT-SWAP", "baseCcy": "BTC", "quoteCcy": "USDT",
+                    "settleCcy": "USDT", "instFamily": "BTC-USDT", "state": "live",
+                }],
+            }
+            return {"data": payloads[path]}
+
+        funding = {
+            "fundingRate": "0.0008",
+            "fundingTime": timestamp_ms,
+            "nextFundingTime": next_funding_ms,
+        }
+        history = {
+            "funding_history_count": 8,
+            "funding_history_avg_bps": 6.0,
+            "funding_history_last_bps": 7.0,
+        }
+        cfg = copy.deepcopy(DEFAULT_SETTINGS)
+        cfg["allow_live_trading"] = False
+        with (
+            mock.patch.object(okx_perp_scanner, "fetch_json", side_effect=public_response),
+            mock.patch.object(okx_perp_scanner, "get_funding", return_value=funding),
+            mock.patch.object(okx_perp_scanner, "get_funding_history", return_value=history),
+        ):
+            batch = okx_perp_scanner.build_scan_batch(1, settings=cfg)
+
+        observation = batch.observations[0]
+        self.assertEqual(8.0, observation["funding_bps"])
+        self.assertEqual(8, observation["funding_history_count"])
+        self.assertIn("basis_bps", observation)
+        self.assertGreaterEqual(observation["quality_score"], 65.0)
+        self.assertLessEqual(observation["stale_minutes"], 2.0)
+        self.assertGreater(observation["time_to_next_funding_minutes"], 0.0)
 
     def test_quality_gate_generates_only_aligned_liquid_candidate(self):
         settings = copy.deepcopy(DEFAULT_SETTINGS)

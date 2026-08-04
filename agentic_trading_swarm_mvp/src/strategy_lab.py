@@ -22,6 +22,7 @@ from storage import RUNS_DIR, add_llm_recommendation, link_recommendation_artifa
 from strategy_reliability import paper_source_veto_record, paper_source_veto_recovery_status
 from strategy_program import (
     LOGIC_TYPE as OBSERVATION_PROGRAM,
+    PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS,
     compile_observation_program,
     generate_program_candidates,
     novelty_signature,
@@ -114,6 +115,33 @@ SURFACE_TARGET_FIELDS = (
     "asset_surface",
 )
 YAHOO_PROXY_SURFACE = "yahoo_proxy"
+PROGRAM_OBSERVATION_ENRICHMENT_FIELDS = PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS | {
+    "spread_bps",
+    "liquidity_score",
+    "quality_score",
+    "quality_status",
+    "funding_bps",
+    "funding_history_count",
+    "funding_history_avg_bps",
+    "funding_history_last_bps",
+    "funding_interval_hours",
+    "next_funding_time",
+    "time_to_next_funding_minutes",
+    "basis_bps",
+    "net_carry_edge_bps",
+    "round_trip_cost_bps",
+    "estimated_round_trip_cost_bps",
+    "quote_volume_24h",
+    "change_24h_pct",
+    "freshness_age_seconds",
+    "stale_minutes",
+    "data_status",
+    "asset_class",
+    "market_type",
+    "region",
+    "base",
+    "quote",
+}
 
 
 def _json_loads(value: str | None, default: Any) -> Any:
@@ -2342,6 +2370,50 @@ def _paper_route_eligible_candidates(
     return eligible, blocked, missing_counts, blocker_counts
 
 
+def _observation_program_inputs(
+    price_observations: dict[str, dict] | list[dict] | None,
+    candidates: list[dict],
+) -> list[dict]:
+    """Join explicit current candidate evidence to complete price observations.
+
+    Historical market features remain observation-native. Route, fee, and leg
+    metadata are copied only when an already route-eligible source candidate
+    supplies them, and cached eligibility is deliberately not propagated so
+    generated candidates are checked again under their emitted direction.
+    """
+
+    candidate_by_key: dict[tuple[str, str], dict] = {}
+    for candidate in candidates:
+        key = (
+            str(candidate.get("venue") or ""),
+            str(candidate.get("inst_id") or candidate.get("instrument_id") or ""),
+        )
+        if key[0] and key[1] and key not in candidate_by_key:
+            candidate_by_key[key] = candidate
+
+    raw_rows = price_observations.values() if isinstance(price_observations, dict) else (price_observations or [])
+    rows: list[dict] = []
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        key = (
+            str(row.get("venue") or ""),
+            str(row.get("inst_id") or row.get("instrument_id") or ""),
+        )
+        source = candidate_by_key.get(key)
+        embedded = dict(row.get("candidate") or {}) if isinstance(row.get("candidate"), dict) else {}
+        embedded.pop("paper_route_eligibility", None)
+        if source:
+            for field in PROGRAM_OBSERVATION_ENRICHMENT_FIELDS:
+                if source.get(field) is not None:
+                    embedded[field] = source[field]
+        if embedded:
+            row["candidate"] = embedded
+        rows.append(row)
+    return rows
+
+
 def generate_strategy_lab_candidates(
     conn: sqlite3.Connection,
     settings: dict,
@@ -2364,14 +2436,6 @@ def generate_strategy_lab_candidates(
             [(_utc(), strategy_lab_id) for strategy_lab_id in promoted_plugins],
         )
         conn.commit()
-    if cfg.get("observation_programs_enabled", True):
-        observation_frames, snapshot_summary = record_feature_snapshots(
-            conn,
-            price_observations,
-            settings,
-        )
-    else:
-        observation_frames, snapshot_summary = [], {"enabled": False}
     source_vetoed_candidates: list[dict] = []
     source_rank_candidates: list[dict] = []
     for candidate in candidates:
@@ -2394,6 +2458,14 @@ def generate_strategy_lab_candidates(
     eligible_candidates, route_blocked, route_missing_counts, route_blocker_counts = (
         _paper_route_eligible_candidates(source_rank_candidates)
     )
+    if cfg.get("observation_programs_enabled", True):
+        observation_frames, snapshot_summary = record_feature_snapshots(
+            conn,
+            _observation_program_inputs(price_observations, eligible_candidates),
+            settings,
+        )
+    else:
+        observation_frames, snapshot_summary = [], {"enabled": False}
     compilation = _compile_strategy_lab_contracts(conn, eligible_candidates, observation_frames)
     all_experiments = _active_experiments(conn)
     source_vetoed_experiments: list[dict] = []

@@ -21,6 +21,11 @@ from typing import Any, Iterable
 LOGIC_TYPE = "observation_program"
 OUTPUT_TRADE_TYPE_SURFACES = {
     "global_proxy_shock_reversal": "proxy",
+    "perp_funding_capture": "perp",
+}
+OUTPUT_TRADE_TYPE_TARGET_SURFACES = {
+    "global_proxy_shock_reversal": "proxy",
+    "perp_funding_capture": "perp_funding_basis",
 }
 SHOCK_REVERSAL_CALCULATED_FEATURES = {
     "shock_magnitude_bps": "abs(return_60m_bps)",
@@ -47,7 +52,18 @@ BASE_FEATURES = {
     "liquidity_score",
     "quality_score",
     "funding_bps",
+    "funding_history_count",
+    "funding_history_avg_bps",
+    "funding_history_last_bps",
+    "time_to_next_funding_minutes",
     "basis_bps",
+    "basis_observed",
+    "basis_zscore_60m",
+    "basis_volatility_60m_bps",
+    "basis_change_5m_bps",
+    "basis_history_ready",
+    "net_carry_edge_bps",
+    "round_trip_cost_bps",
     "dislocation_bps",
     "cross_venue_dislocation_bps",
     "stale_minutes",
@@ -70,6 +86,53 @@ BASE_FEATURES = {
     "quote_volume_1m",
     "relative_volume_1m_60m",
     "microstructure_history_ready",
+}
+PERP_FUNDING_CAPTURE_REQUIRED_FEATURES = {
+    "funding_bps",
+    "funding_history_count",
+    "funding_history_avg_bps",
+    "funding_history_last_bps",
+    "basis_history_ready",
+    "basis_zscore_60m",
+    "basis_volatility_60m_bps",
+    "basis_change_5m_bps",
+    "net_carry_edge_bps",
+}
+PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS = {
+    "hedge_venue",
+    "route_hedge_venue",
+    "hedge_instrument",
+    "hedge_instrument_id",
+    "hedge_symbol",
+    "route_hedge_instrument_id",
+    "route_hedge_symbol",
+    "fee_model",
+    "fee_model_status",
+    "fees_modeled",
+    "total_fee_bps",
+    "estimated_fee_bps",
+    "fee_bps",
+    "route_fee_bps",
+    "estimated_round_trip_cost_bps",
+    "round_trip_cost_bps",
+    "total_cost_bps",
+    "paper_leg_mapping_valid",
+    "leg_mapping_paper_valid",
+    "paper_valid_leg_mapping",
+    "paper_leg_mapping",
+    "leg_mapping",
+    "requires_hedge",
+    "hedge_required",
+    "transfer_required",
+    "requires_transfer",
+    "cross_venue_transfer_required",
+    "hedge_mode_required",
+    "execution_route",
+    "execution_feasibility",
+    "venue_capabilities",
+    "route_requirements",
+    "route_id",
+    "route_status",
 }
 METADATA_NAMES = {
     "venue",
@@ -229,6 +292,11 @@ def _zscore(current: float, prices: list[float]) -> float:
     return (current - statistics.fmean(prices)) / deviation if deviation > 0 else 0.0
 
 
+def _stored_feature(item: dict, name: str) -> Any:
+    features = item.get("features")
+    return features.get(name) if isinstance(features, dict) else None
+
+
 def _base_symbol(row: dict) -> str:
     base = str(row.get("base") or "").upper()
     if base:
@@ -251,6 +319,21 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
     return_60m = _return_bps(last, history, 12)
     return_4h = _return_bps(last, history, 48)
     return_1d = _return_bps(last, history, 288)
+    basis_present = row.get("basis_bps") not in (None, "")
+    basis = _float(row.get("basis_bps")) if basis_present else 0.0
+    recent_basis_history = history[-12:]
+    historical_basis = [
+        _float(_stored_feature(item, "basis_bps"))
+        for item in recent_basis_history
+        if _float(_stored_feature(item, "basis_observed")) >= 1.0
+    ]
+    basis_history_ready = bool(
+        basis_present
+        and len(recent_basis_history) == 12
+        and len(historical_basis) == len(recent_basis_history)
+    )
+    recent_basis = historical_basis + [basis] if basis_history_ready else []
+    basis_change_5m = basis - historical_basis[-1] if basis_history_ready else 0.0
     return {
         **row,
         "last": last,
@@ -258,7 +341,31 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
         "liquidity_score": _float(row.get("liquidity_score"), 0.5),
         "quality_score": _float(row.get("quality_score"), 50.0),
         "funding_bps": _float(row.get("funding_bps")),
-        "basis_bps": _float(row.get("basis_bps")),
+        "funding_history_count": max(0.0, _float(row.get("funding_history_count"))),
+        "funding_history_avg_bps": _float(row.get("funding_history_avg_bps")),
+        "funding_history_last_bps": _float(row.get("funding_history_last_bps")),
+        "time_to_next_funding_minutes": max(
+            0.0,
+            _float(row.get("time_to_next_funding_minutes")),
+        ),
+        "basis_bps": basis,
+        "basis_observed": 1.0 if basis_present else 0.0,
+        "basis_zscore_60m": _zscore(basis, recent_basis) if basis_history_ready else 0.0,
+        "basis_volatility_60m_bps": (
+            statistics.pstdev(recent_basis) if basis_history_ready else 0.0
+        ),
+        "basis_change_5m_bps": basis_change_5m,
+        "basis_history_ready": 1.0 if basis_history_ready else 0.0,
+        "net_carry_edge_bps": _float(row.get("net_carry_edge_bps")),
+        "round_trip_cost_bps": max(
+            0.0,
+            _float(
+                row.get(
+                    "round_trip_cost_bps",
+                    row.get("estimated_round_trip_cost_bps"),
+                )
+            ),
+        ),
         "dislocation_bps": _float(row.get("dislocation_bps", row.get("edge_bps_estimate"))),
         "cross_venue_dislocation_bps": dislocation,
         "stale_minutes": _float(
@@ -478,7 +585,34 @@ def novelty_signature(logic: dict) -> str:
 
 
 def _validate_output_trade_type_contract(program: dict) -> None:
-    if program.get("output_trade_type") != "global_proxy_shock_reversal":
+    output_trade_type = program.get("output_trade_type")
+    if output_trade_type == "perp_funding_capture":
+        universe = program.get("universe") if isinstance(program.get("universe"), dict) else {}
+        trade_types = universe.get("trade_types")
+        trade_type_values = trade_types if isinstance(trade_types, list) else [trade_types] if trade_types else []
+        if {str(value).strip().lower() for value in trade_type_values} != {"perp_funding_basis"}:
+            raise ProgramValidationError("perp_funding_capture_requires_funding_basis_universe")
+        if universe.get("inst_ids"):
+            raise ProgramValidationError("perp_funding_capture_must_not_pin_instruments")
+        if str(program.get("direction") or "").lower() != "short":
+            raise ProgramValidationError("perp_funding_capture_requires_short_direction")
+        referenced: set[str] = set()
+        for expression in (program.get("calculated_features") or {}).values():
+            referenced.update(expression_names(str(expression)))
+        for name in (
+            "entry_expression",
+            "invalidation_expression",
+            "edge_expression",
+            "score_expression",
+        ):
+            referenced.update(expression_names(str(program.get(name) or "")))
+        missing = sorted(PERP_FUNDING_CAPTURE_REQUIRED_FEATURES - referenced)
+        if missing:
+            raise ProgramValidationError(
+                "perp_funding_capture_missing_required_features:" + ",".join(missing)
+            )
+        return
+    if output_trade_type != "global_proxy_shock_reversal":
         return
     universe = program.get("universe") if isinstance(program.get("universe"), dict) else {}
     venues = universe.get("venues")
@@ -653,6 +787,10 @@ def _route_surface(frame: dict, program: dict) -> str:
 
 
 def _route_mapping(frame: dict, program: dict, side: str) -> tuple[str, str]:
+    output_trade_type = str(program.get("output_trade_type") or "")
+    if output_trade_type == "perp_funding_capture":
+        direction = "funding_capture_short_perp" if side == "short" else "funding_capture_long_perp"
+        return "perp_funding_basis", direction
     surface = _route_surface(frame, program)
     if surface == "spot":
         return "frontier_crypto_venue_map", f"{side}_frontier_spot"
@@ -660,12 +798,19 @@ def _route_mapping(frame: dict, program: dict, side: str) -> tuple[str, str]:
         return "frontier_crypto_venue_map", f"{side}_frontier_perp"
     if surface == "prediction":
         return "prediction_market_probability", "yes" if side == "long" else "no"
-    output_trade_type = str(program.get("output_trade_type") or "")
     if output_trade_type:
         return output_trade_type, f"{side}_proxy"
     source_type = str(frame.get("trade_type") or "")
     trade_type = source_type if source_type in {"global_proxy_momentum", "global_market_discovery_proxy"} else "global_market_discovery_proxy"
     return trade_type, f"{side}_proxy"
+
+
+def _target_surface(frame: dict, program: dict) -> str:
+    output_trade_type = str(program.get("output_trade_type") or "")
+    return OUTPUT_TRADE_TYPE_TARGET_SURFACES.get(
+        output_trade_type,
+        _route_surface(frame, program),
+    )
 
 
 def _program_values(frame: dict, program: dict) -> dict:
@@ -727,7 +872,7 @@ def generate_program_candidates(
         if edge <= 0:
             rejects["non_positive_cost_adjusted_edge"] += 1
             continue
-        target_surface = _route_surface(frame, program)
+        target_surface = _target_surface(frame, program)
         source_trade_type = str(frame.get("trade_type") or "")
         trade_type, direction = _route_mapping(frame, program, side)
         signature = str(diagnostic.get("novelty_signature") or novelty_signature(program))
@@ -772,6 +917,7 @@ def generate_program_candidates(
             "region": frame.get("region"),
             "base": frame.get("base"),
             "quote": frame.get("quote"),
+            "paper_only": True,
             "strategy_lab_id": str(experiment.get("strategy_lab_id")),
             "strategy_lab_version": int(experiment.get("version") or 1),
             "strategy_lab_experiment_type": "market_strategy",
@@ -791,6 +937,9 @@ def generate_program_candidates(
             "signal_lineage_key": f"STRATEGY_LAB_PROGRAM|{experiment.get('strategy_lab_id')}|v{experiment.get('version', 1)}",
             "thesis": f"Strategy Lab observation program {experiment.get('strategy_lab_id')}: {experiment.get('hypothesis', '')}"[:1000],
         }
+        for field in PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS:
+            if frame.get(field) is not None:
+                candidate[field] = frame[field]
         generated.append(candidate)
     generated.sort(key=lambda row: (float(row.get("score") or 0), float(row.get("edge_bps_estimate") or 0)), reverse=True)
     return generated[:limit], {
