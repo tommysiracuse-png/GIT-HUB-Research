@@ -85,6 +85,72 @@ class TestSelfImprovementCellScope(unittest.TestCase):
         self.assertEqual(result["action"], "rollback_cell")
         self.assertTrue(result["probation_expired"])
 
+    def test_short_discovery_proxy_cannot_promote_on_small_negative_sample(self) -> None:
+        result = evaluate_paper_cell_policy(
+            {
+                "signal_key": "CME_GROUP|global_market_discovery_proxy|short_proxy|standard",
+                "signal_family": "global_market_discovery_proxy",
+                "venue": "CME_GROUP",
+                "direction": "short_proxy",
+                "paper_route_status": "standard",
+                "closed_count": 11,
+                "avg_pnl_bps": -6.613,
+                "win_rate": 0.545,
+            },
+            config={
+                "paper_cell_policy": {
+                    "min_closed_trades": 3,
+                    "promote_min_avg_pnl_bps": -10.0,
+                    "revert_avg_pnl_bps": -20.0,
+                }
+            },
+        )
+
+        self.assertEqual(result["decision"], "probation")
+        self.assertEqual(result["action"], "retain_cell_probation")
+        gate = result["promotion_gate"]
+        self.assertTrue(gate["paper_only"])
+        self.assertTrue(gate["direction_asymmetric"])
+        self.assertEqual(gate["min_closed_trades"], 20)
+        self.assertEqual(gate["min_avg_pnl_bps"], 1.0)
+        self.assertIn("insufficient_direction_specific_closed_trades", gate["blockers"])
+        self.assertIn("direction_specific_realized_edge_below_floor", gate["blockers"])
+
+    def test_short_discovery_proxy_promotes_after_stable_positive_edge(self) -> None:
+        result = evaluate_paper_cell_policy(
+            {
+                "signal_key": "CME_GROUP|global_market_discovery_proxy|short_proxy|standard",
+                "signal_family": "global_market_discovery_proxy",
+                "venue": "CME_GROUP",
+                "direction": "short_proxy",
+                "paper_route_status": "standard",
+                "closed_count": 20,
+                "avg_pnl_bps": 3.25,
+                "win_rate": 0.55,
+            }
+        )
+
+        self.assertEqual(result["decision"], "promoted")
+        self.assertEqual(result["promotion_gate"]["blockers"], [])
+
+    def test_long_discovery_cell_keeps_generic_promotion_threshold(self) -> None:
+        result = evaluate_paper_cell_policy(
+            {
+                "signal_key": "CME_GROUP|global_market_discovery_proxy|long_proxy|standard",
+                "signal_family": "global_market_discovery_proxy",
+                "venue": "CME_GROUP",
+                "direction": "long_proxy",
+                "paper_route_status": "standard",
+                "closed_count": 6,
+                "avg_pnl_bps": 2.0,
+                "win_rate": 0.55,
+            }
+        )
+
+        self.assertEqual(result["decision"], "promoted")
+        self.assertFalse(result["promotion_gate"]["direction_asymmetric"])
+        self.assertEqual(result["promotion_gate"]["min_closed_trades"], 3)
+
     def test_legacy_record_without_explicit_cell_fields_gets_safe_fallback_scope(self) -> None:
         result = evaluate_paper_cell_policy(
             {

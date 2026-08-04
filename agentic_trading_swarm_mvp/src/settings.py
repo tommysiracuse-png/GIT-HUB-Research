@@ -58,6 +58,15 @@ DEFAULT_SETTINGS = {
         "missing_freshness_penalty_bps": 2.0,
         "minimum_score_multiplier": 0.5,
     },
+    "paper_cell_policy": {
+        "min_closed_trades": 3,
+        "probation_ttl_days": 7,
+        "promote_min_avg_pnl_bps": 1.0,
+        "promote_min_win_rate": 0.5,
+        "revert_avg_pnl_bps": -5.0,
+        "asymmetric_direction_min_closed_trades": 20,
+        "asymmetric_direction_min_avg_pnl_bps": 1.0,
+    },
     "global_market_discovery_scanner": {
         "enabled": True,
         "active_paper_cohort_enabled": True,

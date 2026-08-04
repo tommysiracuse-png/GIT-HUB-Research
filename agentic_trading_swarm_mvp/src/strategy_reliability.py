@@ -1006,6 +1006,31 @@ def paper_signal_cell_key(candidate: dict[str, Any]) -> str:
     return str(paper_signal_cell(candidate).get("cell_key") or "")
 
 
+def _paper_cell_asymmetric_direction_reasons(record: dict[str, Any], cell: dict[str, Any]) -> list[str]:
+    """Identify short proxy/discovery cells that need direction-specific evidence."""
+    direction = str(cell.get("direction") or "").lower()
+    short_direction = "short" in direction
+    haystack = " ".join(
+        str(value or "").lower()
+        for value in (
+            cell.get("signal_key"),
+            cell.get("signal_family"),
+            cell.get("strategy"),
+            cell.get("variant"),
+            cell.get("paper_route_status"),
+            record.get("trade_type"),
+            record.get("market_surface"),
+            record.get("context_key"),
+        )
+    )
+    reasons = []
+    if short_direction and "proxy" in haystack:
+        reasons.append("short_proxy")
+    if short_direction and "discovery" in haystack:
+        reasons.append("short_discovery")
+    return reasons
+
+
 def evaluate_paper_cell_policy(
     record: dict[str, Any],
     config: dict[str, Any] | None = None,
@@ -1047,10 +1072,41 @@ def evaluate_paper_cell_policy(
         except (TypeError, ValueError):
             probation_expired = False
 
+    cell = paper_signal_cell(record)
+    promotion_min_closed_trades = min_closed_trades
+    asymmetric_direction_reasons = _paper_cell_asymmetric_direction_reasons(record, cell)
+    if asymmetric_direction_reasons:
+        promotion_min_closed_trades = max(
+            promotion_min_closed_trades,
+            max(1, _as_int(settings.get("asymmetric_direction_min_closed_trades"), 20)),
+        )
+        # Generic exploration thresholds may be loosened, but short proxy and
+        # discovery cells must retain positive realized after-cost expectancy.
+        promote_min_avg_pnl_bps = max(
+            promote_min_avg_pnl_bps,
+            max(1.0, _as_float(settings.get("asymmetric_direction_min_avg_pnl_bps"), 1.0)),
+        )
+
+    promotion_blockers = []
+    if closed_count < promotion_min_closed_trades:
+        promotion_blockers.append(
+            "insufficient_direction_specific_closed_trades"
+            if asymmetric_direction_reasons
+            else "insufficient_closed_trades"
+        )
+    if avg_pnl_bps < promote_min_avg_pnl_bps:
+        promotion_blockers.append(
+            "direction_specific_realized_edge_below_floor"
+            if asymmetric_direction_reasons
+            else "realized_edge_below_floor"
+        )
+    if win_rate is not None and win_rate < promote_min_win_rate:
+        promotion_blockers.append("win_rate_below_floor")
+
     if closed_count >= min_closed_trades and avg_pnl_bps <= revert_avg_pnl_bps:
         decision = "reverted"
         action = "rollback_cell"
-    elif closed_count >= min_closed_trades and avg_pnl_bps >= promote_min_avg_pnl_bps and (win_rate is None or win_rate >= promote_min_win_rate):
+    elif closed_count >= promotion_min_closed_trades and avg_pnl_bps >= promote_min_avg_pnl_bps and (win_rate is None or win_rate >= promote_min_win_rate):
         decision = "promoted"
         action = "promote_cell"
     elif probation_expired and avg_pnl_bps < 0.0 and prior_state in {"probation", "new"}:
@@ -1060,7 +1116,6 @@ def evaluate_paper_cell_policy(
         decision = "probation"
         action = "retain_cell_probation"
 
-    cell = paper_signal_cell(record)
     return {
         "scope": "paper_signal_cell_policy_v1",
         "cell": cell,
@@ -1073,6 +1128,15 @@ def evaluate_paper_cell_policy(
         "prior_state": prior_state,
         "probation_ttl_days": probation_ttl_days,
         "probation_expired": probation_expired,
+        "promotion_gate": {
+            "paper_only": True,
+            "direction_asymmetric": bool(asymmetric_direction_reasons),
+            "direction_asymmetric_reasons": asymmetric_direction_reasons,
+            "min_closed_trades": promotion_min_closed_trades,
+            "min_avg_pnl_bps": promote_min_avg_pnl_bps,
+            "min_win_rate": promote_min_win_rate,
+            "blockers": promotion_blockers,
+        },
         "reviewed_at": current_now.isoformat(),
     }
 
