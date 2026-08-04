@@ -305,7 +305,8 @@ class DerivativesAdapterTests(unittest.TestCase):
             "last": 100000.0,
             "usd_normalized_last": 98.0,
             "spread_bps": 999.0,
-            "book_levels": {"bids": [[99990.0, 1.0]], "asks": [[100010.0, 1.0]]},
+            "book_levels": {"bids": [[99990.0, 20.0]], "asks": [[100010.0, 20.0]]},
+            "quote_to_usd_multiplier": 0.00098,
             "simulated_fills": {
                 "buy": {"1000": {"filled": True, "slippage_bps": 1.0}},
                 "sell": {"1000": {"filled": True, "slippage_bps": 1.0}},

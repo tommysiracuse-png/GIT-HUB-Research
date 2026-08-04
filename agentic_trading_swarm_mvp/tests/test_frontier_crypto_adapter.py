@@ -324,8 +324,8 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         cfg = settings()
         observations = [
             self._obs("A", "ABC-USDT", "ABC", "USDT", 100, 100000),
-            self._obs("B", "ABC-USDT", "ABC", "USDT", 90, 100000),
-            self._obs("C", "ABC-USDT", "ABC", "USDT", 110, 100000),
+            self._obs("B", "ABC-USDT", "ABC", "USDT", 98, 100000),
+            self._obs("C", "ABC-USDT", "ABC", "USDT", 102, 100000),
         ]
         refs = frontier._reference_prices(observations, cfg)
         candidates = [
@@ -390,8 +390,8 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         cfg = settings()
         observations = [
             self._obs("A", "ABC-USDT", "ABC", "USDT", 100, 100000),
-            self._obs("B", "ABC-USDT", "ABC", "USDT", 90, 100000),
-            self._obs("C", "ABC-USDT", "ABC", "USDT", 110, 100000),
+            self._obs("B", "ABC-USDT", "ABC", "USDT", 98, 100000),
+            self._obs("C", "ABC-USDT", "ABC", "USDT", 102, 100000),
         ]
         refs = frontier._reference_prices(observations, cfg)
         candidates = [
@@ -441,7 +441,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
 
     def test_route_resolver_compatibility_for_frontier_candidate(self) -> None:
         cfg = settings()
-        observation = self._obs("C", "ABC-USDT", "ABC", "USDT", 110, 100000)
+        observation = self._obs("C", "ABC-USDT", "ABC", "USDT", 102, 100000)
         candidate = frontier._candidate_from_observation(observation, cfg, 100, 3)
         route = route_resolver.resolve_candidate_route(candidate, cfg)
 
@@ -456,8 +456,8 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         variant = next(row for row in signal_redesign.DEFAULT_VARIANTS if row["variant_id"] == "frontier_v5_short_route_quality")
         observations = [
             self._quality_obs("A", "ABC-USDT", "ABC", "USDT", 100, 20_000_000, quality_score=90),
-            self._quality_obs("B", "ABC-USDT", "ABC", "USDT", 90, 20_000_000, quality_score=90),
-            self._quality_obs("C", "ABC-USDT", "ABC", "USDT", 110, 20_000_000, quality_score=90),
+            self._quality_obs("B", "ABC-USDT", "ABC", "USDT", 98, 20_000_000, quality_score=90),
+            self._quality_obs("C", "ABC-USDT", "ABC", "USDT", 102, 20_000_000, quality_score=90),
         ]
 
         candidates = frontier.build_variant_candidates(
@@ -477,7 +477,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         cfg = settings()
         variant = next(row for row in signal_redesign.DEFAULT_VARIANTS if row["variant_id"] == "frontier_v5_short_route_quality")
         observations = [
-            self._quality_obs("LUNO", "BTC-USDT", "BTC", "USDT", 110_000, 20_000_000, quality_score=90, region="Africa"),
+            self._quality_obs("LUNO", "BTC-USDT", "BTC", "USDT", 102_000, 20_000_000, quality_score=90, region="Africa"),
             self._quality_obs("A", "BTC-USDT", "BTC", "USDT", 100_000, 20_000_000, quality_score=90),
             self._quality_obs("B", "BTC-USDT", "BTC", "USDT", 100_500, 20_000_000, quality_score=90),
         ]
@@ -501,7 +501,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         cfg = settings()
         variant = next(row for row in signal_redesign.DEFAULT_VARIANTS if row["variant_id"] == "frontier_v14_bybit_spot_long_expansion")
         observations = [
-            self._quality_obs("BYBIT_SPOT", "ABCUSDT", "ABC", "USDT", 90, 20_000_000, quality_score=80),
+            self._quality_obs("BYBIT_SPOT", "ABCUSDT", "ABC", "USDT", 99, 20_000_000, quality_score=80),
             self._quality_obs("GATE", "ABC_USDT", "ABC", "USDT", 100, 20_000_000, quality_score=90),
             self._quality_obs("MEXC", "ABCUSDT", "ABC", "USDT", 101, 20_000_000, quality_score=90),
             self._quality_obs("COINBASE", "ABC-USD", "ABC", "USD", 100.5, 20_000_000, quality_score=90),
@@ -519,6 +519,118 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual(actionable[0]["direction"], "long_frontier_spot")
         self.assertEqual(actionable[0]["variant_route_status"], "standard")
         self.assertTrue(actionable[0]["promotion_eligible"])
+
+    def test_marketability_gate_admits_fresh_deep_confirmed_paper_route(self) -> None:
+        cfg = settings()
+        local = self._quality_obs("FRONTIER", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
+
+        candidate = frontier._candidate_from_observation(
+            local,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[local, peer],
+        )
+
+        self.assertEqual("short_frontier_spot", candidate["direction"])
+        self.assertEqual("passed", candidate["marketability_gate_status"])
+        self.assertTrue(all(check["passed"] for check in candidate["marketability_gate"]["checks"].values()))
+
+    def test_marketability_gate_fails_closed_for_stale_or_thin_book(self) -> None:
+        cfg = settings()
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
+        stale = self._quality_obs("STALE", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        stale["freshness_age_seconds"] = 30.1
+        stale_candidate = frontier._candidate_from_observation(
+            stale,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[stale, peer],
+        )
+
+        thin = self._quality_obs("THIN", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        thin["book_levels"] = {
+            "bids": [[thin["bid"], 500.0 / thin["bid"]]],
+            "asks": [[thin["ask"], 500.0 / thin["ask"]]],
+        }
+        thin_candidate = frontier._candidate_from_observation(
+            thin,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[thin, peer],
+        )
+
+        self.assertEqual("marketability_book_freshness", stale_candidate["candidate_reject_reason"])
+        self.assertTrue(stale_candidate["paper_entry_blocked"])
+        self.assertIn("top_of_book_depth", thin_candidate["marketability_gate"]["failed_checks"])
+        self.assertEqual("watch_only", thin_candidate["direction"])
+
+    def test_marketability_gate_rejects_bad_print_wide_spread_and_unknown_route(self) -> None:
+        cfg = settings()
+        cfg["risk"]["max_spread_bps"] = 100.0
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.0, 1_000_000, quality_score=90)
+
+        bad_print = self._quality_obs("BAD_PRINT", "ABC-USDT", "ABC", "USDT", 104.0, 100_000, quality_score=85)
+        bad_candidate = frontier._candidate_from_observation(
+            bad_print,
+            cfg,
+            100.0,
+            2,
+            reference_observations=[bad_print, peer],
+        )
+
+        wide = self._quality_obs("WIDE", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        wide["bid"] = 100.8
+        wide["ask"] = 101.2
+        wide["spread_bps"] = 39.604
+        wide_candidate = frontier._candidate_from_observation(
+            wide,
+            cfg,
+            100.0,
+            2,
+            reference_observations=[wide, peer],
+        )
+
+        unknown_route = self._quality_obs("NO_ROUTE", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        unknown_route["route_id"] = ""
+        unknown_route.pop("route_mapping_confidence", None)
+        route_candidate = frontier._candidate_from_observation(
+            unknown_route,
+            cfg,
+            100.0,
+            2,
+            reference_observations=[unknown_route, peer],
+        )
+
+        self.assertIn("cross_venue_price_confirmation", bad_candidate["marketability_gate"]["failed_checks"])
+        self.assertIn("spread_sanity", wide_candidate["marketability_gate"]["failed_checks"])
+        self.assertIn("route_confidence", route_candidate["marketability_gate"]["failed_checks"])
+        self.assertTrue(all(row["paper_entry_blocked"] for row in (bad_candidate, wide_candidate, route_candidate)))
+
+    def test_marketability_gate_thresholds_are_configurable(self) -> None:
+        cfg = settings()
+        cfg["frontier_crypto_adapter"]["marketability_gates"].update(
+            {"max_book_age_seconds": 10.0, "min_top_of_book_notional_usd": 2500.0}
+        )
+        local = self._quality_obs("FRONTIER", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
+        local["freshness_age_seconds"] = 11.0
+
+        candidate = frontier._candidate_from_observation(
+            local,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[local, peer],
+        )
+
+        self.assertEqual(
+            ["book_freshness", "top_of_book_depth"],
+            candidate["marketability_gate"]["failed_checks"],
+        )
 
     def _obs(
         self,
@@ -544,6 +656,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                 "comparison_key": base,
                 "instrument_id": f"{venue}:{symbol}",
                 "route_id": f"{venue.lower()}_spot_public",
+                "route_mapping_confidence": 0.8,
                 "data_status": data_status,
                 "http_status": "200" if data_status == "reachable" else "HTTP 403: Forbidden",
                 "latency_ms": 1.0,
@@ -557,6 +670,16 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                 "next_funding_time": None,
                 "quote_volume_24h": quote_volume,
                 "spread_bps": None,
+                "freshness_age_seconds": 5.0,
+                "quote_to_usd_multiplier": 1.0,
+                "book_levels": {
+                    "bids": [[bid, 2000.0 / bid]] if bid else [],
+                    "asks": [[ask, 2000.0 / ask]] if ask else [],
+                },
+                "depth_usd": {
+                    "bid": {"5": 2000.0, "10": 2000.0, "25": 2000.0},
+                    "ask": {"5": 2000.0, "10": 2000.0, "25": 2000.0},
+                },
                 "source_url": "https://example.test",
                 "notes": [],
             }

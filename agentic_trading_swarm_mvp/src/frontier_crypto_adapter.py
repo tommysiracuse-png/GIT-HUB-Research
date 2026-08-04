@@ -6852,6 +6852,18 @@ REGIONAL_FIAT_QUOTES = {
 LATAM_FIAT_QUOTES = {"MXN", "BRL", "CLP", "COP", "PEN", "ARS"}
 PAPER_ONLY_REVIEW_FIAT_QUOTES = LATAM_FIAT_QUOTES | {"TZS", "UGX"}
 QUOTE_ASSETS = USD_LIKE_QUOTES | REGIONAL_FIAT_QUOTES
+
+DEFAULT_FRONTIER_MARKETABILITY_GATES = {
+    "enabled": True,
+    "paper_only": True,
+    "max_book_age_seconds": 30.0,
+    "max_spread_bps": 8.0,
+    "min_top_of_book_notional_usd": 1000.0,
+    "max_cross_venue_deviation_bps": 250.0,
+    "min_reference_venues": 1,
+    "min_route_confidence": 0.70,
+    "known_paper_route_statuses": ["standard"],
+}
 STABLE_OR_FIAT_BASES = {
     "USD",
     "USDT",
@@ -9095,6 +9107,7 @@ def build_variant_candidates(
             variant_settings,
             reference,
             unique_venues,
+            reference_observations=observations,
         )
         reject_reason = candidate.get("candidate_reject_reason")
         route_status = str((candidate.get("execution_feasibility") or {}).get("status") or "unknown")
@@ -9205,6 +9218,245 @@ def _effective_spread_bps(observation: dict) -> float:
     return round(spread, 3)
 
 
+def _frontier_marketability_policy(settings: dict) -> dict:
+    policy = dict(DEFAULT_FRONTIER_MARKETABILITY_GATES)
+    configured = settings.get("frontier_crypto_adapter", {}).get("marketability_gates", {})
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    if configured is False:
+        policy["enabled"] = False
+    return policy
+
+
+def _top_of_book_notional_usd(observation: dict, side: str) -> tuple[float | None, str]:
+    levels = ((observation.get("book_levels") or {}).get(side + "s") or [])
+    multiplier = as_float(observation.get("quote_to_usd_multiplier"), None)
+    if multiplier is None and str(observation.get("quote") or "").upper() in USD_LIKE_QUOTES:
+        multiplier = 1.0
+    if levels and multiplier is not None and multiplier > 0:
+        level = levels[0]
+        if isinstance(level, (list, tuple)) and len(level) >= 2:
+            price = as_float(level[0], None)
+            quantity = as_float(level[1], None)
+            if price is not None and quantity is not None and price > 0 and quantity > 0:
+                return round(price * quantity * multiplier, 3), "top_level"
+    return None, "unavailable"
+
+
+def _frontier_peer_price_confirmation(
+    observation: dict,
+    candidate: dict,
+    reference_observations: list[dict] | None,
+    max_deviation_bps: float,
+) -> dict:
+    local_price = _comparison_price(observation)
+    local_venue = str(observation.get("venue") or "")
+    comparison_key = observation.get("comparison_key")
+    peers = []
+    independent_venue_count = 0
+    if reference_observations is not None:
+        best_by_venue: dict[str, dict] = {}
+        for row in reference_observations:
+            venue = str(row.get("venue") or "")
+            price = _comparison_price(row)
+            if (
+                not venue
+                or venue == local_venue
+                or row.get("comparison_key") != comparison_key
+                or row.get("market_type") != "spot"
+                or row.get("data_status") != "reachable"
+                or row.get("local_quote_observe_only")
+                or price <= 0
+            ):
+                continue
+            deviation = abs(bps(local_price, price)) if local_price > 0 else math.inf
+            previous = best_by_venue.get(venue)
+            if previous is None or deviation < previous["deviation_bps"]:
+                best_by_venue[venue] = {
+                    "venue": venue,
+                    "price": round(price, 8),
+                    "deviation_bps": round(deviation, 3),
+                }
+        peers = sorted(best_by_venue.values(), key=lambda item: item["deviation_bps"])
+        independent_venue_count = len(peers)
+    else:
+        independent_venue_count = max(0, int(candidate.get("source_venue_count") or 0) - 1)
+        reference_price = as_float(candidate.get("reference_price"), None)
+        if independent_venue_count > 0 and reference_price is not None and reference_price > 0 and local_price > 0:
+            peers = [
+                {
+                    "venue": "cross_venue_reference",
+                    "price": round(reference_price, 8),
+                    "deviation_bps": round(abs(bps(local_price, reference_price)), 3),
+                }
+            ]
+    confirmed = [peer for peer in peers if peer["deviation_bps"] <= max_deviation_bps]
+    return {
+        "confirmed": bool(confirmed),
+        "reference_venue_count": independent_venue_count,
+        "confirming_venue_count": len(confirmed),
+        "closest_reference": peers[0] if peers else None,
+        "confirming_venues": confirmed,
+    }
+
+
+def frontier_marketability_gate_review(
+    observation: dict,
+    candidate: dict,
+    settings: dict,
+    reference_observations: list[dict] | None = None,
+) -> dict:
+    """Fail-closed marketability review for paper-only frontier spot emission."""
+
+    policy = _frontier_marketability_policy(settings)
+    applicable = bool(
+        policy.get("enabled", True)
+        and policy.get("paper_only", True)
+        and observation.get("market_type") == "spot"
+    )
+    if not applicable:
+        return {
+            "enabled": bool(policy.get("enabled", True)),
+            "applicable": False,
+            "passed": True,
+            "status": "not_applicable",
+            "paper_only": True,
+            "checks": {},
+            "failed_checks": [],
+        }
+
+    max_age = float(policy["max_book_age_seconds"])
+    max_spread = float(policy["max_spread_bps"])
+    min_depth = float(
+        policy.get("min_top_of_book_notional_usd")
+        or settings.get("risk", {}).get("paper_notional_usd", 1000.0)
+    )
+    max_reference_deviation = float(policy["max_cross_venue_deviation_bps"])
+    min_reference_venues = int(policy["min_reference_venues"])
+    min_route_confidence = float(policy["min_route_confidence"])
+
+    age = as_float(observation.get("freshness_age_seconds"), None)
+    spread = _effective_spread_bps(observation)
+    bid_notional, bid_depth_source = _top_of_book_notional_usd(observation, "bid")
+    ask_notional, ask_depth_source = _top_of_book_notional_usd(observation, "ask")
+    confirmation = _frontier_peer_price_confirmation(
+        observation,
+        candidate,
+        reference_observations,
+        max_reference_deviation,
+    )
+
+    feasibility = candidate.get("execution_feasibility") or {}
+    route_status = str(feasibility.get("status") or "unknown")
+    known_statuses = {str(item) for item in policy.get("known_paper_route_statuses", [])}
+    explicit_route_confidence = None
+    for container in (candidate, observation, observation.get("route_quality") or {}, feasibility):
+        if not isinstance(container, dict):
+            continue
+        for key in ("route_confidence", "route_mapping_confidence", "mapping_confidence"):
+            explicit_route_confidence = as_float(container.get(key), None)
+            if explicit_route_confidence is not None:
+                break
+        if explicit_route_confidence is not None:
+            break
+    known_paper_route = bool(candidate.get("route_id") and route_status in known_statuses)
+    route_confidence = explicit_route_confidence
+    if route_confidence is None:
+        route_confidence = 1.0 if candidate.get("route_id") and route_status == "standard" else 0.0
+    route_passed = bool(known_paper_route or route_confidence >= min_route_confidence)
+
+    checks = {
+        "book_freshness": {
+            "passed": age is not None and age <= max_age,
+            "observed_seconds": age,
+            "maximum_seconds": max_age,
+        },
+        "spread_sanity": {
+            "passed": spread <= max_spread,
+            "observed_bps": spread,
+            "maximum_bps": max_spread,
+        },
+        "top_of_book_depth": {
+            "passed": bool(
+                bid_notional is not None
+                and ask_notional is not None
+                and bid_notional >= min_depth
+                and ask_notional >= min_depth
+            ),
+            "bid_notional_usd": bid_notional,
+            "ask_notional_usd": ask_notional,
+            "bid_source": bid_depth_source,
+            "ask_source": ask_depth_source,
+            "minimum_each_side_usd": min_depth,
+        },
+        "cross_venue_price_confirmation": {
+            "passed": bool(
+                confirmation["confirmed"]
+                and confirmation["reference_venue_count"] >= min_reference_venues
+            ),
+            **confirmation,
+            "minimum_reference_venues": min_reference_venues,
+            "maximum_deviation_bps": max_reference_deviation,
+        },
+        "route_confidence": {
+            "passed": route_passed,
+            "known_paper_route": known_paper_route,
+            "route_id": candidate.get("route_id"),
+            "route_status": route_status,
+            "observed_confidence": round(route_confidence, 6),
+            "minimum_confidence": min_route_confidence,
+        },
+    }
+    failed = [name for name, check in checks.items() if not check["passed"]]
+    return {
+        "enabled": True,
+        "applicable": True,
+        "passed": not failed,
+        "status": "passed" if not failed else "failed",
+        "paper_only": True,
+        "checks": checks,
+        "failed_checks": failed,
+        "policy": policy,
+    }
+
+
+def _apply_frontier_marketability_gate(
+    candidate: dict,
+    observation: dict,
+    settings: dict,
+    reference_observations: list[dict] | None = None,
+) -> dict:
+    review = frontier_marketability_gate_review(
+        observation,
+        candidate,
+        settings,
+        reference_observations,
+    )
+    candidate["marketability_gate"] = review
+    candidate["marketability_gate_status"] = review["status"]
+    if (
+        review.get("applicable")
+        and not review.get("passed")
+        and candidate.get("direction") != "watch_only"
+    ):
+        failed = list(review.get("failed_checks") or [])
+        candidate["direction"] = "watch_only"
+        candidate["candidate_reject_reason"] = "marketability_" + (failed[0] if failed else "failed")
+        candidate["marketability_reject_reasons"] = [f"marketability_{name}" for name in failed]
+        candidate["score"] = min(float(candidate.get("score") or 0.0), 25.0)
+        candidate["quality_action"] = "shadow_only"
+        candidate["quality_allocation_multiplier"] = 0.0
+        candidate["paper_entry_blocked"] = True
+        candidate["promotion_eligible"] = False
+        candidate["execution_feasibility"] = _preliminary_feasibility(
+            "watch_only",
+            str(observation.get("market_type") or "spot"),
+            str(observation.get("data_status") or "unknown"),
+            settings,
+        )
+    return candidate
+
+
 def _direction_for_observation(observation: dict, reference_price: float | None, settings: dict) -> tuple[str, float, str | None]:
     cfg = settings.get("frontier_crypto_adapter", {})
     risk = settings.get("risk", {})
@@ -9225,7 +9477,14 @@ def _direction_for_observation(observation: dict, reference_price: float | None,
     return ("short_frontier_spot" if deviation > 0 else "long_frontier_spot"), round(deviation, 3), None
 
 
-def _candidate_from_observation(observation: dict, settings: dict, reference_price: float | None, source_venue_count: int) -> dict:
+def _candidate_from_observation(
+    observation: dict,
+    settings: dict,
+    reference_price: float | None,
+    source_venue_count: int,
+    *,
+    reference_observations: list[dict] | None = None,
+) -> dict:
     risk = settings.get("risk", {})
     quality_cfg = settings.get("frontier_data_quality", {})
     direction, deviation, reject_reason = _direction_for_observation(observation, reference_price, settings)
@@ -9431,7 +9690,8 @@ def _candidate_from_observation(observation: dict, settings: dict, reference_pri
             "notes": observation.get("notes", []),
         },
     }
-    return annotate_paper_context_cost(candidate, settings)
+    candidate = annotate_paper_context_cost(candidate, settings)
+    return _apply_frontier_marketability_gate(candidate, observation, settings, reference_observations)
 
 
 def build_scan_batch(
@@ -9472,7 +9732,13 @@ def build_scan_batch(
         if row.get("data_status") == "reachable" and row.get("comparison_key") and not row.get("local_quote_observe_only")
     )
     candidates = [
-        _candidate_from_observation(row, settings, refs.get(str(row.get("comparison_key"))), venue_counts.get(row.get("comparison_key"), 0))
+        _candidate_from_observation(
+            row,
+            settings,
+            refs.get(str(row.get("comparison_key"))),
+            venue_counts.get(row.get("comparison_key"), 0),
+            reference_observations=observations,
+        )
         for row in observations
         if row.get("data_status") == "reachable" and row.get("comparison_key") in refs
     ]
@@ -9677,6 +9943,12 @@ def summarize(
         for row in candidates
         if row.get("quote") in REGIONAL_FIAT_QUOTES
     )
+    marketability_statuses = collections.Counter(
+        row.get("marketability_gate_status", "not_evaluated") for row in candidates
+    )
+    marketability_failures: collections.Counter[str] = collections.Counter()
+    for row in candidates:
+        marketability_failures.update((row.get("marketability_gate") or {}).get("failed_checks") or [])
     active_candidate_count = sum(
         1
         for row in candidates
@@ -9701,6 +9973,8 @@ def summarize(
             for gate, count in regional_candidate_blockers.items()
             if gate not in {"passed", "not_applicable"}
         ),
+        "marketability_admitted_candidates": marketability_statuses.get("passed", 0),
+        "marketability_blocked_candidates": marketability_statuses.get("failed", 0),
     }
     expansion_map.update(
         {
@@ -9732,6 +10006,8 @@ def summarize(
             "route_status": (row.get("execution_feasibility") or {}).get("status"),
             "route_blockers": (row.get("execution_feasibility") or {}).get("route_blockers", []),
             "quote_normalization_status": row.get("quote_normalization_status"),
+            "marketability_gate_status": row.get("marketability_gate_status"),
+            "marketability_failed_checks": (row.get("marketability_gate") or {}).get("failed_checks", []),
         }
         for row in candidates[:20]
     ]
@@ -9771,6 +10047,8 @@ def summarize(
         "venue_quota_report": depth_summary.get("venue_quota_report", {}),
         "top_unknown_quality_backlog": unknown_quality_backlog,
         "regional_candidate_gate_counts": dict(regional_candidate_blockers),
+        "marketability_gate_counts": dict(marketability_statuses),
+        "marketability_failure_counts": dict(marketability_failures),
         "anomaly_counts": dict(anomaly_counts.most_common()),
         "freshness_age_seconds": _distribution(freshness_values),
         "depth_latency_ms": _distribution(depth_latency_values),

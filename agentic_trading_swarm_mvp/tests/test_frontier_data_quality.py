@@ -43,6 +43,7 @@ def observation() -> dict:
         "comparison_key": "ABC",
         "instrument_id": "GATE:ABC_USDT",
         "route_id": "gate_spot_public",
+        "route_mapping_confidence": 0.8,
         "data_status": "reachable",
         "http_status": "200",
         "latency_ms": 25.0,
@@ -238,6 +239,14 @@ class QualityMathTests(unittest.TestCase):
         cfg["account_capabilities"]["spot_borrow"] = True
         row = observation()
         row["quote_volume_24h"] = 10_000_000.0
+        row.update(
+            quality.analyze_book(
+                row,
+                healthy_book(),
+                latency_ms=25.0,
+                received_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            )
+        )
         row.update(
             {
                 "quality_status": "degraded",

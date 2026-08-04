@@ -117,6 +117,17 @@ DEFAULT_SETTINGS = {
         "intraday_feature_workers": 6,
         "intraday_feature_max_observations": 24,
         "intraday_feature_max_per_venue": 6,
+        "marketability_gates": {
+            "enabled": True,
+            "paper_only": True,
+            "max_book_age_seconds": 30.0,
+            "max_spread_bps": 8.0,
+            "min_top_of_book_notional_usd": 1000.0,
+            "max_cross_venue_deviation_bps": 250.0,
+            "min_reference_venues": 1,
+            "min_route_confidence": 0.70,
+            "known_paper_route_statuses": ["standard"],
+        },
     },
     "frontier_data_quality": {
         "enabled": True,
