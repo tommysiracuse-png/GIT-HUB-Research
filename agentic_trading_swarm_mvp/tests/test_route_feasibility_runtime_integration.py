@@ -24,6 +24,65 @@ def _candidate(**overrides):
 
 
 class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
+    def test_assumption_backed_short_is_capped_but_not_shadow_filtered(self):
+        candidate = _candidate(
+            score=80.0,
+            paper_short_simulation_allowed=True,
+            borrow_inventory_assumption="fixed_conservative_inventory",
+            borrow_cost_assumption={"bps": 25.0, "model": "paper_stress"},
+            venue_capabilities={
+                "supports_spot_short": True,
+                "supports_margin_spot": True,
+                "supports_borrow_check": True,
+            },
+            route_blockers=["spot_borrow"],
+            execution_feasibility={
+                "status": "conditional",
+                "route_blockers": ["spot_borrow"],
+            },
+        )
+
+        guarded = apply_frontier_paper_guard(candidate)
+
+        self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertEqual(16.0, guarded["score"])
+        self.assertEqual(0.2, guarded["paper_allocation_multiplier"])
+        self.assertEqual(
+            "simulation_assumption",
+            guarded["paper_execution_semantics"],
+        )
+
+    def test_pretrade_rechecks_stale_eligible_route_metadata(self):
+        candidate = _candidate(
+            paper_route_eligibility={
+                "paper_only": True,
+                "suppressed": False,
+                "execution_eligibility": "eligible",
+            },
+            venue_capabilities={
+                "supports_spot_short": False,
+                "supports_margin_spot": False,
+                "supports_borrow_check": False,
+            },
+            paper_short_simulation_allowed=True,
+            borrowable=True,
+            borrow_cost_bps=4.0,
+            margin_eligible=True,
+        )
+
+        guarded = apply_frontier_paper_guard(candidate)
+
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("blocked", guarded["execution_eligibility"])
+        self.assertEqual(
+            "infeasible_for_paper",
+            guarded["paper_feasibility_status"],
+        )
+        self.assertIn(
+            "venue_spot_short_capability_unconfirmed",
+            guarded["candidate_reject_detail"]["blocker_reasons"],
+        )
+
     def test_direct_pretrade_path_blocks_short_without_venue_metadata(self):
         candidate = _candidate(
             venue="UNKNOWN_FRONTIER",

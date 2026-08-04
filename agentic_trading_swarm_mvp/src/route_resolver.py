@@ -43,6 +43,7 @@ ROUTE_STATUSES = {
     "blocked_until_requirements_confirmed",
     "paper_observation_only",
 }
+PAPER_ROUTE_ASSUMPTION_SCORE_MULTIPLIER = 0.20
 
 
 def _utc_now() -> str:
@@ -71,22 +72,68 @@ def load_venue_capability_registry() -> dict[str, dict]:
         return {}
     if not isinstance(payload, dict):
         return {}
-    return {
-        str(venue).strip().upper(): dict(capabilities)
-        for venue, capabilities in payload.items()
-        if isinstance(capabilities, dict)
-    }
+    registry: dict[str, dict] = {}
+    for venue, capabilities in payload.items():
+        if not isinstance(capabilities, dict):
+            continue
+        normalized = dict(capabilities)
+        aliases = {
+            "supports_spot_short": ("spot_short_supported", "supports_spot_short_margin"),
+            "supports_margin_spot": ("margin_supported", "supports_margin"),
+            "supports_borrow_check": ("borrow_supported", "borrow_inventory_supported"),
+            "supports_basis_path": ("supports_basis_carry", "synthetic_carry_supported"),
+        }
+        for canonical, legacy_keys in aliases.items():
+            if canonical in normalized:
+                continue
+            for legacy_key in legacy_keys:
+                if legacy_key in normalized:
+                    normalized[canonical] = normalized[legacy_key]
+                    break
+        registry[str(venue).strip().upper()] = normalized
+    return registry
 
 
 def _configured_venue_capabilities(
     candidate: dict,
     capability_registry: dict[str, dict] | None = None,
 ) -> dict:
+    registry = capability_registry or load_venue_capability_registry()
     venue = str(candidate.get("venue") or "").strip().upper()
-    if not venue:
-        return {}
-    capabilities = (capability_registry or load_venue_capability_registry()).get(venue)
-    return dict(capabilities or {})
+    explicit_surface = str(
+        candidate.get("market_key")
+        or candidate.get("market_surface_key")
+        or candidate.get("execution_venue")
+        or ""
+    ).strip().upper()
+    lookup_keys: list[str] = []
+    if explicit_surface in registry:
+        lookup_keys.append(explicit_surface)
+    if venue:
+        descriptor = " ".join(
+            _paper_gate_text(candidate.get(key))
+            for key in (
+                "surface",
+                "market_type",
+                "instrument_type",
+                "instrument",
+                "inst_id",
+                "asset_class",
+                "direction",
+                "side",
+                "strategy_tags",
+            )
+        )
+        if "spot" in descriptor:
+            lookup_keys.append(f"{venue}_SPOT")
+        lookup_keys.append(venue)
+    for key in lookup_keys:
+        capabilities = registry.get(key)
+        if isinstance(capabilities, dict):
+            result = dict(capabilities)
+            result.setdefault("capability_profile", key)
+            return result
+    return {}
 
 
 def _route_lookup(registry: dict) -> dict[str, dict]:
@@ -462,7 +509,7 @@ def _enforce_venue_capability_contract(
     hedged_structure_required: bool,
     missing: list[str],
     reasons: list[str],
-) -> None:
+) -> list[dict[str, object]]:
     """Fail closed when present venue metadata does not confirm a route.
 
     Capability-dependent short and carry candidates fail closed when the
@@ -471,9 +518,10 @@ def _enforce_venue_capability_contract(
     or carry capability.
     """
 
+    checks: list[dict[str, object]] = []
     capability_confirmation_required = spot_short_required or hedged_structure_required
     if not capability_confirmation_required:
-        return
+        return checks
 
     if not capabilities:
         _append_route_gap(
@@ -482,40 +530,60 @@ def _enforce_venue_capability_contract(
             "venue_capabilities",
             "venue_capability_metadata_missing",
         )
-        return
+        checks.append(
+            {
+                "requirement": "venue_capabilities",
+                "capability": None,
+                "state": "unknown",
+                "reason": "venue_capability_metadata_missing",
+            }
+        )
+        return checks
 
     if spot_short_required:
         short_supported = _route_capability_bool(
             capabilities,
-            "spot_short_supported",
             "supports_spot_short",
+            "spot_short_supported",
             "supports_spot_short_margin",
             "shortability_indication",
         )
         margin_supported = _route_capability_bool(
             capabilities,
+            "supports_margin_spot",
             "margin_supported",
             "margin_available",
             "supports_margin",
         )
         borrow_supported = _route_capability_bool(
             capabilities,
+            "supports_borrow_check",
             "borrow_supported",
             "spot_borrow_supported",
             "borrow_inventory_supported",
             "borrow_hint_present",
         )
-        for supported, prerequisite, reason in (
-            (short_supported, "venue_capabilities.spot_short", "venue_spot_short_capability_unconfirmed"),
-            (margin_supported, "venue_capabilities.margin", "venue_margin_capability_unconfirmed"),
-            (borrow_supported, "venue_capabilities.borrow", "venue_borrow_capability_unconfirmed"),
+        for supported, prerequisite, capability, reason in (
+            (short_supported, "venue_capabilities.spot_short", "supports_spot_short", "venue_spot_short_capability_unconfirmed"),
+            (margin_supported, "venue_capabilities.margin", "supports_margin_spot", "venue_margin_capability_unconfirmed"),
+            (borrow_supported, "venue_capabilities.borrow_check", "supports_borrow_check", "venue_borrow_capability_unconfirmed"),
         ):
+            state = "supported" if supported is True else "unsupported" if supported is False else "unknown"
+            checks.append(
+                {
+                    "requirement": prerequisite,
+                    "capability": capability,
+                    "state": state,
+                    "reason": None if supported is True else reason,
+                }
+            )
             if supported is not True:
                 _append_route_gap(missing, reasons, prerequisite, reason)
 
     if hedged_structure_required:
         carry_supported = _route_capability_bool(
             capabilities,
+            "supports_basis_path",
             "synthetic_carry_supported",
             "supports_basis_carry",
             "basis_support",
@@ -533,13 +601,23 @@ def _enforce_venue_capability_contract(
             "supports_spot",
             "supports_spot_long",
         )
-        for supported, prerequisite, reason in (
-            (carry_supported, "venue_capabilities.synthetic_carry", "venue_synthetic_carry_capability_unconfirmed"),
-            (perp_supported, "venue_capabilities.perp", "venue_perp_capability_unconfirmed"),
-            (spot_supported, "venue_capabilities.spot", "venue_spot_leg_capability_unconfirmed"),
+        for supported, prerequisite, capability, reason in (
+            (carry_supported, "venue_capabilities.basis_path", "supports_basis_path", "venue_synthetic_carry_capability_unconfirmed"),
+            (perp_supported, "venue_capabilities.perp", "supports_perpetuals", "venue_perp_capability_unconfirmed"),
+            (spot_supported, "venue_capabilities.spot", "supports_spot_long", "venue_spot_leg_capability_unconfirmed"),
         ):
+            state = "supported" if supported is True else "unsupported" if supported is False else "unknown"
+            checks.append(
+                {
+                    "requirement": prerequisite,
+                    "capability": capability,
+                    "state": state,
+                    "reason": None if supported is True else reason,
+                }
+            )
             if supported is not True:
                 _append_route_gap(missing, reasons, prerequisite, reason)
+    return checks
 
 
 def _eligibility_bool(value: object) -> bool | None:
@@ -584,11 +662,37 @@ def _eligibility_present(value: object) -> bool:
 
 
 def _spot_short_dependency(candidate: dict) -> bool:
-    direction = _paper_gate_text(_eligibility_value(candidate, "direction", "signal_direction"))
-    surface = _paper_gate_text(_eligibility_value(candidate, "surface", "market_type", "instrument_type"))
+    direction = _paper_gate_text(
+        _eligibility_value(candidate, "direction", "signal_direction", "side")
+    )
+    surface = " ".join(
+        _paper_gate_text(_eligibility_value(candidate, key))
+        for key in (
+            "surface",
+            "market_type",
+            "instrument_type",
+            "instrument",
+            "inst_id",
+            "symbol",
+            "asset_class",
+        )
+    )
     route_id = _paper_gate_text(_eligibility_value(candidate, "route_id"))
     borrow_required = _eligibility_bool(
         _eligibility_value(candidate, "borrow_required", "requires_spot_borrow")
+    )
+    descriptor = " ".join(
+        _paper_gate_text(_eligibility_value(candidate, key))
+        for key in (
+            "direction",
+            "strategy",
+            "strategy_id",
+            "strategy_profile",
+            "signal_key",
+            "route_type",
+            "tags",
+            "strategy_tags",
+        )
     )
     inventory_held = _eligibility_bool(
         _eligibility_value(
@@ -601,16 +705,39 @@ def _spot_short_dependency(candidate: dict) -> bool:
     explicit_short_spot = direction in {
         "short_frontier_spot", "long_perp_short_spot", "short_spot",
     }
-    plain_spot_short = direction == "short" and (surface == "spot" or "spot" in route_id)
+    plain_spot_short = direction in {"short", "sell"} and (
+        "spot" in surface or "spot" in route_id
+    )
+    tagged_short_spot = (
+        "short_frontier_spot" in descriptor
+        or ("short" in descriptor and "spot" in descriptor and "conditional" in descriptor)
+        or "borrow_required" in descriptor
+        or (
+            "margin_required" in descriptor
+            and (direction in {"short", "sell"} or "short" in descriptor)
+            and ("spot" in surface or "spot" in descriptor)
+        )
+    )
     return inventory_held is not True and (
-        explicit_short_spot or plain_spot_short or borrow_required is True
+        explicit_short_spot or plain_spot_short or tagged_short_spot or borrow_required is True
     )
 
 
 def _hedged_structure_dependency(candidate: dict) -> bool:
     descriptor = " ".join(
         _paper_gate_text(_eligibility_value(candidate, key))
-        for key in ("trade_type", "strategy", "signal", "direction", "route_type")
+        for key in (
+            "trade_type",
+            "strategy",
+            "strategy_id",
+            "strategy_profile",
+            "signal",
+            "signal_key",
+            "direction",
+            "route_type",
+            "tags",
+            "strategy_tags",
+        )
     )
     requires_hedge = _eligibility_bool(
         _eligibility_value(candidate, "requires_hedge", "hedge_required")
@@ -618,6 +745,13 @@ def _hedged_structure_dependency(candidate: dict) -> bool:
     return requires_hedge is True or any(
         token in descriptor for token in ("basis", "funding", "carry", "hedge_offset")
     )
+
+
+def _simulation_assumption(candidate: dict, *keys: str) -> object:
+    """Return an explicit paper simulation assumption, never an inferred default."""
+
+    value = _eligibility_value(candidate, *keys)
+    return value if _eligibility_present(value) else None
 
 
 def _paper_route_costs(
@@ -743,6 +877,7 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
     venue_capabilities = _venue_capability_metadata(item)
     missing: list[str] = []
     reasons: list[str] = []
+    simulation_assumptions: dict[str, object] = {}
 
     if spot_short_required:
         paper_short_allowed = _eligibility_bool(
@@ -759,6 +894,7 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         if paper_short_allowed is None:
             paper_short_allowed = _capability_bool(
                 venue_capabilities,
+                "supports_spot_short",
                 "paper_short_simulation_allowed",
                 "paper_route_feasible",
                 "route_feasible",
@@ -773,14 +909,14 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
                 "spot_borrow_supported",
             )
         )
-        if borrowable is None:
-            borrowable = _capability_bool(
-                venue_capabilities,
-                "borrow_supported",
-                "spot_borrow_supported",
-                "borrow_inventory_supported",
-                "borrow_hint_present",
-            )
+        borrow_inventory_assumption = _simulation_assumption(
+            item,
+            "borrow_inventory_assumption",
+            "borrow_availability_assumption",
+            "simulated_borrow_inventory",
+        )
+        if borrowable is None and borrow_inventory_assumption is not None:
+            simulation_assumptions["borrow_inventory"] = borrow_inventory_assumption
         margin_eligible = _eligibility_bool(
             _eligibility_value(
                 item,
@@ -794,6 +930,7 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         if margin_eligible is None:
             margin_eligible = _capability_bool(
                 venue_capabilities,
+                "supports_margin_spot",
                 "margin_supported",
                 "margin_available",
                 "supports_margin",
@@ -817,13 +954,26 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         borrow_cost_assumption = _eligibility_value(
             item, "borrow_cost_assumption", "borrow_cost_model"
         )
+        if borrow_cost is None and (
+            _eligibility_present(borrow_cost_assumption) or borrow_cost_model is True
+        ):
+            simulation_assumptions["borrow_cost"] = (
+                borrow_cost_assumption
+                if _eligibility_present(borrow_cost_assumption)
+                else "explicit_borrow_cost_model"
+            )
         short_checks = (
             (
                 paper_short_allowed is True,
                 "paper_short_simulation_allowed",
                 "paper_short_simulation_permission_missing",
             ),
-            (borrowable is True, "borrowable", "spot_borrow_missing"),
+            (
+                borrowable is True
+                or (borrowable is None and borrow_inventory_assumption is not None),
+                "borrowable",
+                "spot_borrow_missing",
+            ),
             (
                 borrow_cost is not None
                 or borrow_cost_model is True
@@ -907,7 +1057,7 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
                 missing.append(prerequisite)
                 reasons.append(reason)
 
-    _enforce_venue_capability_contract(
+    capability_checks = _enforce_venue_capability_contract(
         venue_capabilities,
         spot_short_required=spot_short_required,
         hedged_structure_required=hedged_structure_required,
@@ -969,6 +1119,21 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         proxy_used = False
 
     suppressed = bool(reasons)
+    assumption_penalty_applied = bool(simulation_assumptions) and not suppressed
+    paper_score_multiplier = (
+        0.0
+        if suppressed
+        else PAPER_ROUTE_ASSUMPTION_SCORE_MULTIPLIER
+        if assumption_penalty_applied
+        else 1.0
+    )
+    feasibility_status = (
+        "infeasible_for_paper"
+        if suppressed
+        else "feasible_with_simulation_assumptions"
+        if assumption_penalty_applied
+        else "feasible_for_paper"
+    )
     applies = bool(
         spot_short_required
         or hedged_structure_required
@@ -982,6 +1147,8 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         "venue_capability_metadata_present": bool(venue_capabilities),
         "venue_capabilities": venue_capabilities,
         "route_decision": decision,
+        "feasibility_status": feasibility_status,
+        "execution_eligibility": "blocked" if suppressed else "eligible",
         "route_eligible": not suppressed,
         "eligible_for_scoring": not suppressed,
         "suppressed": suppressed,
@@ -989,6 +1156,15 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         "selected_proxy_id": legacy_proxy_id if proxy_used else None,
         "missing_prerequisites": list(dict.fromkeys(missing)),
         "blocker_reasons": list(dict.fromkeys(reasons)),
+        "capability_checks": capability_checks,
+        "required_capabilities": [
+            str(check["capability"])
+            for check in capability_checks
+            if check.get("capability")
+        ],
+        "simulation_assumptions": simulation_assumptions,
+        "assumption_penalty_applied": assumption_penalty_applied,
+        "paper_score_multiplier": paper_score_multiplier,
         "expected_edge_bps": expected_edge_bps,
         "assumed_route_cost_bps": assumed_cost_bps,
         "cost_breakdown_bps": cost_breakdown,
@@ -1480,6 +1656,9 @@ def enrich_candidate_with_route(
             "market_hours_status": route["market_hours_status"],
             "paper_route_eligibility": eligibility,
             "eligibility_missing_prerequisites": eligibility["missing_prerequisites"],
+            "paper_feasibility_status": eligibility["feasibility_status"],
+            "execution_eligibility": eligibility["execution_eligibility"],
+            "paper_score_multiplier": eligibility["paper_score_multiplier"],
         }
     )
     enriched["execution_feasibility"] = existing
@@ -1487,6 +1666,9 @@ def enrich_candidate_with_route(
     enriched["route_id"] = route["route_id"]
     enriched["route_status"] = route["route_status"]
     enriched["paper_route_eligibility"] = eligibility
+    enriched["paper_feasibility_status"] = eligibility["feasibility_status"]
+    enriched["execution_eligibility"] = eligibility["execution_eligibility"]
+    enriched["paper_route_score_multiplier"] = eligibility["paper_score_multiplier"]
     if eligibility["suppressed"]:
         if "score" in enriched:
             enriched.setdefault("pre_route_eligibility_score", enriched["score"])
@@ -1496,6 +1678,17 @@ def enrich_candidate_with_route(
         enriched["paper_route_allocation_multiplier"] = 0.0
         enriched["paper_route_score_clamped"] = True
         enriched["paper_route_block_reasons"] = eligibility["blocker_reasons"]
+    elif eligibility["assumption_penalty_applied"]:
+        numeric_score = _eligibility_number(enriched, "score")
+        if numeric_score is not None:
+            enriched.setdefault("pre_route_eligibility_score", enriched["score"])
+            enriched["score"] = round(
+                numeric_score * float(eligibility["paper_score_multiplier"]),
+                6,
+            )
+        enriched["paper_route_allocation_multiplier"] = eligibility["paper_score_multiplier"]
+        enriched["paper_allocation_multiplier"] = eligibility["paper_score_multiplier"]
+        enriched["paper_route_assumption_penalty_applied"] = True
     return enriched
 
 

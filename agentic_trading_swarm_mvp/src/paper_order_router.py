@@ -212,6 +212,19 @@ def _merged_paper_allocation_multiplier(candidate: Mapping[str, Any], proposed: 
     return round(proposed, 3)
 
 
+def _paper_assumption_route_allowed(candidate: Mapping[str, Any]) -> bool:
+    verdict = candidate.get("paper_route_eligibility")
+    if not isinstance(verdict, Mapping):
+        return False
+    return bool(
+        verdict.get("feasibility_status") == "feasible_with_simulation_assumptions"
+        and verdict.get("execution_eligibility") == "eligible"
+        and not _as_bool(verdict.get("suppressed"), False)
+        and isinstance(verdict.get("simulation_assumptions"), Mapping)
+        and verdict.get("simulation_assumptions")
+    )
+
+
 def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize direct-vs-proxy paper route feasibility metadata."""
     blockers = sorted(_route_blockers(candidate))
@@ -243,6 +256,18 @@ def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str,
             or _finite_float(alternative.get("allocation_multiplier"))
             or _finite_float(candidate.get("paper_proxy_allocation_multiplier"))
             or 0.5
+        )
+    elif _paper_assumption_route_allowed(candidate):
+        execution_semantics = "simulation_assumption"
+        paper_route_status = "feasible_with_simulation_assumptions"
+        paper_fill_allowed = True
+        multiplier = (
+            _finite_float(
+                (candidate.get("paper_route_eligibility") or {}).get(
+                    "paper_score_multiplier"
+                )
+            )
+            or 0.2
         )
     elif direct_status in _ROUTE_RESEARCH_ONLY_STATUSES:
         execution_semantics = "research_only"
@@ -342,7 +367,14 @@ def _apply_paper_route_eligibility_metadata(candidate: Mapping[str, Any]) -> dic
     """
 
     annotated = dict(candidate)
-    if isinstance(annotated.get("paper_route_eligibility"), Mapping):
+    upstream_verdict = annotated.get("paper_route_eligibility")
+    if isinstance(upstream_verdict, Mapping) and upstream_verdict.get("suppressed"):
+        annotated.setdefault(
+            "paper_feasibility_status",
+            upstream_verdict.get("feasibility_status", "infeasible_for_paper"),
+        )
+        annotated.setdefault("execution_eligibility", "blocked")
+        annotated.setdefault("paper_route_score_multiplier", 0.0)
         return annotated
     try:
         from route_resolver import evaluate_route_intelligence
@@ -364,10 +396,24 @@ def _apply_paper_route_eligibility_metadata(candidate: Mapping[str, Any]) -> dic
     ):
         return annotated
     annotated["paper_route_eligibility"] = dict(verdict)
+    annotated["paper_feasibility_status"] = verdict.get("feasibility_status")
+    annotated["execution_eligibility"] = verdict.get("execution_eligibility")
+    annotated["paper_route_score_multiplier"] = verdict.get("paper_score_multiplier", 1.0)
     if verdict.get("suppressed"):
         annotated["paper_entry_blocked"] = True
         annotated["promotion_eligible"] = False
         annotated["paper_route_allocation_multiplier"] = 0.0
+    elif verdict.get("assumption_penalty_applied"):
+        multiplier = float(verdict.get("paper_score_multiplier") or 0.0)
+        already_penalized = bool(annotated.get("paper_route_assumption_penalty_applied"))
+        annotated.setdefault("pre_route_eligibility_score", annotated.get("score"))
+        if not already_penalized and _finite_float(annotated.get("score")) is not None:
+            annotated["score"] = round(float(annotated["score"]) * multiplier, 6)
+        annotated["paper_route_allocation_multiplier"] = multiplier
+        annotated["paper_allocation_multiplier"] = _merged_paper_allocation_multiplier(
+            annotated, multiplier
+        )
+        annotated["paper_route_assumption_penalty_applied"] = True
     return annotated
 
 
@@ -712,7 +758,12 @@ def frontier_shadow_filter_reason(
         checks.append({"code": "quality_action_shadow_only", "field": "quality_action", "value": candidate.get("quality_action")})
 
     route_blockers = _route_blockers(candidate)
-    if "spot_borrow" in route_blockers and _is_short_frontier_spot(candidate) and not _is_confirmed_borrow(candidate):
+    if (
+        "spot_borrow" in route_blockers
+        and _is_short_frontier_spot(candidate)
+        and not _is_confirmed_borrow(candidate)
+        and not _paper_assumption_route_allowed(candidate)
+    ):
         checks.append(
             {
                 "code": SPOT_BORROW_SHADOW_CODE,

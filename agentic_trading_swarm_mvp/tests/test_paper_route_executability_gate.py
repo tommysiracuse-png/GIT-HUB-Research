@@ -18,6 +18,129 @@ from strategy_reliability import _annotate
 
 
 class TestPaperRouteExecutabilityGate(unittest.TestCase):
+    def test_side_instrument_and_strategy_tags_infer_spot_short_requirements(self):
+        verdict = evaluate_route_intelligence(
+            {
+                "instrument": "ALT-USDT spot",
+                "side": "sell",
+                "strategy_tags": ["conditional", "margin_required"],
+                "venue_capabilities": {
+                    "supports_spot_short": False,
+                    "supports_margin_spot": False,
+                    "supports_borrow_check": False,
+                },
+            }
+        )
+
+        self.assertTrue(verdict["spot_short_required"])
+        self.assertEqual(
+            {
+                "supports_spot_short",
+                "supports_margin_spot",
+                "supports_borrow_check",
+            },
+            set(verdict["required_capabilities"]),
+        )
+        self.assertEqual("infeasible_for_paper", verdict["feasibility_status"])
+
+    def test_canonical_capabilities_fail_closed_with_auditable_states(self):
+        verdict = evaluate_route_intelligence(
+            {
+                "surface": "spot",
+                "direction": "short_frontier_spot",
+                "paper_short_simulation_allowed": True,
+                "borrowable": True,
+                "borrow_cost_bps": 4.0,
+                "margin_eligible": True,
+                "venue_capabilities": {
+                    "supports_spot_short": False,
+                    "supports_margin_spot": None,
+                    "supports_borrow_check": True,
+                },
+            }
+        )
+
+        self.assertEqual("infeasible_for_paper", verdict["feasibility_status"])
+        self.assertEqual("blocked", verdict["execution_eligibility"])
+        states = {
+            check["capability"]: check["state"]
+            for check in verdict["capability_checks"]
+        }
+        self.assertEqual("unsupported", states["supports_spot_short"])
+        self.assertEqual("unknown", states["supports_margin_spot"])
+        self.assertEqual("supported", states["supports_borrow_check"])
+
+    def test_explicit_unknown_borrow_assumptions_pass_only_with_severe_penalty(self):
+        verdict = evaluate_route_intelligence(
+            {
+                "surface": "spot",
+                "direction": "short_frontier_spot",
+                "paper_short_simulation_allowed": True,
+                "borrow_inventory_assumption": "fixed_conservative_inventory",
+                "borrow_cost_assumption": {"bps": 25.0, "model": "paper_stress"},
+                "venue_capabilities": {
+                    "supports_spot_short": True,
+                    "supports_margin_spot": True,
+                    "supports_borrow_check": True,
+                },
+            }
+        )
+
+        self.assertFalse(verdict["suppressed"])
+        self.assertEqual(
+            "feasible_with_simulation_assumptions",
+            verdict["feasibility_status"],
+        )
+        self.assertTrue(verdict["assumption_penalty_applied"])
+        self.assertEqual(0.2, verdict["paper_score_multiplier"])
+        self.assertEqual(
+            {"borrow_inventory", "borrow_cost"},
+            set(verdict["simulation_assumptions"]),
+        )
+
+    def test_supported_route_without_borrow_assumptions_remains_blocked(self):
+        verdict = evaluate_route_intelligence(
+            {
+                "surface": "spot",
+                "direction": "short_frontier_spot",
+                "paper_short_simulation_allowed": True,
+                "venue_capabilities": {
+                    "supports_spot_short": True,
+                    "supports_margin_spot": True,
+                    "supports_borrow_check": True,
+                },
+            }
+        )
+
+        self.assertTrue(verdict["suppressed"])
+        self.assertIn("spot_borrow_missing", verdict["blocker_reasons"])
+        self.assertIn("borrow_cost_assumption_missing", verdict["blocker_reasons"])
+        self.assertEqual(0.0, verdict["paper_score_multiplier"])
+
+    def test_canonical_basis_path_veto_wins_over_legacy_support_flag(self):
+        verdict = evaluate_route_intelligence(
+            {
+                "trade_type": "perp_funding_basis",
+                "direction": "short_perp_long_spot",
+                "hedge_venue": "OKX_SPOT",
+                "hedge_instrument": "BTC-USDT",
+                "fee_model": "paper_conservative_v1",
+                "paper_leg_mapping_valid": True,
+                "venue_capabilities": {
+                    "supports_basis_path": False,
+                    "supports_basis_carry": True,
+                    "supports_spot_long": True,
+                    "supports_perpetuals": True,
+                },
+            }
+        )
+
+        self.assertTrue(verdict["suppressed"])
+        self.assertIn(
+            "venue_synthetic_carry_capability_unconfirmed",
+            verdict["blocker_reasons"],
+        )
+
     def test_spot_short_requires_explicit_candidate_level_prerequisites(self):
         verdict = evaluate_route_intelligence(
             {
@@ -320,6 +443,53 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
             "venue_spot_short_capability_unconfirmed",
             enriched["paper_route_eligibility"]["blocker_reasons"],
         )
+
+    def test_spot_candidate_uses_instrument_specific_venue_profile(self):
+        enriched = enrich_candidate_with_route(
+            {
+                "venue": "OKX",
+                "trade_type": "frontier_crypto_venue_map",
+                "direction": "short_frontier_spot",
+                "asset_class": "crypto_spot",
+                "data_status": "reachable",
+                "score": 88.0,
+            },
+            copy.deepcopy(DEFAULT_SETTINGS),
+        )
+
+        capabilities = enriched["paper_route_eligibility"]["venue_capabilities"]
+        self.assertEqual("OKX_SPOT", capabilities["capability_profile"])
+        self.assertFalse(capabilities["supports_spot_short"])
+        self.assertFalse(capabilities["supports_margin_spot"])
+        self.assertFalse(capabilities["supports_borrow_check"])
+        self.assertFalse(capabilities["supports_basis_path"])
+
+    def test_enrichment_applies_assumption_penalty_to_score_and_allocation(self):
+        enriched = enrich_candidate_with_route(
+            {
+                "venue": "PAPER_SIM_VENUE",
+                "trade_type": "frontier_crypto_venue_map",
+                "direction": "short_frontier_spot",
+                "asset_class": "crypto_spot",
+                "data_status": "reachable",
+                "score": 80.0,
+                "paper_short_simulation_allowed": True,
+                "borrow_inventory_assumption": "fixed_conservative_inventory",
+                "borrow_cost_assumption": {"bps": 25.0, "model": "paper_stress"},
+                "venue_capabilities": {
+                    "supports_spot_short": True,
+                    "supports_margin_spot": True,
+                    "supports_borrow_check": True,
+                },
+            },
+            copy.deepcopy(DEFAULT_SETTINGS),
+        )
+
+        self.assertEqual(80.0, enriched["pre_route_eligibility_score"])
+        self.assertEqual(16.0, enriched["score"])
+        self.assertEqual(0.2, enriched["paper_route_allocation_multiplier"])
+        self.assertEqual("eligible", enriched["execution_eligibility"])
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
 
     def test_reliability_scoring_cannot_resurrect_blocked_candidate(self):
         candidate = enrich_candidate_with_route(
