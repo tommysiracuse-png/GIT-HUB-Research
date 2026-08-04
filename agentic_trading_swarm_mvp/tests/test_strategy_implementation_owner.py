@@ -56,6 +56,29 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual("owner_queued", status)
 
+    def test_decision_schema_is_strict_and_decodes_flexible_contract_json(self) -> None:
+        schema = owner._decision_schema()
+        self.assertFalse(schema["additionalProperties"])
+        for key in ("strategy_experiment", "code_goal", "blocker"):
+            variants = schema["properties"][key]["anyOf"]
+            self.assertEqual({"string", "null"}, {variant["type"] for variant in variants})
+        decoded = owner._decode_decision_payload(
+            {
+                "decision": "wait_for_data",
+                "rationale": "Need a feature.",
+                "strategy_experiment": None,
+                "code_goal": '{"title":"Add feature"}',
+                "dependencies": '[{"feature":"residual_return"}]',
+                "acceptance_criteria": [],
+                "tests_to_run": [],
+                "blocker": '{"type":"missing_feature"}',
+                "memory_note": "Remember the missing feature.",
+            }
+        )
+        self.assertEqual("Add feature", decoded["code_goal"]["title"])
+        self.assertEqual("residual_return", decoded["dependencies"][0]["feature"])
+        self.assertEqual("missing_feature", decoded["blocker"]["type"])
+
     def test_prose_contract_turn_materializes_experiment_without_code_diff(self) -> None:
         rec = self._recommendation()
         owner.enqueue_recommendation(self.conn, rec, self.settings)

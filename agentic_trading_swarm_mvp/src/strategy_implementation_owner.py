@@ -482,19 +482,22 @@ def _memory_context(conn: sqlite3.Connection, task: dict, settings: dict, chain:
 
 
 def _decision_schema() -> dict:
-    nullable_object = {"anyOf": [{"type": "object"}, {"type": "null"}]}
+    # Strict Responses API schemas cannot admit free-form objects. Keep the
+    # decision envelope strict and carry flexible strategy contracts as JSON
+    # strings; the deterministic validator decodes and validates them below.
+    nullable_json = {"anyOf": [{"type": "string"}, {"type": "null"}]}
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "decision": {"type": "string", "enum": sorted(DECISIONS)},
             "rationale": {"type": "string"},
-            "strategy_experiment": nullable_object,
-            "code_goal": nullable_object,
-            "dependencies": {"type": "array", "items": {"type": "object"}},
+            "strategy_experiment": nullable_json,
+            "code_goal": nullable_json,
+            "dependencies": {"type": "string"},
             "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
             "tests_to_run": {"type": "array", "items": {"type": "string"}},
-            "blocker": nullable_object,
+            "blocker": nullable_json,
             "memory_note": {"type": "string"},
         },
         "required": [
@@ -504,11 +507,33 @@ def _decision_schema() -> dict:
     }
 
 
+def _decode_decision_payload(decision: dict) -> dict:
+    decoded = dict(decision or {})
+    expected = {
+        "strategy_experiment": (dict, type(None)),
+        "code_goal": (dict, type(None)),
+        "dependencies": (list,),
+        "blocker": (dict, type(None)),
+    }
+    for key, allowed_types in expected.items():
+        value = decoded.get(key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid_{key}_json:{exc.msg}") from exc
+        if not isinstance(value, allowed_types):
+            raise ValueError(f"invalid_{key}_type:{type(value).__name__}")
+        decoded[key] = value
+    return decoded
+
+
 def _prompt(task: dict, chain: dict, memories: list[dict]) -> str:
     return "\n\n".join(
         [
             "You are the persistent Strategy Implementation Owner for a paper-only autonomous trading research system.",
             "Own this objective through a concrete runtime artifact. Inspect the repository and current Strategy Lab contracts. This turn is analysis/contract design only: do not edit files. Return exactly the requested JSON schema.",
+            "The strategy_experiment, code_goal, dependencies, and blocker fields are JSON-encoded strings. Encode objects/arrays as valid compact JSON strings; use null only for nullable fields and use '[]' for no dependencies.",
             "Prefer a general reusable observation_program over a one-off instrument rule. Preserve novelty. Use current available features when possible. If a required feature is missing, choose implement_code and define an end-to-end code goal. Do not invent broker writes or live trading.",
             "A materialize_experiment decision must include a complete strategy_experiment compatible with strategy_lab.ingest_strategy_lab_recommendation: strategy_lab_id, version, experiment_type='market_strategy', hypothesis, strategy_logic, data_requirements, risk_gates, and promotion_rules.",
             "An observation program must define a universe, calculated_features, entry_expression, invalidation_expression, direction_logic, edge_formula, and score_formula using supported market feature snapshots. Candidate filters must be broad reusable strategies, not one-off symbols.",
@@ -787,7 +812,22 @@ def process_one(conn: sqlite3.Connection, settings: dict, *, cycle_id: str) -> d
         _record_memory(conn, task, result, status)
         return {"status": status, "task_id": task["task_id"], "codex": result}
 
-    decision = result.get("decision") or {}
+    try:
+        decision = _decode_decision_payload(result.get("decision") or {})
+    except ValueError as exc:
+        result["reason"] = str(exc)
+        result["decision_validation_error"] = str(exc)
+        _release_claim(
+            conn,
+            task["task_id"],
+            status="implementation_paused",
+            result=result,
+            error={"reason": str(exc)},
+            retry=True,
+        )
+        _record_run(conn, task, cycle_id, before, "implementation_paused", result)
+        _record_memory(conn, task, result, "implementation_paused")
+        return {"status": "implementation_paused", "task_id": task["task_id"], "codex": result}
     choice = str(decision.get("decision") or "")
     if choice == "materialize_experiment":
         status, handled = _handle_materialize(conn, task, decision)
