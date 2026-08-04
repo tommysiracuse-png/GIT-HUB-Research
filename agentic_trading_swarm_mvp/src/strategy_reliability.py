@@ -282,146 +282,17 @@ def paper_context_promotion_guard_record(
     }
 
 
-def _paper_family_quarantine_enabled(config: Mapping[str, Any] | bool | None = None) -> bool:
-    if isinstance(config, bool):
-        return config
-    if not isinstance(config, Mapping):
-        return True
-
-    for key in PAPER_FAMILY_QUARANTINE_FLAG_KEYS:
-        if key in config:
-            return _as_bool(config.get(key), True)
-
-    for scope in PAPER_FAMILY_QUARANTINE_SCOPES:
-        scoped = config.get(scope)
-        if not isinstance(scoped, Mapping):
-            continue
-        for key in PAPER_FAMILY_QUARANTINE_FLAG_KEYS:
-            if key in scoped:
-                return _as_bool(scoped.get(key), True)
-    return True
-
-
-def _paper_family_quarantine_applies_in_context(config: Mapping[str, Any] | bool | None = None) -> bool:
-    if isinstance(config, bool) or not isinstance(config, Mapping):
-        return True
-
-    containers: list[Mapping[str, Any]] = [config]
-    for scope in PAPER_FAMILY_QUARANTINE_SCOPES:
-        scoped = config.get(scope)
-        if isinstance(scoped, Mapping):
-            containers.append(scoped)
-
-    saw_explicit_mode = False
-    for container in containers:
-        for key in PAPER_MODE_CONFIG_KEYS:
-            raw_mode = container.get(key)
-            if raw_mode in (None, ""):
-                continue
-            saw_explicit_mode = True
-            normalized = str(raw_mode).strip().lower().replace("-", "_").replace(" ", "_")
-            if normalized in LIVE_MODE_VALUES:
-                return False
-            if normalized in PAPER_MODE_VALUES:
-                return True
-    return not saw_explicit_mode or True
-
-
-def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> tuple[str, str] | None:
-    texts: list[str] = []
-    for field in (
-        "market_key",
-        "market_surface",
-        "signal_family",
-        "signal_key",
-        "strategy",
-        "strategy_id",
-        "variant",
-        "variant_id",
-        "context_key",
-        "trade_type",
-    ):
-        value = candidate.get(field)
-        if value not in (None, ""):
-            texts.append(str(value).strip().lower())
-
-    try:
-        derived_signal_key = signal_key(candidate)
-    except Exception:
-        derived_signal_key = None
-    if derived_signal_key:
-        texts.append(str(derived_signal_key).strip().lower())
-
-    combined = " | ".join(texts)
-    for descendant_key in QUARANTINED_DESCENDANT_KEYS:
-        normalized = str(descendant_key).strip().lower()
-        if normalized and normalized in combined:
-            return ("descendant_key", normalized)
-
-    for lineage_terms in QUARANTINED_BASE_LINEAGE_TERMS:
-        normalized_terms = tuple(str(term).strip().lower() for term in lineage_terms if str(term).strip())
-        if normalized_terms and all(term in combined for term in normalized_terms):
-            return ("base_lineage", "|".join(normalized_terms))
-    return None
-
-
-def paper_family_quarantine_record(
-    candidate: Mapping[str, Any],
-    config: Mapping[str, Any] | bool | None = None,
-) -> dict[str, Any] | None:
-    if not _paper_family_quarantine_enabled(config) or not _paper_family_quarantine_applies_in_context(config):
-        return None
-    if not isinstance(candidate, Mapping):
-        return None
-    matched = _paper_family_quarantine_match(candidate)
-    if matched is None:
-        return None
-    match_type, matched_value = matched
-    return {
-        "reason": "paper_strategy_family_quarantine",
-        "guard": "paper_strategy_family_quarantine",
-        "paper_only": True,
-        "eligible": False,
-        "paper_fill_allowed": False,
-        "paper_score_multiplier": 0.0,
-        "paper_allocation_multiplier": 0.0,
-        "quarantine_action": "monitor_only",
-        "family_key": "YAHOO_PROXY|global_proxy_momentum",
-        "reentry_rule": (
-            "Keep quarantined until rolling paper performance is positive on both long and short branches "
-            "with materially improved win rate and sample depth."
-        ),
-        "matched_on": {"type": match_type, "value": matched_value},
-        "evidence": {
-            "long_proxy_standard_bps": -16.225,
-            "long_proxy_standard_closes": 176,
-            "long_proxy_standard_win_rate_pct": 31.8,
-            "short_proxy_conditional_bps": -24.614,
-            "short_proxy_conditional_closes": 171,
-            "short_proxy_conditional_win_rate_pct": 32.2,
-            "short_proxy_standard_bps": -72.504,
-            "short_proxy_standard_closes": 7,
-        },
-    }
-
-QUARANTINED_BASE_LINEAGE_TERMS = (("yahoo_proxy", "global_proxy_momentum"),)
-QUARANTINED_DESCENDANT_KEYS = {
-    "YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM",
-    "yahoo_proxy_global_proxy_momentum",
-    "YAHOO_PROXY|GLOBAL_PROXY_MOMENTUM",
-    "yahoo_proxy|global_proxy_momentum",
-    "strategy_lab|gate_yahoo_momentum_to_fresh_tight_high_quality_proxies_3342a7f1",
-    "strategy_lab|red_team_yahoo_proxy_momentum_sanity_check_c6d14fc0",
-    "strategy_lab|route_rich_frontier_long_filter_2942c975",
+QUARANTINED_PAPER_FAMILY_KEY = "YAHOO_PROXY|global_proxy_momentum"
+QUARANTINED_PAPER_SOURCE_FAMILY = "yahoo_proxy"
+QUARANTINED_PAPER_STRATEGY_FAMILY = "global_proxy_momentum"
+QUARANTINED_STRATEGY_LAB_PREFIXES = (
     "gate_yahoo_momentum_to_fresh_tight_high_quality_proxies_3342a7f1",
     "red_team_yahoo_proxy_momentum_sanity_check_c6d14fc0",
     "route_rich_frontier_long_filter_2942c975",
-}
+)
 QUARANTINE_RELEASE_CONDITION = (
-    "Only lift quarantine for a new candidate if it is not lineage-derived from the "
-    "quarantined family and it demonstrates fresh positive paper results across "
-    "independent horizons with stable sign and without relying on Yahoo proxy "
-    "momentum inputs."
+    "Keep quarantined until a fresh paper validation window demonstrates stable "
+    "positive after-cost expectancy and an acceptable hit rate for the family."
 )
 
 COVERED_IMPROVEMENT_TASK_IDS = [
@@ -1246,7 +1117,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 def _flag_override(source: Any, keys: tuple[str, ...], scopes: tuple[str, ...]) -> bool | None:
     if isinstance(source, bool):
         return source
-    if not isinstance(source, dict):
+    if not isinstance(source, Mapping):
         return None
 
     for key in keys:
@@ -1255,7 +1126,7 @@ def _flag_override(source: Any, keys: tuple[str, ...], scopes: tuple[str, ...]) 
 
     for scope in scopes:
         scoped = source.get(scope)
-        if not isinstance(scoped, dict):
+        if not isinstance(scoped, Mapping):
             continue
         for key in keys:
             if key in scoped:
@@ -1264,8 +1135,8 @@ def _flag_override(source: Any, keys: tuple[str, ...], scopes: tuple[str, ...]) 
 
 
 def paper_family_quarantine_enabled(
-    candidate: dict[str, Any] | None = None,
-    config: dict[str, Any] | bool | None = None,
+    candidate: Mapping[str, Any] | None = None,
+    config: Mapping[str, Any] | bool | None = None,
 ) -> bool:
     override = _flag_override(config, PAPER_FAMILY_QUARANTINE_FLAG_KEYS, PAPER_FAMILY_QUARANTINE_SCOPES)
     if override is not None:
@@ -1273,6 +1144,26 @@ def paper_family_quarantine_enabled(
     override = _flag_override(candidate, PAPER_FAMILY_QUARANTINE_FLAG_KEYS, PAPER_FAMILY_QUARANTINE_SCOPES)
     if override is not None:
         return override
+    return True
+
+
+def _paper_family_quarantine_applies_in_context(
+    config: Mapping[str, Any] | bool | None = None,
+) -> bool:
+    """Keep this policy unreachable from explicitly live runtime contexts."""
+    if isinstance(config, bool) or not isinstance(config, Mapping):
+        return True
+
+    containers: list[Mapping[str, Any]] = [config]
+    for scope in PAPER_FAMILY_QUARANTINE_SCOPES:
+        scoped = config.get(scope)
+        if isinstance(scoped, Mapping):
+            containers.append(scoped)
+    for container in containers:
+        for key in PAPER_MODE_CONFIG_KEYS:
+            mode = str(container.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
+            if mode in LIVE_MODE_VALUES:
+                return False
     return True
 
 
@@ -1294,66 +1185,180 @@ def _lineage_texts(value: Any) -> list[str]:
     return [text] if text else []
 
 
-def paper_family_quarantine_record(
-    candidate: dict[str, Any],
-    config: dict[str, Any] | bool | None = None,
-) -> dict[str, Any] | None:
-    if not paper_family_quarantine_enabled(candidate, config):
-        return None
+def _family_identity_token(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return "_".join(part for part in "".join(char if char.isalnum() else "_" for char in text).split("_") if part)
 
-    searchable_fields = (
+
+def _identity_has_prefix(identity: str, prefix: str) -> bool:
+    return identity == prefix or identity.startswith(f"{prefix}_")
+
+
+def _paper_family_containers(candidate: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:
+    containers: list[tuple[str, Mapping[str, Any]]] = [("candidate", candidate)]
+    for field in (
+        "family_metadata",
+        "current_family_metadata",
+        "strategy_family_metadata",
+        "lineage_metadata",
+        "strategy_metadata",
+    ):
+        value = candidate.get(field)
+        if isinstance(value, Mapping):
+            containers.append((field, value))
+    return containers
+
+
+def _paper_family_quarantine_match(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Resolve the family from structured metadata first, then bounded name prefixes."""
+    family_key_prefix = _family_identity_token(QUARANTINED_PAPER_FAMILY_KEY)
+    source_fields = (
+        "source_family",
+        "data_source_family",
+        "observation_source_family",
+        "venue",
+        "source_venue",
         "market_key",
-        "market_surface",
+        "family_key",
         "signal_family",
-        "signal_key",
-        "family",
+    )
+    strategy_fields = (
+        "strategy_family",
+        "candidate_family",
+        "feature_family",
+        "feature_set_family",
+        "trade_type",
         "strategy",
+        "family",
+        "signal_family",
+    )
+    family_key_fields = (
+        "family_key",
+        "strategy_family_key",
+        "paper_family_key",
+        "market_key",
+        "signal_key",
+    )
+
+    for container_name, container in _paper_family_containers(candidate):
+        for field in family_key_fields:
+            identity = _family_identity_token(container.get(field))
+            if identity and _identity_has_prefix(identity, family_key_prefix):
+                return {
+                    "type": "family_key_prefix",
+                    "field": f"{container_name}.{field}",
+                    "value": str(container.get(field)),
+                }
+
+        source_matches = [
+            field
+            for field in source_fields
+            if _family_identity_token(container.get(field)) == QUARANTINED_PAPER_SOURCE_FAMILY
+        ]
+        strategy_matches = [
+            field
+            for field in strategy_fields
+            if _family_identity_token(container.get(field)) == QUARANTINED_PAPER_STRATEGY_FAMILY
+        ]
+        if source_matches and strategy_matches:
+            return {
+                "type": "family_metadata",
+                "field": container_name,
+                "source_fields": source_matches,
+                "strategy_fields": strategy_matches,
+                "value": QUARANTINED_PAPER_FAMILY_KEY,
+            }
+
+    lineage_fields = (
+        "strategy_lab_id",
+        "parent_strategy_lab_id",
+        "market_key",
+        "signal_key",
         "strategy_id",
-        "variant",
         "variant_id",
         "lineage",
         "lineage_tags",
-        "tags",
-        "candidate_tags",
-        "contexts",
         "parent_strategy",
         "parent_strategy_id",
         "parent_variant",
         "parent_signal_key",
     )
+    normalized_prefixes = tuple(_family_identity_token(value) for value in QUARANTINED_STRATEGY_LAB_PREFIXES)
+    for field in lineage_fields:
+        for text in _lineage_texts(candidate.get(field)):
+            identity = _family_identity_token(text)
+            for raw_prefix, prefix in zip(QUARANTINED_STRATEGY_LAB_PREFIXES, normalized_prefixes):
+                if _identity_has_prefix(identity, prefix) or _identity_has_prefix(identity, f"strategy_lab_{prefix}"):
+                    return {
+                        "type": "strategy_lab_name_prefix",
+                        "field": field,
+                        "value": text,
+                        "prefix": raw_prefix,
+                    }
 
-    field_texts: dict[str, str] = {}
-    normalized_joined: list[str] = []
-    for field in searchable_fields:
-        texts = _lineage_texts(candidate.get(field))
-        if not texts:
-            continue
-        raw_text = " ".join(texts)
-        field_texts[field] = raw_text
-        normalized_joined.append(raw_text.replace("|", " ").replace("/", " ").replace(";", " ").replace(",", " "))
-
-    combined_raw = " ".join(field_texts.values())
-    combined_normalized = " ".join(normalized_joined)
-    base_match = any(all(term in combined_normalized for term in terms) for terms in QUARANTINED_BASE_LINEAGE_TERMS)
-    matched_descendants = sorted(descendant for descendant in QUARANTINED_DESCENDANT_KEYS if descendant in combined_raw)
-    if not base_match and not matched_descendants:
-        return None
-
-    matched_fields = sorted(
-        field
-        for field, raw_text in field_texts.items()
-        if any(term in raw_text for group in QUARANTINED_BASE_LINEAGE_TERMS for term in group)
-        or any(descendant in raw_text for descendant in QUARANTINED_DESCENDANT_KEYS)
+    lineage_tokens = {
+        token
+        for field in ("lineage", "lineage_tags")
+        for text in _lineage_texts(candidate.get(field))
+        for token in _family_identity_token(text).split("_")
+        if token
+    }
+    lineage_text = "_".join(
+        text
+        for field in ("lineage", "lineage_tags")
+        for text in (_family_identity_token(candidate.get(field)),)
+        if text
     )
+    if (
+        {"yahoo", "proxy"}.issubset(lineage_tokens)
+        and QUARANTINED_PAPER_STRATEGY_FAMILY in lineage_text
+    ):
+        return {
+            "type": "lineage_family_metadata",
+            "field": "lineage",
+            "value": QUARANTINED_PAPER_FAMILY_KEY,
+        }
+    return None
+
+
+def paper_family_quarantine_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(candidate, Mapping)
+        or not paper_family_quarantine_enabled(candidate, config)
+        or not _paper_family_quarantine_applies_in_context(config)
+    ):
+        return None
+    matched_on = _paper_family_quarantine_match(candidate)
+    if matched_on is None:
+        return None
     return {
         "reason": "quarantined_family_decay",
-        "paper_only": True,
-        "paper_fill_allowed": False,
         "guard": "paper_strategy_family_quarantine",
-        "quarantine_family": "YAHOO_PROXY global_proxy_momentum",
+        "paper_only": True,
+        "eligible": False,
+        "paper_score_eligible": False,
+        "paper_rank_eligible": False,
+        "paper_fill_allowed": False,
+        "paper_score_multiplier": 0.0,
+        "paper_allocation_multiplier": 0.0,
+        "quarantine_action": "shadow_monitor_only",
+        "family_key": QUARANTINED_PAPER_FAMILY_KEY,
+        "quarantine_family": QUARANTINED_PAPER_FAMILY_KEY,
         "release_condition": QUARANTINE_RELEASE_CONDITION,
-        "matched_fields": matched_fields,
-        "matched_descendants": matched_descendants,
+        "matched_on": matched_on,
+        "matched_fields": [matched_on["field"]],
+        "matched_descendants": [str(matched_on.get("value") or "").lower()]
+        if matched_on.get("type") == "strategy_lab_name_prefix"
+        else [],
+        "evidence": {
+            "source": "paper_closed_trade_labels_current_cycle",
+            "finding": "family_level_degradation",
+            "long_proxy_standard": {"closed_count": 176, "avg_pnl_bps": -16.225, "win_rate": 0.318},
+            "short_proxy_conditional": {"closed_count": 171, "avg_pnl_bps": -24.614, "win_rate": 0.322},
+        },
     }
 
 
@@ -2121,7 +2126,46 @@ def _repair_proxy_candidate(candidate: dict) -> dict | None:
     return None
 
 
-def _apply_one(candidate: dict) -> dict | None:
+def _apply_family_quarantine(
+    candidate: dict,
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict | None:
+    quarantine = paper_family_quarantine_record(candidate, config=config)
+    if quarantine is None:
+        return None
+
+    pre_quarantine_score = _as_float(candidate.get("score"), 0.0)
+    reliability = _annotate(
+        candidate,
+        profile="yahoo_proxy_family_quarantine",
+        action="family_quarantine_shadow_only",
+        reasons=["family_level_negative_after_cost_expectancy_and_hit_rate"],
+        allocation_multiplier=0.0,
+        shadow_only=True,
+    )
+    reliability["paper_strategy_quarantine"] = dict(quarantine)
+    reliability["pre_quarantine_score"] = pre_quarantine_score
+    reliability["paper_score_multiplier"] = 0.0
+    reliability["paper_rank_eligible"] = False
+    candidate["pre_quarantine_score"] = pre_quarantine_score
+    candidate["score"] = 0.0
+    candidate["paper_score_multiplier"] = 0.0
+    candidate["paper_score_eligible"] = False
+    candidate["paper_rank_eligible"] = False
+    candidate["paper_fill_allowed"] = False
+    candidate["paper_strategy_quarantine"] = dict(quarantine)
+    candidate["strategy_reliability"] = reliability
+    _append_note(candidate, "paper_strategy_family_quarantine:yahoo_proxy_family_decay")
+    return reliability
+
+
+def _apply_one(
+    candidate: dict,
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict | None:
+    quarantined = _apply_family_quarantine(candidate, config=config)
+    if quarantined is not None:
+        return quarantined
     trade_type = candidate.get("trade_type")
     if trade_type == "frontier_crypto_venue_map":
         return _repair_frontier_candidate(candidate)
@@ -2140,10 +2184,12 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
     by_venue = collections.Counter(item["venue"] for item in items if item.get("venue"))
     blocked = sum(1 for item in items if item["action"].startswith("shadow") or "shadow" in item["action"])
     protected = sum(1 for item in items if item.get("protect_working_slice"))
+    quarantined = sum(1 for item in items if item.get("profile") == "yahoo_proxy_family_quarantine")
     return {
         "candidate_count": len(candidates),
         "annotated_count": len(items),
         "shadow_or_blocked_count": blocked,
+        "family_quarantine_count": quarantined,
         "protected_working_slice_count": protected,
         "by_action": dict(by_action),
         "by_profile": dict(by_profile),
@@ -2275,11 +2321,23 @@ def apply_strategy_reliability(
     """Annotate candidates with bounded paper-only reliability controls."""
 
     if settings is not None and not settings.get("strategy_reliability", {}).get("enabled", True):
-        return candidates, {"enabled": False, "generated_at": _utc_now(), "summary": {"candidate_count": len(candidates)}}
+        quarantined = [
+            record
+            for candidate in candidates
+            for record in [_apply_family_quarantine(candidate, config=settings)]
+            if record is not None
+        ]
+        candidates.sort(key=lambda row: row.get("score", 0), reverse=True)
+        return candidates, {
+            "enabled": False,
+            "paper_family_quarantine_enabled": paper_family_quarantine_enabled(config=settings),
+            "generated_at": _utc_now(),
+            "summary": _summarize(quarantined, candidates),
+        }
 
     adjusted = []
     for candidate in candidates:
-        reliability = _apply_one(candidate)
+        reliability = _apply_one(candidate, config=settings)
         if reliability:
             adjusted.append(reliability)
     candidates.sort(key=lambda row: row.get("score", 0), reverse=True)

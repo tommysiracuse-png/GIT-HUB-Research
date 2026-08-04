@@ -194,7 +194,7 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["strategy_reliability_action"], "basis_regime_shadow_only")
         self.assertIn("basis_not_extreme", rows[0]["strategy_reliability_reasons"])
 
-    def test_yahoo_short_proxy_needs_confirmation_but_long_stays_eligible(self) -> None:
+    def test_yahoo_proxy_direction_family_is_quarantined_on_both_sides(self) -> None:
         short = base_candidate(
             venue="YAHOO_PROXY",
             inst_id="YAHOO_PROXY:EWZ",
@@ -217,16 +217,12 @@ class StrategyReliabilityTests(unittest.TestCase):
         rows, _ = strategy_reliability.apply_strategy_reliability([short, long])
         by_direction = {row["direction"]: row for row in rows}
 
-        self.assertTrue(by_direction["short_proxy"]["paper_entry_blocked"])
-        self.assertEqual(
-            by_direction["short_proxy"]["strategy_reliability_action"],
-            "short_proxy_shadow_confirmation",
-        )
-        self.assertFalse(by_direction["long_proxy"].get("paper_entry_blocked", False))
-        self.assertEqual(
-            by_direction["long_proxy"]["strategy_reliability_action"],
-            "long_proxy_context_tracking",
-        )
+        for direction in ("short_proxy", "long_proxy"):
+            candidate = by_direction[direction]
+            self.assertTrue(candidate["paper_entry_blocked"])
+            self.assertFalse(candidate["paper_score_eligible"])
+            self.assertEqual(candidate["score"], 0.0)
+            self.assertEqual(candidate["strategy_reliability_action"], "family_quarantine_shadow_only")
 
     def test_duplicate_suppression_recognizes_strategy_pack_themes(self) -> None:
         self.assertEqual(

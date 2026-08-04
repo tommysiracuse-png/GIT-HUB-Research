@@ -133,7 +133,7 @@ class PaperContextCostFloorTests(unittest.TestCase):
         self.assertFalse(live_gate["enabled"])
         self.assertTrue(live_gate["eligible"])
 
-    def test_fill_boundary_rechecks_proxy_context_cost_floor(self) -> None:
+    def test_fill_boundary_prioritizes_proxy_family_quarantine(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         init_db(conn)
@@ -165,7 +165,11 @@ class PaperContextCostFloorTests(unittest.TestCase):
         self.assertEqual(result["order"]["status"], "shadow_filtered")
         self.assertEqual(
             result["order"]["shadow_filter"]["reason"],
-            "paper_context_cost_floor_not_cleared",
+            "quarantined_family_decay",
+        )
+        self.assertEqual(
+            result["order"]["shadow_filter"]["family_key"],
+            "YAHOO_PROXY|global_proxy_momentum",
         )
 
 
