@@ -24,6 +24,32 @@ def settings() -> dict:
 
 
 class PredictionMarketScannerTests(unittest.TestCase):
+    def test_prediction_adapter_remains_public_data_only_when_capability_is_enabled(self) -> None:
+        cfg = settings()
+        cfg["account_capabilities"]["prediction_markets"] = True
+        route = prediction.feasibility(cfg)
+
+        self.assertEqual(route["status"], "conditional")
+        self.assertTrue(route["paper_only"])
+        self.assertTrue(route["public_data_only"])
+        self.assertFalse(route["live_execution_supported"])
+
+    def test_prediction_report_cannot_advertise_live_trading(self) -> None:
+        old_runs = prediction.RUNS_DIR
+        cfg = settings()
+        cfg["mode"] = "live"
+        cfg["allow_live_trading"] = True
+        with tempfile.TemporaryDirectory() as tmp:
+            prediction.RUNS_DIR = pathlib.Path(tmp)
+            try:
+                path = prediction.write_outputs([], settings=cfg)
+                report = json.loads(path.read_text())
+            finally:
+                prediction.RUNS_DIR = old_runs
+
+        self.assertEqual(report["mode"], "paper")
+        self.assertFalse(report["live_trading_allowed"])
+
     def test_build_scan_batch_writes_current_enriched_report(self) -> None:
         old_fetch = prediction.fetch_json
         old_runs = prediction.RUNS_DIR
@@ -234,7 +260,7 @@ class PredictionMarketScannerTests(unittest.TestCase):
                         "liquidityNum": "9000",
                         "volume24hr": "1200",
                         "endDate": "2026-08-10T00:00:00Z",
-                        "clobTokenIds": json.dumps(["fresh-token"]),
+                        "clobTokenIds": json.dumps(["fresh-yes-token", "fresh-no-token"]),
                     },
                     {
                         "id": "expired",
@@ -273,6 +299,109 @@ class PredictionMarketScannerTests(unittest.TestCase):
         self.assertEqual(summary["by_liquidity_bucket"], {"moderate": 1})
         self.assertEqual(summary["event_review_shadow_trials"][0]["status"], "shadow_only")
         self.assertTrue(summary["provider_status"])
+
+    def test_polymarket_normalizes_binary_yes_no_books_and_freshness(self) -> None:
+        old_fetch = prediction.fetch_json
+        now = prediction.dt.datetime.now(prediction.dt.timezone.utc)
+        book_time = (now - prediction.dt.timedelta(minutes=4)).replace(microsecond=0)
+        expiry = (now + prediction.dt.timedelta(days=8)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+        def fake_fetch(url: str, timeout: int = 12):
+            if "gamma-api.polymarket.com/markets?" in url:
+                self.assertIn("order=liquidity", url)
+                self.assertIn("ascending=false", url)
+                return [
+                    {
+                        "id": "binary-1",
+                        "question": "Will the policy rate be cut this month?",
+                        "outcomes": json.dumps(["Yes", "No"]),
+                        "outcomePrices": json.dumps(["0.42", "0.58"]),
+                        "clobTokenIds": json.dumps(["yes-token", "no-token"]),
+                        "endDate": expiry,
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                        "liquidityNum": "25000",
+                        "volume24hr": "4000",
+                    }
+                ]
+            if "yes-token" in url:
+                return {
+                    "timestamp": str(int(book_time.timestamp() * 1000)),
+                    "neg_risk": False,
+                    "bids": [{"price": "0.41", "size": "100"}],
+                    "asks": [{"price": "0.43", "size": "120"}],
+                }
+            if "no-token" in url:
+                return {
+                    "timestamp": str(int(book_time.timestamp() * 1000)),
+                    "neg_risk": False,
+                    "bids": [{"price": "0.57", "size": "90"}],
+                    "asks": [{"price": "0.59", "size": "110"}],
+                }
+            raise AssertionError(url)
+
+        prediction.fetch_json = fake_fetch
+        try:
+            rows, status = prediction._polymarket_candidates(settings(), limit=150)
+        finally:
+            prediction.fetch_json = old_fetch
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(status["market_cap"], 100)
+        self.assertEqual(status["requested_limit"], 100)
+        self.assertEqual(row["venue"], "POLYMARKET")
+        self.assertEqual(row["market_id"], "binary-1")
+        self.assertEqual(row["title"], "Will the policy rate be cut this month?")
+        self.assertEqual(row["probability_mid"], 0.42)
+        self.assertEqual(row["best_bid"], 0.41)
+        self.assertEqual(row["best_ask"], 0.43)
+        self.assertEqual(row["yes_best_bid"], 0.41)
+        self.assertEqual(row["yes_best_ask"], 0.43)
+        self.assertEqual(row["no_best_bid"], 0.57)
+        self.assertEqual(row["no_best_ask"], 0.59)
+        self.assertEqual(row["spread_bps"], 200.0)
+        self.assertGreater(row["depth_usd"], 0.0)
+        self.assertGreaterEqual(row["stale_minutes"], 3.9)
+        self.assertLess(row["stale_minutes"], 5.0)
+        self.assertEqual(row["expiry"], expiry)
+        self.assertTrue(row["paper_only"])
+        self.assertTrue(row["read_only"])
+
+    def test_polymarket_excludes_resolved_and_ambiguous_markets(self) -> None:
+        old_fetch = prediction.fetch_json
+        expiry = (prediction.dt.datetime.now(prediction.dt.timezone.utc) + prediction.dt.timedelta(days=5)).isoformat()
+
+        def fake_fetch(url: str, timeout: int = 12):
+            if "gamma-api.polymarket.com/markets?" in url:
+                base = {
+                    "question": "Example?",
+                    "outcomePrices": json.dumps([0.5, 0.5]),
+                    "clobTokenIds": json.dumps(["yes", "no"]),
+                    "endDate": expiry,
+                    "liquidityNum": "1000",
+                }
+                return [
+                    {**base, "id": "resolved", "resolved": True},
+                    {**base, "id": "neg-risk", "negRisk": True},
+                    {**base, "id": "multi", "outcomes": json.dumps(["A", "B", "C"])},
+                    {**base, "id": "one-token", "clobTokenIds": json.dumps(["yes"])},
+                ]
+            raise AssertionError(url)
+
+        prediction.fetch_json = fake_fetch
+        try:
+            rows, status = prediction._polymarket_candidates(settings(), limit=100)
+        finally:
+            prediction.fetch_json = old_fetch
+
+        self.assertEqual(rows, [])
+        self.assertEqual(status["rejected_count"], 4)
+        self.assertEqual(status["reject_reason_counts"]["closed_or_resolved"], 1)
+        self.assertEqual(status["reject_reason_counts"]["ambiguous_multi_condition"], 1)
+        self.assertEqual(status["reject_reason_counts"]["ambiguous_outcomes"], 1)
+        self.assertEqual(status["reject_reason_counts"]["missing_binary_token_pair"], 1)
 
 
 if __name__ == "__main__":

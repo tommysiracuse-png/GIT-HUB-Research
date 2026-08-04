@@ -318,7 +318,8 @@ DEFAULT_SETTINGS = {
     },
     "prediction_market_scanner": {
         "orderbook_enrichment_top": 30,
-        "provider_market_cap": 50,
+        "provider_market_cap": 100,
+        "polymarket_market_cap": 100,
         "kalshi_market_cap": 50,
     },
     "self_improvement": {

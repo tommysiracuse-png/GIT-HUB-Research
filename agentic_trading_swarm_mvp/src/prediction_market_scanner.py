@@ -23,6 +23,7 @@ from strict_json_object import coerce_single_json_object
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
+POLYMARKET_MARKET_CAP = 100
 
 
 def fetch_json(url: str, timeout: int = 12):
@@ -38,6 +39,55 @@ def as_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    if text in {"false", "0", "no", "off"}:
+        return False
+    return default
+
+
+def _utc_datetime(value: object) -> dt.datetime | None:
+    """Parse provider ISO, epoch-second, or epoch-millisecond timestamps."""
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is not None and math.isfinite(numeric):
+        if abs(numeric) >= 10_000_000_000:
+            numeric /= 1_000.0
+        try:
+            return dt.datetime.fromtimestamp(numeric, tz=dt.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _freshness_fields(*values: object) -> tuple[str | None, float | None]:
+    parsed = [timestamp for timestamp in (_utc_datetime(value) for value in values) if timestamp]
+    if not parsed:
+        return None, None
+    # When both outcome books are present, the older timestamp is the safe age.
+    timestamp = min(parsed)
+    stale = max(0.0, (dt.datetime.now(dt.timezone.utc) - timestamp).total_seconds() / 60.0)
+    return timestamp.isoformat(), round(stale, 3)
 
 
 def liquidity_score(liquidity: float) -> float:
@@ -66,14 +116,11 @@ def _bucket(value: float, cutoffs: list[tuple[float, str]], default: str) -> str
 
 
 def _end_date_bucket(value: object) -> str:
-    if not value:
+    end = _utc_datetime(value)
+    if end is None:
         return "unknown"
-    try:
-        end = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        now = dt.datetime.now(dt.timezone.utc)
-        days = (end - now).total_seconds() / 86400.0
-    except ValueError:
-        return "unknown"
+    now = dt.datetime.now(dt.timezone.utc)
+    days = (end - now).total_seconds() / 86400.0
     if days < 0:
         return "expired_or_resolution_pending"
     if days <= 1:
@@ -164,11 +211,8 @@ def _prediction_risk_flags(end_date: object, spread_bps: float, liquidity: float
 
 
 def _days_to_end(end_date: object) -> float | None:
-    if not end_date:
-        return None
-    try:
-        end = dt.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
-    except ValueError:
+    end = _utc_datetime(end_date)
+    if end is None:
         return None
     now = dt.datetime.now(dt.timezone.utc)
     return (end - now).total_seconds() / 86400.0
@@ -224,6 +268,7 @@ def _polymarket_paper_gate(candidate: dict, row: dict, settings: dict) -> tuple[
     max_days = as_float(config.get("polymarket_max_days_to_resolution"), 30.0)
     min_liquidity = as_float(config.get("polymarket_min_liquidity_usd"), 1_000.0)
     max_spread_bps = as_float(config.get("polymarket_max_spread_bps"), 300.0)
+    max_stale_minutes = as_float(config.get("polymarket_max_stale_minutes"), 0.0)
     if days_to_end is None:
         reasons.append("missing_outcome_timestamp")
     elif days_to_end < 0:
@@ -235,6 +280,12 @@ def _polymarket_paper_gate(candidate: dict, row: dict, settings: dict) -> tuple[
             reasons.append("missing_verified_orderbook")
         if as_float(metadata.get("orderbook_best_bid")) <= 0 or as_float(metadata.get("orderbook_best_ask")) <= 0:
             reasons.append("missing_visible_bid_ask")
+    stale_minutes = candidate.get("stale_minutes")
+    if max_stale_minutes > 0:
+        if stale_minutes is None:
+            reasons.append("missing_freshness_timestamp")
+        elif as_float(stale_minutes) > max_stale_minutes:
+            reasons.append("stale_public_quote")
     if max_spread_bps > 0 and as_float(candidate.get("spread_bps")) > max_spread_bps:
         reasons.append("paper_spread_too_wide")
     liquidity_proxy = max(candidate.get("quote_volume_24h"), as_float(row.get("liquidityNum") or row.get("liquidity")), as_float(metadata.get("orderbook_depth_usd")))
@@ -266,21 +317,77 @@ def _polymarket_orderbook(token_id: object) -> dict:
         row = fetch_json("https://clob.polymarket.com/book?" + urllib.parse.urlencode({"token_id": str(token_id)}), timeout=8)
         bids = row.get("bids") or []
         asks = row.get("asks") or []
-        best_bid = max([as_float(item.get("price") if isinstance(item, dict) else item[0]) for item in bids] or [0.0])
+        best_bid_values = [
+            as_float(item.get("price") if isinstance(item, dict) else item[0]) for item in bids
+        ]
+        best_bid_values = [value for value in best_bid_values if 0 < value < 1]
+        best_bid = max(best_bid_values or [0.0])
         best_ask_values = [as_float(item.get("price") if isinstance(item, dict) else item[0]) for item in asks]
-        best_ask_values = [value for value in best_ask_values if value]
+        best_ask_values = [value for value in best_ask_values if 0 < value < 1]
         best_ask = min(best_ask_values) if best_ask_values else 0.0
         spread = (best_ask - best_bid) * 10_000.0 if best_ask > best_bid > 0 else None
         return {
-            "orderbook_status": "verified" if bids or asks else "empty",
+            "orderbook_status": "verified" if spread is not None else "empty",
             "orderbook_best_bid": round(best_bid, 6) if best_bid else None,
             "orderbook_best_ask": round(best_ask, 6) if best_ask else None,
             "orderbook_spread_bps": round(spread, 3) if spread is not None else None,
             "orderbook_depth_usd": round(_book_depth_from_levels(bids) + _book_depth_from_levels(asks), 3),
+            "orderbook_timestamp": row.get("timestamp"),
+            "orderbook_token_id": str(token_id),
+            "orderbook_neg_risk": _as_bool(row.get("neg_risk")),
             "orderbook_source": "Polymarket CLOB public book",
         }
     except Exception as exc:  # noqa: BLE001
         return {"orderbook_status": "error", "orderbook_error": str(exc)[:160]}
+
+
+def _polymarket_outcome_orderbooks(token_ids: list) -> dict:
+    """Read and combine the public YES and NO books for one binary market."""
+    yes_book = _polymarket_orderbook(token_ids[0] if len(token_ids) == 2 else None)
+    no_book = _polymarket_orderbook(token_ids[1] if len(token_ids) == 2 else None)
+    yes_status = yes_book.get("orderbook_status")
+    no_status = no_book.get("orderbook_status")
+    if yes_status == no_status == "verified":
+        status = "verified"
+    elif "error" in {yes_status, no_status}:
+        status = "error"
+    elif "missing_token" in {yes_status, no_status}:
+        status = "missing_token"
+    elif "empty" in {yes_status, no_status}:
+        status = "empty"
+    else:
+        status = "partial"
+    timestamp, stale_minutes = _freshness_fields(
+        yes_book.get("orderbook_timestamp"),
+        no_book.get("orderbook_timestamp"),
+    )
+    return {
+        "orderbook_status": status,
+        "orderbook_best_bid": yes_book.get("orderbook_best_bid"),
+        "orderbook_best_ask": yes_book.get("orderbook_best_ask"),
+        "orderbook_spread_bps": yes_book.get("orderbook_spread_bps"),
+        "orderbook_depth_usd": round(
+            as_float(yes_book.get("orderbook_depth_usd"))
+            + as_float(no_book.get("orderbook_depth_usd")),
+            3,
+        ),
+        "orderbook_timestamp": timestamp,
+        "orderbook_stale_minutes": stale_minutes,
+        "orderbook_neg_risk": bool(
+            yes_book.get("orderbook_neg_risk") or no_book.get("orderbook_neg_risk")
+        ),
+        "yes_token_id": str(token_ids[0]) if len(token_ids) == 2 else None,
+        "no_token_id": str(token_ids[1]) if len(token_ids) == 2 else None,
+        "yes_best_bid": yes_book.get("orderbook_best_bid"),
+        "yes_best_ask": yes_book.get("orderbook_best_ask"),
+        "yes_spread_bps": yes_book.get("orderbook_spread_bps"),
+        "yes_depth_usd": yes_book.get("orderbook_depth_usd"),
+        "no_best_bid": no_book.get("orderbook_best_bid"),
+        "no_best_ask": no_book.get("orderbook_best_ask"),
+        "no_spread_bps": no_book.get("orderbook_spread_bps"),
+        "no_depth_usd": no_book.get("orderbook_depth_usd"),
+        "orderbook_source": "Polymarket CLOB public YES/NO books",
+    }
 
 
 def _kalshi_orderbook(ticker: object) -> dict:
@@ -309,14 +416,16 @@ def _kalshi_orderbook(ticker: object) -> dict:
 
 
 def feasibility(settings: dict) -> dict:
-    allowed = settings.get("account_capabilities", {}).get("prediction_markets", False)
     return {
-        "status": "standard" if allowed else "conditional",
+        "status": "conditional",
         "requires_short_spot": False,
+        "paper_only": True,
+        "public_data_only": True,
+        "live_execution_supported": False,
         "legs": ["buy YES or NO event contract"],
         "notes": [
-            "Prediction-market execution requires jurisdiction, account, API, and venue eligibility checks.",
-            "Paper mode may study these markets before a live route is configured.",
+            "This adapter supports public market-data research only.",
+            "No wallet, authenticated API, order placement, or live route is implemented.",
         ],
     }
 
@@ -386,11 +495,43 @@ def _candidate(
     }
 
 
+def _polymarket_reject_reason(row: object) -> str | None:
+    """Keep v1 deliberately binary, open, unresolved, and CLOB-readable."""
+    if not isinstance(row, dict):
+        return "invalid_market_record"
+    if "active" in row and not _as_bool(row.get("active")):
+        return "inactive_market"
+    if _as_bool(row.get("closed")) or _as_bool(row.get("resolved")) or _as_bool(row.get("archived")):
+        return "closed_or_resolved"
+    if "acceptingOrders" in row and not _as_bool(row.get("acceptingOrders")):
+        return "orders_not_accepted"
+    if _as_bool(row.get("negRisk")) or _as_bool(row.get("enableNegRisk")):
+        return "ambiguous_multi_condition"
+    if not row.get("id"):
+        return "missing_market_id"
+    if not (row.get("question") or row.get("title") or row.get("slug")):
+        return "missing_title"
+    expiry = row.get("endDate") or row.get("end_date")
+    if not expiry:
+        return "missing_expiry"
+    if _end_date_bucket(expiry) == "expired_or_resolution_pending":
+        return "expired_or_resolution_pending"
+    outcomes = [str(value).strip().lower() for value in _json_list(row.get("outcomes"))]
+    if outcomes and outcomes != ["yes", "no"]:
+        return "ambiguous_outcomes"
+    token_ids = _json_list(row.get("clobTokenIds") or row.get("clobTokenIDs"))
+    if len(token_ids) != 2 or any(not str(token_id).strip() for token_id in token_ids):
+        return "missing_binary_token_pair"
+    prices = _json_list(row.get("outcomePrices"))
+    if prices and len(prices) != 2:
+        return "ambiguous_outcome_prices"
+    if prices and any(not 0.0 <= as_float(price, -1.0) <= 1.0 for price in prices):
+        return "invalid_outcome_prices"
+    return None
+
+
 def _polymarket_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> dict | None:
-    try:
-        prices = json.loads(row.get("outcomePrices") or "[]")
-    except json.JSONDecodeError:
-        prices = []
+    prices = _json_list(row.get("outcomePrices"))
     yes = as_float(prices[0] if prices else row.get("lastTradePrice"), 0.5)
     no = max(0.01, min(0.99, 1.0 - yes))
     one_week = as_float(row.get("oneWeekPriceChange"), 0.0) * 10_000.0
@@ -398,22 +539,39 @@ def _polymarket_candidate_from_row(row: dict, settings: dict, orderbook: dict) -
     token_ids = _json_list(row.get("clobTokenIds") or row.get("clobTokenIDs"))
     price = yes if direction == "buy_yes_event" else no
     spread_bps = as_float(row.get("spread"), 0.03) * 10_000.0
+    yes_bid = as_float(orderbook.get("yes_best_bid"), 0.0)
+    yes_ask = as_float(orderbook.get("yes_best_ask"), 0.0)
+    if yes_ask > yes_bid > 0:
+        yes = (yes_bid + yes_ask) / 2.0
+        no = max(0.01, min(0.99, 1.0 - yes))
+        price = yes if direction == "buy_yes_event" else no
+        spread_bps = (yes_ask - yes_bid) * 10_000.0
+    if orderbook.get("orderbook_timestamp"):
+        freshness_timestamp, stale_minutes = _freshness_fields(orderbook.get("orderbook_timestamp"))
+    else:
+        freshness_timestamp, stale_minutes = _freshness_fields(
+            row.get("updatedAt") or row.get("updated_at")
+        )
     tag_details = _event_tag_details(row)
+    title = row.get("question") or row.get("title") or row.get("slug") or "Polymarket market"
+    expiry = row.get("endDate") or row.get("end_date")
     metadata = {
         "provider": "Polymarket Gamma API",
         "slug": row.get("slug"),
-        "market_id": row.get("id"),
-        "endDate": row.get("endDate"),
-        "outcome_timestamp_present": bool(row.get("endDate")),
-        "has_orderbook_token": bool(token_ids),
+        "market_id": str(row.get("id")),
+        "endDate": expiry,
+        "outcome_timestamp_present": bool(expiry),
+        "has_orderbook_token": len(token_ids) == 2,
         "event_tags": tag_details["tags"],
         "event_tag_confidence": tag_details["confidence"],
+        "freshness_timestamp": freshness_timestamp,
+        "stale_minutes": stale_minutes,
         **orderbook,
     }
-    return _candidate(
+    candidate = _candidate(
         "POLYMARKET",
         f"poly:{row.get('id')}",
-        row.get("question") or row.get("slug") or "Polymarket market",
+        title,
         price,
         direction,
         as_float(row.get("liquidityNum") or row.get("liquidity")),
@@ -423,21 +581,67 @@ def _polymarket_candidate_from_row(row: dict, settings: dict, orderbook: dict) -
         settings,
         metadata,
     )
+    candidate.update(
+        {
+            "market_id": str(row.get("id")),
+            "title": str(title),
+            "probability_mid": round(max(0.0, min(1.0, yes)), 6),
+            "best_bid": round(yes_bid, 6) if yes_bid > 0 else None,
+            "best_ask": round(yes_ask, 6) if yes_ask > 0 else None,
+            "yes_best_bid": orderbook.get("yes_best_bid"),
+            "yes_best_ask": orderbook.get("yes_best_ask"),
+            "no_best_bid": orderbook.get("no_best_bid"),
+            "no_best_ask": orderbook.get("no_best_ask"),
+            "depth_usd": as_float(orderbook.get("orderbook_depth_usd")),
+            "freshness_timestamp": freshness_timestamp,
+            "stale_minutes": stale_minutes,
+            "expiry": expiry,
+            "paper_only": True,
+            "read_only": True,
+        }
+    )
+    return candidate
 
 
 def _polymarket_candidates(settings: dict, limit: int) -> tuple[list[dict], dict]:
+    scanner_cfg = settings.get("prediction_market_scanner", {}) or {}
+    configured_cap = int(scanner_cfg.get("polymarket_market_cap", POLYMARKET_MARKET_CAP))
+    market_cap = max(1, min(POLYMARKET_MARKET_CAP, configured_cap))
+    requested_limit = max(1, min(int(limit), market_cap))
     url = "https://gamma-api.polymarket.com/markets?" + urllib.parse.urlencode(
-        {"active": "true", "closed": "false", "limit": str(limit)}
+        {
+            "active": "true",
+            "closed": "false",
+            "limit": str(requested_limit),
+            "order": "liquidity",
+            "ascending": "false",
+        }
     )
     rows = fetch_json(url)
+    if not isinstance(rows, list):
+        raise ValueError("Polymarket public markets response must be a list")
+    rows = sorted(
+        rows,
+        key=lambda row: as_float((row or {}).get("liquidityNum") or (row or {}).get("liquidity"))
+        if isinstance(row, dict)
+        else 0.0,
+        reverse=True,
+    )[:requested_limit]
     preliminary = []
     expired_filtered = 0
-    enrich_top = int(settings.get("prediction_market_scanner", {}).get("orderbook_enrichment_top", 10))
+    reject_reasons: collections.Counter[str] = collections.Counter()
+    enrich_top = max(0, min(requested_limit, int(scanner_cfg.get("orderbook_enrichment_top", 10))))
     paper_gate_filtered = 0
     paper_gate_reasons = collections.Counter()
     row_by_id = {}
     for row in rows:
-        if _end_date_bucket(row.get("endDate")) == "expired_or_resolution_pending":
+        reject_reason = _polymarket_reject_reason(row)
+        if reject_reason:
+            reject_reasons[reject_reason] += 1
+            if reject_reason == "expired_or_resolution_pending":
+                expired_filtered += 1
+            continue
+        if _end_date_bucket(row.get("endDate") or row.get("end_date")) == "expired_or_resolution_pending":
             expired_filtered += 1
             continue
         candidate = _polymarket_candidate_from_row(row, settings, {"orderbook_status": "not_selected_for_depth"})
@@ -459,7 +663,10 @@ def _polymarket_candidates(settings: dict, limit: int) -> tuple[list[dict], dict
         orderbook = {"orderbook_status": "not_selected_for_depth"}
         if candidate["inst_id"] in enriched_ids:
             token_ids = _json_list(row.get("clobTokenIds") or row.get("clobTokenIDs"))
-            orderbook = _polymarket_orderbook(token_ids[0] if token_ids else None)
+            orderbook = _polymarket_outcome_orderbooks(token_ids)
+            if orderbook.get("orderbook_neg_risk"):
+                reject_reasons["ambiguous_multi_condition"] += 1
+                continue
         rebuilt = _polymarket_candidate_from_row(row, settings, orderbook)
         if rebuilt:
             allowed, reasons = _polymarket_paper_gate(rebuilt, row, settings)
@@ -476,7 +683,12 @@ def _polymarket_candidates(settings: dict, limit: int) -> tuple[list[dict], dict
         "provider": "POLYMARKET",
         "fetched_count": len(rows),
         "expired_filtered_count": expired_filtered,
+        "rejected_count": sum(reject_reasons.values()),
+        "reject_reason_counts": dict(reject_reasons),
         "candidate_count": len(candidates),
+        "market_cap": market_cap,
+        "requested_limit": requested_limit,
+        "catalog_order": "liquidity_desc",
         "orderbook_enrichment_top": enrich_top,
         "paper_gate_enabled": bool((settings.get("prediction_market_scanner", {}) or {}).get("polymarket_paper_gate_enabled", True)),
         "paper_gate_filtered_count": paper_gate_filtered,
@@ -910,8 +1122,8 @@ def write_outputs(
         json.dumps(
             {
                 "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "mode": (settings or {}).get("mode", "paper"),
-                "live_trading_allowed": bool((settings or {}).get("allow_live_trading", False)),
+                "mode": "paper",
+                "live_trading_allowed": False,
                 "summary": summarize(candidates, scan_metadata=scan_metadata),
                 "observations": observations or [],
                 "candidates": candidates,

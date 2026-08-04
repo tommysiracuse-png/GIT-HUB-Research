@@ -49,7 +49,7 @@ class PredictionMarketScannerPublicGateTests(unittest.TestCase):
                         "liquidityNum": "5000",
                         "volume24hr": "2000",
                         "endDate": fresh_end,
-                        "clobTokenIds": json.dumps(["token-good"]),
+                        "clobTokenIds": json.dumps(["token-good-yes", "token-good-no"]),
                     },
                     {
                         "id": "far",
@@ -61,7 +61,7 @@ class PredictionMarketScannerPublicGateTests(unittest.TestCase):
                         "liquidityNum": "6000",
                         "volume24hr": "1800",
                         "endDate": far_end,
-                        "clobTokenIds": json.dumps(["token-far"]),
+                        "clobTokenIds": json.dumps(["token-far-yes", "token-far-no"]),
                     },
                     {
                         "id": "empty",
@@ -73,7 +73,7 @@ class PredictionMarketScannerPublicGateTests(unittest.TestCase):
                         "liquidityNum": "7000",
                         "volume24hr": "2200",
                         "endDate": fresh_end,
-                        "clobTokenIds": json.dumps(["token-empty"]),
+                        "clobTokenIds": json.dumps(["token-empty-yes", "token-empty-no"]),
                     },
                 ]
             if "token-good" in url:
