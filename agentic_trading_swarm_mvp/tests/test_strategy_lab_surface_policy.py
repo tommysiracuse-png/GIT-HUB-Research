@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import json
 import pathlib
 import sqlite3
 import sys
@@ -100,6 +101,122 @@ class StrategyLabSurfacePolicyTests(unittest.TestCase):
         self.assertEqual("quarantined_surface_policy", row["status"])
         self.assertIn("source_surface", row["surface_policy_json"])
         self.assertEqual(1, len(summary["surface_quarantine_review"]))
+
+    def test_yahoo_proxy_cross_surface_contract_is_quarantined_at_ingestion(self) -> None:
+        rec = recommendation()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["strategy_lab_id"] = (
+            "gate_yahoo_momentum_to_fresh_tight_high_quality_proxies_3342a7f1"
+        )
+        experiment["source_surface"] = "YAHOO_PROXY"
+        experiment["permitted_target_surface"] = ["frontier_spot"]
+
+        with connection() as conn:
+            result = ingest_strategy_lab_recommendation(conn, rec)
+            row = conn.execute(
+                "select status, surface_policy_json from strategy_lab_experiments"
+            ).fetchone()
+
+        policy = json.loads(row["surface_policy_json"])
+        self.assertEqual("quarantined", result[0]["action_status"])
+        self.assertEqual("quarantined_surface_policy", row["status"])
+        self.assertIsNotNone(result[0]["source_veto"])
+        self.assertEqual("yahoo_proxy_same_surface_required", policy["reason"])
+        self.assertEqual(
+            ["frontier_spot"],
+            policy["yahoo_proxy_same_surface_review"]["blocked_target_surfaces"],
+        )
+
+    def test_yahoo_proxy_same_surface_contract_remains_eligible(self) -> None:
+        rec = recommendation()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["source_surface"] = "YAHOO_PROXY"
+        experiment["permitted_target_surface"] = ["YAHOO_PROXY"]
+
+        with connection() as conn:
+            result = ingest_strategy_lab_recommendation(conn, rec)
+            row = conn.execute(
+                "select status, surface_policy_json from strategy_lab_experiments"
+            ).fetchone()
+
+        policy = json.loads(row["surface_policy_json"])
+        self.assertEqual("created", result[0]["action_status"])
+        self.assertNotEqual("quarantined_surface_policy", row["status"])
+        self.assertTrue(policy["eligible"])
+
+    def test_yahoo_proxy_explicit_cross_surface_request_cannot_hide_in_allowed_list(self) -> None:
+        rec = recommendation()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["source_surface"] = "YAHOO_PROXY"
+        experiment["permitted_target_surface"] = ["YAHOO_PROXY"]
+        experiment["target_surface"] = "OKX_SPOT"
+
+        with connection() as conn:
+            result = ingest_strategy_lab_recommendation(conn, rec)
+            row = conn.execute(
+                "select status, surface_policy_json from strategy_lab_experiments"
+            ).fetchone()
+
+        policy = json.loads(row["surface_policy_json"])
+        self.assertEqual("quarantined", result[0]["action_status"])
+        self.assertEqual("quarantined_surface_policy", row["status"])
+        self.assertEqual("okx_spot", policy["requested_target_surface"])
+
+    def test_runtime_ranker_rechecks_yahoo_proxy_cached_verdict(self) -> None:
+        cross_surface = {
+            "strategy_lab_id": "yahoo-cross-surface",
+            "strategy_lab_logic_type": "candidate_filter",
+            "inst_id": "BTC-USDT",
+            "score": 99.0,
+            "source_surface": "YAHOO_PROXY",
+            "target_surface": "frontier_spot",
+            "permitted_target_surface": ["frontier_spot"],
+            "strategy_lab_surface_policy": {"eligible": True},
+        }
+        same_surface = {
+            **cross_surface,
+            "strategy_lab_id": "yahoo-same-surface",
+            "inst_id": "YAHOO_PROXY:EWZ",
+            "target_surface": "YAHOO_PROXY",
+            "permitted_target_surface": ["YAHOO_PROXY"],
+        }
+
+        selected, summary = _select_runtime_strategy_lab_candidates(
+            [cross_surface, same_surface],
+            {"strategy_lab": {"runtime_candidate_filters_enabled": True}},
+        )
+
+        self.assertEqual(["YAHOO_PROXY:EWZ"], [row["inst_id"] for row in selected])
+        self.assertEqual(1, summary["accepted_count"])
+
+    def test_preexisting_active_yahoo_cross_surface_artifact_is_quarantined(self) -> None:
+        rec = recommendation()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["source_surface"] = "YAHOO_PROXY"
+        experiment["permitted_target_surface"] = ["YAHOO_PROXY"]
+
+        with connection() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set status = 'active_testing', compile_status = 'compiled',
+                    permitted_target_surfaces_json = '["frontier_spot"]'
+                """
+            )
+            conn.commit()
+            generated, _report = generate_strategy_lab_candidates(
+                conn,
+                self.settings(),
+                [candidate("BTC-USDT", "frontier_spot")],
+            )
+            row = conn.execute(
+                "select status, compile_status from strategy_lab_experiments"
+            ).fetchone()
+
+        self.assertEqual([], generated)
+        self.assertEqual("quarantined_surface_policy", row["status"])
+        self.assertEqual("surface_quarantined", row["compile_status"])
 
     def test_incompatible_and_missing_targets_are_excluded_from_construction(self) -> None:
         with connection() as conn:

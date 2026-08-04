@@ -108,6 +108,7 @@ SURFACE_TARGET_FIELDS = (
     "route_surface",
     "asset_surface",
 )
+YAHOO_PROXY_SURFACE = "yahoo_proxy"
 
 
 def _json_loads(value: str | None, default: Any) -> Any:
@@ -196,6 +197,61 @@ def _surface_values(value: Any) -> list[str]:
     )
 
 
+def _requested_target_surface(sources: list[dict]) -> str | None:
+    for source in sources:
+        containers = [source]
+        logic = source.get("strategy_logic")
+        if isinstance(logic, dict):
+            containers.append(logic)
+        for container in containers:
+            for field in (
+                "requested_target_surface",
+                "target_surface",
+                "destination_surface",
+                "route_surface",
+                "execution_surface",
+            ):
+                target = _normalize_surface(container.get(field))
+                if target:
+                    return target
+    return None
+
+
+def _yahoo_proxy_surface_review(
+    source_surface: str | None,
+    permitted: list[str],
+    requested_target_surface: str | None = None,
+) -> dict:
+    """Require explicit same-surface validation for Yahoo-derived artifacts."""
+    applies = source_surface == YAHOO_PROXY_SURFACE
+    blocked_targets = [surface for surface in permitted if surface != source_surface]
+    source_explicitly_permitted = bool(source_surface and source_surface in permitted)
+    requested_target_eligible = requested_target_surface is None or (
+        requested_target_surface == source_surface
+        and requested_target_surface in permitted
+    )
+    eligible = not applies or (
+        source_explicitly_permitted
+        and not blocked_targets
+        and requested_target_eligible
+    )
+    return {
+        "applies": applies,
+        "eligible": eligible,
+        "reason": (
+            "yahoo_proxy_same_surface_validated"
+            if applies and eligible
+            else "yahoo_proxy_same_surface_required"
+            if applies
+            else "not_applicable"
+        ),
+        "source_explicitly_permitted": source_explicitly_permitted,
+        "requested_target_surface": requested_target_surface,
+        "blocked_target_surfaces": blocked_targets,
+        "paper_only": True,
+    }
+
+
 def _surface_contract(payload: dict, contract: dict, data_requirements: dict) -> dict:
     sources = [contract, data_requirements, payload]
     source_surface = None
@@ -213,13 +269,29 @@ def _surface_contract(payload: dict, contract: dict, data_requirements: dict) ->
         missing.append("source_surface")
     if not permitted:
         missing.append("permitted_target_surface")
+    requested_target_surface = _requested_target_surface(sources)
+    yahoo_review = _yahoo_proxy_surface_review(
+        source_surface,
+        permitted,
+        requested_target_surface,
+    )
+    eligible = not missing and yahoo_review["eligible"]
+    reason = (
+        "missing_surface_metadata"
+        if missing
+        else yahoo_review["reason"]
+        if yahoo_review["applies"]
+        else "surface_contract_valid"
+    )
     return {
         "source_surface": source_surface,
         "permitted_target_surface": permitted,
-        "eligible": not missing,
-        "reason": "surface_contract_valid" if not missing else "missing_surface_metadata",
+        "requested_target_surface": requested_target_surface,
+        "eligible": eligible,
+        "reason": reason,
         "missing_fields": missing,
-        "review_required": bool(missing),
+        "review_required": not eligible,
+        "yahoo_proxy_same_surface_review": yahoo_review,
         "paper_only": True,
     }
 
@@ -253,12 +325,19 @@ def _surface_compatibility(experiment: dict, candidate: dict) -> dict:
         missing.append("permitted_target_surface")
     if target_surface is None:
         missing.append("target_surface")
-    eligible = not missing and target_surface in permitted
+    yahoo_review = _yahoo_proxy_surface_review(
+        source_surface,
+        permitted,
+        target_surface,
+    )
+    eligible = not missing and target_surface in permitted and yahoo_review["eligible"]
     reason = (
         "surface_compatible"
         if eligible
         else "missing_surface_metadata"
         if missing
+        else yahoo_review["reason"]
+        if yahoo_review["applies"] and not yahoo_review["eligible"]
         else "target_surface_not_permitted"
     )
     return {
@@ -269,8 +348,32 @@ def _surface_compatibility(experiment: dict, candidate: dict) -> dict:
         "permitted_target_surface": permitted,
         "missing_fields": missing,
         "review_required": not eligible,
+        "yahoo_proxy_same_surface_review": yahoo_review,
         "paper_only": True,
     }
+
+
+def strategy_lab_surface_activation_eligible(candidate: dict) -> bool:
+    """Recheck Yahoo same-surface lineage instead of trusting a cached verdict."""
+    policy = candidate.get("strategy_lab_surface_policy")
+    if not isinstance(policy, dict) or policy.get("eligible") is not True:
+        return False
+    source_surface = _normalize_surface(
+        candidate.get("source_surface") or policy.get("source_surface")
+    )
+    if source_surface != YAHOO_PROXY_SURFACE:
+        return True
+    experiment = {
+        "source_surface": source_surface,
+        "permitted_target_surface": (
+            candidate.get("permitted_target_surface")
+            or policy.get("permitted_target_surface")
+        ),
+    }
+    activation_candidate = dict(candidate)
+    if _candidate_target_surface(activation_candidate) is None:
+        activation_candidate["target_surface"] = policy.get("target_surface")
+    return _surface_compatibility(experiment, activation_candidate)["eligible"]
 
 
 def _runtime_strategy_vocabulary(candidates: list[dict]) -> dict:
@@ -946,7 +1049,7 @@ def ingest_strategy_lab_recommendation(
     veto_subject = dict(payload)
     veto_subject["validated_strategy_contract"] = contract
     source_veto = paper_source_veto_record(veto_subject, settings)
-    if source_veto is not None:
+    if source_veto is not None and contract["status"] != "quarantined_surface_policy":
         return [
             {
                 "action_status": "skipped",
@@ -976,7 +1079,7 @@ def ingest_strategy_lab_recommendation(
         ).fetchone()
         discover_signals()
         promoted_match = known_strategy_signatures().get(signature)
-        if duplicate or promoted_match:
+        if (duplicate or promoted_match) and contract["status"] != "quarantined_surface_policy":
             contract["status"] = "rejected_invalid"
     novelty_status = (
         "duplicate_experiment"
@@ -1129,6 +1232,7 @@ def ingest_strategy_lab_recommendation(
                 else None
             ),
             "novelty_status": novelty_status,
+            "source_veto": source_veto,
             "created": created,
         }
     ]
@@ -1147,6 +1251,7 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
         """
     ).fetchall()
     output = []
+    quarantined = False
     for row in rows:
         item = dict(row)
         compiled_logic = item.pop("compiled_strategy_logic_json", None)
@@ -1168,10 +1273,31 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
             item.pop("permitted_target_surfaces_json", None), []
         )
         item["surface_policy"] = _json_loads(item.pop("surface_policy_json", None), {})
+        surface_contract = _surface_contract({}, item, item["data_requirements"])
+        yahoo_review = surface_contract["yahoo_proxy_same_surface_review"]
+        if yahoo_review["applies"] and not surface_contract["eligible"]:
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set status = 'quarantined_surface_policy',
+                    compile_status = 'surface_quarantined',
+                    surface_policy_json = ?, updated_at = ?
+                where strategy_lab_id = ?
+                """,
+                (
+                    json.dumps(surface_contract, sort_keys=True),
+                    _utc(),
+                    item["strategy_lab_id"],
+                ),
+            )
+            quarantined = True
+            continue
         item["risk_gates"] = _json_loads(item.pop("risk_gates_json"), {})
         item["promotion_rules"] = _json_loads(item.pop("promotion_rules_json"), {})
         item["evaluation"] = _json_loads(item.pop("evaluation_json"), {})
         output.append(item)
+    if quarantined:
+        conn.commit()
     return output
 
 
@@ -1715,18 +1841,13 @@ def _compile_strategy_lab_contracts(
                 row.get("permitted_target_surfaces_json"), []
             ),
         }
-        surface_contract = _surface_compatibility(surface_experiment, {})
-        contract_missing = [
-            field
-            for field in surface_contract["missing_fields"]
-            if field != "target_surface"
-        ]
-        if contract_missing:
+        surface_contract = _surface_contract({}, surface_experiment, data_requirements)
+        if not surface_contract["eligible"]:
             diagnostic = {
                 "compiled_at": now,
                 "compile_status": "surface_quarantined",
-                "reason": "missing_surface_metadata",
-                "missing_fields": contract_missing,
+                "reason": surface_contract["reason"],
+                "missing_fields": surface_contract["missing_fields"],
                 "surface_policy": surface_contract,
                 "review_required": True,
             }

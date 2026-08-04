@@ -54,7 +54,12 @@ from self_improvement_open_pack import build_open_pack_report, write_open_pack_r
 from signal_safety import run_signal_safety_governor
 from signal_redesign import run_frontier_redesign
 from settings import load_settings
-from strategy_lab import evaluate_strategy_lab, generate_strategy_lab_candidates, write_strategy_lab_reports
+from strategy_lab import (
+    evaluate_strategy_lab,
+    generate_strategy_lab_candidates,
+    strategy_lab_surface_activation_eligible,
+    write_strategy_lab_reports,
+)
 from strategy_reliability import apply_strategy_reliability
 from storage import (
     RUNS_DIR,
@@ -158,8 +163,7 @@ def _is_strategy_lab_runtime_candidate(item: dict) -> bool:
 
 
 def _strategy_lab_surface_rank_eligible(item: dict) -> bool:
-    policy = item.get("strategy_lab_surface_policy")
-    return isinstance(policy, dict) and policy.get("eligible") is True
+    return strategy_lab_surface_activation_eligible(item)
 
 
 def _strategy_lab_runtime_selection_summary(
