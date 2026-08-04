@@ -584,6 +584,11 @@ _PAPER_ONLY_YAHOO_CRYPTO_FRESHNESS_POLICY = {
     "max_destination_proxy_age_seconds": 90.0,
 }
 
+_PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY = {
+    "enabled": True,
+    "max_destination_spread_bps": 8.0,
+}
+
 _PAPER_ONLY_CRYPTO_ROUTE_TOKENS = frozenset(
     {
         "crypto",
@@ -604,6 +609,316 @@ _PAPER_ONLY_CRYPTO_ROUTE_TOKENS = frozenset(
         "mercadobitcoin",
     }
 )
+
+
+def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
+    """Require venue-local confirmation for Yahoo momentum transferred to crypto.
+
+    The guard is deliberately limited to paper candidates whose lineage names
+    Yahoo proxy momentum and whose destination is a non-Yahoo crypto spot or
+    derivatives surface.  Missing local trend or spread evidence fails closed.
+    ``force_paper_exit`` is only raised when a position that passed this guard
+    at entry now has an explicitly adverse local trend.
+    """
+
+    record = record if isinstance(record, dict) else {}
+    profile = profile if isinstance(profile, dict) else {}
+    containers = [record]
+    for container in tuple(containers):
+        for key in (
+            "source_context",
+            "lineage_context",
+            "recommendation_lineage",
+            "proxy_context",
+            "route_context",
+            "destination_context",
+            "local_confirmation",
+            "intraday_features",
+            "candidate",
+        ):
+            nested = container.get(key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+
+    def _lookup(*keys):
+        for container in containers:
+            value = _paper_only_route_intelligence_first(container, keys)
+            if value not in (None, "", [], {}, ()):
+                return value
+        return None
+
+    def _profile_lookup(*keys):
+        config_containers = []
+        for key in (
+            "yahoo_proxy_cross_surface_alignment_guard",
+            "frontier_crypto_adapter",
+            "risk",
+            "paper",
+        ):
+            nested = profile.get(key)
+            if isinstance(nested, dict):
+                config_containers.append(nested)
+        config_containers.append(profile)
+        for container in config_containers:
+            value = _paper_only_route_intelligence_first(container, keys)
+            if value not in (None, "", [], {}, ()):
+                return value
+        return None
+
+    def _bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        token = _paper_only_route_intelligence_tag(value)
+        if token in {"1", "true", "yes", "on", "enabled", "eligible", "passed", "aligned"}:
+            return True
+        if token in {"0", "false", "no", "off", "disabled", "blocked", "failed", "adverse"}:
+            return False
+        return None
+
+    def _float(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if math.isfinite(numeric) else None
+
+    guard_config = profile.get("yahoo_proxy_cross_surface_alignment_guard")
+    enabled = _bool(
+        guard_config.get("enabled")
+        if isinstance(guard_config, dict)
+        else profile.get("yahoo_proxy_cross_surface_alignment_guard_enabled")
+    )
+    if enabled is None:
+        enabled = _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY["enabled"]
+
+    token_fields = (
+        "source_family",
+        "data_source_family",
+        "observation_source_family",
+        "originating_signal_family",
+        "origin_signal_family",
+        "parent_signal_family",
+        "feature_family",
+        "signal_family",
+        "feature_set_family",
+        "market_key",
+        "signal_key",
+        "parent_signal_key",
+        "strategy_family",
+        "trade_type",
+        "origin_surface",
+        "source_surface",
+        "target_surface",
+        "candidate_surface",
+        "execution_surface",
+        "market_surface",
+        "market_type",
+        "asset_class",
+        "venue",
+        "execution_venue",
+        "target_venue",
+        "route_id",
+        "lineage",
+        "lineage_tags",
+    )
+    scope_text = "|".join(
+        str(container.get(key) or "").strip().lower().replace("-", "_").replace("/", "|")
+        for container in containers
+        for key in token_fields
+        if container.get(key) not in (None, "", [], {}, ())
+    )
+    source_is_yahoo = "yahoo_proxy" in scope_text or (
+        "yahoo" in scope_text and "proxy" in scope_text
+    )
+    momentum_family = "global_proxy_momentum" in scope_text or "yahoo_proxy_momentum" in scope_text or (
+        "proxy" in scope_text and "momentum" in scope_text
+    )
+
+    destination_venue = _paper_only_route_intelligence_tag(
+        _lookup("target_venue", "execution_venue", "destination_venue", "venue")
+    )
+    destination_is_native_proxy = destination_venue in {"yahoo", "yahoo_proxy"}
+    destination_is_fast_crypto = any(token in scope_text for token in _PAPER_ONLY_CRYPTO_ROUTE_TOKENS)
+    execution_mode = _paper_only_route_intelligence_tag(
+        _lookup("execution_mode", "trading_mode", "mode", "destination_mode", "runner_mode")
+    )
+    if execution_mode is None:
+        execution_mode = _paper_only_route_intelligence_tag(
+            _profile_lookup("execution_mode", "trading_mode", "mode", "destination_mode", "runner_mode")
+        )
+    paper_mode = execution_mode in {None, "paper", "paper_only", "simulation", "sim", "review"}
+    applies = bool(
+        enabled
+        and paper_mode
+        and source_is_yahoo
+        and momentum_family
+        and destination_is_fast_crypto
+        and not destination_is_native_proxy
+    )
+
+    direction_value = _paper_only_route_intelligence_tag(
+        _lookup("destination_direction", "candidate_direction", "position_side", "direction", "side")
+    ) or ""
+    if "short" in direction_value or direction_value == "sell":
+        direction = "short"
+    elif "long" in direction_value or direction_value == "buy":
+        direction = "long"
+    else:
+        direction = None
+
+    explicit_flip = _bool(
+        _lookup(
+            "local_confirmation_flipped",
+            "local_confirmation_flipped_negative",
+            "local_trend_flipped_negative",
+            "destination_confirmation_flipped",
+        )
+    ) is True
+    explicit_confirmation = _bool(
+        _lookup(
+            "local_direction_confirmed",
+            "destination_direction_confirmed",
+            "local_market_confirms_direction",
+            "destination_market_confirms_direction",
+            "local_trend_confirmed",
+            "local_short_horizon_confirmed",
+        )
+    )
+    local_direction_value = _paper_only_route_intelligence_tag(
+        _lookup(
+            "local_short_horizon_direction",
+            "local_short_horizon_trend",
+            "destination_short_horizon_direction",
+            "destination_short_horizon_trend",
+            "local_trend_direction",
+            "destination_trend_direction",
+        )
+    ) or ""
+    if "short" in local_direction_value or local_direction_value in {"sell", "down", "negative", "bearish"}:
+        local_direction = "short"
+    elif "long" in local_direction_value or local_direction_value in {"buy", "up", "positive", "bullish"}:
+        local_direction = "long"
+    else:
+        local_direction = None
+    local_trend_bps = _float(
+        _lookup(
+            "local_short_horizon_trend_bps",
+            "local_short_horizon_trend",
+            "destination_short_horizon_trend_bps",
+            "destination_short_horizon_trend",
+            "local_return_1m_bps",
+            "destination_return_1m_bps",
+            "return_1m_bps",
+            "local_return_5m_bps",
+            "destination_return_5m_bps",
+            "return_5m_bps",
+            "short_horizon_return_bps",
+        )
+    )
+    if explicit_flip:
+        local_trend_state = "adverse"
+    elif local_direction and direction:
+        local_trend_state = "aligned" if local_direction == direction else "adverse"
+    elif local_trend_bps is not None and direction:
+        signed_trend = local_trend_bps if direction == "long" else -local_trend_bps
+        local_trend_state = "aligned" if signed_trend > 0.0 else "adverse" if signed_trend < 0.0 else "neutral"
+    elif explicit_confirmation is True:
+        local_trend_state = "aligned"
+    elif explicit_confirmation is False:
+        local_trend_state = "not_confirmed"
+    else:
+        local_trend_state = "missing"
+    local_direction_confirmed = local_trend_state == "aligned"
+
+    max_spread_bps = _float(
+        _lookup("max_destination_spread_bps", "maximum_spread_bps", "max_spread_bps")
+    )
+    if max_spread_bps is None:
+        max_spread_bps = _float(
+            _profile_lookup("max_destination_spread_bps", "maximum_spread_bps", "max_spread_bps")
+        )
+    if max_spread_bps is None or max_spread_bps <= 0.0:
+        max_spread_bps = _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY[
+            "max_destination_spread_bps"
+        ]
+    explicit_spread_ok = _bool(
+        _lookup(
+            "local_spread_non_adverse",
+            "destination_spread_non_adverse",
+            "non_adverse_spread",
+            "spread_condition_non_adverse",
+            "destination_spread_ok",
+            "local_spread_ok",
+            "spread_ok",
+        )
+    )
+    destination_spread_bps = _float(
+        _lookup(
+            "destination_spread_bps",
+            "local_spread_bps",
+            "current_spread_bps",
+            "spread_bps",
+            "simulated_spread_bps",
+        )
+    )
+    if destination_spread_bps is not None:
+        spread_non_adverse = 0.0 <= destination_spread_bps <= max_spread_bps
+    else:
+        spread_non_adverse = explicit_spread_ok is True
+    spread_evidence_present = destination_spread_bps is not None or explicit_spread_ok is not None
+
+    eligible = bool(applies and direction and local_direction_confirmed and spread_non_adverse)
+    if not applies:
+        reason = "disabled" if not enabled else "non_paper_mode" if not paper_mode else "not_applicable"
+    elif direction is None:
+        reason = "missing_destination_direction"
+    elif local_trend_state == "missing":
+        reason = "missing_local_short_horizon_trend"
+    elif local_trend_state == "adverse":
+        reason = "local_short_horizon_trend_adverse"
+    elif not local_direction_confirmed:
+        reason = "local_direction_not_confirmed"
+    elif not spread_evidence_present:
+        reason = "missing_destination_spread"
+    elif not spread_non_adverse:
+        reason = "destination_spread_adverse"
+    else:
+        reason = "local_alignment_confirmed"
+
+    prior_review = record.get("yahoo_proxy_cross_surface_alignment_guard")
+    entry_was_confirmed = _bool(
+        _lookup("entry_local_confirmation_passed", "entry_alignment_confirmed")
+    ) is True or bool(isinstance(prior_review, dict) and prior_review.get("eligible"))
+    force_paper_exit = bool(
+        applies and entry_was_confirmed and local_trend_state == "adverse"
+    )
+    return {
+        "enabled": bool(enabled),
+        "paper_only": True,
+        "applies": applies,
+        "eligible": eligible if applies else True,
+        "blocked": bool(applies and not eligible),
+        "entry_allowed": eligible if applies else True,
+        "reason": reason,
+        "source_family": "yahoo_proxy" if source_is_yahoo else None,
+        "signal_family": "global_proxy_momentum" if momentum_family else None,
+        "destination_venue": destination_venue,
+        "destination_direction": direction,
+        "local_direction": local_direction,
+        "local_short_horizon_trend_bps": local_trend_bps,
+        "local_trend_state": local_trend_state,
+        "local_direction_confirmed": local_direction_confirmed,
+        "destination_spread_bps": destination_spread_bps,
+        "max_destination_spread_bps": max_spread_bps,
+        "spread_non_adverse": spread_non_adverse,
+        "entry_was_confirmed": entry_was_confirmed,
+        "force_paper_exit": force_paper_exit,
+        "exit_reason": "local_confirmation_flipped_adverse" if force_paper_exit else None,
+    }
 
 
 def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now=None):
@@ -939,25 +1254,47 @@ def _paper_only_cross_surface_seed_guard_review(record, profile=None):
         {"frontier", "perp", "perpetual", "cross_surface", "non_native"} & scope_tokens
     )
     freshness_gate = _paper_only_yahoo_proxy_crypto_freshness_review(record, profile)
+    alignment_guard = paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile)
     applies = bool(freshness_gate.get("applies"))
-    blocked = bool(applies and freshness_gate.get("blocked"))
+    blocked = bool(
+        (applies and freshness_gate.get("blocked"))
+        or (alignment_guard.get("applies") and alignment_guard.get("blocked"))
+    )
+    if alignment_guard.get("applies") and alignment_guard.get("blocked"):
+        reason = alignment_guard.get("reason")
+    else:
+        reason = freshness_gate.get("reason") if applies else "not_applicable"
 
     return {
         "enabled": True,
-        "applies": applies,
+        "applies": bool(applies or alignment_guard.get("applies")),
         "blocked": blocked,
         "eligible": not blocked,
-        "reason": freshness_gate.get("reason") if applies else "not_applicable",
+        "reason": reason,
         "source_family": source_family,
         "feature_family": feature_family,
         "candidate_surface": candidate_surface,
         "native_proxy_variant": native_proxy_variant,
         "cross_surface_target": cross_surface_target,
-        "policy": "freshness_and_session_gated_propagation" if applies else "allow",
-        "gate_reason": freshness_gate.get("gate_reason"),
-        "gate_reasons": list(freshness_gate.get("gate_reasons") or ()),
-        "propagated_momentum_contribution": freshness_gate.get("propagated_momentum_contribution"),
+        "policy": "freshness_session_and_local_alignment_gated_propagation" if applies else "allow",
+        "gate_reason": reason if blocked else None,
+        "gate_reasons": list(
+            dict.fromkeys(
+                [
+                    *list(freshness_gate.get("gate_reasons") or ()),
+                    *(
+                        [alignment_guard.get("reason")]
+                        if alignment_guard.get("applies") and alignment_guard.get("blocked")
+                        else []
+                    ),
+                ]
+            )
+        ),
+        "propagated_momentum_contribution": (
+            0.0 if blocked else freshness_gate.get("propagated_momentum_contribution")
+        ),
         "freshness_gate": freshness_gate,
+        "alignment_guard": alignment_guard,
     }
 
 def _paper_only_route_intelligence_surface(record, tokens):

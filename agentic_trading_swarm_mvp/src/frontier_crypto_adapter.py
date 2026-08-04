@@ -17,6 +17,7 @@ try:
         _paper_only_yahoo_proxy_crypto_freshness_review,
         _paper_only_family_decay_guard_review,
         _paper_only_parse_timestamp,
+        paper_only_yahoo_proxy_cross_surface_alignment_guard,
         paper_only_shadow_direction_inversion_review,
         paper_only_route_requirement_profile,
         paper_only_route_quality_record,
@@ -29,6 +30,7 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
             _paper_only_cross_surface_seed_guard_review,
             _paper_only_yahoo_proxy_crypto_freshness_review,
             _paper_only_parse_timestamp,
+            paper_only_yahoo_proxy_cross_surface_alignment_guard,
             paper_only_shadow_direction_inversion_review,
             paper_only_route_requirement_profile,
             _paper_only_family_decay_guard_review,
@@ -120,6 +122,18 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "gate_reasons": [],
                 "input_momentum_contribution": contribution,
                 "propagated_momentum_contribution": contribution,
+            }
+
+        def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
+            return {
+                "enabled": False,
+                "paper_only": True,
+                "applies": False,
+                "eligible": True,
+                "blocked": False,
+                "entry_allowed": True,
+                "reason": "guard_disabled",
+                "force_paper_exit": False,
             }
 
         def _paper_only_family_decay_guard_review(record, config=None):
@@ -1835,6 +1849,9 @@ def _paper_only_route_requirements_packet(route_status, profile):
         "critical_missing_fields": critical_missing_fields,
         "carry_alignment_review": carry_alignment_review,
         "yahoo_proxy_crypto_freshness_gate": cross_surface_seed_guard_review.get("freshness_gate"),
+        "yahoo_proxy_cross_surface_alignment_guard": cross_surface_seed_guard_review.get(
+            "alignment_guard"
+        ),
         "propagated_momentum_contribution": cross_surface_seed_guard_review.get(
             "propagated_momentum_contribution"
         ),
@@ -1888,6 +1905,12 @@ def _paper_only_annotate_route_intelligence(route_status):
             "propagated_momentum_contribution"
         )
         route_status["proxy_momentum_gate_reason"] = yahoo_freshness_gate.get("gate_reason")
+    yahoo_alignment_guard = route_packet.get("yahoo_proxy_cross_surface_alignment_guard")
+    if isinstance(yahoo_alignment_guard, dict) and yahoo_alignment_guard.get("applies"):
+        route_status["yahoo_proxy_cross_surface_alignment_guard"] = yahoo_alignment_guard
+        route_status["local_cross_surface_confirmation"] = yahoo_alignment_guard.get(
+            "local_direction_confirmed"
+        )
     if route_packet.get("paper_only_route_blocked"):
         route_status["route_requirement_status"] = "blocked"
         route_status["route_complete"] = False
@@ -1917,6 +1940,7 @@ def _paper_only_annotate_route_intelligence(route_status):
         "critical_missing_fields",
         "carry_alignment_review",
         "yahoo_proxy_crypto_freshness_gate",
+        "yahoo_proxy_cross_surface_alignment_guard",
         "propagated_momentum_contribution",
         "paper_only_route_blocked",
         "paper_only_block_reason",

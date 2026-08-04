@@ -532,6 +532,24 @@ def _paper_okx_basis_carry_gate(
     return dict(record) if isinstance(record, Mapping) else None
 
 
+def _paper_yahoo_proxy_cross_surface_alignment_guard(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    """Load the paper-only alignment guard without coupling router imports."""
+    try:
+        from frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
+    except ImportError:  # pragma: no cover - package import fallback
+        try:
+            from src.frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
+        except ImportError:
+            return None
+
+    profile = config if isinstance(config, Mapping) else {}
+    review = paper_only_yahoo_proxy_cross_surface_alignment_guard(dict(candidate), profile)
+    return dict(review) if isinstance(review, Mapping) else None
+
+
 def frontier_shadow_filter_reason(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -543,6 +561,29 @@ def frontier_shadow_filter_reason(
     verified positive-net candidates with no slippage or quality blocker remain
     eligible for paper fills.
     """
+    alignment_guard = candidate.get("yahoo_proxy_cross_surface_alignment_guard")
+    if not isinstance(alignment_guard, Mapping):
+        alignment_guard = _paper_yahoo_proxy_cross_surface_alignment_guard(candidate, config)
+    if (
+        isinstance(alignment_guard, Mapping)
+        and _as_bool(alignment_guard.get("applies"), False)
+        and not _as_bool(alignment_guard.get("eligible"), False)
+    ):
+        return {
+            "reason": "paper_yahoo_proxy_cross_surface_alignment_blocked",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "yahoo_proxy_cross_surface_alignment_guard",
+            "candidate": _candidate_reference(candidate),
+            "checks": [
+                {
+                    "code": alignment_guard.get("reason") or "local_alignment_not_confirmed",
+                    "field": "yahoo_proxy_cross_surface_alignment_guard",
+                }
+            ],
+            "alignment_guard": dict(alignment_guard),
+        }
+
     route_eligibility = candidate.get("paper_route_eligibility") or {}
     if isinstance(route_eligibility, Mapping) and _as_bool(
         route_eligibility.get("suppressed"), False
@@ -751,14 +792,21 @@ def apply_frontier_paper_guard(
 ) -> dict[str, Any]:
     """Return a copy of ``candidate`` annotated as shadow-filtered when needed."""
     route_guard_enabled = frontier_route_feasibility_guard_enabled(config)
-    guarded = _apply_paper_route_eligibility_metadata(candidate) if route_guard_enabled else dict(candidate)
+    guarded = dict(candidate)
+    alignment_guard = _paper_yahoo_proxy_cross_surface_alignment_guard(guarded, config)
+    if isinstance(alignment_guard, Mapping) and alignment_guard.get("applies"):
+        guarded["yahoo_proxy_cross_surface_alignment_guard"] = dict(alignment_guard)
+        guarded["local_cross_surface_confirmation"] = alignment_guard.get(
+            "local_direction_confirmed"
+        )
+        if not alignment_guard.get("eligible"):
+            guarded["paper_entry_blocked"] = True
+            guarded["promotion_eligible"] = False
+            guarded["paper_allocation_multiplier"] = 0.0
+    guarded = _apply_paper_route_eligibility_metadata(guarded) if route_guard_enabled else guarded
     guarded = _apply_route_feasibility_metadata(guarded) if (
         is_frontier_crypto_candidate(guarded) and route_guard_enabled
     ) else guarded
-    quarantine_reason = _paper_family_quarantine_reason(guarded, config)
-    if quarantine_reason is not None:
-        return _annotate_shadow_filtered_candidate(guarded, quarantine_reason, "paper_strategy_quarantine")
-
     reason = frontier_shadow_filter_reason(guarded, config)
     if reason is None:
         return guarded

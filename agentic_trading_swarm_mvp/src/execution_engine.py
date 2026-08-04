@@ -153,16 +153,34 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         order["shadow_filter"] = candidate.get("candidate_reject_detail")
         order["notes"].append("Paper fill suppressed by a paper-only candidate guard.")
         order_id = save_execution_order(conn, order, candidate, review)
-        return {"order_id": order_id, "order": order, "fills": [], "paper_filled": False}
+        return {
+            "order_id": order_id,
+            "order": order,
+            "fills": [],
+            "paper_filled": False,
+            "candidate": candidate,
+        }
 
     if settings.get("mode") == "live" or settings.get("allow_live_trading"):
         order["status"] = "blocked_live_trading_not_implemented"
         order_id = save_execution_order(conn, order, candidate, review)
-        return {"order_id": order_id, "order": order, "fills": [], "paper_filled": False}
+        return {
+            "order_id": order_id,
+            "order": order,
+            "fills": [],
+            "paper_filled": False,
+            "candidate": candidate,
+        }
 
     if order["status"] != "ready_for_paper_execution":
         order_id = save_execution_order(conn, order, candidate, review)
-        return {"order_id": order_id, "order": order, "fills": [], "paper_filled": False}
+        return {
+            "order_id": order_id,
+            "order": order,
+            "fills": [],
+            "paper_filled": False,
+            "candidate": candidate,
+        }
 
     fills = [_paper_fill_for_leg(leg, settings) for leg in order["legs"]]
     order["status"] = "paper_filled"
@@ -179,4 +197,5 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         "fills": fills,
         "fill_ids": fill_ids,
         "paper_filled": True,
+        "candidate": candidate,
     }

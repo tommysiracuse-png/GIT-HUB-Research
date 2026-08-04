@@ -54,6 +54,10 @@
     "min_opening_gap_bps": 40.0,
     "min_opening_gap_followthrough_ratio": 0.25
   },
+  "yahoo_proxy_cross_surface_alignment_guard": {
+    "enabled": true,
+    "max_destination_spread_bps": 8.0
+  },
   "paper_cell_policy": {
     "min_closed_trades": 3,
     "probation_ttl_days": 7,

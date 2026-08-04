@@ -139,6 +139,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "paper_trades", "close_delay_seconds", "real")
     _ensure_column(conn, "paper_trades", "close_measurement_status", "text")
     _ensure_column(conn, "paper_trades", "close_price_source", "text")
+    _ensure_column(conn, "paper_trades", "close_reason", "text")
     _ensure_column(conn, "paper_trades", "selected_hold_minutes", "integer")
     _ensure_column(conn, "paper_trades", "hold_decision_json", "text")
     _ensure_column(conn, "paper_trades", "strategy_lab_id", "text")
@@ -1228,6 +1229,8 @@ def open_paper_trade(
     execution: dict | None = None,
     settings: dict | None = None,
 ) -> int:
+    if execution and isinstance(execution.get("candidate"), dict):
+        candidate = execution["candidate"]
     entry = candidate["last"]
     execution_order_id = None
     route_id = None
@@ -1622,17 +1625,126 @@ def close_due_trades(
     hold_minutes: int,
     settings: dict | None = None,
 ) -> list[dict]:
-    del latest_by_inst
     closed = []
     rows = conn.execute(
         """
         select id, opened_at, venue, inst_id, direction, trade_type, signal_key, entry,
-               selected_hold_minutes, hold_decision_json
+               selected_hold_minutes, hold_decision_json, candidate_json,
+               entry_fee_bps, entry_slippage_bps
         from paper_trades
         where status = 'open'
         """
     ).fetchall()
     for row in rows:
+        try:
+            candidate = json.loads(row["candidate_json"] or "{}")
+        except (TypeError, ValueError):
+            candidate = {}
+        latest = latest_by_inst.get(row["inst_id"])
+        prior_alignment = candidate.get("yahoo_proxy_cross_surface_alignment_guard")
+        if (
+            isinstance(latest, dict)
+            and isinstance(prior_alignment, dict)
+            and prior_alignment.get("eligible")
+            and latest.get("last") not in (None, "")
+        ):
+            current = dict(candidate)
+            nested_latest = latest.get("candidate")
+            if isinstance(nested_latest, dict):
+                current.update(nested_latest)
+            current.update({key: value for key, value in latest.items() if key != "candidate"})
+            current["yahoo_proxy_cross_surface_alignment_guard"] = prior_alignment
+            try:
+                from frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
+            except ImportError:  # pragma: no cover - package import fallback
+                from src.frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
+            alignment = paper_only_yahoo_proxy_cross_surface_alignment_guard(current, settings or {})
+            if alignment.get("force_paper_exit"):
+                try:
+                    from paper_loop import direction_sign
+                except ImportError:  # pragma: no cover - package import fallback
+                    from src.paper_loop import direction_sign
+
+                sign = direction_sign(row["direction"])
+                if sign:
+                    exit_px = float(latest["last"])
+                    pnl_bps = (exit_px / float(row["entry"]) - 1.0) * 10_000.0 * sign
+                    risk = (settings or {}).get("risk", {})
+                    if row["trade_type"] == "frontier_crypto_venue_map" and candidate.get(
+                        "frontier_cost_source"
+                    ):
+                        pnl_bps -= float(row["entry_fee_bps"] or 0.0)
+                        pnl_bps -= float(
+                            candidate.get(
+                                "estimated_fee_bps_per_side",
+                                (settings or {}).get("frontier_data_quality", {}).get(
+                                    "conservative_fee_bps_per_side", 10.0
+                                ),
+                            )
+                        )
+                        pnl_bps -= float(
+                            candidate.get(
+                                "exit_slippage_bps_estimate",
+                                risk.get("slippage_bps_per_leg", 0.0),
+                            )
+                        )
+                    else:
+                        pnl_bps -= float(row["entry_fee_bps"] or 0.0)
+                        pnl_bps -= float(row["entry_slippage_bps"] or 0.0)
+                        pnl_bps -= float(risk.get("taker_fee_bps_per_leg", 0.0))
+                        pnl_bps -= float(risk.get("slippage_bps_per_leg", 0.0))
+                    now = utc_now()
+                    observed_at = (
+                        latest.get("observed_at")
+                        or latest.get("seen_at")
+                        or latest.get("last_checked_at")
+                        or now
+                    )
+                    data_source = latest.get("data_source")
+                    source_provider = (
+                        data_source.get("provider") if isinstance(data_source, dict) else data_source
+                    )
+                    price_source = (
+                        latest.get("price_source")
+                        or source_provider
+                        or latest.get("venue")
+                        or "scanner"
+                    )
+                    conn.execute(
+                        """
+                        update paper_trades
+                        set closed_at = ?, exit = ?, pnl_bps = ?, status = 'closed',
+                            target_close_at = ?, close_observed_at = ?,
+                            close_measurement_status = ?, close_price_source = ?,
+                            close_reason = ?
+                        where id = ?
+                        """,
+                        (
+                            now,
+                            exit_px,
+                            round(pnl_bps, 3),
+                            now,
+                            observed_at,
+                            "forced_local_confirmation_flip",
+                            price_source,
+                            alignment.get("exit_reason"),
+                            row["id"],
+                        ),
+                    )
+                    closed.append(
+                        {
+                            "id": row["id"],
+                            "inst_id": row["inst_id"],
+                            "direction": row["direction"],
+                            "pnl_bps": round(pnl_bps, 3),
+                            "measurement_status": "forced_local_confirmation_flip",
+                            "hold_minutes": 0,
+                            "forced_exit": True,
+                            "exit_reason": alignment.get("exit_reason"),
+                            "alignment_guard": alignment,
+                        }
+                    )
+                    continue
         if row["selected_hold_minutes"]:
             selected_hold_minutes = int(row["selected_hold_minutes"])
             try:
