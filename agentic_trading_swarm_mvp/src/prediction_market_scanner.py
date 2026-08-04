@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import math
 import pathlib
+import re
 import urllib.parse
 import urllib.request
 
@@ -99,13 +100,26 @@ def _event_tag_details(row: dict) -> dict:
         "macro": ("fed", "inflation", "rate", "cpi", "gdp", "jobs", "unemployment"),
         "earnings_company": ("earnings", "revenue", "profit", "ipo", "stock", "company", "tesla", "nvidia"),
         "regulation": ("sec", "lawsuit", "ban", "approve", "approval", "regulation", "court", "tariff"),
-        "sports": ("nba", "nfl", "mlb", "soccer", "champion", "game"),
+        "sports": (
+            "nba",
+            "nfl",
+            "mlb",
+            "soccer",
+            "football",
+            "champion",
+            "game",
+            "world cup",
+            "fifa",
+            "uefa",
+            "tournament",
+            "premier league",
+        ),
         "crypto": ("bitcoin", "btc", "ethereum", "eth", "crypto", "solana"),
         "geopolitics": ("war", "ceasefire", "china", "taiwan", "ukraine", "israel"),
         "weather": ("hurricane", "temperature", "weather", "rain", "storm"),
         "regional": ("africa", "nigeria", "south africa", "brazil", "mexico", "argentina", "indonesia"),
     }.items():
-        if any(term in text for term in terms):
+        if any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) for term in terms):
             tags.append(tag)
     if not tags:
         return {"tags": ["uncategorized"], "confidence": 0.25}
@@ -277,12 +291,17 @@ def _kalshi_orderbook(ticker: object) -> dict:
             f"https://external-api.kalshi.com/trade-api/v2/markets/{urllib.parse.quote(str(ticker))}/orderbook",
             timeout=8,
         )
-        body = row.get("orderbook") or row.get("market_orderbook") or row
-        yes = body.get("yes") or body.get("yes_bids") or []
-        no = body.get("no") or body.get("no_bids") or []
+        body = row.get("orderbook_fp") or row.get("orderbook") or row.get("market_orderbook") or row
+        yes = body.get("yes_dollars") or body.get("yes") or body.get("yes_bids") or []
+        no = body.get("no_dollars") or body.get("no") or body.get("no_bids") or []
+        price_scale = 1.0 if body.get("yes_dollars") is not None or body.get("no_dollars") is not None else 0.01
         return {
             "orderbook_status": "verified" if yes or no else "empty",
-            "orderbook_depth_usd": round(_book_depth_from_levels(yes, price_scale=0.01) + _book_depth_from_levels(no, price_scale=0.01), 3),
+            "orderbook_depth_usd": round(
+                _book_depth_from_levels(yes, price_scale=price_scale)
+                + _book_depth_from_levels(no, price_scale=price_scale),
+                3,
+            ),
             "orderbook_source": "Kalshi public market orderbook",
         }
     except Exception as exc:  # noqa: BLE001
@@ -470,20 +489,67 @@ def polymarket_candidates(settings: dict, limit: int) -> list[dict]:
     return candidates
 
 
-def _kalshi_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> dict | None:
-    close_time = row.get("close_time")
-    yes_bid = as_float(row.get("yes_bid"), 0.0) / 100.0
-    yes_ask = as_float(row.get("yes_ask"), 0.0) / 100.0
-    no_bid = as_float(row.get("no_bid"), 0.0) / 100.0
-    no_ask = as_float(row.get("no_ask"), 0.0) / 100.0
-    last = as_float(row.get("last_price"), 0.0) / 100.0
+def _kalshi_probability(row: dict, cents_key: str, dollars_key: str) -> float:
+    if row.get(dollars_key) not in (None, ""):
+        return as_float(row.get(dollars_key), 0.0)
+    return as_float(row.get(cents_key), 0.0) / 100.0
+
+
+def _kalshi_amount(row: dict, *keys: str) -> float:
+    for key in keys:
+        if row.get(key) not in (None, ""):
+            return as_float(row.get(key), 0.0)
+    return 0.0
+
+
+def _kalshi_quote(row: dict) -> dict:
+    yes_bid = _kalshi_probability(row, "yes_bid", "yes_bid_dollars")
+    yes_ask = _kalshi_probability(row, "yes_ask", "yes_ask_dollars")
+    no_bid = _kalshi_probability(row, "no_bid", "no_bid_dollars")
+    no_ask = _kalshi_probability(row, "no_ask", "no_ask_dollars")
+    last = _kalshi_probability(row, "last_price", "last_price_dollars")
     if last <= 0 and yes_bid > 0 and yes_ask > 0:
         last = (yes_bid + yes_ask) / 2.0
-    if last <= 0:
+    return {
+        "yes_bid": yes_bid,
+        "yes_ask": yes_ask,
+        "no_bid": no_bid,
+        "no_ask": no_ask,
+        "last": last,
+        "volume": _kalshi_amount(row, "volume_24h_fp", "volume_24h", "volume_fp", "volume"),
+        "open_interest": _kalshi_amount(row, "open_interest_fp", "open_interest"),
+        "liquidity": _kalshi_amount(row, "liquidity_dollars", "liquidity"),
+    }
+
+
+def _kalshi_reject_reason(row: dict, quote: dict) -> str | None:
+    status = str(row.get("status") or row.get("settlement_status") or "").strip().lower()
+    if status and status not in {"active", "open", "initialized"}:
+        return "inactive_status"
+    if not row.get("close_time"):
+        return "missing_end_date"
+    if quote["last"] <= 0:
+        return "missing_price"
+    has_two_sided_quote = quote["yes_bid"] > 0 and quote["yes_ask"] > 0
+    if max(quote["volume"], quote["open_interest"], quote["liquidity"]) <= 0 and not has_two_sided_quote:
+        return "zero_liquidity"
+    return None
+
+
+def _kalshi_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> dict | None:
+    close_time = row.get("close_time")
+    quote = _kalshi_quote(row)
+    if _kalshi_reject_reason(row, quote):
         return None
+    yes_bid = quote["yes_bid"]
+    yes_ask = quote["yes_ask"]
+    no_bid = quote["no_bid"]
+    no_ask = quote["no_ask"]
+    last = quote["last"]
     spread_bps = (yes_ask - yes_bid) * 10_000.0 if yes_ask > yes_bid > 0 else 500.0
-    volume = as_float(row.get("volume_24h") or row.get("volume"))
-    open_interest = as_float(row.get("open_interest"))
+    volume = quote["volume"]
+    open_interest = quote["open_interest"]
+    liquidity = quote["liquidity"]
     tag_details = _event_tag_details(row)
     metadata = {
         "provider": "Kalshi public API",
@@ -497,6 +563,10 @@ def _kalshi_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> di
         "no_ask": no_ask if no_ask > 0 else None,
         "settlement_status": row.get("settlement_status") or row.get("status"),
         "open_interest": open_interest,
+        "reported_liquidity": liquidity,
+        "kalshi_price_schema": "dollars_fixed_point"
+        if any(str(key).endswith(("_dollars", "_fp")) for key in row)
+        else "legacy_cents",
         "event_tags": tag_details["tags"],
         "event_tag_confidence": tag_details["confidence"],
         **orderbook,
@@ -507,7 +577,7 @@ def _kalshi_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> di
         row.get("title") or row.get("ticker") or "Kalshi market",
         last,
         "buy_yes_event",
-        open_interest,
+        max(open_interest, liquidity),
         volume,
         spread_bps,
         as_float(row.get("price_delta_24h"), 0.0),
@@ -517,17 +587,46 @@ def _kalshi_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> di
 
 
 def _kalshi_candidates(settings: dict, limit: int) -> tuple[list[dict], dict]:
-    limit = min(int(limit), int(settings.get("prediction_market_scanner", {}).get("kalshi_market_cap", 50)))
-    url = "https://external-api.kalshi.com/trade-api/v2/markets?" + urllib.parse.urlencode({"limit": str(limit)})
-    data = fetch_json(url)
+    scanner_cfg = settings.get("prediction_market_scanner", {})
+    limit = min(int(limit), int(scanner_cfg.get("kalshi_market_cap", 50)))
+    max_pages = max(1, min(5, int(scanner_cfg.get("kalshi_fetch_pages", 3))))
+    page_size = max(100, limit)
+    rows = []
+    cursor = None
+    fetched_pages = 0
+    seen_tickers = set()
+    for _page in range(max_pages):
+        params = {"limit": str(page_size), "status": "open", "mve_filter": "exclude"}
+        if cursor:
+            params["cursor"] = cursor
+        data = fetch_json("https://external-api.kalshi.com/trade-api/v2/markets?" + urllib.parse.urlencode(params))
+        fetched_pages += 1
+        for row in data.get("markets", []):
+            ticker = str(row.get("ticker") or "")
+            if ticker and ticker in seen_tickers:
+                continue
+            if ticker:
+                seen_tickers.add(ticker)
+            rows.append(row)
+        cursor = data.get("cursor")
+        accepted_quotes = sum(_kalshi_reject_reason(row, _kalshi_quote(row)) is None for row in rows)
+        if not cursor or accepted_quotes >= limit:
+            break
     preliminary = []
     expired_filtered = 0
+    reject_reasons: collections.Counter[str] = collections.Counter()
     enrich_top = int(settings.get("prediction_market_scanner", {}).get("orderbook_enrichment_top", 10))
     row_by_id = {}
-    for row in data.get("markets", []):
+    for row in rows:
         close_time = row.get("close_time")
         if _end_date_bucket(close_time) == "expired_or_resolution_pending":
             expired_filtered += 1
+            reject_reasons["expired_or_resolution_pending"] += 1
+            continue
+        quote = _kalshi_quote(row)
+        reject_reason = _kalshi_reject_reason(row, quote)
+        if reject_reason:
+            reject_reasons[reject_reason] += 1
             continue
         candidate = _kalshi_candidate_from_row(row, settings, {"orderbook_status": "not_selected_for_depth"})
         if candidate:
@@ -541,6 +640,7 @@ def _kalshi_candidates(settings: dict, limit: int) -> tuple[list[dict], dict]:
         ),
         reverse=True,
     )
+    preliminary = preliminary[:limit]
     enriched_ids = {row["inst_id"] for row in preliminary[:enrich_top]}
     candidates = []
     for candidate in preliminary:
@@ -553,10 +653,15 @@ def _kalshi_candidates(settings: dict, limit: int) -> tuple[list[dict], dict]:
             candidates.append(rebuilt)
     return candidates, {
         "provider": "KALSHI",
-        "fetched_count": len(data.get("markets", [])),
+        "fetched_count": len(rows),
+        "fetched_pages": fetched_pages,
         "expired_filtered_count": expired_filtered,
+        "rejected_count": sum(reject_reasons.values()),
+        "reject_reason_counts": dict(reject_reasons),
+        "eligible_quote_count": len(preliminary),
         "candidate_count": len(candidates),
         "orderbook_enrichment_top": enrich_top,
+        "multivariate_filter": "exclude",
     }
 
 
@@ -751,10 +856,15 @@ def summarize(candidates: list[dict], scan_metadata: dict | None = None) -> dict
     }
     provider_status = scan_metadata.get("provider_status", [])
     expired_filtered_count = sum(int(item.get("expired_filtered_count") or 0) for item in provider_status)
+    provider_reject_reasons: collections.Counter[str] = collections.Counter()
+    for item in provider_status:
+        provider_reject_reasons.update(item.get("reject_reason_counts") or {})
     return {
         "candidate_count": len(candidates),
         "expired_filtered_count": expired_filtered_count,
         "provider_status": provider_status,
+        "provider_rejected_count": sum(provider_reject_reasons.values()),
+        "provider_reject_reason_counts": dict(provider_reject_reasons),
         "by_venue": dict(by_venue),
         "by_route_status": dict(by_route),
         "by_orderbook_status": dict(by_orderbook),

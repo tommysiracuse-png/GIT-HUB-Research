@@ -124,9 +124,10 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
     recent_dollar_volume = sum(price * volume for price, volume in pairs[-27:])
     liq = liquidity_score(recent_dollar_volume)
     spread = estimated_spread_bps(liq)
+    decision_time = dt.datetime.now(dt.timezone.utc)
     last_ts = timestamps[-1] if timestamps else int(time.time())
     last_seen = dt.datetime.fromtimestamp(last_ts, tz=dt.timezone.utc)
-    stale_minutes = (dt.datetime.now(dt.timezone.utc) - last_seen).total_seconds() / 60.0
+    stale_minutes = (decision_time - last_seen).total_seconds() / 60.0
 
     direction = "long_proxy" if ret_1d_bps >= 0 else "short_proxy"
     abs_signal = abs(ret_1d_bps) * 0.11 + abs(ret_short_bps) * 0.16
@@ -137,7 +138,7 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
         score = min(score, 25.0)
 
     return {
-        "seen_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "seen_at": decision_time.isoformat(),
         "venue": "YAHOO_PROXY",
         "inst_id": item["symbol"],
         "name": item["name"],
@@ -157,6 +158,10 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
         "liquidity_score": round(liq, 3),
         "spread_bps": round(spread, 3),
         "last_bar_utc": last_seen.isoformat(),
+        "source_bar_end_utc": last_seen.isoformat(),
+        "decision_time_utc": decision_time.isoformat(),
+        "provider_age_seconds": round(max(0.0, (decision_time - last_seen).total_seconds()), 3),
+        "entry_price_convention": "decision_time_last_bar_price",
         "stale_minutes": round(stale_minutes, 1),
         "score": score,
         "risk_notes": [

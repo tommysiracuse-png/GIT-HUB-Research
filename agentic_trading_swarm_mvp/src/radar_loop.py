@@ -32,7 +32,7 @@ from global_market_discovery_scanner import build_scan_batch as build_global_mar
 from global_proxy_scanner import build_scan_batch as build_global_proxy_scan_batch
 from hunter_allocation import allocate_candidate_review, write_hunter_allocation_report
 from learning import load_adjustments, stats_snapshot, update_signal_stats
-from llm_bridge import ingest_llm_recommendations, write_llm_state_packet
+from llm_bridge import cross_context_reliability, ingest_llm_recommendations, write_llm_state_packet
 from market_admission import run_market_admission_monitor
 from market_admission_bridge import run_market_admission_bridge
 from llm_swarm_runner import run_once as run_llm_swarm_once
@@ -76,6 +76,7 @@ from storage import (
     record_due_horizon_outcomes,
     save_opportunity,
 )
+from yahoo_counterfactual import run_yahoo_counterfactual_analysis
 
 
 def _auxiliary_runtime_policy(settings: dict) -> dict:
@@ -476,6 +477,8 @@ def run_once(settings: dict) -> dict:
             settings=settings,
         )
         stats = update_signal_stats(conn, settings) if settings["learning"]["enabled"] else {}
+        yahoo_counterfactual = run_yahoo_counterfactual_analysis(conn, settings)
+        reliability_cards = cross_context_reliability(conn)
         strategy_lab_evaluation = evaluate_strategy_lab(conn, settings)
         strategy_lab_report = write_strategy_lab_reports(conn, strategy_lab_generation, strategy_lab_evaluation)
         adjustments = load_adjustments(conn)
@@ -577,6 +580,8 @@ def run_once(settings: dict) -> dict:
         auto_improvement["signal_redesign"] = signal_redesign
         auto_improvement["okx_signal_research"] = okx_signal_research
         auto_improvement["strategy_reliability"] = strategy_reliability
+        auto_improvement["yahoo_counterfactual"] = yahoo_counterfactual
+        auto_improvement["cross_context_reliability"] = reliability_cards
         auto_improvement["strategy_lab"] = strategy_lab_report.get("summary", {})
         auto_improvement["market_admission"] = market_admission.get("summary", {})
         auto_improvement["market_admission_bridge"] = market_admission_bridge.get("summary", {})
@@ -597,6 +602,8 @@ def run_once(settings: dict) -> dict:
             "signal_redesign": signal_redesign,
             "okx_signal_research": okx_signal_research,
             "strategy_reliability": strategy_reliability,
+            "yahoo_counterfactual": yahoo_counterfactual,
+            "cross_context_reliability": reliability_cards,
             "strategy_lab": strategy_lab_report.get("summary", {}),
             "market_admission": market_admission,
             "market_admission_bridge": market_admission_bridge,

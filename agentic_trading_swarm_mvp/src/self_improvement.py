@@ -2738,6 +2738,29 @@ def _report_markdown(report: dict) -> str:
                 f"reasons={item.get('reasons')}"
             )
 
+    yahoo_counterfactual = report.get("yahoo_counterfactual") or {}
+    if yahoo_counterfactual:
+        lines.extend(["", "## Yahoo Proxy Counterfactuals", ""])
+        lines.append(f"- Decision: `{yahoo_counterfactual.get('decision')}`")
+        lines.append(f"- Reliable labels: `{yahoo_counterfactual.get('reliable_label_count', 0)}`")
+        lines.append(f"- Horizon metrics: `{yahoo_counterfactual.get('horizon_metrics', {})}`")
+        lines.append(
+            f"- Direction-flip 60m: "
+            f"`{(yahoo_counterfactual.get('counterfactuals') or {}).get('direction_flip_60m', {})}`"
+        )
+        lines.append(f"- Shadow recommendations: `{yahoo_counterfactual.get('shadow_recommendations', [])}`")
+
+    reliability_cards = report.get("cross_context_reliability") or {}
+    if reliability_cards:
+        lines.extend(["", "## Cross-Context Reliability", ""])
+        lines.append(f"- Contrast cards: `{reliability_cards.get('card_count', 0)}`")
+        lines.append(f"- Guidance: {reliability_cards.get('guidance')}")
+        for item in reliability_cards.get("cards", [])[:6]:
+            lines.append(
+                f"- `{item.get('group_key')}` delta=`{item.get('delta_avg_pnl_bps')}`bps "
+                f"confidence=`{item.get('confidence')}` action=`{item.get('recommended_action')}`"
+            )
+
     lab = report.get("strategy_lab") or {}
     if lab:
         lines.extend(["", "## Strategy Lab", ""])

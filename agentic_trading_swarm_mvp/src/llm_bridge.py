@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import pathlib
 import sqlite3
@@ -355,6 +356,141 @@ def _contextual_stats(conn: sqlite3.Connection) -> list[dict]:
         )
         stats.append(item)
     return stats
+
+
+def _contrast_confidence(sample_count: int) -> str:
+    if sample_count >= 50:
+        return "high"
+    if sample_count >= 20:
+        return "medium"
+    return "early"
+
+
+def _contrast_action(positive_avg: float, negative_avg: float) -> str:
+    if positive_avg > 0 > negative_avg:
+        return "preserve_positive_slice_and_diagnose_negative_slice"
+    if positive_avg > 0 and negative_avg >= 0:
+        return "expand_stronger_slice_in_shadow"
+    return "diagnose_both_prioritizing_worse_slice"
+
+
+def _build_contrast_card(card_type: str, group_key: str, left: dict, right: dict, label_key: str) -> dict | None:
+    left_avg = float(left.get("avg_pnl_bps") or 0.0)
+    right_avg = float(right.get("avg_pnl_bps") or 0.0)
+    positive, negative = (left, right) if left_avg >= right_avg else (right, left)
+    positive_avg = float(positive.get("avg_pnl_bps") or 0.0)
+    negative_avg = float(negative.get("avg_pnl_bps") or 0.0)
+    delta = positive_avg - negative_avg
+    min_count = min(int(positive.get("closed_count") or 0), int(negative.get("closed_count") or 0))
+    if min_count < 5 or delta < 10.0:
+        return None
+    confidence_weight = min(1.0, math.sqrt(min_count / 30.0))
+    return {
+        "card_type": card_type,
+        "group_key": group_key,
+        "positive_slice": {
+            "label": positive.get(label_key),
+            "closed_count": int(positive.get("closed_count") or 0),
+            "avg_pnl_bps": round(positive_avg, 3),
+            "win_rate": round(float(positive.get("win_rate") or 0.0), 3),
+        },
+        "negative_slice": {
+            "label": negative.get(label_key),
+            "closed_count": int(negative.get("closed_count") or 0),
+            "avg_pnl_bps": round(negative_avg, 3),
+            "win_rate": round(float(negative.get("win_rate") or 0.0), 3),
+        },
+        "delta_avg_pnl_bps": round(delta, 3),
+        "delta_win_rate": round(
+            float(positive.get("win_rate") or 0.0) - float(negative.get("win_rate") or 0.0),
+            3,
+        ),
+        "minimum_sample_count": min_count,
+        "confidence": _contrast_confidence(min_count),
+        "recommended_action": _contrast_action(positive_avg, negative_avg),
+        "rank_score": round(delta * confidence_weight, 3),
+        "paper_only": True,
+    }
+
+
+def build_cross_context_reliability_cards(
+    signal_stats: list[dict],
+    contextual_stats: list[dict],
+    max_cards: int = 6,
+) -> dict:
+    candidates = []
+    family_groups: dict[str, list[dict]] = {}
+    for row in signal_stats:
+        signal_key = str(row.get("signal_key") or "")
+        parts = signal_key.split("|")
+        if len(parts) < 4 or parts[0] == "STRATEGY_LAB":
+            continue
+        family_groups.setdefault("|".join(parts[:2]), []).append(dict(row, contrast_label=signal_key))
+    for family, rows in family_groups.items():
+        eligible = [row for row in rows if int(row.get("closed_count") or 0) >= 5]
+        if len(eligible) < 2:
+            continue
+        card = _build_contrast_card(
+            "signal_family",
+            family,
+            min(eligible, key=lambda row: float(row.get("avg_pnl_bps") or 0.0)),
+            max(eligible, key=lambda row: float(row.get("avg_pnl_bps") or 0.0)),
+            "contrast_label",
+        )
+        if card:
+            candidates.append(card)
+
+    context_groups: dict[tuple[str, str], list[dict]] = {}
+    for row in contextual_stats:
+        context_key = str(row.get("context_key") or "")
+        parts = context_key.split("|")
+        if len(parts) < 5 or "=" not in parts[-1] or parts[0] == "STRATEGY_LAB":
+            continue
+        dimension, value = parts[-1].split("=", 1)
+        if value in {"", "unknown", "all"}:
+            continue
+        signal_key = "|".join(parts[:4])
+        context_groups.setdefault((signal_key, dimension), []).append(dict(row, contrast_label=value))
+    for (signal_key, dimension), rows in context_groups.items():
+        eligible = [row for row in rows if int(row.get("closed_count") or 0) >= 5]
+        if len(eligible) < 2:
+            continue
+        card = _build_contrast_card(
+            "within_signal_context",
+            f"{signal_key}|{dimension}",
+            min(eligible, key=lambda row: float(row.get("avg_pnl_bps") or 0.0)),
+            max(eligible, key=lambda row: float(row.get("avg_pnl_bps") or 0.0)),
+            "contrast_label",
+        )
+        if card:
+            candidates.append(card)
+
+    cards = sorted(candidates, key=lambda row: row["rank_score"], reverse=True)[: max(1, int(max_cards))]
+    return {
+        "card_count": len(cards),
+        "max_cards": max(1, int(max_cards)),
+        "minimum_sample_count": 5,
+        "minimum_effect_bps": 10.0,
+        "cards": cards,
+        "guidance": "Use matched contrasts to preserve working slices and diagnose failures; do not infer causality from unmatched aggregate statistics.",
+    }
+
+
+def cross_context_reliability(conn: sqlite3.Connection, max_cards: int = 6) -> dict:
+    context_rows = conn.execute(
+        """
+        select context_key, closed_count, wins, avg_pnl_bps, win_rate, updated_at
+        from contextual_stats
+        where closed_count >= 5
+        order by closed_count desc, abs(avg_pnl_bps) desc
+        limit 750
+        """
+    ).fetchall()
+    return build_cross_context_reliability_cards(
+        _signal_stats(conn),
+        [dict(row) for row in context_rows],
+        max_cards=max_cards,
+    )
 
 
 def _crypto_venue_health_gaps(items: list[dict]) -> list[dict]:
@@ -1067,6 +1203,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     stats = _signal_stats(conn)
     contextual_stats = _contextual_stats(conn)
+    reliability_cards = payload.get("cross_context_reliability") or cross_context_reliability(conn)
     directives = open_hunter_directives(conn)
     tasks = open_tasks(conn)
     experiments = open_experiments(conn)
@@ -1109,6 +1246,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "signal_redesign": _compact_signal_redesign(payload.get("signal_redesign", {})),
         "okx_signal_research": _compact_okx_signal_research(payload.get("okx_signal_research", {})),
         "strategy_reliability": _compact_strategy_reliability(payload.get("strategy_reliability", {})),
+        "yahoo_counterfactual": payload.get("yahoo_counterfactual", {}),
         "strategy_lab": payload.get("strategy_lab") or strategy_lab_summary(conn),
         "market_admission_bridge": payload.get("market_admission_bridge", {}),
         "autonomous_builder": payload.get("autonomous_builder", {}),
@@ -1124,6 +1262,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "recent_closed": payload.get("closed", []),
         "signal_stats": stats[:50],
         "contextual_stats": contextual_stats,
+        "cross_context_reliability": reliability_cards,
         "hunter_directives": directives[:50],
         "growth_experiments": experiments[:50],
         "improvement_tasks": tasks[:50],

@@ -138,6 +138,85 @@ class PredictionMarketScannerTests(unittest.TestCase):
         self.assertEqual(source["settlement_status"], "active")
         self.assertEqual(rows[0]["execution_feasibility"]["status"], "conditional")
 
+    def test_kalshi_current_dollar_schema_and_reject_accounting(self) -> None:
+        old_fetch = prediction.fetch_json
+        old_runs = prediction.RUNS_DIR
+
+        def fake_fetch(url: str, timeout: int = 12):
+            if "gamma-api.polymarket.com/markets?" in url:
+                return []
+            if "markets?" in url:
+                return {
+                    "markets": [
+                        {
+                            "ticker": "KXDOLLARS",
+                            "title": "Will the policy rate fall this year?",
+                            "yes_bid_dollars": "0.42",
+                            "yes_ask_dollars": "0.45",
+                            "no_bid_dollars": "0.55",
+                            "no_ask_dollars": "0.58",
+                            "last_price_dollars": "0.44",
+                            "liquidity_dollars": "2500.50",
+                            "volume_24h_fp": "825.25",
+                            "open_interest_fp": "1400.75",
+                            "close_time": "2026-08-10T00:00:00Z",
+                            "status": "active",
+                        },
+                        {
+                            "ticker": "KXNOPRICE",
+                            "title": "Unquoted multivariate market",
+                            "last_price_dollars": "0.00",
+                            "liquidity_dollars": "0.00",
+                            "close_time": "2026-08-10T00:00:00Z",
+                            "status": "active",
+                        },
+                        {
+                            "ticker": "KXNODATE",
+                            "title": "Missing date market",
+                            "last_price_dollars": "0.52",
+                            "volume_24h_fp": "100",
+                            "status": "active",
+                        },
+                    ]
+                }
+            if "orderbook" in url:
+                return {"orderbook_fp": {"yes_dollars": [["0.42", "100"]], "no_dollars": [["0.55", "80"]]}}
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prediction.fetch_json = fake_fetch
+            prediction.RUNS_DIR = pathlib.Path(tmp)
+            try:
+                batch = prediction.build_scan_batch(settings(), limit=10)
+                report = json.loads((pathlib.Path(tmp) / "prediction_markets_latest.json").read_text())
+            finally:
+                prediction.fetch_json = old_fetch
+                prediction.RUNS_DIR = old_runs
+
+        self.assertEqual([row["inst_id"] for row in batch.candidates], ["kalshi:KXDOLLARS"])
+        source = batch.candidates[0]["data_source"]
+        self.assertEqual(source["yes_bid"], 0.42)
+        self.assertEqual(source["yes_ask"], 0.45)
+        self.assertEqual(source["kalshi_price_schema"], "dollars_fixed_point")
+        self.assertEqual(source["orderbook_status"], "verified")
+        self.assertEqual(
+            report["summary"]["provider_reject_reason_counts"],
+            {"missing_price": 1, "missing_end_date": 1},
+        )
+        kalshi_status = next(item for item in report["summary"]["provider_status"] if item["provider"] == "KALSHI")
+        self.assertEqual(kalshi_status["multivariate_filter"], "exclude")
+        self.assertEqual(kalshi_status["fetched_pages"], 1)
+
+    def test_event_tags_use_token_boundaries_and_world_cup_phrases(self) -> None:
+        netherlands = prediction._event_tag_details(
+            {"title": "Will the Netherlands win the FIFA World Cup tournament?"}
+        )
+        ethereum = prediction._event_tag_details({"title": "Will ETH outperform Bitcoin?"})
+
+        self.assertIn("sports", netherlands["tags"])
+        self.assertNotIn("crypto", netherlands["tags"])
+        self.assertIn("crypto", ethereum["tags"])
+
     def test_polymarket_expired_markets_filtered_and_event_review_queue_reported(self) -> None:
         old_fetch = prediction.fetch_json
         old_runs = prediction.RUNS_DIR
