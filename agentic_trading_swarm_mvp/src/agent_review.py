@@ -291,6 +291,8 @@ def review_candidate(
     confidence += max(min(adjustment / 100.0, 0.08), -0.08)
     if hard_blocks:
         confidence -= 0.2
+    if paper_route_eligibility.get("route_status") == "unknown":
+        confidence = min(confidence, 0.4)
     confidence = round(max(0.0, min(0.95, confidence)), 3)
 
     return {
@@ -309,6 +311,13 @@ def review_candidate(
         "route_id": route_id,
         "effective_route_id": route_alternative.get("route_id") if route_alternative_usable else route_id,
         "route_status": route_status,
+        "route_intelligence_status": paper_route_eligibility.get("route_status"),
+        "candidate_status": paper_route_eligibility.get("candidate_status"),
+        "required_capabilities": paper_route_eligibility.get("required_capabilities", []),
+        "blocking_reason": paper_route_eligibility.get("blocking_reason"),
+        "paper_route_notes": paper_route_eligibility.get("paper_route_notes", []),
+        "rank_contribution_cap": paper_route_eligibility.get("rank_contribution_cap"),
+        "rank_contribution": paper_route_eligibility.get("rank_contribution"),
         "missing_requirements": missing_requirements,
         "direct_missing_requirements": missing_requirements if route_alternative_usable else [],
         "route_alternative": route_alternative if route_alternative_usable else {},

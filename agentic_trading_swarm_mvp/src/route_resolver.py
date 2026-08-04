@@ -46,6 +46,7 @@ ROUTE_STATUSES = {
     "paper_observation_only",
 }
 PAPER_ROUTE_ASSUMPTION_SCORE_MULTIPLIER = 0.20
+PAPER_ROUTE_UNKNOWN_RANK_CAP = 0.20
 
 VENUE_CAPABILITY_ALIASES = {
     "supports_spot_short": ("spot_short_supported", "supports_spot_short_margin"),
@@ -54,6 +55,8 @@ VENUE_CAPABILITY_ALIASES = {
     "supports_basis_path": ("supports_basis_carry", "synthetic_carry_supported"),
     "supports_spot_long": ("spot_supported", "supports_spot"),
     "supports_perpetuals": ("perp_supported", "perp_available"),
+    "supports_transfers": ("transfer_supported", "cross_venue_transfer_supported"),
+    "supports_hedge_mode": ("hedge_mode_supported", "dual_side_position_supported"),
 }
 
 
@@ -561,6 +564,9 @@ def _enforce_venue_capability_contract(
     *,
     spot_short_required: bool,
     hedged_structure_required: bool,
+    margin_required: bool,
+    transfer_required: bool,
+    hedge_mode_required: bool,
     missing: list[str],
     reasons: list[str],
 ) -> list[dict[str, object]]:
@@ -573,7 +579,15 @@ def _enforce_venue_capability_contract(
     """
 
     checks: list[dict[str, object]] = []
-    capability_confirmation_required = spot_short_required or hedged_structure_required
+    capability_confirmation_required = any(
+        (
+            spot_short_required,
+            hedged_structure_required,
+            margin_required,
+            transfer_required,
+            hedge_mode_required,
+        )
+    )
     if not capability_confirmation_required:
         return checks
 
@@ -584,13 +598,43 @@ def _enforce_venue_capability_contract(
             "venue_capabilities",
             "venue_capability_metadata_missing",
         )
-        checks.append(
+        expected_capabilities: list[tuple[str, str]] = []
+        if spot_short_required:
+            expected_capabilities.extend(
+                (
+                    ("venue_capabilities.spot_short", "supports_spot_short"),
+                    ("venue_capabilities.margin", "supports_margin_spot"),
+                    ("venue_capabilities.borrow_check", "supports_borrow_check"),
+                )
+            )
+        elif margin_required:
+            expected_capabilities.append(
+                ("venue_capabilities.margin", "supports_margin_spot")
+            )
+        if hedged_structure_required:
+            expected_capabilities.extend(
+                (
+                    ("venue_capabilities.basis_path", "supports_basis_path"),
+                    ("venue_capabilities.perp", "supports_perpetuals"),
+                    ("venue_capabilities.spot", "supports_spot_long"),
+                )
+            )
+        if transfer_required:
+            expected_capabilities.append(
+                ("venue_capabilities.transfers", "supports_transfers")
+            )
+        if hedge_mode_required:
+            expected_capabilities.append(
+                ("venue_capabilities.hedge_mode", "supports_hedge_mode")
+            )
+        checks.extend(
             {
-                "requirement": "venue_capabilities",
-                "capability": None,
+                "requirement": requirement,
+                "capability": capability,
                 "state": "unknown",
                 "reason": "venue_capability_metadata_missing",
             }
+            for requirement, capability in dict.fromkeys(expected_capabilities)
         )
         return checks
 
@@ -671,6 +715,45 @@ def _enforce_venue_capability_contract(
             )
             if supported is not True:
                 _append_route_gap(missing, reasons, prerequisite, reason)
+
+    extra_checks = (
+        (
+            margin_required and not spot_short_required,
+            ("supports_margin_spot", "margin_supported", "supports_margin"),
+            "venue_capabilities.margin",
+            "supports_margin_spot",
+            "venue_margin_capability_unconfirmed",
+        ),
+        (
+            transfer_required,
+            ("supports_transfers", "transfer_supported", "cross_venue_transfer_supported"),
+            "venue_capabilities.transfers",
+            "supports_transfers",
+            "venue_transfer_capability_unconfirmed",
+        ),
+        (
+            hedge_mode_required,
+            ("supports_hedge_mode", "hedge_mode_supported", "dual_side_position_supported"),
+            "venue_capabilities.hedge_mode",
+            "supports_hedge_mode",
+            "venue_hedge_mode_capability_unconfirmed",
+        ),
+    )
+    for required, aliases, prerequisite, capability, reason in extra_checks:
+        if not required:
+            continue
+        supported = _route_capability_bool(capabilities, *aliases)
+        state = "supported" if supported is True else "unsupported" if supported is False else "unknown"
+        checks.append(
+            {
+                "requirement": prerequisite,
+                "capability": capability,
+                "state": state,
+                "reason": None if supported is True else reason,
+            }
+        )
+        if supported is not True:
+            _append_route_gap(missing, reasons, prerequisite, reason)
     return checks
 
 
@@ -798,6 +881,37 @@ def _hedged_structure_dependency(candidate: dict) -> bool:
     )
     return requires_hedge is True or any(
         token in descriptor for token in ("basis", "funding", "carry", "hedge_offset")
+    )
+
+
+def _route_dependency_flag(candidate: dict, *keys: str) -> bool:
+    return _eligibility_bool(_eligibility_value(candidate, *keys)) is True
+
+
+def _transfer_dependency(candidate: dict, *, hedged_structure_required: bool) -> bool:
+    if _route_dependency_flag(
+        candidate,
+        "transfer_required",
+        "requires_transfer",
+        "cross_venue_transfer_required",
+    ):
+        return True
+    descriptor = " ".join(
+        _paper_gate_text(_eligibility_value(candidate, key))
+        for key in ("route_type", "strategy", "strategy_profile", "signal_key", "tags")
+    )
+    prefunded = _eligibility_bool(
+        _eligibility_value(candidate, "legs_prefunded", "prefunded_inventory")
+    )
+    return hedged_structure_required and "cross_venue" in descriptor and prefunded is not True
+
+
+def _hedge_mode_dependency(candidate: dict) -> bool:
+    return _route_dependency_flag(
+        candidate,
+        "hedge_mode_required",
+        "requires_hedge_mode",
+        "dual_side_position_required",
     )
 
 
@@ -951,6 +1065,13 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
             break
     spot_short_required = _spot_short_dependency(item)
     hedged_structure_required = _hedged_structure_dependency(item)
+    margin_required = spot_short_required or _route_dependency_flag(
+        item, "margin_required", "requires_margin", "margin_permission_required"
+    )
+    transfer_required = _transfer_dependency(
+        item, hedged_structure_required=hedged_structure_required
+    )
+    hedge_mode_required = _hedge_mode_dependency(item)
     venue_capabilities = _venue_capability_metadata(item)
     missing: list[str] = []
     reasons: list[str] = []
@@ -1138,6 +1259,9 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         venue_capabilities,
         spot_short_required=spot_short_required,
         hedged_structure_required=hedged_structure_required,
+        margin_required=margin_required,
+        transfer_required=transfer_required,
+        hedge_mode_required=hedge_mode_required,
         missing=missing,
         reasons=reasons,
     )
@@ -1185,10 +1309,18 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
             "margin_eligible",
             "venue_capabilities.spot_short",
             "venue_capabilities.margin",
-            "venue_capabilities.borrow",
+            "venue_capabilities.borrow_check",
         }
         missing = [value for value in missing if value not in direct_short_prerequisites]
         reasons = [value for value in reasons if value not in direct_short_reasons]
+        for check in capability_checks:
+            if check.get("capability") in {
+                "supports_spot_short",
+                "supports_margin_spot",
+                "supports_borrow_check",
+            }:
+                check["critical"] = False
+                check["replaced_by_proxy"] = str(legacy_proxy_id)
         decision = "blocked_hard" if reasons else "executable_proxy"
         proxy_used = True
     else:
@@ -1214,13 +1346,81 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
     applies = bool(
         spot_short_required
         or hedged_structure_required
+        or margin_required
+        or transfer_required
+        or hedge_mode_required
         or (expected_edge_bps is not None and cost_breakdown)
+    )
+    capability_states = {
+        str(check.get("state") or "unknown")
+        for check in capability_checks
+        if check.get("critical", True)
+    }
+    if "unsupported" in capability_states:
+        route_intelligence_status = "unsupported"
+        candidate_status = "quarantined_route_unavailable"
+    elif reasons or "unknown" in capability_states:
+        route_intelligence_status = "unknown"
+        candidate_status = "route_needs_confirmation"
+    elif applies:
+        route_intelligence_status = "supported"
+        candidate_status = "route_supported"
+    else:
+        route_intelligence_status = "not_applicable"
+        candidate_status = str(item.get("candidate_status") or "route_not_required")
+    blocking_reasons = list(dict.fromkeys(reasons))
+    unsupported_reasons = [
+        str(check.get("reason"))
+        for check in capability_checks
+        if check.get("state") == "unsupported" and check.get("reason")
+    ]
+    blocking_reason = (
+        unsupported_reasons[0]
+        if unsupported_reasons
+        else blocking_reasons[0]
+        if blocking_reasons
+        else None
+    )
+    if route_intelligence_status == "unsupported":
+        paper_route_notes = [
+            "Critical route capability is explicitly unsupported; candidate is quarantined from promotion.",
+        ]
+    elif route_intelligence_status == "unknown":
+        paper_route_notes = [
+            "Critical route evidence is unknown; keep the candidate paper-only and confirmation-gated.",
+        ]
+    elif route_intelligence_status == "supported":
+        paper_route_notes = [
+            "All inferred critical route capabilities are explicitly supported for paper scoring.",
+        ]
+    else:
+        paper_route_notes = ["No route-dependent capability gate applies."]
+    paper_route_notes.extend(
+        f"{check['capability']}={check['state']}"
+        for check in capability_checks
+        if check.get("capability")
+    )
+    rank_contribution_cap = (
+        PAPER_ROUTE_UNKNOWN_RANK_CAP
+        if route_intelligence_status == "unknown"
+        else 0.0
+        if route_intelligence_status == "unsupported"
+        else 1.0
+    )
+    raw_score = _eligibility_number(item, "score")
+    rank_contribution = (
+        None
+        if raw_score is None
+        else round(max(0.0, raw_score) * rank_contribution_cap, 6)
     )
     return {
         "paper_only": True,
         "applies": applies,
         "spot_short_required": spot_short_required,
         "hedged_structure_required": hedged_structure_required,
+        "margin_required": margin_required,
+        "transfer_required": transfer_required,
+        "hedge_mode_required": hedge_mode_required,
         "venue_capability_metadata_present": bool(venue_capabilities),
         "venue_capabilities": venue_capabilities,
         "route_decision": decision,
@@ -1233,13 +1433,19 @@ def evaluate_route_intelligence(candidate: dict) -> dict[str, object]:
         "selected_proxy_id": legacy_proxy_id if proxy_used else None,
         "missing_prerequisites": list(dict.fromkeys(missing)),
         "blocker_reasons": list(dict.fromkeys(reasons)),
+        "blocking_reason": blocking_reason,
         "capability_checks": capability_checks,
         "required_capabilities": [
             str(check["capability"])
             for check in capability_checks
-            if check.get("capability")
+            if check.get("capability") and check.get("critical", True)
         ],
         "simulation_assumptions": simulation_assumptions,
+        "route_status": route_intelligence_status,
+        "candidate_status": candidate_status,
+        "paper_route_notes": paper_route_notes,
+        "rank_contribution_cap": rank_contribution_cap,
+        "rank_contribution": rank_contribution,
         "assumption_penalty_applied": assumption_penalty_applied,
         "paper_score_multiplier": paper_score_multiplier,
         "expected_edge_bps": expected_edge_bps,
@@ -1817,6 +2023,14 @@ def enrich_candidate_with_route(
             "paper_feasibility_status": eligibility["feasibility_status"],
             "execution_eligibility": eligibility["execution_eligibility"],
             "paper_score_multiplier": eligibility["paper_score_multiplier"],
+            "route_intelligence_status": eligibility["route_status"],
+            "candidate_status": eligibility["candidate_status"],
+            "required_capabilities": eligibility["required_capabilities"],
+            "capability_checks": eligibility["capability_checks"],
+            "blocking_reason": eligibility["blocking_reason"],
+            "paper_route_notes": eligibility["paper_route_notes"],
+            "rank_contribution_cap": eligibility["rank_contribution_cap"],
+            "rank_contribution": eligibility["rank_contribution"],
         }
     )
     enriched["execution_feasibility"] = existing
@@ -1830,6 +2044,14 @@ def enrich_candidate_with_route(
     enriched["paper_feasibility_status"] = eligibility["feasibility_status"]
     enriched["execution_eligibility"] = eligibility["execution_eligibility"]
     enriched["paper_route_score_multiplier"] = eligibility["paper_score_multiplier"]
+    enriched["route_intelligence_status"] = eligibility["route_status"]
+    enriched["candidate_status"] = eligibility["candidate_status"]
+    enriched["required_capabilities"] = eligibility["required_capabilities"]
+    enriched["route_capability_checks"] = eligibility["capability_checks"]
+    enriched["blocking_reason"] = eligibility["blocking_reason"]
+    enriched["paper_route_notes"] = eligibility["paper_route_notes"]
+    enriched["rank_contribution_cap"] = eligibility["rank_contribution_cap"]
+    enriched["rank_contribution"] = eligibility["rank_contribution"]
     if eligibility["suppressed"]:
         if "score" in enriched:
             enriched.setdefault("pre_route_eligibility_score", enriched["score"])

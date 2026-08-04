@@ -565,6 +565,13 @@ def _apply_paper_route_eligibility_metadata(candidate: Mapping[str, Any]) -> dic
         )
         annotated.setdefault("execution_eligibility", "blocked")
         annotated.setdefault("paper_route_score_multiplier", 0.0)
+        annotated.setdefault("route_intelligence_status", upstream_verdict.get("route_status"))
+        annotated.setdefault("candidate_status", upstream_verdict.get("candidate_status"))
+        annotated.setdefault("required_capabilities", upstream_verdict.get("required_capabilities", []))
+        annotated.setdefault("blocking_reason", upstream_verdict.get("blocking_reason"))
+        annotated.setdefault("paper_route_notes", upstream_verdict.get("paper_route_notes", []))
+        annotated.setdefault("rank_contribution_cap", upstream_verdict.get("rank_contribution_cap"))
+        annotated.setdefault("rank_contribution", upstream_verdict.get("rank_contribution"))
         return annotated
     try:
         from route_resolver import evaluate_route_intelligence
@@ -589,6 +596,14 @@ def _apply_paper_route_eligibility_metadata(candidate: Mapping[str, Any]) -> dic
     annotated["paper_feasibility_status"] = verdict.get("feasibility_status")
     annotated["execution_eligibility"] = verdict.get("execution_eligibility")
     annotated["paper_route_score_multiplier"] = verdict.get("paper_score_multiplier", 1.0)
+    annotated["route_intelligence_status"] = verdict.get("route_status")
+    annotated["candidate_status"] = verdict.get("candidate_status")
+    annotated["required_capabilities"] = verdict.get("required_capabilities", [])
+    annotated["route_capability_checks"] = verdict.get("capability_checks", [])
+    annotated["blocking_reason"] = verdict.get("blocking_reason")
+    annotated["paper_route_notes"] = verdict.get("paper_route_notes", [])
+    annotated["rank_contribution_cap"] = verdict.get("rank_contribution_cap")
+    annotated["rank_contribution"] = verdict.get("rank_contribution")
     if verdict.get("suppressed"):
         annotated["paper_entry_blocked"] = True
         annotated["promotion_eligible"] = False

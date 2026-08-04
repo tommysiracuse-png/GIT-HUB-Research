@@ -79,6 +79,13 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
             "infeasible_for_paper",
             guarded["paper_feasibility_status"],
         )
+        self.assertEqual("unsupported", guarded["route_intelligence_status"])
+        self.assertEqual(
+            "quarantined_route_unavailable", guarded["candidate_status"]
+        )
+        self.assertEqual(0.0, guarded["rank_contribution_cap"])
+        self.assertTrue(guarded["required_capabilities"])
+        self.assertTrue(guarded["paper_route_notes"])
         self.assertIn(
             "venue_spot_short_capability_unconfirmed",
             guarded["candidate_reject_detail"]["blocker_reasons"],
@@ -104,6 +111,17 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
         self.assertIn(
             "venue_capability_metadata_missing",
             guarded["candidate_reject_detail"]["blocker_reasons"],
+        )
+        self.assertEqual("unknown", guarded["route_intelligence_status"])
+        self.assertEqual("route_needs_confirmation", guarded["candidate_status"])
+        self.assertEqual(0.2, guarded["rank_contribution_cap"])
+        self.assertEqual(
+            {
+                "supports_spot_short",
+                "supports_margin_spot",
+                "supports_borrow_check",
+            },
+            set(guarded["required_capabilities"]),
         )
 
     def test_direct_pretrade_path_blocks_carry_with_unsupported_venue_metadata(self):
