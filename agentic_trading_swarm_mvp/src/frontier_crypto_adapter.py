@@ -14,6 +14,7 @@ try:
         _paper_only_context_evidence_review,
         _paper_only_strategy_scope_review,
         _paper_only_cross_surface_seed_guard_review,
+        _paper_only_yahoo_proxy_crypto_freshness_review,
         _paper_only_family_decay_guard_review,
         _paper_only_parse_timestamp,
         paper_only_shadow_direction_inversion_review,
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
             _paper_only_context_evidence_review,
             _paper_only_strategy_scope_review,
             _paper_only_cross_surface_seed_guard_review,
+            _paper_only_yahoo_proxy_crypto_freshness_review,
             _paper_only_parse_timestamp,
             paper_only_shadow_direction_inversion_review,
             paper_only_route_requirement_profile,
@@ -103,6 +105,21 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "native_proxy_variant": False,
                 "cross_surface_target": False,
                 "policy": "guard_disabled",
+            }
+
+        def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now=None):
+            contribution = record.get("momentum_contribution") if isinstance(record, dict) else None
+            return {
+                "enabled": False,
+                "paper_only": True,
+                "applies": False,
+                "eligible": True,
+                "blocked": False,
+                "reason": "guard_disabled",
+                "gate_reason": None,
+                "gate_reasons": [],
+                "input_momentum_contribution": contribution,
+                "propagated_momentum_contribution": contribution,
             }
 
         def _paper_only_family_decay_guard_review(record, config=None):
@@ -1770,8 +1787,14 @@ def _paper_only_route_requirements_packet(route_status, profile):
             route_viability_score = min(route_viability_score, 0.49)
     if fee_confidence < 0.5:
         route_viability_score = max(0.0, route_viability_score - 0.1)
-    paper_only_route_blocked = bool(carry_alignment_review.get("blocked"))
-    paper_only_block_reason = carry_alignment_review.get("reason") if paper_only_route_blocked else None
+    paper_only_route_blocked = bool(
+        carry_alignment_review.get("blocked") or cross_surface_seed_guard_review.get("blocked")
+    )
+    paper_only_block_reason = None
+    if cross_surface_seed_guard_review.get("blocked"):
+        paper_only_block_reason = cross_surface_seed_guard_review.get("gate_reason") or cross_surface_seed_guard_review.get("reason")
+    elif carry_alignment_review.get("blocked"):
+        paper_only_block_reason = carry_alignment_review.get("reason")
     if paper_only_route_blocked:
         route_complete = False
         if "carry_alignment" not in critical_missing_fields:
@@ -1811,6 +1834,10 @@ def _paper_only_route_requirements_packet(route_status, profile):
         "route_actionability": route_actionability,
         "critical_missing_fields": critical_missing_fields,
         "carry_alignment_review": carry_alignment_review,
+        "yahoo_proxy_crypto_freshness_gate": cross_surface_seed_guard_review.get("freshness_gate"),
+        "propagated_momentum_contribution": cross_surface_seed_guard_review.get(
+            "propagated_momentum_contribution"
+        ),
         "paper_only_route_blocked": paper_only_route_blocked,
         "paper_only_block_reason": paper_only_block_reason,
     }
@@ -1854,6 +1881,13 @@ def _paper_only_annotate_route_intelligence(route_status):
         merged_packet.update(route_packet)
         route_packet = merged_packet
     route_status["route_requirements_packet"] = route_packet
+    yahoo_freshness_gate = route_packet.get("yahoo_proxy_crypto_freshness_gate")
+    if isinstance(yahoo_freshness_gate, dict) and yahoo_freshness_gate.get("applies"):
+        route_status["yahoo_proxy_crypto_freshness_gate"] = yahoo_freshness_gate
+        route_status["propagated_momentum_contribution"] = yahoo_freshness_gate.get(
+            "propagated_momentum_contribution"
+        )
+        route_status["proxy_momentum_gate_reason"] = yahoo_freshness_gate.get("gate_reason")
     if route_packet.get("paper_only_route_blocked"):
         route_status["route_requirement_status"] = "blocked"
         route_status["route_complete"] = False
@@ -1882,6 +1916,8 @@ def _paper_only_annotate_route_intelligence(route_status):
         "route_actionability",
         "critical_missing_fields",
         "carry_alignment_review",
+        "yahoo_proxy_crypto_freshness_gate",
+        "propagated_momentum_contribution",
         "paper_only_route_blocked",
         "paper_only_block_reason",
     ):
@@ -5418,6 +5454,7 @@ DEFAULT_PAPER_ONLY_PROXY_SIGNAL_FRESHNESS_POLICY = {
     "min_mapping_confidence": 0.70,
     "require_monotonic_updates": True,
     "fail_closed_state": "observe_only",
+    "max_destination_proxy_age_ms": 90000.0,
 }
 
 
@@ -5518,6 +5555,29 @@ def _paper_only_is_proxy_market_key(market_key: str | None) -> bool:
     return any(token in normalized for token in DEFAULT_PAPER_ONLY_PROXY_SIGNAL_FRESHNESS_POLICY["market_key_tokens"])
 
 
+def _paper_only_is_crypto_destination(destination: object) -> bool:
+    normalized = str(destination or "").strip().lower().replace("-", "_")
+    return any(
+        token in normalized
+        for token in (
+            "crypto",
+            "frontier",
+            "spot",
+            "perp",
+            "swap",
+            "okx",
+            "bitget",
+            "binance",
+            "valr",
+            "gate",
+            "bybit",
+            "indodax",
+            "bitso",
+            "mercado_bitcoin",
+        )
+    )
+
+
 def _paper_only_float_or_none(value: object) -> float | None:
     try:
         if value in (None, ""):
@@ -5566,6 +5626,49 @@ def _paper_only_timestamp_ms(value: object) -> float | None:
     return numeric
 
 
+def paper_only_yahoo_proxy_crypto_momentum_gate(
+    *,
+    momentum_contribution: float | None = None,
+    source_quote_timestamp: object = None,
+    evaluated_at: object = None,
+    source_session_status: str | None = None,
+    source_session_open: bool | None = None,
+    allow_delayed_mode: bool = False,
+    destination_proxy_age_seconds: float | None = None,
+    max_source_quote_age_seconds: float = 90.0,
+    max_destination_proxy_age_seconds: float = 90.0,
+    execution_mode: str = "paper",
+    destination_surface: str = "crypto",
+    source_family: str = "yahoo_proxy",
+    feature_family: str = "global_proxy_momentum",
+) -> dict:
+    """Return the effective Yahoo momentum contribution for a crypto route.
+
+    This is a paper-policy boundary only.  Live/non-paper inputs are left
+    untouched so this diagnostic helper can never make live execution more
+    reachable.
+    """
+
+    return _paper_only_yahoo_proxy_crypto_freshness_review(
+        {
+            "execution_mode": execution_mode,
+            "source_family": source_family,
+            "feature_family": feature_family,
+            "target_surface": destination_surface,
+            "source_quote_timestamp": source_quote_timestamp,
+            "evaluated_at": evaluated_at,
+            "source_session_status": source_session_status,
+            "source_session_open": source_session_open,
+            "allow_delayed_mode": allow_delayed_mode,
+            "destination_proxy_age_seconds": destination_proxy_age_seconds,
+            "max_source_quote_age_seconds": max_source_quote_age_seconds,
+            "max_destination_proxy_age_seconds": max_destination_proxy_age_seconds,
+            "momentum_contribution": momentum_contribution,
+        },
+        now=evaluated_at,
+    )
+
+
 def paper_only_proxy_signal_freshness_gate(
     *,
     market_key: str | None = None,
@@ -5581,12 +5684,23 @@ def paper_only_proxy_signal_freshness_gate(
     min_mapping_confidence: float | None = None,
     enabled: bool | None = None,
     require_monotonic_updates: bool | None = None,
+    execution_mode: str = "paper",
+    destination_market: object = None,
+    source_session_status: str | None = None,
+    source_session_open: bool | None = None,
+    allow_delayed_mode: bool = False,
+    destination_proxy_age_ms: float | None = None,
+    max_destination_proxy_age_ms: float | None = None,
+    momentum_contribution: float | None = None,
 ) -> dict:
     """Fail-closed paper-only freshness gate for proxy-backed signal contexts."""
 
     policy = DEFAULT_PAPER_ONLY_PROXY_SIGNAL_FRESHNESS_POLICY
     enabled = policy["enabled"] if enabled is None else bool(enabled)
-    applicable = enabled and _paper_only_is_proxy_market_key(market_key)
+    normalized_mode = str(execution_mode or "paper").strip().lower()
+    paper_mode = normalized_mode in {"paper", "paper_only", "simulation", "sim", "review"}
+    applicable = enabled and paper_mode and _paper_only_is_proxy_market_key(market_key)
+    crypto_destination = _paper_only_is_crypto_destination(destination_market)
     threshold_bar_age_ms = float(
         policy["max_bar_age_ms"] if max_bar_age_ms is None else max_bar_age_ms
     )
@@ -5598,6 +5712,11 @@ def paper_only_proxy_signal_freshness_gate(
     )
     threshold_mapping_confidence = float(
         policy["min_mapping_confidence"] if min_mapping_confidence is None else min_mapping_confidence
+    )
+    threshold_destination_proxy_age_ms = float(
+        policy["max_destination_proxy_age_ms"]
+        if max_destination_proxy_age_ms is None
+        else max_destination_proxy_age_ms
     )
     require_monotonic = bool(
         policy["require_monotonic_updates"] if require_monotonic_updates is None else require_monotonic_updates
@@ -5625,6 +5744,14 @@ def paper_only_proxy_signal_freshness_gate(
             "basis_deviation_bps": basis_bps,
             "mapping_confidence": mapping_score,
             "suppressed_signal_count": 0,
+            "paper_only": True,
+            "execution_mode": normalized_mode,
+            "crypto_destination": crypto_destination,
+            "gate_reason": None,
+            "gate_reasons": [],
+            "input_momentum_contribution": _paper_only_float_or_none(momentum_contribution),
+            "propagated_momentum_contribution": _paper_only_float_or_none(momentum_contribution),
+            "momentum_state": "unchanged",
             "state": "eligible",
         }
 
@@ -5661,7 +5788,28 @@ def paper_only_proxy_signal_freshness_gate(
     elif mapping_score < threshold_mapping_confidence:
         fail_closed_reasons.append("mapping_confidence_too_low")
 
+    session_open = source_session_open
+    normalized_session = str(source_session_status or "").strip().lower().replace("-", "_")
+    if session_open is None and normalized_session:
+        if normalized_session in {"open", "regular", "regular_hours", "trading", "active"}:
+            session_open = True
+        elif normalized_session in {"closed", "off_session", "after_hours", "halted", "holiday", "weekend"}:
+            session_open = False
+    destination_age = _paper_only_float_or_none(destination_proxy_age_ms)
+    if crypto_destination:
+        if not (session_open is True or bool(allow_delayed_mode)):
+            fail_closed_reasons.append(
+                "source_session_unknown" if session_open is None else "source_session_closed"
+            )
+        if destination_age is None:
+            destination_age = source_timestamp_lag_ms
+        if destination_age is None:
+            fail_closed_reasons.append("missing_destination_proxy_age")
+        elif destination_age > threshold_destination_proxy_age_ms:
+            fail_closed_reasons.append("stale_destination_proxy")
+
     eligible = not fail_closed_reasons
+    raw_contribution = _paper_only_float_or_none(momentum_contribution)
     return {
         "enabled": enabled,
         "applicable": True,
@@ -5670,6 +5818,8 @@ def paper_only_proxy_signal_freshness_gate(
         "emit_recommendation": eligible,
         "fail_closed_reason": fail_closed_reasons[0] if fail_closed_reasons else None,
         "fail_closed_reasons": fail_closed_reasons,
+        "gate_reason": fail_closed_reasons[0] if fail_closed_reasons else None,
+        "gate_reasons": fail_closed_reasons,
         "proxy_bar_age_ms": round(proxy_bar_age_ms, 3) if proxy_bar_age_ms is not None else None,
         "source_timestamp_lag_ms": round(source_timestamp_lag_ms, 3) if source_timestamp_lag_ms is not None else None,
         "basis_deviation_bps": basis_bps,
@@ -5679,6 +5829,17 @@ def paper_only_proxy_signal_freshness_gate(
         "max_source_lag_ms": threshold_source_lag_ms,
         "max_basis_deviation_bps": threshold_basis_bps,
         "min_mapping_confidence": threshold_mapping_confidence,
+        "paper_only": True,
+        "execution_mode": normalized_mode,
+        "crypto_destination": crypto_destination,
+        "source_session_status": normalized_session or None,
+        "source_session_open": session_open,
+        "delayed_mode_allowed": bool(allow_delayed_mode),
+        "destination_proxy_age_ms": destination_age,
+        "max_destination_proxy_age_ms": threshold_destination_proxy_age_ms,
+        "input_momentum_contribution": raw_contribution,
+        "propagated_momentum_contribution": 0.0 if not eligible else raw_contribution,
+        "momentum_state": "neutral" if not eligible else "propagated",
         "require_monotonic_updates": require_monotonic,
         "monotonic_updates": monotonic_updates,
         "latest_bar_timestamp_ms": latest_bar_timestamp_ms,

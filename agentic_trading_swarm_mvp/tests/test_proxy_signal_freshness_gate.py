@@ -12,6 +12,105 @@ import frontier_crypto_adapter as fca
 
 
 class ProxySignalFreshnessGateTests(unittest.TestCase):
+    def test_stale_yahoo_quote_is_neutralized_before_crypto_propagation(self):
+        gate = fca.paper_only_yahoo_proxy_crypto_momentum_gate(
+            momentum_contribution=0.8,
+            source_quote_timestamp="2026-08-04T14:00:00+00:00",
+            evaluated_at="2026-08-04T14:02:00+00:00",
+            source_session_status="open",
+            destination_proxy_age_seconds=45.0,
+        )
+
+        self.assertTrue(gate["applies"])
+        self.assertTrue(gate["blocked"])
+        self.assertEqual("stale_source_quote", gate["gate_reason"])
+        self.assertEqual("neutral", gate["momentum_state"])
+        self.assertEqual(0.0, gate["propagated_momentum_contribution"])
+
+    def test_closed_session_requires_explicit_delayed_mode(self):
+        common = {
+            "momentum_contribution": -0.55,
+            "source_quote_timestamp": "2026-08-04T14:00:30+00:00",
+            "evaluated_at": "2026-08-04T14:01:00+00:00",
+            "source_session_status": "closed",
+            "destination_proxy_age_seconds": 30.0,
+        }
+
+        blocked = fca.paper_only_yahoo_proxy_crypto_momentum_gate(**common)
+        allowed = fca.paper_only_yahoo_proxy_crypto_momentum_gate(
+            **common,
+            allow_delayed_mode=True,
+        )
+
+        self.assertEqual("source_session_closed", blocked["gate_reason"])
+        self.assertEqual(0.0, blocked["propagated_momentum_contribution"])
+        self.assertTrue(allowed["eligible"])
+        self.assertEqual(-0.55, allowed["propagated_momentum_contribution"])
+
+    def test_stale_destination_proxy_is_neutral_even_with_fresh_open_source(self):
+        gate = fca.paper_only_yahoo_proxy_crypto_momentum_gate(
+            momentum_contribution=0.4,
+            source_quote_timestamp="2026-08-04T14:00:45+00:00",
+            evaluated_at="2026-08-04T14:01:00+00:00",
+            source_session_open=True,
+            destination_proxy_age_seconds=91.0,
+        )
+
+        self.assertEqual("stale_destination_proxy", gate["gate_reason"])
+        self.assertEqual(0.0, gate["propagated_momentum_contribution"])
+
+    def test_gate_is_not_applied_to_live_mode(self):
+        gate = fca.paper_only_yahoo_proxy_crypto_momentum_gate(
+            momentum_contribution=0.7,
+            execution_mode="live",
+            source_session_status="closed",
+        )
+
+        self.assertFalse(gate["applies"])
+        self.assertFalse(gate["blocked"])
+        self.assertEqual("non_paper_mode", gate["reason"])
+        self.assertEqual(0.7, gate["propagated_momentum_contribution"])
+
+    def test_crypto_extension_of_existing_gate_records_session_reason(self):
+        gate = fca.paper_only_proxy_signal_freshness_gate(
+            market_key="YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM",
+            latest_bar_timestamp="2026-08-04T14:00:30+00:00",
+            previous_bar_timestamp="2026-08-04T13:59:30+00:00",
+            scheduler_timestamp="2026-08-04T14:01:00+00:00",
+            source_timestamp="2026-08-04T14:00:45+00:00",
+            basis_deviation_bps=5.0,
+            mapping_confidence=0.9,
+            destination_market="OKX crypto perp",
+            source_session_status="closed",
+            destination_proxy_age_ms=30_000.0,
+            momentum_contribution=0.6,
+        )
+
+        self.assertIn("source_session_closed", gate["gate_reasons"])
+        self.assertEqual(0.0, gate["propagated_momentum_contribution"])
+        self.assertEqual("neutral", gate["momentum_state"])
+
+    def test_route_annotation_overwrites_stale_propagated_contribution(self):
+        route = {
+            "execution_mode": "paper",
+            "source_family": "yahoo_proxy",
+            "feature_family": "global_proxy_momentum",
+            "target_surface": "frontier_perp",
+            "venue": "OKX",
+            "source_quote_timestamp": "2026-08-04T14:00:00+00:00",
+            "evaluated_at": "2026-08-04T14:02:00+00:00",
+            "source_session_status": "open",
+            "destination_proxy_age_seconds": 120.0,
+            "momentum_contribution": 0.9,
+            "propagated_momentum_contribution": 0.9,
+        }
+
+        annotated = fca._paper_only_annotate_route_intelligence(route)
+
+        self.assertEqual(0.0, annotated["propagated_momentum_contribution"])
+        self.assertEqual("stale_source_quote", annotated["proxy_momentum_gate_reason"])
+        self.assertTrue(annotated["paper_only_route_blocked"])
+
     def test_stale_proxy_bar_suppresses_yahoo_proxy_context(self):
         gate = fca.paper_only_proxy_signal_freshness_gate(
             market_key="YAHOO_PROXY_GLOBAL_PROXY_MOMENTUM",

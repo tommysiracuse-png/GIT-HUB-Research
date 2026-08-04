@@ -579,6 +579,288 @@ def _paper_only_promotion_context_guard_review(record, profile=None):
     return {"allowed": True, "reason": "paper_promotion_context_ok", "checks": checks}
 
 
+_PAPER_ONLY_YAHOO_CRYPTO_FRESHNESS_POLICY = {
+    "max_source_quote_age_seconds": 90.0,
+    "max_destination_proxy_age_seconds": 90.0,
+}
+
+_PAPER_ONLY_CRYPTO_ROUTE_TOKENS = frozenset(
+    {
+        "crypto",
+        "frontier",
+        "spot",
+        "perp",
+        "perpetual",
+        "swap",
+        "okx",
+        "bitget",
+        "binance_us",
+        "valr",
+        "gate",
+        "bybit",
+        "indodax",
+        "bitso",
+        "mercado_bitcoin",
+        "mercadobitcoin",
+    }
+)
+
+
+def _paper_only_yahoo_proxy_crypto_freshness_review(record, profile=None, *, now=None):
+    """Gate Yahoo momentum before it contributes to a paper crypto route.
+
+    The review is deliberately fail-closed for in-scope paper routes.  It does
+    not alter non-paper contexts, and it keeps the rejected contribution in
+    the diagnostic packet while publishing a neutral effective contribution.
+    """
+
+    containers = [item for item in (record, profile) if isinstance(item, dict)]
+
+    def _lookup(*keys):
+        for container in containers:
+            value = _paper_only_route_intelligence_first(container, keys)
+            if value not in (None, "", [], {}, ()):
+                return value
+            for nested_key in (
+                "source_context",
+                "lineage_context",
+                "recommendation_lineage",
+                "proxy_context",
+                "route_context",
+            ):
+                nested = container.get(nested_key)
+                if not isinstance(nested, dict):
+                    continue
+                value = _paper_only_route_intelligence_first(nested, keys)
+                if value not in (None, "", [], {}, ()):
+                    return value
+        return None
+
+    def _bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        token = _paper_only_route_intelligence_tag(value)
+        if token in {"1", "true", "yes", "on", "open", "allowed", "enabled"}:
+            return True
+        if token in {"0", "false", "no", "off", "closed", "denied", "disabled"}:
+            return False
+        return None
+
+    def _float(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if math.isfinite(numeric) else None
+
+    scope_tokens = set()
+    for container in containers:
+        for key in (
+            "source_family",
+            "data_source_family",
+            "observation_source_family",
+            "feature_family",
+            "signal_family",
+            "feature_set_family",
+            "market_key",
+            "signal_key",
+            "candidate_family",
+            "strategy_family",
+            "trade_type",
+            "origin_surface",
+            "source_surface",
+            "target_surface",
+            "candidate_surface",
+            "execution_surface",
+            "market_surface",
+            "market_type",
+            "asset_class",
+            "venue",
+            "execution_venue",
+            "route_id",
+        ):
+            raw = container.get(key)
+            if raw in (None, "", [], {}, ()):
+                continue
+            normalized = str(raw).strip().lower().replace("-", "_").replace("/", "|")
+            scope_tokens.update(token.strip("_ ") for token in normalized.split("|") if token.strip("_ "))
+
+    joined_scope = "|".join(sorted(scope_tokens))
+    source_is_yahoo = "yahoo_proxy" in joined_scope or ("yahoo" in joined_scope and "proxy" in joined_scope)
+    momentum_family = "global_proxy_momentum" in joined_scope or (
+        "proxy" in joined_scope and "momentum" in joined_scope
+    )
+    destination_is_crypto = any(
+        token in joined_scope
+        for token in (
+            "frontier",
+            "crypto",
+            "spot",
+            "perp",
+            "perpetual",
+            "swap",
+            "okx",
+            "bitget",
+            "binance_us",
+            "valr",
+            "gate",
+            "bybit",
+            "indodax",
+            "bitso",
+            "mercado_bitcoin",
+        )
+    )
+
+    execution_mode = _paper_only_route_intelligence_tag(
+        _lookup("execution_mode", "trading_mode", "mode", "destination_mode", "runner_mode")
+    )
+    paper_mode = execution_mode in {None, "paper", "paper_only", "simulation", "sim", "review"}
+    applies = bool(paper_mode and source_is_yahoo and momentum_family and destination_is_crypto)
+
+    raw_contribution = _float(
+        _lookup(
+            "propagated_momentum_contribution",
+            "momentum_contribution",
+            "proxy_momentum_contribution",
+            "momentum_score",
+        )
+    )
+    if not applies:
+        return {
+            "enabled": True,
+            "paper_only": True,
+            "applies": False,
+            "eligible": True,
+            "blocked": False,
+            "reason": "non_paper_mode" if not paper_mode else "not_applicable",
+            "gate_reason": None,
+            "gate_reasons": [],
+            "input_momentum_contribution": raw_contribution,
+            "propagated_momentum_contribution": raw_contribution,
+        }
+
+    max_source_age = _float(
+        _lookup("max_source_quote_age_seconds", "source_freshness_threshold_seconds")
+    )
+    if max_source_age is None or max_source_age <= 0.0:
+        max_source_age = _PAPER_ONLY_YAHOO_CRYPTO_FRESHNESS_POLICY["max_source_quote_age_seconds"]
+    max_destination_age = _float(
+        _lookup("max_destination_proxy_age_seconds", "destination_proxy_freshness_threshold_seconds")
+    )
+    if max_destination_age is None or max_destination_age <= 0.0:
+        max_destination_age = _PAPER_ONLY_YAHOO_CRYPTO_FRESHNESS_POLICY[
+            "max_destination_proxy_age_seconds"
+        ]
+
+    evaluated_at = _paper_only_parse_timestamp(
+        now
+        or _lookup(
+            "evaluated_at",
+            "evaluation_timestamp",
+            "scheduler_timestamp",
+            "decision_time_utc",
+            "destination_timestamp",
+        )
+    ) or _paper_only_freshness_now()
+    source_timestamp = _paper_only_parse_timestamp(
+        _lookup(
+            "source_quote_timestamp",
+            "source_timestamp",
+            "latest_bar_timestamp",
+            "source_bar_end_utc",
+            "last_bar_utc",
+            "proxy_timestamp",
+        )
+    )
+    source_age = _float(
+        _lookup("source_quote_age_seconds", "source_age_seconds", "proxy_quote_age_seconds")
+    )
+    if source_age is None and source_timestamp is not None:
+        source_age = max(0.0, (evaluated_at - source_timestamp).total_seconds())
+
+    destination_age = _float(
+        _lookup(
+            "destination_proxy_age_seconds",
+            "propagated_proxy_age_seconds",
+            "destination_source_age_seconds",
+        )
+    )
+    destination_age_basis = "explicit_destination_proxy_age"
+    if destination_age is None:
+        destination_age = source_age
+        destination_age_basis = "source_quote_age"
+
+    explicit_session_open = _bool(_lookup("source_session_open", "proxy_session_open"))
+    session_status = _paper_only_route_intelligence_tag(
+        _lookup("source_session_status", "proxy_session_status", "session_status", "market_session_status")
+    )
+    if explicit_session_open is not None:
+        source_session_open = explicit_session_open
+    elif session_status in {"open", "regular", "regular_hours", "trading", "active"}:
+        source_session_open = True
+    elif session_status in {"closed", "off_session", "after_hours", "halted", "holiday", "weekend"}:
+        source_session_open = False
+    else:
+        source_session_open = None
+
+    delayed_mode_allowed = _bool(
+        _lookup(
+            "allow_delayed_mode",
+            "delayed_mode_allowed",
+            "allow_closed_session_proxy",
+            "allow_off_session_proxy",
+        )
+    ) is True
+    delayed_mode = _paper_only_route_intelligence_tag(
+        _lookup("source_handling_mode", "proxy_handling_mode", "delayed_mode", "session_handling_mode")
+    )
+    if delayed_mode in {"delayed", "delayed_mode", "allow_delayed", "off_session_delayed"}:
+        delayed_mode_allowed = True
+    session_allowed = source_session_open is True or delayed_mode_allowed
+
+    reasons = []
+    if source_age is None:
+        reasons.append("missing_source_quote_timestamp")
+    elif source_age > max_source_age:
+        reasons.append("stale_source_quote")
+    if not session_allowed:
+        reasons.append("source_session_unknown" if source_session_open is None else "source_session_closed")
+    if destination_age is None:
+        reasons.append("missing_destination_proxy_age")
+    elif destination_age > max_destination_age:
+        reasons.append("stale_destination_proxy")
+
+    blocked = bool(reasons)
+    return {
+        "enabled": True,
+        "paper_only": True,
+        "applies": True,
+        "eligible": not blocked,
+        "blocked": blocked,
+        "reason": reasons[0] if reasons else "fresh_proxy_session_allowed",
+        "gate_reason": reasons[0] if reasons else None,
+        "gate_reasons": reasons,
+        "source_quote_timestamp": source_timestamp.isoformat() if source_timestamp else None,
+        "evaluated_at": evaluated_at.isoformat(),
+        "source_quote_age_seconds": round(source_age, 3) if source_age is not None else None,
+        "max_source_quote_age_seconds": max_source_age,
+        "source_session_status": session_status,
+        "source_session_open": source_session_open,
+        "delayed_mode_allowed": delayed_mode_allowed,
+        "session_allowed": session_allowed,
+        "destination_proxy_age_seconds": round(destination_age, 3) if destination_age is not None else None,
+        "destination_proxy_age_basis": destination_age_basis,
+        "max_destination_proxy_age_seconds": max_destination_age,
+        "input_momentum_contribution": raw_contribution,
+        "propagated_momentum_contribution": 0.0 if blocked else raw_contribution,
+        "momentum_state": "neutral" if blocked else "propagated",
+    }
+
+
 def _paper_only_cross_surface_seed_guard_review(record, profile=None):
     containers = []
     if isinstance(record, dict):
@@ -649,21 +931,26 @@ def _paper_only_cross_surface_seed_guard_review(record, profile=None):
     cross_surface_target = bool(
         {"frontier", "perp", "perpetual", "cross_surface", "non_native"} & scope_tokens
     )
-    applies = bool(source_family == "yahoo_proxy" and feature_family == "global_proxy_momentum")
-    blocked = bool(applies and (cross_surface_target or candidate_surface in {"frontier", "perp"} or native_proxy_variant))
+    freshness_gate = _paper_only_yahoo_proxy_crypto_freshness_review(record, profile)
+    applies = bool(freshness_gate.get("applies"))
+    blocked = bool(applies and freshness_gate.get("blocked"))
 
     return {
         "enabled": True,
         "applies": applies,
         "blocked": blocked,
         "eligible": not blocked,
-        "reason": "cross_surface_seed_blocked" if blocked else "not_applicable",
+        "reason": freshness_gate.get("reason") if applies else "not_applicable",
         "source_family": source_family,
         "feature_family": feature_family,
         "candidate_surface": candidate_surface,
         "native_proxy_variant": native_proxy_variant,
         "cross_surface_target": cross_surface_target,
-        "policy": "block_cross_surface_propagation" if applies else "allow",
+        "policy": "freshness_and_session_gated_propagation" if applies else "allow",
+        "gate_reason": freshness_gate.get("gate_reason"),
+        "gate_reasons": list(freshness_gate.get("gate_reasons") or ()),
+        "propagated_momentum_contribution": freshness_gate.get("propagated_momentum_contribution"),
+        "freshness_gate": freshness_gate,
     }
 
 def _paper_only_route_intelligence_surface(record, tokens):
