@@ -1,8 +1,22 @@
 $ErrorActionPreference = "Continue"
 $Starter = Resolve-Path (Join-Path $PSScriptRoot "start_system_hidden.ps1")
-$Log = Join-Path (Resolve-Path (Join-Path $PSScriptRoot "..\runs")) "system_watchdog.log"
+$RunsDir = Resolve-Path (Join-Path $PSScriptRoot "..\runs")
+$Log = Join-Path $RunsDir "system_watchdog.log"
+$PidPath = Join-Path $RunsDir "system_watchdog.pid"
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8 = "1"
+
+if (Test-Path $PidPath) {
+    try {
+        $existingPid = [int](Get-Content $PidPath | Select-Object -First 1)
+        $existing = Get-CimInstance Win32_Process -Filter "ProcessId=$existingPid" -ErrorAction SilentlyContinue
+        if ($existing -and [string]$existing.CommandLine -like "*system_watchdog.ps1*") {
+            exit 0
+        }
+    }
+    catch {}
+}
+Set-Content -Path $PidPath -Value $PID -Encoding ASCII
 
 while ($true) {
     try {
