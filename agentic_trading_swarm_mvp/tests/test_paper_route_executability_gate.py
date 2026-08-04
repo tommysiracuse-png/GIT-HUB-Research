@@ -444,6 +444,59 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
             enriched["paper_route_eligibility"]["blocker_reasons"],
         )
 
+    def test_candidate_capability_flags_cannot_override_maintained_venue_veto(self):
+        candidate = {
+            "venue": "OKX_SPOT",
+            "trade_type": "frontier_crypto_venue_map",
+            "direction": "short_frontier_spot",
+            "asset_class": "crypto_spot",
+            "score": 80.0,
+            "paper_short_simulation_allowed": True,
+            "borrowable": True,
+            "borrow_cost_bps": 4.0,
+            "margin_eligible": True,
+            "venue_capabilities": {
+                "supports_spot_short": True,
+                "supports_margin_spot": True,
+                "supports_borrow_check": True,
+            },
+        }
+
+        enriched = enrich_candidate_with_route(
+            candidate,
+            copy.deepcopy(DEFAULT_SETTINGS),
+        )
+
+        capabilities = enriched["paper_route_eligibility"]["venue_capabilities"]
+        self.assertFalse(capabilities["supports_spot_short"])
+        self.assertFalse(capabilities["supports_margin_spot"])
+        self.assertFalse(capabilities["supports_borrow_check"])
+        self.assertEqual("blocked", enriched["execution_eligibility"])
+        self.assertEqual("infeasible_for_paper", enriched["paper_feasibility_status"])
+
+    def test_borrow_cost_assumption_is_included_in_route_cost_gate(self):
+        verdict = evaluate_route_intelligence(
+            {
+                "venue": "PAPER_SIM_VENUE",
+                "surface": "spot",
+                "direction": "short_frontier_spot",
+                "paper_short_simulation_allowed": True,
+                "borrow_inventory_assumption": "fixed_conservative_inventory",
+                "borrow_cost_assumption": {"bps": 25.0, "model": "paper_stress"},
+                "venue_capabilities": {
+                    "supports_spot_short": True,
+                    "supports_margin_spot": True,
+                    "supports_borrow_check": True,
+                },
+                "expected_edge_bps": 10.0,
+            }
+        )
+
+        self.assertEqual(25.0, verdict["cost_breakdown_bps"]["borrow"])
+        self.assertEqual(25.0, verdict["assumed_route_cost_bps"])
+        self.assertTrue(verdict["suppressed"])
+        self.assertIn("expected_edge_below_route_costs", verdict["blocker_reasons"])
+
     def test_spot_candidate_uses_instrument_specific_venue_profile(self):
         enriched = enrich_candidate_with_route(
             {

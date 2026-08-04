@@ -26,6 +26,7 @@ class FrontierConditionalShortAdmissionTests(unittest.TestCase):
     def test_direct_executable_short_remains_admissible_and_annotated(self):
         guarded = apply_frontier_paper_guard(
             _candidate(
+                venue="PAPER_SIM_VENUE",
                 borrow_confirmed=True,
                 paper_short_simulation_allowed=True,
                 borrowable=True,

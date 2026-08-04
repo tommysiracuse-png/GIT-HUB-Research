@@ -45,6 +45,15 @@ ROUTE_STATUSES = {
 }
 PAPER_ROUTE_ASSUMPTION_SCORE_MULTIPLIER = 0.20
 
+VENUE_CAPABILITY_ALIASES = {
+    "supports_spot_short": ("spot_short_supported", "supports_spot_short_margin"),
+    "supports_margin_spot": ("margin_supported", "supports_margin"),
+    "supports_borrow_check": ("borrow_supported", "borrow_inventory_supported"),
+    "supports_basis_path": ("supports_basis_carry", "synthetic_carry_supported"),
+    "supports_spot_long": ("spot_supported", "supports_spot"),
+    "supports_perpetuals": ("perp_supported", "perp_available"),
+}
+
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -76,29 +85,70 @@ def load_venue_capability_registry() -> dict[str, dict]:
     for venue, capabilities in payload.items():
         if not isinstance(capabilities, dict):
             continue
-        normalized = dict(capabilities)
-        aliases = {
-            "supports_spot_short": ("spot_short_supported", "supports_spot_short_margin"),
-            "supports_margin_spot": ("margin_supported", "supports_margin"),
-            "supports_borrow_check": ("borrow_supported", "borrow_inventory_supported"),
-            "supports_basis_path": ("supports_basis_carry", "synthetic_carry_supported"),
-        }
-        for canonical, legacy_keys in aliases.items():
-            if canonical in normalized:
-                continue
-            for legacy_key in legacy_keys:
-                if legacy_key in normalized:
-                    normalized[canonical] = normalized[legacy_key]
-                    break
-        registry[str(venue).strip().upper()] = normalized
+        registry[str(venue).strip().upper()] = _normalize_venue_capabilities(capabilities)
     return registry
+
+
+def _normalize_venue_capabilities(capabilities: dict) -> dict:
+    """Normalize aliases and fail closed on contradictory capability flags."""
+
+    normalized = dict(capabilities)
+    for canonical, legacy_keys in VENUE_CAPABILITY_ALIASES.items():
+        values = [
+            normalized[key]
+            for key in (canonical, *legacy_keys)
+            if key in normalized
+        ]
+        if not values:
+            continue
+        states = [_eligibility_bool(value) for value in values]
+        if False in states:
+            normalized[canonical] = False
+        elif None in states:
+            normalized[canonical] = None
+        else:
+            normalized[canonical] = True
+    return normalized
+
+
+def _merge_venue_capabilities(
+    maintained: dict | None,
+    observed: dict | None,
+) -> dict:
+    """Merge capability evidence without allowing a positive flag to erase a veto.
+
+    Maintained metadata defines the paper route envelope. Candidate/instrument
+    metadata may narrow that envelope, but cannot broaden a false or unknown
+    maintained capability into a supported one.
+    """
+
+    maintained_normalized = _normalize_venue_capabilities(maintained or {})
+    observed_normalized = _normalize_venue_capabilities(observed or {})
+    merged = dict(maintained_normalized)
+    for key, value in observed_normalized.items():
+        if key not in VENUE_CAPABILITY_ALIASES or key not in maintained_normalized:
+            merged[key] = value
+            continue
+        maintained_state = _eligibility_bool(maintained_normalized[key])
+        observed_state = _eligibility_bool(value)
+        if maintained_state is False or observed_state is False:
+            merged[key] = False
+        elif maintained_state is None or observed_state is None:
+            merged[key] = None
+        else:
+            merged[key] = True
+    return merged
 
 
 def _configured_venue_capabilities(
     candidate: dict,
     capability_registry: dict[str, dict] | None = None,
 ) -> dict:
-    registry = capability_registry or load_venue_capability_registry()
+    registry = (
+        load_venue_capability_registry()
+        if capability_registry is None
+        else capability_registry
+    )
     venue = str(candidate.get("venue") or "").strip().upper()
     explicit_surface = str(
         candidate.get("market_key")
@@ -130,7 +180,7 @@ def _configured_venue_capabilities(
     for key in lookup_keys:
         capabilities = registry.get(key)
         if isinstance(capabilities, dict):
-            result = dict(capabilities)
+            result = _normalize_venue_capabilities(capabilities)
             result.setdefault("capability_profile", key)
             return result
     return {}
@@ -447,7 +497,7 @@ def _venue_capability_metadata(candidate: dict) -> dict:
     snapshots.
     """
 
-    merged: dict = {}
+    observed: dict = {}
     containers = (
         candidate.get("execution_route"),
         candidate.get("execution_feasibility"),
@@ -460,13 +510,15 @@ def _venue_capability_metadata(candidate: dict) -> dict:
             continue
         capabilities = container.get("venue_capabilities")
         if isinstance(capabilities, dict):
-            merged.update(capabilities)
+            observed = _merge_venue_capabilities(observed, capabilities)
         packet = container.get("route_requirements_packet")
         if isinstance(packet, dict) and isinstance(packet.get("venue_capabilities"), dict):
-            merged.update(packet["venue_capabilities"])
-    if not merged:
-        merged.update(_configured_venue_capabilities(candidate))
-    return merged
+            observed = _merge_venue_capabilities(
+                observed,
+                packet["venue_capabilities"],
+            )
+    maintained = _configured_venue_capabilities(candidate)
+    return _merge_venue_capabilities(maintained, observed)
 
 
 def _capability_bool(capabilities: dict, *keys: str) -> bool | None:
@@ -810,6 +862,29 @@ def _paper_route_costs(
         "borrow_fee_bps_estimate",
         "borrow_fee_bps_estimate_or_unknown",
     )
+    if borrow is None:
+        borrow_assumption = _eligibility_value(
+            candidate,
+            "borrow_cost_assumption",
+            "borrow_cost_model",
+        )
+        if isinstance(borrow_assumption, dict):
+            for key in ("bps", "cost_bps", "borrow_cost_bps", "value"):
+                if key not in borrow_assumption:
+                    continue
+                value = borrow_assumption.get(key)
+                if isinstance(value, bool):
+                    continue
+                try:
+                    borrow = float(value)
+                except (TypeError, ValueError):
+                    borrow = None
+                break
+        elif not isinstance(borrow_assumption, bool):
+            try:
+                borrow = float(borrow_assumption)
+            except (TypeError, ValueError):
+                borrow = None
     funding_drag = _eligibility_number(
         candidate, "funding_drag_bps", "expected_funding_drag_bps"
     )
@@ -1610,9 +1685,10 @@ def enrich_candidate_with_route(
     )
     supplied_capabilities = enriched.get("venue_capabilities")
     if configured_capabilities:
-        merged_capabilities = dict(configured_capabilities)
-        if isinstance(supplied_capabilities, dict):
-            merged_capabilities.update(supplied_capabilities)
+        merged_capabilities = _merge_venue_capabilities(
+            configured_capabilities,
+            supplied_capabilities if isinstance(supplied_capabilities, dict) else None,
+        )
         enriched["venue_capabilities"] = merged_capabilities
         enriched["venue_capability_source"] = (
             "candidate_and_paper_route_registry"

@@ -26,6 +26,7 @@ def _candidate(**overrides):
 class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
     def test_assumption_backed_short_is_capped_but_not_shadow_filtered(self):
         candidate = _candidate(
+            venue="PAPER_SIM_VENUE",
             score=80.0,
             paper_short_simulation_allowed=True,
             borrow_inventory_assumption="fixed_conservative_inventory",
