@@ -44,6 +44,8 @@ def recommendation(*, market_key: str, lab_id: str, parent: str | None = None) -
                 "parent_strategy_lab_id": parent,
                 "experiment_type": "market_strategy",
                 "hypothesis": "A source transformation may retain paper expectancy.",
+                "source_surface": "frontier_spot",
+                "permitted_target_surface": ["frontier_spot"],
                 "strategy_logic": {
                     "type": "candidate_filter",
                     "venues": ["OKX_SPOT"],
@@ -112,6 +114,7 @@ class YahooProxySourceVetoTests(unittest.TestCase):
             "direction": "long_frontier_spot",
             "score": 99.0,
             "execution_feasibility": {"status": "standard"},
+            "target_surface": "frontier_spot",
         }
         with memory_db() as conn:
             generated, report = generate_strategy_lab_candidates(conn, settings(), [direct])
@@ -137,6 +140,7 @@ class YahooProxySourceVetoTests(unittest.TestCase):
             "last": 10.0,
             "edge_bps_estimate": 12.0,
             "execution_feasibility": {"status": "standard"},
+            "target_surface": "frontier_spot",
         }
         with memory_db() as conn:
             created = ingest_strategy_lab_recommendation(conn, rec, self._recovered_settings())

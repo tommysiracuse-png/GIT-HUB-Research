@@ -618,6 +618,7 @@ def generate_program_candidates(
         except (ProgramValidationError, ArithmeticError, ValueError, TypeError, OverflowError):
             rejects["expression_runtime_error"] += 1
             continue
+        target_surface = _route_surface(frame, program)
         trade_type, direction = _route_mapping(frame, program, side)
         signature = str(diagnostic.get("novelty_signature") or novelty_signature(program))
         candidate = {
@@ -625,6 +626,7 @@ def generate_program_candidates(
             "inst_id": str(frame.get("inst_id")),
             "direction": direction,
             "trade_type": trade_type,
+            "target_surface": target_surface,
             "score": round(score, 3),
             "liquidity_score": max(0.0, min(1.0, _float(frame.get("liquidity_score"), 0.5))),
             "spread_bps": max(0.0, _float(frame.get("spread_bps"))),

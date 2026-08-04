@@ -84,6 +84,7 @@ class TestOkxFundingCaptureQualityGate(unittest.TestCase):
             "seen_at": now,
             "last": 100.0,
             "route_status": "standard",
+            "target_surface": "perp_funding_basis",
             "hedge_venue": "OKX_SPOT",
             "hedge_instrument": "BTC-USDT",
             "fee_model": "paper_conservative_v1",
@@ -121,6 +122,7 @@ class TestOkxFundingCaptureQualityGate(unittest.TestCase):
             "seen_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "last": 100.0,
             "route_status": "standard",
+            "target_surface": "perp_funding_basis",
         }
         with self._connection() as conn:
             self_improvement.ingest_strategy_lab_recommendation(conn, self._recommendation())

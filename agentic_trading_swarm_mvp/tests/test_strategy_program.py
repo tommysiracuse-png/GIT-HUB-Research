@@ -75,6 +75,8 @@ def lab_recommendation(strategy_lab_id: str = "observation_momentum_v1", logic: 
                 "version": 1,
                 "experiment_type": "market_strategy",
                 "hypothesis": "Liquid instruments with fresh quality-confirmed momentum continue after costs.",
+                "source_surface": "proxy",
+                "permitted_target_surface": ["proxy"],
                 "strategy_logic": logic or program_logic(),
                 "data_requirements": {"paper_only": True},
                 "risk_gates": {},
@@ -169,6 +171,7 @@ class StrategyProgramTests(unittest.TestCase):
             "direction": "long_proxy",
             "trade_type": "global_market_discovery_proxy",
             "score": 70.0,
+            "strategy_lab_surface_policy": {"eligible": True, "reason": "surface_compatible"},
         }
         selected, summary = _select_runtime_strategy_lab_candidates([candidate], settings())
         self.assertEqual([candidate], selected)

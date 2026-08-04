@@ -8,6 +8,7 @@ except Exception:  # pragma: no cover
 
 
 class StrategyLabRuntimeSelectionTests(unittest.TestCase):
+    SURFACE_POLICY = {"eligible": True, "reason": "surface_compatible"}
     def setUp(self):
         if strategy_lab_runtime_module is None:
             self.skipTest("strategy lab runtime module unavailable")
@@ -80,10 +81,10 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
 
     def test_review_reserve_selects_distinct_lab_experiments(self):
         candidates = [
-            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "inst_id": "A", "direction": "long_proxy", "score": 99},
-            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "inst_id": "A2", "direction": "long_proxy", "score": 98},
-            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "inst_id": "B", "direction": "long_proxy", "score": 80},
-            {"strategy_lab_id": "lab_c", "strategy_lab_logic_type": "candidate_filter", "inst_id": "C", "direction": "long_proxy", "score": 70},
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "inst_id": "A", "direction": "long_proxy", "score": 99, "strategy_lab_surface_policy": self.SURFACE_POLICY},
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "inst_id": "A2", "direction": "long_proxy", "score": 98, "strategy_lab_surface_policy": self.SURFACE_POLICY},
+            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "inst_id": "B", "direction": "long_proxy", "score": 80, "strategy_lab_surface_policy": self.SURFACE_POLICY},
+            {"strategy_lab_id": "lab_c", "strategy_lab_logic_type": "candidate_filter", "inst_id": "C", "direction": "long_proxy", "score": 70, "strategy_lab_surface_policy": self.SURFACE_POLICY},
         ]
 
         selected, summary = self.reserve_review_candidates(
@@ -98,7 +99,7 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
 
     def test_review_reserve_excludes_watch_only_candidates(self):
         selected, summary = self.reserve_review_candidates(
-            [{"strategy_lab_id": "lab_watch", "strategy_lab_logic_type": "candidate_filter", "direction": "watch_only", "score": 100}],
+            [{"strategy_lab_id": "lab_watch", "strategy_lab_logic_type": "candidate_filter", "direction": "watch_only", "score": 100, "strategy_lab_surface_policy": self.SURFACE_POLICY}],
             {"strategy_lab": {"runtime_review_reserved_slots": 5}},
             total_slots=25,
         )
@@ -108,10 +109,10 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
 
     def test_review_reserve_prefers_standard_routes_and_distinct_sources(self):
         candidates = [
-            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "venue": "OKX", "inst_id": "LA-SWAP", "direction": "long_perp_short_spot", "trade_type": "basis", "route_status": "conditional", "score": 100},
-            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "venue": "OKX_SPOT", "inst_id": "BTC-USDT", "direction": "long_frontier_spot", "trade_type": "spot", "route_status": "standard", "score": 80},
-            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "venue": "OKX_SPOT", "inst_id": "BTC-USDT", "direction": "long_frontier_spot", "trade_type": "spot", "route_status": "standard", "score": 90},
-            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "venue": "KRAKEN", "inst_id": "ETHUSD", "direction": "long_frontier_spot", "trade_type": "spot", "route_status": "standard", "score": 70},
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "venue": "OKX", "inst_id": "LA-SWAP", "direction": "long_perp_short_spot", "trade_type": "basis", "route_status": "conditional", "score": 100, "strategy_lab_surface_policy": self.SURFACE_POLICY},
+            {"strategy_lab_id": "lab_a", "strategy_lab_logic_type": "candidate_filter", "venue": "OKX_SPOT", "inst_id": "BTC-USDT", "direction": "long_frontier_spot", "trade_type": "spot", "route_status": "standard", "score": 80, "strategy_lab_surface_policy": self.SURFACE_POLICY},
+            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "venue": "OKX_SPOT", "inst_id": "BTC-USDT", "direction": "long_frontier_spot", "trade_type": "spot", "route_status": "standard", "score": 90, "strategy_lab_surface_policy": self.SURFACE_POLICY},
+            {"strategy_lab_id": "lab_b", "strategy_lab_logic_type": "candidate_filter", "venue": "KRAKEN", "inst_id": "ETHUSD", "direction": "long_frontier_spot", "trade_type": "spot", "route_status": "standard", "score": 70, "strategy_lab_surface_policy": self.SURFACE_POLICY},
         ]
 
         selected, summary = self.reserve_review_candidates(

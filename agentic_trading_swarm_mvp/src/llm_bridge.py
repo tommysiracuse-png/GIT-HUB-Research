@@ -1124,6 +1124,8 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "required_fields": [
                 "strategy_lab_id",
                 "hypothesis",
+                "source_surface",
+                "permitted_target_surface",
                 "strategy_logic",
                 "data_requirements",
                 "risk_gates",
@@ -1135,6 +1137,10 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
                 "max_spread_bps, min_quality_score, max_stale_minutes, and required_fields."
             ),
             "paper_only_rule": "This creates experimental paper candidates only; deterministic outcomes decide promotion.",
+            "surface_policy": (
+                "source_surface names the evidence context and permitted_target_surface explicitly lists exact "
+                "application surfaces. Missing or incompatible surfaces are denied and quarantined for review."
+            ),
         },
         "agent_spec": {
             "required_only_for": "spawn_agent",

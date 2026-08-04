@@ -221,6 +221,8 @@ class FrontierShockSnapbackFeatureTests(unittest.TestCase):
                     "version": 1,
                     "experiment_type": "market_strategy",
                     "hypothesis": "Liquid spot downside shocks snap back after volume-backed recovery confirmation.",
+                    "source_surface": "spot",
+                    "permitted_target_surface": ["spot"],
                     "strategy_logic": snapback_program(),
                     "data_requirements": {"paper_only": True, "closed_1m_candles": 61},
                     "risk_gates": {"max_spread_bps": 8, "min_quality_score": 60},

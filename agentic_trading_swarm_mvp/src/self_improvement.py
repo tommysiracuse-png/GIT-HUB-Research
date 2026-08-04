@@ -551,6 +551,8 @@ def _normalize_strategy_lab_recommendation_payload(payload: dict) -> dict:
             "market_key": "okx_perp_funding_basis",
             "signal_key": "okx_funding_capture",
             "strategy_family": str(_first_present(scope, "strategy_family", "family") or "funding_capture"),
+            "source_surface": "perp_funding_basis",
+            "permitted_target_surface": ["perp_funding_basis"],
             "venue": venue,
             "trade_types": ["perp_funding_basis"],
             "allowed_directions": allowed_directions,
@@ -571,6 +573,8 @@ def _normalize_strategy_lab_recommendation_payload(payload: dict) -> dict:
                     or payload.get("title")
                     or "Tighter OKX funding-capture quality gates improve paper outcomes."
                 ),
+                "source_surface": "perp_funding_basis",
+                "permitted_target_surface": ["perp_funding_basis"],
                 "strategy_logic": strategy_logic,
                 "data_requirements": {
                     "source_trade_type": "perp_funding_basis",

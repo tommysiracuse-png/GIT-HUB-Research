@@ -53,6 +53,8 @@ def lab_rec():
             "agent_name": "strategy_lab",
             "strategy_lab_experiment": {
                 "strategy_lab_id": "okx_spot_survivor_lab_v1",
+                "source_surface": "frontier_spot",
+                "permitted_target_surface": ["frontier_spot"],
                 "hypothesis": "High-quality OKX spot frontier longs continue after dislocation.",
                 "strategy_logic": {
                     "type": "candidate_filter",
@@ -86,6 +88,7 @@ def candidate(**overrides):
         "funding_bps": 0.0,
         "basis_bps": 0.0,
         "execution_feasibility": {"status": "standard"},
+        "target_surface": "frontier_spot",
     }
     row.update(overrides)
     return row
@@ -101,6 +104,8 @@ class StrategyLabTest(unittest.TestCase):
                 "rationale": "Test a paper-only venue-specific frontier long refinement.",
                 "market_key": "frontier_crypto_venue_map",
                 "proposed_change": {
+                    "source_surface": "frontier_spot",
+                    "permitted_target_surface": ["frontier_spot"],
                     "asset_surface": "frontier_spot",
                     "direction": "long_only",
                     "include_venue_primary": "BITGET",
@@ -279,6 +284,8 @@ class StrategyLabTest(unittest.TestCase):
             "min_quality_score": 0.65,
             "max_spread_bps": 8,
         }
+        experiment["source_surface"] = "perp_funding_basis"
+        experiment["permitted_target_surface"] = ["perp_funding_basis"]
         source = candidate(
             venue="OKX",
             inst_id="BTC-USDT-SWAP",
@@ -293,6 +300,7 @@ class StrategyLabTest(unittest.TestCase):
             hedge_instrument="BTC-USDT",
             fee_model="paper_conservative_v1",
             paper_leg_mapping_valid=True,
+            target_surface="perp_funding_basis",
         )
 
         with memory_db() as conn:
@@ -317,12 +325,15 @@ class StrategyLabTest(unittest.TestCase):
             "required_fields": ["edge_bps", "timestamp"],
             "min_edge_bps": 10,
         }
+        experiment["source_surface"] = "proxy"
+        experiment["permitted_target_surface"] = ["proxy"]
         historical = candidate(
             venue="JOHANNESBURG_STOCK_EXCHANGE",
             inst_id="JOHANNESBURG_STOCK_EXCHANGE:SBSW",
             trade_type="global_market_discovery_proxy",
             direction="long_proxy",
             seen_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            target_surface="proxy",
         )
         review = {
             "learned_score": 70.0,
@@ -417,6 +428,8 @@ class StrategyLabTest(unittest.TestCase):
             "min_edge_bps": 10,
             "min_liquidity_score": 0.35,
         }
+        experiment["source_surface"] = "proxy_momentum"
+        experiment["permitted_target_surface"] = ["frontier_spot"]
 
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, rec)
@@ -525,11 +538,14 @@ class StrategyLabTest(unittest.TestCase):
             "min_liquidity_score": 0.35,
             "max_spread_bps": 8,
         }
+        experiment["source_surface"] = "regional_cross_reference_spread"
+        experiment["permitted_target_surface"] = ["regional_cross_reference_spread"]
         new_candidate = candidate(
             venue="NEW_VENUE",
             inst_id="NEW_VENUE:ABC",
             trade_type="regional_cross_reference_spread",
             direction="buy_local_sell_reference",
+            target_surface="regional_cross_reference_spread",
         )
 
         with memory_db() as conn:

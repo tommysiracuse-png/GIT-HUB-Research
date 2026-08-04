@@ -90,6 +90,8 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
                 "version": 1,
                 "experiment_type": "market_strategy",
                 "hypothesis": "Aligned own momentum and relative strength predict positive 60m returns.",
+                "source_surface": "proxy_momentum",
+                "permitted_target_surface": ["proxy_momentum"],
                 "strategy_logic": {
                     "type": "candidate_filter",
                     "trade_types": ["global_proxy_momentum"],

@@ -157,6 +157,11 @@ def _is_strategy_lab_runtime_candidate(item: dict) -> bool:
     )
 
 
+def _strategy_lab_surface_rank_eligible(item: dict) -> bool:
+    policy = item.get("strategy_lab_surface_policy")
+    return isinstance(policy, dict) and policy.get("eligible") is True
+
+
 def _strategy_lab_runtime_selection_summary(
     candidates: list[dict],
     *,
@@ -206,6 +211,8 @@ def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: di
         if str(candidate.get("direction") or "").lower() == "watch_only":
             continue
         if not _is_strategy_lab_runtime_candidate(candidate):
+            continue
+        if not _strategy_lab_surface_rank_eligible(candidate):
             continue
         by_experiment.setdefault(strategy_lab_id, []).append(candidate)
 
@@ -260,6 +267,9 @@ def _select_runtime_strategy_lab_candidates(candidates: list[dict], settings: di
     skipped = 0
     for candidate in candidates:
         if not _is_strategy_lab_runtime_candidate(candidate):
+            skipped += 1
+            continue
+        if not _strategy_lab_surface_rank_eligible(candidate):
             skipped += 1
             continue
         if candidate.get("enabled") is False:

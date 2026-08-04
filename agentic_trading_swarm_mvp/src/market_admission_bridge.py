@@ -204,6 +204,8 @@ def _create_strategy_discovery(
                     f"Find a repeatable, surface-specific paper strategy for {state.get('venue')} "
                     f"{state.get('inst_id')} using its normalized market features and relative context."
                 ),
+                "source_surface": state.get("market_surface"),
+                "permitted_target_surface": [state.get("market_surface")],
                 "strategy_logic": {
                     "type": "candidate_selector",
                     "allowed_venues": [state.get("venue")],
@@ -214,6 +216,8 @@ def _create_strategy_discovery(
                     "admission_key": state.get("admission_key"),
                     "inst_id": state.get("inst_id"),
                     "market_surface": state.get("market_surface"),
+                    "source_surface": state.get("market_surface"),
+                    "permitted_target_surface": [state.get("market_surface")],
                     "requires_independent_signal_logic": True,
                 },
                 "risk_gates": {"require_route_feasible": True},

@@ -757,6 +757,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "strategy_lab_experiments", "novelty_signature", "text")
     _ensure_column(conn, "strategy_lab_experiments", "novelty_status", "text not null default 'unassessed'")
     _ensure_column(conn, "strategy_lab_experiments", "novelty_details_json", "text not null default '{}'")
+    _ensure_column(conn, "strategy_lab_experiments", "source_surface", "text")
+    _ensure_column(conn, "strategy_lab_experiments", "permitted_target_surfaces_json", "text not null default '[]'")
+    _ensure_column(conn, "strategy_lab_experiments", "surface_policy_json", "text not null default '{}'")
     conn.execute(
         """
         create table if not exists strategy_owner_tasks (

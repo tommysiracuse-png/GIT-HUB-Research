@@ -45,6 +45,7 @@ TRACKED_STATUSES = {
     "retired_bad_evidence",
     "retired_no_activity",
     "rejected_invalid",
+    "quarantined_surface_policy",
 }
 EXPERIMENT_TYPES = {
     "market_strategy",
@@ -98,6 +99,14 @@ FALLBACK_DIRECTION_TRADE_TYPE_HINTS = {
     "yes": "prediction_market_probability",
     "no": "prediction_market_probability",
 }
+
+SURFACE_TARGET_FIELDS = (
+    "target_surface",
+    "market_surface",
+    "execution_surface",
+    "route_surface",
+    "asset_surface",
+)
 
 
 def _json_loads(value: str | None, default: Any) -> Any:
@@ -158,6 +167,109 @@ def _unique(values: list[str]) -> list[str]:
             output.append(value)
             seen.add(value)
     return output
+
+
+def _normalize_surface(value: Any) -> str | None:
+    """Normalize an explicit surface label without equating distinct markets."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    normalized = []
+    for char in text:
+        if char.isalnum():
+            normalized.append(char)
+        elif normalized and normalized[-1] != "_":
+            normalized.append("_")
+    return "".join(normalized).strip("_") or None
+
+
+def _surface_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw = value.replace(";", ",").split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        raw = []
+    return _unique(
+        [surface for item in raw if (surface := _normalize_surface(item)) is not None]
+    )
+
+
+def _surface_contract(payload: dict, contract: dict, data_requirements: dict) -> dict:
+    sources = [contract, data_requirements, payload]
+    source_surface = None
+    permitted: list[str] = []
+    for source in sources:
+        if source_surface is None:
+            source_surface = _normalize_surface(source.get("source_surface"))
+        if not permitted:
+            permitted = _surface_values(
+                source.get("permitted_target_surface")
+                or source.get("permitted_target_surfaces")
+            )
+    missing = []
+    if source_surface is None:
+        missing.append("source_surface")
+    if not permitted:
+        missing.append("permitted_target_surface")
+    return {
+        "source_surface": source_surface,
+        "permitted_target_surface": permitted,
+        "eligible": not missing,
+        "reason": "surface_contract_valid" if not missing else "missing_surface_metadata",
+        "missing_fields": missing,
+        "review_required": bool(missing),
+        "paper_only": True,
+    }
+
+
+def _candidate_target_surface(candidate: dict) -> str | None:
+    for key in SURFACE_TARGET_FIELDS:
+        surface = _normalize_surface(candidate.get(key))
+        if surface:
+            return surface
+    target_segment = candidate.get("target_segment")
+    if isinstance(target_segment, dict):
+        return _normalize_surface(
+            target_segment.get("target_surface")
+            or target_segment.get("surface")
+            or target_segment.get("market_surface")
+            or target_segment.get("execution_surface")
+        )
+    return None
+
+
+def _surface_compatibility(experiment: dict, candidate: dict) -> dict:
+    source_surface = _normalize_surface(experiment.get("source_surface"))
+    permitted = _surface_values(experiment.get("permitted_target_surface"))
+    if not permitted:
+        permitted = _surface_values(experiment.get("permitted_target_surfaces"))
+    target_surface = _candidate_target_surface(candidate)
+    missing = []
+    if source_surface is None:
+        missing.append("source_surface")
+    if not permitted:
+        missing.append("permitted_target_surface")
+    if target_surface is None:
+        missing.append("target_surface")
+    eligible = not missing and target_surface in permitted
+    reason = (
+        "surface_compatible"
+        if eligible
+        else "missing_surface_metadata"
+        if missing
+        else "target_surface_not_permitted"
+    )
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "source_surface": source_surface,
+        "target_surface": target_surface,
+        "permitted_target_surface": permitted,
+        "missing_fields": missing,
+        "review_required": not eligible,
+        "paper_only": True,
+    }
 
 
 def _runtime_strategy_vocabulary(candidates: list[dict]) -> dict:
@@ -669,11 +781,19 @@ def _structured_strategy_contract(payload: dict, proposed: dict) -> dict | None:
         ).encode("utf-8")
     ).hexdigest()[:10]
     strategy_lab_id = f"{_slug(variant_name or payload.get('title') or hypothesis)}_{digest}"
+    source_surface = _first_explicit(sources, "source_surface")
+    permitted_target_surface = _first_explicit(
+        sources,
+        "permitted_target_surface",
+        "permitted_target_surfaces",
+    )
     return {
         "strategy_lab_id": strategy_lab_id,
         "version": 1,
         "experiment_type": "market_strategy",
         "hypothesis": hypothesis,
+        "source_surface": source_surface,
+        "permitted_target_surface": permitted_target_surface,
         "strategy_logic": logic,
         "data_requirements": {
             "paper_only": True,
@@ -770,6 +890,23 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
     ):
         if payload.get(source) not in (None, ""):
             data_requirements.setdefault(target, payload[source])
+    if experiment_type == "market_strategy":
+        surface_policy = _surface_contract(payload, contract, data_requirements)
+        data_requirements["source_surface"] = surface_policy["source_surface"]
+        data_requirements["permitted_target_surface"] = surface_policy["permitted_target_surface"]
+        data_requirements["surface_policy_required"] = True
+        if not surface_policy["eligible"]:
+            status = "quarantined_surface_policy"
+    else:
+        surface_policy = {
+            "source_surface": None,
+            "permitted_target_surface": [],
+            "eligible": True,
+            "reason": "non_market_experiment_not_applicable",
+            "missing_fields": [],
+            "review_required": False,
+            "paper_only": True,
+        }
     parent = contract.get("parent_strategy_lab_id")
 
     return {
@@ -779,6 +916,9 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
         "experiment_type": experiment_type,
         "status": status,
         "hypothesis": hypothesis,
+        "source_surface": surface_policy["source_surface"],
+        "permitted_target_surface": surface_policy["permitted_target_surface"],
+        "surface_policy": surface_policy,
         "strategy_logic": logic,
         "data_requirements": data_requirements,
         "risk_gates": risk_gates,
@@ -874,6 +1014,9 @@ def ingest_strategy_lab_recommendation(
         json.dumps(contract["data_requirements"], sort_keys=True),
         json.dumps(contract["risk_gates"], sort_keys=True),
         json.dumps(contract["promotion_rules"], sort_keys=True),
+        contract["source_surface"],
+        json.dumps(contract["permitted_target_surface"], sort_keys=True),
+        json.dumps(contract["surface_policy"], sort_keys=True),
         payload.get("agent_name") or payload.get("source_agent") or rec.get("source_agent"),
         rec.get("recommendation_id"),
         now,
@@ -886,9 +1029,10 @@ def ingest_strategy_lab_recommendation(
                 strategy_lab_id, version, parent_strategy_lab_id, experiment_type, status, hypothesis,
                 strategy_logic_json, original_strategy_logic_json, compile_status, compile_diagnostics_json,
                 data_requirements_json, risk_gates_json,
-                promotion_rules_json, source_agent, source_recommendation_id,
+                promotion_rules_json, source_surface, permitted_target_surfaces_json, surface_policy_json,
+                source_agent, source_recommendation_id,
                 created_at, updated_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -899,6 +1043,7 @@ def ingest_strategy_lab_recommendation(
             """
             update strategy_lab_experiments
             set updated_at = ?, status = case
+                    when ? = 'quarantined_surface_policy' then ?
                     when status in ('promoted_to_code', 'promotion_queued') then status
                     else ?
                 end,
@@ -912,11 +1057,16 @@ def ingest_strategy_lab_recommendation(
                 data_requirements_json = ?,
                 risk_gates_json = ?,
                 promotion_rules_json = ?,
+                source_surface = ?,
+                permitted_target_surfaces_json = ?,
+                surface_policy_json = ?,
                 source_recommendation_id = coalesce(source_recommendation_id, ?)
             where strategy_lab_id = ?
             """,
             (
                 now,
+                contract["status"],
+                contract["status"],
                 contract["status"],
                 contract["hypothesis"],
                 contract["experiment_type"],
@@ -935,6 +1085,9 @@ def ingest_strategy_lab_recommendation(
                 json.dumps(contract["data_requirements"], sort_keys=True),
                 json.dumps(contract["risk_gates"], sort_keys=True),
                 json.dumps(contract["promotion_rules"], sort_keys=True),
+                contract["source_surface"],
+                json.dumps(contract["permitted_target_surface"], sort_keys=True),
+                json.dumps(contract["surface_policy"], sort_keys=True),
                 rec.get("recommendation_id"),
                 contract["strategy_lab_id"],
             ),
@@ -959,11 +1112,21 @@ def ingest_strategy_lab_recommendation(
 
     return [
         {
-            "action_status": "created",
+            "action_status": (
+                "quarantined"
+                if contract["status"] == "quarantined_surface_policy"
+                else "created"
+            ),
             "artifact": "strategy_lab_experiment",
             "strategy_lab_id": contract["strategy_lab_id"],
             "experiment_type": contract["experiment_type"],
             "status": contract["status"],
+            "surface_policy": contract["surface_policy"],
+            "reason": (
+                contract["surface_policy"]["reason"]
+                if contract["status"] == "quarantined_surface_policy"
+                else None
+            ),
             "novelty_status": novelty_status,
             "created": created,
         }
@@ -1000,6 +1163,10 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
             item["strategy_logic"],
         )
         item["data_requirements"] = _json_loads(item.pop("data_requirements_json"), {})
+        item["permitted_target_surface"] = _json_loads(
+            item.pop("permitted_target_surfaces_json", None), []
+        )
+        item["surface_policy"] = _json_loads(item.pop("surface_policy_json", None), {})
         item["risk_gates"] = _json_loads(item.pop("risk_gates_json"), {})
         item["promotion_rules"] = _json_loads(item.pop("promotion_rules_json"), {})
         item["evaluation"] = _json_loads(item.pop("evaluation_json"), {})
@@ -1534,6 +1701,49 @@ def _compile_strategy_lab_contracts(
         if not original:
             original = _json_loads(row.get("strategy_logic_json"), {})
         data_requirements = _json_loads(row.get("data_requirements_json"), {})
+        surface_experiment = {
+            "source_surface": row.get("source_surface"),
+            "permitted_target_surface": _json_loads(
+                row.get("permitted_target_surfaces_json"), []
+            ),
+        }
+        surface_contract = _surface_compatibility(surface_experiment, {})
+        contract_missing = [
+            field
+            for field in surface_contract["missing_fields"]
+            if field != "target_surface"
+        ]
+        if contract_missing:
+            diagnostic = {
+                "compiled_at": now,
+                "compile_status": "surface_quarantined",
+                "reason": "missing_surface_metadata",
+                "missing_fields": contract_missing,
+                "surface_policy": surface_contract,
+                "review_required": True,
+            }
+            prior_evaluation = _json_loads(row.get("evaluation_json"), {})
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set compile_status = 'surface_quarantined', compile_diagnostics_json = ?,
+                    status = 'quarantined_surface_policy', updated_at = ?,
+                    last_compiled_at = ?, compile_attempts = compile_attempts + 1,
+                    evaluation_json = ?, surface_policy_json = ?
+                where strategy_lab_id = ?
+                """,
+                (
+                    json.dumps(diagnostic, sort_keys=True),
+                    now,
+                    now,
+                    json.dumps({**prior_evaluation, "contract_compilation": diagnostic}, sort_keys=True),
+                    json.dumps(surface_contract, sort_keys=True),
+                    row["strategy_lab_id"],
+                ),
+            )
+            summary["surface_quarantined"] += 1
+            diagnostics[str(row["strategy_lab_id"])] = diagnostic
+            continue
         if str(original.get("type") or original.get("logic_type") or "") == OBSERVATION_PROGRAM:
             compiled_program, program_diagnostic = compile_observation_program(original)
             signature = novelty_signature(compiled_program or original) if original else None
@@ -1630,7 +1840,22 @@ def _compile_strategy_lab_contracts(
             summary[compile_status] += 1
             diagnostics[str(row["strategy_lab_id"])] = diagnostic
             continue
-        logic = _normalize_strategy_logic(original, vocabulary)
+        compatible_runtime_evidence: list[dict] = []
+        surface_quarantined_evidence: list[dict] = []
+        for candidate in runtime_evidence:
+            compatibility = _surface_compatibility(surface_experiment, candidate)
+            if compatibility["eligible"]:
+                compatible_runtime_evidence.append(candidate)
+            else:
+                surface_quarantined_evidence.append(
+                    {
+                        "inst_id": candidate.get("inst_id"),
+                        "venue": candidate.get("venue"),
+                        **compatibility,
+                    }
+                )
+        surface_vocabulary = _runtime_strategy_vocabulary(compatible_runtime_evidence)
+        logic = _normalize_strategy_logic(original, surface_vocabulary)
 
         # Admission-generated ideas carry an exact instrument as evidence. Use
         # that observation to learn the runtime surface, but keep the strategy
@@ -1638,7 +1863,7 @@ def _compile_strategy_lab_contracts(
         requested_inst = str(data_requirements.get("inst_id") or "").strip()
         evidence_candidates = [
             candidate
-            for candidate in runtime_evidence
+            for candidate in compatible_runtime_evidence
             if requested_inst and str(candidate.get("inst_id")) == requested_inst
         ]
         if evidence_candidates:
@@ -1653,7 +1878,7 @@ def _compile_strategy_lab_contracts(
         nearest: list[dict] = []
         matches: list[dict] = []
         if _has_strategy_scope(logic):
-            for candidate in runtime_evidence:
+            for candidate in compatible_runtime_evidence:
                 reasons = _scope_match_reasons(candidate, logic)
                 if not reasons:
                     matches.append(candidate)
@@ -1673,9 +1898,11 @@ def _compile_strategy_lab_contracts(
         unsupported_fields = [
             field
             for field in required_fields
-            if not any(_candidate_field_value(candidate, field) is not None for candidate in runtime_evidence)
+            if not any(_candidate_field_value(candidate, field) is not None for candidate in compatible_runtime_evidence)
         ]
-        capability_issues = _scope_capability_issues(logic, vocabulary, runtime_evidence)
+        capability_issues = _scope_capability_issues(
+            logic, surface_vocabulary, compatible_runtime_evidence
+        )
         if not _has_strategy_scope(logic):
             compile_status = "needs_contract_repair"
             status = "needs_data"
@@ -1684,10 +1911,14 @@ def _compile_strategy_lab_contracts(
             compile_status = "needs_data"
             status = "needs_data"
             reason = "unsupported_required_fields"
-        elif not runtime_evidence:
+        elif not compatible_runtime_evidence:
             compile_status = "needs_data"
             status = "needs_data"
-            reason = "runtime_candidate_pool_empty"
+            reason = (
+                "no_surface_compatible_runtime_evidence"
+                if runtime_evidence
+                else "runtime_candidate_pool_empty"
+            )
         elif capability_issues:
             compile_status = "needs_data"
             status = "needs_data"
@@ -1702,9 +1933,12 @@ def _compile_strategy_lab_contracts(
             "compile_status": compile_status,
             "reason": reason,
             "runtime_schema_fingerprint": schema_fingerprint,
-            "source_candidate_count": len(runtime_evidence),
+            "source_candidate_count": len(compatible_runtime_evidence),
             "current_candidate_count": len(candidates),
-            "persisted_evidence_count": max(0, len(runtime_evidence) - len(candidates)),
+            "persisted_evidence_count": max(0, len(compatible_runtime_evidence) - len(candidates)),
+            "surface_policy": surface_experiment,
+            "surface_quarantined_candidate_count": len(surface_quarantined_evidence),
+            "surface_quarantined_candidates": surface_quarantined_evidence[:10],
             "scope_match_count": len(matches),
             "unsupported_required_fields": unsupported_fields,
             "capability_issues": capability_issues,
@@ -1873,6 +2107,8 @@ def generate_strategy_lab_candidates(
     rejects: dict[str, Counter] = defaultdict(Counter)
     nearest_candidates: dict[str, list[dict]] = defaultdict(list)
     status_by_experiment: dict[str, str] = {}
+    surface_quarantined_applications: list[dict] = []
+    surface_quarantine_reasons: Counter = Counter()
 
     pool = sorted(
         eligible_candidates,
@@ -1901,6 +2137,30 @@ def generate_strategy_lab_candidates(
                 settings,
                 max_candidates=min(max_per_experiment, remaining),
             )
+            compatible_program_candidates: list[dict] = []
+            for candidate in program_candidates:
+                compatibility = _surface_compatibility(experiment, candidate)
+                if compatibility["eligible"]:
+                    annotated = dict(candidate)
+                    annotated["strategy_lab_surface_policy"] = compatibility
+                    annotated["source_surface"] = experiment.get("source_surface")
+                    annotated["permitted_target_surface"] = list(
+                        experiment.get("permitted_target_surface") or []
+                    )
+                    annotated["target_surface"] = compatibility["target_surface"]
+                    compatible_program_candidates.append(annotated)
+                    continue
+                surface_quarantine_reasons[compatibility["reason"]] += 1
+                rejects[experiment_id][f"surface_policy:{compatibility['reason']}"] += 1
+                surface_quarantined_applications.append(
+                    {
+                        "strategy_lab_id": experiment_id,
+                        "inst_id": candidate.get("inst_id"),
+                        "venue": candidate.get("venue"),
+                        **compatibility,
+                    }
+                )
+            program_candidates = compatible_program_candidates
             (
                 program_candidates,
                 program_route_blocked,
@@ -1956,7 +2216,28 @@ def generate_strategy_lab_candidates(
         bonus = max(0.0, min(max_bonus, _as_float(logic.get("score_bonus"), default_bonus)))
         edge_bonus = max(0.0, min(max_bonus, _as_float(logic.get("edge_bonus_bps"), 0.0)))
         local_limit = min(max_per_experiment, max(1, _as_int(logic.get("max_candidates_per_loop"), max_per_experiment)))
+        surface_rank_pool: list[dict] = []
         for candidate in pool:
+            compatibility = _surface_compatibility(experiment, candidate)
+            if compatibility["eligible"]:
+                annotated = dict(candidate)
+                annotated["strategy_lab_surface_policy"] = compatibility
+                surface_rank_pool.append(annotated)
+                continue
+            surface_quarantine_reasons[compatibility["reason"]] += 1
+            rejects[experiment["strategy_lab_id"]][f"surface_policy:{compatibility['reason']}"] += 1
+            surface_quarantined_applications.append(
+                {
+                    "strategy_lab_id": experiment["strategy_lab_id"],
+                    "inst_id": candidate.get("inst_id"),
+                    "venue": candidate.get("venue"),
+                    **compatibility,
+                }
+            )
+        surface_rank_pool.sort(
+            key=lambda row: (_paper_route_rank(row), -_as_float(row.get("score")))
+        )
+        for candidate in surface_rank_pool:
             if len(generated) >= max_total or per_experiment[experiment["strategy_lab_id"]] >= local_limit:
                 break
             ok, reasons = _matches_logic(candidate, logic, risk_gates, settings)
@@ -1984,6 +2265,11 @@ def generate_strategy_lab_candidates(
             lab_candidate["strategy_lab_source_trade_type"] = candidate.get("trade_type")
             lab_candidate["strategy_lab_source_signal_key"] = candidate.get("signal_key")
             lab_candidate["strategy_lab_candidate"] = True
+            lab_candidate["source_surface"] = experiment.get("source_surface")
+            lab_candidate["permitted_target_surface"] = list(
+                experiment.get("permitted_target_surface") or []
+            )
+            lab_candidate["target_surface"] = _candidate_target_surface(candidate)
             lab_candidate["strategy_lab_normalized_features"] = {
                 "quality_score": _candidate_field_value(candidate, "quality_score"),
                 "stale_minutes": _candidate_field_value(candidate, "stale_minutes"),
@@ -2066,6 +2352,14 @@ def generate_strategy_lab_candidates(
         "generated_at": _utc(),
         "active_experiments": len(experiments),
         "source_candidate_count": len(candidates),
+        "surface_policy_enforced": True,
+        "surface_quarantined_application_count": len(surface_quarantined_applications),
+        "surface_quarantine_reason_counts": dict(surface_quarantine_reasons),
+        "surface_quarantined_applications": surface_quarantined_applications[:20],
+        "surface_quarantined_construction_count": sum(
+            int(diagnostic.get("surface_quarantined_candidate_count") or 0)
+            for diagnostic in (compilation.get("diagnostics") or {}).values()
+        ),
         "source_vetoed_candidate_count": len(source_vetoed_candidates),
         "source_vetoed_candidates": source_vetoed_candidates[:20],
         "source_vetoed_experiment_count": len(source_vetoed_experiments),
@@ -2125,7 +2419,12 @@ def _pnl_stats(values: list[float]) -> dict:
     }
 
 
-def _experiment_outcomes(conn: sqlite3.Connection, strategy_lab_id: str, horizon: int) -> dict:
+def _experiment_outcomes(
+    conn: sqlite3.Connection,
+    strategy_lab_id: str,
+    horizon: int,
+    experiment: dict | None = None,
+) -> dict:
     rows = conn.execute(
         """
         select p.id, p.opened_at, p.closed_at, p.venue, p.inst_id, p.direction, p.trade_type,
@@ -2143,11 +2442,25 @@ def _experiment_outcomes(conn: sqlite3.Connection, strategy_lab_id: str, horizon
     by_region: dict[str, list[float]] = defaultdict(list)
     by_venue: dict[str, list[float]] = defaultdict(list)
     examples = []
+    surface_quarantined = []
     for row in rows:
         item = dict(row)
         status = str(item.get("measurement_status") or "missing")
-        status_counts[status] += 1
         candidate = _json_loads(item.get("candidate_json"), {})
+        if experiment is not None:
+            compatibility = _surface_compatibility(experiment, candidate)
+            if not compatibility["eligible"]:
+                status_counts["surface_quarantined"] += 1
+                surface_quarantined.append(
+                    {
+                        "trade_id": item["id"],
+                        "venue": item.get("venue"),
+                        "inst_id": item.get("inst_id"),
+                        **compatibility,
+                    }
+                )
+                continue
+        status_counts[status] += 1
         review = _json_loads(item.get("review_json"), {})
         route = str(review.get("route_status") or candidate.get("route_status") or (candidate.get("execution_feasibility") or {}).get("status") or "unknown")
         route_counts[route] += 1
@@ -2176,6 +2489,8 @@ def _experiment_outcomes(conn: sqlite3.Connection, strategy_lab_id: str, horizon
         "by_region": {key: _pnl_stats(value) for key, value in by_region.items()},
         "by_venue": {key: _pnl_stats(value) for key, value in by_venue.items()},
         "examples": examples,
+        "surface_quarantined_count": len(surface_quarantined),
+        "surface_quarantined_examples": surface_quarantined[:10],
     }
 
 
@@ -2243,6 +2558,8 @@ def _queue_promotion(
                 "hypothesis": experiment["hypothesis"],
                 "strategy_logic": logic,
                 "risk_gates": experiment.get("risk_gates", {}),
+                "source_surface": experiment.get("source_surface"),
+                "permitted_target_surface": experiment.get("permitted_target_surface", []),
             },
             "promotion_target": {
                 "module": target_module if is_observation_program else None,
@@ -2353,9 +2670,10 @@ def _maybe_split_children(
                 insert into strategy_lab_experiments (
                     strategy_lab_id, version, parent_strategy_lab_id, experiment_type, status, hypothesis,
                     strategy_logic_json, data_requirements_json, risk_gates_json,
-                    promotion_rules_json, source_agent, source_recommendation_id,
+                    promotion_rules_json, source_surface, permitted_target_surfaces_json, surface_policy_json,
+                    source_agent, source_recommendation_id,
                     created_at, updated_at
-                ) values (?, ?, ?, ?, 'active_testing', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) values (?, ?, ?, ?, 'active_testing', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     child_id,
@@ -2367,6 +2685,9 @@ def _maybe_split_children(
                     json.dumps(experiment.get("data_requirements") or {}, sort_keys=True),
                     json.dumps(experiment.get("risk_gates") or {}, sort_keys=True),
                     json.dumps(experiment.get("promotion_rules") or {}, sort_keys=True),
+                    experiment.get("source_surface"),
+                    json.dumps(experiment.get("permitted_target_surface") or [], sort_keys=True),
+                    json.dumps(experiment.get("surface_policy") or {}, sort_keys=True),
                     "strategy_lab_evaluator",
                     experiment.get("source_recommendation_id"),
                     now,
@@ -2409,7 +2730,12 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             )
             continue
         rules = _rules(settings, experiment)
-        outcomes = _experiment_outcomes(conn, experiment["strategy_lab_id"], rules["horizon_minutes"])
+        outcomes = _experiment_outcomes(
+            conn,
+            experiment["strategy_lab_id"],
+            rules["horizon_minutes"],
+            experiment,
+        )
         metrics = outcomes["metrics"]
         count = int(metrics.get("count") or 0)
         avg = metrics.get("avg_pnl_bps")
@@ -2524,7 +2850,8 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
                experiment_type, strategy_logic_json, created_at, updated_at, last_evaluated_at, evaluation_json,
                consecutive_passes, promoted_proposal_id, compile_status,
                compile_diagnostics_json, runtime_schema_fingerprint, compile_attempts, last_compiled_at,
-               novelty_signature, novelty_status, novelty_details_json
+               novelty_signature, novelty_status, novelty_details_json,
+               source_surface, permitted_target_surfaces_json, surface_policy_json
         from strategy_lab_experiments
         order by updated_at desc
         limit ?
@@ -2540,6 +2867,10 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
         item["evaluation"] = _json_loads(item.pop("evaluation_json"), {})
         item["compile_diagnostics"] = _json_loads(item.pop("compile_diagnostics_json"), {})
         item["novelty_details"] = _json_loads(item.pop("novelty_details_json"), {})
+        item["permitted_target_surface"] = _json_loads(
+            item.pop("permitted_target_surfaces_json"), []
+        )
+        item["surface_policy"] = _json_loads(item.pop("surface_policy_json"), {})
         recent_status_counts[item["status"]] += 1
         items.append(item)
     total = conn.execute("select count(*) as n from strategy_lab_experiments").fetchone()
@@ -2614,6 +2945,17 @@ def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
             }
             for item in items
             if item.get("experiment_type") == "market_strategy" and item.get("compile_status") != "compiled"
+        ][:20],
+        "surface_quarantine_review": [
+            {
+                "strategy_lab_id": item["strategy_lab_id"],
+                "status": item["status"],
+                "source_surface": item.get("source_surface"),
+                "permitted_target_surface": item.get("permitted_target_surface", []),
+                "surface_policy": item.get("surface_policy", {}),
+            }
+            for item in items
+            if item.get("status") == "quarantined_surface_policy"
         ][:20],
         "recent": items,
         "recent_market_strategies": [
