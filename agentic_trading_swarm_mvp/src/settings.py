@@ -106,6 +106,12 @@ DEFAULT_SETTINGS = {
         "allow_native_proxy_monitoring": True,
         "reenable_condition": "native_crypto_confirmation_with_positive_closed_signal_performance",
     },
+    "paper_portability_quarantine": {
+        "enabled": True,
+        "min_closed_count": 20,
+        "min_expectancy_net_bps": 0.0,
+        "neutral_score": 0.0,
+    },
     "paper_cell_policy": {
         "min_closed_trades": 3,
         "probation_ttl_days": 7,

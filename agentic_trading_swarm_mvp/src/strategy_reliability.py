@@ -57,6 +57,19 @@ PAPER_MODE_CONFIG_KEYS = (
 )
 PAPER_MODE_VALUES = {"paper", "paper_only", "research", "simulation", "sim", "dry_run", "dryrun", "backtest"}
 LIVE_MODE_VALUES = {"live", "production", "prod", "real", "broker"}
+PAPER_PORTABILITY_QUARANTINE_FLAG_KEYS = (
+    "paper_portability_quarantine_enabled",
+    "cross_surface_portability_quarantine_enabled",
+    "paper_cross_family_portability_guard_enabled",
+)
+PAPER_PORTABILITY_QUARANTINE_SCOPES = (
+    "paper_portability_quarantine",
+    "paper_policy",
+    "strategy_reliability",
+    "paper",
+)
+PAPER_PORTABILITY_MIN_CLOSED_COUNT = 20
+PAPER_PORTABILITY_MIN_EXPECTANCY_NET_BPS = 0.0
 PAPER_CONTEXT_PROMOTION_FLAG_KEYS = (
     "paper_context_promotion_guard_enabled",
     "paper_cross_surface_scope_guard_enabled",
@@ -1150,6 +1163,7 @@ def evaluate_paper_cell_policy(
         already_backfilled=not needs_cost_backfill,
     )
     avg_pnl_bps = _as_float(cost_audit.get("adjusted_pnl_bps"), reported_avg_pnl_bps)
+    portability = paper_portability_quarantine_record(record, config=config)
     promotion_min_closed_trades = min_closed_trades
     asymmetric_direction_reasons = _paper_cell_asymmetric_direction_reasons(record, cell)
     if asymmetric_direction_reasons:
@@ -1188,6 +1202,8 @@ def evaluate_paper_cell_policy(
     } or bool(cost_audit.get("backfill_applied"))
     if quality_audit["applies"] and not verified_cost_basis:
         promotion_blockers.append("unverified_realized_cost_basis")
+    if portability is not None and not portability["promotion_eligible"]:
+        promotion_blockers.append(portability["reason"])
 
     if closed_count >= min_closed_trades and avg_pnl_bps <= revert_avg_pnl_bps:
         decision = "reverted"
@@ -1231,6 +1247,7 @@ def evaluate_paper_cell_policy(
             "quality_audit": quality_audit,
             "realized_cost_audit": cost_audit,
             "realized_cost_basis_verified": verified_cost_basis,
+            "portability_quarantine": portability,
         },
         "reviewed_at": current_now.isoformat(),
     }
@@ -1271,6 +1288,269 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if text in {"0", "false", "f", "no", "n", "off", "disabled"}:
         return False
     return default
+
+
+def _portability_policy(config: Mapping[str, Any] | bool | None) -> dict[str, Any]:
+    policy: dict[str, Any] = {}
+    if isinstance(config, Mapping):
+        for container in (
+            config,
+            config.get("paper"),
+            config.get("paper_policy"),
+            config.get("strategy_reliability"),
+        ):
+            if not isinstance(container, Mapping):
+                continue
+            nested = container.get("paper_portability_quarantine")
+            if isinstance(nested, Mapping):
+                policy.update(nested)
+        for key in PAPER_PORTABILITY_QUARANTINE_FLAG_KEYS:
+            if key in config:
+                policy["enabled"] = config.get(key)
+        for key in ("enabled", "min_closed_count", "min_closed_trades", "min_expectancy_net_bps", "min_expectancy_bps", "neutral_score"):
+            if key in config:
+                policy[key] = config.get(key)
+    elif isinstance(config, bool):
+        policy["enabled"] = config
+    return policy
+
+
+def _portability_mode_is_paper(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None,
+) -> bool:
+    containers: list[Mapping[str, Any]] = [candidate]
+    if isinstance(config, Mapping):
+        containers.append(config)
+        for scope in PAPER_PORTABILITY_QUARANTINE_SCOPES:
+            scoped = config.get(scope)
+            if isinstance(scoped, Mapping):
+                containers.append(scoped)
+    for container in containers:
+        for key in PAPER_MODE_CONFIG_KEYS:
+            mode = _family_identity_token(container.get(key))
+            if mode in LIVE_MODE_VALUES:
+                return False
+    return True
+
+
+def _portability_family(value: Any) -> str | None:
+    token = _family_identity_token(value)
+    if not token:
+        return None
+    parts = set(token.split("_"))
+    if "crypto" in parts or parts.intersection({"perp", "perpetual", "swap"}):
+        return "crypto"
+    if "proxy" in parts or "yahoo" in parts:
+        return "proxy"
+    if parts.intersection({"equity", "equities", "stock", "stocks", "etf"}):
+        return "equities"
+    if parts.intersection({"prediction", "event", "kalshi", "polymarket"}):
+        return "prediction_markets"
+    if parts.intersection({"energy", "power", "electricity"}):
+        return "energy"
+    return token
+
+
+def _first_portability_family(
+    containers: list[tuple[str, Mapping[str, Any]]],
+    fields: tuple[str, ...],
+) -> tuple[str | None, str | None, str | None]:
+    for container_name, container in containers:
+        for field in fields:
+            raw = container.get(field)
+            family = _portability_family(raw)
+            if family:
+                return family, str(raw), f"{container_name}.{field}"
+    return None, None, None
+
+
+def _portability_families(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    source_containers: list[tuple[str, Mapping[str, Any]]] = []
+    destination_containers: list[tuple[str, Mapping[str, Any]]] = []
+    for field in ("source_context", "origin_context", "recommendation_context", "lineage_source_context"):
+        nested = candidate.get(field)
+        if isinstance(nested, Mapping):
+            source_containers.append((field, nested))
+    source_containers.append(("candidate", candidate))
+    for field in ("destination_context", "target_context", "execution_context", "route_context", "candidate"):
+        nested = candidate.get(field) if field != "candidate" else candidate
+        if isinstance(nested, Mapping):
+            destination_containers.append((field, nested))
+
+    source = _first_portability_family(
+        source_containers,
+        (
+            "source_market_family",
+            "origin_market_family",
+            "source_execution_family",
+            "source_family",
+            "data_source_family",
+            "observation_source_family",
+            "market_family",
+            "execution_family",
+            "instrument_family",
+            "asset_class",
+        ),
+    )
+    destination = _first_portability_family(
+        destination_containers,
+        (
+            "destination_execution_family",
+            "destination_market_family",
+            "target_market_family",
+            "target_execution_family",
+            "execution_family",
+            "market_family",
+            "instrument_family",
+            "asset_class",
+            "market_surface",
+        ),
+    )
+    return {
+        "source_family": source[0],
+        "source_family_raw": source[1],
+        "source_family_field": source[2],
+        "destination_family": destination[0],
+        "destination_family_raw": destination[1],
+        "destination_family_field": destination[2],
+    }
+
+
+def _portability_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    containers: list[tuple[str, Mapping[str, Any]]] = []
+    for field in (
+        "destination_family_paper_proof",
+        "destination_family_paper_stats",
+        "destination_paper_stats",
+        "translated_variant_paper_stats",
+        "portability_evidence",
+        "paper_portability_evidence",
+        "paper_performance",
+    ):
+        nested = candidate.get(field)
+        if isinstance(nested, Mapping):
+            containers.append((field, nested))
+    containers.append(("candidate", candidate))
+
+    closed_count = None
+    closed_count_field = None
+    expectancy_net_bps = None
+    expectancy_field = None
+    for name, container in containers:
+        if closed_count is None:
+            for field in (
+                "destination_family_closed_count",
+                "destination_paper_closed_count",
+                "closed_count",
+                "closed_trades",
+                "sample_size",
+                "trade_count",
+            ):
+                if container.get(field) is not None:
+                    closed_count = max(0, _as_int(container.get(field), 0))
+                    closed_count_field = f"{name}.{field}"
+                    break
+        if expectancy_net_bps is None:
+            for field in (
+                "destination_family_expectancy_net_bps",
+                "destination_expectancy_net_bps",
+                "expectancy_net_bps",
+                "net_expectancy_bps",
+                "recent_expectancy_bps",
+                "expectancy_bps",
+                "avg_pnl_bps",
+            ):
+                value = _maybe_float(container.get(field))
+                if value is not None:
+                    expectancy_net_bps = value
+                    expectancy_field = f"{name}.{field}"
+                    break
+    return {
+        "closed_count": closed_count,
+        "closed_count_field": closed_count_field,
+        "expectancy_net_bps": expectancy_net_bps,
+        "expectancy_field": expectancy_field,
+    }
+
+
+def paper_portability_quarantine_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    """Require destination-family paper proof for cross-family translations.
+
+    This policy only annotates paper research candidates. Native destination
+    strategies never enter the quarantine, and translated variants cannot rank
+    above neutral or promote until their destination family has sufficient,
+    strictly positive net paper expectancy.
+    """
+    if not isinstance(candidate, Mapping) or not _portability_mode_is_paper(candidate, config):
+        return None
+    policy = _portability_policy(config)
+    if not _as_bool(policy.get("enabled"), True):
+        return None
+
+    families = _portability_families(candidate)
+    source_family = families.get("source_family")
+    destination_family = families.get("destination_family")
+    if not source_family or not destination_family or source_family == destination_family:
+        return None
+
+    evidence = _portability_evidence(candidate)
+    min_closed_count = max(
+        1,
+        _as_int(
+            policy.get("min_closed_count", policy.get("min_closed_trades")),
+            PAPER_PORTABILITY_MIN_CLOSED_COUNT,
+        ),
+    )
+    min_expectancy = _as_float(
+        policy.get("min_expectancy_net_bps", policy.get("min_expectancy_bps")),
+        PAPER_PORTABILITY_MIN_EXPECTANCY_NET_BPS,
+    )
+    closed_count = evidence.get("closed_count")
+    expectancy = evidence.get("expectancy_net_bps")
+    sufficient = closed_count is not None and closed_count >= min_closed_count
+    positive = expectancy is not None and expectancy > min_expectancy
+    proven = bool(sufficient and positive)
+    if not sufficient:
+        reason = "insufficient_destination_family_paper_evidence"
+        state = "pending_destination_family_proof"
+    elif expectancy is None:
+        reason = "missing_destination_family_expectancy"
+        state = "pending_destination_family_proof"
+    elif not positive:
+        reason = "non_positive_destination_family_expectancy"
+        state = "destination_family_expectancy_failed"
+    else:
+        reason = "positive_destination_family_paper_expectancy"
+        state = "destination_family_proven"
+
+    return {
+        "guard": "paper_cross_family_portability_quarantine",
+        "paper_only": True,
+        "applies": True,
+        "eligible": proven,
+        "quarantined": not proven,
+        "reason": reason,
+        "state": state,
+        **families,
+        **evidence,
+        "min_closed_count": min_closed_count,
+        "min_expectancy_net_bps": min_expectancy,
+        "sufficient_closed_count": sufficient,
+        "positive_destination_expectancy": positive,
+        "destination_family_proof": proven,
+        "rank_above_neutral_allowed": proven,
+        "paper_rank_eligible": proven,
+        "promotion_eligible": proven,
+        "promotion_blocked": not proven,
+        "paper_fill_allowed": proven,
+        "paper_score_multiplier": 1.0 if proven else 0.0,
+        "paper_allocation_multiplier": 1.0 if proven else 0.0,
+        "neutral_score": _as_float(policy.get("neutral_score"), 0.0),
+    }
 
 
 def _flag_override(source: Any, keys: tuple[str, ...], scopes: tuple[str, ...]) -> bool | None:
@@ -2630,11 +2910,52 @@ def _apply_family_quarantine(
     return reliability
 
 
+def _apply_portability_quarantine(
+    candidate: dict,
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict | None:
+    quarantine = paper_portability_quarantine_record(candidate, config=config)
+    if quarantine is None:
+        return None
+    candidate["paper_portability_quarantine"] = dict(quarantine)
+    if quarantine["eligible"]:
+        return None
+
+    pre_quarantine_score = _as_float(candidate.get("score"), 0.0)
+    reliability = _annotate(
+        candidate,
+        profile="cross_family_portability_quarantine",
+        action="destination_family_proof_shadow_only",
+        reasons=[quarantine["reason"]],
+        allocation_multiplier=0.0,
+        shadow_only=True,
+    )
+    neutral_score = _as_float(quarantine.get("neutral_score"), 0.0)
+    candidate["pre_portability_quarantine_score"] = pre_quarantine_score
+    candidate["score"] = min(pre_quarantine_score, neutral_score)
+    candidate["paper_score_multiplier"] = 0.0
+    candidate["paper_score_eligible"] = False
+    candidate["paper_rank_eligible"] = False
+    candidate["paper_fill_allowed"] = False
+    candidate["paper_allocation_multiplier"] = 0.0
+    candidate["candidate_reject_reason"] = "paper_cross_family_portability_quarantine"
+    reliability["paper_portability_quarantine"] = dict(quarantine)
+    reliability["pre_quarantine_score"] = pre_quarantine_score
+    reliability["paper_score_multiplier"] = 0.0
+    reliability["paper_rank_eligible"] = False
+    candidate["strategy_reliability"] = reliability
+    _append_note(candidate, f"paper_portability_quarantine:{quarantine['reason']}")
+    return reliability
+
+
 def _apply_one(
     candidate: dict,
     config: Mapping[str, Any] | bool | None = None,
 ) -> dict | None:
     _record_proxy_short_quality(candidate, config)
+    portability_quarantine = _apply_portability_quarantine(candidate, config=config)
+    if portability_quarantine is not None:
+        return portability_quarantine
     quarantined = _apply_family_quarantine(candidate, config=config)
     if quarantined is not None:
         return quarantined
@@ -2659,6 +2980,9 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
     blocked = sum(1 for item in items if item["action"].startswith("shadow") or "shadow" in item["action"])
     protected = sum(1 for item in items if item.get("protect_working_slice"))
     quarantined = sum(1 for item in items if item.get("profile") == "yahoo_proxy_family_quarantine")
+    portability_quarantined = sum(
+        1 for item in items if item.get("profile") == "cross_family_portability_quarantine"
+    )
     by_quality_failure = collections.Counter(
         reason
         for candidate in candidates
@@ -2669,6 +2993,7 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         "annotated_count": len(items),
         "shadow_or_blocked_count": blocked,
         "family_quarantine_count": quarantined,
+        "portability_quarantine_count": portability_quarantined,
         "by_quality_failure": dict(by_quality_failure),
         "protected_working_slice_count": protected,
         "by_action": dict(by_action),
@@ -2757,6 +3082,7 @@ def _report_markdown(report: dict) -> str:
         f"- Candidates reviewed: `{summary.get('candidate_count', 0)}`",
         f"- Annotated candidates: `{summary.get('annotated_count', 0)}`",
         f"- Shadow/blocked by reliability layer: `{summary.get('shadow_or_blocked_count', 0)}`",
+        f"- Cross-family portability quarantines: `{summary.get('portability_quarantine_count', 0)}`",
         f"- Protected working slices: `{summary.get('protected_working_slice_count', 0)}`",
         f"- Actions: `{summary.get('by_action', {})}`",
         f"- Profiles: `{summary.get('by_profile', {})}`",
@@ -2794,6 +3120,55 @@ def _report_markdown(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _hydrate_portability_paper_evidence(candidates: list[dict], conn: Any | None) -> None:
+    """Attach prior-loop realized destination evidence without changing storage."""
+    if conn is None:
+        return
+    for candidate in candidates:
+        families = _portability_families(candidate)
+        if (
+            not families.get("source_family")
+            or not families.get("destination_family")
+            or families["source_family"] == families["destination_family"]
+        ):
+            continue
+        evidence = _portability_evidence(candidate)
+        if evidence.get("closed_count") is not None or evidence.get("expectancy_net_bps") is not None:
+            continue
+        candidate_signal_key = signal_key(candidate)
+        try:
+            row = conn.execute(
+                """
+                select closed_count, avg_pnl_bps, win_rate, updated_at
+                from signal_stats
+                where signal_key = ?
+                """,
+                (candidate_signal_key,),
+            ).fetchone()
+        except Exception:  # noqa: BLE001 - optional read-only runtime evidence
+            continue
+        if row is None:
+            continue
+        try:
+            stats = dict(row)
+        except (TypeError, ValueError):
+            stats = {
+                "closed_count": row[0],
+                "avg_pnl_bps": row[1],
+                "win_rate": row[2],
+                "updated_at": row[3],
+            }
+        candidate["destination_family_paper_stats"] = {
+            "signal_key": candidate_signal_key,
+            "closed_count": stats.get("closed_count"),
+            "expectancy_net_bps": stats.get("avg_pnl_bps"),
+            "win_rate": stats.get("win_rate"),
+            "updated_at": stats.get("updated_at"),
+            "evidence_source": "persisted_paper_signal_stats",
+            "cost_basis": "realized_paper_pnl_bps",
+        }
+
+
 def apply_strategy_reliability(
     candidates: list[dict],
     settings: dict | None = None,
@@ -2801,6 +3176,7 @@ def apply_strategy_reliability(
 ) -> tuple[list[dict], dict]:
     """Annotate candidates with bounded paper-only reliability controls."""
 
+    _hydrate_portability_paper_evidence(candidates, conn)
     for candidate in candidates:
         _remove_invalid_proxy_confirmation(candidate)
         _record_proxy_short_quality(candidate, settings)
@@ -2808,7 +3184,10 @@ def apply_strategy_reliability(
         quarantined = [
             record
             for candidate in candidates
-            for record in [_apply_family_quarantine(candidate, config=settings)]
+            for record in [
+                _apply_portability_quarantine(candidate, config=settings)
+                or _apply_family_quarantine(candidate, config=settings)
+            ]
             if record is not None
         ]
         candidates.sort(key=lambda row: row.get("score", 0), reverse=True)

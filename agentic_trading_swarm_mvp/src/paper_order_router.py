@@ -732,6 +732,24 @@ def _paper_family_quarantine_reason(
         return None
 
 
+def _paper_portability_quarantine_reason(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    try:
+        from strategy_reliability import paper_portability_quarantine_record
+    except Exception:
+        return None
+
+    try:
+        record = paper_portability_quarantine_record(candidate, config=config)
+    except Exception:
+        return None
+    if isinstance(record, Mapping) and not _as_bool(record.get("eligible"), False):
+        return dict(record)
+    return None
+
+
 def _paper_signal_cell(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
     try:
         from strategy_reliability import paper_signal_cell as _paper_signal_cell_record
@@ -860,6 +878,24 @@ def frontier_shadow_filter_reason(
                 }
             ],
             "alignment_guard": dict(alignment_guard),
+        }
+
+    portability_reason = _paper_portability_quarantine_reason(candidate, config=config)
+    if portability_reason is not None:
+        return {
+            **portability_reason,
+            "reason": portability_reason.get("reason") or "paper_cross_family_portability_quarantine",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "paper_cross_family_portability_quarantine",
+            "candidate": _candidate_reference(candidate),
+            "checks": [
+                {
+                    "code": portability_reason.get("reason"),
+                    "field": "paper_portability_quarantine",
+                }
+            ],
+            "portability_quarantine": portability_reason,
         }
 
     route_eligibility = candidate.get("paper_route_eligibility") or {}
@@ -1059,7 +1095,10 @@ def _annotate_shadow_filtered_candidate(
     guarded["candidate_reject_reason"] = guarded.get("candidate_reject_reason") or reason.get("reason") or FRONTIER_SHADOW_REASON
     guarded["candidate_reject_detail"] = dict(reason)
     guarded[detail_field] = dict(reason)
-    if reason.get("guard") == "yahoo_proxy_cross_surface_alignment_guard":
+    if reason.get("guard") in {
+        "yahoo_proxy_cross_surface_alignment_guard",
+        "paper_cross_family_portability_quarantine",
+    }:
         guarded["paper_entry_blocked"] = True
         guarded["promotion_eligible"] = False
         guarded["paper_allocation_multiplier"] = 0.0
