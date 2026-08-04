@@ -14,12 +14,14 @@ import datetime as dt
 import json
 import math
 import pathlib
+import statistics
 import sys
 import time
 import urllib.parse
 import urllib.request
 
 from scan_batch import ScanBatch, observation_from_candidate
+from paper_context_cost import annotate_paper_context_cost
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -131,13 +133,19 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
 
     direction = "long_proxy" if ret_1d_bps >= 0 else "short_proxy"
     abs_signal = abs(ret_1d_bps) * 0.11 + abs(ret_short_bps) * 0.16
-    edge_bps = round(max(0.0, min(abs_signal, 45.0) - spread), 3)
+    gross_edge_bps = min(abs_signal, 45.0)
+    one_bar_returns = [
+        bps_change(pairs[index][0], pairs[index - 1][0])
+        for index in range(max(1, len(pairs) - 12), len(pairs))
+    ]
+    recent_volatility_bps = statistics.pstdev(one_bar_returns) if len(one_bar_returns) > 1 else 0.0
+    edge_bps = round(max(0.0, gross_edge_bps - spread), 3)
     score = round(max(0.0, min(100.0, abs_signal + (liq * 25.0) - spread - min(stale_minutes / 10.0, 15.0))), 3)
     if stale_minutes > 120:
         direction = "watch_only"
         score = min(score, 25.0)
 
-    return {
+    candidate = {
         "seen_at": decision_time.isoformat(),
         "venue": "YAHOO_PROXY",
         "inst_id": item["symbol"],
@@ -151,12 +159,14 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
         "last": round(last, 6),
         "funding_bps": 0.0,
         "basis_bps": 0.0,
+        "gross_edge_bps_estimate": round(gross_edge_bps, 3),
         "edge_bps_estimate": edge_bps,
         "change_24h_pct": round(ret_1d_bps / 100.0, 3),
         "short_return_pct": round(ret_short_bps / 100.0, 3),
         "quote_volume_24h": round(recent_dollar_volume, 2),
         "liquidity_score": round(liq, 3),
         "spread_bps": round(spread, 3),
+        "recent_volatility_bps": round(recent_volatility_bps, 3),
         "last_bar_utc": last_seen.isoformat(),
         "source_bar_end_utc": last_seen.isoformat(),
         "decision_time_utc": decision_time.isoformat(),
@@ -177,6 +187,7 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
             "currency": meta.get("currency"),
         },
     }
+    return annotate_paper_context_cost(candidate, settings)
 
 
 def build_scan_batch(

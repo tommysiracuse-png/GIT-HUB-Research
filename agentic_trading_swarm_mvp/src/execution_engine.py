@@ -12,6 +12,7 @@ import math
 import sqlite3
 
 from paper_order_router import apply_frontier_paper_guard
+from paper_context_cost import enforce_paper_context_cost_gate
 from storage import save_execution_fill, save_execution_order
 
 
@@ -144,11 +145,13 @@ def _paper_fill_for_leg(leg: dict, settings: dict) -> dict:
 
 def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
     candidate = apply_frontier_paper_guard(candidate, settings)
+    if not candidate.get("shadow_filtered"):
+        candidate = enforce_paper_context_cost_gate(candidate, settings)
     order = build_order_ticket(candidate, review, settings)
     if candidate.get("shadow_filtered"):
         order["status"] = "shadow_filtered"
         order["shadow_filter"] = candidate.get("candidate_reject_detail")
-        order["notes"].append("Paper fill suppressed by the frontier paper guard.")
+        order["notes"].append("Paper fill suppressed by a paper-only candidate guard.")
         order_id = save_execution_order(conn, order, candidate, review)
         return {"order_id": order_id, "order": order, "fills": [], "paper_filled": False}
 

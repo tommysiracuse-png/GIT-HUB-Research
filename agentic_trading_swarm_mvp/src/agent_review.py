@@ -8,6 +8,7 @@ fast paper loop auditable.
 from __future__ import annotations
 
 from contextual_failure_filters import build_context_features, context_matches
+from paper_context_cost import paper_context_cost_gate
 from storage import signal_key
 
 
@@ -94,6 +95,7 @@ def review_candidate(
         and not paper_route_eligibility.get("suppressed", False)
     )
     net_edge_bps = estimate_net_edge_bps(candidate, settings)
+    context_cost_gate = paper_context_cost_gate(candidate, settings)
     context_features = build_context_features(candidate, {}, net_edge_bps=net_edge_bps)
     matched_policies = _matching_policies(key, policies, context_features)
 
@@ -105,6 +107,11 @@ def review_candidate(
         0.0,
         min(1.0, float(candidate.get("quality_allocation_multiplier", 1.0))),
     )
+    if context_cost_gate.get("applicable") and context_cost_gate.get("enabled"):
+        allocation_multiplier = min(
+            allocation_multiplier,
+            max(0.0, min(1.0, float(context_cost_gate.get("score_multiplier", 1.0)))),
+        )
     strategy_reliability = candidate.get("strategy_reliability") or {}
     if candidate.get("strategy_reliability_allocation_multiplier") is not None:
         allocation_multiplier = min(
@@ -131,6 +138,19 @@ def review_candidate(
         warnings.append(f"large 24h move: {candidate['change_24h_pct']}%")
     if net_edge_bps < risk["min_net_edge_bps"]:
         hard_blocks.append(f"estimated net edge too small after costs: {net_edge_bps} bps")
+    if context_cost_gate.get("applicable") and context_cost_gate.get("enabled"):
+        if context_cost_gate.get("eligible"):
+            evidence.append(
+                "paper context gross edge "
+                f"{context_cost_gate.get('gross_edge_bps')} bps clears required "
+                f"{context_cost_gate.get('required_gross_edge_bps')} bps"
+            )
+        else:
+            hard_blocks.append(
+                "paper context cost floor not cleared: gross edge "
+                f"{context_cost_gate.get('gross_edge_bps')} bps must exceed "
+                f"{context_cost_gate.get('required_gross_edge_bps')} bps"
+            )
     if feasibility_status == "conditional":
         if missing_requirements and route_alternative_usable:
             allocation_multiplier = min(
@@ -281,6 +301,7 @@ def review_candidate(
         "learned_score": learned_score,
         "confidence": confidence,
         "net_edge_bps_estimate": net_edge_bps,
+        "paper_context_cost_gate": context_cost_gate,
         "paper_allocation_multiplier": round(allocation_multiplier, 4),
         "applied_policies": applied_policies,
         "context_features": context_features,

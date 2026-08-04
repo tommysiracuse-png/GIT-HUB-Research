@@ -5328,6 +5328,7 @@ import urllib.request
 
 from regional_fx_reference import get_regional_fx_references
 from scan_batch import ScanBatch, normalize_observation
+from paper_context_cost import annotate_paper_context_cost
 
 DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY = {
     "fee_buffer_bps": 4.0,
@@ -8972,7 +8973,11 @@ def _candidate_from_observation(observation: dict, settings: dict, reference_pri
         score = min(25.0, 8.0 + abs(deviation) * 0.3 + liq * 10.0)
     feasibility = _preliminary_feasibility(direction, observation["market_type"], observation["data_status"], settings)
     funding_bps = (float(observation.get("funding_rate") or 0.0) * 10_000.0) if observation.get("funding_rate") is not None else 0.0
-    return {
+    change_24h_pct = float(as_float(observation.get("change_24h_pct"), 0.0) or 0.0)
+    recent_volatility_bps = as_float(observation.get("realized_volatility_bps"), None)
+    if recent_volatility_bps is None:
+        recent_volatility_bps = abs(change_24h_pct) * 100.0
+    candidate = {
         "seen_at": observation["last_checked_at"],
         "venue": observation["venue"],
         "inst_id": observation["instrument_id"],
@@ -9012,10 +9017,12 @@ def _candidate_from_observation(observation: dict, settings: dict, reference_pri
         "entry_slippage_bps_estimate": round(entry_slippage, 3),
         "exit_slippage_bps_estimate": round(exit_slippage, 3),
         "frontier_cost_source": cost_source,
-        "change_24h_pct": 0.0,
+        "change_24h_pct": round(change_24h_pct, 3),
         "quote_volume_24h": round(float(observation.get("quote_volume_24h") or 0.0), 3),
         "liquidity_score": liq,
+        "depth_liquidity_score": observation.get("depth_liquidity_score"),
         "spread_bps": spread,
+        "recent_volatility_bps": round(float(recent_volatility_bps), 3),
         "score": round(max(0.0, score), 3),
         "data_status": observation["data_status"],
         "http_status": observation["http_status"],
@@ -9054,6 +9061,7 @@ def _candidate_from_observation(observation: dict, settings: dict, reference_pri
             "notes": observation.get("notes", []),
         },
     }
+    return annotate_paper_context_cost(candidate, settings)
 
 
 def build_scan_batch(
