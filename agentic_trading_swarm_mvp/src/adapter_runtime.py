@@ -166,22 +166,51 @@ def build_scan_batch(settings: dict) -> ScanBatch:
                     )
                 )
     completed.sort(key=lambda item: item[0])
-    candidates = [candidate for _adapter_id, batch, _mode in completed for candidate in batch.candidates]
-    observations = [observation for _adapter_id, batch, _mode in completed for observation in batch.observations]
+    candidates: list[dict] = []
+    observations: list[dict] = []
+    normalized_batches: dict[str, tuple[list[dict], list[dict]]] = {}
+    for adapter_id, batch, _mode in completed:
+        info = get_adapter(adapter_id).info
+        batch_candidates = []
+        batch_observations = []
+        for candidate in batch.candidates:
+            normalized = dict(candidate)
+            normalized.setdefault("adapter_id", adapter_id)
+            normalized.setdefault("source_adapter_id", adapter_id)
+            normalized.setdefault("venue", info.venue)
+            batch_candidates.append(normalized)
+        for observation in batch.observations:
+            normalized = dict(observation)
+            normalized.setdefault("adapter_id", adapter_id)
+            normalized.setdefault("source_adapter_id", adapter_id)
+            normalized.setdefault("venue", info.venue)
+            batch_observations.append(normalized)
+        normalized_batches[adapter_id] = (batch_candidates, batch_observations)
+        candidates.extend(batch_candidates)
+        observations.extend(batch_observations)
     details = []
     statuses = Counter()
     venues = Counter()
     surfaces = Counter()
     for adapter_id, batch, mode in completed:
         info = get_adapter(adapter_id).info
+        batch_candidates, batch_observations = normalized_batches[adapter_id]
         source_status = str(batch.metadata.get("source_status") or "unknown")
         statuses[source_status] += 1
-        venues[str(info.venue)] += len(batch.observations)
+        venues[str(info.venue)] += len(batch_observations)
         batch_surfaces = Counter(
             str(row.get("market_surface") or row.get("market_type") or "unknown")
-            for row in batch.observations
+            for row in batch_observations
         )
         surfaces.update(batch_surfaces)
+        available_fields = sorted(
+            {
+                str(key)
+                for row in batch_observations[:100]
+                for key, value in row.items()
+                if value not in (None, "", [], {})
+            }
+        )
         details.append(
             {
                 "adapter_id": adapter_id,
@@ -189,20 +218,24 @@ def build_scan_batch(settings: dict) -> ScanBatch:
                 "market_type": info.market_type,
                 "source_status": source_status,
                 "cache_status": batch.metadata.get("cache_status") or mode,
-                "observation_count": len(batch.observations),
-                "candidate_count": len(batch.candidates),
+                "observation_count": len(batch_observations),
+                "price_observation_count": sum(float(row.get("last") or 0.0) > 0.0 for row in batch_observations),
+                "candidate_count": len(batch_candidates),
                 "research_only_count": sum(
                     1
-                    for row in batch.observations
+                    for row in batch_observations
                     if row.get("direction") == "watch_only" or row.get("candidate_reject_reason")
                 ),
                 "market_surfaces": dict(batch_surfaces),
                 "sample_instruments": [
                     str(row.get("inst_id") or row.get("instrument_id"))
-                    for row in batch.observations
+                    for row in batch_observations
                     if row.get("inst_id") or row.get("instrument_id")
                 ][:8],
+                "available_fields": available_fields,
                 "capability_gap": batch.metadata.get("capability_gap"),
+                "adapter_spec_id": batch.metadata.get("adapter_spec_id"),
+                "paper_only": bool(batch.metadata.get("paper_only", True)),
                 "runtime_entrypoint": info.runtime_entrypoint,
                 "docs_url": info.docs_url,
             }

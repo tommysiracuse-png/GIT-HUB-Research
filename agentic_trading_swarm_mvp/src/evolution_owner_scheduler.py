@@ -8,7 +8,7 @@ import sqlite3
 from typing import Any
 
 
-LANES = ("strategy", "adapter", "general")
+LANES = ("strategy", "adapter", "activation", "general")
 SCHEDULER_KEY = "codex_writer_round_robin_v1"
 
 

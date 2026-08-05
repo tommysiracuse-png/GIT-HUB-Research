@@ -560,6 +560,7 @@ def run_market_admission_monitor(
         proxy_short_review = proxy_short_quality_review(item, cfg)
         details = {
             **stats,
+            "adapter_id": item.get("adapter_id") or item.get("source_adapter_id"),
             "direction": item.get("direction"),
             "trade_type": item.get("trade_type"),
             "route_status": _route_status(item),

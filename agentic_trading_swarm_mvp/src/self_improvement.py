@@ -59,6 +59,7 @@ from strategy_implementation_owner import (
     enqueue_recommendation as enqueue_strategy_owner_recommendation,
     summary as strategy_owner_summary,
 )
+from market_activation_owner import summary as market_activation_owner_summary
 
 
 ACTIVE_POLICIES_JSON = RUNS_DIR / "active_signal_policies.json"
@@ -2620,6 +2621,7 @@ def write_reports(conn: sqlite3.Connection, report: dict | None = None, settings
     report["code_evolution"] = report.get("code_evolution") or write_code_evolution_reports(conn, settings)
     report["strategy_lab"] = report.get("strategy_lab") or strategy_lab_summary(conn)
     report["strategy_implementation_owner"] = strategy_owner_summary(conn, limit=40)
+    report["market_activation_owner"] = market_activation_owner_summary(conn, limit=60)
     report["recommendation_registry"] = registry_summary(conn)
     ACTIVE_POLICIES_JSON.write_text(json.dumps(report.get("active_policies", []), indent=2), encoding="utf-8")
     REPORT_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -2973,6 +2975,14 @@ def _report_markdown(report: dict) -> str:
         lines.append(f"- User capability constraints honored: `{admission_bridge.get('user_constraints_suppressed', 0)}`")
         lines.append(f"- By action: `{admission_bridge.get('by_action', {})}`")
         lines.append(f"- Report: `{RUNS_DIR / 'market_admission_report.md'}`")
+
+    activation_owner = report.get("market_activation_owner") or {}
+    if activation_owner:
+        lines.extend(["", "## Market Activation Owner", ""])
+        lines.append(f"- Surfaces by status: `{activation_owner.get('by_status', {})}`")
+        lines.append(f"- Conversion funnel: `{activation_owner.get('funnel', {})}`")
+        lines.append(f"- Codex outcomes: `{activation_owner.get('runs_by_decision', {})}`")
+        lines.append(f"- Report: `{RUNS_DIR / 'market_activation_owner.md'}`")
 
     research_path = RUNS_DIR / "research_worker_latest.json"
     if research_path.exists():

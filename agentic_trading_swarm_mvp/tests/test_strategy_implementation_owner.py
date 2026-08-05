@@ -465,9 +465,9 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
             evolution_owner_scheduler.record_turn(
                 self.conn, order[0], cycle_id=str(cycle), status="used", consumed_writer=True
             )
-        self.assertEqual(["strategy", "adapter", "general", "strategy", "adapter", "general"], seen)
+        self.assertEqual(["strategy", "adapter", "activation", "general", "strategy", "adapter"], seen)
         summary = evolution_owner_scheduler.scheduler_summary(self.conn)
-        self.assertEqual({"strategy": 2, "adapter": 2, "general": 2}, summary["turns_by_lane"])
+        self.assertEqual({"strategy": 2, "adapter": 2, "activation": 1, "general": 1}, summary["turns_by_lane"])
 
     def test_owner_prioritizes_new_strategy_when_testing_portfolio_is_thin(self) -> None:
         now = owner._utc_now()

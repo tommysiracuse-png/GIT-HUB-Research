@@ -971,6 +971,67 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists market_activation_tasks (
+            task_id text primary key,
+            created_at text not null,
+            updated_at text not null,
+            completed_at text,
+            dedupe_key text not null unique,
+            adapter_id text not null,
+            venue text not null,
+            market_surface text not null,
+            objective_type text not null,
+            priority integer not null,
+            status text not null,
+            source_adapter_spec_id integer,
+            source_admission_key text,
+            strategy_owner_task_id text,
+            strategy_lab_id text,
+            code_proposal_id text,
+            claimed_pid integer,
+            lease_expires_at text,
+            next_retry_at text,
+            attempt_count integer not null default 0,
+            evidence_json text not null default '{}',
+            acceptance_json text not null default '{}',
+            last_result_json text not null default '{}',
+            last_error_json text not null default '{}'
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_market_activation_tasks_status "
+        "on market_activation_tasks(status, priority desc, updated_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_market_activation_tasks_adapter "
+        "on market_activation_tasks(adapter_id, market_surface)"
+    )
+    conn.execute(
+        """
+        create table if not exists market_activation_runs (
+            run_id text primary key,
+            task_id text not null,
+            cycle_id text not null,
+            started_at text not null,
+            completed_at text,
+            status_before text not null,
+            status_after text,
+            decision text,
+            code_proposal_id text,
+            strategy_owner_task_id text,
+            result_json text not null default '{}',
+            error_json text not null default '{}',
+            foreign key(task_id) references market_activation_tasks(task_id)
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_market_activation_runs_task "
+        "on market_activation_runs(task_id, started_at desc)"
+    )
+    conn.execute(
+        """
         create table if not exists recommendation_topics (
             topic_key text primary key,
             created_at text not null,

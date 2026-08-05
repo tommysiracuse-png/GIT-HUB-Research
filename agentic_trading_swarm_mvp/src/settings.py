@@ -695,6 +695,17 @@ DEFAULT_SETTINGS = {
         "min_minutes_between_attempts": 15,
         "scan_limit": 100,
     },
+    "market_activation_owner": {
+        "enabled": True,
+        "max_new_tasks_per_cycle": 100,
+        "max_strategy_handoffs_per_cycle": 20,
+        "lease_seconds": 2400,
+        "retry_backoff_seconds": 300,
+        "runtime_verification_scans": 3,
+        "minimum_price_observations": 1,
+        "trade_evidence_lookback_rows": 10000,
+        "report_limit": 100,
+    },
     "strategy_implementation_owner": {
         "enabled": True,
         "lease_seconds": 2400,

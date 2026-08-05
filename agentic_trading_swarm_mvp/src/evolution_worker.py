@@ -23,6 +23,7 @@ from autonomous_builder import run_autonomous_builder
 from evolution_owner_scheduler import lane_order, record_turn, scheduler_summary
 from llm_bridge import STATE_JSON, ingest_llm_recommendations
 from llm_swarm_runner import run_once as run_llm_swarm_once
+from market_activation_owner import run_once as run_market_activation_owner
 from research_worker import run_once as run_research_worker_once
 from self_improvement import run_auto_improvement
 from settings import load_settings
@@ -116,6 +117,7 @@ def _write_report(report: dict) -> dict:
         f"- Inbox ingested: `{len(report.get('llm_recommendations_ingested') or [])}`",
         f"- Auto-improvement consumed: `{len((report.get('self_improvement') or {}).get('consumed') or [])}`",
         f"- Adapter owner status: `{(report.get('adapter_implementation_owner') or {}).get('status')}`",
+        f"- Market activation owner status: `{(report.get('market_activation_owner') or {}).get('status')}`",
         f"- Strategy owner status: `{((report.get('strategy_implementation_owner') or {}).get('last_cycle') or {}).get('status')}`",
         f"- Writer lane: `{(report.get('owner_scheduler') or {}).get('last_lane')}`",
         f"- Autonomous builder status: `{(report.get('autonomous_builder') or {}).get('status')}`",
@@ -159,11 +161,19 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         ),
     )
     strategy_owner = strategy_owner or {"status": "database_busy_retry_later", "last_cycle": {}}
+    activation_owner, activation_error = _run_db_stage(
+        "market_activation_owner_sync",
+        lambda conn: run_market_activation_owner(
+            conn, worker_settings, execute_turn=False, cycle_id=cycle_id,
+            scheduler=scheduler_summary(conn),
+        ),
+    )
+    activation_owner = activation_owner or {"status": "database_busy_retry_later", "last_cycle": {}}
     order_state, scheduler_error = _run_db_stage("owner_scheduler", lambda conn: lane_order(conn))
     if order_state:
         lanes, _initial_scheduler = order_state
     else:
-        lanes, _initial_scheduler = ["strategy", "adapter", "general"], {}
+        lanes, _initial_scheduler = ["strategy", "adapter", "activation", "general"], {}
 
     adapter_owner = {"status": "deferred_by_scheduler"}
     self_improvement = {"status": "deferred_by_scheduler", "consumed": []}
@@ -192,6 +202,17 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
             adapter_owner = adapter_owner or {"status": "database_busy_retry_later"}
             lane_status = str(adapter_owner.get("status") or "unknown")
             consumed_writer = lane_status not in {"disabled", "not_due", "no_eligible_adapter_spec", "database_busy_retry_later"}
+        elif lane == "activation":
+            activation_owner, activation_error = _run_db_stage(
+                "market_activation_owner",
+                lambda conn: run_market_activation_owner(
+                    conn, worker_settings, execute_turn=True, cycle_id=cycle_id,
+                    scheduler=scheduler_summary(conn),
+                ),
+            )
+            activation_owner = activation_owner or {"status": "database_busy_retry_later", "last_cycle": {}}
+            lane_status = str((activation_owner.get("last_cycle") or {}).get("status") or activation_owner.get("status") or "unknown")
+            consumed_writer = bool(activation_owner.get("consumed_writer"))
         else:
             self_improvement, improvement_error = _run_db_stage(
                 "self_improvement",
@@ -259,6 +280,7 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         for error in (
             ingest_error,
             strategy_error,
+            activation_error,
             improvement_error,
             adapter_error,
             builder_error,
@@ -282,6 +304,7 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         "self_improvement": self_improvement,
         "strategy_implementation_owner": strategy_owner,
         "adapter_implementation_owner": adapter_owner,
+        "market_activation_owner": activation_owner,
         "autonomous_builder": autonomous_builder,
         "owner_scheduler": owner_scheduler,
         "llm_inbox": inbox_summary or {},
