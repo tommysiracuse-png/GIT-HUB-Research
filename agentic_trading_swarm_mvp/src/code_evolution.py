@@ -2252,6 +2252,7 @@ def _cfg(settings: dict) -> dict:
         "patch_generation_max_output_tokens": 12000,
         "patch_generation_timeout_seconds": 90,
         "sandbox_timeout_seconds": 120,
+        "full_regression_timeout_seconds": 300,
         "install_changed_python_dependencies": True,
         "standard_patch_tier": "fast",
         "repair_patch_tier": "fast",
@@ -4732,8 +4733,11 @@ def _added_files_from_diff(diff_text: str) -> dict[str, str]:
 def _run_candidate_tests(payload: dict, cfg: dict, app_root: pathlib.Path) -> dict:
     commands = []
     timeout = int(cfg.get("sandbox_timeout_seconds", 120))
+    full_regression_timeout = int(cfg.get("full_regression_timeout_seconds", max(timeout, 300)))
+    full_regression = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
     for command in _test_commands(payload, cfg, root=app_root):
-        result = _run(command, app_root, timeout)
+        command_timeout = full_regression_timeout if command == full_regression else timeout
+        result = _run(command, app_root, command_timeout)
         commands.append(result)
         if result["returncode"] != 0:
             return {"passed": False, "stage": "tests", "commands": commands}

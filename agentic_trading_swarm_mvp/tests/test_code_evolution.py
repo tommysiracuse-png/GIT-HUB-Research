@@ -1746,6 +1746,29 @@ diff --git a/tests/test_frontier_model_policy.py b/tests/test_frontier_model_pol
             ],
         )
 
+    def test_full_regression_uses_its_own_longer_timeout(self) -> None:
+        focused = [sys.executable, "-m", "unittest", "tests/test_code_evolution.py"]
+        full = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
+        timeouts = []
+
+        def fake_run(command, _root, timeout):
+            timeouts.append((command, timeout))
+            return {"returncode": 0}
+
+        with mock.patch.object(code_evolution, "_test_commands", return_value=[focused, full]), mock.patch.object(
+            code_evolution,
+            "_run",
+            side_effect=fake_run,
+        ):
+            result = code_evolution._run_candidate_tests(
+                {},
+                {"sandbox_timeout_seconds": 120, "full_regression_timeout_seconds": 300},
+                pathlib.Path("."),
+            )
+
+        self.assertTrue(result["passed"])
+        self.assertEqual([(focused, 120), (full, 300)], timeouts)
+
     def test_process_repairs_malformed_patch_before_discarding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp) / "repo"

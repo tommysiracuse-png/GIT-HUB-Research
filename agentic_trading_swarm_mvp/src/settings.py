@@ -632,6 +632,7 @@ DEFAULT_SETTINGS = {
         "required_model": "openai/gpt-5.6-terra",
         "min_priority": 50,
         "run_full_regression": True,
+        "full_regression_timeout_seconds": 300,
         "probation_loops": 1,
         "rollback_on_health_failure": True,
         "generate_patch_when_missing": True,
