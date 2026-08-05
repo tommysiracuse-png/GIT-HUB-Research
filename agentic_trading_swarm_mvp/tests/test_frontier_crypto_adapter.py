@@ -1035,6 +1035,18 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual("FRONTIER:ABC-USDT", ranked[0]["inst_id"])
         self.assertLess(ranked[0]["paper_ranking_score"], 37.5)
 
+        summary = frontier.summarize([], ranked)
+        venue_context = summary["venue_quote_context"]["unknown"]
+        self.assertTrue(venue_context["paper_only"])
+        self.assertEqual(1, venue_context["candidate_count"])
+        self.assertEqual(1, venue_context["synthetic_route_count"])
+        self.assertEqual(1, venue_context["stale_candidate_count"])
+        self.assertEqual(40.0, venue_context["spread_bps"]["median"])
+        self.assertEqual(3_600_000.0, venue_context["quote_age_ms"]["median"])
+        self.assertEqual(200.0, venue_context["top_of_book_depth_notional"]["median"])
+        self.assertEqual(10.0, venue_context["ranking_penalty_points"]["median"])
+        self.assertEqual(40.0, summary["top_dislocations"][0]["spread_bps"])
+
     def test_marketability_diagnostics_use_conservative_route_for_stale_or_thin_book(self) -> None:
         cfg = settings()
         peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)

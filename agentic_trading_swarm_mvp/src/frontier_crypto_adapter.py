@@ -11326,6 +11326,66 @@ def _quality_rates(observations: list[dict], key: str) -> dict:
     }
 
 
+def _venue_quote_context(candidates: list[dict]) -> dict[str, dict]:
+    """Summarize paper-only quote diagnostics by frontier venue.
+
+    The scanner still emits every priceable candidate.  This report makes the
+    ranking evidence visible per venue so later tuning can distinguish a
+    venue-wide quote-context issue from a single candidate's edge estimate.
+    """
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        venue = str(candidate.get("venue") or "unknown")
+        bucket = grouped.setdefault(
+            venue,
+            {
+                "candidate_count": 0,
+                "synthetic_route_count": 0,
+                "stale_candidate_count": 0,
+                "staleness_reasons": collections.Counter(),
+                "spread_bps": [],
+                "quote_age_ms": [],
+                "top_of_book_depth_notional": [],
+                "venue_score": [],
+                "ranking_penalty_points": [],
+            },
+        )
+        bucket["candidate_count"] += 1
+        bucket["synthetic_route_count"] += int(bool(candidate.get("synthetic_route_flag")))
+        reason = candidate.get("staleness_reason")
+        if reason:
+            bucket["stale_candidate_count"] += 1
+            bucket["staleness_reasons"][str(reason)] += 1
+        for field in (
+            "spread_bps",
+            "quote_age_ms",
+            "top_of_book_depth_notional",
+            "venue_score",
+            "quote_context_ranking_penalty",
+        ):
+            value = as_float(candidate.get(field), None)
+            if value is not None:
+                target = "ranking_penalty_points" if field == "quote_context_ranking_penalty" else field
+                bucket[target].append(value)
+
+    return {
+        venue: {
+            "paper_only": True,
+            "candidate_count": values["candidate_count"],
+            "synthetic_route_count": values["synthetic_route_count"],
+            "stale_candidate_count": values["stale_candidate_count"],
+            "staleness_reasons": dict(values["staleness_reasons"]),
+            "spread_bps": _distribution(values["spread_bps"]),
+            "quote_age_ms": _distribution(values["quote_age_ms"]),
+            "top_of_book_depth_notional": _distribution(values["top_of_book_depth_notional"]),
+            "venue_score": _distribution(values["venue_score"]),
+            "ranking_penalty_points": _distribution(values["ranking_penalty_points"]),
+        }
+        for venue, values in sorted(grouped.items())
+    }
+
+
 def _starved_venue_coverage(observations: list[dict], depth_summary: dict) -> dict:
     starved = {str(venue).upper() for venue in depth_summary.get("starved_venues", [])}
     selected_by_venue = depth_summary.get("selected_by_venue", {}) or {}
@@ -11421,6 +11481,7 @@ def summarize(
         count for status, count in quality_statuses.items() if status in {"verified", "degraded"}
     )
     depth_summary = quality_summary or {}
+    venue_quote_context = _venue_quote_context(candidates)
     depth_selected = int(depth_summary.get("selected_count", 0) or 0)
     depth_enriched = int(depth_summary.get("enriched_count", 0) or 0)
     observation_count = len(observations)
@@ -11587,6 +11648,7 @@ def summarize(
             "anomaly_flags": row.get("anomaly_flags", []),
             "route_status": (row.get("execution_feasibility") or {}).get("status"),
             "route_blockers": (row.get("execution_feasibility") or {}).get("route_blockers", []),
+            "spread_bps": row.get("spread_bps"),
             "quote_normalization_status": row.get("quote_normalization_status"),
             "native_quote_currency": row.get("native_quote_currency") or row.get("quote"),
             "canonical_normalized_price": row.get("canonical_normalized_price"),
@@ -11657,6 +11719,7 @@ def summarize(
         "candidate_activity": candidate_activity,
         "by_preliminary_route_status": dict(route_status),
         "by_route_blocker": dict(route_blockers),
+        "venue_quote_context": venue_quote_context,
         "top_dislocations": top_dislocations,
         "reachable_venues": sorted({row["venue"] for row in observations if row.get("data_status") == "reachable"}),
         "blocked_venues": sorted({row["venue"] for row in observations if row.get("data_status") == "blocked"}),
@@ -11794,6 +11857,7 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Paper cohort outcomes: `{summary.get('dislocation_quality_cohort_outcomes', {})}`")
     lines.append(f"- Paper-only short cost decomposition: `{summary.get('short_cost_decomposition', {})}`")
     lines.append(f"- Frontier-short market context: `{summary.get('frontier_short_market_context', {})}`")
+    lines.append(f"- Venue quote context: `{summary.get('venue_quote_context', {})}`")
     expansion = summary.get("expansion_map", {})
     lines.extend(["", "## Expansion Map", ""])
     lines.append(f"- Known quality rate: `{expansion.get('known_quality_rate')}`")
@@ -11843,6 +11907,10 @@ def _markdown(report: dict) -> str:
             f"- `{row.get('inst_id')}` {row.get('direction')} score=`{row.get('score')}` "
             f"quality_rank=`{row.get('paper_quality_rank')}` dislocation_quality=`{row.get('dislocation_quality_score')}` "
             f"dev=`{row.get('venue_deviation_bps')}`bps edge=`{row.get('edge_bps_estimate')}`bps "
+            f"spread=`{row.get('spread_bps')}`bps quote_age=`{row.get('quote_age_ms')}`ms "
+            f"top_depth=`{row.get('top_of_book_depth_notional')}` synthetic=`{row.get('synthetic_route_flag')}` "
+            f"venue_score=`{row.get('venue_score')}` stale_reason=`{row.get('staleness_reason')}` "
+            f"quote_penalty=`{row.get('quote_context_ranking_penalty')}` "
             f"quality=`{row.get('quality_score')}` action=`{row.get('quality_action')}` "
             f"quote_norm=`{row.get('quote_normalization_status')}` "
             f"native_quote=`{row.get('native_quote_currency')}` canonical_price=`{row.get('canonical_normalized_price')}` "
