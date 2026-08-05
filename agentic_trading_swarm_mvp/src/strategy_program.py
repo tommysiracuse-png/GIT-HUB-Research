@@ -836,6 +836,7 @@ def generate_program_candidates(
         0.0,
         min(1.0, _float(risk_gates.get("paper_allocation_multiplier"), 1.0)),
     )
+    exploration_mode = bool((settings.get("paper_exploration") or {}).get("enabled", False))
     generated: list[dict] = []
     rejects: dict[str, int] = defaultdict(int)
     lifecycle_diagnostics: dict[str, int] = defaultdict(int)
@@ -872,9 +873,12 @@ def generate_program_candidates(
         except (ProgramValidationError, ArithmeticError, ValueError, TypeError, OverflowError):
             rejects["expression_runtime_error"] += 1
             continue
-        if edge <= 0:
-            rejects["non_positive_cost_adjusted_edge"] += 1
-            continue
+        non_positive_edge_at_entry = edge <= 0
+        if non_positive_edge_at_entry:
+            lifecycle_diagnostics["non_positive_cost_adjusted_edge_at_entry"] += 1
+            if not exploration_mode:
+                rejects["non_positive_cost_adjusted_edge"] += 1
+                continue
         target_surface = _target_surface(frame, program)
         source_trade_type = str(frame.get("trade_type") or "")
         trade_type, direction = _route_mapping(frame, program, side)
@@ -932,10 +936,25 @@ def generate_program_candidates(
             "strategy_lab_program_signature": signature,
             "strategy_lab_invalidation_expression": program["invalidation_expression"],
             "strategy_lab_invalidation_active_at_entry": invalidation_active_at_entry,
+            "strategy_lab_non_positive_edge_at_entry": non_positive_edge_at_entry,
+            "strategy_lab_contract_warnings": [
+                warning
+                for warning, applies in (
+                    ("entry_invalidation_overlap", invalidation_active_at_entry),
+                    ("non_positive_cost_adjusted_edge", non_positive_edge_at_entry),
+                )
+                if applies
+            ],
             "strategy_lab_contract_warning": (
-                "entry_invalidation_overlap" if invalidation_active_at_entry else None
+                "entry_invalidation_overlap"
+                if invalidation_active_at_entry
+                else "non_positive_cost_adjusted_edge"
+                if non_positive_edge_at_entry
+                else None
             ),
-            "promotion_eligible": not invalidation_active_at_entry,
+            "promotion_eligible": not (
+                invalidation_active_at_entry or non_positive_edge_at_entry
+            ),
             "strategy_reliability_allocation_multiplier": experimental_allocation,
             "strategy_lab_relaxation": risk_gates.get("adaptive_relaxation") or {},
             "strategy_lab_program_features": {

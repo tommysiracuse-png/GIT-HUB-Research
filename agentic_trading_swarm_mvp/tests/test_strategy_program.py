@@ -621,6 +621,31 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertEqual(1, missing["account_permission"])
         self.assertEqual(1, blockers["route_not_confirmed"])
 
+    def test_exploration_tests_non_positive_model_edge_without_promoting_it(self) -> None:
+        cfg = settings()
+        logic = program_logic()
+        logic["entry_expression"] = "quality_score >= 60"
+        logic["long_expression"] = "quality_score >= 60"
+        logic["edge_expression"] = "-5"
+        recommendation = lab_recommendation("non_positive_edge_exploration_v1", logic)
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [observation(100.0, now.isoformat())],
+            )
+
+        self.assertEqual(1, len(generated))
+        self.assertEqual("active_testing", report["status_by_experiment"]["non_positive_edge_exploration_v1"])
+        self.assertEqual(-5.0, generated[0]["edge_bps_estimate"])
+        self.assertTrue(generated[0]["strategy_lab_non_positive_edge_at_entry"])
+        self.assertIn("non_positive_cost_adjusted_edge", generated[0]["strategy_lab_contract_warnings"])
+        self.assertFalse(generated[0]["promotion_eligible"])
+
     def test_partial_invalidation_is_not_a_contract_mismatch(self) -> None:
         mismatch = _runtime_entry_invalidation_contract_mismatch(
             {"candidate_count": 3},
