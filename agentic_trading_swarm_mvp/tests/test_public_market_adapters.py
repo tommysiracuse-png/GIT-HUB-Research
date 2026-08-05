@@ -61,6 +61,12 @@ from adapters.venues.california_air_resources_board import (
     parse_carb_auction_notice,
     parse_carb_auction_results,
 )
+from adapters.venues.central_bank_of_bahrain import (
+    RESULTS_URL as CBB_TBILL_RESULTS_URL,
+    SOURCE_URL as CBB_TBILL_SOURCE_URL,
+    CentralBankOfBahrainTreasuryBillsAdapter,
+    parse_central_bank_of_bahrain_treasury_bill_auction,
+)
 from adapters.venues.dc_department_of_energy_environment import (
     FINAL_SALES_URL as DC_SRC_FINAL_SALES_URL,
     FOR_SALE_URL as DC_SRC_FOR_SALE_URL,
@@ -369,6 +375,7 @@ class PublicAdapterParserTests(unittest.TestCase):
             "polymarket_sports_websocket",
             "b3_public_data_hub",
             "bank_of_canada_regular_treasury_bills",
+            "central_bank_of_bahrain_treasury_bills",
             "stock_exchange_of_thailand_yuanta_securities_thailand",
             "republican_stock_exchange_toshkent_public",
             "dc_department_of_energy_environment",
@@ -616,6 +623,100 @@ class PublicAdapterParserTests(unittest.TestCase):
             unavailable_batch.observations[0]["candidate_reject_reason"],
         )
         self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+
+    def test_cbb_tbill_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "central_bank_of_bahrain_treasury_bills"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsNotNone(adapter)
+        self.assertEqual("CENTRAL_BANK_OF_BAHRAIN", adapter.info.venue)
+        self.assertEqual(CBB_TBILL_SOURCE_URL, adapter.info.docs_url)
+        self.assertIn("lowest_accepted_price", adapter.info.capabilities)
+        self.assertIn("issue_number", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+
+    def test_cbb_tbill_parser_normalizes_issue_number_price_and_rate(self) -> None:
+        payload = """
+        <article><p>Published on 15 December 2025</p>
+        <p>Manama, Bahrain – 15th December 2025 – This week’s BD 70 million issue
+        of Government Treasury Bills has been oversubscribed by 101%.</p>
+        <p>The bills, carrying a maturity of 91 days, are issued by the CBB.</p>
+        <p>The issue date of the bills is 17<sup>th</sup> December 2025, and the maturity date
+        is 18<sup>th</sup> March 2026.</p>
+        <p>The weighted average rate of interest is 4.91% compared to 4.90 to the
+        previous issue on 3rd December 2025.</p>
+        <p>The approximate average price for the issue was 98.773% with the lowest
+        accepted price being 98.727%.</p>
+        <p>This is issue No.2099 (ISIN BH000NF62M89) of Government Treasury Bills.</p>
+        </article>
+        """
+        rows = parse_central_bank_of_bahrain_treasury_bill_auction(
+            payload,
+            received_at="2025-12-16T12:00:00+00:00",
+        )
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        self.assertEqual("CENTRAL_BANK_OF_BAHRAIN:TBILL:ISSUE:2099", row["inst_id"])
+        self.assertEqual("BH000NF62M89", row["isin"])
+        self.assertEqual(98.773, row["last"])
+        self.assertEqual(98.727, row["lowest_accepted_price_per_100"])
+        self.assertEqual(4.91, row["average_interest_rate_pct"])
+        self.assertEqual(101.0, row["oversubscription_pct"])
+        self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual("results_published", row["session_status"])
+        self.assertEqual(CBB_TBILL_RESULTS_URL, row["source_url"])
+        self.assertEqual("watch_only", row["direction"])
+
+    def test_cbb_tbill_adapter_preserves_parser_and_fetch_evidence(self) -> None:
+        reachable_bad_schema = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>Government Securities reference page</body></html>",
+            "received_at": "2026-08-04T16:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.central_bank_of_bahrain.fetch_text",
+            return_value=reachable_bad_schema,
+        ):
+            parser_batch = CentralBankOfBahrainTreasuryBillsAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable",
+            parser_batch.metadata["fetch_status"]["treasury_bill_results"]["fetch_status"],
+        )
+        self.assertIn("markers", parser_batch.metadata["parser_failures"][0]["error"])
+        self.assertTrue(parser_batch.metadata["paper_only"])
+        self.assertEqual("watch_only", parser_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_treasury_bill_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+
+        unavailable = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T16:01:00+00:00",
+            "latency_ms": 5.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch(
+            "adapters.venues.central_bank_of_bahrain.fetch_text",
+            return_value=unavailable,
+        ):
+            unavailable_batch = CentralBankOfBahrainTreasuryBillsAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("unknown", unavailable_batch.metadata["freshness_state"])
+        self.assertEqual("unknown", unavailable_batch.metadata["session_state"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_treasury_bill_source_unavailable",
+            unavailable_batch.observations[0]["candidate_reject_reason"],
+        )
 
     def test_vsdc_hnx_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
         adapter_id = "vietnam_securities_depository_and_clearing_corporation_hanoi_sto"
@@ -2763,6 +2864,29 @@ class AdapterCapabilityTests(unittest.TestCase):
         self.assertEqual("fully_covered", match["match_status"])
         self.assertEqual("kazakhstan_stock_exchange_kase_global", match["adapter_id"])
         self.assertIn("delayed_quote", match["available_capabilities"])
+        self.assertNotIn("entry_quality_quote", match["available_capabilities"])
+
+    def test_cbb_treasury_bill_adapter_closes_spec_679_without_quote_claims(self) -> None:
+        spec = {
+            "title": "Implement public adapter #679: Central Bank of Bahrain",
+            "market_key": "global_discovery|Central Bank of Bahrain",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "Central Bank of Bahrain",
+                    "public_docs_url": CBB_TBILL_SOURCE_URL,
+                    "asset_or_event": (
+                        "Bahrain Government Treasury Bills weekly auctions "
+                        "(issue-numbered, with lowest accepted price and average rate)"
+                    ),
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("central_bank_of_bahrain_treasury_bills", match["adapter_id"])
+        self.assertIn("event_price_reference", match["available_capabilities"])
         self.assertNotIn("entry_quality_quote", match["available_capabilities"])
 
     def test_eex_uka_adapter_closes_spec_1400_without_quote_claims(self) -> None:
