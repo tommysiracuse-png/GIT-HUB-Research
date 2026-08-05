@@ -93,6 +93,11 @@ from adapters.venues.ethiopian_securities_exchange import (
     parse_esx_fixed_income_session,
 )
 from adapters.venues.kase_futures import parse_kase_futures
+from adapters.venues.kazakhstan_stock_exchange_kase import (
+    MARKET_MAKER_NOTICE_URL as KASE_GLOBAL_DOCS_URL,
+    KazakhstanStockExchangeKaseGlobalAdapter,
+    parse_kase_global,
+)
 from adapters.venues.kalshi import (
     DOCS_URL as KALSHI_DOCS_URL,
     KalshiPublicPredictionMarketsAdapter,
@@ -340,6 +345,7 @@ class PublicAdapterParserTests(unittest.TestCase):
         expected = {
             "twse_daily_public",
             "kase_futures_public_results",
+            "kazakhstan_stock_exchange_kase_global",
             "nzx_gdt_event_reference",
             "bursa_derivatives_contract_catalog",
             "bahrain_cross_listings_catalog",
@@ -2008,6 +2014,53 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual(520.5, rows[0]["last"])
         self.assertEqual("fx_futures", rows[0]["asset_class"])
 
+    def test_kase_global_parser_normalizes_foreign_etfs_and_adrs(self) -> None:
+        html = """
+        <table><tr><th>Ticker</th><th>Company</th><th>ISIN</th><th>Type</th><th>Currency</th>
+        <th>Price,KZT</th><th>Volume,mln KZT</th><th>Date</th><th>Liquidity class</th><th>Market-maker</th></tr>
+        <tr><td>IBIT_KZ</td><td>iShares Bitcoin Trust ETF</td><td>US46438F1012</td><td>ETF</td><td>USD</td>
+        <td>36,19</td><td>2,2</td><td>04.08.2026</td><td>3</td><td>Standard Investment Company</td></tr>
+        <tr><td>BABAd</td><td>Alibaba Group Holding Ltd</td><td>US01609W1027</td><td>depository receipts</td><td>USD</td>
+        <td>125,78</td><td>0,060</td><td>04.08.2026</td><td>1</td><td>Standard Investment Company</td></tr>
+        <tr><td>SOLZ_KZ</td><td>Volatility Shares Trust</td><td>US92864M8221</td><td>ETF</td><td>USD</td>
+        <td>–</td><td>–</td><td>–</td><td>3</td><td>Standard Investment Company</td></tr></table>
+        """
+        rows = parse_kase_global(html, received_at="2026-08-04T18:30:00+00:00")
+        by_symbol = {row["symbol"]: row for row in rows}
+        self.assertEqual(36.19, by_symbol["IBIT_KZ"]["last"])
+        self.assertEqual("foreign_etf", by_symbol["IBIT_KZ"]["asset_class"])
+        self.assertEqual("KASE:BABAd", by_symbol["BABAd"]["inst_id"])
+        self.assertEqual("foreign_depository_receipt", by_symbol["BABAd"]["asset_class"])
+        self.assertEqual(0.0, by_symbol["SOLZ_KZ"]["last"])
+        self.assertEqual("no_trade_reported", by_symbol["SOLZ_KZ"]["session_status"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in rows))
+
+    def test_kase_global_adapter_is_discoverable_and_preserves_failure_evidence(self) -> None:
+        adapter_id = "kazakhstan_stock_exchange_kase_global"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsInstance(adapter, KazakhstanStockExchangeKaseGlobalAdapter)
+        self.assertEqual(KASE_GLOBAL_DOCS_URL, adapter.info.docs_url)
+        self.assertNotIn("entry_quality_quote", adapter.info.capabilities)
+        malformed = {
+            "ok": True, "status": "reachable", "http_status": 200,
+            "text": "<html><body>unrelated KASE page</body></html>",
+            "received_at": "2026-08-04T18:30:00+00:00", "latency_ms": 4.0,
+        }
+        with mock.patch("adapters.venues.kazakhstan_stock_exchange_kase.fetch_text", return_value=malformed):
+            parser_batch = KazakhstanStockExchangeKaseGlobalAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual("reachable", parser_batch.metadata["fetch_status"]["kase_global"]["fetch_status"])
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual("public_kase_global_parser_failure", parser_batch.observations[0]["candidate_reject_reason"])
+        blocked = {**malformed, "ok": False, "status": "blocked", "http_status": 403, "text": "", "error": "blocked"}
+        with mock.patch("adapters.venues.kazakhstan_stock_exchange_kase.fetch_text", return_value=blocked):
+            unavailable_batch = KazakhstanStockExchangeKaseGlobalAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual("public_kase_global_source_unavailable", unavailable_batch.observations[0]["candidate_reject_reason"])
+
     def test_nzx_gdt_parser_normalizes_event_prices(self) -> None:
         html = """
         <table><tr><th>Products</th><th>Event 401</th><th>Event 400</th><th>Change</th></tr>
@@ -2573,6 +2626,30 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
 
 
 class AdapterCapabilityTests(unittest.TestCase):
+    def test_kase_global_adapter_closes_spec_1239_with_reference_quotes_only(self) -> None:
+        spec = {
+            "title": "Implement public adapter #1239: Kazakhstan Stock Exchange (KASE)",
+            "market_key": "global_discovery|Kazakhstan Stock Exchange (KASE)",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "Kazakhstan Stock Exchange (KASE)",
+                    "public_docs_url": KASE_GLOBAL_DOCS_URL,
+                    "asset_or_event": (
+                        "KASE Global foreign ETFs and ADRs: IBIT_KZ, ETHA_KZ, SOLZ_KZ, "
+                        "BITO_KZ, SPY_KZ, QQQ_KZ, BABAd, and BIDUd"
+                    ),
+                    "why_interesting": "daily quote and settlement reference coverage",
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("kazakhstan_stock_exchange_kase_global", match["adapter_id"])
+        self.assertIn("delayed_quote", match["available_capabilities"])
+        self.assertNotIn("entry_quality_quote", match["available_capabilities"])
+
     def test_eex_uka_adapter_closes_spec_1400_without_quote_claims(self) -> None:
         spec = {
             "title": "Implement public adapter #1400: European Energy Exchange (EEX)",

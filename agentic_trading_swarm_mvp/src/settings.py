@@ -289,6 +289,7 @@ DEFAULT_SETTINGS = {
         "workers": 5,
         "twse_daily_public": {"enabled": True, "cache_minutes": 60, "max_instruments": 300},
         "kase_futures_public_results": {"enabled": True, "cache_minutes": 15},
+        "kazakhstan_stock_exchange_kase_global": {"enabled": True, "cache_minutes": 60},
         "nzx_gdt_event_reference": {"enabled": True, "cache_minutes": 60},
         "bursa_derivatives_contract_catalog": {"enabled": True, "cache_minutes": 360},
         "bahrain_cross_listings_catalog": {"enabled": True, "cache_minutes": 360},
