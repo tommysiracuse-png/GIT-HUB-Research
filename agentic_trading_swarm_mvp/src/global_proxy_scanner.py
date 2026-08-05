@@ -22,7 +22,7 @@ import urllib.request
 
 from scan_batch import ScanBatch, observation_from_candidate
 from paper_context_cost import annotate_paper_context_cost
-from proxy_signal_quality import enrich_parsed_proxy_quality
+from proxy_signal_quality import enrich_parsed_proxy_quality, proxy_momentum_context_review
 from yahoo_proxy_reuse import evaluate_yahoo_proxy_reuse
 
 
@@ -193,6 +193,23 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
         },
     }
     enrich_parsed_proxy_quality(candidate)
+    context = proxy_momentum_context_review(candidate, settings)
+    candidate["proxy_momentum_context"] = context
+    if context.get("applicable"):
+        candidate["proxy_momentum_context_score"] = context["score"]
+        candidate["proxy_momentum_context_diagnostics"] = list(context["diagnostics"])
+        candidate["score_before_proxy_momentum_context"] = candidate["score"]
+        candidate["score"] = round(
+            max(0.0, candidate["score"] - float(context["ranking_penalty_points"])), 3
+        )
+        candidate["paper_allocation_multiplier"] = min(
+            float(candidate.get("paper_allocation_multiplier", 1.0)),
+            float(context["allocation_multiplier"]),
+        )
+        if context["diagnostics"]:
+            candidate["risk_notes"].append(
+                "proxy momentum context is unconfirmed; retain as a conservative counterfactual paper experiment"
+            )
     return annotate_paper_context_cost(candidate, settings)
 
 

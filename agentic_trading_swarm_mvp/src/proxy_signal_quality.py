@@ -21,6 +21,16 @@ DEFAULT_MAX_FRESHNESS_AGE_SECONDS = 3600.0
 DEFAULT_MIN_DEPTH_NOTIONAL_USD = 1.0
 DEFAULT_MIN_LIQUIDITY_SCORE = 0.65
 HEALTHY_VENUE_STATES = {"healthy", "normal", "open", "reachable", "verified"}
+DEFAULT_PROXY_MOMENTUM_CONTEXT_POLICY = {
+    "enabled": True,
+    "paper_only": True,
+    "minimum_move_strength_bps": 40.0,
+    "minimum_tradable_followthrough_bps": 5.0,
+    "max_freshness_age_seconds": 900.0,
+    "minimum_volatility_normalized_persistence": 0.75,
+    "ranking_penalty_points": 15.0,
+    "minimum_counterfactual_allocation_multiplier": 0.25,
+}
 
 
 def _number(value: Any) -> float | None:
@@ -196,4 +206,139 @@ def proxy_short_quality_review(
             "status": health_status,
             "basis": candidate.get("proxy_venue_health_basis"),
         },
+    }
+
+
+def proxy_momentum_context_review(
+    candidate: Mapping[str, Any],
+    settings: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Score Yahoo momentum confirmation without suppressing paper research.
+
+    A weak proxy move can remain a priceable native paper observation.  This
+    review only lowers its ranking and paper allocation while preserving the
+    raw candidate and its diagnostics for counterfactual measurement.
+    """
+
+    configured = (settings or {}).get("yahoo_proxy_momentum_context", {})
+    policy = dict(DEFAULT_PROXY_MOMENTUM_CONTEXT_POLICY)
+    if isinstance(configured, Mapping):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    if configured is False:
+        policy["enabled"] = False
+
+    trade_type = str(candidate.get("trade_type") or "").strip().lower()
+    venue = str(candidate.get("venue") or "").strip().upper()
+    mode = str(candidate.get("execution_mode") or candidate.get("mode") or "paper").strip().lower()
+    paper_mode = mode in {"paper", "paper_only", "simulation", "sim", "review"}
+    source_text = " ".join(
+        str(value or "")
+        for value in (
+            candidate.get("data_source"),
+            (candidate.get("data_source") or {}).get("provider")
+            if isinstance(candidate.get("data_source"), Mapping)
+            else None,
+        )
+    ).lower()
+    yahoo_source = bool(
+        venue == "YAHOO_PROXY"
+        or isinstance(candidate.get("proxy_reuse_gate"), Mapping)
+        or "yahoo" in source_text
+    )
+    applies = bool(
+        policy.get("enabled", True)
+        and policy.get("paper_only", True)
+        and paper_mode
+        and yahoo_source
+        and trade_type in {"global_proxy_momentum", "global_market_discovery_proxy"}
+    )
+    if not applies:
+        return {
+            "enabled": bool(policy.get("enabled", True)),
+            "applicable": False,
+            "paper_only": True,
+            "emission_action": "unchanged",
+        }
+
+    direction = str(candidate.get("direction") or "").strip().lower()
+    move_pct = _number(candidate.get("change_24h_pct"))
+    followthrough_pct = _number(candidate.get("short_return_pct"))
+    move_bps = move_pct * 100.0 if move_pct is not None else None
+    followthrough_bps = followthrough_pct * 100.0 if followthrough_pct is not None else None
+    freshness_age = _number(
+        candidate.get("freshness_age_seconds", candidate.get("provider_age_seconds"))
+    )
+    volatility_bps = _number(candidate.get("recent_volatility_bps"))
+    min_move = max(0.001, float(policy["minimum_move_strength_bps"]))
+    min_followthrough = max(0.001, float(policy["minimum_tradable_followthrough_bps"]))
+    max_age = max(0.001, float(policy["max_freshness_age_seconds"]))
+    min_persistence = max(0.001, float(policy["minimum_volatility_normalized_persistence"]))
+
+    expected_sign = -1.0 if direction == "short_proxy" else 1.0
+    signed_followthrough = expected_sign * followthrough_bps if followthrough_bps is not None else None
+    persistence = (
+        abs(followthrough_bps) / volatility_bps
+        if followthrough_bps is not None and volatility_bps is not None and volatility_bps > 0.0
+        else None
+    )
+    components = {
+        "proxy_move_strength": min(100.0, 100.0 * abs(move_bps) / min_move) if move_bps is not None else 0.0,
+        "tradable_followthrough": (
+            min(100.0, 100.0 * signed_followthrough / min_followthrough)
+            if signed_followthrough is not None and signed_followthrough > 0.0
+            else 0.0
+        ),
+        "freshness": (
+            max(0.0, 100.0 * (1.0 - freshness_age / max_age))
+            if freshness_age is not None
+            else 50.0
+        ),
+        "volatility_normalized_persistence": (
+            min(100.0, 100.0 * persistence / min_persistence)
+            if persistence is not None
+            else 0.0
+        ),
+    }
+    diagnostics: list[str] = []
+    if move_bps is None or abs(move_bps) < min_move:
+        diagnostics.append("proxy_move_strength_below_confirmation")
+    if signed_followthrough is None:
+        diagnostics.append("tradable_followthrough_unavailable")
+    elif signed_followthrough < min_followthrough:
+        diagnostics.append("tradable_followthrough_not_confirmed")
+    if freshness_age is None:
+        diagnostics.append("proxy_freshness_unavailable")
+    elif freshness_age > max_age:
+        diagnostics.append("proxy_freshness_degraded")
+    if persistence is None or persistence < min_persistence:
+        diagnostics.append("volatility_normalized_persistence_not_confirmed")
+
+    score = sum(components.values()) / len(components)
+    confirmed = not diagnostics
+    counterfactual_floor = max(
+        0.01,
+        min(1.0, float(policy["minimum_counterfactual_allocation_multiplier"])),
+    )
+    allocation_multiplier = 1.0 if confirmed else max(counterfactual_floor, score / 100.0)
+    ranking_penalty = max(0.0, float(policy["ranking_penalty_points"])) * (1.0 - score / 100.0)
+    return {
+        "enabled": True,
+        "applicable": True,
+        "paper_only": True,
+        "score": round(max(0.0, min(100.0, score)), 3),
+        "components": {key: round(value, 3) for key, value in components.items()},
+        "diagnostics": diagnostics,
+        "confirmed": confirmed,
+        "emission_action": "primary_simulated_route" if confirmed else "counterfactual_guard_value",
+        "allocation_multiplier": round(allocation_multiplier, 6),
+        "ranking_penalty_points": round(ranking_penalty, 6),
+        "proxy_move_bps": round(move_bps, 6) if move_bps is not None else None,
+        "minimum_move_strength_bps": min_move,
+        "tradable_followthrough_bps": round(followthrough_bps, 6) if followthrough_bps is not None else None,
+        "minimum_tradable_followthrough_bps": min_followthrough,
+        "freshness_age_seconds": round(freshness_age, 6) if freshness_age is not None else None,
+        "max_freshness_age_seconds": max_age,
+        "volatility_bps": round(volatility_bps, 6) if volatility_bps is not None else None,
+        "volatility_normalized_persistence": round(persistence, 6) if persistence is not None else None,
+        "minimum_volatility_normalized_persistence": min_persistence,
     }

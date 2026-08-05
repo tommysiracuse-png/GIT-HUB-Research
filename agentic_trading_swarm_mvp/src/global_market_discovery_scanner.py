@@ -14,6 +14,7 @@ import datetime as dt
 import json
 import math
 import pathlib
+import statistics
 import time
 from typing import Any
 
@@ -30,7 +31,7 @@ from research_worker import (
     normalize_market_candidate,
 )
 from scan_batch import ScanBatch, observation_from_candidate
-from proxy_signal_quality import enrich_parsed_proxy_quality
+from proxy_signal_quality import enrich_parsed_proxy_quality, proxy_momentum_context_review
 from yahoo_proxy_reuse import evaluate_yahoo_proxy_reuse
 
 
@@ -756,6 +757,11 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
     ref_short = pairs[-5][0] if len(pairs) >= 5 else pairs[0][0]
     ret_1d_bps = bps_change(last, ref_1d)
     ret_short_bps = bps_change(last, ref_short)
+    one_bar_returns = [
+        bps_change(pairs[index][0], pairs[index - 1][0])
+        for index in range(max(1, len(pairs) - 12), len(pairs))
+    ]
+    recent_volatility_bps = statistics.pstdev(one_bar_returns) if len(one_bar_returns) > 1 else 0.0
     recent_dollar_volume = sum(price * volume for price, volume in pairs[-27:])
     liq = liquidity_score(recent_dollar_volume)
     spread = estimated_spread_bps(liq)
@@ -838,6 +844,7 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
         "quote_volume_24h": round(recent_dollar_volume, 2),
         "liquidity_score": round(liq, 3),
         "spread_bps": round(spread, 3),
+        "recent_volatility_bps": round(recent_volatility_bps, 3),
         "last_bar_utc": last_seen.isoformat(),
         "stale_minutes": round(stale_minutes, 1),
         "session_status": session_status,
@@ -877,7 +884,25 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
             "public_docs_url": discovery.get("public_docs_url"),
         },
     }
-    return enrich_parsed_proxy_quality(candidate)
+    enrich_parsed_proxy_quality(candidate)
+    context = proxy_momentum_context_review(candidate, settings)
+    candidate["proxy_momentum_context"] = context
+    if context.get("applicable"):
+        candidate["proxy_momentum_context_score"] = context["score"]
+        candidate["proxy_momentum_context_diagnostics"] = list(context["diagnostics"])
+        candidate["score_before_proxy_momentum_context"] = candidate["score"]
+        candidate["score"] = round(
+            max(0.0, candidate["score"] - float(context["ranking_penalty_points"])), 3
+        )
+        candidate["paper_allocation_multiplier"] = min(
+            float(candidate.get("paper_allocation_multiplier", 1.0)),
+            float(context["allocation_multiplier"]),
+        )
+        if context["diagnostics"]:
+            candidate["risk_notes"].append(
+                "proxy momentum context is unconfirmed; retain as a conservative counterfactual paper experiment"
+            )
+    return candidate
 
 
 def _watch_only_candidate(discovery: dict[str, Any]) -> dict[str, Any]:

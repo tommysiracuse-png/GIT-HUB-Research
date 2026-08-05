@@ -160,6 +160,16 @@ DEFAULT_SETTINGS = {
         "min_opening_gap_bps": 40.0,
         "min_opening_gap_followthrough_ratio": 0.25,
     },
+    "yahoo_proxy_momentum_context": {
+        "enabled": True,
+        "paper_only": True,
+        "minimum_move_strength_bps": 40.0,
+        "minimum_tradable_followthrough_bps": 5.0,
+        "max_freshness_age_seconds": 900.0,
+        "minimum_volatility_normalized_persistence": 0.75,
+        "ranking_penalty_points": 15.0,
+        "minimum_counterfactual_allocation_multiplier": 0.25,
+    },
     "yahoo_proxy_cross_surface_alignment_guard": {
         "enabled": True,
         "max_destination_spread_bps": 8.0,
@@ -298,6 +308,16 @@ DEFAULT_SETTINGS = {
             "synthetic_route_penalty_bps": 6.0,
             "unconfirmed_borrow_proxy_penalty_bps": 6.0,
             "allocation_edge_bps_cap": 24.0,
+        },
+        "short_market_context": {
+            "enabled": True,
+            "paper_only": True,
+            "minimum_reference_breadth": 3,
+            "max_spread_plus_slippage_to_edge_ratio": 1.0,
+            "min_broader_risk_off_ratio": 0.60,
+            "minimum_local_reversal_bps": 1.0,
+            "ranking_weight": 0.20,
+            "minimum_counterfactual_allocation_multiplier": 0.25,
         },
     },
     "frontier_data_quality": {

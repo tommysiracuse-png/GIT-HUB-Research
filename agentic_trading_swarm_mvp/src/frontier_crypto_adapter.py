@@ -9522,6 +9522,21 @@ DEFAULT_FRONTIER_SHORT_COST_DECOMPOSITION_POLICY = {
     "allocation_edge_bps_cap": 24.0,
 }
 
+# This is deliberately a paper-research context model, not an entry gate.
+# Weak frontier-short conditions stay emitted, but are visibly downranked and
+# routed as smaller counterfactual experiments so their guard value can be
+# measured instead of inferred from a suppression rule.
+DEFAULT_FRONTIER_SHORT_MARKET_CONTEXT_POLICY = {
+    "enabled": True,
+    "paper_only": True,
+    "minimum_reference_breadth": 3,
+    "max_spread_plus_slippage_to_edge_ratio": 1.0,
+    "min_broader_risk_off_ratio": 0.60,
+    "minimum_local_reversal_bps": 1.0,
+    "ranking_weight": 0.20,
+    "minimum_counterfactual_allocation_multiplier": 0.25,
+}
+
 
 def _frontier_dislocation_quality_policy(settings: dict) -> dict:
     policy = dict(DEFAULT_FRONTIER_DISLOCATION_QUALITY_POLICY)
@@ -9544,6 +9559,16 @@ def _frontier_effective_edge_policy(settings: dict) -> dict:
 def _frontier_short_cost_decomposition_policy(settings: dict) -> dict:
     policy = dict(DEFAULT_FRONTIER_SHORT_COST_DECOMPOSITION_POLICY)
     configured = settings.get("frontier_crypto_adapter", {}).get("short_cost_decomposition", {})
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    if configured is False:
+        policy["enabled"] = False
+    return policy
+
+
+def _frontier_short_market_context_policy(settings: dict) -> dict:
+    policy = dict(DEFAULT_FRONTIER_SHORT_MARKET_CONTEXT_POLICY)
+    configured = settings.get("frontier_crypto_adapter", {}).get("short_market_context", {})
     if isinstance(configured, dict):
         policy.update({key: value for key, value in configured.items() if value is not None})
     if configured is False:
@@ -9756,6 +9781,152 @@ def _refresh_frontier_short_route_requirements_report(candidate: dict, settings:
     return candidate
 
 
+def frontier_short_market_context_review(
+    observation: dict,
+    candidate: dict,
+    reference_observations: list[dict] | None,
+    settings: dict,
+) -> dict:
+    """Score frontier-short context without suppressing a paper candidate.
+
+    Breadth, cost burden, local reversal, and broader peer pressure distinguish
+    a venue-specific premium from a move that has risk-off confirmation.  A
+    failed check selects conservative counterfactual routing only; it never
+    changes an otherwise priceable candidate into a blocked entry.
+    """
+
+    policy = _frontier_short_market_context_policy(settings)
+    applicable = bool(
+        policy.get("enabled", True)
+        and policy.get("paper_only", True)
+        and settings.get("mode", "paper") == "paper"
+        and not settings.get("allow_live_trading", False)
+        and observation.get("market_type") == "spot"
+        and candidate.get("direction") == "short_frontier_spot"
+    )
+    if not applicable:
+        return {
+            "enabled": bool(policy.get("enabled", True)),
+            "applicable": False,
+            "paper_only": True,
+            "emission_action": "unchanged",
+        }
+
+    peers = _frontier_reference_peer_rows(observation, reference_observations)
+    breadth = len(peers)
+    breadth_target = max(1, int(policy["minimum_reference_breadth"]))
+    expected_edge = abs(as_float(candidate.get("venue_deviation_bps"), 0.0) or 0.0)
+    spread = max(0.0, as_float(candidate.get("spread_bps"), 0.0) or 0.0)
+    entry_slippage = max(0.0, as_float(candidate.get("entry_slippage_bps_estimate"), 0.0) or 0.0)
+    exit_slippage = max(0.0, as_float(candidate.get("exit_slippage_bps_estimate"), 0.0) or 0.0)
+    crossing_cost = spread + entry_slippage + exit_slippage
+    cost_to_edge_ratio = crossing_cost / expected_edge if expected_edge > 0.0 else None
+    max_cost_ratio = max(0.001, float(policy["max_spread_plus_slippage_to_edge_ratio"]))
+
+    peer_returns = [
+        as_float(row.get("change_24h_pct"), None)
+        for row in peers
+    ]
+    peer_returns = [value * 100.0 for value in peer_returns if value is not None]
+    negative_peer_count = sum(value < 0.0 for value in peer_returns)
+    risk_off_ratio = negative_peer_count / len(peer_returns) if peer_returns else None
+    min_risk_off_ratio = max(0.0, min(1.0, float(policy["min_broader_risk_off_ratio"])))
+    local_trend = as_float(candidate.get("local_short_horizon_trend_bps"), None)
+    reversal_floor = max(0.0, float(policy["minimum_local_reversal_bps"]))
+
+    components = {
+        "reference_breadth": min(100.0, 100.0 * breadth / breadth_target),
+        "spread_plus_slippage_efficiency": (
+            max(0.0, min(100.0, 100.0 * (1.0 - cost_to_edge_ratio / max_cost_ratio)))
+            if cost_to_edge_ratio is not None
+            else 0.0
+        ),
+        "broader_risk_off": (
+            min(100.0, 100.0 * risk_off_ratio / min_risk_off_ratio)
+            if risk_off_ratio is not None and min_risk_off_ratio > 0.0
+            else 50.0
+        ),
+        "local_premium_reversal": (
+            100.0
+            if local_trend is not None and local_trend <= -reversal_floor
+            else 0.0
+            if local_trend is not None
+            else 50.0
+        ),
+    }
+    score = sum(components.values()) / len(components)
+    diagnostics = []
+    if breadth < breadth_target:
+        diagnostics.append("reference_breadth_below_context_target")
+    if cost_to_edge_ratio is None or cost_to_edge_ratio > max_cost_ratio:
+        diagnostics.append("spread_plus_slippage_exceeds_expected_edge")
+    if risk_off_ratio is None:
+        diagnostics.append("broader_risk_off_reference_unavailable")
+    elif risk_off_ratio < min_risk_off_ratio:
+        diagnostics.append("broader_risk_off_not_confirmed")
+    if local_trend is None:
+        diagnostics.append("local_premium_reversal_unavailable")
+    elif local_trend > -reversal_floor:
+        diagnostics.append("local_premium_reversal_not_confirmed")
+
+    confirmed = not diagnostics
+    counterfactual_floor = max(
+        0.01,
+        min(1.0, float(policy["minimum_counterfactual_allocation_multiplier"])),
+    )
+    allocation_multiplier = 1.0 if confirmed else max(counterfactual_floor, score / 100.0)
+    return {
+        "enabled": True,
+        "applicable": True,
+        "paper_only": True,
+        "score": round(max(0.0, min(100.0, score)), 3),
+        "components": {key: round(value, 3) for key, value in components.items()},
+        "diagnostics": diagnostics,
+        "confirmed": confirmed,
+        "emission_action": "primary_simulated_route" if confirmed else "counterfactual_guard_value",
+        "allocation_multiplier": round(allocation_multiplier, 6),
+        "reference_breadth": breadth,
+        "minimum_reference_breadth": breadth_target,
+        "spread_plus_slippage_bps": round(crossing_cost, 6),
+        "expected_edge_bps": round(expected_edge, 6),
+        "spread_plus_slippage_to_edge_ratio": round(cost_to_edge_ratio, 6) if cost_to_edge_ratio is not None else None,
+        "max_spread_plus_slippage_to_edge_ratio": max_cost_ratio,
+        "broader_risk_off_reference_count": len(peer_returns),
+        "broader_risk_off_negative_count": negative_peer_count,
+        "broader_risk_off_ratio": round(risk_off_ratio, 6) if risk_off_ratio is not None else None,
+        "min_broader_risk_off_ratio": min_risk_off_ratio,
+        "local_short_horizon_trend_bps": round(local_trend, 6) if local_trend is not None else None,
+        "minimum_local_reversal_bps": reversal_floor,
+    }
+
+
+def _apply_frontier_short_market_context(
+    candidate: dict,
+    observation: dict,
+    reference_observations: list[dict] | None,
+    settings: dict,
+) -> dict:
+    review = frontier_short_market_context_review(
+        observation, candidate, reference_observations, settings
+    )
+    candidate["frontier_short_market_context"] = review
+    if not review.get("applicable"):
+        return candidate
+    candidate["market_context_score"] = review["score"]
+    candidate["market_context_diagnostics"] = list(review["diagnostics"])
+    candidate["market_context_allocation_multiplier"] = review["allocation_multiplier"]
+    existing = as_float(candidate.get("paper_allocation_multiplier"), None)
+    candidate["paper_allocation_multiplier"] = min(
+        existing if existing is not None else 1.0,
+        float(review["allocation_multiplier"]),
+    )
+    if review["diagnostics"]:
+        candidate["risk_notes"] = list(candidate.get("risk_notes") or []) + [
+            "frontier short context is unconfirmed; retain as a conservative counterfactual paper experiment",
+        ]
+    return candidate
+
+
 def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> list[dict]:
     """Rank the paper cohort while retaining every emitted, priceable candidate."""
     policy = _frontier_dislocation_quality_policy(settings)
@@ -9768,6 +9939,12 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
     quality_weight = (
         min(1.0, max(0.0, float(policy["ranking_quality_weight"])))
         if paper_only_active
+        else 0.0
+    )
+    context_policy = _frontier_short_market_context_policy(settings)
+    context_weight = (
+        min(1.0, max(0.0, float(context_policy["ranking_weight"])))
+        if paper_only_active and context_policy.get("enabled", True) and context_policy.get("paper_only", True)
         else 0.0
     )
     for candidate in candidates:
@@ -9791,10 +9968,24 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         )
         effective_edge_score = max(0.0, ranking_edge or 0.0)
         local_quote_penalty = max(0.0, as_float(candidate.get("local_quote_score_penalty"), 0.0) or 0.0)
+        context_review = candidate.get("frontier_short_market_context")
+        context_score = (
+            as_float(context_review.get("score"), None)
+            if isinstance(context_review, dict) and context_review.get("applicable")
+            else None
+        )
         candidate["paper_ranking_score"] = round(
-            effective_edge_score + quality_weight * quality_score - local_quote_penalty
+            effective_edge_score
+            + quality_weight * quality_score
+            + context_weight * ((context_score - 100.0) if context_score is not None else 0.0)
+            - local_quote_penalty
             if ranking_edge is not None
-            else (1.0 - quality_weight) * base_score + quality_weight * quality_score - local_quote_penalty,
+            else (
+                (1.0 - quality_weight) * base_score
+                + quality_weight * quality_score
+                + context_weight * ((context_score - 100.0) if context_score is not None else 0.0)
+                - local_quote_penalty
+            ),
             3,
         )
         candidate["paper_ranking_edge_bps"] = round(ranking_edge, 6) if ranking_edge is not None else None
@@ -9808,6 +9999,13 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         )
         candidate["paper_quality_filter_status"] = (
             "ranked_not_blocked" if paper_only_active else "paper_only_ranking_inactive"
+        )
+        candidate["paper_market_context_filter_status"] = (
+            "ranked_and_counterfactually_routed"
+            if context_score is not None and isinstance(context_review, dict) and not context_review.get("confirmed")
+            else "ranked_with_confirmed_context"
+            if context_score is not None
+            else "not_applicable"
         )
     ranked = sorted(
         candidates,
@@ -10898,6 +11096,9 @@ def _candidate_from_observation(
     candidate = _refresh_frontier_short_route_requirements_report(candidate, settings)
     candidate = annotate_paper_context_cost(candidate, settings)
     candidate = _apply_frontier_effective_edge(candidate, observation, settings)
+    candidate = _apply_frontier_short_market_context(
+        candidate, observation, reference_observations, settings
+    )
     return _apply_frontier_marketability_gate(candidate, observation, settings, reference_observations)
 
 
@@ -11173,6 +11374,9 @@ def summarize(
     marketability_failures: collections.Counter[str] = collections.Counter()
     dislocation_quality_diagnostics: collections.Counter[str] = collections.Counter()
     dislocation_quality_scores = []
+    short_market_context_diagnostics: collections.Counter[str] = collections.Counter()
+    short_market_context_scores = []
+    short_market_context_counterfactual_count = 0
     short_net_edges = []
     short_cost_components: collections.Counter[str] = collections.Counter()
     for row in candidates:
@@ -11181,6 +11385,14 @@ def summarize(
         score = as_float(row.get("dislocation_quality_score"), None)
         if score is not None:
             dislocation_quality_scores.append(score)
+        market_context = row.get("frontier_short_market_context") or {}
+        if isinstance(market_context, dict) and market_context.get("applicable"):
+            context_score = as_float(market_context.get("score"), None)
+            if context_score is not None:
+                short_market_context_scores.append(context_score)
+            short_market_context_diagnostics.update(market_context.get("diagnostics") or [])
+            if market_context.get("emission_action") == "counterfactual_guard_value":
+                short_market_context_counterfactual_count += 1
         short_cost = row.get("short_cost_decomposition") or {}
         if isinstance(short_cost, dict) and short_cost.get("applicable"):
             net_edge = as_float(short_cost.get("net_edge_bps"), None)
@@ -11275,6 +11487,8 @@ def summarize(
             "paper_ranking_edge_bps": row.get("paper_ranking_edge_bps"),
             "paper_ranking_edge_source": row.get("paper_ranking_edge_source"),
             "short_cost_decomposition": row.get("short_cost_decomposition"),
+            "frontier_short_market_context": row.get("frontier_short_market_context"),
+            "paper_market_context_filter_status": row.get("paper_market_context_filter_status"),
             "quote_ccy": row.get("quote_ccy"),
             "fx_to_usd": row.get("fx_to_usd"),
             "fx_age_minutes": row.get("fx_age_minutes"),
@@ -11348,6 +11562,13 @@ def summarize(
             "cost_component_totals_bps": {
                 key: round(value, 6) for key, value in short_cost_components.items()
             },
+        },
+        "frontier_short_market_context": {
+            "paper_only": True,
+            "candidate_count": len(short_market_context_scores),
+            "counterfactual_candidate_count": short_market_context_counterfactual_count,
+            "score": _distribution(short_market_context_scores),
+            "diagnostics": dict(short_market_context_diagnostics),
         },
         "anomaly_counts": dict(anomaly_counts.most_common()),
         "freshness_age_seconds": _distribution(freshness_values),
@@ -11448,6 +11669,7 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Dislocation quality diagnostics: `{summary.get('dislocation_quality_diagnostics', {})}`")
     lines.append(f"- Paper cohort outcomes: `{summary.get('dislocation_quality_cohort_outcomes', {})}`")
     lines.append(f"- Paper-only short cost decomposition: `{summary.get('short_cost_decomposition', {})}`")
+    lines.append(f"- Frontier-short market context: `{summary.get('frontier_short_market_context', {})}`")
     expansion = summary.get("expansion_map", {})
     lines.extend(["", "## Expansion Map", ""])
     lines.append(f"- Known quality rate: `{expansion.get('known_quality_rate')}`")
