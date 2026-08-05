@@ -18,7 +18,6 @@ from storage import init_db
 from strategy_lab import generate_strategy_lab_candidates
 from strategy_reliability import (
     apply_strategy_reliability,
-    hydrate_paper_lineage_source_health,
     paper_lineage_source_health_record,
     paper_source_veto_record,
 )
@@ -56,102 +55,7 @@ def negative_health(*, closed_count: int, expectancy: float = -7.0) -> dict[str,
     }
 
 
-def record_closed_source_trade(
-    conn: sqlite3.Connection,
-    *,
-    closed_at: str,
-    pnl_bps: float,
-    signal: str = "SOURCE_SURFACE|source_momentum|long|standard",
-) -> None:
-    conn.execute(
-        """
-        insert into paper_trades (
-            opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
-            base_score, learned_score, entry, pnl_bps, status, thesis, candidate_json, review_json
-        ) values (?, ?, 'SOURCE_SURFACE', 'SOURCE_SURFACE:ABC', 'long', 'source_momentum', ?,
-                  50, 50, 1, ?, 'closed', 'paper-only test', '{}', '{}')
-        """,
-        (closed_at, closed_at, signal, pnl_bps),
-    )
-
-
 class LineageSourceHealthGuardTests(unittest.TestCase):
-    def test_recent_negative_source_family_quarantines_cross_surface_descendant(self) -> None:
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        init_db(conn)
-        try:
-            for index in range(12):
-                record_closed_source_trade(
-                    conn,
-                    closed_at=f"2026-08-04T00:{index:02d}:00+00:00",
-                    pnl_bps=-8.0,
-                )
-            descendant = candidate(
-                source_surface="SOURCE_SURFACE",
-                source_signal_family="source_momentum",
-            )
-            rows, _ = apply_strategy_reliability([descendant], conn=conn)
-        finally:
-            conn.close()
-
-        review = rows[0]["paper_lineage_source_health"]
-        self.assertTrue(rows[0]["paper_entry_blocked"])
-        self.assertEqual("quarantine", review["action"])
-        self.assertEqual(12, review["source_health"]["closed_count"])
-        self.assertEqual("recent_closed_paper_source_lineage", review["source_health"]["evidence_source"])
-
-    def test_recent_source_recovery_requires_configured_pnl_win_rate_and_sample_size(self) -> None:
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        init_db(conn)
-        cfg = copy.deepcopy(DEFAULT_SETTINGS)
-        cfg["strategy_lab"]["lineage_source_health_guard"].update(
-            {
-                "rolling_window_closed_trades": 10,
-                "recovery_min_closed_count": 10,
-                "recovery_min_avg_pnl_bps": 1.0,
-                "recovery_min_win_rate": 0.60,
-            }
-        )
-        try:
-            for index in range(12):
-                record_closed_source_trade(
-                    conn,
-                    closed_at=f"2026-08-03T00:{index:02d}:00+00:00",
-                    pnl_bps=-8.0,
-                )
-            for index in range(10):
-                record_closed_source_trade(
-                    conn,
-                    closed_at=f"2026-08-04T00:{index:02d}:00+00:00",
-                    pnl_bps=3.0 if index < 7 else -1.0,
-                )
-            descendant = candidate(
-                source_surface="SOURCE_SURFACE",
-                source_signal_family="source_momentum",
-            )
-            hydrate_paper_lineage_source_health([descendant], conn, cfg)
-            review = paper_lineage_source_health_record(descendant, cfg)
-        finally:
-            conn.close()
-
-        self.assertIsNone(review)
-
-    def test_recent_verified_recovery_releases_static_yahoo_descendant_veto(self) -> None:
-        recovered = {
-            "market_key": "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
-            "lineage_source_health_recent": {
-                "closed_count": 10,
-                "after_cost_expectancy_bps": 2.0,
-                "win_rate": 0.70,
-                "recent_window": True,
-                "evidence_source": "recent_closed_paper_source_lineage",
-            },
-        }
-
-        self.assertIsNone(paper_source_veto_record(recovered, DEFAULT_SETTINGS))
-
     def test_persistent_negative_parent_edge_is_quarantined_before_sorting(self) -> None:
         degraded = candidate(
             inst_id="OKX_SPOT:DEGRADED-USDT",

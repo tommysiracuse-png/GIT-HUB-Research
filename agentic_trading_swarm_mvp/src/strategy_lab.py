@@ -2439,7 +2439,7 @@ def _lineage_source_health_rank_guard(
         dict,
     ):
         return (annotated if prior_review.get("paper_rank_eligible") else None), None
-    hydrate_paper_lineage_source_health([annotated], conn, settings)
+    hydrate_paper_lineage_source_health([annotated], conn)
     review = paper_lineage_source_health_record(annotated, settings)
     if review is None:
         return annotated, None
@@ -2587,7 +2587,7 @@ def generate_strategy_lab_candidates(
             [(_utc(), strategy_lab_id) for strategy_lab_id in promoted_plugins],
         )
         conn.commit()
-    hydrate_paper_lineage_source_health(candidates, conn, settings)
+    hydrate_paper_lineage_source_health(candidates, conn)
     source_vetoed_candidates: list[dict] = []
     lineage_source_health_guarded_candidates: list[dict] = []
     proxy_frontier_quarantined_candidates: list[dict] = []
