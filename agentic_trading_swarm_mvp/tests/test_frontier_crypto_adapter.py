@@ -556,7 +556,9 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertIn("dislocation_quality_score", summary)
         self.assertIn("dislocation_quality_diagnostics", summary)
         self.assertIn("dislocation_quality_cohort_outcomes", summary)
+        self.assertIn("short_cost_decomposition", summary)
         self.assertIn("dislocation_quality_score", summary["top_dislocations"][0])
+        self.assertIn("short_cost_decomposition", summary["top_dislocations"][0])
         self.assertEqual(summary["expansion_map"]["worker_count"], 16)
         self.assertEqual(summary["expansion_map"]["selection_limits"]["max_symbols_per_cycle"], 300)
         self.assertEqual(summary["expansion_map"]["venue_quota_report"]["A"]["status"], "partial")
@@ -723,7 +725,61 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertTrue(all(check["passed"] for check in candidate["marketability_gate"]["checks"].values()))
         self.assertTrue(candidate["route_health_confirmation"]["confirmed"])
         self.assertEqual("primary", candidate["simulated_order_allocation"]["mode"])
-        self.assertEqual(1.0, candidate["paper_allocation_multiplier"])
+        self.assertGreater(candidate["paper_allocation_multiplier"], 0.0)
+        self.assertLess(candidate["paper_allocation_multiplier"], 1.0)
+
+    def test_short_cost_decomposition_prices_short_friction_without_blocking_paper(self) -> None:
+        cfg = settings()
+        local = self._quality_obs("FRONTIER", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
+
+        candidate = frontier._candidate_from_observation(
+            local,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[local, peer],
+        )
+        frontier.rank_frontier_paper_candidates([candidate], cfg)
+
+        costs = candidate["short_cost_decomposition"]
+        expected_net = (
+            costs["gross_edge_bps"]
+            - costs["spread_cost_bps"]
+            - costs["depth_slippage_cost_bps"]
+            - costs["estimated_taker_fee_cost_bps"]
+            - costs["venue_quality_penalty_bps"]
+            - costs["synthetic_route_penalty_bps"]
+            - costs["borrow_proxy_penalty_bps"]
+        )
+        self.assertTrue(costs["applicable"])
+        self.assertAlmostEqual(expected_net, costs["net_edge_bps"], places=5)
+        self.assertEqual(6.0, costs["borrow_proxy_penalty_bps"])
+        self.assertEqual("unconfirmed_borrow_proxy", costs["borrow_proxy_source"])
+        self.assertEqual("short_cost_decomposition.net_edge_bps", candidate["paper_ranking_edge_source"])
+        self.assertFalse(candidate["paper_entry_blocked"])
+
+    def test_short_cost_decomposition_reorders_synthetic_route_by_net_edge(self) -> None:
+        cfg = settings()
+        direct = {
+            "inst_id": "DIRECT",
+            "score": 20.0,
+            "dislocation_quality_score": 50.0,
+            "effective_edge_bps": 20.0,
+            "short_cost_decomposition": {"applicable": True, "net_edge_bps": 12.0},
+        }
+        synthetic = {
+            "inst_id": "SYNTHETIC",
+            "score": 99.0,
+            "dislocation_quality_score": 50.0,
+            "effective_edge_bps": 30.0,
+            "short_cost_decomposition": {"applicable": True, "net_edge_bps": 5.0},
+        }
+
+        ranked = frontier.rank_frontier_paper_candidates([synthetic, direct], cfg)
+
+        self.assertEqual("DIRECT", ranked[0]["inst_id"])
+        self.assertEqual("short_cost_decomposition.net_edge_bps", synthetic["paper_ranking_edge_source"])
 
     def test_effective_edge_decomposes_execution_costs_and_scales_synthetic_routes(self) -> None:
         cfg = settings()

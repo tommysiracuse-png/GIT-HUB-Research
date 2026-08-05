@@ -290,6 +290,15 @@ DEFAULT_SETTINGS = {
             "low_reliability_score": 0.70,
             "counterfactual_allocation_multiplier": 0.25,
         },
+        "short_cost_decomposition": {
+            "enabled": True,
+            "paper_only": True,
+            "venue_quality_penalty_bps_cap": 8.0,
+            "missing_venue_quality_penalty_bps": 6.0,
+            "synthetic_route_penalty_bps": 6.0,
+            "unconfirmed_borrow_proxy_penalty_bps": 6.0,
+            "allocation_edge_bps_cap": 24.0,
+        },
     },
     "frontier_data_quality": {
         "enabled": True,

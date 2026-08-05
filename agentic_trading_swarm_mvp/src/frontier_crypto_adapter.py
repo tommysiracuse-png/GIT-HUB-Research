@@ -9394,6 +9394,20 @@ DEFAULT_FRONTIER_EFFECTIVE_EDGE_POLICY = {
     "counterfactual_allocation_multiplier": 0.25,
 }
 
+# Short frontier spot observations can look attractive on a gross venue
+# deviation while still carrying distinctly asymmetric execution costs.  This
+# stays a paper-only ranking/allocation model: a negative result moves the
+# observation to counterfactual routing instead of suppressing its emission.
+DEFAULT_FRONTIER_SHORT_COST_DECOMPOSITION_POLICY = {
+    "enabled": True,
+    "paper_only": True,
+    "venue_quality_penalty_bps_cap": 8.0,
+    "missing_venue_quality_penalty_bps": 6.0,
+    "synthetic_route_penalty_bps": 6.0,
+    "unconfirmed_borrow_proxy_penalty_bps": 6.0,
+    "allocation_edge_bps_cap": 24.0,
+}
+
 
 def _frontier_dislocation_quality_policy(settings: dict) -> dict:
     policy = dict(DEFAULT_FRONTIER_DISLOCATION_QUALITY_POLICY)
@@ -9406,6 +9420,16 @@ def _frontier_dislocation_quality_policy(settings: dict) -> dict:
 def _frontier_effective_edge_policy(settings: dict) -> dict:
     policy = dict(DEFAULT_FRONTIER_EFFECTIVE_EDGE_POLICY)
     configured = settings.get("frontier_crypto_adapter", {}).get("effective_edge", {})
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    if configured is False:
+        policy["enabled"] = False
+    return policy
+
+
+def _frontier_short_cost_decomposition_policy(settings: dict) -> dict:
+    policy = dict(DEFAULT_FRONTIER_SHORT_COST_DECOMPOSITION_POLICY)
+    configured = settings.get("frontier_crypto_adapter", {}).get("short_cost_decomposition", {})
     if isinstance(configured, dict):
         policy.update({key: value for key, value in configured.items() if value is not None})
     if configured is False:
@@ -9562,14 +9586,30 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         quality_score = as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0
         base_score = as_float(candidate.get("score"), 0.0) or 0.0
         effective_edge = as_float(candidate.get("effective_edge_bps"), None)
-        effective_edge_score = max(0.0, effective_edge or 0.0)
+        short_cost_model = candidate.get("short_cost_decomposition") or {}
+        short_net_edge = (
+            as_float(short_cost_model.get("net_edge_bps"), None)
+            if isinstance(short_cost_model, dict) and short_cost_model.get("applicable")
+            else None
+        )
+        ranking_edge = short_net_edge if short_net_edge is not None else effective_edge
+        ranking_edge_source = (
+            "short_cost_decomposition.net_edge_bps"
+            if short_net_edge is not None
+            else "effective_edge_bps"
+            if effective_edge is not None
+            else "base_score"
+        )
+        effective_edge_score = max(0.0, ranking_edge or 0.0)
         local_quote_penalty = max(0.0, as_float(candidate.get("local_quote_score_penalty"), 0.0) or 0.0)
         candidate["paper_ranking_score"] = round(
             effective_edge_score + quality_weight * quality_score - local_quote_penalty
-            if effective_edge is not None
+            if ranking_edge is not None
             else (1.0 - quality_weight) * base_score + quality_weight * quality_score - local_quote_penalty,
             3,
         )
+        candidate["paper_ranking_edge_bps"] = round(ranking_edge, 6) if ranking_edge is not None else None
+        candidate["paper_ranking_edge_source"] = ranking_edge_source
         candidate["paper_quality_cohort"] = (
             "quality_ranked"
             if paper_only_active and quality_score >= 60.0
@@ -9604,6 +9644,131 @@ def _frontier_effective_edge_reliability(observation: dict, candidate: dict) -> 
         if value is not None:
             return max(0.0, min(1.0, value / 100.0 if value > 1.0 else value)), source
     return None, "unavailable"
+
+
+def frontier_short_cost_decomposition_review(observation: dict, candidate: dict, settings: dict) -> dict:
+    """Estimate paper-only short-side execution drag for frontier spot.
+
+    The output is deliberately diagnostic and ranking-oriented.  It never
+    changes direction, reject reason, or ``paper_entry_blocked``; an adverse
+    net edge is retained as a counterfactual paper experiment by the existing
+    effective-edge routing path.
+    """
+    policy = _frontier_short_cost_decomposition_policy(settings)
+    applicable = bool(
+        policy.get("enabled", True)
+        and policy.get("paper_only", True)
+        and settings.get("mode", "paper") == "paper"
+        and not settings.get("allow_live_trading", False)
+        and observation.get("market_type") == "spot"
+        and candidate.get("direction") == "short_frontier_spot"
+    )
+    if not applicable:
+        return {
+            "enabled": bool(policy.get("enabled", True)),
+            "applicable": False,
+            "paper_only": True,
+            "emission_action": "unchanged",
+        }
+
+    gross_edge = abs(as_float(candidate.get("venue_deviation_bps"), 0.0) or 0.0)
+    spread_cost = max(0.0, as_float(candidate.get("spread_bps"), 0.0) or 0.0)
+    entry_slippage = max(0.0, as_float(candidate.get("entry_slippage_bps_estimate"), 0.0) or 0.0)
+    exit_slippage = max(0.0, as_float(candidate.get("exit_slippage_bps_estimate"), 0.0) or 0.0)
+    depth_slippage_cost = entry_slippage + exit_slippage
+    taker_fee_cost = 2.0 * max(0.0, as_float(candidate.get("estimated_fee_bps_per_side"), 0.0) or 0.0)
+
+    quality_value = as_float(candidate.get("quality_score"), None)
+    quality_source = "quality_score"
+    if quality_value is None:
+        quality_value = as_float(observation.get("venue_health_score"), None)
+        quality_source = "venue_health_score" if quality_value is not None else "unavailable"
+    if quality_value is None:
+        venue_quality_penalty = max(0.0, float(policy["missing_venue_quality_penalty_bps"]))
+    else:
+        normalized_quality = max(0.0, min(1.0, quality_value / 100.0 if quality_value > 1.0 else quality_value))
+        venue_quality_penalty = (1.0 - normalized_quality) * max(
+            0.0, float(policy["venue_quality_penalty_bps_cap"])
+        )
+
+    route_text = " ".join(
+        str(value or "")
+        for value in (
+            candidate.get("route_id"),
+            candidate.get("paper_route_status"),
+            candidate.get("route_status"),
+            candidate.get("data_source"),
+        )
+    ).lower()
+    synthetic_route = bool(candidate.get("synthetic_research_paper")) or any(
+        token in route_text for token in ("synthetic", "proxy", "counterfactual")
+    )
+    synthetic_route_penalty = (
+        max(0.0, float(policy["synthetic_route_penalty_bps"])) if synthetic_route else 0.0
+    )
+
+    borrow_penalty = None
+    borrow_source = "unconfirmed_borrow_proxy"
+    for container, source, keys in (
+        (candidate, "candidate", ("borrow_proxy_penalty_bps", "borrow_cost_bps", "borrow_cost_bps_estimate")),
+        (observation, "observation", ("borrow_proxy_penalty_bps", "borrow_cost_bps", "borrow_cost_bps_estimate")),
+    ):
+        for key in keys:
+            value = as_float(container.get(key), None)
+            if value is not None:
+                borrow_penalty = max(0.0, value)
+                borrow_source = f"{source}.{key}"
+                break
+        if borrow_penalty is not None:
+            break
+    execution = candidate.get("execution_feasibility") or {}
+    route_blockers = set(execution.get("route_blockers") or []) if isinstance(execution, dict) else set()
+    borrow_confirmed = bool(
+        candidate.get("borrow_confirmed")
+        or candidate.get("borrowable")
+        or observation.get("borrow_confirmed")
+        or observation.get("borrowable")
+        or "spot_borrow" not in route_blockers
+    )
+    if borrow_penalty is None:
+        borrow_penalty = 0.0 if borrow_confirmed else max(
+            0.0, float(policy["unconfirmed_borrow_proxy_penalty_bps"])
+        )
+        borrow_source = "confirmed_no_cost_observed" if borrow_confirmed else borrow_source
+
+    net_edge = (
+        gross_edge
+        - spread_cost
+        - depth_slippage_cost
+        - taker_fee_cost
+        - venue_quality_penalty
+        - synthetic_route_penalty
+        - borrow_penalty
+    )
+    costs = {
+        "spread_cost_bps": round(spread_cost, 6),
+        "depth_slippage_cost_bps": round(depth_slippage_cost, 6),
+        "estimated_taker_fee_cost_bps": round(taker_fee_cost, 6),
+        "venue_quality_penalty_bps": round(venue_quality_penalty, 6),
+        "synthetic_route_penalty_bps": round(synthetic_route_penalty, 6),
+        "borrow_proxy_penalty_bps": round(borrow_penalty, 6),
+    }
+    return {
+        "enabled": True,
+        "applicable": True,
+        "paper_only": True,
+        "emission_action": "rank_and_size_with_diagnostics",
+        "gross_edge_bps": round(gross_edge, 6),
+        **costs,
+        "total_cost_bps": round(sum(costs.values()), 6),
+        "net_edge_bps": round(net_edge, 6),
+        "venue_quality_score": round(quality_value, 6) if quality_value is not None else None,
+        "venue_quality_source": quality_source,
+        "synthetic_route": synthetic_route,
+        "borrow_confirmed": borrow_confirmed,
+        "borrow_proxy_source": borrow_source,
+        "allocation_edge_bps_cap": max(0.001, float(policy["allocation_edge_bps_cap"])),
+    }
 
 
 def frontier_effective_edge_review(observation: dict, candidate: dict, settings: dict) -> dict:
@@ -9751,10 +9916,31 @@ def frontier_effective_edge_review(observation: dict, candidate: dict, settings:
 def _apply_frontier_effective_edge(candidate: dict, observation: dict, settings: dict) -> dict:
     review = frontier_effective_edge_review(observation, candidate, settings)
     candidate["effective_edge_model"] = review
-    if not review.get("applicable"):
+    if review.get("applicable"):
+        candidate["effective_edge_bps"] = review["effective_edge_bps"]
+        candidate["confidence_score"] = review["confidence_score"]
+        candidate["effective_edge_primary_admitted"] = review["primary_admitted"]
+        candidate["effective_edge_admission_reasons"] = list(review["admission_reasons"])
+        candidate["effective_edge_allocation_multiplier"] = review["primary_allocation_multiplier"]
+    short_cost = frontier_short_cost_decomposition_review(observation, candidate, settings)
+    candidate["short_cost_decomposition"] = short_cost
+    if not short_cost.get("applicable") or not review.get("applicable"):
         return candidate
-    candidate["effective_edge_bps"] = review["effective_edge_bps"]
-    candidate["confidence_score"] = review["confidence_score"]
+
+    short_net_edge = float(short_cost["net_edge_bps"])
+    short_edge_scale = max(0.0, min(1.0, short_net_edge / float(short_cost["allocation_edge_bps_cap"])))
+    short_allocation = min(
+        float(review["primary_allocation_multiplier"]),
+        short_edge_scale * float(review["confidence_score"]),
+    )
+    short_primary_admitted = short_net_edge > float(review["minimums"]["effective_edge_bps"])
+    review["ranking_sizing_edge_bps"] = round(short_net_edge, 6)
+    review["ranking_sizing_edge_source"] = "short_cost_decomposition.net_edge_bps"
+    review["primary_allocation_multiplier"] = round(short_allocation, 6)
+    if not short_primary_admitted:
+        review["primary_admitted"] = False
+        review["admission_reasons"] = list(review["admission_reasons"]) + ["short_net_edge_not_positive"]
+        review["emission_action"] = "counterfactual_guard_value"
     candidate["effective_edge_primary_admitted"] = review["primary_admitted"]
     candidate["effective_edge_admission_reasons"] = list(review["admission_reasons"])
     candidate["effective_edge_allocation_multiplier"] = review["primary_allocation_multiplier"]
@@ -10200,9 +10386,12 @@ def _apply_frontier_marketability_gate(
             min(1.0, as_float(effective_edge.get("counterfactual_allocation_multiplier"), 0.25) or 0.25),
         )
     effective_allocation = effective_primary_multiplier if effective_primary_admitted else effective_counterfactual_multiplier
+    # Counterfactual routes retain their configured nonzero guard-value size.
+    # The short-cost model only scales trusted primary simulation, so weak-cost
+    # evidence cannot accidentally suppress the paper experiment itself.
     final_allocation = (
         route_multiplier * quality_multiplier * effective_allocation
-        if effective_primary_admitted
+        if route_health_confirmed and effective_primary_admitted
         else min(route_multiplier, effective_counterfactual_multiplier) * quality_multiplier
     )
     candidate["simulated_order_allocation"] = {
@@ -10789,12 +10978,29 @@ def summarize(
     marketability_failures: collections.Counter[str] = collections.Counter()
     dislocation_quality_diagnostics: collections.Counter[str] = collections.Counter()
     dislocation_quality_scores = []
+    short_net_edges = []
+    short_cost_components: collections.Counter[str] = collections.Counter()
     for row in candidates:
         marketability_failures.update((row.get("marketability_gate") or {}).get("failed_checks") or [])
         dislocation_quality_diagnostics.update(row.get("dislocation_quality_diagnostics") or [])
         score = as_float(row.get("dislocation_quality_score"), None)
         if score is not None:
             dislocation_quality_scores.append(score)
+        short_cost = row.get("short_cost_decomposition") or {}
+        if isinstance(short_cost, dict) and short_cost.get("applicable"):
+            net_edge = as_float(short_cost.get("net_edge_bps"), None)
+            if net_edge is not None:
+                short_net_edges.append(net_edge)
+            for key in (
+                "spread_cost_bps",
+                "depth_slippage_cost_bps",
+                "venue_quality_penalty_bps",
+                "synthetic_route_penalty_bps",
+                "borrow_proxy_penalty_bps",
+            ):
+                value = as_float(short_cost.get(key), None)
+                if value is not None:
+                    short_cost_components[key] += value
     active_candidate_count = sum(
         1
         for row in candidates
@@ -10871,6 +11077,9 @@ def summarize(
             "dislocation_quality_diagnostics": row.get("dislocation_quality_diagnostics", []),
             "paper_quality_rank": row.get("paper_quality_rank"),
             "paper_quality_cohort": row.get("paper_quality_cohort"),
+            "paper_ranking_edge_bps": row.get("paper_ranking_edge_bps"),
+            "paper_ranking_edge_source": row.get("paper_ranking_edge_source"),
+            "short_cost_decomposition": row.get("short_cost_decomposition"),
             "quote_ccy": row.get("quote_ccy"),
             "fx_to_usd": row.get("fx_to_usd"),
             "fx_age_minutes": row.get("fx_age_minutes"),
@@ -10937,6 +11146,14 @@ def summarize(
         "dislocation_quality_cohort_outcomes": depth_summary.get(
             "dislocation_quality_cohort_outcomes", {}
         ),
+        "short_cost_decomposition": {
+            "paper_only": True,
+            "candidate_count": len(short_net_edges),
+            "net_edge_bps": _distribution(short_net_edges),
+            "cost_component_totals_bps": {
+                key: round(value, 6) for key, value in short_cost_components.items()
+            },
+        },
         "anomaly_counts": dict(anomaly_counts.most_common()),
         "freshness_age_seconds": _distribution(freshness_values),
         "depth_latency_ms": _distribution(depth_latency_values),
@@ -11035,6 +11252,7 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Dislocation quality scores: `{summary.get('dislocation_quality_score', {})}`")
     lines.append(f"- Dislocation quality diagnostics: `{summary.get('dislocation_quality_diagnostics', {})}`")
     lines.append(f"- Paper cohort outcomes: `{summary.get('dislocation_quality_cohort_outcomes', {})}`")
+    lines.append(f"- Paper-only short cost decomposition: `{summary.get('short_cost_decomposition', {})}`")
     expansion = summary.get("expansion_map", {})
     lines.extend(["", "## Expansion Map", ""])
     lines.append(f"- Known quality rate: `{expansion.get('known_quality_rate')}`")
