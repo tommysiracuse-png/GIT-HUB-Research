@@ -32,9 +32,16 @@ ROUTE_REQUIREMENT_FIELDS = (
     "borrow_required",
     "borrow_asset",
     "borrow_fee_bps_estimate_or_unknown",
+    "borrow_availability_status",
+    "maker_fee_bps_or_unknown",
+    "taker_fee_bps_or_unknown",
+    "fee_stack_bps_estimate_or_unknown",
     "margin_required",
+    "margin_mode",
     "venue_api_requirement",
+    "api_route_status",
     "endpoint_constraints",
+    "minimum_liquidity_usd_or_unknown",
     "jurisdiction_requirement",
     "fee_bps_per_side_or_unknown",
     "slippage_bps_per_side_or_unknown",
@@ -60,6 +67,7 @@ ROUTE_REQUIREMENT_FIELDS = (
     "requires_margin_permission",
     "route_requirement_checklist",
     "route_requirement_checklist_complete",
+    "conditional_short_route_diagnostics",
 )
 
 # These are the route facts that an opportunity report must carry forward to a
@@ -103,8 +111,151 @@ def build_route_requirements_matrix(
     for opportunity in opportunities:
         normalized = _route_requirement_opportunity(opportunity)
         row = _build_route_requirement_row(normalized)
-        rows.append(_annotate_route_feasibility_fields(normalized, row))
+        annotated = _annotate_route_feasibility_fields(normalized, row)
+        diagnostics = build_conditional_short_route_diagnostics(normalized, row=annotated)
+        annotated.update(
+            {
+                "borrow_availability_status": diagnostics["borrow_availability"],
+                "maker_fee_bps_or_unknown": diagnostics["maker_taker_fee_stack_bps"]["maker_bps"],
+                "taker_fee_bps_or_unknown": diagnostics["maker_taker_fee_stack_bps"]["taker_bps"],
+                "fee_stack_bps_estimate_or_unknown": diagnostics["maker_taker_fee_stack_bps"],
+                "margin_mode": diagnostics["margin_mode"],
+                "api_route_status": diagnostics["api_route_status"],
+                "minimum_liquidity_usd_or_unknown": diagnostics["minimum_liquidity_usd"],
+                "conditional_short_route_diagnostics": diagnostics,
+            }
+        )
+        rows.append(annotated)
     return sorted(rows, key=_route_priority_key)
+
+
+def build_conditional_short_route_diagnostics(
+    opportunity: dict[str, Any],
+    *,
+    row: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe conditional-short execution requirements without probing a route.
+
+    This is intentionally a ranking diagnostic, not an eligibility decision.
+    Unknown borrow, fee, margin, API, or liquidity facts reduce only the
+    paper-review rank of a conditional short; they never set a paper-entry
+    blocker or alter a broker/account capability.
+    """
+
+    source = dict(row or {})
+    source.update({key: value for key, value in opportunity.items() if value not in (None, "")})
+    blockers = _route_blockers(source)
+    direction = str(source.get("direction") or UNKNOWN).lower()
+    route_status = str(source.get("route_status") or _paper_route_status(source, blockers=blockers)).lower()
+    applies = "short" in direction and route_status in {
+        "conditional",
+        "route_unknown",
+        "unsupported_or_unknown",
+        "paper_testable_via_proxy",
+        "blocked_until_requirements_confirmed",
+    }
+    borrow_required = _requires_spot_borrow(source, blockers=blockers)
+
+    borrow_availability = _route_fact_status(
+        _first_known(
+            source,
+            "borrow_availability_status",
+            "borrow_status",
+            "borrow_available",
+            "borrowable",
+            "borrow_supported",
+        ),
+        required=borrow_required,
+        unresolved=borrow_required or "spot_borrow" in blockers,
+    )
+    borrow_fee = _first_known(
+        source,
+        "borrow_fee_bps_estimate_or_unknown",
+        "borrow_fee_bps_estimate",
+        "borrow_fee_bps",
+        "borrow_cost_bps",
+    )
+    maker_fee = _first_known(source, "maker_fee_bps_or_unknown", "maker_fee_bps", "estimated_maker_fee_bps")
+    taker_fee = _first_known(
+        source,
+        "taker_fee_bps_or_unknown",
+        "taker_fee_bps",
+        "fee_bps_per_side_or_unknown",
+        "fee_bps_per_side",
+    )
+    margin_mode = _first_known(source, "margin_mode", "margin_account_mode", "leverage_mode")
+    if margin_mode == UNKNOWN and _requires_margin_permission(source, blockers=blockers, borrow_required=borrow_required) is True:
+        margin_mode = "unconfirmed"
+    api_route_status = _route_fact_status(
+        _first_known(source, "api_route_status", "api_access_status", "venue_api_status", "endpoint_status"),
+        required=True,
+        unresolved=applies,
+    )
+    minimum_liquidity = _first_known(
+        source,
+        "minimum_liquidity_usd_or_unknown",
+        "minimum_liquidity_usd",
+        "min_liquidity_usd",
+        "liquidity_floor_usd",
+        "required_liquidity_usd",
+    )
+    taker_number = _float_or_none(taker_fee)
+    fee_stack: dict[str, Any] = {"maker_bps": maker_fee, "taker_bps": taker_fee}
+    if taker_number is not None:
+        fee_stack["estimated_round_trip_taker_bps"] = round(taker_number * 2.0, 4)
+    else:
+        fee_stack["estimated_round_trip_taker_bps"] = UNKNOWN
+
+    risk_reasons: list[str] = []
+    risk_points = 0
+    if applies:
+        for value, unknown_reason, unavailable_reason, points in (
+            (borrow_availability, "borrow_availability_unconfirmed", "borrow_unavailable", 25),
+            (borrow_fee, "borrow_fee_unestimated", "borrow_fee_unestimated", 15),
+            (maker_fee, "maker_fee_unestimated", "maker_fee_unestimated", 10),
+            (taker_fee, "taker_fee_unestimated", "taker_fee_unestimated", 15),
+            (margin_mode, "margin_mode_unconfirmed", "margin_mode_unconfirmed", 15),
+            (api_route_status, "api_route_status_unconfirmed", "api_route_unavailable", 20),
+            (minimum_liquidity, "minimum_liquidity_unspecified", "minimum_liquidity_unspecified", 10),
+        ):
+            normalized = str(value or UNKNOWN).strip().lower()
+            if normalized in {UNKNOWN, "unconfirmed", "not_checked", "not_applicable"}:
+                risk_points += points
+                risk_reasons.append(unknown_reason)
+            elif normalized in {"missing", "unavailable", "unsupported", "blocked"}:
+                risk_points += points * 2
+                risk_reasons.append(unavailable_reason)
+    risk_score = min(100, risk_points)
+    rank_multiplier = round(max(0.35, 1.0 - risk_score / 200.0), 4) if applies else 1.0
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "applies": applies,
+        "borrow_availability": borrow_availability,
+        "estimated_borrow_fee_bps": borrow_fee,
+        "maker_taker_fee_stack_bps": fee_stack,
+        "margin_mode": margin_mode,
+        "api_route_status": api_route_status,
+        "minimum_liquidity_usd": minimum_liquidity,
+        "execution_risk_score": risk_score,
+        "execution_risk_reasons": list(dict.fromkeys(risk_reasons)),
+        "paper_rank_multiplier": rank_multiplier,
+        "ranking_action": "down_rank_only" if applies and risk_score else "no_rank_adjustment",
+        "hard_blocking": False,
+    }
+
+
+def _route_fact_status(value: Any, *, required: bool, unresolved: bool) -> str:
+    """Normalize a route fact while retaining unknowns as report diagnostics."""
+
+    if value == UNKNOWN or value in (None, ""):
+        return "unconfirmed" if unresolved else "not_applicable" if not required else UNKNOWN
+    boolean = _bool_flag(value)
+    if boolean is True:
+        return "available"
+    if boolean is False:
+        return "unavailable"
+    return str(value)
 
 
 def build_route_requirements_report(

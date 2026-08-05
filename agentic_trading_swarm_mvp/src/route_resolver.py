@@ -15,25 +15,43 @@ import json
 import pathlib
 from typing import Iterable
 
-from paper_context_cost import (
-    annotate_paper_context_cost,
-    paper_context_cost_report,
-    rank_paper_candidates_by_context,
-)
-from paper_route_registry import apply_paper_route_registry
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 try:
-    from route_intelligence import build_route_requirements_report
+    from paper_context_cost import (
+        annotate_paper_context_cost,
+        paper_context_cost_report,
+        rank_paper_candidates_by_context,
+    )
+    from paper_route_registry import apply_paper_route_registry
 except ModuleNotFoundError:  # pragma: no cover - package import fallback
-    from .route_intelligence import build_route_requirements_report
+    from .paper_context_cost import (
+        annotate_paper_context_cost,
+        paper_context_cost_report,
+        rank_paper_candidates_by_context,
+    )
+    from .paper_route_registry import apply_paper_route_registry
+
+try:
+    from route_intelligence import (
+        build_conditional_short_route_diagnostics,
+        build_route_requirements_report,
+    )
+except ModuleNotFoundError:  # pragma: no cover - package import fallback
+    from .route_intelligence import (
+        build_conditional_short_route_diagnostics,
+        build_route_requirements_report,
+    )
 
 try:
     from storage import RUNS_DIR
 except ModuleNotFoundError:  # pragma: no cover - fallback for isolated test imports
-    from src.storage import RUNS_DIR
+    # The resolver only needs the report directory.  Avoid importing the
+    # persistence module here so package-style, read-only route diagnostics do
+    # not load storage's runtime-only dependencies.
+    RUNS_DIR = ROOT / "runs"
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "config"
 CUSTOM_ROUTES_PATH = CONFIG_DIR / "execution_routes.json"
 EXAMPLE_ROUTES_PATH = CONFIG_DIR / "execution_routes.example.json"
@@ -2012,9 +2030,21 @@ def enrich_candidate_with_route(
     route_sensitivity_reasons = _paper_route_sensitivity_reasons(enriched, route)
     route_sensitive = bool(route_sensitivity_reasons)
     route_feasibility_score = _paper_route_feasibility_score(enriched, route, eligibility)
+    diagnostic_input = dict(enriched)
+    diagnostic_input.update(
+        {
+            "route_status": route.get("route_status"),
+            "borrow_status": route.get("borrow_status"),
+            "margin_required": route.get("margin_required"),
+            "api_access_status": route.get("api_access_status"),
+            "route_blockers": route.get("route_blockers", []),
+        }
+    )
+    conditional_short_diagnostics = build_conditional_short_route_diagnostics(diagnostic_input)
     route["route_sensitive"] = route_sensitive
     route["route_sensitivity_reasons"] = route_sensitivity_reasons
     route["route_feasibility_score"] = route_feasibility_score
+    route["conditional_short_route_diagnostics"] = conditional_short_diagnostics
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
     route["paper_route_registry"] = enriched["paper_route_registry"]
@@ -2070,6 +2100,7 @@ def enrich_candidate_with_route(
             "paper_route_notes": eligibility["paper_route_notes"],
             "rank_contribution_cap": eligibility["rank_contribution_cap"],
             "rank_contribution": eligibility["rank_contribution"],
+            "conditional_short_route_diagnostics": conditional_short_diagnostics,
         }
     )
     enriched["execution_feasibility"] = existing
@@ -2091,6 +2122,7 @@ def enrich_candidate_with_route(
     enriched["paper_route_notes"] = eligibility["paper_route_notes"]
     enriched["rank_contribution_cap"] = eligibility["rank_contribution_cap"]
     enriched["rank_contribution"] = eligibility["rank_contribution"]
+    enriched["conditional_short_route_diagnostics"] = conditional_short_diagnostics
     if eligibility["suppressed"]:
         if "score" in enriched:
             enriched.setdefault(
@@ -2120,6 +2152,18 @@ def enrich_candidate_with_route(
             else route_allocation
         )
         enriched["paper_route_assumption_penalty_applied"] = True
+    if (
+        conditional_short_diagnostics.get("applies")
+        and not eligibility["suppressed"]
+        and not eligibility["assumption_penalty_applied"]
+        and not enriched.get("conditional_short_execution_risk_downrank_applied")
+    ):
+        risk_multiplier = float(conditional_short_diagnostics["paper_rank_multiplier"])
+        if risk_multiplier < 1.0 and _eligibility_number(enriched, "score") is not None:
+            enriched.setdefault("score_before_conditional_short_execution_risk", enriched["score"])
+            enriched["score"] = round(float(enriched["score"]) * risk_multiplier, 6)
+            enriched["conditional_short_execution_risk_downrank_applied"] = True
+            enriched["conditional_short_execution_risk_multiplier"] = risk_multiplier
     prior_context_gate = enriched.get("paper_context_cost_gate") or {}
     prior_context_multiplier = float(prior_context_gate.get("score_multiplier", 1.0) or 1.0)
     refresh_context_cost = bool(prior_context_gate) or enriched.get("trade_type") in {

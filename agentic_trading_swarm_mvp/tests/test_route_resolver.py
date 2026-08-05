@@ -22,6 +22,25 @@ def settings() -> dict:
 
 
 class RouteResolverTests(unittest.TestCase):
+    def test_unmapped_conditional_short_is_down_ranked_without_a_new_paper_block(self) -> None:
+        enriched = route_resolver.enrich_candidate_with_route(
+            {
+                "venue": "UNMAPPED",
+                "trade_type": "research",
+                "direction": "short_signal",
+                "asset_class": "research",
+                "score": 100.0,
+            },
+            settings(),
+        )
+
+        diagnostics = enriched["conditional_short_route_diagnostics"]
+        self.assertTrue(diagnostics["applies"])
+        self.assertLess(enriched["score"], 100.0)
+        self.assertFalse(enriched["paper_route_eligibility"]["suppressed"])
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
+        self.assertTrue(enriched["conditional_short_execution_risk_downrank_applied"])
+
     def test_okx_short_perp_route_is_standard(self) -> None:
         candidate = {
             "venue": "OKX",

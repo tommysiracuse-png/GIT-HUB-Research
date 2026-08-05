@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 
 from route_intelligence import (  # noqa: E402
     ROUTE_REQUIREMENT_FIELDS,
+    build_conditional_short_route_diagnostics,
     build_route_requirements_matrix,
     render_route_requirements_markdown,
     route_requirements_json,
@@ -19,6 +20,39 @@ from route_intelligence import (  # noqa: E402
 
 
 class RouteIntelligenceTests(unittest.TestCase):
+    def test_conditional_short_diagnostics_expose_route_requirements_and_only_down_rank(self) -> None:
+        opportunity = {
+            "venue": "OKX",
+            "inst_id": "OKX:ARC-USDT",
+            "direction": "long_perp_short_spot",
+            "route_status": "conditional",
+            "route_blockers": ["spot_borrow"],
+            "borrow_available": "unknown",
+            "borrow_fee_bps_estimate": 12.5,
+            "maker_fee_bps": 1.0,
+            "taker_fee_bps": 3.0,
+            "margin_mode": "isolated",
+            "api_access_status": "public_data_only",
+            "min_liquidity_usd": 50000,
+        }
+
+        diagnostics = build_conditional_short_route_diagnostics(opportunity)
+        row = build_route_requirements_matrix([opportunity])[0]
+
+        self.assertTrue(diagnostics["applies"])
+        self.assertEqual("unconfirmed", diagnostics["borrow_availability"])
+        self.assertEqual(12.5, diagnostics["estimated_borrow_fee_bps"])
+        self.assertEqual(6.0, diagnostics["maker_taker_fee_stack_bps"]["estimated_round_trip_taker_bps"])
+        self.assertEqual("isolated", diagnostics["margin_mode"])
+        self.assertEqual("public_data_only", diagnostics["api_route_status"])
+        self.assertEqual(50000, diagnostics["minimum_liquidity_usd"])
+        self.assertLess(diagnostics["paper_rank_multiplier"], 1.0)
+        self.assertEqual("down_rank_only", diagnostics["ranking_action"])
+        self.assertFalse(diagnostics["hard_blocking"])
+        self.assertEqual("isolated", row["margin_mode"])
+        self.assertEqual(3.0, row["taker_fee_bps_or_unknown"])
+        self.assertIn("conditional_short_route_diagnostics", row)
+
     def test_spot_borrow_routes_are_paper_only_prioritized_with_unknowns(self) -> None:
         rows = build_route_requirements_matrix(
             [
