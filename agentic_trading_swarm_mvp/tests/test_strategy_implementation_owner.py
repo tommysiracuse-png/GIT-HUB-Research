@@ -373,6 +373,34 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         result = owner.sync_backlog(self.conn, settings)
         self.assertEqual(1, result["historical_experiments_salvaged"])
 
+    def test_zero_output_experiment_is_requeued_for_diagnosis(self) -> None:
+        now = owner._utc_now()
+        evaluation = {
+            "generation_diagnostic": {
+                "generated_candidate_count": 0,
+                "feasibility": {"universe_match_count": 421, "candidate_count": 2},
+            }
+        }
+        self.conn.execute(
+            """
+            insert into strategy_lab_experiments (
+                strategy_lab_id,version,experiment_type,status,hypothesis,strategy_logic_json,
+                data_requirements_json,risk_gates_json,promotion_rules_json,source_agent,
+                created_at,updated_at,evaluation_json,compile_status
+            ) values (?,1,'market_strategy','needs_more_evidence',?,'{}','{}','{}','{}','test',?,?,?,'compiled')
+            """,
+            ("zero-output-child", "A valid universe should emit candidates", now, now, json.dumps(evaluation)),
+        )
+        self.conn.commit()
+        settings = {"strategy_implementation_owner": {"salvage_invalid_backlog": True, "salvage_limit_per_cycle": 10}}
+        result = owner.sync_backlog(self.conn, settings)
+        task = self.conn.execute(
+            "select objective_type,status from strategy_owner_tasks where strategy_lab_id='zero-output-child'"
+        ).fetchone()
+        self.assertEqual(1, result["historical_experiments_salvaged"])
+        self.assertEqual("diagnose_zero_output", task["objective_type"])
+        self.assertEqual("queued", task["status"])
+
 
 if __name__ == "__main__":
     unittest.main()

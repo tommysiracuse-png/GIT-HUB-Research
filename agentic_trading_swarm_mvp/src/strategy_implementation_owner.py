@@ -261,6 +261,7 @@ def _salvage_score(experiment: dict) -> tuple[float, str]:
         "needs_data": 300.0,
         "needs_contract_revision": 290.0,
         "quarantined_surface_policy": 280.0,
+        "needs_more_evidence": 260.0,
         "active_testing": 250.0,
         "proposed": 180.0,
         "rejected_invalid": 100.0,
@@ -275,6 +276,23 @@ def _salvage_score(experiment: dict) -> tuple[float, str]:
     )
     repairable = 25.0 if diagnostics.get("nearest_candidates") or diagnostics.get("missing_features") else 0.0
     return status_rank.get(str(experiment.get("status")), 0.0) + min(100.0, evidence_count) + repairable, str(experiment.get("updated_at") or "")
+
+
+def _needs_zero_output_diagnosis(experiment: dict) -> bool:
+    """Return true when a compiled experiment sees its universe but emits nothing."""
+
+    if str(experiment.get("status") or "") != "needs_more_evidence":
+        return False
+    evaluation = experiment.get("evaluation") if isinstance(experiment.get("evaluation"), dict) else {}
+    diagnostic = evaluation.get("generation_diagnostic") if isinstance(evaluation.get("generation_diagnostic"), dict) else {}
+    feasibility = diagnostic.get("feasibility") if isinstance(diagnostic.get("feasibility"), dict) else {}
+    universe_matches = int(
+        feasibility.get("universe_match_count")
+        or diagnostic.get("universe_match_count")
+        or 0
+    )
+    generated = int(diagnostic.get("generated_candidate_count") or 0)
+    return universe_matches > 0 and generated == 0
 
 
 def _backfill_artifact_lifecycle(conn: sqlite3.Connection) -> dict:
@@ -442,7 +460,8 @@ def sync_backlog(conn: sqlite3.Connection, settings: dict) -> dict:
             select * from strategy_lab_experiments
             where status in (
                 'rejected_invalid', 'needs_data', 'needs_contract_revision',
-                'quarantined_surface_policy', 'proposed', 'promote_candidate'
+                'quarantined_surface_policy', 'proposed', 'promote_candidate',
+                'needs_more_evidence'
             )
                or (status = 'active_testing' and updated_at <= ?)
             order by case status when 'promote_candidate' then 0 when 'needs_data' then 1 else 2 end,
@@ -458,6 +477,11 @@ def sync_backlog(conn: sqlite3.Connection, settings: dict) -> dict:
             reverse=True,
         )
         for experiment in ranked_experiments:
+            if (
+                str(experiment.get("status") or "") == "needs_more_evidence"
+                and not _needs_zero_output_diagnosis(experiment)
+            ):
+                continue
             signature = _dedupe_key({}, experiment)
             if signature in seen:
                 continue
@@ -469,6 +493,7 @@ def sync_backlog(conn: sqlite3.Connection, settings: dict) -> dict:
                 "quarantined_surface_policy": "repair_surface_contract",
                 "proposed": "materialize_hypothesis",
                 "promote_candidate": "promote_proven_experiment",
+                "needs_more_evidence": "diagnose_zero_output",
             }.get(str(experiment.get("status")), "diagnose_zero_output")
             salvaged += _enqueue_experiment_repair(conn, experiment, objective)
             if salvaged >= int(cfg.get("salvage_limit_per_cycle", 12)):
