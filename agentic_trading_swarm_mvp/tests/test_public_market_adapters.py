@@ -65,6 +65,11 @@ from adapters.venues.papua_new_guinea_customs_service import (
     PapuaNewGuineaCustomsServiceAdapter,
     parse_papua_new_guinea_customs_tscs,
 )
+from adapters.venues.nairobi_coffee_exchange import (
+    SOURCE_URL as NAIROBI_COFFEE_EXCHANGE_SOURCE_URL,
+    NairobiCoffeeExchangeAdapter,
+    parse_nairobi_coffee_exchange_market_report,
+)
 from adapters.venues.casablanca_stock_exchange_futures_market import (
     SOURCE_URL as CASABLANCA_FUTURES_SOURCE_URL,
     CasablancaStockExchangeFuturesMarketAdapter,
@@ -781,6 +786,136 @@ class PublicAdapterParserTests(unittest.TestCase):
 
         self.assertEqual(1, len(batch.observations))
         self.assertEqual("PNG_CUSTOMS", batch.observations[0]["venue"])
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        report = batch.metadata["public_market_adapters"]
+        self.assertEqual(target_adapter_id, report["adapters"][0]["adapter_id"])
+        self.assertEqual("reachable", report["adapters"][0]["source_status"])
+
+    def test_nairobi_coffee_exchange_parser_normalizes_grade_market_totals(self) -> None:
+        report = """
+        Sale 25 of Wednesday, April 8, 2026
+        MARKET TOTAL
+        GRADE Bags offered Weight offered Min price Max price Value (USD) Average price
+        AA 1,110 68,488 285.00 400.00 473,419.38 345.62
+        AB 2,597 159,279 136.00 390.00 1,046,813.20 328.61
+        UG1 1,196 73,721 100.00 308.00 377,476.28 256.02
+        Note Prices are in USD per 50 Kg
+        NAIROBI COFFEE EXCHANGE
+        """
+        rows = parse_nairobi_coffee_exchange_market_report(
+            report, received_at="2026-04-10T12:00:00+00:00"
+        )
+
+        self.assertEqual({"AA", "AB", "UG1"}, {row["symbol"].removeprefix("NCE_") for row in rows})
+        aa = next(row for row in rows if row["symbol"] == "NCE_AA")
+        self.assertEqual("NAIROBI_COFFEE_EXCHANGE:SALE:25:GRADE:AA", aa["inst_id"])
+        self.assertEqual(345.62, aa["last"])
+        self.assertEqual(285.0, aa["published_min_price_usd_per_50kg"])
+        self.assertEqual(400.0, aa["published_max_price_usd_per_50kg"])
+        self.assertEqual(115.0, aa["grade_price_dispersion_usd_per_50kg"])
+        self.assertEqual(1110, aa["bags_offered"])
+        self.assertEqual("USD_PER_50_KG", aa["quote"])
+        self.assertEqual("2026-04-08", aa["auction_sale_date"])
+        self.assertEqual("completed", aa["session_status"])
+        self.assertEqual("fresh", aa["freshness_state"])
+        self.assertEqual(NAIROBI_COFFEE_EXCHANGE_SOURCE_URL, aa["source_url"])
+        self.assertTrue(aa["price_available"])
+        self.assertEqual("watch_only", aa["direction"])
+        self.assertEqual("synthetic_research_only", aa["paper_route_status"])
+        self.assertNotIn("candidate_reject_reason", aa)
+
+    def test_nairobi_coffee_exchange_adapter_preserves_parser_and_fetch_evidence(self) -> None:
+        malformed = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html>replacement page</html>",
+            "received_at": "2026-04-10T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.nairobi_coffee_exchange.fetch_bytes", return_value=malformed
+        ):
+            parser_batch = NairobiCoffeeExchangeAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual("reachable", parser_batch.metadata["fetch_status"]["market_report"]["fetch_status"])
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual(0, parser_batch.metadata["real_observation_count"])
+        self.assertEqual("watch_only", parser_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_nairobi_coffee_exchange_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+
+        unavailable = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "error": "blocked",
+            "content": b"",
+            "received_at": "2026-04-10T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.nairobi_coffee_exchange.fetch_bytes", return_value=unavailable
+        ):
+            unavailable_batch = NairobiCoffeeExchangeAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("unknown", unavailable_batch.metadata["freshness_state"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_nairobi_coffee_exchange_source_unavailable",
+            unavailable_batch.observations[0]["candidate_reject_reason"],
+        )
+
+    def test_nairobi_coffee_exchange_plugin_is_auto_discovered_by_adapter_runtime(self) -> None:
+        target_adapter_id = "nairobi_coffee_exchange"
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": """
+                Sale 25 of Wednesday, April 8, 2026
+                MARKET TOTAL
+                GRADE Bags offered Weight offered Min price Max price Value (USD) Average price
+                AA 1,110 68,488 285.00 400.00 473,419.38 345.62
+                Note Prices are in USD per 50 Kg
+                NAIROBI COFFEE EXCHANGE
+            """,
+            "received_at": "2026-04-10T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        original_discover = adapter_runtime.discover_adapters
+
+        def discover_only_nairobi() -> list[str]:
+            return [
+                adapter_id
+                for adapter_id in original_discover()
+                if adapter_id == target_adapter_id
+            ]
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "adapters.venues.nairobi_coffee_exchange.fetch_bytes", return_value=result
+        ), mock.patch.object(adapter_runtime, "RUNS_DIR", pathlib.Path(tmp)), mock.patch.object(
+            adapter_runtime, "CACHE_DIR", pathlib.Path(tmp) / "cache"
+        ), mock.patch.object(adapter_runtime, "REPORT_JSON", pathlib.Path(tmp) / "report.json"), mock.patch.object(
+            adapter_runtime, "REPORT_MD", pathlib.Path(tmp) / "report.md"
+        ), mock.patch.object(adapter_runtime, "discover_adapters", side_effect=discover_only_nairobi):
+            batch = adapter_runtime.build_scan_batch(
+                {
+                    "public_market_adapters": {
+                        "enabled": True,
+                        "workers": 1,
+                        "adapters": {target_adapter_id: {"cache_minutes": 0}},
+                    }
+                }
+            )
+
+        self.assertEqual(1, len(batch.observations))
+        self.assertEqual("NAIROBI_COFFEE_EXCHANGE", batch.observations[0]["venue"])
+        self.assertEqual(345.62, batch.observations[0]["last"])
+        self.assertTrue(batch.observations[0]["price_available"])
         self.assertEqual("watch_only", batch.observations[0]["direction"])
         report = batch.metadata["public_market_adapters"]
         self.assertEqual(target_adapter_id, report["adapters"][0]["adapter_id"])
