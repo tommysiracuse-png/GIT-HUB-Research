@@ -189,6 +189,13 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
 
         paper_only_route_quality_record = None
 
+try:
+    from src.paper_route_registry import assess_paper_route_registry
+    from src.route_intelligence import build_paper_route_requirement_report
+except ImportError:  # pragma: no cover - fallback for direct module execution
+    from paper_route_registry import assess_paper_route_registry
+    from route_intelligence import build_paper_route_requirement_report
+
 _VALR_PAPER_PUBLIC_BASE_URL = "https://api.valr.com"
 _VALR_PAPER_SUPPORTED_SYMBOLS = {
     "BTCZAR": {"base": "BTC", "quote": "ZAR"},
@@ -9568,6 +9575,80 @@ def _frontier_dislocation_quality(
     }
 
 
+def _refresh_frontier_short_route_requirements_report(candidate: dict, settings: dict) -> dict:
+    """Attach the read-only route snapshot before paper sizing or ranking.
+
+    Scanner candidates do not necessarily pass through ``route_resolver``
+    before their allocation and ranking fields are calculated.  Keep that
+    direct path honest by projecting the already-known public route facts into
+    the same requirements report here.  This is deliberately metadata only:
+    it does not call a venue, alter candidate emission, or make a live route
+    reachable.
+    """
+
+    if str(candidate.get("direction") or "").strip().lower() != "short_frontier_spot":
+        return candidate
+
+    feasibility = candidate.get("execution_route")
+    if not isinstance(feasibility, dict):
+        feasibility = candidate.get("execution_feasibility")
+    feasibility = dict(feasibility) if isinstance(feasibility, dict) else {}
+    registry = assess_paper_route_registry(candidate, settings)
+    support_status = str(registry.get("support_status") or "unknown").strip().lower()
+    route_blockers = list(feasibility.get("route_blockers") or [])
+    required_permissions = list(registry.get("required_permissions") or [])
+    requires_borrow = bool(feasibility.get("requires_short_spot")) or "spot_borrow" in required_permissions
+    if requires_borrow and "spot_borrow" not in route_blockers:
+        route_blockers.append("spot_borrow")
+
+    report_input = dict(candidate)
+    report_input.update(
+        {
+            "route_status": feasibility.get("route_status") or feasibility.get("status") or "unknown",
+            "route_blockers": route_blockers,
+            "required_permissions": required_permissions,
+            "paper_route_registry": registry,
+            "paper_route_registry_status": support_status,
+            "paper_route_required_permissions": required_permissions,
+            "paper_route_required_account_modes": list(registry.get("required_account_modes") or []),
+            "paper_route_estimated_cost_bps": dict(registry.get("estimated_cost_bps") or {}),
+            "borrow_required": requires_borrow,
+            "borrow_availability_status": (
+                "unavailable" if support_status == "unsupported" else "unknown"
+            ),
+            "margin_required": requires_borrow,
+            "margin_mode": "unsupported" if support_status == "unsupported" else "required_unconfirmed",
+            # The scanner has a public endpoint observation only.  Do not
+            # imply private/order API entitlement from that observation.
+            "api_access_status": "public_data_only",
+            "maker_fee_bps": candidate.get("maker_fee_bps", candidate.get("estimated_fee_bps_per_side")),
+            "taker_fee_bps": candidate.get("taker_fee_bps", candidate.get("estimated_fee_bps_per_side")),
+        }
+    )
+    route = {
+        "venue": report_input.get("venue"),
+        "inst_id": report_input.get("inst_id"),
+        "direction": report_input.get("direction"),
+        "route_status": report_input["route_status"],
+        "route_blockers": route_blockers,
+        "required_permissions": required_permissions,
+        "borrow_required": requires_borrow,
+        "margin_required": requires_borrow,
+        "api_access_status": "public_data_only",
+    }
+    report = build_paper_route_requirement_report(report_input, route=route)
+    candidate["paper_route_requirement_report"] = report
+    candidate["frontier_short_spot_route_intelligence"] = report[
+        "frontier_short_spot_route_intelligence"
+    ]
+    candidate["frontier_short_spot_route_requirements_report"] = report[
+        "frontier_short_spot_route_requirements_report"
+    ]
+    candidate["route_requirement_summary"] = report["route_requirement_summary"]
+    candidate["route_requirements_prepared_before_ranking_and_sizing"] = True
+    return candidate
+
+
 def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> list[dict]:
     """Rank the paper cohort while retaining every emitted, priceable candidate."""
     policy = _frontier_dislocation_quality_policy(settings)
@@ -9583,6 +9664,7 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         else 0.0
     )
     for candidate in candidates:
+        _refresh_frontier_short_route_requirements_report(candidate, settings)
         quality_score = as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0
         base_score = as_float(candidate.get("score"), 0.0) or 0.0
         effective_edge = as_float(candidate.get("effective_edge_bps"), None)
@@ -10701,6 +10783,10 @@ def _candidate_from_observation(
             "notes": observation.get("notes", []),
         },
     }
+    # Route facts must be present before either context-cost sizing or the
+    # frontier ranking pass reads this candidate.  The helper only attaches a
+    # non-blocking paper report for short frontier spot candidates.
+    candidate = _refresh_frontier_short_route_requirements_report(candidate, settings)
     candidate = annotate_paper_context_cost(candidate, settings)
     candidate = _apply_frontier_effective_edge(candidate, observation, settings)
     return _apply_frontier_marketability_gate(candidate, observation, settings, reference_observations)

@@ -728,6 +728,66 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertGreater(candidate["paper_allocation_multiplier"], 0.0)
         self.assertLess(candidate["paper_allocation_multiplier"], 1.0)
 
+    def test_frontier_short_route_report_refreshes_before_sizing_for_mexc_and_valr(self) -> None:
+        cfg = settings()
+        for venue in ("MEXC", "VALR"):
+            with self.subTest(venue=venue):
+                local = self._quality_obs(venue, "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+                peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.0, 100_000, quality_score=85)
+                seen_before_sizing = []
+
+                def assert_report_before_sizing(candidate, observation, runtime_settings):
+                    report = candidate["frontier_short_spot_route_requirements_report"]
+                    seen_before_sizing.append(report)
+                    self.assertTrue(candidate["route_requirements_prepared_before_ranking_and_sizing"])
+                    self.assertTrue(report["paper_only"])
+                    self.assertTrue(report["prepared_before_ranking_and_sizing"])
+                    self.assertEqual("unsupported", report["per_venue_status"]["status"])
+                    self.assertEqual("unavailable", report["borrow_availability"])
+                    self.assertEqual("unsupported", report["margin_eligibility"]["mode"])
+                    self.assertEqual("public_data_only", report["api_connectivity"]["status"])
+                    self.assertEqual("unconfirmed", report["api_connectivity"]["path_readiness"])
+                    self.assertEqual("observed", report["route_freshness"]["status"])
+                    self.assertIn("maker_fee_bps", report["fee_tiers"])
+                    self.assertFalse(report["entry_blocked"])
+                    return candidate
+
+                with mock.patch.object(
+                    frontier,
+                    "_apply_frontier_effective_edge",
+                    side_effect=assert_report_before_sizing,
+                ):
+                    candidate = frontier._candidate_from_observation(
+                        local,
+                        cfg,
+                        100.0,
+                        2,
+                        reference_observations=[local, peer],
+                    )
+
+                self.assertEqual(1, len(seen_before_sizing))
+                self.assertFalse(candidate["paper_entry_blocked"])
+
+    def test_ranking_refreshes_prebuilt_frontier_short_route_reports(self) -> None:
+        candidate = {
+            "venue": "MEXC",
+            "inst_id": "MEXC:ABC-USDT",
+            "direction": "short_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "score": 55.0,
+            "estimated_fee_bps_per_side": 10.0,
+            "freshness_age_seconds": 2.0,
+            "latency_ms": 10.0,
+        }
+
+        ranked = frontier.rank_frontier_paper_candidates([candidate], settings())
+
+        report = ranked[0]["frontier_short_spot_route_requirements_report"]
+        self.assertTrue(ranked[0]["route_requirements_prepared_before_ranking_and_sizing"])
+        self.assertEqual("MEXC", report["candidate"]["venue"])
+        self.assertEqual("unsupported", report["per_venue_status"]["status"])
+        self.assertFalse(report["entry_blocked"])
+
     def test_short_cost_decomposition_prices_short_friction_without_blocking_paper(self) -> None:
         cfg = settings()
         local = self._quality_obs("FRONTIER", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
