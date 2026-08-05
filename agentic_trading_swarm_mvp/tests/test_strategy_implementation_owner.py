@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import sqlite3
 import tempfile
@@ -269,6 +270,78 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         self.assertEqual("implementation_paused", first["status"])
         self.assertEqual("waiting_data", second["status"])
         self.assertEqual([None, "thread-resume-1"], calls)
+
+    def test_runtime_contract_mismatch_requeues_one_canonical_owner_repair(self) -> None:
+        artifact = owner.enqueue_recommendation(self.conn, self._recommendation(), self.settings)
+        now = owner._utc_now()
+        mismatch = {
+            "repairable": True,
+            "reason": "compiled_universe_does_not_match_available_observations",
+            "observation_count": 10629,
+            "universe_match_count": 0,
+            "missing_features": [],
+            "mismatches": [
+                {
+                    "universe_key": "market_types",
+                    "runtime_field": "market_type",
+                    "required_values": ["PERP"],
+                    "observed_values": ["<MISSING>"],
+                }
+            ],
+            "owner_objective": "repair_runtime_contract",
+        }
+        self.conn.execute(
+            """
+            insert into strategy_lab_experiments(
+                strategy_lab_id,version,experiment_type,status,hypothesis,strategy_logic_json,
+                data_requirements_json,risk_gates_json,promotion_rules_json,source_agent,
+                created_at,updated_at,compile_status,evaluation_json
+            ) values('runtime-contract-lab',1,'market_strategy','needs_contract_revision','test',
+                     '{}','{}','{}','{}','strategy_owner',?,?, 'compiled',?)
+            """,
+            (
+                now,
+                now,
+                json.dumps(
+                    {"generation_diagnostic": {"runtime_contract_mismatch": mismatch}}
+                ),
+            ),
+        )
+        self.conn.execute(
+            """
+            update strategy_owner_tasks
+            set strategy_lab_id='runtime-contract-lab', status='waiting_data', priority=92
+            where task_id=?
+            """,
+            (artifact["task_id"],),
+        )
+        self.conn.execute(
+            """
+            insert into strategy_owner_tasks(
+                task_id,created_at,updated_at,dedupe_key,objective_type,priority,status,
+                strategy_lab_id,strategy_lab_version,hypothesis,acceptance_json,dependency_json
+            ) values('duplicate-repair',?,?, 'duplicate-repair-key','add_missing_strategy_features',
+                     84,'waiting_data','runtime-contract-lab',1,'test','{}','{}')
+            """,
+            (now, now),
+        )
+        self.conn.commit()
+
+        result = owner.monitor_tasks(self.conn)
+
+        canonical = self.conn.execute(
+            "select status,objective_type,priority,dependency_json from strategy_owner_tasks where task_id=?",
+            (artifact["task_id"],),
+        ).fetchone()
+        duplicate = self.conn.execute(
+            "select status from strategy_owner_tasks where task_id='duplicate-repair'"
+        ).fetchone()
+        self.assertEqual("analyzing", canonical["status"])
+        self.assertEqual("repair_runtime_contract", canonical["objective_type"])
+        self.assertEqual(94, canonical["priority"])
+        self.assertIn("runtime_contract_mismatch", canonical["dependency_json"])
+        self.assertEqual("superseded_duplicate", duplicate["status"])
+        self.assertEqual(2, len(result["transitions"]))
 
     def test_round_robin_is_persistent_and_equal(self) -> None:
         seen = []

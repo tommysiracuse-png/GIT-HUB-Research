@@ -2464,6 +2464,72 @@ def _lineage_source_health_rank_guard(
     return annotated, review
 
 
+_PROGRAM_UNIVERSE_FIELDS = {
+    "venues": "venue",
+    "inst_ids": "inst_id",
+    "trade_types": "trade_type",
+    "asset_classes": "asset_class",
+    "regions": "region",
+    "market_types": "market_type",
+    "quotes": "quote",
+    "bases": "base",
+}
+
+
+def _runtime_universe_contract_mismatch(
+    program: dict,
+    observation_frames: list[dict],
+    program_diagnostic: dict,
+    feasibility: dict,
+) -> dict | None:
+    """Describe a compiled universe contract that cannot match available rows."""
+
+    reject_reasons = program_diagnostic.get("reject_reasons") or {}
+    if (
+        not observation_frames
+        or int(feasibility.get("universe_match_count") or 0) != 0
+        or set(reject_reasons) != {"universe_mismatch"}
+        or program_diagnostic.get("missing_features")
+    ):
+        return None
+    universe = program.get("universe") if isinstance(program.get("universe"), dict) else {}
+    mismatches = []
+    for plural, field in _PROGRAM_UNIVERSE_FIELDS.items():
+        required_raw = universe.get(plural)
+        if not required_raw:
+            continue
+        required = sorted(
+            {
+                str(value).upper()
+                for value in (required_raw if isinstance(required_raw, list) else [required_raw])
+            }
+        )
+        observed = sorted(
+            {str(frame.get(field) or "<missing>").upper() for frame in observation_frames}
+        )
+        if set(required).intersection(observed):
+            continue
+        mismatches.append(
+            {
+                "universe_key": plural,
+                "runtime_field": field,
+                "required_values": required,
+                "observed_values": observed[:25],
+            }
+        )
+    if not mismatches:
+        return None
+    return {
+        "repairable": True,
+        "reason": "compiled_universe_does_not_match_available_observations",
+        "observation_count": len(observation_frames),
+        "universe_match_count": 0,
+        "missing_features": [],
+        "mismatches": mismatches,
+        "owner_objective": "repair_runtime_contract",
+    }
+
+
 def generate_strategy_lab_candidates(
     conn: sqlite3.Connection,
     settings: dict,
@@ -2639,6 +2705,12 @@ def generate_strategy_lab_candidates(
                 settings,
                 max_candidates=min(max_per_experiment, remaining),
             )
+            runtime_contract_mismatch = _runtime_universe_contract_mismatch(
+                feasibility.get("program") or {},
+                observation_frames,
+                program_diagnostic,
+                feasibility,
+            )
             compatible_program_candidates: list[dict] = []
             for candidate in program_candidates:
                 compatibility = _surface_compatibility(experiment, candidate)
@@ -2713,6 +2785,8 @@ def generate_strategy_lab_candidates(
                 rejects[experiment_id][str(reason)] += int(count)
             if program_candidates:
                 diagnostic_status = "active_testing"
+            elif runtime_contract_mismatch:
+                diagnostic_status = "needs_contract_revision"
             elif relaxed_child and relaxed_child.get("status") == "created":
                 diagnostic_status = "needs_contract_revision"
             elif feasibility.get("feasibility_status") in {
@@ -2740,6 +2814,7 @@ def generate_strategy_lab_candidates(
                 "feasibility": {
                     key: value for key, value in feasibility.items() if key != "program"
                 },
+                "runtime_contract_mismatch": runtime_contract_mismatch,
                 "relaxed_child": relaxed_child,
             }
             prior_evaluation = experiment.get("evaluation") or {}

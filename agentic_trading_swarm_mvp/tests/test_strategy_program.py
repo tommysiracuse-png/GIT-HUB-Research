@@ -500,6 +500,47 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertEqual("compiled", row["compile_status"])
         self.assertEqual("novel", row["novelty_status"])
 
+    def test_available_observations_with_unmatched_universe_request_contract_repair(self) -> None:
+        cfg = settings()
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        logic = funding_capture_logic()
+        logic["universe"]["market_types"] = ["perp"]
+        recommendation = lab_recommendation("okx_runtime_contract_mismatch_v1", logic)
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["source_surface"] = "perp_funding_basis"
+        experiment["permitted_target_surface"] = ["perp_funding_basis"]
+        observation_row = funding_observation(100.0, 2.0, now.isoformat())
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [observation_row],
+            )
+            row = conn.execute(
+                "select status, evaluation_json from strategy_lab_experiments where strategy_lab_id = ?",
+                ("okx_runtime_contract_mismatch_v1",),
+            ).fetchone()
+
+        self.assertEqual([], generated)
+        self.assertEqual(
+            "needs_contract_revision",
+            report["status_by_experiment"]["okx_runtime_contract_mismatch_v1"],
+        )
+        self.assertEqual("needs_contract_revision", row["status"])
+        mismatch = json.loads(row["evaluation_json"])["generation_diagnostic"][
+            "runtime_contract_mismatch"
+        ]
+        self.assertTrue(mismatch["repairable"])
+        self.assertEqual("repair_runtime_contract", mismatch["owner_objective"])
+        market_type = next(
+            item for item in mismatch["mismatches"] if item["runtime_field"] == "market_type"
+        )
+        self.assertEqual(["PERP"], market_type["required_values"])
+        self.assertEqual(["<MISSING>"], market_type["observed_values"])
+
     def test_program_input_join_does_not_copy_cached_route_eligibility(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         source = {

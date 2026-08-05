@@ -465,7 +465,7 @@ def sync_backlog(conn: sqlite3.Connection, settings: dict) -> dict:
             objective = {
                 "rejected_invalid": "repair_invalid_contract",
                 "needs_data": "add_missing_strategy_features",
-                "needs_contract_revision": "repair_impossible_contract",
+                "needs_contract_revision": "repair_runtime_contract",
                 "quarantined_surface_policy": "repair_surface_contract",
                 "proposed": "materialize_hypothesis",
                 "promote_candidate": "promote_proven_experiment",
@@ -968,6 +968,67 @@ def monitor_tasks(conn: sqlite3.Connection) -> dict:
             continue
         experiment_status = str(experiment["status"])
         compile_status = str(experiment["compile_status"] or "")
+        evaluation = _json(experiment["evaluation_json"], {})
+        generation_diagnostic = (
+            evaluation.get("generation_diagnostic")
+            if isinstance(evaluation.get("generation_diagnostic"), dict)
+            else {}
+        )
+        runtime_contract_mismatch = generation_diagnostic.get("runtime_contract_mismatch")
+        if (
+            experiment_status == "needs_contract_revision"
+            and isinstance(runtime_contract_mismatch, dict)
+            and runtime_contract_mismatch.get("repairable")
+        ):
+            canonical = conn.execute(
+                """
+                select task_id from strategy_owner_tasks
+                where strategy_lab_id = ?
+                  and status not in ('completed','promoted_to_code','retired_bad_evidence','superseded_duplicate')
+                order by priority desc, created_at asc limit 1
+                """,
+                (task.get("strategy_lab_id"),),
+            ).fetchone()
+            if canonical and str(canonical["task_id"]) != str(task["task_id"]):
+                conn.execute(
+                    """
+                    update strategy_owner_tasks
+                    set status='superseded_duplicate', completed_at=?, updated_at=?,
+                        claimed_by=null, claimed_pid=null
+                    where task_id=?
+                    """,
+                    (_utc_now(), _utc_now(), task["task_id"]),
+                )
+                transitions.append(
+                    {
+                        "task_id": task["task_id"],
+                        "from": task["status"],
+                        "to": "superseded_duplicate",
+                        "reason": "canonical_runtime_contract_repair_exists",
+                    }
+                )
+                continue
+            dependencies = dict(task.get("dependencies") or {})
+            dependencies["runtime_contract_mismatch"] = runtime_contract_mismatch
+            conn.execute(
+                """
+                update strategy_owner_tasks
+                set status='analyzing', objective_type='repair_runtime_contract', priority=max(priority,94),
+                    dependency_json=?, next_retry_at=null, claimed_by=null, claimed_pid=null, updated_at=?
+                where task_id=?
+                """,
+                (json.dumps(dependencies, sort_keys=True), _utc_now(), task["task_id"]),
+            )
+            transitions.append(
+                {
+                    "task_id": task["task_id"],
+                    "from": task["status"],
+                    "to": "analyzing",
+                    "reason": "repairable_runtime_contract_mismatch",
+                    "objective_type": "repair_runtime_contract",
+                }
+            )
+            continue
         next_status = {
             "promote_candidate": "promote_candidate",
             "promotion_queued": "coding",
