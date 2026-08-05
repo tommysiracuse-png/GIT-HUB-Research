@@ -172,6 +172,19 @@
       "min_route_confidence": 0.7,
       "min_venue_health_score": 60.0,
       "known_paper_route_statuses": ["standard"]
+    },
+    "dislocation_quality": {
+      "enabled": true,
+      "paper_only": true,
+      "reference_breadth_target": 3,
+      "max_leave_one_out_shift_bps": 25.0,
+      "freshness_target_seconds": 30.0,
+      "freshness_max_seconds": 90.0,
+      "ranking_quality_weight": 0.35,
+      "reference_breadth_weight": 0.25,
+      "reference_stability_weight": 0.3,
+      "cost_efficiency_weight": 0.3,
+      "freshness_weight": 0.15
     }
   },
   "global_market_discovery_scanner": {

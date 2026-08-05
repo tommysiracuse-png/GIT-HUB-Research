@@ -9280,6 +9280,201 @@ def _variant_reference(
     return statistics.median(prices), unique_venues
 
 
+DEFAULT_FRONTIER_DISLOCATION_QUALITY_POLICY = {
+    "enabled": True,
+    "paper_only": True,
+    "reference_breadth_target": 3,
+    "max_leave_one_out_shift_bps": 25.0,
+    "freshness_target_seconds": 30.0,
+    "freshness_max_seconds": 90.0,
+    "ranking_quality_weight": 0.35,
+    "reference_breadth_weight": 0.25,
+    "reference_stability_weight": 0.30,
+    "cost_efficiency_weight": 0.30,
+    "freshness_weight": 0.15,
+}
+
+
+def _frontier_dislocation_quality_policy(settings: dict) -> dict:
+    policy = dict(DEFAULT_FRONTIER_DISLOCATION_QUALITY_POLICY)
+    configured = settings.get("frontier_crypto_adapter", {}).get("dislocation_quality", {})
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    return policy
+
+
+def _frontier_reference_peer_rows(
+    observation: dict,
+    reference_observations: list[dict] | None,
+) -> list[dict]:
+    """Return one priceable independent spot observation per reference venue."""
+    if not reference_observations:
+        return []
+    local_venue = str(observation.get("venue") or "")
+    comparison_key = observation.get("comparison_key")
+    best_by_venue: dict[str, dict] = {}
+    for row in reference_observations:
+        venue = str(row.get("venue") or "")
+        if (
+            not venue
+            or venue == local_venue
+            or row.get("comparison_key") != comparison_key
+            or row.get("market_type") != "spot"
+            or row.get("data_status") != "reachable"
+            or row.get("local_quote_observe_only")
+            or _comparison_price(row) <= 0
+        ):
+            continue
+        previous = best_by_venue.get(venue)
+        if previous is None or float(row.get("quote_volume_24h") or 0.0) > float(
+            previous.get("quote_volume_24h") or 0.0
+        ):
+            best_by_venue[venue] = row
+    return list(best_by_venue.values())
+
+
+def _frontier_dislocation_quality(
+    observation: dict,
+    reference_price: float | None,
+    reference_observations: list[dict] | None,
+    round_trip_cost_bps: float,
+    gross_edge_bps: float,
+    settings: dict,
+) -> dict:
+    """Score paper dislocations without changing candidate eligibility.
+
+    A thin or unstable reference, high crossing cost, or old quote is recorded
+    as ranking evidence.  It is deliberately not a paper-entry gate: paper
+    exploration can still measure the counterfactual for every priceable row.
+    """
+    policy = _frontier_dislocation_quality_policy(settings)
+    peers = _frontier_reference_peer_rows(observation, reference_observations)
+    peer_prices = [_comparison_price(row) for row in peers]
+    peer_count = len(peer_prices)
+    breadth_target = max(1, int(policy["reference_breadth_target"]))
+    breadth_score = min(100.0, 100.0 * peer_count / breadth_target)
+
+    peer_median = statistics.median(peer_prices) if peer_prices else None
+    leave_one_out_shifts = []
+    if peer_median is not None:
+        for index in range(peer_count):
+            remaining = peer_prices[:index] + peer_prices[index + 1 :]
+            if remaining:
+                leave_one_out_shifts.append(abs(bps(peer_median, statistics.median(remaining))))
+    reference_shift_bps = (
+        abs(bps(float(reference_price), peer_median))
+        if reference_price and reference_price > 0 and peer_median and peer_median > 0
+        else None
+    )
+    loo_shift_bps = max(leave_one_out_shifts, default=reference_shift_bps)
+    stability_limit = max(0.001, float(policy["max_leave_one_out_shift_bps"]))
+    stability_score = (
+        max(0.0, 100.0 * (1.0 - loo_shift_bps / stability_limit))
+        if loo_shift_bps is not None
+        else 0.0
+    )
+
+    cost_ratio = round_trip_cost_bps / gross_edge_bps if gross_edge_bps > 0 else None
+    cost_efficiency_score = (
+        max(0.0, min(100.0, 100.0 * (1.0 - cost_ratio)))
+        if cost_ratio is not None
+        else 0.0
+    )
+    freshness_values = [as_float(observation.get("freshness_age_seconds"), None)]
+    freshness_values.extend(as_float(row.get("freshness_age_seconds"), None) for row in peers)
+    known_freshness = [value for value in freshness_values if value is not None and value >= 0]
+    oldest_freshness = max(known_freshness) if known_freshness else None
+    freshness_max = max(0.001, float(policy["freshness_max_seconds"]))
+    freshness_score = (
+        max(0.0, 100.0 * (1.0 - oldest_freshness / freshness_max))
+        if oldest_freshness is not None
+        else 25.0
+    )
+
+    weights = {
+        "reference_breadth": max(0.0, float(policy["reference_breadth_weight"])),
+        "reference_stability": max(0.0, float(policy["reference_stability_weight"])),
+        "cost_efficiency": max(0.0, float(policy["cost_efficiency_weight"])),
+        "freshness": max(0.0, float(policy["freshness_weight"])),
+    }
+    weight_total = sum(weights.values()) or 1.0
+    component_scores = {
+        "reference_breadth": round(breadth_score, 3),
+        "reference_stability": round(stability_score, 3),
+        "cost_efficiency": round(cost_efficiency_score, 3),
+        "freshness": round(freshness_score, 3),
+    }
+    score = sum(component_scores[key] * weights[key] for key in component_scores) / weight_total
+    diagnostics = []
+    if peer_count < breadth_target:
+        diagnostics.append("narrow_reference_set")
+    if loo_shift_bps is None:
+        diagnostics.append("leave_one_out_reference_unavailable")
+    elif loo_shift_bps > stability_limit:
+        diagnostics.append("leave_one_out_reference_unstable")
+    if cost_ratio is None or cost_ratio >= 1.0:
+        diagnostics.append("crossing_cost_consumes_dislocation")
+    if oldest_freshness is None:
+        diagnostics.append("reference_freshness_unavailable")
+    elif oldest_freshness > float(policy["freshness_target_seconds"]):
+        diagnostics.append("quote_or_reference_freshness_degraded")
+    return {
+        "score": round(max(0.0, min(100.0, score)), 3),
+        "components": component_scores,
+        "reference_peer_count": peer_count,
+        "reference_peer_venues": sorted(str(row.get("venue")) for row in peers),
+        "peer_reference_price": round(peer_median, 8) if peer_median is not None else None,
+        "reference_shift_bps": round(reference_shift_bps, 3) if reference_shift_bps is not None else None,
+        "leave_one_out_max_shift_bps": round(loo_shift_bps, 3) if loo_shift_bps is not None else None,
+        "crossing_cost_to_edge_ratio": round(cost_ratio, 6) if cost_ratio is not None else None,
+        "oldest_reference_freshness_seconds": round(oldest_freshness, 3) if oldest_freshness is not None else None,
+        "diagnostics": diagnostics,
+        "paper_only": True,
+        "eligibility_effect": "ranking_and_diagnostics_only",
+    }
+
+
+def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> list[dict]:
+    """Rank the paper cohort while retaining every emitted, priceable candidate."""
+    policy = _frontier_dislocation_quality_policy(settings)
+    paper_only_active = bool(
+        policy.get("enabled", True)
+        and policy.get("paper_only", True)
+        and settings.get("mode", "paper") == "paper"
+        and not settings.get("allow_live_trading", False)
+    )
+    quality_weight = (
+        min(1.0, max(0.0, float(policy["ranking_quality_weight"])))
+        if paper_only_active
+        else 0.0
+    )
+    for candidate in candidates:
+        quality_score = as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0
+        base_score = as_float(candidate.get("score"), 0.0) or 0.0
+        candidate["paper_ranking_score"] = round(
+            (1.0 - quality_weight) * base_score + quality_weight * quality_score,
+            3,
+        )
+        candidate["paper_quality_cohort"] = (
+            "quality_ranked"
+            if paper_only_active and quality_score >= 60.0
+            else "quality_diagnostic"
+            if paper_only_active
+            else "baseline"
+        )
+        candidate["paper_quality_filter_status"] = (
+            "ranked_not_blocked" if paper_only_active else "paper_only_ranking_inactive"
+        )
+    ranked = sorted(
+        candidates,
+        key=lambda row: (float(row.get("paper_ranking_score") or 0.0), float(row.get("score") or 0.0)),
+        reverse=True,
+    )
+    for rank, candidate in enumerate(ranked, start=1):
+        candidate["paper_quality_rank"] = rank
+    return ranked
+
+
 def build_variant_candidates(
     observations: list[dict],
     settings: dict,
@@ -9378,8 +9573,7 @@ def build_variant_candidates(
         candidate["variant_min_depth_adjusted_edge_bps"] = min_depth_edge
         candidate["variant_min_source_venue_count"] = min_source_venues
         candidates.append(candidate)
-    candidates.sort(key=lambda row: row.get("score", 0.0), reverse=True)
-    return candidates
+    return rank_frontier_paper_candidates(candidates, settings)
 
 
 def _preliminary_feasibility(direction: str, market_type: str, data_status: str, settings: dict) -> dict:
@@ -9773,6 +9967,14 @@ def _candidate_from_observation(
     )
     gross_edge = abs(deviation)
     edge = max(0.0, gross_edge - round_trip_cost_bps)
+    dislocation_quality = _frontier_dislocation_quality(
+        observation,
+        reference_price,
+        reference_observations,
+        round_trip_cost_bps,
+        gross_edge,
+        settings,
+    )
     anomaly_flags = list(observation.get("anomaly_flags") or [])
     critical_anomalies = list(observation.get("critical_anomaly_flags") or [])
     if round_trip_cost_bps >= gross_edge and direction != "watch_only":
@@ -9914,6 +10116,10 @@ def _candidate_from_observation(
         "microstructure_status": observation.get("microstructure_status"),
         "recent_volatility_bps": round(float(recent_volatility_bps), 3),
         "score": round(max(0.0, score), 3),
+        "dislocation_quality_score": dislocation_quality["score"],
+        "dislocation_quality": dislocation_quality,
+        "dislocation_quality_components": dislocation_quality["components"],
+        "dislocation_quality_diagnostics": dislocation_quality["diagnostics"],
         "data_status": observation["data_status"],
         "http_status": observation["http_status"],
         "latency_ms": observation["latency_ms"],
@@ -10005,7 +10211,7 @@ def build_scan_batch(
         for row in observations
         if row.get("data_status") == "reachable" and row.get("comparison_key") in refs
     ]
-    candidates.sort(key=lambda row: row.get("score", 0.0), reverse=True)
+    candidates = rank_frontier_paper_candidates(candidates, settings)
     if limit:
         candidates = candidates[: int(limit)]
     if write_preliminary_report:
@@ -10216,8 +10422,14 @@ def summarize(
         row.get("marketability_gate_status", "not_evaluated") for row in candidates
     )
     marketability_failures: collections.Counter[str] = collections.Counter()
+    dislocation_quality_diagnostics: collections.Counter[str] = collections.Counter()
+    dislocation_quality_scores = []
     for row in candidates:
         marketability_failures.update((row.get("marketability_gate") or {}).get("failed_checks") or [])
+        dislocation_quality_diagnostics.update(row.get("dislocation_quality_diagnostics") or [])
+        score = as_float(row.get("dislocation_quality_score"), None)
+        if score is not None:
+            dislocation_quality_scores.append(score)
     active_candidate_count = sum(
         1
         for row in candidates
@@ -10289,6 +10501,11 @@ def summarize(
             "marketability_failed_checks": (row.get("marketability_gate") or {}).get("failed_checks", []),
             "route_health_confirmed": (row.get("route_health_confirmation") or {}).get("confirmed"),
             "simulated_order_allocation": row.get("simulated_order_allocation"),
+            "dislocation_quality_score": row.get("dislocation_quality_score"),
+            "dislocation_quality_components": row.get("dislocation_quality_components"),
+            "dislocation_quality_diagnostics": row.get("dislocation_quality_diagnostics", []),
+            "paper_quality_rank": row.get("paper_quality_rank"),
+            "paper_quality_cohort": row.get("paper_quality_cohort"),
         }
         for row in candidates[:20]
     ]
@@ -10331,6 +10548,11 @@ def summarize(
         "regional_candidate_gate_counts": dict(regional_candidate_blockers),
         "marketability_gate_counts": dict(marketability_statuses),
         "marketability_failure_counts": dict(marketability_failures),
+        "dislocation_quality_score": _distribution(dislocation_quality_scores),
+        "dislocation_quality_diagnostics": dict(dislocation_quality_diagnostics),
+        "dislocation_quality_cohort_outcomes": depth_summary.get(
+            "dislocation_quality_cohort_outcomes", {}
+        ),
         "anomaly_counts": dict(anomaly_counts.most_common()),
         "freshness_age_seconds": _distribution(freshness_values),
         "depth_latency_ms": _distribution(depth_latency_values),
@@ -10424,6 +10646,9 @@ def _markdown(report: dict) -> str:
     lines.append(f"- $1,000 buy slippage: `{summary.get('buy_slippage_1000_bps', {})}`")
     lines.append(f"- $1,000 sell slippage: `{summary.get('sell_slippage_1000_bps', {})}`")
     lines.append(f"- Anomalies: `{summary.get('anomaly_counts', {})}`")
+    lines.append(f"- Dislocation quality scores: `{summary.get('dislocation_quality_score', {})}`")
+    lines.append(f"- Dislocation quality diagnostics: `{summary.get('dislocation_quality_diagnostics', {})}`")
+    lines.append(f"- Paper cohort outcomes: `{summary.get('dislocation_quality_cohort_outcomes', {})}`")
     expansion = summary.get("expansion_map", {})
     lines.extend(["", "## Expansion Map", ""])
     lines.append(f"- Known quality rate: `{expansion.get('known_quality_rate')}`")
@@ -10471,6 +10696,7 @@ def _markdown(report: dict) -> str:
     for row in top:
         lines.append(
             f"- `{row.get('inst_id')}` {row.get('direction')} score=`{row.get('score')}` "
+            f"quality_rank=`{row.get('paper_quality_rank')}` dislocation_quality=`{row.get('dislocation_quality_score')}` "
             f"dev=`{row.get('venue_deviation_bps')}`bps edge=`{row.get('edge_bps_estimate')}`bps "
             f"quality=`{row.get('quality_score')}` action=`{row.get('quality_action')}` "
             f"quote_norm=`{row.get('quote_normalization_status')}` "

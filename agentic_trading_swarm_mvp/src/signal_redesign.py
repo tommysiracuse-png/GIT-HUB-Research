@@ -1285,6 +1285,47 @@ def _reliable_paper_metrics(conn: sqlite3.Connection, horizon: int = 60) -> dict
     return _metrics([float(row["pnl_bps"]) for row in rows])
 
 
+def dislocation_quality_cohort_outcomes(conn: sqlite3.Connection, horizon: int = 60) -> dict:
+    """Compare score-ranked frontier paper trades with the active baseline.
+
+    The score is a paper-only cohort label persisted in ``candidate_json``.
+    Older trades remain part of the baseline, which keeps the comparison useful
+    while the new ranked cohort accumulates its first evaluation window.
+    """
+    rows = conn.execute(
+        """
+        select o.pnl_bps, p.candidate_json
+        from paper_trade_outcomes o
+        join paper_trades p on p.id = o.trade_id
+        where o.horizon_minutes = ?
+          and o.measurement_status = 'valid'
+          and o.pnl_bps is not null
+          and p.trade_type = 'frontier_crypto_venue_map'
+          and coalesce(json_extract(p.context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
+        """,
+        (horizon,),
+    ).fetchall()
+    baseline = []
+    ranked = []
+    diagnostic = []
+    for row in rows:
+        pnl_bps = float(row["pnl_bps"])
+        baseline.append(pnl_bps)
+        candidate = json.loads(row["candidate_json"] or "{}")
+        cohort = str(candidate.get("paper_quality_cohort") or "baseline")
+        if cohort == "quality_ranked":
+            ranked.append(pnl_bps)
+        elif cohort == "quality_diagnostic":
+            diagnostic.append(pnl_bps)
+    return {
+        "horizon_minutes": horizon,
+        "baseline_all_frontier": _metrics(baseline),
+        "quality_ranked": _metrics(ranked),
+        "quality_diagnostic": _metrics(diagnostic),
+        "comparison_note": "Compare avg_pnl_bps, win_rate, and worst_decile_bps after the next evaluation window; cohorts do not change paper eligibility.",
+    }
+
+
 def _bucket_numeric(value: object, bounds: tuple[float, float, float], labels: tuple[str, str, str, str]) -> str:
     try:
         numeric = float(value or 0.0)
@@ -1720,6 +1761,7 @@ def run_frontier_redesign(
         "venue_quality_leaderboard": venue_quality_leaderboard,
         "quality_outcome_relationship_60m": quality_outcome_relationship(conn),
         "market_testing_progress": market_testing_progress(conn),
+        "dislocation_quality_cohort_outcomes": dislocation_quality_cohort_outcomes(conn),
     }
     write_frontier_outputs(
         enriched_observations,

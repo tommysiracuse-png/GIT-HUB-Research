@@ -36,7 +36,12 @@ def memory_conn() -> sqlite3.Connection:
     return conn
 
 
-def insert_trade(conn: sqlite3.Connection, opened_at: str, inst_id: str = "TEST") -> int:
+def insert_trade(
+    conn: sqlite3.Connection,
+    opened_at: str,
+    inst_id: str = "TEST",
+    candidate_extra: dict | None = None,
+) -> int:
     candidate = {
         "seen_at": opened_at,
         "venue": "TEST",
@@ -48,6 +53,7 @@ def insert_trade(conn: sqlite3.Connection, opened_at: str, inst_id: str = "TEST"
         "thesis": "test",
         "execution_feasibility": {"status": "standard"},
     }
+    candidate.update(candidate_extra or {})
     review = {"learned_score": 60.0, "route_status": "standard"}
     trade_id = storage.open_paper_trade(conn, candidate, review)
     conn.execute("update paper_trades set opened_at = ? where id = ?", (opened_at, trade_id))
@@ -56,6 +62,36 @@ def insert_trade(conn: sqlite3.Connection, opened_at: str, inst_id: str = "TEST"
 
 
 class ReliableOutcomeTests(unittest.TestCase):
+    def test_dislocation_quality_cohort_outcomes_compares_ranked_and_baseline(self) -> None:
+        conn = memory_conn()
+        now = dt.datetime.now(dt.timezone.utc)
+        opened_at = (now - dt.timedelta(minutes=61)).isoformat()
+        insert_trade(
+            conn,
+            opened_at,
+            "RANKED",
+            {"paper_quality_cohort": "quality_ranked", "dislocation_quality_score": 82.0},
+        )
+        insert_trade(
+            conn,
+            opened_at,
+            "DIAGNOSTIC",
+            {"paper_quality_cohort": "quality_diagnostic", "dislocation_quality_score": 35.0},
+        )
+        observations = {
+            "RANKED": {"inst_id": "RANKED", "last": 101.0, "observed_at": now.isoformat(), "price_source": "test"},
+            "DIAGNOSTIC": {"inst_id": "DIAGNOSTIC", "last": 99.0, "observed_at": now.isoformat(), "price_source": "test"},
+        }
+        storage.record_due_horizon_outcomes(conn, observations, settings())
+
+        metrics = signal_redesign.dislocation_quality_cohort_outcomes(conn)
+
+        self.assertEqual(2, metrics["baseline_all_frontier"]["count"])
+        self.assertEqual(1, metrics["quality_ranked"]["count"])
+        self.assertEqual(1, metrics["quality_diagnostic"]["count"])
+        self.assertGreater(metrics["quality_ranked"]["avg_pnl_bps"], 0)
+        self.assertLess(metrics["quality_diagnostic"]["avg_pnl_bps"], 0)
+
     def test_complete_observation_prices_trade_outside_ranked_candidates(self) -> None:
         observed_at = dt.datetime.now(dt.timezone.utc).isoformat()
         batch = ScanBatch(

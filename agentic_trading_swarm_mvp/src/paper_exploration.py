@@ -285,7 +285,18 @@ def fair_lineage_order(candidates: list[dict], cycle_index: int, settings: Mappi
     offset = int(cycle_index) % len(keys)
     keys = keys[offset:] + keys[:offset]
     for rows in grouped.values():
-        rows.sort(key=lambda row: float(row.get("score") or 0.0), reverse=True)
+        # The frontier quality score is a paper-only ordering input.  It never
+        # removes a priceable candidate, but makes bounded review/execution
+        # capacity favor independently corroborated, cost-aware dislocations.
+        rows.sort(
+            key=lambda row: float(
+                row.get("paper_ranking_score")
+                if row.get("trade_type") == "frontier_crypto_venue_map"
+                and row.get("paper_ranking_score") is not None
+                else row.get("score") or 0.0
+            ),
+            reverse=True,
+        )
     ordered: list[dict] = []
     while keys:
         remaining = []

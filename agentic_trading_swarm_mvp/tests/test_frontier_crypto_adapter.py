@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 import frontier_crypto_adapter as frontier
 import route_resolver
 import signal_redesign
+from paper_exploration import fair_lineage_order
 from settings import DEFAULT_SETTINGS
 
 
@@ -505,9 +506,49 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertIn("candidate_activity", summary)
         self.assertIn("marketability_confirmed_route_candidates", summary["candidate_activity"])
         self.assertIn("marketability_conservative_route_candidates", summary["candidate_activity"])
+        self.assertIn("dislocation_quality_score", summary)
+        self.assertIn("dislocation_quality_diagnostics", summary)
+        self.assertIn("dislocation_quality_cohort_outcomes", summary)
+        self.assertIn("dislocation_quality_score", summary["top_dislocations"][0])
         self.assertEqual(summary["expansion_map"]["worker_count"], 16)
         self.assertEqual(summary["expansion_map"]["selection_limits"]["max_symbols_per_cycle"], 300)
         self.assertEqual(summary["expansion_map"]["venue_quota_report"]["A"]["status"], "partial")
+
+    def test_dislocation_quality_ranks_broad_stable_references_without_blocking_fragile_paper(self) -> None:
+        cfg = settings()
+        stable_local = self._quality_obs("LOCAL_STABLE", "ABC-USDT", "ABC", "USDT", 98.0, 100_000, quality_score=85)
+        stable_peers = [
+            self._quality_obs("PEER_A", "ABC-USDT", "ABC", "USDT", 100.0, 100_000, quality_score=85),
+            self._quality_obs("PEER_B", "ABC-USDT", "ABC", "USDT", 100.1, 100_000, quality_score=85),
+            self._quality_obs("PEER_C", "ABC-USDT", "ABC", "USDT", 99.9, 100_000, quality_score=85),
+        ]
+        fragile_local = self._quality_obs("LOCAL_FRAGILE", "XYZ-USDT", "XYZ", "USDT", 98.0, 100_000, quality_score=85)
+        fragile_peer = self._quality_obs("PEER_D", "XYZ-USDT", "XYZ", "USDT", 100.0, 100_000, quality_score=85)
+
+        stable = frontier._candidate_from_observation(
+            stable_local, cfg, 100.0, 4, reference_observations=[stable_local, *stable_peers]
+        )
+        fragile = frontier._candidate_from_observation(
+            fragile_local, cfg, 100.0, 2, reference_observations=[fragile_local, fragile_peer]
+        )
+        ranked = frontier.rank_frontier_paper_candidates([fragile, stable], cfg)
+
+        self.assertGreater(stable["dislocation_quality_score"], fragile["dislocation_quality_score"])
+        self.assertIn("narrow_reference_set", fragile["dislocation_quality_diagnostics"])
+        self.assertFalse(fragile["paper_entry_blocked"])
+        self.assertEqual("ranked_not_blocked", fragile["paper_quality_filter_status"])
+        self.assertEqual(stable["inst_id"], ranked[0]["inst_id"])
+        self.assertEqual(1, ranked[0]["paper_quality_rank"])
+
+        ordered = fair_lineage_order(
+            [
+                {**fragile, "venue": "SAME", "paper_ranking_score": 55.0, "score": 95.0},
+                {**stable, "venue": "SAME", "paper_ranking_score": 75.0, "score": 45.0},
+            ],
+            0,
+            cfg,
+        )
+        self.assertEqual(stable["inst_id"], ordered[0]["inst_id"])
 
     def test_route_resolver_compatibility_for_frontier_candidate(self) -> None:
         cfg = settings()
