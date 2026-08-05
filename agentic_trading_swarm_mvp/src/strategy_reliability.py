@@ -1593,8 +1593,20 @@ def paper_portability_quarantine_record(
         "destination_family_proof": proven,
         "rank_above_neutral_allowed": proven,
         "paper_rank_eligible": proven,
-        "sandbox_rank_eligible": False,
-        "maximum_stage": "paper_promotion" if proven else "quarantined",
+        # A proxy-to-frontier transfer without exact-surface proof is capped
+        # at sandbox ranking.  The rank remains observational only; promotion
+        # and paper fills stay blocked until the target-surface guard passes.
+        "sandbox_rank_eligible": bool(
+            proxy_momentum_frontier_transfer
+            and target_surface_review.get("sandbox_rank_eligible", False)
+        ),
+        "maximum_stage": (
+            "paper_promotion"
+            if proven
+            else "sandbox_ranking"
+            if proxy_momentum_frontier_transfer
+            else "quarantined"
+        ),
         "promotion_eligible": proven,
         "promotion_blocked": not proven,
         "paper_fill_allowed": proven,
@@ -3285,9 +3297,13 @@ def _apply_portability_quarantine(
     neutral_score = _as_float(quarantine.get("neutral_score"), 0.0)
     candidate["pre_portability_quarantine_score"] = pre_quarantine_score
     candidate["score"] = pre_quarantine_score if sandbox_rank_eligible else min(pre_quarantine_score, neutral_score)
-    candidate["paper_score_multiplier"] = 1.0 if sandbox_rank_eligible else 0.0
-    candidate["paper_score_eligible"] = sandbox_rank_eligible
-    candidate["paper_rank_eligible"] = sandbox_rank_eligible
+    # Sandbox ranking is observational.  Do not leak that status into the
+    # paper-score or promotion fields, which downstream order routing treats
+    # as permission to advance a candidate.
+    candidate["paper_score_multiplier"] = 0.0
+    candidate["paper_score_eligible"] = False
+    candidate["paper_rank_eligible"] = False
+    candidate["sandbox_rank_eligible"] = sandbox_rank_eligible
     candidate["promotion_eligible"] = False
     candidate["paper_fill_allowed"] = False
     candidate["paper_allocation_multiplier"] = 0.0
@@ -3295,7 +3311,8 @@ def _apply_portability_quarantine(
     reliability["paper_portability_quarantine"] = dict(quarantine)
     reliability["pre_quarantine_score"] = pre_quarantine_score
     reliability["paper_score_multiplier"] = candidate["paper_score_multiplier"]
-    reliability["paper_rank_eligible"] = sandbox_rank_eligible
+    reliability["paper_rank_eligible"] = False
+    reliability["sandbox_rank_eligible"] = sandbox_rank_eligible
     reliability["maximum_stage"] = quarantine.get("maximum_stage")
     candidate["strategy_reliability"] = reliability
     _append_note(candidate, f"paper_portability_quarantine:{quarantine['reason']}")

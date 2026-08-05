@@ -1488,12 +1488,21 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "creation_allowed": eligible,
         "paper_score_eligible": eligible,
         "paper_rank_eligible": eligible,
-        "sandbox_rank_eligible": eligible,
+        # An unproven transfer may remain visible to local sandbox ranking so
+        # the target surface can collect the paper observations needed for a
+        # later promotion.  It must not, however, become paper-rank eligible
+        # or emit a route until that exact-surface proof is fresh and meets
+        # the configured quality thresholds.
+        "sandbox_rank_eligible": bool(
+            not applies or target_surface_evidence.get("sandbox_rank_eligible", False)
+        ),
         "activation_allowed": eligible,
         "paper_allocation_multiplier": 1.0 if eligible else 0.0,
         "maximum_stage": (
-            target_surface_evidence.get("maximum_stage") if eligible else "quarantined"
-        ) if applies else None,
+            target_surface_evidence.get("maximum_stage")
+            if applies
+            else None
+        ),
         "reason": reason,
         "alignment_reason": alignment_reason,
         "source_family": (

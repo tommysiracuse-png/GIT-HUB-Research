@@ -181,7 +181,9 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         )
 
         self.assertTrue(all(row["blocked"] for row in (stale, wrong_surface, low_quality)))
-        self.assertTrue(all(not row["sandbox_rank_eligible"] for row in (stale, wrong_surface, low_quality)))
+        self.assertTrue(all(row["sandbox_rank_eligible"] for row in (stale, wrong_surface, low_quality)))
+        self.assertTrue(all(row["maximum_stage"] == "sandbox_ranking" for row in (stale, wrong_surface, low_quality)))
+        self.assertTrue(all(not row["promotion_eligible"] for row in (stale, wrong_surface, low_quality)))
         self.assertIn(
             "fresh_observations",
             stale["target_surface_paper_evidence_review"]["failed_checks"],
@@ -273,7 +275,7 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertTrue(review["applies"])
         self.assertTrue(review["blocked"])
         self.assertEqual("proxy_derived", review["source_family"])
-        self.assertEqual("quarantined", review["maximum_stage"])
+        self.assertEqual("sandbox_ranking", review["maximum_stage"])
 
         routed = apply_frontier_paper_guard(
             cross_surface_candidate(
