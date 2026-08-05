@@ -59,6 +59,18 @@ DEFAULT_PAPER_CONTEXT_COST_POLICY = {
     "frontier_long_min_liquidity_score": 0.35,
     "frontier_long_max_freshness_age_seconds": 90.0,
     "minimum_score_multiplier": 0.5,
+    "context_transfer_scoring": {
+        "enabled": True,
+        "distance_penalty": 0.30,
+        "minimum_multiplier": 0.15,
+        "synthetic_route_multiplier": 0.80,
+        "secondary_venue_multiplier": 0.85,
+        "product_type_mismatch_multiplier": 0.85,
+        "secondary_venue_short_multiplier": 0.85,
+        "near_trade_threshold_score": 50.0,
+        "near_threshold_band": 10.0,
+        "near_threshold_allocation_multiplier": 0.50,
+    },
 }
 
 _PAPER_CONTEXT_FAMILIES = {
@@ -119,6 +131,259 @@ def _policy(settings: Mapping[str, Any] | None) -> dict[str, Any]:
     if isinstance(configured, Mapping):
         merged.update(configured)
     return merged
+
+
+def _transfer_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge transfer-scoring defaults without sharing nested settings state."""
+    defaults = DEFAULT_PAPER_CONTEXT_COST_POLICY["context_transfer_scoring"]
+    configured = policy.get("context_transfer_scoring")
+    return {
+        **defaults,
+        **(configured if isinstance(configured, Mapping) else {}),
+    }
+
+
+def _first_text(candidate: Mapping[str, Any], *fields: str) -> tuple[str | None, str | None]:
+    for field in fields:
+        value = candidate.get(field)
+        if isinstance(value, str) and value.strip():
+            return field, value.strip()
+    return None, None
+
+
+def _nested_text(candidate: Mapping[str, Any], containers: tuple[str, ...], *fields: str) -> tuple[str | None, str | None]:
+    for container_name in containers:
+        container = candidate.get(container_name)
+        if not isinstance(container, Mapping):
+            continue
+        field, value = _first_text(container, *fields)
+        if value is not None:
+            return f"{container_name}.{field}", value
+    return None, None
+
+
+def _normalized_distance(value: Any) -> float | None:
+    distance = _finite_float(value)
+    if distance is None or distance < 0.0:
+        return None
+    if distance > 1.0 and distance <= 100.0:
+        distance /= 100.0
+    return min(1.0, distance)
+
+
+def _product_type(value: str | None) -> str | None:
+    token = str(value or "").lower().replace("-", "_")
+    if any(part in token for part in ("perp", "swap", "future", "derivative")):
+        return "perp"
+    if "spot" in token:
+        return "spot"
+    if any(part in token for part in ("proxy", "yahoo", "equity", "adr", "etf")):
+        return "proxy"
+    return None
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _route_type(candidate: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    field, value = _first_text(
+        candidate,
+        "paper_route_type",
+        "route_type",
+        "paper_execution_semantics",
+        "execution_semantics",
+    )
+    if value is not None:
+        return field, value
+    return _nested_text(
+        candidate,
+        ("frontier_route_feasibility", "execution_feasibility", "execution_route"),
+        "paper_route_type",
+        "route_type",
+        "execution_semantics",
+        "status",
+    )
+
+
+def paper_context_transfer_score(
+    candidate: Mapping[str, Any],
+    settings: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Measure paper-only confidence loss when a signal crosses market contexts.
+
+    This is deliberately a ranking and sizing diagnostic.  It never changes a
+    paper eligibility, route, or fill permission, so a priceable candidate can
+    continue to collect the evidence needed to validate its transfer.
+    """
+    policy = _policy(settings)
+    transfer = _transfer_policy(policy)
+    paper_mode = str((settings or {}).get("mode", "paper")).lower() == "paper"
+    enabled = bool(transfer.get("enabled", True)) and paper_mode and not bool(
+        (settings or {}).get("allow_live_trading", False)
+    )
+    family = paper_context_family(candidate)
+    source_surface_field, source_surface = _first_text(
+        candidate,
+        "source_target_source_surface",
+        "source_market_surface",
+        "source_surface",
+        "origin_surface",
+        "source_market_family",
+    )
+    target_surface_field, target_surface = _first_text(
+        candidate,
+        "target_market_surface",
+        "target_surface",
+        "execution_surface",
+        "market_surface",
+        "market_type",
+    )
+    if target_surface is None:
+        target_surface_field, target_surface = _nested_text(
+            candidate,
+            ("paper_strategy_surface_scope", "execution_feasibility"),
+            "execution_surface",
+            "target_surface",
+            "market_surface",
+            "market_type",
+        )
+    if target_surface is None:
+        family_kind = _PAPER_CONTEXT_FAMILIES.get(family or "")
+        direction = str(candidate.get("direction") or "").lower()
+        target_surface = "perp" if family_kind == "carry" or "perp" in direction else family_kind
+        target_surface_field = "derived_family_surface"
+    if source_surface is None:
+        # Native candidates have no transplant; treating their target as their
+        # source preserves directly priceable same-surface exploration.
+        source_surface = target_surface
+        source_surface_field = "inferred_same_surface"
+
+    source_product = _product_type(source_surface)
+    target_product = _product_type(target_surface)
+    explicit_mismatch = candidate.get("product_type_mismatch")
+    product_mismatch = (
+        _truthy(explicit_mismatch)
+        if explicit_mismatch is not None
+        else bool(source_product and target_product and source_product != target_product)
+    )
+    explicit_distance = _normalized_distance(candidate.get("source_target_distance"))
+    if explicit_distance is not None:
+        distance = explicit_distance
+        distance_basis = "explicit_source_target_distance"
+    elif str(source_surface).strip().lower() == str(target_surface).strip().lower():
+        distance = 0.0
+        distance_basis = "same_surface"
+    elif product_mismatch:
+        distance = 1.0
+        distance_basis = "product_type_mismatch"
+    else:
+        distance = 0.5
+        distance_basis = "cross_venue_or_surface"
+
+    route_type_field, route_type = _route_type(candidate)
+    route_token = str(route_type or "").lower()
+    synthetic_route = bool(
+        _truthy(candidate.get("synthetic_research_paper"))
+        or _truthy(candidate.get("paper_proxy_used"))
+        or _truthy(candidate.get("paper_proxy_activated"))
+        or any(token in route_token for token in ("synthetic", "proxy", "simulated"))
+    )
+    venue_tier_field, venue_tier = _first_text(
+        candidate,
+        "target_venue_tier",
+        "venue_tier",
+        "execution_venue_tier",
+    )
+    tier_token = str(venue_tier or "").lower().replace("-", "_")
+    secondary_venue = bool(
+        _truthy(candidate.get("secondary_venue"))
+        or _truthy(candidate.get("target_secondary_venue"))
+        or tier_token in {"secondary", "tier_2", "tier2", "frontier"}
+    )
+    direction = str(candidate.get("direction") or "").lower()
+    explicit_short_asymmetry = candidate.get("short_asymmetry")
+    short_asymmetry = (
+        _truthy(explicit_short_asymmetry)
+        if explicit_short_asymmetry is not None
+        else bool("short" in direction and secondary_venue)
+    )
+
+    minimum = max(0.01, min(1.0, float(transfer["minimum_multiplier"])))
+    distance_multiplier = max(
+        minimum,
+        1.0 - max(0.0, min(1.0, distance)) * max(0.0, float(transfer["distance_penalty"])),
+    )
+    components = {
+        "source_target_distance": round(distance_multiplier, 6),
+        "route_type": round(float(transfer["synthetic_route_multiplier"]) if synthetic_route else 1.0, 6),
+        "venue_tier": round(float(transfer["secondary_venue_multiplier"]) if secondary_venue else 1.0, 6),
+        "product_type_mismatch": round(float(transfer["product_type_mismatch_multiplier"]) if product_mismatch else 1.0, 6),
+        "short_asymmetry": round(float(transfer["secondary_venue_short_multiplier"]) if short_asymmetry else 1.0, 6),
+    }
+    multiplier = 1.0
+    for component in components.values():
+        multiplier *= max(0.0, min(1.0, component))
+    multiplier = max(minimum, min(1.0, multiplier)) if enabled else 1.0
+    base_score = _finite_float(candidate.get("score"))
+    discounted_score = None if base_score is None else round(max(0.0, base_score * multiplier), 3)
+    net_edge = _finite_float(candidate.get("net_edge_bps"))
+    residual_net_edge = None if net_edge is None else round(net_edge * multiplier, 3)
+    reasons = [
+        name
+        for name, applies in (
+            ("source_target_distance", distance > 0.0),
+            ("synthetic_route", synthetic_route),
+            ("secondary_venue", secondary_venue),
+            ("product_type_mismatch", product_mismatch),
+            ("secondary_venue_short_asymmetry", short_asymmetry),
+        )
+        if applies
+    ]
+    threshold = max(0.0, float(transfer["near_trade_threshold_score"]))
+    band = max(0.0, float(transfer["near_threshold_band"]))
+    near_threshold = bool(
+        enabled
+        and multiplier < 0.999999
+        and discounted_score is not None
+        and threshold <= discounted_score <= threshold + band
+    )
+    allocation_cap = (
+        max(0.0, min(1.0, float(transfer["near_threshold_allocation_multiplier"])))
+        if near_threshold
+        else 1.0
+    )
+    return {
+        "paper_only": True,
+        "applicable": family is not None,
+        "enabled": enabled,
+        "source_surface": source_surface,
+        "source_surface_field": source_surface_field,
+        "target_surface": target_surface,
+        "target_surface_field": target_surface_field,
+        "source_product_type": source_product,
+        "target_product_type": target_product,
+        "source_target_distance": round(distance, 6),
+        "distance_basis": distance_basis,
+        "route_type": route_type,
+        "route_type_field": route_type_field,
+        "venue_tier": venue_tier,
+        "venue_tier_field": venue_tier_field,
+        "product_type_mismatch": product_mismatch,
+        "short_asymmetry": short_asymmetry,
+        "synthetic_route": synthetic_route,
+        "secondary_venue": secondary_venue,
+        "component_multipliers": components,
+        "confidence_multiplier": round(multiplier, 6),
+        "base_score": round(base_score, 3) if base_score is not None else None,
+        "discounted_score": discounted_score,
+        "residual_net_edge_bps": residual_net_edge,
+        "near_trade_threshold": near_threshold,
+        "near_threshold_allocation_cap": round(allocation_cap, 6),
+        "reasons": reasons,
+    }
 
 
 def _surface_cost_policy(policy: Mapping[str, Any], family_kind: str | None) -> dict[str, float]:
@@ -819,6 +1084,37 @@ def annotate_paper_context_cost(
         raw_score = float(annotated["score"])
         annotated["score_before_context_cost"] = round(raw_score, 3)
         annotated["score"] = round(raw_score * float(gate["score_multiplier"]), 3)
+    transfer = paper_context_transfer_score(annotated, settings)
+    annotated["paper_context_transfer_score"] = transfer
+    annotated["paper_context_transfer_confidence_multiplier"] = transfer["confidence_multiplier"]
+    if adjust_score and transfer["applicable"] and transfer["enabled"]:
+        if transfer["discounted_score"] is not None:
+            annotated["score_before_context_transfer"] = transfer["base_score"]
+            annotated["score"] = transfer["discounted_score"]
+            annotated["paper_context_transfer_score_applied"] = True
+        confidence = _finite_float(annotated.get("confidence"))
+        if confidence is not None:
+            annotated["confidence_before_context_transfer"] = round(confidence, 6)
+            annotated["confidence"] = round(
+                max(0.0, min(1.0, confidence * float(transfer["confidence_multiplier"]))),
+                6,
+            )
+        if transfer["near_trade_threshold"]:
+            current_allocation = _finite_float(annotated.get("paper_allocation_multiplier"))
+            annotated["paper_allocation_multiplier"] = round(
+                min(
+                    max(0.0, min(1.0, current_allocation if current_allocation is not None else 1.0)),
+                    float(transfer["near_threshold_allocation_cap"]),
+                ),
+                6,
+            )
+            annotated["paper_context_transfer_size_capped"] = True
+        if transfer["reasons"]:
+            notes = list(annotated.get("risk_notes") or [])
+            marker = "paper-only context-transfer discount applied to ranking and sizing"
+            if marker not in notes:
+                notes.append(marker)
+            annotated["risk_notes"] = notes
     notes = list(annotated.get("risk_notes") or [])
     marker = "paper-only gross edge must clear the market-context cost floor"
     if marker not in notes:
@@ -836,6 +1132,7 @@ def paper_context_cost_report(
     rows: list[dict[str, Any]] = []
     reason_counts: dict[str, int] = {}
     family_counts: dict[str, int] = {}
+    transfer_reason_counts: dict[str, int] = {}
     for candidate in candidates:
         stored = candidate.get("paper_context_cost_gate")
         gate = dict(stored) if isinstance(stored, Mapping) else paper_context_cost_gate(candidate)
@@ -845,6 +1142,13 @@ def paper_context_cost_report(
         family_kind = str(gate.get("family_kind") or "unknown")
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
         family_counts[family_kind] = family_counts.get(family_kind, 0) + 1
+        transfer = candidate.get("paper_context_transfer_score")
+        if not isinstance(transfer, Mapping):
+            transfer = paper_context_transfer_score(candidate)
+        for transfer_reason in transfer.get("reasons") or []:
+            transfer_reason_counts[str(transfer_reason)] = (
+                transfer_reason_counts.get(str(transfer_reason), 0) + 1
+            )
         rows.append(
             {
                 "venue": candidate.get("venue"),
@@ -859,6 +1163,9 @@ def paper_context_cost_report(
                 "net_edge_bps": gate.get("net_edge_bps"),
                 "freshness_minutes": gate.get("freshness_minutes"),
                 "gating_reason": reason,
+                "context_transfer_multiplier": transfer.get("confidence_multiplier"),
+                "context_transfer_residual_net_edge_bps": transfer.get("residual_net_edge_bps"),
+                "context_transfer_reasons": transfer.get("reasons", []),
             }
         )
     rows.sort(
@@ -875,6 +1182,7 @@ def paper_context_cost_report(
         "eligible_candidate_count": len(rows) - gated_count,
         "by_family_kind": family_counts,
         "by_gating_reason": reason_counts,
+        "by_context_transfer_reason": transfer_reason_counts,
         "candidates": rows[: max(0, int(limit))],
     }
 

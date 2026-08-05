@@ -9895,7 +9895,15 @@ def _apply_frontier_marketability_gate(
         "allocation_multiplier": round(route_multiplier * quality_multiplier, 6),
         "failed_route_health_checks": failed,
     }
-    candidate["paper_allocation_multiplier"] = candidate["simulated_order_allocation"]["allocation_multiplier"]
+    existing_allocation = as_float(candidate.get("paper_allocation_multiplier"), None)
+    simulated_allocation = candidate["simulated_order_allocation"]["allocation_multiplier"]
+    # Context-transfer scoring can already have capped a near-threshold paper
+    # experiment.  Marketability may add a tighter cap, but must not erase it.
+    candidate["paper_allocation_multiplier"] = (
+        min(max(0.0, min(1.0, existing_allocation)), simulated_allocation)
+        if existing_allocation is not None
+        else simulated_allocation
+    )
     if failed:
         candidate["risk_notes"] = list(candidate.get("risk_notes") or []) + [
             "venue-health or route-quality evidence is unconfirmed; use conservative counterfactual paper routing",

@@ -20,6 +20,7 @@ from paper_context_cost import (  # noqa: E402
     annotate_paper_context_cost,
     paper_context_cost_gate,
     paper_context_cost_report,
+    paper_context_transfer_score,
     realized_paper_cost_audit,
 )
 from settings import DEFAULT_SETTINGS  # noqa: E402
@@ -352,6 +353,92 @@ class PaperContextCostFloorTests(unittest.TestCase):
         self.assertEqual(annotated["score_before_context_cost"], 80.0)
         self.assertLess(annotated["score"], 80.0)
         self.assertIn("paper_context_cost_gate", annotated)
+
+    def test_context_transfer_discount_preserves_direct_same_surface_candidate(self) -> None:
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+        settings["paper_context_cost_floor"]["enabled"] = False
+        candidate = frontier_candidate(
+            source_surface="spot",
+            target_surface="spot",
+            paper_route_type="direct",
+            venue_tier="primary",
+            paper_allocation_multiplier=0.8,
+        )
+
+        annotated = annotate_paper_context_cost(candidate, settings)
+        transfer = annotated["paper_context_transfer_score"]
+
+        self.assertEqual(1.0, transfer["confidence_multiplier"])
+        self.assertEqual(80.0, annotated["score"])
+        self.assertEqual(0.8, annotated["paper_allocation_multiplier"])
+        self.assertTrue(annotated["paper_eligible"])
+        self.assertNotIn("paper_entry_blocked", annotated)
+
+    def test_context_transfer_discount_ranks_and_sizes_proxy_frontier_short(self) -> None:
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+        settings["paper_context_cost_floor"]["enabled"] = False
+        settings["paper_context_cost_floor"]["context_transfer_scoring"].update(
+            {
+                "distance_penalty": 0.10,
+                "synthetic_route_multiplier": 0.95,
+                "secondary_venue_multiplier": 0.95,
+                "product_type_mismatch_multiplier": 0.95,
+                "secondary_venue_short_multiplier": 0.95,
+                "near_trade_threshold_score": 50.0,
+                "near_threshold_band": 10.0,
+                "near_threshold_allocation_multiplier": 0.4,
+            }
+        )
+        candidate = frontier_candidate(
+            direction="short_frontier_spot",
+            source_surface="YAHOO_PROXY",
+            target_surface="OKX_SPOT",
+            source_target_distance=0.8,
+            paper_route_type="synthetic_proxy",
+            venue_tier="secondary",
+            confidence=0.8,
+        )
+
+        annotated = annotate_paper_context_cost(candidate, settings)
+        transfer = annotated["paper_context_transfer_score"]
+
+        expected_multiplier = 0.92 * 0.95 * 0.95 * 0.95 * 0.95
+        self.assertAlmostEqual(expected_multiplier, transfer["confidence_multiplier"], places=6)
+        self.assertEqual(59.948, annotated["score"])
+        self.assertEqual(0.4, annotated["paper_allocation_multiplier"])
+        self.assertAlmostEqual(0.8 * expected_multiplier, annotated["confidence"], places=6)
+        self.assertTrue(transfer["near_trade_threshold"])
+        self.assertEqual(
+            {
+                "source_target_distance",
+                "synthetic_route",
+                "secondary_venue",
+                "product_type_mismatch",
+                "secondary_venue_short_asymmetry",
+            },
+            set(transfer["reasons"]),
+        )
+        self.assertTrue(annotated["paper_eligible"])
+        self.assertNotIn("paper_entry_blocked", annotated)
+
+    def test_context_transfer_scoring_is_inactive_outside_paper_mode(self) -> None:
+        settings = copy.deepcopy(DEFAULT_SETTINGS)
+        settings["mode"] = "live"
+        candidate = frontier_candidate(
+            source_surface="YAHOO_PROXY",
+            target_surface="OKX_SPOT",
+            source_target_distance=1.0,
+            paper_route_type="synthetic_proxy",
+            venue_tier="secondary",
+            direction="short_frontier_spot",
+        )
+
+        transfer = paper_context_transfer_score(candidate, settings)
+        annotated = annotate_paper_context_cost(candidate, settings)
+
+        self.assertFalse(transfer["enabled"])
+        self.assertEqual(1.0, transfer["confidence_multiplier"])
+        self.assertEqual(candidate["score"], annotated["score"])
 
     def test_review_tags_low_gross_edge_without_blocking_exploration(self) -> None:
         candidate = frontier_candidate(

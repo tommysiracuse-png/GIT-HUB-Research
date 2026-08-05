@@ -118,6 +118,18 @@ DEFAULT_SETTINGS = {
         "frontier_long_min_liquidity_score": 0.35,
         "frontier_long_max_freshness_age_seconds": 90.0,
         "minimum_score_multiplier": 0.5,
+        "context_transfer_scoring": {
+            "enabled": True,
+            "distance_penalty": 0.30,
+            "minimum_multiplier": 0.15,
+            "synthetic_route_multiplier": 0.80,
+            "secondary_venue_multiplier": 0.85,
+            "product_type_mismatch_multiplier": 0.85,
+            "secondary_venue_short_multiplier": 0.85,
+            "near_trade_threshold_score": 50.0,
+            "near_threshold_band": 10.0,
+            "near_threshold_allocation_multiplier": 0.50,
+        },
     },
     "yahoo_proxy_reuse_gate": {
         "enabled": True,

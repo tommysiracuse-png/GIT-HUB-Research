@@ -2107,8 +2107,14 @@ def enrich_candidate_with_route(
                 numeric_score * float(eligibility["paper_score_multiplier"]),
                 6,
             )
-        enriched["paper_route_allocation_multiplier"] = eligibility["paper_score_multiplier"]
-        enriched["paper_allocation_multiplier"] = eligibility["paper_score_multiplier"]
+        route_allocation = float(eligibility["paper_score_multiplier"])
+        existing_allocation = _eligibility_number(enriched, "paper_allocation_multiplier")
+        enriched["paper_route_allocation_multiplier"] = route_allocation
+        enriched["paper_allocation_multiplier"] = (
+            min(existing_allocation, route_allocation)
+            if existing_allocation is not None
+            else route_allocation
+        )
         enriched["paper_route_assumption_penalty_applied"] = True
     prior_context_gate = enriched.get("paper_context_cost_gate") or {}
     prior_context_multiplier = float(prior_context_gate.get("score_multiplier", 1.0) or 1.0)
