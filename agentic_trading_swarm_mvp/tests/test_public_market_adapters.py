@@ -159,6 +159,11 @@ from adapters.venues.suruhanjaya_tenaga_energy_commission import (
     SuruhanjayaTenagaEnergyCommissionAdapter,
     parse_enegem_programme,
 )
+from adapters.venues.government_of_india_ministry_of_msme_pib import (
+    SOURCE_URL as INDIA_TREDS_PIB_SOURCE_URL,
+    GovernmentOfIndiaMinistryOfMsmePibAdapter,
+    parse_india_treds_pib_release,
+)
 from adapters.venues.twse_daily import parse_twse_daily
 from adapters.venues.vietnam_securities_depository_and_clearing_corporation_hanoi_sto import (
     GUIDELINE_URL as VSDC_CARBON_GUIDELINE_URL,
@@ -3128,6 +3133,179 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
             "public_programme_source_unavailable",
             unavailable_batch.observations[0]["candidate_reject_reason"],
         )
+
+    def test_india_treds_pib_parser_normalizes_platform_and_policy_evidence(self) -> None:
+        document = """
+        <html><body>
+          <p>Ministry of Micro,Small &amp; Medium Enterprises</p>
+          <h1>Faster Payments, Stronger MSME: Government Mandates TReDS</h1>
+          <p>Posted On: 10 JUL 2026 11:43AM by PIB Delhi</p>
+          <p>Mandatory settlement through TReDS: All operating Central Public Sector
+          Enterprises (CPSEs) must route the settlement of invoices for goods and
+          services procured from MSMEs through TReDS platforms authorised by the
+          Reserve Bank of India (RBI).</p>
+          <p>The Ministry of MSME has notified mandatory use of the Trade Receivables
+          Discounting System (TReDS). The Notification, issued on 30 June 2026,
+          gives effect to the policy.</p>
+          <p>TReDS is an RBI-regulated electronic platform, operational since 2017,
+          for financing and discounting the trade receivables of MSMEs due from
+          corporate buyers, Government Departments and Public Sector Undertakings,
+          through competitive bidding by multiple financiers. Five platforms are
+          currently operational: RXIL, M1xchange, Invoicemart, C2treds and DTX.
+          The platform has grown from strength to strength, with invoice discounting
+          increasing from ₹40,000 crore in FY 2021-22 to ₹3.47 lakh crore in FY 2025-26.</p>
+        </body></html>
+        """
+        rows = parse_india_treds_pib_release(
+            document, received_at="2026-08-04T16:30:00+00:00"
+        )
+
+        self.assertEqual(5, len(rows))
+        rxil = rows[0]
+        self.assertEqual("INDIA_TREDS:RXIL", rxil["inst_id"])
+        self.assertEqual("RXIL", rxil["platform"])
+        self.assertTrue(rxil["cpse_mandatory_treds_routing"])
+        self.assertEqual("2026-06-30", rxil["notification_date"])
+        self.assertEqual("2026-07-10", rxil["release_date"])
+        self.assertEqual(40_000.0, rxil["invoice_discounting_start_crore_inr"])
+        self.assertEqual(347_000.0, rxil["invoice_discounting_end_crore_inr"])
+        self.assertEqual("official_policy_reference", rxil["session_status"])
+        self.assertEqual("fresh", rxil["freshness_state"])
+        self.assertEqual(INDIA_TREDS_PIB_SOURCE_URL, rxil["source_url"])
+        self.assertEqual("watch_only", rxil["direction"])
+        self.assertEqual(0.0, rxil["last"])
+        self.assertEqual(
+            "public_treds_release_has_no_invoice_level_discount_rate",
+            rxil["candidate_reject_reason"],
+        )
+
+        reachable = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": document,
+            "received_at": "2026-08-04T16:30:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.government_of_india_ministry_of_msme_pib.fetch_text",
+            return_value=reachable,
+        ):
+            batch = GovernmentOfIndiaMinistryOfMsmePibAdapter().scan({})
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["pib_treds_release"]["fetch_status"])
+        self.assertEqual("fresh", batch.metadata["freshness_state"])
+        self.assertEqual("official_policy_reference", batch.metadata["session_state"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+
+    def test_india_treds_pib_plugin_is_runtime_discoverable_and_preserves_failures(self) -> None:
+        adapter_id = "government_of_india_ministry_of_msme_pib"
+        self.assertIn(adapter_id, discover_adapters())
+        discovered = get_adapter(adapter_id)
+        self.assertIsInstance(discovered, GovernmentOfIndiaMinistryOfMsmePibAdapter)
+        self.assertEqual(INDIA_TREDS_PIB_SOURCE_URL, discovered.info.docs_url)
+        self.assertIn("invoice_discounting_platform_catalog", discovered.info.capabilities)
+
+        parser_result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>replacement page</body></html>",
+            "received_at": "2026-08-04T16:30:00+00:00",
+            "latency_ms": 5.0,
+        }
+        with mock.patch(
+            "adapters.venues.government_of_india_ministry_of_msme_pib.fetch_text",
+            return_value=parser_result,
+        ):
+            parser_batch = GovernmentOfIndiaMinistryOfMsmePibAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable", parser_batch.metadata["fetch_status"]["pib_treds_release"]["fetch_status"]
+        )
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual("watch_only", parser_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_treds_policy_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+
+        unavailable = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "error": "blocked",
+            "text": "",
+            "received_at": "2026-08-04T16:31:00+00:00",
+            "latency_ms": 7.0,
+        }
+        with mock.patch(
+            "adapters.venues.government_of_india_ministry_of_msme_pib.fetch_text",
+            return_value=unavailable,
+        ):
+            unavailable_batch = GovernmentOfIndiaMinistryOfMsmePibAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("unknown", unavailable_batch.metadata["freshness_state"])
+        self.assertEqual("unknown", unavailable_batch.metadata["session_state"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_treds_policy_source_unavailable",
+            unavailable_batch.observations[0]["candidate_reject_reason"],
+        )
+
+    def test_india_treds_pib_plugin_is_auto_discovered_by_adapter_runtime(self) -> None:
+        adapter_id = "government_of_india_ministry_of_msme_pib"
+        document = """
+        <html><body>Ministry of Micro,Small &amp; Medium Enterprises
+        Posted On: 10 JUL 2026 11:43AM
+        All operating Central Public Sector Enterprises (CPSEs) must use mandatory
+        settlement through TReDS. Trade Receivables Discounting System (TReDS) is an
+        RBI-regulated electronic platform through competitive bidding by multiple
+        financiers. Notification dated 30 June 2026. Five platforms are currently
+        operational: RXIL, M1xchange, Invoicemart, C2treds and DTX. Invoice discounting
+        increasing from ₹40,000 crore in FY 2021-22 to ₹3.47 lakh crore in FY 2025-26.
+        </body></html>
+        """
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": document,
+            "received_at": "2026-08-04T16:30:00+00:00",
+            "latency_ms": 4.0,
+        }
+        original_discover = adapter_runtime.discover_adapters
+
+        def discover_only_india_treds() -> list[str]:
+            return [identifier for identifier in original_discover() if identifier == adapter_id]
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "adapters.venues.government_of_india_ministry_of_msme_pib.fetch_text",
+            return_value=result,
+        ), mock.patch.object(adapter_runtime, "RUNS_DIR", pathlib.Path(tmp)), mock.patch.object(
+            adapter_runtime, "CACHE_DIR", pathlib.Path(tmp) / "cache"
+        ), mock.patch.object(adapter_runtime, "REPORT_JSON", pathlib.Path(tmp) / "report.json"), mock.patch.object(
+            adapter_runtime, "REPORT_MD", pathlib.Path(tmp) / "report.md"
+        ), mock.patch.object(adapter_runtime, "discover_adapters", side_effect=discover_only_india_treds):
+            batch = adapter_runtime.build_scan_batch(
+                {
+                    "public_market_adapters": {
+                        "enabled": True,
+                        "workers": 1,
+                        "adapters": {adapter_id: {"cache_minutes": 0}},
+                    }
+                }
+            )
+
+        self.assertEqual(5, len(batch.observations))
+        self.assertTrue(all(row["venue"] == "INDIA_TREDS" for row in batch.observations))
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        report = batch.metadata["public_market_adapters"]
+        self.assertEqual(adapter_id, report["adapters"][0]["adapter_id"])
+        self.assertEqual("reachable", report["adapters"][0]["source_status"])
 
     def test_uae_mof_issuance_programme_parser_normalizes_t_bonds_and_t_sukuk(self) -> None:
         document = """
