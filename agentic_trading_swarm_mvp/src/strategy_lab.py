@@ -2491,6 +2491,7 @@ def _runtime_universe_contract_mismatch(
         return None
     universe = program.get("universe") if isinstance(program.get("universe"), dict) else {}
     mismatches = []
+    normalized_requirements = {}
     for plural, field in _PROGRAM_UNIVERSE_FIELDS.items():
         required_raw = universe.get(plural)
         if not required_raw:
@@ -2501,6 +2502,7 @@ def _runtime_universe_contract_mismatch(
                 for value in (required_raw if isinstance(required_raw, list) else [required_raw])
             }
         )
+        normalized_requirements[plural] = required
         observed = sorted(
             {str(frame.get(field) or "<missing>").upper() for frame in observation_frames}
         )
@@ -2514,6 +2516,34 @@ def _runtime_universe_contract_mismatch(
                 "observed_values": observed[:25],
             }
         )
+    nearest_observations = []
+    for frame in observation_frames:
+        failed_fields = []
+        for plural, required in normalized_requirements.items():
+            field = _PROGRAM_UNIVERSE_FIELDS[plural]
+            if str(frame.get(field) or "<missing>").upper() not in set(required):
+                failed_fields.append(field)
+        if failed_fields:
+            nearest_observations.append(
+                {
+                    "venue": frame.get("venue"),
+                    "inst_id": frame.get("inst_id") or frame.get("instrument_id"),
+                    "trade_type": frame.get("trade_type"),
+                    "market_type": frame.get("market_type"),
+                    "quote": frame.get("quote"),
+                    "failed_fields": failed_fields,
+                }
+            )
+    nearest_observations.sort(key=lambda item: (len(item["failed_fields"]), str(item.get("venue") or "")))
+    if not mismatches and normalized_requirements:
+        mismatches.append(
+            {
+                "universe_key": "joint_contract",
+                "runtime_field": "multiple",
+                "required_values": normalized_requirements,
+                "observed_values": [],
+            }
+        )
     if not mismatches:
         return None
     return {
@@ -2523,6 +2553,7 @@ def _runtime_universe_contract_mismatch(
         "universe_match_count": 0,
         "missing_features": list(program_diagnostic.get("missing_features") or []),
         "mismatches": mismatches,
+        "nearest_observations": nearest_observations[:10],
         "owner_objective": "repair_runtime_contract",
     }
 

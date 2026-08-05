@@ -565,6 +565,26 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertTrue(mismatch["repairable"])
         self.assertEqual(["funding_history_count"], mismatch["missing_features"])
 
+    def test_joint_universe_contract_mismatch_across_different_rows(self) -> None:
+        mismatch = _runtime_universe_contract_mismatch(
+            {
+                "universe": {
+                    "venues": ["OKX"],
+                    "market_types": ["perp"],
+                    "trade_types": ["perp_funding_basis"],
+                }
+            },
+            [
+                {"venue": "OKX", "market_type": "spot", "trade_type": "perp_funding_basis"},
+                {"venue": "OTHER", "market_type": "perp", "trade_type": "perp_funding_basis"},
+            ],
+            {"reject_reasons": {"universe_mismatch": 2}},
+            {"feasibility_status": "missing_surface_data", "universe_match_count": 0},
+        )
+
+        self.assertEqual("joint_contract", mismatch["mismatches"][0]["universe_key"])
+        self.assertEqual(["market_type"], mismatch["nearest_observations"][0]["failed_fields"])
+
     def test_runtime_contract_falls_back_to_persisted_logic(self) -> None:
         raw_logic = {"universe": {"market_types": ["perp"]}}
 
