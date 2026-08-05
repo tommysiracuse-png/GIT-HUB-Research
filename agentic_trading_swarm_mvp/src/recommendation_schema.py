@@ -22,6 +22,25 @@ REQUIRED_RECOMMENDATION_KEYS = (
 )
 
 
+def _reject_non_json_constant(value: str) -> None:
+    """Reject JavaScript-style numeric constants that are not valid JSON."""
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _unique_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build an object only when every key appears once.
+
+    Python's standard decoder otherwise keeps the final duplicate value, which
+    makes a recommendation ambiguous to consumers that use another parser.
+    """
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        payload[key] = value
+    return payload
+
+
 def paper_only_fallback_recommendation(
     *,
     market_key: str = "paper.market_radar.fallback",
@@ -54,15 +73,21 @@ def validate_recommendation_object(payload: Any) -> bool:
 def finalize_recommendation_response(response: str | bytes | bytearray) -> dict[str, Any]:
     """Return one complete recommendation object or reject the model response.
 
-    ``json.loads`` deliberately parses the entire response, so markdown fences,
-    commentary, multiple values, arrays, and partial objects are never recovered
-    heuristically. Whitespace surrounding the single JSON value is permitted.
+    The decoder consumes the entire response, so markdown fences, commentary,
+    multiple values, arrays, and partial objects are never recovered
+    heuristically. Non-standard constants and duplicate object keys are also
+    rejected so all consumers see the same recommendation. Whitespace around
+    the single JSON value is permitted.
     """
     if not isinstance(response, (str, bytes, bytearray)):
         raise ValueError("recommendation response must be JSON text")
     try:
-        payload = json.loads(response)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = json.loads(
+            response,
+            parse_constant=_reject_non_json_constant,
+            object_pairs_hook=_unique_object_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError("recommendation response must be exactly one complete JSON object") from exc
     if not isinstance(payload, dict):
         raise ValueError("recommendation response must be a JSON object")

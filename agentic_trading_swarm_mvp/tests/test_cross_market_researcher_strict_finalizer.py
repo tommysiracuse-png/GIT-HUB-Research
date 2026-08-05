@@ -67,6 +67,19 @@ class RecommendationFinalizerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     finalize_recommendation_response(response)
 
+    def test_rejects_non_standard_constants_and_duplicate_keys(self):
+        payload = json.dumps(_payload())
+        duplicate_title = payload.replace(
+            '"title": "Compare paper-market outcomes",',
+            '"title": "Compare paper-market outcomes", "title": "Conflicting title",',
+        )
+        non_standard_number = payload.replace('"priority": 82', '"priority": NaN')
+
+        for response in (duplicate_title, non_standard_number):
+            with self.subTest(response=response):
+                with self.assertRaises(ValueError):
+                    finalize_recommendation_response(response)
+
 
 class CrossMarketResearcherRetryTests(unittest.TestCase):
     def setUp(self):
