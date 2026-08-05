@@ -2528,6 +2528,13 @@ def _runtime_universe_contract_mismatch(
     }
 
 
+def _runtime_contract_program(feasibility: dict, raw_logic: dict) -> dict:
+    """Keep contract diagnosis independent from transient profiler payloads."""
+
+    profiled = feasibility.get("program")
+    return profiled if isinstance(profiled, dict) and profiled else dict(raw_logic or {})
+
+
 def generate_strategy_lab_candidates(
     conn: sqlite3.Connection,
     settings: dict,
@@ -2704,7 +2711,7 @@ def generate_strategy_lab_candidates(
                 max_candidates=min(max_per_experiment, remaining),
             )
             runtime_contract_mismatch = _runtime_universe_contract_mismatch(
-                feasibility.get("program") or {},
+                _runtime_contract_program(feasibility, raw_logic),
                 observation_frames,
                 program_diagnostic,
                 feasibility,

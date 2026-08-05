@@ -20,6 +20,7 @@ from storage import init_db  # noqa: E402
 from strategy_lab import (  # noqa: E402
     _observation_program_inputs,
     _queue_promotion,
+    _runtime_contract_program,
     _runtime_universe_contract_mismatch,
     generate_strategy_lab_candidates,
     ingest_strategy_lab_recommendation,
@@ -552,6 +553,11 @@ class StrategyProgramTests(unittest.TestCase):
 
         self.assertTrue(mismatch["repairable"])
         self.assertEqual("market_type", mismatch["mismatches"][0]["runtime_field"])
+
+    def test_runtime_contract_falls_back_to_persisted_logic(self) -> None:
+        raw_logic = {"universe": {"market_types": ["perp"]}}
+
+        self.assertEqual(raw_logic, _runtime_contract_program({}, raw_logic))
 
     def test_program_input_join_does_not_copy_cached_route_eligibility(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
