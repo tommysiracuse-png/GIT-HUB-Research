@@ -115,9 +115,12 @@ def _strategy_lab_runtime_summary(strategy_lab_generation: dict | None, runtime_
     generation = strategy_lab_generation or {}
     accepted = generation.get("accepted_candidates")
     rejected = generation.get("rejected_candidates")
+    generated_count = generation.get("generated_count")
+    if generated_count is None:
+        generated_count = generation.get("generated_candidates", 0)
     summary = {
         "enabled": bool(generation.get("enabled", True)),
-        "generated_count": int(generation.get("generated_count", 0) or 0),
+        "generated_count": int(generated_count or 0),
         "accepted_count": (
             len(accepted)
             if isinstance(accepted, list)

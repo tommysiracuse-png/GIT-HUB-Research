@@ -60,6 +60,15 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
         self.assertEqual(summary["generated_count"], 1)
         self.assertEqual(summary["accepted_count"], 1)
 
+    def test_expansion_summary_uses_strategy_lab_generator_count(self):
+        summary = radar_loop_module._strategy_lab_runtime_summary(
+            {"enabled": True, "generated_candidates": 50},
+            {"selected_count": 50, "runtime_selection_mode": "lab_generation"},
+        )
+
+        self.assertEqual(50, summary["generated_count"])
+        self.assertEqual(50, summary["selected_count"])
+
     def test_runtime_summary_includes_selection_mode_when_explicitly_enabled(self):
         candidates = [
             {"strategy_lab_type": "candidate_filter", "enabled": True},

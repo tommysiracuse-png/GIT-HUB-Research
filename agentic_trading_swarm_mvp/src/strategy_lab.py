@@ -4174,6 +4174,8 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     backfilled_experiment_type_count = _backfill_experiment_types(conn)
     summary = strategy_lab_summary(conn)
+    if generation is not None:
+        summary["generated_candidates_last_cycle"] = int(generation.get("generated_candidates") or 0)
     report = {
         "generated_at": _utc(),
         "summary": summary,

@@ -952,6 +952,18 @@ class StrategyLabTest(unittest.TestCase):
         self.assertEqual(1, len(report["summary"]["recent_non_market_experiments"]))
         self.assertEqual("system_repair", repair_row["experiment_type"])
 
+    def test_report_summary_uses_current_generation_count(self):
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_path = Path(tmpdir)
+                with mock.patch("strategy_lab.REPORT_JSON", tmp_path / "strategy_lab_report.json"), (
+                    mock.patch("strategy_lab.REPORT_MD", tmp_path / "strategy_lab_report.md")
+                ):
+                    report = write_strategy_lab_reports(conn, {"generated_candidates": 6})
+
+        self.assertEqual(6, report["summary"]["generated_candidates_last_cycle"])
+
 
 if __name__ == "__main__":
     unittest.main()
