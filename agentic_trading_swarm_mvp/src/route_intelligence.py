@@ -981,6 +981,37 @@ def build_candidate_route_requirement_summary(
     margin_mode = facts.get("margin_mode", diagnostics.get("margin_mode", _first_known(source, "margin_mode", "margin_account_mode")))
     freshness_status = facts.get("freshness_latency_status", frontier.get("freshness_latency_status", _freshness_latency_notes(source)["status"]))
 
+    required_permissions = facts.get(
+        "required_permissions", _first_known(source, "required_permissions")
+    )
+    route_blockers = facts.get("route_blockers", _route_blockers(source))
+    broker_status = facts.get("broker_permission_status", UNKNOWN)
+    if broker_status == UNKNOWN:
+        extraction = source.get("route_requirement_extraction")
+        extraction = extraction if isinstance(extraction, dict) else {}
+        broker_requirement = (extraction.get("requirements") or {}).get(
+            "broker_permissions"
+        )
+        if isinstance(broker_requirement, dict):
+            broker_status = broker_requirement.get("status", UNKNOWN)
+    if broker_status == UNKNOWN and route_blockers:
+        broker_status = "needs_confirmation"
+
+    def requires_spot_borrow(value: Any) -> bool:
+        values = (value,) if isinstance(value, str) else (value or [])
+        return any("spot_borrow" in str(item).lower() for item in values)
+
+    explicit_borrow_required = _bool_flag(facts.get("borrow_required"))
+    borrow_required = (
+        explicit_borrow_required is True
+        or _bool_flag(facts.get("requires_spot_borrow")) is True
+        or requires_spot_borrow(required_permissions)
+        or requires_spot_borrow(route_blockers)
+    )
+    borrow_asset = facts.get("borrow_asset", UNKNOWN)
+    if borrow_required and borrow_asset in (None, "", "not_applicable", UNKNOWN):
+        borrow_asset = _borrow_asset(str(facts.get("inst_id") or source.get("inst_id") or ""))
+
     return {
         "summary_version": "paper_route_requirement_summary_v1",
         "paper_only": True,
@@ -996,14 +1027,14 @@ def build_candidate_route_requirement_summary(
         },
         "broker_venue_eligibility": {
             "route_status": facts.get("route_status", source.get("route_status") or UNKNOWN),
-            "broker_permission_status": facts.get("broker_permission_status", UNKNOWN),
-            "required_permissions": facts.get("required_permissions", _first_known(source, "required_permissions")),
-            "route_blockers": facts.get("route_blockers", _route_blockers(source)),
+            "broker_permission_status": broker_status,
+            "required_permissions": required_permissions,
+            "route_blockers": route_blockers,
         },
         "short_borrow_availability": {
-            "short_required": bool(facts.get("requires_spot_borrow") or facts.get("borrow_required")),
-            "borrow_required": bool(facts.get("borrow_required")),
-            "borrow_asset": facts.get("borrow_asset", UNKNOWN),
+            "short_required": borrow_required,
+            "borrow_required": borrow_required,
+            "borrow_asset": borrow_asset,
             "availability_status": borrow_status,
             "borrow_fee_bps_estimate": facts.get("borrow_fee_bps_estimate_or_unknown", UNKNOWN),
         },
@@ -2296,7 +2327,21 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
     venue = _venue(opportunity)
     inst_id = str(opportunity.get("inst_id") or UNKNOWN)
     requirement_flags = list(blockers)
-    if _requires_frontier_spot_short_route(opportunity) and "spot_borrow" not in requirement_flags:
+    explicit_permissions = _route_required_permissions(opportunity, requirement_flags)
+    explicit_borrow_required = _bool_flag(opportunity.get("borrow_required")) is True
+    permissions_require_borrow = any(
+        "spot_borrow" in str(permission).lower()
+        for permission in (
+            (explicit_permissions,)
+            if isinstance(explicit_permissions, str)
+            else (explicit_permissions or [])
+        )
+    )
+    if (
+        _requires_frontier_spot_short_route(opportunity)
+        or explicit_borrow_required
+        or permissions_require_borrow
+    ) and "spot_borrow" not in requirement_flags:
         requirement_flags.append("spot_borrow")
     borrow_required = "spot_borrow" in requirement_flags
     requires_margin_permission = _requires_margin_permission(
@@ -2744,8 +2789,11 @@ def _route_requirement_opportunity(opportunity: dict[str, Any]) -> dict[str, Any
     for key in (
         "route_status",
         "required_permissions",
+        "requirements",
         "borrow_required",
+        "borrow_status",
         "margin_required",
+        "margin_mode",
         "api_access_status",
         "fee_model_status",
         "route_id",
@@ -2755,12 +2803,23 @@ def _route_requirement_opportunity(opportunity: dict[str, Any]) -> dict[str, Any
             if value not in (None, "", [], {}):
                 normalized[key] = value
 
-    if normalized.get("route_blockers") in (None, "", [], {}):
-        blockers = route.get("missing_permissions") or route.get("route_blockers")
-        if not blockers:
-            blockers = feasibility.get("route_blockers") or feasibility.get("missing_requirements")
-        if blockers:
-            normalized["route_blockers"] = blockers
+    resolved_blockers = route.get("missing_permissions") or route.get("route_blockers")
+    if not resolved_blockers:
+        resolved_blockers = feasibility.get("route_blockers") or feasibility.get("missing_requirements")
+    existing_blockers = normalized.get("route_blockers")
+    existing_values = (
+        [existing_blockers]
+        if isinstance(existing_blockers, str)
+        else list(existing_blockers or [])
+    )
+    resolved_values = (
+        [resolved_blockers]
+        if isinstance(resolved_blockers, str)
+        else list(resolved_blockers or [])
+    )
+    combined_blockers = list(dict.fromkeys([*existing_values, *resolved_values]))
+    if combined_blockers:
+        normalized["route_blockers"] = combined_blockers
 
     return normalized
 

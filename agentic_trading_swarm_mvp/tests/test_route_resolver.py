@@ -190,6 +190,29 @@ class RouteResolverTests(unittest.TestCase):
         )
         self.assertFalse(enriched.get("paper_entry_blocked", False))
 
+    def test_enrichment_summary_keeps_resolved_borrow_requirement_visible(self) -> None:
+        enriched = route_resolver.enrich_candidate_with_route(
+            {
+                "venue": "OKX",
+                "inst_id": "OKX:BTC-USDT-SWAP",
+                "trade_type": "perp_funding_basis",
+                "direction": "long_perp_short_spot",
+                "asset_class": "crypto_derivatives",
+                "score": 73.0,
+                "freshness_state": "fresh",
+                "freshness_age_seconds": 4.0,
+            },
+            settings(),
+        )
+
+        summary = enriched["paper_route_requirement_summary"]
+        borrow = summary["short_borrow_availability"]
+        self.assertTrue(borrow["short_required"])
+        self.assertTrue(borrow["borrow_required"])
+        self.assertEqual("BTC", borrow["borrow_asset"])
+        self.assertEqual("fresh", summary["freshness"]["state"])
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
+
     def test_polymarket_route_is_conditional_with_account_api_and_jurisdiction(self) -> None:
         candidate = {
             "venue": "POLYMARKET",
