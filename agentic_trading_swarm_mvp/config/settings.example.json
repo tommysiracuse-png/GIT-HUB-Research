@@ -37,6 +37,16 @@
     "zero_admission_revert_loops": 3,
     "guard_value_horizon_minutes": 60
   },
+  "paper_context_drag": {
+    "enabled": true,
+    "paper_only": true,
+    "min_closed_trades": 8,
+    "underperformance_net_edge_bps": 0.0,
+    "ranking_penalty_bps_cap": 30.0,
+    "minimum_ranking_multiplier": 0.35,
+    "delay_decay_bps_per_second": 0.02,
+    "max_delay_decay_bps": 8.0
+  },
   "paper_route_feasibility_gate": {
     "enabled": true,
     "min_score": 0.65

@@ -2648,6 +2648,12 @@ def _report_markdown(report: dict) -> str:
             f"capacity deferred (24h) `{exploration_summary.get('capacity_deferrals_24h', 0)}`, "
             f"true invalid-data rejections (24h) `{exploration_summary.get('true_invalid_data_rejections_24h', 0)}`"
         )
+    context_drag = report.get("paper_context_drag") or {}
+    if context_drag:
+        lines.append(
+            f"- Paper context drag: `{context_drag.get('down_ranked_candidates', 0)}` candidate(s) down-ranked "
+            f"across `{context_drag.get('context_count', 0)}` realized contexts; eligibility unchanged."
+        )
     lines.extend(
         [
             "",

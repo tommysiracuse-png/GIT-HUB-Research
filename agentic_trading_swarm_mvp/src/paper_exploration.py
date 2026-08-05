@@ -299,6 +299,8 @@ def fair_lineage_order(candidates: list[dict], cycle_index: int, settings: Mappi
         )
         grouped[key].append(candidate)
     def priority(row: Mapping) -> float:
+        if row.get("paper_context_drag_ranking_score") is not None:
+            return float(row.get("paper_context_drag_ranking_score") or 0.0)
         if (
             row.get("trade_type") == "frontier_crypto_venue_map"
             and row.get("paper_ranking_score") is not None

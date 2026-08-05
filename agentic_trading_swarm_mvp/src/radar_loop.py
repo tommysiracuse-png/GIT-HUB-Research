@@ -43,6 +43,7 @@ from market_hunter import run_market_hunter
 from memory_graph import ingest_radar_memory, memory_summary
 from okx_perp_scanner import build_scan_batch as build_okx_scan_batch
 from paper_context_cost import paper_context_cost_report
+from paper_context_drag import apply_context_drag_overlay, context_drag_report, context_drag_statistics
 from okx_signal_research import run_okx_signal_research
 from paper_exploration import exploration_enabled, fair_lineage_order, prepare_candidate_for_exploration
 from paper_exploration_report import compact_paper_exploration_report, write_paper_exploration_report
@@ -547,6 +548,9 @@ def run_once(settings: dict) -> dict:
             contextual_failure_filters.get("cross_context_observations", []),
             settings,
         )
+        context_drag_stats = context_drag_statistics(conn, settings)
+        candidates = apply_context_drag_overlay(candidates, context_drag_stats, settings)
+        paper_context_drag = context_drag_report(context_drag_stats, candidates)
         policies = active_signal_policies(conn)
         review_limit = int(scan_cfg["review_top"])
         reserved_lab_candidates, strategy_lab_review_reserve = _reserve_strategy_lab_review_candidates(
@@ -692,6 +696,7 @@ def run_once(settings: dict) -> dict:
         auto_improvement["expansion_map"] = expansion_map
         auto_improvement["self_improvement_open_pack"] = self_improvement_open_pack
         auto_improvement["paper_exploration"] = paper_exploration_packet
+        auto_improvement["paper_context_drag"] = paper_context_drag
         auto_improvement = write_self_improvement_reports(conn, auto_improvement)
         summary = performance_summary(conn)
         maintenance = perform_maintenance(conn, settings)
@@ -743,6 +748,7 @@ def run_once(settings: dict) -> dict:
                 for item in reviewed[:10]
             ],
             "paper_net_edge_gates": paper_context_cost_report(candidates),
+            "paper_context_drag": paper_context_drag,
             "route_resolver": route_resolver_report,
             "expansion_map": expansion_map,
             "self_improvement_open_pack": self_improvement_open_pack,
