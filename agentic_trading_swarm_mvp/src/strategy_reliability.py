@@ -339,8 +339,12 @@ LINEAGE_SOURCE_HEALTH_POLICY_KEY = "lineage_source_health_guard"
 LINEAGE_SOURCE_HEALTH_DEFAULT_MIN_CLOSED_COUNT = 10
 LINEAGE_SOURCE_HEALTH_DEFAULT_PENALTY_MIN_CLOSED_COUNT = 3
 LINEAGE_SOURCE_HEALTH_DEFAULT_PENALTY_MULTIPLIER = 0.50
+LINEAGE_SOURCE_HEALTH_DEFAULT_ROLLING_WINDOW_CLOSED_TRADES = 30
+LINEAGE_SOURCE_HEALTH_DEFAULT_RECOVERY_MIN_AVG_PNL_BPS = 0.0
+LINEAGE_SOURCE_HEALTH_DEFAULT_RECOVERY_MIN_WIN_RATE = 0.50
 LINEAGE_SOURCE_HEALTH_FIELDS = (
     "lineage_source_health",
+    "lineage_source_health_recent",
     "parent_signal_health",
     "source_signal_health",
     "upstream_signal_health",
@@ -354,6 +358,21 @@ LINEAGE_SOURCE_SIGNAL_KEY_FIELDS = (
     "strategy_lab_source_signal_key",
     "upstream_signal_key",
     "origin_signal_key",
+)
+LINEAGE_SOURCE_SURFACE_FIELDS = (
+    "source_surface",
+    "lineage_source_surface",
+    "parent_surface",
+    "origin_surface",
+    "upstream_surface",
+)
+LINEAGE_SOURCE_SIGNAL_FAMILY_FIELDS = (
+    "source_signal_family",
+    "parent_signal_family",
+    "origin_signal_family",
+    "upstream_signal_family",
+    "source_trade_type",
+    "parent_trade_type",
 )
 
 COVERED_IMPROVEMENT_TASK_IDS = [
@@ -2208,6 +2227,53 @@ def _lineage_source_health_enabled(config: Mapping[str, Any] | bool | None) -> b
     return _as_bool(policy.get("enabled"), True)
 
 
+def _lineage_source_recent_recovered(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> bool:
+    """Return true only for hydrated, recent, threshold-passing source evidence."""
+    policy = _lineage_source_health_policy_config(config if isinstance(config, Mapping) else None)
+    min_count = max(
+        1,
+        _as_int(
+            policy.get("recovery_min_closed_count", policy.get("min_closed_count")),
+            LINEAGE_SOURCE_HEALTH_DEFAULT_MIN_CLOSED_COUNT,
+        ),
+    )
+    min_avg_pnl_bps = _as_float(
+        policy.get("recovery_min_avg_pnl_bps"),
+        LINEAGE_SOURCE_HEALTH_DEFAULT_RECOVERY_MIN_AVG_PNL_BPS,
+    )
+    min_win_rate = max(
+        0.0,
+        min(
+            1.0,
+            _as_float(
+                policy.get("recovery_min_win_rate"), LINEAGE_SOURCE_HEALTH_DEFAULT_RECOVERY_MIN_WIN_RATE),
+        ),
+    )
+    for _container_name, container in _paper_family_containers(candidate):
+        raw = container.get("lineage_source_health_recent")
+        if not isinstance(raw, Mapping):
+            continue
+        if raw.get("evidence_source") != "recent_closed_paper_source_lineage":
+            continue
+        if not _as_bool(raw.get("recent_window"), False):
+            continue
+        if _as_int(raw.get("closed_count"), 0) < min_count:
+            continue
+        avg_pnl_bps = _maybe_float(raw.get("after_cost_expectancy_bps"))
+        win_rate = _maybe_float(raw.get("win_rate"))
+        if (
+            avg_pnl_bps is not None
+            and win_rate is not None
+            and avg_pnl_bps >= min_avg_pnl_bps
+            and win_rate >= min_win_rate
+        ):
+            return True
+    return False
+
+
 def _lineage_source_keys(candidate: Mapping[str, Any]) -> list[tuple[str, str]]:
     keys: list[tuple[str, str]] = []
     for container_name, container in _paper_family_containers(candidate):
@@ -2216,6 +2282,70 @@ def _lineage_source_keys(candidate: Mapping[str, Any]) -> list[tuple[str, str]]:
             if value and (f"{container_name}.{field}", value) not in keys:
                 keys.append((f"{container_name}.{field}", value))
     return keys
+
+
+def _lineage_source_identities(candidate: Mapping[str, Any]) -> dict[str, set[str]]:
+    """Resolve explicit upstream identifiers without inferring lineage from prose."""
+    identities = {"signal_keys": set(), "surfaces": set(), "families": set()}
+    for _field, key in _lineage_source_keys(candidate):
+        identities["signal_keys"].add(key)
+        parts = [part.strip() for part in key.split("|")]
+        if parts and parts[0]:
+            identities["surfaces"].add(parts[0].upper())
+        if len(parts) > 1 and parts[1]:
+            identities["families"].add(parts[1].lower())
+    for container_name, container in _paper_family_containers(candidate):
+        is_source_context = any(
+            token in container_name.lower()
+            for token in ("source", "parent", "origin", "upstream", "lineage")
+        )
+        for field in LINEAGE_SOURCE_SURFACE_FIELDS:
+            value = str(container.get(field) or "").strip()
+            if value:
+                identities["surfaces"].add(value.upper())
+        for field in LINEAGE_SOURCE_SIGNAL_FAMILY_FIELDS:
+            value = str(container.get(field) or "").strip()
+            if value:
+                identities["families"].add(value.lower())
+        # Nested source-context packets commonly use the unprefixed labels.
+        if is_source_context:
+            surface = str(container.get("market_surface") or container.get("venue") or "").strip()
+            family = str(
+                container.get("signal_family")
+                or container.get("trade_family")
+                or container.get("trade_type")
+                or ""
+            ).strip()
+            if surface:
+                identities["surfaces"].add(surface.upper())
+            if family:
+                identities["families"].add(family.lower())
+    return identities
+
+
+def _lineage_source_trade_matches(
+    identities: Mapping[str, set[str]],
+    trade: Mapping[str, Any],
+) -> bool:
+    """Match a closed paper trade to an explicit source signal, family, or surface."""
+    signal = str(trade.get("signal_key") or "").strip()
+    parts = [part.strip() for part in signal.split("|")]
+    surfaces = {str(trade.get("venue") or "").upper()}
+    families = {str(trade.get("trade_type") or "").lower()}
+    if parts and parts[0]:
+        surfaces.add(parts[0].upper())
+    if len(parts) > 1 and parts[1]:
+        families.add(parts[1].lower())
+    source_keys = identities.get("signal_keys", set())
+    if signal and signal in source_keys:
+        return True
+    source_surfaces = identities.get("surfaces", set())
+    source_families = identities.get("families", set())
+    if source_surfaces and source_families:
+        return bool(surfaces.intersection(source_surfaces) and families.intersection(source_families))
+    if source_families:
+        return bool(families.intersection(source_families))
+    return bool(source_surfaces and surfaces.intersection(source_surfaces))
 
 
 def _lineage_source_health_evidence(candidate: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2263,6 +2393,8 @@ def _lineage_source_health_evidence(candidate: Mapping[str, Any]) -> list[dict[s
                     "evidence_source": raw.get("evidence_source") or "candidate_lineage_metadata",
                     "cost_basis": raw.get("cost_basis") or "realized_paper_after_cost",
                     "persistent_negative": persistent_negative,
+                    "recent_window": _as_bool(raw.get("recent_window"), False),
+                    "historical_negative": _as_bool(raw.get("historical_negative"), False),
                 }
             )
     return evidence
@@ -2308,10 +2440,34 @@ def paper_lineage_source_health_record(
             ),
         ),
     )
+    recovery_min_count = max(
+        1,
+        _as_int(policy.get("recovery_min_closed_count"), quarantine_min_count),
+    )
+    recovery_min_avg_pnl_bps = _as_float(
+        policy.get("recovery_min_avg_pnl_bps"),
+        LINEAGE_SOURCE_HEALTH_DEFAULT_RECOVERY_MIN_AVG_PNL_BPS,
+    )
+    recovery_min_win_rate = max(
+        0.0,
+        min(
+            1.0,
+            _as_float(
+                policy.get("recovery_min_win_rate"),
+                LINEAGE_SOURCE_HEALTH_DEFAULT_RECOVERY_MIN_WIN_RATE,
+            ),
+        ),
+    )
+    # A current, sufficiently large rolling window is the only evidence that
+    # can release a previously degraded lineage.  Aggregate signal stats are
+    # deliberately not allowed to mask a weak recent source regime.
+    if _lineage_source_recent_recovered(candidate, config):
+        return None
     negative = [
         item
         for item in evidence
         if item["persistent_negative"]
+        or item.get("historical_negative")
         or (
             item["after_cost_expectancy_bps"] is not None
             and item["after_cost_expectancy_bps"] < negative_edge_floor
@@ -2358,6 +2514,9 @@ def paper_lineage_source_health_record(
             "negative_edge_floor_bps": negative_edge_floor,
             "penalty_min_closed_count": penalty_min_count,
             "quarantine_min_closed_count": quarantine_min_count,
+            "recovery_min_closed_count": recovery_min_count,
+            "recovery_min_avg_pnl_bps": recovery_min_avg_pnl_bps,
+            "recovery_min_win_rate": recovery_min_win_rate,
         },
         "release_condition": QUARANTINE_RELEASE_CONDITION,
     }
@@ -2366,29 +2525,35 @@ def paper_lineage_source_health_record(
 def hydrate_paper_lineage_source_health(
     candidates: list[dict],
     conn: Any | None,
+    config: Mapping[str, Any] | bool | None = None,
 ) -> None:
     """Attach read-only persisted source statistics to explicit paper lineages."""
-    if conn is None:
+    if conn is None or not _lineage_source_health_enabled(config):
         return
     requested: dict[str, list[dict]] = collections.defaultdict(list)
+    identities_by_candidate: dict[int, dict[str, set[str]]] = {}
     for candidate in candidates:
+        identities = _lineage_source_identities(candidate)
+        if any(identities.values()):
+            identities_by_candidate[id(candidate)] = identities
         for _field, source_key in _lineage_source_keys(candidate):
             requested[source_key].append(candidate)
-            break
-    if not requested:
+    if not requested and not identities_by_candidate:
         return
-    placeholders = ",".join("?" for _ in requested)
-    try:
-        rows = conn.execute(
-            f"""
-            select signal_key, closed_count, avg_pnl_bps, win_rate, updated_at
-            from signal_stats
-            where signal_key in ({placeholders})
-            """,
-            tuple(requested),
-        ).fetchall()
-    except Exception:  # noqa: BLE001 - optional read-only runtime evidence
-        return
+    rows = []
+    if requested:
+        placeholders = ",".join("?" for _ in requested)
+        try:
+            rows = conn.execute(
+                f"""
+                select signal_key, closed_count, avg_pnl_bps, win_rate, updated_at
+                from signal_stats
+                where signal_key in ({placeholders})
+                """,
+                tuple(requested),
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - optional read-only runtime evidence
+            rows = []
     for raw in rows:
         try:
             row = dict(raw)
@@ -2412,6 +2577,59 @@ def hydrate_paper_lineage_source_health(
                 "cost_basis": "realized_paper_pnl_bps",
             }
 
+    if not identities_by_candidate:
+        return
+    try:
+        closed_rows = conn.execute(
+            """
+            select id, closed_at, venue, trade_type, signal_key, pnl_bps, candidate_json, context_json
+            from paper_trades
+            where status = 'closed' and pnl_bps is not null
+            order by closed_at desc, id desc
+            """
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - optional read-only runtime evidence
+        return
+    policy = _lineage_source_health_policy_config(config if isinstance(config, Mapping) else None)
+    window = max(
+        1,
+        _as_int(
+            policy.get("rolling_window_closed_trades"),
+            LINEAGE_SOURCE_HEALTH_DEFAULT_ROLLING_WINDOW_CLOSED_TRADES,
+        ),
+    )
+    grouped: dict[int, list[float]] = collections.defaultdict(list)
+    for raw in closed_rows:
+        try:
+            trade = dict(raw)
+        except (TypeError, ValueError):
+            continue
+        for candidate_id, identities in identities_by_candidate.items():
+            if _lineage_source_trade_matches(identities, trade):
+                grouped[candidate_id].append(_as_float(trade.get("pnl_bps")))
+    for candidate in candidates:
+        values = grouped.get(id(candidate), [])
+        if not values:
+            continue
+        recent = values[:window]
+        wins = sum(1 for value in recent if value > 0)
+        history_avg = sum(values) / len(values)
+        candidate["lineage_source_health_recent"] = {
+            "source_signal_key": next(iter(identities_by_candidate[id(candidate)]["signal_keys"]), ""),
+            "source_surfaces": sorted(identities_by_candidate[id(candidate)]["surfaces"]),
+            "source_signal_families": sorted(identities_by_candidate[id(candidate)]["families"]),
+            "closed_count": len(recent),
+            "after_cost_expectancy_bps": round(sum(recent) / len(recent), 3),
+            "win_rate": round(wins / len(recent), 3),
+            "recent_window": True,
+            "rolling_window_closed_trades": window,
+            "historical_closed_count": len(values),
+            "historical_avg_pnl_bps": round(history_avg, 3),
+            "historical_negative": history_avg < 0,
+            "evidence_source": "recent_closed_paper_source_lineage",
+            "cost_basis": "realized_paper_pnl_bps",
+        }
+
 
 def paper_source_veto_record(
     candidate: Mapping[str, Any],
@@ -2422,6 +2640,8 @@ def paper_source_veto_record(
         return None
     matched_on = _paper_family_quarantine_match(candidate)
     if matched_on is None:
+        return None
+    if _lineage_source_recent_recovered(candidate, config):
         return None
     recovery = paper_source_veto_recovery_status(config)
     if recovery["recovered"]:
@@ -2457,6 +2677,8 @@ def paper_family_quarantine_record(
         return None
     matched_on = _paper_family_quarantine_match(candidate)
     if matched_on is None:
+        return None
+    if _lineage_source_recent_recovered(candidate, config):
         return None
     recovery = paper_source_veto_recovery_status(config if isinstance(config, Mapping) else None)
     if recovery["recovered"]:
@@ -3988,7 +4210,7 @@ def apply_strategy_reliability(
 ) -> tuple[list[dict], dict]:
     """Annotate candidates with bounded paper-only reliability controls."""
 
-    hydrate_paper_lineage_source_health(candidates, conn)
+    hydrate_paper_lineage_source_health(candidates, conn, settings)
     _hydrate_portability_paper_evidence(candidates, conn)
     hydrate_paper_context_loss_statistics(candidates, conn, settings)
     for candidate in candidates:

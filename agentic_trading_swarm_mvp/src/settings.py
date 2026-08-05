@@ -465,10 +465,14 @@ DEFAULT_SETTINGS = {
         },
         "lineage_source_health_guard": {
             "enabled": True,
+            "rolling_window_closed_trades": 30,
             "negative_edge_floor_bps": 0.0,
             "penalty_min_closed_count": 3,
             "min_closed_count": 10,
             "penalty_score_multiplier": 0.50,
+            "recovery_min_closed_count": 10,
+            "recovery_min_avg_pnl_bps": 0.0,
+            "recovery_min_win_rate": 0.50,
         },
     },
     "okx_signal_research": {
