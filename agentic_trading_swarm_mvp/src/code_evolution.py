@@ -6134,9 +6134,77 @@ def _git_commit_is_ancestor(commit: str, root: pathlib.Path = ROOT) -> bool:
     return result.returncode == 0
 
 
+def _git_promoted_commits_by_proposal(root: pathlib.Path = ROOT) -> dict[str, str]:
+    """Find candidate commits whose final database write may have been interrupted."""
+    result = subprocess.run(
+        ["git", "log", "-n", "2000", "--format=%H%x00%s"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+    commits: dict[str, str] = {}
+    prefix = "Autonomous candidate "
+    for line in result.stdout.splitlines():
+        if "\x00" not in line:
+            continue
+        commit, subject = line.split("\x00", 1)
+        if subject.startswith(prefix):
+            commits.setdefault(subject[len(prefix) :].strip(), commit.strip())
+    return commits
+
+
+def _git_commit_changed_files(commit: str, root: pathlib.Path = ROOT) -> list[str]:
+    result = subprocess.run(
+        ["git", "show", "--format=", "--name-only", commit],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    project_prefix = f"{root.name}/"
+    files = []
+    for raw in result.stdout.splitlines():
+        path = raw.strip().replace("\\", "/")
+        if not path:
+            continue
+        if path.startswith(project_prefix):
+            path = path[len(project_prefix) :]
+        files.append(path)
+    return list(dict.fromkeys(files))
+
+
 def reconcile_code_evolution_git_statuses(conn: Any, root: pathlib.Path = ROOT) -> dict[str, int]:
     """Make Git ancestry authoritative when persisted proposal status drifted."""
     updated: dict[str, int] = {}
+    promoted_commits = _git_promoted_commits_by_proposal(root=root)
+    missing_commit_rows = conn.execute(
+        """
+        select proposal_id
+        from code_evolution_proposals
+        where candidate_commit is null and status not in ('promoted', 'reverted')
+        order by updated_at desc
+        limit 2000
+        """
+    ).fetchall()
+    for row in missing_commit_rows:
+        proposal_id = str(row["proposal_id"] or "")
+        candidate = promoted_commits.get(proposal_id)
+        if not candidate or not _git_commit_is_ancestor(candidate, root=root):
+            continue
+        update_code_evolution_proposal(
+            conn,
+            proposal_id,
+            candidate_commit=candidate,
+            changed_files=_git_commit_changed_files(candidate, root=root),
+        )
+        updated["candidate_commit_recovered_from_git"] = updated.get("candidate_commit_recovered_from_git", 0) + 1
     rows = conn.execute(
         """
         select proposal_id, status, candidate_commit, evaluation_json,

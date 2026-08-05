@@ -310,6 +310,14 @@ def parse_recommendation(text: str, agent: dict, packet: dict) -> dict:
         )
     if rec.get("action") not in allowed:
         return _reject_recommendation(agent, text, "invalid_action", "action_not_allowed")
+    evidence = rec.get("evidence")
+    if not isinstance(evidence, dict):
+        if isinstance(evidence, str) and evidence.strip():
+            rec["evidence"] = {"summary": evidence.strip(), "source_format": "string"}
+        elif isinstance(evidence, list):
+            rec["evidence"] = {"items": evidence, "source_format": "list"}
+        else:
+            rec["evidence"] = {}
     agent_allowed = set(agent.get("allowed_actions") or [])
     if agent.get("dynamic_agent_id") and agent_allowed and rec.get("action") not in agent_allowed:
         return _reject_recommendation(agent, text, "invalid_action", "action_not_allowed_for_dynamic_agent")

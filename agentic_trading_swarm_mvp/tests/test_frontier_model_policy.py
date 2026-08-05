@@ -232,6 +232,36 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(rec["parse_status"], "recovered_valid")
         self.assertEqual(rec["priority"], 81)
 
+    def test_non_planner_code_request_preserves_string_evidence_without_crashing(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": [
+                "propose_code_change",
+                "propose_diagnostic_hypothesis",
+            ]
+        }
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "red_team")
+
+        rec = llm_swarm_runner.parse_recommendation(
+            json.dumps(
+                {
+                    "action": "propose_code_change",
+                    "priority": 85,
+                    "title": "Repair malformed outcome lineage",
+                    "rationale": "The current packet shows missing lineage.",
+                    "market_key": "strategy_lab",
+                    "evidence": "Three current-cycle records lack strategy_lab_id.",
+                    "proposed_change": "Ask the build planner to repair outcome lineage.",
+                }
+            ),
+            agent,
+            packet,
+        )
+
+        self.assertFalse(rec.get("_rejected", False))
+        self.assertEqual(rec["action"], "propose_diagnostic_hypothesis")
+        self.assertEqual(rec["evidence"]["summary"], "Three current-cycle records lack strategy_lab_id.")
+        self.assertTrue(rec["evidence"]["build_planner_required"])
+
     def test_truncated_outer_object_does_not_recover_nested_evidence(self) -> None:
         packet = {"allowed_recommendation_actions": ["propose_strategy_lab_experiment", "no_action"]}
         agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "strategy_lab")
