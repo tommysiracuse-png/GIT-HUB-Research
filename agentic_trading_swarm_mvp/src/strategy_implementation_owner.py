@@ -150,6 +150,48 @@ def _row_dict(row: sqlite3.Row | None) -> dict:
     return item
 
 
+def _strategy_portfolio_stats(conn: sqlite3.Connection) -> dict:
+    """Count independent strategy lineages without inflating relaxed descendants."""
+
+    rows = conn.execute(
+        """
+        select strategy_lab_id, parent_strategy_lab_id, status, compile_status
+        from strategy_lab_experiments
+        where experiment_type = 'market_strategy'
+        """
+    ).fetchall()
+    parents = {
+        str(row["strategy_lab_id"]): str(row["parent_strategy_lab_id"] or "")
+        for row in rows
+        if row["strategy_lab_id"]
+    }
+    active_ids = [
+        str(row["strategy_lab_id"])
+        for row in rows
+        if row["strategy_lab_id"]
+        and row["compile_status"] == "compiled"
+        and row["status"] in {"active_testing", "needs_more_evidence", "needs_contract_revision"}
+    ]
+
+    def lineage_root(strategy_lab_id: str) -> str:
+        current = strategy_lab_id
+        seen = {current}
+        while parents.get(current):
+            parent = parents[current]
+            if parent in seen:
+                return min(seen)
+            seen.add(parent)
+            current = parent
+        return current
+
+    roots = sorted({lineage_root(strategy_lab_id) for strategy_lab_id in active_ids})
+    return {
+        "compiled_experiments": len(active_ids),
+        "distinct_lineages": len(roots),
+        "lineage_roots": roots,
+    }
+
+
 def enqueue_recommendation(conn: sqlite3.Connection, rec: dict, settings: dict) -> dict:
     """Create the durable downstream artifact before a recommendation is handled."""
 
@@ -542,17 +584,8 @@ def claim_task(conn: sqlite3.Connection, settings: dict) -> dict | None:
     now = _utc_now()
     cfg = _cfg(settings)
     lease_until = (_parse_iso(now) + dt.timedelta(seconds=int(cfg["lease_seconds"]))).isoformat()
-    healthy_experiments = int(
-        conn.execute(
-            """
-            select count(*) from strategy_lab_experiments
-            where experiment_type = 'market_strategy'
-              and compile_status = 'compiled'
-              and status in ('active_testing', 'needs_more_evidence')
-            """
-        ).fetchone()[0]
-    )
-    prioritize_materialization = healthy_experiments < int(
+    portfolio = _strategy_portfolio_stats(conn)
+    prioritize_materialization = portfolio["distinct_lineages"] < int(
         cfg.get("minimum_concurrent_experiments", 8)
     )
     conn.execute("begin immediate")
@@ -1267,6 +1300,7 @@ def summary(conn: sqlite3.Connection, limit: int = 100) -> dict:
         blocker = (task.get("last_result") or {}).get("blocker") or (task.get("last_error") or {}).get("reason")
         if blocker:
             blockers[str(blocker)[:240]] += 1
+    portfolio = _strategy_portfolio_stats(conn)
     return {
         "enabled": True,
         "by_status": by_status,
@@ -1283,6 +1317,7 @@ def summary(conn: sqlite3.Connection, limit: int = 100) -> dict:
         "resumed_codex_turns": int(run_metrics[2] or 0),
         "estimated_cost_usd": round(float(run_metrics[3] or 0), 6),
         "exact_blockers": dict(blockers.most_common(20)),
+        "testing_portfolio": portfolio,
         "tasks": rows,
     }
 
@@ -1303,6 +1338,8 @@ def write_report(conn: sqlite3.Connection, *, cycle: dict | None = None, schedul
         f"- Tasks: `{report['summary']['total_tasks']}`",
         f"- Paper trades: `{report['summary']['paper_trades']}`",
         f"- Reliable labels: `{report['summary']['valid_labels']}`",
+        f"- Distinct active strategy lineages: `{report['summary']['testing_portfolio']['distinct_lineages']}`",
+        f"- Compiled experiment versions: `{report['summary']['testing_portfolio']['compiled_experiments']}`",
         f"- Last cycle: `{(cycle or {}).get('status')}`",
         "", "## Lifecycle", "",
     ]

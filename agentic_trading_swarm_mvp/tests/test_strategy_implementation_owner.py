@@ -379,6 +379,48 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
 
         self.assertEqual("materialize-task", claimed["task_id"])
 
+    def test_relaxed_descendants_do_not_inflate_strategy_portfolio_floor(self) -> None:
+        now = owner._utc_now()
+        parent = None
+        for index in range(10):
+            strategy_id = "carry-root" if index == 0 else f"carry-root__relaxed_r{index}"
+            self.conn.execute(
+                """
+                insert into strategy_lab_experiments (
+                    strategy_lab_id,version,parent_strategy_lab_id,experiment_type,status,
+                    hypothesis,strategy_logic_json,data_requirements_json,risk_gates_json,
+                    promotion_rules_json,source_agent,compile_status,created_at,updated_at
+                ) values (?,1,?,'market_strategy','active_testing',?,'{}','{}','{}','{}',
+                          'strategy_feasibility_profiler','compiled',?,?)
+                """,
+                (strategy_id, parent, strategy_id, now, now),
+            )
+            parent = strategy_id
+        for task_id, objective, priority in (
+            ("repair-task", "repair_runtime_contract", 99),
+            ("materialize-task", "materialize_hypothesis", 84),
+        ):
+            self.conn.execute(
+                """
+                insert into strategy_owner_tasks(
+                    task_id,created_at,updated_at,dedupe_key,objective_type,priority,status,
+                    hypothesis,acceptance_json,dependency_json
+                ) values(?,?,?,?,?,?,'queued',?,'{}','{}')
+                """,
+                (task_id, now, now, task_id, objective, priority, objective),
+            )
+        self.conn.commit()
+
+        portfolio = owner._strategy_portfolio_stats(self.conn)
+        claimed = owner.claim_task(
+            self.conn,
+            {"strategy_implementation_owner": {"minimum_concurrent_experiments": 8}},
+        )
+
+        self.assertEqual(10, portfolio["compiled_experiments"])
+        self.assertEqual(1, portfolio["distinct_lineages"])
+        self.assertEqual("materialize-task", claimed["task_id"])
+
     def test_invalid_backlog_collapses_by_novelty_signature(self) -> None:
         now = owner._utc_now()
         for suffix in ("a", "b"):
