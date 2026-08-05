@@ -115,6 +115,20 @@ class ProxyMomentumContextTests(unittest.TestCase):
         self.assertIn("proxy_freshness_degraded", review["diagnostics"])
         self.assertIn("tradable_followthrough_not_confirmed", review["diagnostics"])
 
+    def test_opposite_direction_proxy_move_is_counterfactual_not_confirmation(self) -> None:
+        review = proxy_momentum_context_review(
+            self._candidate(
+                direction="long_proxy",
+                change_24h_pct=-1.0,
+                short_return_pct=0.2,
+            )
+        )
+
+        self.assertFalse(review["confirmed"])
+        self.assertEqual("counterfactual_guard_value", review["emission_action"])
+        self.assertEqual(-100.0, review["directional_proxy_move_bps"])
+        self.assertIn("proxy_move_strength_below_confirmation", review["diagnostics"])
+
     def test_live_mode_is_out_of_scope(self) -> None:
         review = proxy_momentum_context_review(self._candidate(execution_mode="live"))
 

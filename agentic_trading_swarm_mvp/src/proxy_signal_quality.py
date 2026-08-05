@@ -274,7 +274,14 @@ def proxy_momentum_context_review(
     max_age = max(0.001, float(policy["max_freshness_age_seconds"]))
     min_persistence = max(0.001, float(policy["minimum_volatility_normalized_persistence"]))
 
+    # A large proxy move in the opposite direction is not confirmation.  The
+    # older magnitude-only check could label a falling proxy as confirmation
+    # for a long paper candidate whenever the very short return happened to
+    # be positive.  Keep the raw observation, but require the source move and
+    # the proposed direction to agree before using it as primary-route
+    # context.
     expected_sign = -1.0 if direction == "short_proxy" else 1.0
+    signed_move = expected_sign * move_bps if move_bps is not None else None
     signed_followthrough = expected_sign * followthrough_bps if followthrough_bps is not None else None
     persistence = (
         abs(followthrough_bps) / volatility_bps
@@ -282,7 +289,11 @@ def proxy_momentum_context_review(
         else None
     )
     components = {
-        "proxy_move_strength": min(100.0, 100.0 * abs(move_bps) / min_move) if move_bps is not None else 0.0,
+        "proxy_move_strength": (
+            min(100.0, 100.0 * signed_move / min_move)
+            if signed_move is not None and signed_move > 0.0
+            else 0.0
+        ),
         "tradable_followthrough": (
             min(100.0, 100.0 * signed_followthrough / min_followthrough)
             if signed_followthrough is not None and signed_followthrough > 0.0
@@ -300,7 +311,9 @@ def proxy_momentum_context_review(
         ),
     }
     diagnostics: list[str] = []
-    if move_bps is None or abs(move_bps) < min_move:
+    if signed_move is None:
+        diagnostics.append("proxy_move_strength_unavailable")
+    elif signed_move < min_move:
         diagnostics.append("proxy_move_strength_below_confirmation")
     if signed_followthrough is None:
         diagnostics.append("tradable_followthrough_unavailable")
@@ -333,6 +346,7 @@ def proxy_momentum_context_review(
         "allocation_multiplier": round(allocation_multiplier, 6),
         "ranking_penalty_points": round(ranking_penalty, 6),
         "proxy_move_bps": round(move_bps, 6) if move_bps is not None else None,
+        "directional_proxy_move_bps": round(signed_move, 6) if signed_move is not None else None,
         "minimum_move_strength_bps": min_move,
         "tradable_followthrough_bps": round(followthrough_bps, 6) if followthrough_bps is not None else None,
         "minimum_tradable_followthrough_bps": min_followthrough,
