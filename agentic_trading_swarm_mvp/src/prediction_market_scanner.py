@@ -26,6 +26,7 @@ RUNS_DIR = ROOT / "runs"
 POLYMARKET_MARKET_CAP = 100
 PREDICTION_MARKET_SIGNAL_SURFACE = "prediction_market_probability"
 POLYMARKET_PAPER_ROUTE = "prediction_market_public_research_paper"
+KALSHI_FAIR_VALUE_MODEL_VERSION = "neutral_shrinkage_calibration_v1"
 
 
 def fetch_json(url: str, timeout: int = 12):
@@ -423,13 +424,37 @@ def _kalshi_orderbook(ticker: object) -> dict:
         yes = body.get("yes_dollars") or body.get("yes") or body.get("yes_bids") or []
         no = body.get("no_dollars") or body.get("no") or body.get("no_bids") or []
         price_scale = 1.0 if body.get("yes_dollars") is not None or body.get("no_dollars") is not None else 0.01
+        def prices(levels: list) -> list[float]:
+            values = []
+            for level in levels:
+                raw_price = level.get("price") if isinstance(level, dict) else level[0] if isinstance(level, (list, tuple)) and level else None
+                price = as_float(raw_price, -1.0) * price_scale
+                if 0.0 < price < 1.0:
+                    values.append(price)
+            return values
+
+        yes_prices = prices(yes)
+        no_prices = prices(no)
+        yes_bid = max(yes_prices, default=0.0)
+        no_bid = max(no_prices, default=0.0)
+        yes_ask = 1.0 - no_bid if no_bid else 0.0
+        no_ask = 1.0 - yes_bid if yes_bid else 0.0
+        two_sided = yes_bid > 0.0 and no_bid > 0.0
+        crossed = two_sided and yes_bid > yes_ask
         return {
-            "orderbook_status": "verified" if yes or no else "empty",
+            "orderbook_status": "crossed" if crossed else "verified" if two_sided else "one_sided" if (yes_bid or no_bid) else "empty",
             "orderbook_depth_usd": round(
                 _book_depth_from_levels(yes, price_scale=price_scale)
                 + _book_depth_from_levels(no, price_scale=price_scale),
                 3,
             ),
+            "yes_best_bid": round(yes_bid, 6) if yes_bid else None,
+            "yes_best_ask": round(yes_ask, 6) if yes_ask else None,
+            "no_best_bid": round(no_bid, 6) if no_bid else None,
+            "no_best_ask": round(no_ask, 6) if no_ask else None,
+            "orderbook_spread_bps": round((yes_ask - yes_bid) * 10_000.0, 3)
+            if two_sided and not crossed
+            else None,
             "orderbook_source": "Kalshi public market orderbook",
         }
     except Exception as exc:  # noqa: BLE001
@@ -786,12 +811,120 @@ def _kalshi_reject_reason(row: dict, quote: dict) -> str | None:
         return "inactive_status"
     if not row.get("close_time"):
         return "missing_end_date"
+    market_type = str(row.get("market_type") or row.get("type") or "").strip().lower()
+    if market_type and market_type not in {"binary", "yes_no", "yes/no"}:
+        return "non_binary_contract"
     if quote["last"] <= 0:
         return "missing_price"
-    has_two_sided_quote = quote["yes_bid"] > 0 and quote["yes_ask"] > 0
-    if max(quote["volume"], quote["open_interest"], quote["liquidity"]) <= 0 and not has_two_sided_quote:
-        return "zero_liquidity"
+    if quote["yes_bid"] > 0 and quote["yes_ask"] > 0 and quote["yes_bid"] > quote["yes_ask"]:
+        return "crossed_catalog_quote"
     return None
+
+
+def _clamp_probability(value: float) -> float:
+    return max(0.01, min(0.99, value))
+
+
+def _kalshi_fair_probability(implied_probability: float, settings: dict) -> tuple[float, dict]:
+    """Return a conservative, explicit fair-value estimate for a binary contract.
+
+    This intentionally does not claim access to proprietary event forecasts.  It
+    applies a configurable calibration shrinkage toward a neutral prior, which
+    creates a reproducible counterfactual probability that can later be scored
+    against resolved outcomes.
+    """
+    cfg = settings.get("prediction_market_scanner", {}) or {}
+    prior = _clamp_probability(as_float(cfg.get("kalshi_fair_value_prior"), 0.5))
+    shrinkage = max(0.0, min(1.0, as_float(cfg.get("kalshi_market_shrinkage"), 0.70)))
+    fair = _clamp_probability(prior + (implied_probability - prior) * shrinkage)
+    return fair, {
+        "model_name": KALSHI_FAIR_VALUE_MODEL_VERSION,
+        "model_prior_probability": round(prior, 6),
+        "model_market_shrinkage": round(shrinkage, 6),
+        "model_probability": round(fair, 6),
+    }
+
+
+def _kalshi_paper_diagnostics(
+    row: dict,
+    quote: dict,
+    orderbook: dict,
+    implied_probability: float,
+    fair_probability: float,
+    settings: dict,
+) -> dict:
+    """Assess research quality without suppressing a priceable paper candidate."""
+    cfg = settings.get("prediction_market_scanner", {}) or {}
+    close_time = row.get("close_time")
+    days_to_resolution = _days_to_end(close_time)
+    hours_to_resolution = None if days_to_resolution is None else days_to_resolution * 24.0
+    min_hours = max(0.0, as_float(cfg.get("kalshi_min_hours_to_resolution"), 2.0))
+    max_days = max(0.0, as_float(cfg.get("kalshi_max_days_to_resolution"), 30.0))
+    min_liquidity = max(0.0, as_float(cfg.get("kalshi_min_liquidity_usd"), 1_000.0))
+    max_spread = max(0.0, as_float(cfg.get("kalshi_max_spread_bps"), 500.0))
+    max_stale_minutes = max(0.0, as_float(cfg.get("kalshi_max_stale_minutes"), 15.0))
+    fee_proxy_bps = max(0.0, as_float(cfg.get("kalshi_fee_proxy_bps"), 15.0))
+    min_edge_bps = max(0.0, as_float(cfg.get("kalshi_min_model_edge_bps"), 25.0))
+    depth = as_float(orderbook.get("orderbook_depth_usd"), 0.0)
+    liquidity = max(quote["liquidity"], quote["open_interest"], depth)
+    spread_bps = orderbook.get("orderbook_spread_bps")
+    if spread_bps is None:
+        spread_bps = (quote["yes_ask"] - quote["yes_bid"]) * 10_000.0 if quote["yes_ask"] > quote["yes_bid"] > 0 else None
+    raw_edge_bps = abs(fair_probability - implied_probability) * 10_000.0
+    freshness_timestamp, stale_minutes = _freshness_fields(
+        row.get("updated_time") or row.get("updated_at") or row.get("last_updated_time")
+    )
+    reasons: list[str] = []
+    if hours_to_resolution is None:
+        reasons.append("missing_resolution_time")
+    elif hours_to_resolution < min_hours:
+        reasons.append("too_near_resolution")
+    elif max_days and days_to_resolution is not None and days_to_resolution > max_days:
+        reasons.append("outside_short_event_window")
+    if liquidity < min_liquidity:
+        reasons.append("below_minimum_liquidity_diagnostic")
+    if spread_bps is None:
+        reasons.append("missing_two_sided_quote_diagnostic")
+    elif max_spread and spread_bps > max_spread:
+        reasons.append("spread_above_sanity_diagnostic")
+    if orderbook.get("orderbook_status") in {"crossed", "error"}:
+        reasons.append("invalid_or_unavailable_orderbook_diagnostic")
+    if freshness_timestamp is None:
+        reasons.append("missing_quote_freshness_diagnostic")
+    elif max_stale_minutes and stale_minutes is not None and stale_minutes > max_stale_minutes:
+        reasons.append("stale_quote_diagnostic")
+    if raw_edge_bps < min_edge_bps:
+        reasons.append("below_model_edge_threshold_diagnostic")
+    return {
+        "paper_gate_status": "eligible" if not reasons else "diagnostic_only",
+        "paper_gate_reasons": reasons,
+        "time_to_resolution_hours": round(hours_to_resolution, 3) if hours_to_resolution is not None else None,
+        "short_event_window": bool(
+            hours_to_resolution is not None
+            and hours_to_resolution >= min_hours
+            and (not max_days or days_to_resolution is not None and days_to_resolution <= max_days)
+        ),
+        "quote_quality": "two_sided" if spread_bps is not None else "proxy_last_trade",
+        "liquidity_gate_pass": liquidity >= min_liquidity,
+        "spread_sanity_pass": spread_bps is not None and (not max_spread or spread_bps <= max_spread),
+        "raw_model_edge_bps": round(raw_edge_bps, 3),
+        "fee_proxy_bps": round(fee_proxy_bps, 3),
+        "net_model_edge_after_fee_proxy_bps": round(raw_edge_bps - fee_proxy_bps, 3),
+        "model_edge_threshold_bps": round(min_edge_bps, 3),
+        "calibration_error_status": "pending_resolution",
+        "realized_brier_status": "pending_resolution",
+        "hit_rate_after_fees_proxy_status": "pending_resolution",
+        "candidate_stability_status": "baseline_snapshot_pending",
+        "freshness_timestamp": freshness_timestamp,
+        "stale_minutes": stale_minutes,
+        "freshness_status": (
+            "missing"
+            if freshness_timestamp is None
+            else "stale"
+            if max_stale_minutes and stale_minutes is not None and stale_minutes > max_stale_minutes
+            else "fresh"
+        ),
+    }
 
 
 def _kalshi_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> dict | None:
@@ -799,11 +932,14 @@ def _kalshi_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> di
     quote = _kalshi_quote(row)
     if _kalshi_reject_reason(row, quote):
         return None
-    yes_bid = quote["yes_bid"]
-    yes_ask = quote["yes_ask"]
+    yes_bid = as_float(orderbook.get("yes_best_bid"), quote["yes_bid"])
+    yes_ask = as_float(orderbook.get("yes_best_ask"), quote["yes_ask"])
     no_bid = quote["no_bid"]
     no_ask = quote["no_ask"]
-    last = quote["last"]
+    implied_probability = (yes_bid + yes_ask) / 2.0 if yes_ask > yes_bid > 0 else quote["last"]
+    fair_probability, model = _kalshi_fair_probability(implied_probability, settings)
+    direction = "buy_yes_event" if fair_probability >= implied_probability else "buy_no_event"
+    entry_probability = implied_probability if direction == "buy_yes_event" else 1.0 - implied_probability
     spread_bps = (yes_ask - yes_bid) * 10_000.0 if yes_ask > yes_bid > 0 else 500.0
     volume = quote["volume"]
     open_interest = quote["open_interest"]
@@ -829,12 +965,17 @@ def _kalshi_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> di
         "event_tag_confidence": tag_details["confidence"],
         **orderbook,
     }
-    return _candidate(
+    diagnostics = _kalshi_paper_diagnostics(
+        row, quote, orderbook, implied_probability, fair_probability, settings
+    )
+    metadata.update(model)
+    metadata.update(diagnostics)
+    candidate = _candidate(
         "KALSHI",
         f"kalshi:{row.get('ticker')}",
         row.get("title") or row.get("ticker") or "Kalshi market",
-        last,
-        "buy_yes_event",
+        entry_probability,
+        direction,
         max(open_interest, liquidity),
         volume,
         spread_bps,
@@ -842,6 +983,49 @@ def _kalshi_candidate_from_row(row: dict, settings: dict, orderbook: dict) -> di
         settings,
         metadata,
     )
+    raw_edge_bps = float(diagnostics["raw_model_edge_bps"])
+    candidate.update(
+        {
+            "title": str(row.get("title") or row.get("ticker") or "Kalshi market"),
+            "probability_mid": round(implied_probability, 6),
+            "yes_probability": round(implied_probability, 6),
+            "no_probability": round(1.0 - implied_probability, 6),
+            "fair_probability": round(fair_probability, 6),
+            "fair_probability_directional": round(
+                fair_probability if direction == "buy_yes_event" else 1.0 - fair_probability,
+                6,
+            ),
+            "edge_bps_estimate": raw_edge_bps,
+            "best_bid": round(yes_bid, 6) if yes_bid > 0 else None,
+            "best_ask": round(yes_ask, 6) if yes_ask > 0 else None,
+            "yes_best_bid": orderbook.get("yes_best_bid") or (round(yes_bid, 6) if yes_bid else None),
+            "yes_best_ask": orderbook.get("yes_best_ask") or (round(yes_ask, 6) if yes_ask else None),
+            "depth_usd": as_float(orderbook.get("orderbook_depth_usd")),
+            "freshness_timestamp": diagnostics["freshness_timestamp"],
+            "stale_minutes": diagnostics["stale_minutes"],
+            "freshness_status": diagnostics["freshness_status"],
+            "expiry": close_time,
+            "paper_only": True,
+            "read_only": True,
+            "live_execution_supported": False,
+            "execution_disabled": True,
+            "order_routing_disabled": True,
+            "paper_recommendation_path": "prediction_market_public_research_paper",
+            "paper_experiment_capacity_deferred": (
+                "resolution window is too near for a measurable paper experiment"
+                if "too_near_resolution" in diagnostics["paper_gate_reasons"]
+                else "resolution falls outside the configured short event window"
+                if "outside_short_event_window" in diagnostics["paper_gate_reasons"]
+                else None
+            ),
+        }
+    )
+    if candidate["paper_experiment_capacity_deferred"]:
+        candidate["paper_entry_blocked"] = True
+        candidate["shadow_filtered"] = True
+        candidate["paper_fill_allowed"] = False
+        candidate["candidate_reject_reason"] = "paper_experiment_capacity_deferred"
+    return candidate
 
 
 def _kalshi_candidates(settings: dict, limit: int) -> tuple[list[dict], dict]:
@@ -1121,6 +1305,15 @@ def summarize(candidates: list[dict], scan_metadata: dict | None = None) -> dict
     provider_reject_reasons: collections.Counter[str] = collections.Counter()
     for item in provider_status:
         provider_reject_reasons.update(item.get("reject_reason_counts") or {})
+    kalshi_candidates = [row for row in candidates if row.get("venue") == "KALSHI"]
+    kalshi_edges = [
+        as_float((row.get("data_source") or {}).get("raw_model_edge_bps"))
+        for row in kalshi_candidates
+    ]
+    kalshi_gate_statuses = collections.Counter(
+        str((row.get("data_source") or {}).get("paper_gate_status") or "unknown")
+        for row in kalshi_candidates
+    )
     return {
         "candidate_count": len(candidates),
         "expired_filtered_count": expired_filtered_count,
@@ -1158,6 +1351,20 @@ def summarize(candidates: list[dict], scan_metadata: dict | None = None) -> dict
                 "direction",
                 "execution_feasibility.status",
             ],
+            "kalshi_probability_measurement": {
+                "model_name": KALSHI_FAIR_VALUE_MODEL_VERSION,
+                "candidate_count": len(kalshi_candidates),
+                "mean_model_market_deviation_bps": round(
+                    sum(kalshi_edges) / len(kalshi_edges), 3
+                )
+                if kalshi_edges
+                else None,
+                "calibration_error": "pending until resolved outcomes are observed",
+                "realized_brier_style_quality": "pending until resolved outcomes are observed",
+                "hit_rate_after_fees_proxy": "pending until resolved outcomes are observed",
+                "candidate_stability": "baseline snapshot recorded; compare repeated scans by inst_id",
+                "research_gate_status_counts": dict(kalshi_gate_statuses),
+            },
         },
         "event_review_shadow_trials": event_review_shadow_trials,
         "top_candidates": [
@@ -1174,6 +1381,9 @@ def summarize(candidates: list[dict], scan_metadata: dict | None = None) -> dict
                 "orderbook_status": (row.get("data_source") or {}).get("orderbook_status"),
                 "end_date_bucket": (row.get("data_source") or {}).get("end_date_bucket"),
                 "resolution_risk_status": (row.get("data_source") or {}).get("resolution_risk_status"),
+                "model_probability": (row.get("data_source") or {}).get("model_probability"),
+                "raw_model_edge_bps": (row.get("data_source") or {}).get("raw_model_edge_bps"),
+                "paper_gate_status": (row.get("data_source") or {}).get("paper_gate_status"),
             }
             for row in candidates[:15]
         ],

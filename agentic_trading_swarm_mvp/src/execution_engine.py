@@ -221,6 +221,14 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
                 "reason", "paper_context_loss_quarantine"
             )
             candidate["candidate_reject_detail"] = dict(context_loss_quarantine)
+        elif candidate.get("paper_experiment_capacity_deferred"):
+            # A scanner can defer an otherwise valid priceable idea when the
+            # bounded paper window cannot produce a meaningful experiment.
+            # Preserve that explicit capacity decision; exploration should not
+            # turn it into a fill merely because its route is synthetic.
+            candidate["shadow_filtered"] = True
+            candidate["paper_fill_allowed"] = False
+            candidate["paper_entry_blocked"] = True
         else:
             candidate["shadow_filtered"] = False
             candidate["paper_fill_allowed"] = True

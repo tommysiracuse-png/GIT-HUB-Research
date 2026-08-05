@@ -126,6 +126,25 @@ class PaperExplorationTests(unittest.TestCase):
         self.assertIn("missing or invalid price", review["hard_blocks"])
         self.assertTrue(any("dangerously stale" in item for item in review["hard_blocks"]))
 
+    def test_explicit_capacity_deferral_keeps_candidate_visible_but_prevents_fill(self) -> None:
+        candidate = prepare_candidate_for_exploration(
+            self.candidate(paper_experiment_capacity_deferred="resolution window is too near"),
+            self.settings,
+        )
+
+        self.assertTrue(candidate["paper_entry_blocked"])
+        self.assertTrue(candidate["shadow_filtered"])
+        self.assertFalse(candidate["paper_fill_allowed"])
+        self.assertEqual("paper_experiment_capacity_deferred", candidate["candidate_reject_reason"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            review = review_candidate(candidate, self.settings, {}, policies=[])
+            execution = execute_order(conn, candidate, review, self.settings)
+            self.assertFalse(execution["paper_filled"])
+            self.assertEqual("shadow_filtered", execution["order"]["status"])
+            conn.close()
+
     def test_real_two_leg_candidate_requires_prices_or_explicit_proxy(self) -> None:
         candidate = prepare_candidate_for_exploration(
             self.candidate(

@@ -181,6 +181,17 @@ def prepare_candidate_for_exploration(candidate: dict, settings: Mapping | None)
     prepared["paper_exploration_prior_blocked"] = original_blocked
     if prepared["paper_exploration_immutable_rejections"]:
         return prepared
+    capacity_deferral = str(candidate.get("paper_experiment_capacity_deferred") or "").strip()
+    if capacity_deferral:
+        prepared["paper_entry_blocked"] = True
+        prepared["shadow_filtered"] = True
+        prepared["paper_fill_allowed"] = False
+        prepared["candidate_reject_reason"] = "paper_experiment_capacity_deferred"
+        prepared["candidate_reject_detail"] = {"reason": capacity_deferral}
+        prepared["paper_exploration_would_block_reasons"] = [
+            "paper experiment capacity deferred: " + capacity_deferral
+        ]
+        return prepared
 
     prepared["paper_entry_blocked"] = False
     prepared["shadow_filtered"] = False

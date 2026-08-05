@@ -123,7 +123,11 @@ class PredictionMarketScannerTests(unittest.TestCase):
             2,
         )
         self.assertEqual(report["summary"]["paper_measurement"]["fresh_candidate_count"], 1)
-        self.assertEqual(report["summary"]["paper_measurement"]["order_routing_disabled_count"], 1)
+        self.assertEqual(report["summary"]["paper_measurement"]["order_routing_disabled_count"], 2)
+        kalshi_metrics = report["summary"]["paper_measurement"]["kalshi_probability_measurement"]
+        self.assertEqual("neutral_shrinkage_calibration_v1", kalshi_metrics["model_name"])
+        self.assertEqual(1, kalshi_metrics["candidate_count"])
+        self.assertEqual("pending until resolved outcomes are observed", kalshi_metrics["calibration_error"])
         self.assertEqual(batch.candidates[0]["execution_feasibility"]["status"], "conditional")
 
     def test_kalshi_public_coverage_skips_expired_and_keeps_quote_fields(self) -> None:
@@ -245,6 +249,59 @@ class PredictionMarketScannerTests(unittest.TestCase):
         kalshi_status = next(item for item in report["summary"]["provider_status"] if item["provider"] == "KALSHI")
         self.assertEqual(kalshi_status["multivariate_filter"], "exclude")
         self.assertEqual(kalshi_status["fetched_pages"], 1)
+
+    def test_kalshi_uses_fair_value_direction_and_keeps_quality_gates_diagnostic(self) -> None:
+        old_fetch = prediction.fetch_json
+        now = prediction.dt.datetime.now(prediction.dt.timezone.utc)
+        near = (now + prediction.dt.timedelta(minutes=30)).isoformat()
+        far = (now + prediction.dt.timedelta(days=45)).isoformat()
+
+        def fake_fetch(url: str, timeout: int = 12):
+            if "markets?" in url:
+                return {
+                    "markets": [
+                        {
+                            "ticker": "KXHIGHYES",
+                            "title": "Will this high-probability event happen?",
+                            "yes_bid_dollars": "0.79",
+                            "yes_ask_dollars": "0.81",
+                            "last_price_dollars": "0.80",
+                            "close_time": near,
+                            "status": "open",
+                        },
+                        {
+                            "ticker": "KXFARLOWLIQ",
+                            "title": "Will this distant low-liquidity event happen?",
+                            "last_price_dollars": "0.40",
+                            "close_time": far,
+                            "status": "open",
+                        },
+                    ]
+                }
+            if "orderbook" in url:
+                return {"orderbook_fp": {"yes_dollars": [["0.79", "50"]], "no_dollars": [["0.19", "50"]]}}
+            raise AssertionError(url)
+
+        prediction.fetch_json = fake_fetch
+        try:
+            rows = prediction.kalshi_candidates(settings(), limit=10)
+        finally:
+            prediction.fetch_json = old_fetch
+
+        self.assertEqual([row["inst_id"] for row in rows], ["kalshi:KXHIGHYES", "kalshi:KXFARLOWLIQ"])
+        high = rows[0]
+        self.assertEqual("buy_no_event", high["direction"])
+        self.assertEqual(0.8, high["yes_probability"])
+        self.assertEqual(0.71, high["fair_probability"])
+        self.assertEqual(0.2, high["last"])
+        self.assertEqual("diagnostic_only", high["data_source"]["paper_gate_status"])
+        self.assertIn("too_near_resolution", high["data_source"]["paper_gate_reasons"])
+
+        low_liquidity = rows[1]["data_source"]
+        self.assertEqual("diagnostic_only", low_liquidity["paper_gate_status"])
+        self.assertIn("outside_short_event_window", low_liquidity["paper_gate_reasons"])
+        self.assertIn("below_minimum_liquidity_diagnostic", low_liquidity["paper_gate_reasons"])
+        self.assertEqual("pending_resolution", low_liquidity["realized_brier_status"])
 
     def test_event_tags_use_token_boundaries_and_world_cup_phrases(self) -> None:
         netherlands = prediction._event_tag_details(

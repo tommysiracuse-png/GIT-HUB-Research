@@ -1914,7 +1914,7 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
     if venue in {"KALSHI", "POLYMARKET"}:
         venue_key = "kalshi_events" if venue == "KALSHI" else "polymarket_events"
         feasibility = candidate.get("execution_feasibility") or {}
-        polymarket_research_only = venue == "POLYMARKET" and bool(
+        prediction_market_research_only = bool(
             candidate.get("paper_only")
             or candidate.get("read_only")
             or candidate.get("execution_disabled")
@@ -1922,10 +1922,10 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
             or feasibility.get("public_data_only")
             or feasibility.get("live_execution_supported") is False
         )
-        # Scanner-created Polymarket rows are deliberately not promotable to a
-        # venue route. Account configuration must never turn public ingestion
-        # into order-routing authorization.
-        allowed = bool(caps.get("prediction_markets", False)) and not polymarket_research_only
+        # Scanner-created public prediction-market rows are deliberately not
+        # promotable to a venue route. Account configuration must never turn
+        # anonymous ingestion into order-routing authorization.
+        allowed = bool(caps.get("prediction_markets", False)) and not prediction_market_research_only
         missing = [] if allowed else ["prediction_markets_account", "venue_api_access", "jurisdiction_eligibility"]
         overrides = {}
         if allowed:
@@ -1944,10 +1944,10 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
                 "Event-contract execution requires account, jurisdiction, contract eligibility, and API checks.",
                 *(
                     [
-                        "This Polymarket candidate came from an anonymous public-data adapter; direct execution and order routing are disabled.",
+                        f"This {venue.title()} candidate came from an anonymous public-data adapter; direct execution and order routing are disabled.",
                         "Only the prediction-market public research paper alternative may be used.",
                     ]
-                    if polymarket_research_only
+                    if prediction_market_research_only
                     else []
                 ),
             ],

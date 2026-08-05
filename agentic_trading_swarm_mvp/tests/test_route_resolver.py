@@ -105,6 +105,38 @@ class RouteResolverTests(unittest.TestCase):
         )
         self.assertTrue(any("order routing are disabled" in note for note in route["route_notes"]))
 
+    def test_public_kalshi_adapter_cannot_be_promoted_to_direct_route(self) -> None:
+        cfg = settings()
+        cfg["account_capabilities"]["prediction_markets"] = True
+        candidate = {
+            "venue": "KALSHI",
+            "trade_type": "prediction_market_probability",
+            "direction": "buy_yes_event",
+            "asset_class": "event_contract",
+            "score": 72.0,
+            "paper_only": True,
+            "read_only": True,
+            "execution_disabled": True,
+            "order_routing_disabled": True,
+            "execution_feasibility": {
+                "public_data_only": True,
+                "live_execution_supported": False,
+            },
+        }
+
+        route = route_resolver.resolve_candidate_route(candidate, cfg)
+
+        self.assertEqual(route["route_status"], "conditional")
+        self.assertEqual(
+            set(route["missing_permissions"]),
+            {"prediction_markets_account", "venue_api_access", "jurisdiction_eligibility"},
+        )
+        self.assertEqual(
+            route["best_route_alternative"]["route_id"],
+            "prediction_market_public_research_paper",
+        )
+        self.assertTrue(any("Kalshi candidate" in note for note in route["route_notes"]))
+
     def test_watch_only_route_is_blocked(self) -> None:
         candidate = {
             "venue": "OKX",
