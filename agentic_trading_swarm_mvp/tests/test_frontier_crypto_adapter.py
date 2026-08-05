@@ -678,6 +678,77 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual("primary", candidate["simulated_order_allocation"]["mode"])
         self.assertEqual(1.0, candidate["paper_allocation_multiplier"])
 
+    def test_effective_edge_decomposes_execution_costs_and_scales_synthetic_routes(self) -> None:
+        cfg = settings()
+        local = self._quality_obs("FRONTIER", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
+        local["route_id"] = "synthetic_frontier_paper"
+
+        candidate = frontier._candidate_from_observation(
+            local,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[local, peer],
+        )
+
+        model = candidate["effective_edge_model"]
+        expected = (
+            model["raw_edge_bps"]
+            - model["half_spread_bps"]
+            - model["estimated_taker_fee_bps"]
+            - model["quote_conversion_cost_bps"]
+            - model["proxy_drag_bps"]
+            - model["freshness_penalty_bps"]
+            - model["venue_reliability_penalty_bps"]
+        )
+        self.assertAlmostEqual(expected, candidate["effective_edge_bps"], places=5)
+        self.assertTrue(model["primary_admitted"])
+        self.assertTrue(model["synthetic_or_proxy_route"])
+        self.assertEqual(0.25, model["primary_allocation_multiplier"])
+        self.assertEqual(0.25, candidate["paper_allocation_multiplier"])
+
+    def test_non_positive_effective_edge_uses_counterfactual_route_without_suppressing_candidate(self) -> None:
+        cfg = settings()
+        cfg["frontier_crypto_adapter"]["min_dislocation_bps"] = 1.0
+        local = self._quality_obs("FRONTIER", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.9, 1_000_000, quality_score=90)
+
+        candidate = frontier._candidate_from_observation(
+            local,
+            cfg,
+            100.9,
+            2,
+            reference_observations=[local, peer],
+        )
+
+        self.assertEqual("short_frontier_spot", candidate["direction"])
+        self.assertLessEqual(candidate["effective_edge_bps"], 0.0)
+        self.assertFalse(candidate["effective_edge_primary_admitted"])
+        self.assertIn("effective_edge_not_positive", candidate["effective_edge_admission_reasons"])
+        self.assertFalse(candidate["paper_entry_blocked"])
+        self.assertEqual("counterfactual_guard_value", candidate["simulated_order_allocation"]["mode"])
+        self.assertEqual(0.25, candidate["paper_allocation_multiplier"])
+
+    def test_effective_edge_replaces_raw_score_for_frontier_ranking(self) -> None:
+        cfg = settings()
+        raw_spread_leader = {
+            "inst_id": "RAW-LEADER",
+            "score": 99.0,
+            "dislocation_quality_score": 50.0,
+            "effective_edge_bps": 1.0,
+        }
+        executable_leader = {
+            "inst_id": "EXECUTABLE-LEADER",
+            "score": 20.0,
+            "dislocation_quality_score": 50.0,
+            "effective_edge_bps": 12.0,
+        }
+
+        ranked = frontier.rank_frontier_paper_candidates([raw_spread_leader, executable_leader], cfg)
+
+        self.assertEqual("EXECUTABLE-LEADER", ranked[0]["inst_id"])
+
     def test_marketability_diagnostics_use_conservative_route_for_stale_or_thin_book(self) -> None:
         cfg = settings()
         peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)

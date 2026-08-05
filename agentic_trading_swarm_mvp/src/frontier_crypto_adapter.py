@@ -9294,12 +9294,45 @@ DEFAULT_FRONTIER_DISLOCATION_QUALITY_POLICY = {
     "freshness_weight": 0.15,
 }
 
+# This model is intentionally a paper-routing and ranking control.  A failed
+# primary admission remains a priceable counterfactual observation so that the
+# paper loop can measure whether the missing cost estimate was conservative.
+DEFAULT_FRONTIER_EFFECTIVE_EDGE_POLICY = {
+    "enabled": True,
+    "paper_only": True,
+    "minimum_effective_edge_bps": 0.0,
+    "max_freshness_age_seconds": 90.0,
+    "freshness_penalty_window_seconds": 30.0,
+    "freshness_penalty_bps_per_window": 2.0,
+    "max_freshness_penalty_bps": 12.0,
+    "min_liquidity_score": 0.35,
+    "min_venue_reliability_score": 0.60,
+    "max_venue_reliability_penalty_bps": 5.0,
+    "external_quote_conversion_cost_bps": 4.0,
+    "synthetic_proxy_drag_bps": 4.0,
+    "allocation_edge_bps_cap": 24.0,
+    "synthetic_allocation_cap": 0.25,
+    "low_reliability_allocation_cap": 0.50,
+    "low_reliability_score": 0.70,
+    "counterfactual_allocation_multiplier": 0.25,
+}
+
 
 def _frontier_dislocation_quality_policy(settings: dict) -> dict:
     policy = dict(DEFAULT_FRONTIER_DISLOCATION_QUALITY_POLICY)
     configured = settings.get("frontier_crypto_adapter", {}).get("dislocation_quality", {})
     if isinstance(configured, dict):
         policy.update({key: value for key, value in configured.items() if value is not None})
+    return policy
+
+
+def _frontier_effective_edge_policy(settings: dict) -> dict:
+    policy = dict(DEFAULT_FRONTIER_EFFECTIVE_EDGE_POLICY)
+    configured = settings.get("frontier_crypto_adapter", {}).get("effective_edge", {})
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    if configured is False:
+        policy["enabled"] = False
     return policy
 
 
@@ -9451,8 +9484,12 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
     for candidate in candidates:
         quality_score = as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0
         base_score = as_float(candidate.get("score"), 0.0) or 0.0
+        effective_edge = as_float(candidate.get("effective_edge_bps"), None)
+        effective_edge_score = max(0.0, effective_edge or 0.0)
         candidate["paper_ranking_score"] = round(
-            (1.0 - quality_weight) * base_score + quality_weight * quality_score,
+            effective_edge_score + quality_weight * quality_score
+            if effective_edge is not None
+            else (1.0 - quality_weight) * base_score + quality_weight * quality_score,
             3,
         )
         candidate["paper_quality_cohort"] = (
@@ -9473,6 +9510,177 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
     for rank, candidate in enumerate(ranked, start=1):
         candidate["paper_quality_rank"] = rank
     return ranked
+
+
+def _frontier_effective_edge_reliability(observation: dict, candidate: dict) -> tuple[float | None, str]:
+    """Return normalized venue reliability, preferring explicit health telemetry."""
+    for container, source in (
+        (observation, "venue_health_score"),
+        (candidate, "venue_health_score"),
+        (observation.get("venue_health"), "venue_health.venue_quality_score"),
+        (candidate.get("venue_health"), "venue_health.venue_quality_score"),
+    ):
+        if not isinstance(container, dict):
+            continue
+        value = as_float(container.get("venue_health_score", container.get("venue_quality_score")), None)
+        if value is not None:
+            return max(0.0, min(1.0, value / 100.0 if value > 1.0 else value)), source
+    return None, "unavailable"
+
+
+def frontier_effective_edge_review(observation: dict, candidate: dict, settings: dict) -> dict:
+    """Decompose a frontier paper candidate's executable edge.
+
+    This is deliberately separate from candidate emission.  ``primary_admitted``
+    controls trusted simulated allocation; a false result is retained as a
+    counterfactual paper route with its reason and cost terms intact.
+    """
+    policy = _frontier_effective_edge_policy(settings)
+    applicable = bool(
+        policy.get("enabled", True)
+        and policy.get("paper_only", True)
+        and settings.get("mode", "paper") == "paper"
+        and not settings.get("allow_live_trading", False)
+        and observation.get("market_type") == "spot"
+    )
+    if not applicable:
+        return {
+            "enabled": bool(policy.get("enabled", True)),
+            "applicable": False,
+            "paper_only": True,
+            "primary_admitted": True,
+            "emission_action": "unchanged",
+        }
+
+    raw_edge = abs(as_float(candidate.get("venue_deviation_bps"), 0.0) or 0.0)
+    half_spread = max(0.0, as_float(candidate.get("spread_bps"), 0.0) or 0.0) / 2.0
+    taker_fee = max(
+        0.0,
+        as_float(candidate.get("estimated_fee_bps_per_side"), None)
+        if as_float(candidate.get("estimated_fee_bps_per_side"), None) is not None
+        else as_float(settings.get("risk", {}).get("taker_fee_bps_per_leg"), 0.0) or 0.0,
+    )
+    quote_status = str(observation.get("quote_normalization_status") or "").lower()
+    quote_conversion_cost = max(0.0, as_float(observation.get("quote_conversion_cost_bps"), None) or 0.0)
+    if quote_conversion_cost == 0.0 and quote_status == "external_fx_reference":
+        quote_conversion_cost = max(0.0, float(policy["external_quote_conversion_cost_bps"]))
+    route_text = " ".join(
+        str(value or "")
+        for value in (
+            candidate.get("route_id"),
+            candidate.get("paper_route_status"),
+            candidate.get("route_status"),
+            candidate.get("data_source"),
+        )
+    ).lower()
+    proxy_drag = max(0.0, as_float(observation.get("proxy_drag_bps"), None) or 0.0)
+    synthetic_route = any(token in route_text for token in ("synthetic", "proxy", "counterfactual"))
+    if proxy_drag == 0.0 and synthetic_route:
+        proxy_drag = max(0.0, float(policy["synthetic_proxy_drag_bps"]))
+    freshness_age = as_float(candidate.get("freshness_age_seconds"), None)
+    freshness_window = max(0.001, float(policy["freshness_penalty_window_seconds"]))
+    freshness_penalty = 0.0
+    if freshness_age is not None and freshness_age > freshness_window:
+        freshness_penalty = min(
+            max(0.0, float(policy["max_freshness_penalty_bps"])),
+            (freshness_age / freshness_window - 1.0) * float(policy["freshness_penalty_bps_per_window"]),
+        )
+    reliability, reliability_source = _frontier_effective_edge_reliability(observation, candidate)
+    reliability_penalty = (
+        (1.0 - reliability) * max(0.0, float(policy["max_venue_reliability_penalty_bps"]))
+        if reliability is not None
+        else max(0.0, float(policy["max_venue_reliability_penalty_bps"]))
+    )
+    effective_edge = raw_edge - half_spread - taker_fee - quote_conversion_cost - proxy_drag - freshness_penalty - reliability_penalty
+    min_freshness = max(0.0, float(policy["max_freshness_age_seconds"]))
+    min_liquidity = max(0.0, float(policy["min_liquidity_score"]))
+    min_reliability = max(0.0, min(1.0, float(policy["min_venue_reliability_score"])))
+    reported_liquidity = max(0.0, min(1.0, as_float(candidate.get("liquidity_score"), 0.0) or 0.0))
+    bid_depth, _ = _top_of_book_notional_usd(observation, "bid")
+    ask_depth, _ = _top_of_book_notional_usd(observation, "ask")
+    paper_notional = max(1.0, as_float(settings.get("risk", {}).get("paper_notional_usd"), 1000.0) or 1000.0)
+    depth_liquidity = (
+        max(0.0, min(1.0, min(bid_depth, ask_depth) / paper_notional))
+        if bid_depth is not None and ask_depth is not None
+        else 0.0
+    )
+    # A deep public book can support a paper experiment even before enough
+    # rolling turnover has accumulated to raise the volume-derived score.
+    liquidity = max(reported_liquidity, depth_liquidity)
+    freshness_confidence = 1.0 if freshness_age is not None and freshness_age <= min_freshness else (
+        max(0.0, min(1.0, min_freshness / freshness_age)) if freshness_age and freshness_age > 0.0 else 0.0
+    )
+    liquidity_confidence = 1.0 if liquidity >= min_liquidity else (liquidity / min_liquidity if min_liquidity else 1.0)
+    reliability_confidence = (
+        1.0 if reliability is not None and reliability >= min_reliability
+        else (reliability / min_reliability if reliability is not None and min_reliability else 0.0)
+    )
+    confidence_score = max(0.0, min(1.0, freshness_confidence * liquidity_confidence * reliability_confidence))
+    reasons = []
+    if effective_edge <= float(policy["minimum_effective_edge_bps"]):
+        reasons.append("effective_edge_not_positive")
+    if freshness_age is None or freshness_age > min_freshness:
+        reasons.append("freshness_below_minimum")
+    if liquidity < min_liquidity:
+        reasons.append("liquidity_below_minimum")
+    if reliability is None or reliability < min_reliability:
+        reasons.append("venue_reliability_below_minimum")
+    primary_admitted = not reasons
+    edge_scale = max(0.0, min(1.0, max(0.0, effective_edge) / max(0.001, float(policy["allocation_edge_bps_cap"]))))
+    primary_allocation = edge_scale * confidence_score
+    allocation_cap = 1.0
+    if synthetic_route:
+        allocation_cap = min(allocation_cap, max(0.01, min(1.0, float(policy["synthetic_allocation_cap"]))))
+    if reliability is None or reliability < float(policy["low_reliability_score"]):
+        allocation_cap = min(allocation_cap, max(0.01, min(1.0, float(policy["low_reliability_allocation_cap"]))))
+    primary_allocation = min(primary_allocation, allocation_cap)
+    return {
+        "enabled": True,
+        "applicable": True,
+        "paper_only": True,
+        "primary_admitted": primary_admitted,
+        "admission_reasons": reasons,
+        "emission_action": "primary_simulated_route" if primary_admitted else "counterfactual_guard_value",
+        "raw_edge_bps": round(raw_edge, 6),
+        "half_spread_bps": round(half_spread, 6),
+        "estimated_taker_fee_bps": round(taker_fee, 6),
+        "quote_conversion_cost_bps": round(quote_conversion_cost, 6),
+        "proxy_drag_bps": round(proxy_drag, 6),
+        "freshness_penalty_bps": round(freshness_penalty, 6),
+        "venue_reliability_penalty_bps": round(reliability_penalty, 6),
+        "effective_edge_bps": round(effective_edge, 6),
+        "confidence_score": round(confidence_score, 6),
+        "liquidity_score": round(liquidity, 6),
+        "reported_liquidity_score": round(reported_liquidity, 6),
+        "depth_liquidity_score": round(depth_liquidity, 6),
+        "venue_reliability_score": round(reliability, 6) if reliability is not None else None,
+        "venue_reliability_source": reliability_source,
+        "synthetic_or_proxy_route": synthetic_route,
+        "primary_allocation_multiplier": round(primary_allocation, 6),
+        "allocation_cap": round(allocation_cap, 6),
+        "counterfactual_allocation_multiplier": round(
+            max(0.01, min(1.0, float(policy["counterfactual_allocation_multiplier"]))), 6
+        ),
+        "minimums": {
+            "effective_edge_bps": float(policy["minimum_effective_edge_bps"]),
+            "freshness_age_seconds": min_freshness,
+            "liquidity_score": min_liquidity,
+            "venue_reliability_score": min_reliability,
+        },
+    }
+
+
+def _apply_frontier_effective_edge(candidate: dict, observation: dict, settings: dict) -> dict:
+    review = frontier_effective_edge_review(observation, candidate, settings)
+    candidate["effective_edge_model"] = review
+    if not review.get("applicable"):
+        return candidate
+    candidate["effective_edge_bps"] = review["effective_edge_bps"]
+    candidate["confidence_score"] = review["confidence_score"]
+    candidate["effective_edge_primary_admitted"] = review["primary_admitted"]
+    candidate["effective_edge_admission_reasons"] = list(review["admission_reasons"])
+    candidate["effective_edge_allocation_multiplier"] = review["primary_allocation_multiplier"]
+    return candidate
 
 
 def build_variant_candidates(
@@ -9867,6 +10075,21 @@ def _apply_frontier_marketability_gate(
 
     policy = review.get("policy") if isinstance(review.get("policy"), dict) else {}
     failed = list(review.get("failed_checks") or [])
+    effective_edge = candidate.get("effective_edge_model")
+    if isinstance(effective_edge, dict) and effective_edge.get("applicable"):
+        effective_admitted = bool(effective_edge.get("primary_admitted"))
+        review["checks"]["effective_edge_admission"] = {
+            "passed": effective_admitted,
+            "effective_edge_bps": effective_edge.get("effective_edge_bps"),
+            "confidence_score": effective_edge.get("confidence_score"),
+            "minimums": effective_edge.get("minimums"),
+            "admission_reasons": list(effective_edge.get("admission_reasons") or []),
+        }
+        if not effective_admitted:
+            failed.append("effective_edge_admission")
+            review["failed_checks"] = failed
+            review["passed"] = False
+            review["status"] = "failed"
     route_health_confirmed = not failed
     confirmed_multiplier = as_float(policy.get("confirmed_route_allocation_multiplier"), 1.0)
     conservative_multiplier = as_float(policy.get("conservative_route_allocation_multiplier"), 0.25)
@@ -9886,13 +10109,32 @@ def _apply_frontier_marketability_gate(
         "failed_checks": failed,
         "mode": "confirmed_simulated_route" if route_health_confirmed else "conservative_counterfactual_route",
     }
+    effective_primary_multiplier = 1.0
+    effective_counterfactual_multiplier = 1.0
+    effective_primary_admitted = True
+    if isinstance(effective_edge, dict) and effective_edge.get("applicable"):
+        effective_primary_admitted = bool(effective_edge.get("primary_admitted"))
+        effective_primary_multiplier = max(
+            0.0, min(1.0, as_float(effective_edge.get("primary_allocation_multiplier"), 0.0) or 0.0)
+        )
+        effective_counterfactual_multiplier = max(
+            0.01,
+            min(1.0, as_float(effective_edge.get("counterfactual_allocation_multiplier"), 0.25) or 0.25),
+        )
+    effective_allocation = effective_primary_multiplier if effective_primary_admitted else effective_counterfactual_multiplier
+    final_allocation = (
+        route_multiplier * quality_multiplier * effective_allocation
+        if effective_primary_admitted
+        else min(route_multiplier, effective_counterfactual_multiplier) * quality_multiplier
+    )
     candidate["simulated_order_allocation"] = {
         "paper_only": True,
         "mode": "primary" if route_health_confirmed else "counterfactual_guard_value",
         "route_health_confirmed": route_health_confirmed,
         "route_allocation_multiplier": round(route_multiplier, 6),
         "quality_allocation_multiplier": round(quality_multiplier, 6),
-        "allocation_multiplier": round(route_multiplier * quality_multiplier, 6),
+        "effective_edge_allocation_multiplier": round(effective_allocation, 6),
+        "allocation_multiplier": round(final_allocation, 6),
         "failed_route_health_checks": failed,
     }
     existing_allocation = as_float(candidate.get("paper_allocation_multiplier"), None)
@@ -10168,6 +10410,7 @@ def _candidate_from_observation(
         },
     }
     candidate = annotate_paper_context_cost(candidate, settings)
+    candidate = _apply_frontier_effective_edge(candidate, observation, settings)
     return _apply_frontier_marketability_gate(candidate, observation, settings, reference_observations)
 
 
