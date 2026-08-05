@@ -408,6 +408,16 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         self.assertEqual("diagnose_zero_output", task["objective_type"])
         self.assertEqual(96, task["priority"])
         self.assertTrue(any(item["task_id"] for item in transitions["transitions"]))
+        self.conn.execute(
+            "update strategy_owner_tasks set priority=84 where strategy_lab_id='zero-output-child'"
+        )
+        self.conn.commit()
+        owner.monitor_tasks(self.conn)
+        task = self.conn.execute(
+            "select status,priority from strategy_owner_tasks where strategy_lab_id='zero-output-child'"
+        ).fetchone()
+        self.assertEqual("analyzing", task["status"])
+        self.assertEqual(96, task["priority"])
 
     def test_parent_with_adaptive_child_stays_in_monitoring(self) -> None:
         now = owner._utc_now()

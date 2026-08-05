@@ -1084,7 +1084,8 @@ def monitor_tasks(conn: sqlite3.Connection) -> dict:
                 experiment_status,
                 "monitoring_evidence" if compile_status == "compiled" else task["status"],
             )
-        if next_status != task["status"]:
+        priority_needs_raise = zero_output_needs_owner and int(task.get("priority") or 0) < 96
+        if next_status != task["status"] or priority_needs_raise:
             conn.execute(
                 """update strategy_owner_tasks
                    set status = ?, priority = case when ? then max(priority,96) else priority end,
