@@ -196,6 +196,11 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
     from paper_route_registry import assess_paper_route_registry
     from route_intelligence import build_paper_route_requirement_report
 
+try:
+    from src.signals.frontier_crypto_venue_map import native_spot_surface_fields
+except ImportError:  # pragma: no cover - fallback for direct module execution
+    from signals.frontier_crypto_venue_map import native_spot_surface_fields
+
 _VALR_PAPER_PUBLIC_BASE_URL = "https://api.valr.com"
 _VALR_PAPER_SUPPORTED_SYMBOLS = {
     "BTCZAR": {"base": "BTC", "quote": "ZAR"},
@@ -2822,6 +2827,31 @@ def _paper_only_valr_order_book_top(levels, *, reverse=False):
     return normalized[0]
 
 
+def _paper_only_valr_shallow_order_book(levels, *, reverse=False, max_levels=5):
+    """Normalize a bounded public VALR book without retaining full depth."""
+
+    if not isinstance(levels, (list, tuple)):
+        return []
+    normalized = []
+    for level in levels:
+        if isinstance(level, dict):
+            price = _paper_only_valr_float_or_none(
+                level.get("price") or level.get("rate") or level.get("bidPrice") or level.get("askPrice")
+            )
+            quantity = _paper_only_valr_float_or_none(
+                level.get("quantity") or level.get("qty") or level.get("volume") or level.get("size")
+            )
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            price = _paper_only_valr_float_or_none(level[0])
+            quantity = _paper_only_valr_float_or_none(level[1])
+        else:
+            continue
+        if price is not None and quantity is not None and price > 0.0 and quantity > 0.0:
+            normalized.append([price, quantity])
+    normalized.sort(key=lambda item: item[0], reverse=bool(reverse))
+    return normalized[: max(1, int(max_levels))]
+
+
 def paper_only_valr_normalize_symbol(symbol):
     """Normalize supported VALR spot symbols into the venue's compact form."""
 
@@ -2859,15 +2889,26 @@ def paper_only_valr_market_catalog(symbols=None):
                 "market": f"VALR:{display_symbol}",
                 "symbol": display_symbol,
                 "venue_symbol": venue_symbol,
+                "instrument_id": f"VALR:{venue_symbol}",
                 "base_asset": spec["base"],
                 "quote_asset": spec["quote"],
+                "market_type": "spot",
+                "route_id": "valr_spot_public",
+                "instrument_metadata": {
+                    "venue": "VALR",
+                    "venue_symbol": venue_symbol,
+                    "base_asset": spec["base"],
+                    "quote_asset": spec["quote"],
+                    "market_type": "spot",
+                    "public_read_only": True,
+                },
                 "paper_only": True,
                 "build_governor_fields": _paper_only_build_governor_fields(),
                 "frontier_tags": ["frontier_crypto_venue_map", "zar_fiat_quote", "public_read_only"],
                 "endpoints": {
                     "ticker": f"{base_path}/marketsummary",
                     "top_of_book": f"{base_path}/orderbook",
-                    "recent_trades": f"{base_path}/tradehistory?limit=50",
+                    "recent_trades": f"{base_path}/trades?limit=50",
                 },
             }
         )
@@ -3181,6 +3222,10 @@ def paper_only_valr_observation_from_public_payloads(
 
     bid_book, bid_size = _paper_only_valr_order_book_top(orderbook.get("bids") or orderbook.get("Bids"), reverse=True)
     ask_book, ask_size = _paper_only_valr_order_book_top(orderbook.get("asks") or orderbook.get("Asks"), reverse=False)
+    shallow_order_book = {
+        "bids": _paper_only_valr_shallow_order_book(orderbook.get("bids") or orderbook.get("Bids"), reverse=True),
+        "asks": _paper_only_valr_shallow_order_book(orderbook.get("asks") or orderbook.get("Asks"), reverse=False),
+    }
 
     if best_bid is None:
         best_bid = bid_book
@@ -3218,7 +3263,21 @@ def paper_only_valr_observation_from_public_payloads(
         if mid_price > 0.0 and best_ask >= best_bid:
             spread_bps = ((best_ask - best_bid) / mid_price) * 10_000.0
 
-    observed_at = _paper_only_parse_timestamp(quote_timestamp or as_of)
+    ticker_trade_timestamp = _paper_only_parse_timestamp(
+        _paper_only_valr_pick_first(
+            ticker,
+            "lastTradedTimestamp",
+            "lastTradedAt",
+            "lastTradeTimestamp",
+            "lastTradeAt",
+            "timestamp",
+        )
+    )
+    observed_at = (
+        _paper_only_parse_timestamp(quote_timestamp or as_of)
+        or ticker_trade_timestamp
+        or recent_trade_timestamp
+    )
     evaluation_at = _paper_only_parse_timestamp(evaluation_timestamp or as_of)
 
     route_quality = None
@@ -3241,13 +3300,24 @@ def paper_only_valr_observation_from_public_payloads(
     paper_ineligible_reason = route_quality.get("blocking_reason") if isinstance(route_quality, dict) else None
     simulated_slippage_tier = route_quality.get("simulated_slippage_tier") if isinstance(route_quality, dict) else None
 
-    return {
+    observation = {
         "venue": "VALR",
         "market": f"VALR:{display_symbol}",
         "symbol": display_symbol,
         "venue_symbol": venue_symbol,
+        "instrument_id": f"VALR:{venue_symbol}",
         "base_asset": spec["base"],
         "quote_asset": spec["quote"],
+        "market_type": "spot",
+        "route_id": "valr_spot_public",
+        "instrument_metadata": {
+            "venue": "VALR",
+            "venue_symbol": venue_symbol,
+            "base_asset": spec["base"],
+            "quote_asset": spec["quote"],
+            "market_type": "spot",
+            "public_read_only": True,
+        },
         "paper_only": True,
         "observation_type": "spot",
         "last_price": last_price,
@@ -3263,12 +3333,18 @@ def paper_only_valr_observation_from_public_payloads(
         "recent_trade_price": recent_trade_price,
         "recent_trade_quantity": recent_trade_quantity,
         "recent_trade_timestamp": recent_trade_timestamp.isoformat() if recent_trade_timestamp is not None else None,
+        "last_trade_timestamp": (
+            ticker_trade_timestamp or recent_trade_timestamp
+        ).isoformat() if (ticker_trade_timestamp or recent_trade_timestamp) is not None else None,
         "observed_at": observed_at.isoformat() if observed_at is not None else None,
+        "shallow_order_book": shallow_order_book,
         "route_quality": route_quality,
         "paper_ineligible": paper_ineligible,
         "paper_ineligible_reason": paper_ineligible_reason,
         "simulated_slippage_tier": simulated_slippage_tier,
     }
+    observation.update(native_spot_surface_fields(observation))
+    return observation
 
 
 def paper_only_entry_confirmation_gate(
@@ -5451,9 +5527,14 @@ import time
 import urllib.error
 import urllib.request
 
-from regional_fx_reference import get_regional_fx_references
-from scan_batch import ScanBatch, normalize_observation
-from paper_context_cost import annotate_paper_context_cost
+try:
+    from src.regional_fx_reference import get_regional_fx_references
+    from src.scan_batch import ScanBatch, normalize_observation
+    from src.paper_context_cost import annotate_paper_context_cost
+except ImportError:  # pragma: no cover - fallback for direct module execution
+    from regional_fx_reference import get_regional_fx_references
+    from scan_batch import ScanBatch, normalize_observation
+    from paper_context_cost import annotate_paper_context_cost
 
 DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY = {
     "fee_buffer_bps": 4.0,
@@ -8512,23 +8593,49 @@ def _parse_luno_tickers(target: dict, result: dict) -> list[dict]:
 
 
 def _parse_valr_market_summary(target: dict, result: dict) -> list[dict]:
-    payload = result.get("payload") or []
-    rows = payload if isinstance(payload, list) else payload.get("data", [])
+    rows = _valr_payload_rows(result)
     observations = []
     for data in rows:
-        symbol = str(data.get("currencyPair") or data.get("pair") or "")
+        symbol = str(data.get("currencyPair") or data.get("pair") or data.get("symbol") or "").upper()
+        if not symbol:
+            continue
         row = _base_observation(target, result, symbol)
+        last_trade_at = _paper_only_parse_timestamp(
+            _paper_only_valr_pick_first(
+                data,
+                "lastTradedTimestamp",
+                "lastTradedAt",
+                "lastTradeTimestamp",
+                "lastTradeAt",
+                "timestamp",
+            )
+        )
         row.update(
             {
                 "bid": as_float(data.get("bidPrice") or data.get("bid")),
                 "ask": as_float(data.get("askPrice") or data.get("ask")),
-                "last": as_float(data.get("lastTradedPrice") or data.get("last")),
+                "last": as_float(data.get("lastTradedPrice") or data.get("last") or data.get("price")),
                 "quote_volume_24h": as_float(data.get("quoteVolume") or data.get("quote_volume")),
+                "venue_symbol": symbol,
+                "best_bid": as_float(data.get("bidPrice") or data.get("bid")),
+                "best_ask": as_float(data.get("askPrice") or data.get("ask")),
+                "last_trade_timestamp": last_trade_at.isoformat() if last_trade_at is not None else None,
+                "exchange_timestamp": last_trade_at.isoformat() if last_trade_at is not None else None,
+                "instrument_metadata": {
+                    "venue": "VALR",
+                    "venue_symbol": symbol,
+                    "base_asset": row.get("base"),
+                    "quote_asset": row.get("quote"),
+                    "market_type": "spot",
+                    "public_read_only": True,
+                },
             }
         )
         if row.get("quote_volume_24h") is None:
             row["quote_volume_24h"] = (as_float(data.get("baseVolume"), 0.0) or 0.0) * float(row.get("last") or 0.0)
-        observations.append(_finalize_observation(row))
+        output = _finalize_observation(row)
+        output.update(native_spot_surface_fields(output))
+        observations.append(output)
     return observations
 
 
@@ -10783,6 +10890,8 @@ def _candidate_from_observation(
             "notes": observation.get("notes", []),
         },
     }
+    if observation.get("market_type") == "spot":
+        candidate.update(native_spot_surface_fields(observation))
     # Route facts must be present before either context-cost sizing or the
     # frontier ranking pass reads this candidate.  The helper only attaches a
     # non-blocking paper report for short frontier spot candidates.

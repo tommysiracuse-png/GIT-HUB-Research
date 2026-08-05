@@ -124,6 +124,84 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                 self.assertEqual(rows[0]["region"], target["region"])
                 self.assertGreater(rows[0]["last"], 0)
 
+    def test_valr_public_parser_carries_native_spot_metadata_to_paper_candidates(self) -> None:
+        target = {
+            "venue": "VALR",
+            "market_type": "spot",
+            "route_id": "valr_spot_public",
+            "url": "https://api.valr.com/v1/public/marketsummary",
+            "region": "Africa",
+        }
+        rows = frontier._parse_valr_market_summary(
+            target,
+            result(
+                [
+                    {
+                        "currencyPair": "BTCZAR",
+                        "bidPrice": "1790000",
+                        "askPrice": "1791000",
+                        "lastTradedPrice": "1790500",
+                        "baseVolume": "20",
+                        "lastTradedTimestamp": "2026-08-05T17:00:00Z",
+                    }
+                ]
+            ),
+        )
+
+        self.assertEqual(1, len(rows))
+        valr = rows[0]
+        self.assertEqual((valr["base"], valr["quote"]), ("BTC", "ZAR"))
+        self.assertEqual(valr["best_bid"], 1790000.0)
+        self.assertEqual(valr["best_ask"], 1791000.0)
+        self.assertEqual(valr["last_trade_timestamp"], "2026-08-05T17:00:00+00:00")
+        self.assertEqual(valr["instrument_metadata"]["venue_symbol"], "BTCZAR")
+        self.assertEqual(valr["market_data_origin"], "native_public_spot")
+
+        valr.update(
+            {
+                "usd_normalized_last": 99_500.0,
+                "canonical_normalized_price": 99_500.0,
+                "comparison_price": 99_500.0,
+                "quote_normalization_status": "same_venue_stablecoin_reference",
+                "local_quote_observe_only": False,
+                "quality_status": "verified",
+                "quality_score": 85.0,
+                "freshness_age_seconds": 1.0,
+                "anomaly_flags": [],
+                "critical_anomaly_flags": [],
+            }
+        )
+        candidate = frontier._candidate_from_observation(
+            valr,
+            settings(),
+            100_000.0,
+            2,
+            reference_observations=[valr],
+        )
+
+        self.assertEqual(candidate["direction"], "long_frontier_spot")
+        self.assertFalse(candidate["paper_entry_blocked"])
+        self.assertEqual(candidate["market_data_origin"], "native_public_spot")
+        self.assertEqual(candidate["instrument_metadata"]["venue"], "VALR")
+
+        short_valr = copy.deepcopy(valr)
+        short_valr.update(
+            {
+                "usd_normalized_last": 100_500.0,
+                "canonical_normalized_price": 100_500.0,
+                "comparison_price": 100_500.0,
+            }
+        )
+        short_candidate = frontier._candidate_from_observation(
+            short_valr,
+            settings(),
+            100_000.0,
+            2,
+            reference_observations=[short_valr],
+        )
+        self.assertEqual(short_candidate["direction"], "short_frontier_spot")
+        self.assertFalse(short_candidate["paper_entry_blocked"])
+
     def test_latam_public_parsers_create_normalized_observations(self) -> None:
         old_fetch = frontier.fetch_json
 

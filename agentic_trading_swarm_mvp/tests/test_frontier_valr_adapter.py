@@ -23,7 +23,7 @@ class ValrPaperAdapterTests(unittest.TestCase):
         self.assertEqual(catalog[0]["endpoints"]["top_of_book"], "https://api.valr.com/v1/public/BTCZAR/orderbook")
         self.assertEqual(
             catalog[0]["endpoints"]["recent_trades"],
-            "https://api.valr.com/v1/public/BTCZAR/tradehistory?limit=50",
+            "https://api.valr.com/v1/public/BTCZAR/trades?limit=50",
         )
 
     def test_observation_builds_from_public_payloads(self):
@@ -32,6 +32,7 @@ class ValrPaperAdapterTests(unittest.TestCase):
             ticker_payload={
                 "lastTradedPrice": "1234500.0",
                 "quoteVolume": "25000000.0",
+                "lastTradedTimestamp": "2026-07-21T23:45:30Z",
             },
             orderbook_payload={
                 "bids": [{"price": "1234400.0", "quantity": "0.75"}],
@@ -61,7 +62,11 @@ class ValrPaperAdapterTests(unittest.TestCase):
         self.assertEqual(observation["recent_trade_price"], 1234550.0)
         self.assertEqual(observation["recent_trade_quantity"], 0.10)
         self.assertEqual(observation["recent_trade_timestamp"], "2026-07-21T23:45:00+00:00")
+        self.assertEqual(observation["last_trade_timestamp"], "2026-07-21T23:45:30+00:00")
         self.assertEqual(observation["observed_at"], "2026-07-21T23:46:00+00:00")
+        self.assertEqual(observation["instrument_metadata"]["market_type"], "spot")
+        self.assertEqual(observation["shallow_order_book"]["bids"], [[1234400.0, 0.75]])
+        self.assertEqual(observation["market_data_origin"], "native_public_spot")
 
 
 class ValrPaperDataQualityTests(unittest.TestCase):
@@ -77,7 +82,7 @@ class ValrPaperDataQualityTests(unittest.TestCase):
             {
                 "ticker": "https://api.valr.com/v1/public/BTCZAR/marketsummary",
                 "top_of_book": "https://api.valr.com/v1/public/BTCZAR/orderbook",
-                "recent_trades": "https://api.valr.com/v1/public/BTCZAR/tradehistory?limit=25",
+                "recent_trades": "https://api.valr.com/v1/public/BTCZAR/trades?limit=25",
             },
         )
         self.assertEqual(
@@ -85,10 +90,10 @@ class ValrPaperDataQualityTests(unittest.TestCase):
             [
                 "https://api.valr.com/v1/public/BTCZAR/marketsummary",
                 "https://api.valr.com/v1/public/BTCZAR/orderbook",
-                "https://api.valr.com/v1/public/BTCZAR/tradehistory?limit=25",
+                "https://api.valr.com/v1/public/BTCZAR/trades?limit=25",
                 "https://api.valr.com/v1/public/ETHZAR/marketsummary",
                 "https://api.valr.com/v1/public/ETHZAR/orderbook",
-                "https://api.valr.com/v1/public/ETHZAR/tradehistory?limit=25",
+                "https://api.valr.com/v1/public/ETHZAR/trades?limit=25",
             ],
         )
 

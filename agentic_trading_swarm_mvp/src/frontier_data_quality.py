@@ -3489,7 +3489,7 @@ def paper_only_valr_public_request_plan(symbols=None, *, trade_limit=50, base_ur
         endpoints = {
             "ticker": f"{pair_base_url}/marketsummary",
             "top_of_book": f"{pair_base_url}/orderbook",
-            "recent_trades": f"{pair_base_url}/tradehistory?limit={max(1, int(trade_limit))}",
+            "recent_trades": f"{pair_base_url}/trades?limit={max(1, int(trade_limit))}",
         }
         requests.append(
             {

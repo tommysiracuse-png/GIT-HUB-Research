@@ -33,6 +33,52 @@ def _coerce_float(value: object) -> float | None:
         return None
 
 
+def native_spot_surface_fields(observation: Mapping[str, object]) -> dict[str, object]:
+    """Return portable read-only public-spot fields for frontier candidates.
+
+    The helper distinguishes native venue data from synthetic research but does
+    not make an admission decision; callers retain price-safety checks.
+    """
+
+    source = dict(observation) if isinstance(observation, Mapping) else {}
+    venue = str(source.get("venue") or "").upper() or None
+    symbol = str(source.get("symbol") or "").upper() or None
+    base = str(source.get("base") or source.get("base_asset") or "").upper() or None
+    quote = str(source.get("quote") or source.get("quote_asset") or "").upper() or None
+    venue_symbol = str(source.get("venue_symbol") or symbol or "").upper() or None
+    metadata = source.get("instrument_metadata")
+    metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+    metadata.update(
+        {
+            "venue": venue,
+            "venue_symbol": venue_symbol,
+            "base_asset": base,
+            "quote_asset": quote,
+            "market_type": "spot",
+            "public_read_only": True,
+        }
+    )
+    shallow_order_book = source.get("shallow_order_book")
+    if not isinstance(shallow_order_book, Mapping):
+        levels = source.get("book_levels")
+        if isinstance(levels, Mapping):
+            shallow_order_book = {
+                "bids": list(levels.get("bids") or [])[:5],
+                "asks": list(levels.get("asks") or [])[:5],
+            }
+        else:
+            shallow_order_book = None
+    return {
+        "market_data_origin": "native_public_spot",
+        "synthetic_research": False,
+        "instrument_metadata": metadata,
+        "best_bid": _coerce_float(source.get("best_bid") if source.get("best_bid") is not None else source.get("bid")),
+        "best_ask": _coerce_float(source.get("best_ask") if source.get("best_ask") is not None else source.get("ask")),
+        "last_trade_timestamp": source.get("last_trade_timestamp") or source.get("exchange_timestamp"),
+        "shallow_order_book": shallow_order_book,
+    }
+
+
 def build_leave_one_out_frontier_signals(
     venue_values: Mapping[str, object],
     *,
