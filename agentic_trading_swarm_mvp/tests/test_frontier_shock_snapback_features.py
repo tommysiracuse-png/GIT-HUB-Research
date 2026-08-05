@@ -186,6 +186,112 @@ class FrontierShockSnapbackFeatureTests(unittest.TestCase):
         self.assertEqual("insufficient_closed_candles", enriched[0]["microstructure_status"])
         self.assertEqual(0.0, enriched[1]["microstructure_history_ready"])
 
+    def test_active_strategy_intraday_requirements_prioritize_matching_frame(self) -> None:
+        cfg = settings()
+        cfg["frontier_crypto_adapter"]["intraday_feature_max_observations"] = 1
+        cfg["frontier_crypto_adapter"]["intraday_feature_max_per_venue"] = 1
+        program = snapback_program()
+        program["universe"] = {"market_types": ["spot"], "quotes": ["USDT"], "bases": ["LOW"]}
+        recommendation = {
+            "recommendation_id": "rec_strategy_aware_intraday_coverage",
+            "payload": {
+                "action": "propose_strategy_lab_experiment",
+                "strategy_lab_experiment": {
+                    "strategy_lab_id": "strategy_aware_intraday_coverage_v1",
+                    "version": 1,
+                    "experiment_type": "market_strategy",
+                    "hypothesis": "A program-universe spot frame receives its required intraday confirmation.",
+                    "source_surface": "spot",
+                    "permitted_target_surface": ["spot"],
+                    "strategy_logic": program,
+                    "data_requirements": {
+                        "paper_only": True,
+                        "required_snapshot_features": [
+                            "microstructure_history_ready",
+                            "return_1m_bps",
+                            "relative_volume_1m_60m",
+                        ],
+                    },
+                    "risk_gates": {"paper_only": True, "live_trading_disabled": True},
+                    "promotion_rules": {},
+                },
+            },
+        }
+        rows = [
+            {
+                "instrument_id": "OKX_SPOT:HIGH-USDT",
+                "venue": "OKX_SPOT",
+                "market_type": "spot",
+                "symbol": "HIGH-USDT",
+                "base": "HIGH",
+                "quote": "USDT",
+                "last": 100.0,
+                "quote_volume_24h": 10_000_000.0,
+                "data_status": "reachable",
+            },
+            {
+                "instrument_id": "OKX_SPOT:LOW-USDT",
+                "venue": "OKX_SPOT",
+                "market_type": "spot",
+                "symbol": "LOW-USDT",
+                "base": "LOW",
+                "quote": "USDT",
+                "last": 100.0,
+                "quote_volume_24h": 10_000.0,
+                "data_status": "reachable",
+            },
+        ]
+        registry = {
+            "venues": [
+                {
+                    "venue": "OKX_SPOT",
+                    "intraday": {
+                        "url_template": "https://public.test/{symbol}",
+                        "parser": "okx_1m_candles",
+                    },
+                }
+            ]
+        }
+        candles = []
+        for index in range(62):
+            close = 100.5 if index == 61 else 100.0
+            volume = 2000.0 if index == 61 else 1000.0
+            candles.append([index * 60_000, "0", "0", "0", str(close), "0", "0", str(volume), "1"])
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            conn.execute(
+                "update strategy_lab_experiments set status = 'needs_data' where strategy_lab_id = ?",
+                ("strategy_aware_intraday_coverage_v1",),
+            )
+            conn.commit()
+            requirements = frontier._active_strategy_intraday_requirements(conn)
+            with mock.patch.object(
+                frontier,
+                "fetch_json",
+                return_value={"ok": True, "payload": {"data": list(reversed(candles))}},
+            ) as fetch:
+                enriched, summary = frontier.enrich_intraday_features(
+                    rows,
+                    cfg,
+                    registry,
+                    strategy_requirements=requirements,
+                )
+
+        self.assertEqual(1, fetch.call_count)
+        self.assertEqual(
+            ["microstructure_history_ready", "relative_volume_1m_60m", "return_1m_bps"],
+            summary["strategy_required_features"],
+        )
+        self.assertEqual(1, summary["strategy_required_selected_count"])
+        self.assertEqual(1, summary["attempted_count"])
+        self.assertEqual(1, summary["ready_count"])
+        self.assertEqual({"OKX_SPOT": {"ready": 1}}, summary["microstructure_status_by_venue"])
+        self.assertEqual(0.0, enriched[0]["microstructure_history_ready"])
+        self.assertEqual(1.0, enriched[1]["microstructure_history_ready"])
+        self.assertGreater(enriched[1]["return_1m_bps"], 0.0)
+        self.assertGreater(enriched[1]["relative_volume_1m_60m"], 1.0)
+
     def test_strategy_snapshot_persists_intraday_confirmation_features(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
         ready = observation(
@@ -253,12 +359,17 @@ class FrontierShockSnapbackFeatureTests(unittest.TestCase):
                 cfg,
                 [],
                 {ready["inst_id"]: ready},
+                runtime_diagnostics={"frontier_crypto_intraday": {"attempted_count": 1, "ready_count": 1}},
             )
 
         self.assertEqual(1, len(generated), report)
         self.assertEqual("long_frontier_spot", generated[0]["direction"])
         self.assertEqual("observation_program", generated[0]["strategy_lab_logic_type"])
         self.assertEqual(2.0, generated[0]["strategy_lab_program_features"]["relative_volume_1m_60m"])
+        self.assertEqual(
+            {"attempted_count": 1, "ready_count": 1},
+            report["runtime_coverage_diagnostics"]["frontier_crypto_intraday"],
+        )
 
 
 if __name__ == "__main__":

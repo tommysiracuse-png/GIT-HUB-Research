@@ -2693,8 +2693,10 @@ def generate_strategy_lab_candidates(
     settings: dict,
     candidates: list[dict],
     price_observations: list[dict] | None = None,
+    runtime_diagnostics: dict | None = None,
 ) -> tuple[list[dict], dict]:
     cfg = settings.get("strategy_lab", {})
+    runtime_diagnostics = dict(runtime_diagnostics or {})
     if not cfg.get("enabled", True):
         return [], {"enabled": False, "generated_candidates": 0}
 
@@ -3027,6 +3029,7 @@ def generate_strategy_lab_candidates(
                 },
                 "runtime_contract_mismatch": runtime_contract_mismatch,
                 "relaxed_child": relaxed_child,
+                "runtime_coverage_diagnostics": runtime_diagnostics,
             }
             prior_evaluation = experiment.get("evaluation") or {}
             conn.execute(
@@ -3304,6 +3307,7 @@ def generate_strategy_lab_candidates(
         "strategy_feasibility": feasibility_by_experiment,
         "adaptive_relaxed_children": relaxed_children,
         "feature_snapshots": snapshot_summary,
+        "runtime_coverage_diagnostics": runtime_diagnostics,
         "observation_program_count": sum(
             1 for experiment in experiments if str((experiment.get("strategy_logic") or {}).get("type")) == OBSERVATION_PROGRAM
         ),

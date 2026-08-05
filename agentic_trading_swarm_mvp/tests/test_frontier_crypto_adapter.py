@@ -63,6 +63,64 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             )
             write_outputs.assert_called_once()
 
+    def test_scan_batch_adds_active_program_universe_for_bounded_intraday_coverage(self) -> None:
+        cfg = settings()
+        cfg["frontier_crypto_adapter"]["intraday_feature_max_observations"] = 1
+        cfg["frontier_crypto_adapter"]["intraday_feature_max_per_venue"] = 1
+        high = self._obs("OKX_SPOT", "HIGH-USDT", "HIGH", "USDT", 100, 10_000_000)
+        low = self._obs("OKX_SPOT", "LOW-USDT", "LOW", "USDT", 100, 10_000)
+        registry = {
+            "venues": [
+                {
+                    "venue": "OKX_SPOT",
+                    "intraday": {
+                        "url_template": "https://public.test/{symbol}",
+                        "parser": "okx_1m_candles",
+                    },
+                }
+            ]
+        }
+        candles = []
+        for index in range(62):
+            close = 100.5 if index == 61 else 100.0
+            volume = 2000.0 if index == 61 else 1000.0
+            candles.append([index * 60_000, "0", "0", "0", str(close), "0", "0", str(volume), "1"])
+        requirements = {
+            "active_program_count": 1,
+            "required_features": ["microstructure_history_ready"],
+            "programs": [
+                {
+                    "strategy_lab_id": "coverage_test_v1",
+                    "required_features": ["microstructure_history_ready"],
+                    "universe": {"market_types": ["spot"], "quotes": ["USDT"], "bases": ["LOW"]},
+                }
+            ],
+        }
+
+        with (
+            mock.patch.object(frontier, "load_venue_registry", return_value=registry),
+            mock.patch.object(frontier, "scan_venues", return_value=[high, low]),
+            mock.patch.object(frontier, "_select_observations", return_value=[high]),
+            mock.patch.object(frontier, "_active_strategy_intraday_requirements", return_value=requirements),
+            mock.patch.object(frontier, "_reference_prices", return_value={}),
+            mock.patch.object(
+                frontier,
+                "fetch_json",
+                return_value={"ok": True, "payload": {"data": list(reversed(candles))}},
+            ) as fetch,
+        ):
+            batch = frontier.build_scan_batch(
+                cfg,
+                conn=object(),
+                write_preliminary_report=False,
+            )
+
+        self.assertEqual(1, fetch.call_count)
+        self.assertEqual(1, batch.metadata["intraday_features"]["strategy_required_selected_count"])
+        low_frame = next(row for row in batch.observations if row["inst_id"] == low["instrument_id"])
+        self.assertEqual(1.0, low_frame["candidate"]["microstructure_history_ready"])
+        self.assertGreater(low_frame["candidate"]["return_1m_bps"], 0.0)
+
     def test_public_venue_parsers_normalize_symbols(self) -> None:
         cases = [
             (

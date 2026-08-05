@@ -496,6 +496,7 @@ def run_once(settings: dict) -> dict:
             venue_health = scan_crypto_venues()
             write_crypto_venue_health(venue_health)
         frontier_crypto_venues = {}
+        frontier_intraday_coverage = {}
         signal_redesign = {}
         if scan_cfg.get("enable_frontier_crypto_adapter_scan", False) and settings.get("frontier_crypto_adapter", {}).get(
             "enabled", True
@@ -510,6 +511,9 @@ def run_once(settings: dict) -> dict:
                 write_preliminary_report=not redesign_enabled,
             )
             batches.append(frontier_batch)
+            frontier_intraday_coverage = dict(
+                frontier_batch.metadata.get("intraday_features") or {}
+            )
             price_observations = merge_observations(batches)
             if redesign_enabled:
                 frontier_candidates, signal_redesign = run_frontier_redesign(
@@ -550,6 +554,7 @@ def run_once(settings: dict) -> dict:
             settings,
             candidates,
             price_observations,
+            runtime_diagnostics={"frontier_crypto_intraday": frontier_intraday_coverage},
         )
         strategy_lab_generation["promoted_signal_runtime"] = promoted_signal_runtime
         selected_strategy_lab_candidates, strategy_lab_runtime = _select_runtime_strategy_lab_candidates(

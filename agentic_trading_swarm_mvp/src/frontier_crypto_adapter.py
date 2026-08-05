@@ -5546,6 +5546,15 @@ DEFAULT_PAPER_ONLY_EXECUTABLE_QUALITY_POLICY = {
 }
 
 
+INTRADAY_CONFIRMATION_FEATURES = frozenset(
+    {
+        "microstructure_history_ready",
+        "return_1m_bps",
+        "relative_volume_1m_60m",
+    }
+)
+
+
 DEFAULT_PAPER_ONLY_CONFIDENCE_POLICY = {
     "min_confidence": 0.70,
     "trend_weight": 0.40,
@@ -8144,34 +8153,165 @@ def _intraday_features(config: dict, result: dict) -> dict:
     }
 
 
+def _json_object(value: object) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, str):
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return dict(decoded) if isinstance(decoded, dict) else {}
+
+
+def _active_strategy_intraday_requirements(conn) -> dict:
+    """Read active Strategy Lab intraday requirements without coupling to Strategy Lab imports."""
+
+    empty = {"active_program_count": 0, "required_features": [], "programs": []}
+    if conn is None or not callable(getattr(conn, "execute", None)):
+        return empty
+    try:
+        rows = conn.execute(
+            """
+            select strategy_lab_id, strategy_logic_json, compiled_strategy_logic_json,
+                   data_requirements_json
+            from strategy_lab_experiments
+            where experiment_type = 'market_strategy'
+              and status in ('active_testing', 'needs_data', 'needs_more_evidence',
+                             'needs_contract_revision')
+            """
+        ).fetchall()
+    except Exception:  # pragma: no cover - optional Strategy Lab storage during standalone scans
+        return empty
+
+    programs = []
+    required_features: set[str] = set()
+    for raw in rows:
+        try:
+            row = dict(raw)
+        except (TypeError, ValueError):
+            continue
+        logic = _json_object(row.get("compiled_strategy_logic_json"))
+        if not logic:
+            logic = _json_object(row.get("strategy_logic_json"))
+        if str(logic.get("type") or "") != "observation_program":
+            continue
+        data_requirements = _json_object(row.get("data_requirements_json"))
+        explicit = data_requirements.get("required_snapshot_features") or []
+        serialized_logic = json.dumps(logic, sort_keys=True)
+        required = {
+            feature
+            for feature in INTRADAY_CONFIRMATION_FEATURES
+            if feature in explicit or feature in serialized_logic
+        }
+        if not required:
+            continue
+        universe = logic.get("universe") if isinstance(logic.get("universe"), dict) else {}
+        programs.append(
+            {
+                "strategy_lab_id": str(row.get("strategy_lab_id") or ""),
+                "required_features": sorted(required),
+                "universe": universe,
+            }
+        )
+        required_features.update(required)
+    return {
+        "active_program_count": len(programs),
+        "required_features": sorted(required_features),
+        "programs": programs,
+    }
+
+
+def _strategy_universe_matches_observation(observation: dict, universe: dict) -> bool:
+    fields = {
+        "venues": "venue",
+        "inst_ids": "inst_id",
+        "trade_types": "trade_type",
+        "asset_classes": "asset_class",
+        "regions": "region",
+        "market_types": "market_type",
+        "quotes": "quote",
+        "bases": "base",
+    }
+    for plural, field in fields.items():
+        allowed = universe.get(plural)
+        if not allowed:
+            continue
+        values = allowed if isinstance(allowed, list) else [allowed]
+        observed = observation.get(field)
+        if field == "inst_id":
+            observed = observed or observation.get("instrument_id")
+        if str(observed or "").upper() not in {str(value).upper() for value in values}:
+            return False
+    return True
+
+
+def _strategy_intraday_priority(observation: dict, strategy_requirements: dict | None) -> int:
+    programs = (strategy_requirements or {}).get("programs") or []
+    return sum(
+        1
+        for program in programs
+        if _strategy_universe_matches_observation(observation, program.get("universe") or {})
+    )
+
+
 def enrich_intraday_features(
     observations: list[dict],
     settings: dict,
     registry: dict | None = None,
+    strategy_requirements: dict | None = None,
 ) -> tuple[list[dict], dict]:
-    """Add bounded public-candle features to a liquid, venue-diverse spot subset."""
+    """Add bounded public-candle features, prioritizing active program universes."""
 
     cfg = settings.get("frontier_crypto_adapter", {})
     output = [dict(row) for row in observations]
+    for row in output:
+        row.setdefault("return_1m_bps", 0.0)
+        row.setdefault("quote_volume_1m", 0.0)
+        row.setdefault("relative_volume_1m_60m", 0.0)
+        row.setdefault("microstructure_history_ready", 0.0)
+        row.setdefault("microstructure_status", "not_requested")
+    coverage_base = {
+        "strategy_required_features": list((strategy_requirements or {}).get("required_features") or []),
+        "strategy_required_program_count": int((strategy_requirements or {}).get("active_program_count") or 0),
+        "strategy_required_eligible_count": 0,
+        "strategy_required_selected_count": 0,
+        "attempted_count": 0,
+        "unavailable_count": 0,
+        "microstructure_status_by_venue": {},
+    }
     if not cfg.get("intraday_features_enabled", True):
-        return output, {"enabled": False, "selected_count": 0, "ready_count": 0}
+        return output, {"enabled": False, "selected_count": 0, "ready_count": 0, **coverage_base}
     targets = {
         str(item.get("venue") or "").upper(): item
         for item in (registry or load_venue_registry()).get("venues", [])
         if isinstance(item.get("intraday"), dict)
     }
+    eligible = [
+        row
+        for row in output
+        if str(row.get("venue") or "").upper() in targets
+        and row.get("market_type") == "spot"
+        and row.get("data_status") == "reachable"
+        and str(row.get("quote") or "").upper() in USD_LIKE_QUOTES
+        and float(row.get("last") or 0.0) > 0
+    ]
+    priority_by_id = {
+        str(row.get("instrument_id") or ""): _strategy_intraday_priority(row, strategy_requirements)
+        for row in eligible
+    }
+    coverage_base["strategy_required_eligible_count"] = sum(
+        1 for priority in priority_by_id.values() if priority > 0
+    )
     ranked = sorted(
-        (
-            row
-            for row in output
-            if str(row.get("venue") or "").upper() in targets
-            and row.get("market_type") == "spot"
-            and row.get("data_status") == "reachable"
-            and str(row.get("quote") or "").upper() in USD_LIKE_QUOTES
-            and float(row.get("last") or 0.0) > 0
+        eligible,
+        key=lambda row: (
+            -priority_by_id.get(str(row.get("instrument_id") or ""), 0),
+            -float(row.get("quote_volume_24h") or 0.0),
+            str(row.get("venue") or ""),
+            str(row.get("instrument_id") or ""),
         ),
-        key=lambda row: float(row.get("quote_volume_24h") or 0.0),
-        reverse=True,
     )
     total_limit = max(0, int(cfg.get("intraday_feature_max_observations", 24)))
     venue_limit = max(1, int(cfg.get("intraday_feature_max_per_venue", 6)))
@@ -8208,11 +8348,35 @@ def enrich_intraday_features(
         features = features_by_id.get(str(row.get("instrument_id") or ""))
         if features:
             row.update(features)
+    status_by_venue: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    for row in selected:
+        venue = str(row.get("venue") or "UNKNOWN")
+        features = features_by_id.get(str(row.get("instrument_id") or ""), {})
+        status_by_venue[venue][str(features.get("microstructure_status") or "unavailable")] += 1
+    coverage_base.update(
+        {
+            "strategy_required_selected_count": sum(
+                1
+                for row in selected
+                if priority_by_id.get(str(row.get("instrument_id") or ""), 0) > 0
+            ),
+            "attempted_count": len(selected),
+            "unavailable_count": sum(
+                1
+                for item in features_by_id.values()
+                if item.get("microstructure_status") != "ready"
+            ),
+            "microstructure_status_by_venue": {
+                venue: dict(counts) for venue, counts in sorted(status_by_venue.items())
+            },
+        }
+    )
     return output, {
         "enabled": True,
         "selected_count": len(selected),
         "ready_count": sum(1 for item in features_by_id.values() if item["microstructure_history_ready"] >= 1),
         "selected_by_venue": dict(venue_counts),
+        **coverage_base,
     }
 
 
@@ -11229,6 +11393,7 @@ def build_scan_batch(
     write_preliminary_report: bool = True,
 ) -> ScanBatch:
     registry = load_venue_registry()
+    strategy_intraday_requirements = _active_strategy_intraday_requirements(conn)
     all_observations = scan_venues(
         settings,
         selected_only=False,
@@ -11241,7 +11406,19 @@ def build_scan_batch(
         if row.get("instrument_id") in (required_inst_ids or set()) and row.get("instrument_id") not in selected_ids:
             observations.append(row)
             selected_ids.add(row.get("instrument_id"))
-    observations, intraday_summary = enrich_intraday_features(observations, settings, registry)
+    for row in all_observations:
+        if (
+            _strategy_intraday_priority(row, strategy_intraday_requirements) > 0
+            and row.get("instrument_id") not in selected_ids
+        ):
+            observations.append(row)
+            selected_ids.add(row.get("instrument_id"))
+    observations, intraday_summary = enrich_intraday_features(
+        observations,
+        settings,
+        registry,
+        strategy_requirements=strategy_intraday_requirements,
+    )
     enriched_by_id = {
         str(row.get("instrument_id")): row
         for row in observations
