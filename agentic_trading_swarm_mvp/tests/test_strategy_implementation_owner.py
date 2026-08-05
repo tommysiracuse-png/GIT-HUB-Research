@@ -338,7 +338,7 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("analyzing", canonical["status"])
         self.assertEqual("repair_runtime_contract", canonical["objective_type"])
-        self.assertEqual(94, canonical["priority"])
+        self.assertEqual(99, canonical["priority"])
         self.assertIn("runtime_contract_mismatch", canonical["dependency_json"])
         self.assertEqual("superseded_duplicate", duplicate["status"])
         self.assertEqual(2, len(result["transitions"]))

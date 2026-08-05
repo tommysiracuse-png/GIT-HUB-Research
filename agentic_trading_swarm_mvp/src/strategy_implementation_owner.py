@@ -1013,7 +1013,7 @@ def monitor_tasks(conn: sqlite3.Connection) -> dict:
             conn.execute(
                 """
                 update strategy_owner_tasks
-                set status='analyzing', objective_type='repair_runtime_contract', priority=max(priority,94),
+                set status='analyzing', objective_type='repair_runtime_contract', priority=max(priority,99),
                     dependency_json=?, next_retry_at=null, claimed_by=null, claimed_pid=null, updated_at=?
                 where task_id=?
                 """,
