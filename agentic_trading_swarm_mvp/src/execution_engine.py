@@ -206,11 +206,25 @@ def _paper_fill_for_leg(leg: dict, settings: dict) -> dict:
 
 
 def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
+    context_loss_quarantine = candidate.get("paper_context_loss_quarantine") or {}
+    context_loss_quarantined = bool(
+        isinstance(context_loss_quarantine, dict)
+        and not context_loss_quarantine.get("paper_fill_allowed", True)
+    )
     if exploration_enabled(settings):
         candidate = prepare_candidate_for_exploration(dict(candidate), settings)
-        candidate["shadow_filtered"] = False
-        candidate["paper_fill_allowed"] = True
-        candidate["paper_entry_blocked"] = False
+        if context_loss_quarantined:
+            candidate["shadow_filtered"] = True
+            candidate["paper_fill_allowed"] = False
+            candidate["paper_entry_blocked"] = True
+            candidate["candidate_reject_reason"] = context_loss_quarantine.get(
+                "reason", "paper_context_loss_quarantine"
+            )
+            candidate["candidate_reject_detail"] = dict(context_loss_quarantine)
+        else:
+            candidate["shadow_filtered"] = False
+            candidate["paper_fill_allowed"] = True
+            candidate["paper_entry_blocked"] = False
     else:
         candidate = apply_frontier_paper_guard(candidate, settings)
         recovery_probe = bool(

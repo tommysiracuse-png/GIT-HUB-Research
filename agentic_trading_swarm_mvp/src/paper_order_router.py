@@ -750,6 +750,40 @@ def _paper_lineage_source_health_reason(
     return None
 
 
+def _paper_context_loss_quarantine_reason(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    if isinstance(config, Mapping):
+        for container in (
+            config,
+            config.get("paper"),
+            config.get("paper_policy"),
+            config.get("strategy_reliability"),
+        ):
+            if isinstance(container, Mapping) and str(
+                container.get("mode")
+                or container.get("runtime_mode")
+                or container.get("execution_mode")
+                or ""
+            ).strip().lower() in {"live", "production", "prod", "real", "broker"}:
+                return None
+    existing = candidate.get("paper_context_loss_quarantine")
+    if isinstance(existing, Mapping) and not _as_bool(existing.get("paper_fill_allowed"), True):
+        return dict(existing)
+    try:
+        from strategy_reliability import paper_context_loss_quarantine_record
+    except Exception:
+        return None
+    try:
+        record = paper_context_loss_quarantine_record(candidate, config=config)
+    except Exception:
+        return None
+    if isinstance(record, Mapping) and not _as_bool(record.get("paper_fill_allowed"), True):
+        return dict(record)
+    return None
+
+
 def _paper_portability_quarantine_reason(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -912,6 +946,23 @@ def frontier_shadow_filter_reason(
                 {
                     "code": lineage_source_health.get("reason"),
                     "field": "lineage_source_health",
+                }
+            ],
+        }
+
+    context_loss_quarantine = _paper_context_loss_quarantine_reason(candidate, config=config)
+    if context_loss_quarantine is not None:
+        return {
+            **context_loss_quarantine,
+            "reason": context_loss_quarantine.get("reason") or "paper_context_loss_quarantine",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "paper_context_loss_quarantine",
+            "candidate": _candidate_reference(candidate),
+            "checks": [
+                {
+                    "code": context_loss_quarantine.get("reason") or "paper_context_loss_quarantine",
+                    "field": "paper_context_loss_quarantine",
                 }
             ],
         }
@@ -1134,6 +1185,7 @@ def _annotate_shadow_filtered_candidate(
     if reason.get("guard") in {
         "yahoo_proxy_cross_surface_alignment_guard",
         "paper_lineage_source_health",
+        "paper_context_loss_quarantine",
         "paper_cross_family_portability_quarantine",
     }:
         guarded["paper_entry_blocked"] = True

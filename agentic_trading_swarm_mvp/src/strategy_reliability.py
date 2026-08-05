@@ -61,6 +61,21 @@ PAPER_MODE_CONFIG_KEYS = (
 )
 PAPER_MODE_VALUES = {"paper", "paper_only", "research", "simulation", "sim", "dry_run", "dryrun", "backtest"}
 LIVE_MODE_VALUES = {"live", "production", "prod", "real", "broker"}
+PAPER_CONTEXT_LOSS_QUARANTINE_POLICY_KEY = "paper_context_loss_quarantine"
+PAPER_CONTEXT_LOSS_QUARANTINE_DEFAULTS = {
+    "enabled": True,
+    "rolling_window_closed_trades": 30,
+    "min_closed_trades": 12,
+    "max_expectancy_bps": 0.0,
+    "max_win_rate": 0.45,
+    "max_tail_average_bps": -20.0,
+    "max_worst_loss_bps": -80.0,
+    "cooldown_hours": 24,
+    "recovery_min_closed_trades": 8,
+    "recovery_min_expectancy_bps": 0.0,
+    "recovery_min_win_rate": 0.50,
+    "recovery_min_tail_average_bps": -20.0,
+}
 PAPER_PORTABILITY_QUARANTINE_FLAG_KEYS = (
     "paper_portability_quarantine_enabled",
     "cross_surface_portability_quarantine_enabled",
@@ -1313,6 +1328,216 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if text in {"0", "false", "f", "no", "n", "off", "disabled"}:
         return False
     return default
+
+
+def _paper_context_loss_policy(config: Mapping[str, Any] | bool | None) -> dict[str, Any]:
+    policy = dict(PAPER_CONTEXT_LOSS_QUARANTINE_DEFAULTS)
+    if isinstance(config, bool):
+        policy["enabled"] = config
+        return policy
+    if not isinstance(config, Mapping):
+        return policy
+    for container in (
+        config,
+        config.get("paper"),
+        config.get("paper_policy"),
+        config.get("strategy_reliability"),
+    ):
+        if isinstance(container, Mapping) and isinstance(
+            container.get(PAPER_CONTEXT_LOSS_QUARANTINE_POLICY_KEY), Mapping
+        ):
+            policy.update(container[PAPER_CONTEXT_LOSS_QUARANTINE_POLICY_KEY])
+    return policy
+
+
+def _paper_context_loss_enabled(config: Mapping[str, Any] | bool | None) -> bool:
+    if isinstance(config, Mapping):
+        for container in (
+            config,
+            config.get("paper"),
+            config.get("paper_policy"),
+            config.get("strategy_reliability"),
+        ):
+            if not isinstance(container, Mapping):
+                continue
+            for key in PAPER_MODE_CONFIG_KEYS:
+                if str(container.get(key) or "").strip().lower() in LIVE_MODE_VALUES:
+                    return False
+    return _as_bool(_paper_context_loss_policy(config).get("enabled"), True)
+
+
+def _paper_context_loss_value(value: Any, default: str = "unknown") -> str:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return text or default
+
+
+def paper_context_loss_key(candidate: Mapping[str, Any]) -> str:
+    """Return the paper-only venue/surface/type/direction evidence key."""
+    asset_surface = (
+        candidate.get("asset_surface")
+        or candidate.get("execution_surface")
+        or candidate.get("market_surface")
+        or candidate.get("market_type")
+        or candidate.get("trade_type")
+    )
+    return "|".join(
+        (
+            _paper_context_loss_value(candidate.get("venue")),
+            _paper_context_loss_value(asset_surface),
+            _paper_context_loss_value(candidate.get("trade_type")),
+            _paper_context_loss_value(candidate.get("direction")),
+        )
+    )
+
+
+def _paper_context_loss_stats(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    key = paper_context_loss_key(candidate)
+    for field in ("paper_context_loss_stats", "paper_context_loss_statistics"):
+        value = candidate.get(field)
+        if not isinstance(value, Mapping):
+            continue
+        if any(name in value for name in ("closed_count", "closed_trades", "sample_size")):
+            return dict(value)
+        scoped = value.get(key)
+        if isinstance(scoped, Mapping):
+            return dict(scoped)
+    policy_stats = _paper_context_loss_policy(config).get("stats_by_context")
+    if isinstance(policy_stats, Mapping):
+        scoped = policy_stats.get(key)
+        if isinstance(scoped, Mapping):
+            return dict(scoped)
+    return None
+
+
+def _paper_context_loss_metric(stats: Mapping[str, Any], *names: str) -> float | None:
+    for name in names:
+        value = stats.get(name)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _paper_context_loss_recovery_passes(stats: Mapping[str, Any] | None, policy: Mapping[str, Any]) -> bool:
+    if not isinstance(stats, Mapping):
+        return False
+    count = _as_int(stats.get("closed_count", stats.get("closed_trades", stats.get("sample_size"))), 0)
+    expectancy = _paper_context_loss_metric(stats, "expectancy_bps", "avg_pnl_bps", "recent_expectancy_bps")
+    win_rate = _paper_context_loss_metric(stats, "win_rate", "recent_win_rate")
+    tail_average = _paper_context_loss_metric(stats, "tail_average_bps", "tail_avg_bps", "average_tail_loss_bps")
+    return bool(
+        count >= max(1, _as_int(policy.get("recovery_min_closed_trades"), 8))
+        and expectancy is not None
+        and expectancy > _as_float(policy.get("recovery_min_expectancy_bps"), 0.0)
+        and win_rate is not None
+        and win_rate >= _as_float(policy.get("recovery_min_win_rate"), 0.50)
+        and tail_average is not None
+        and tail_average >= _as_float(policy.get("recovery_min_tail_average_bps"), -20.0)
+    )
+
+
+def paper_context_loss_quarantine_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    """Evaluate a durable paper-only context quarantine from closed-trade evidence."""
+    if not isinstance(candidate, Mapping) or not _paper_context_loss_enabled(config):
+        return None
+    policy = _paper_context_loss_policy(config)
+    context_key = paper_context_loss_key(candidate)
+    stats = _paper_context_loss_stats(candidate, config=config)
+    state = candidate.get("paper_context_loss_quarantine_state")
+    state = dict(state) if isinstance(state, Mapping) else {}
+    if not isinstance(stats, Mapping):
+        if str(state.get("status") or "").lower() not in {"active", "cooldown"}:
+            return None
+        stats = {}
+
+    closed_count = _as_int(stats.get("closed_count", stats.get("closed_trades", stats.get("sample_size"))), 0)
+    expectancy = _paper_context_loss_metric(stats, "expectancy_bps", "avg_pnl_bps", "recent_expectancy_bps")
+    win_rate = _paper_context_loss_metric(stats, "win_rate", "recent_win_rate")
+    tail_average = _paper_context_loss_metric(stats, "tail_average_bps", "tail_avg_bps", "average_tail_loss_bps")
+    worst_loss = _paper_context_loss_metric(stats, "worst_bps", "worst_loss_bps", "minimum_pnl_bps")
+    tail_negative = bool(
+        (tail_average is not None and tail_average <= _as_float(policy.get("max_tail_average_bps"), -20.0))
+        or (worst_loss is not None and worst_loss <= _as_float(policy.get("max_worst_loss_bps"), -80.0))
+    )
+    failure = bool(
+        closed_count >= max(1, _as_int(policy.get("min_closed_trades"), 12))
+        and expectancy is not None
+        and expectancy < _as_float(policy.get("max_expectancy_bps"), 0.0)
+        and win_rate is not None
+        and win_rate < _as_float(policy.get("max_win_rate"), 0.45)
+        and tail_negative
+    )
+
+    now = dt.datetime.now(dt.timezone.utc)
+    cooldown_complete = _as_bool(stats.get("cooldown_complete"), False)
+    cooldown_until = state.get("cooldown_until")
+    if cooldown_until:
+        try:
+            cooldown_complete = cooldown_complete or dt.datetime.fromisoformat(
+                str(cooldown_until).replace("Z", "+00:00")
+            ) <= now
+        except ValueError:
+            pass
+    recovery = candidate.get("paper_context_recovery_stats")
+    recovery = recovery if isinstance(recovery, Mapping) else stats.get("recovery_stats")
+    active_state = str(state.get("status") or "").lower() in {"active", "cooldown"}
+    recovered = bool(active_state and cooldown_complete and _paper_context_loss_recovery_passes(recovery, policy))
+    quarantined = bool((failure or active_state) and not recovered)
+    if not quarantined and not failure and not active_state:
+        return None
+
+    reason = "paper_context_loss_quarantine" if failure else "paper_context_loss_quarantine_active"
+    if active_state and not cooldown_complete:
+        reason = "paper_context_loss_quarantine_cooldown"
+    if recovered:
+        reason = "paper_context_loss_quarantine_recovered"
+    return {
+        "guard": PAPER_CONTEXT_LOSS_QUARANTINE_POLICY_KEY,
+        "reason": reason,
+        "paper_only": True,
+        "context_key": context_key,
+        "context": {
+            "venue": context_key.split("|")[0],
+            "asset_surface": context_key.split("|")[1],
+            "trade_type": context_key.split("|")[2],
+            "direction": context_key.split("|")[3],
+        },
+        "stats": dict(stats),
+        "state": state,
+        "thresholds": dict(policy),
+        "failure_signature": {
+            "closed_count": closed_count,
+            "expectancy_bps": expectancy,
+            "win_rate": win_rate,
+            "tail_average_bps": tail_average,
+            "worst_loss_bps": worst_loss,
+            "tail_negative": tail_negative,
+        },
+        "quarantined": quarantined,
+        "paper_fill_allowed": not quarantined,
+        "paper_score_eligible": not quarantined,
+        "paper_rank_eligible": not quarantined,
+        "paper_score_multiplier": 0.0 if quarantined else 1.0,
+        "paper_allocation_multiplier": 0.0 if quarantined else 1.0,
+        "promotion_eligible": False,
+        "cooldown_complete": cooldown_complete,
+        "recovery_required": active_state or failure,
+        "recovered": recovered,
+        "state_transition": "released" if recovered else "activate" if failure and not active_state else None,
+        "release_condition": (
+            "After the cooldown, require a new paper sample with positive expectancy, "
+            "acceptable win rate, and acceptable tail losses."
+        ),
+    }
 
 
 def _portability_policy(config: Mapping[str, Any] | bool | None) -> dict[str, Any]:
@@ -3183,6 +3408,196 @@ def _repair_proxy_shock_reversal_candidate(
     )
 
 
+def hydrate_paper_context_loss_statistics(
+    candidates: list[dict],
+    conn: Any | None,
+    config: Mapping[str, Any] | bool | None = None,
+) -> None:
+    """Attach rolling closed-paper evidence and persisted quarantine state."""
+    if conn is None or not _paper_context_loss_enabled(config):
+        return
+    policy = _paper_context_loss_policy(config)
+    keys = {paper_context_loss_key(candidate) for candidate in candidates}
+    if not keys:
+        return
+    grouped: dict[str, list[float]] = collections.defaultdict(list)
+    try:
+        rows = conn.execute(
+            """
+            select venue, direction, trade_type, pnl_bps, candidate_json
+            from paper_trades
+            where status = 'closed' and pnl_bps is not null
+            order by closed_at desc, id desc
+            """
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - optional paper evidence is read-only
+        return
+    for row in rows:
+        try:
+            raw = dict(row)
+        except (TypeError, ValueError):
+            continue
+        try:
+            trade_candidate = json.loads(raw.get("candidate_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            trade_candidate = {}
+        if not isinstance(trade_candidate, Mapping):
+            trade_candidate = {}
+        if str(trade_candidate.get("signal_stats_scope") or "").lower() == "synthetic_research":
+            continue
+        context_candidate = {
+            **trade_candidate,
+            "venue": trade_candidate.get("venue") or raw.get("venue"),
+            "direction": trade_candidate.get("direction") or raw.get("direction"),
+            "trade_type": trade_candidate.get("trade_type") or raw.get("trade_type"),
+        }
+        key = paper_context_loss_key(context_candidate)
+        if key in keys:
+            grouped[key].append(_as_float(raw.get("pnl_bps")))
+
+    window = max(1, _as_int(policy.get("rolling_window_closed_trades"), 30))
+    stats_by_key: dict[str, dict[str, Any]] = {}
+    for key, values in grouped.items():
+        values = values[:window]
+        if not values:
+            continue
+        tail_count = max(1, math.ceil(len(values) * 0.25))
+        worst_values = sorted(values)[:tail_count]
+        stats_by_key[key] = {
+            "closed_count": len(values),
+            "wins": sum(value > 0.0 for value in values),
+            "win_rate": round(sum(value > 0.0 for value in values) / len(values), 6),
+            "expectancy_bps": round(sum(values) / len(values), 6),
+            "tail_average_bps": round(sum(worst_values) / len(worst_values), 6),
+            "worst_bps": round(min(values), 6),
+            "rolling_window_closed_trades": window,
+        }
+    states: dict[str, dict[str, Any]] = {}
+    placeholders = ",".join("?" for _ in keys)
+    try:
+        state_rows = conn.execute(
+            f"""
+            select context_key, status, quarantined_at, cooldown_until,
+                   baseline_closed_count, last_closed_count, evidence_json, updated_at
+            from paper_context_quarantines
+            where context_key in ({placeholders})
+            """,
+            tuple(keys),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - compatible with un-migrated read-only stores
+        state_rows = []
+    for row in state_rows:
+        item = dict(row)
+        try:
+            item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item["evidence"] = {}
+        states[str(item["context_key"])] = item
+    for candidate in candidates:
+        key = paper_context_loss_key(candidate)
+        if key in stats_by_key and not isinstance(candidate.get("paper_context_loss_stats"), Mapping):
+            candidate["paper_context_loss_stats"] = stats_by_key[key]
+        if key in states:
+            candidate["paper_context_loss_quarantine_state"] = states[key]
+
+
+def _persist_paper_context_loss_quarantine(
+    conn: Any | None,
+    record: Mapping[str, Any] | None,
+) -> None:
+    if conn is None or not isinstance(record, Mapping) or not record.get("state_transition"):
+        return
+    context = record.get("context") or {}
+    stats = record.get("stats") or {}
+    state = record.get("state") or {}
+    now = dt.datetime.now(dt.timezone.utc)
+    transition = record["state_transition"]
+    if transition == "released":
+        try:
+            conn.execute(
+                """
+                update paper_context_quarantines
+                set status = 'released', last_closed_count = ?, evidence_json = ?, updated_at = ?
+                where context_key = ?
+                """,
+                (
+                    _as_int(stats.get("closed_count"), 0),
+                    json.dumps(dict(record), sort_keys=True),
+                    now.isoformat(),
+                    record["context_key"],
+                ),
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001 - failure must not weaken the in-memory gate
+            return
+        return
+    cooldown_hours = max(0.0, _as_float((record.get("thresholds") or {}).get("cooldown_hours"), 24.0))
+    cooldown_until = now + dt.timedelta(hours=cooldown_hours)
+    try:
+        conn.execute(
+            """
+            insert into paper_context_quarantines (
+                context_key, venue, asset_surface, trade_type, direction, status,
+                quarantined_at, cooldown_until, baseline_closed_count, last_closed_count,
+                evidence_json, updated_at
+            ) values (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+            on conflict(context_key) do update set
+                status = 'active', cooldown_until = excluded.cooldown_until,
+                last_closed_count = excluded.last_closed_count,
+                evidence_json = excluded.evidence_json, updated_at = excluded.updated_at
+            """,
+            (
+                record["context_key"],
+                context.get("venue", "unknown"),
+                context.get("asset_surface", "unknown"),
+                context.get("trade_type", "unknown"),
+                context.get("direction", "unknown"),
+                state.get("quarantined_at") or now.isoformat(),
+                cooldown_until.isoformat(),
+                _as_int(state.get("baseline_closed_count"), _as_int(stats.get("closed_count"), 0)),
+                _as_int(stats.get("closed_count"), 0),
+                json.dumps(dict(record), sort_keys=True),
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 - failure must not weaken the in-memory gate
+        return
+
+
+def _apply_context_loss_quarantine(
+    candidate: dict,
+    config: Mapping[str, Any] | bool | None = None,
+    conn: Any | None = None,
+) -> dict | None:
+    record = paper_context_loss_quarantine_record(candidate, config=config)
+    if record is None:
+        return None
+    candidate["paper_context_loss_quarantine"] = dict(record)
+    _persist_paper_context_loss_quarantine(conn, record)
+    if not record["quarantined"]:
+        return None
+    pre_quarantine_score = _as_float(candidate.get("score"), 0.0)
+    reliability = _annotate(
+        candidate,
+        profile="paper_context_loss_quarantine",
+        action="context_loss_quarantine_shadow_only",
+        reasons=[record["reason"]],
+        allocation_multiplier=0.0,
+        shadow_only=True,
+    )
+    candidate["pre_context_loss_quarantine_score"] = pre_quarantine_score
+    candidate["score"] = 0.0
+    candidate["paper_score_multiplier"] = 0.0
+    candidate["paper_score_eligible"] = False
+    candidate["paper_rank_eligible"] = False
+    candidate["paper_fill_allowed"] = False
+    candidate["promotion_eligible"] = False
+    candidate["candidate_reject_reason"] = record["reason"]
+    reliability["paper_context_loss_quarantine"] = dict(record)
+    return reliability
+
+
 def _apply_family_quarantine(
     candidate: dict,
     config: Mapping[str, Any] | bool | None = None,
@@ -3322,8 +3737,12 @@ def _apply_portability_quarantine(
 def _apply_one(
     candidate: dict,
     config: Mapping[str, Any] | bool | None = None,
+    conn: Any | None = None,
 ) -> dict | None:
     _record_proxy_short_quality(candidate, config)
+    context_loss_quarantine = _apply_context_loss_quarantine(candidate, config=config, conn=conn)
+    if context_loss_quarantine is not None:
+        return context_loss_quarantine
     portability_quarantine = _apply_portability_quarantine(candidate, config=config)
     if portability_quarantine is not None:
         return portability_quarantine
@@ -3360,6 +3779,9 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
     lineage_source_health_guarded = sum(
         1 for item in items if item.get("profile") == "lineage_source_health_guard"
     )
+    context_loss_quarantined = sum(
+        1 for item in items if item.get("profile") == "paper_context_loss_quarantine"
+    )
     by_quality_failure = collections.Counter(
         reason
         for candidate in candidates
@@ -3372,6 +3794,7 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         "family_quarantine_count": quarantined,
         "portability_quarantine_count": portability_quarantined,
         "lineage_source_health_guard_count": lineage_source_health_guarded,
+        "context_loss_quarantine_count": context_loss_quarantined,
         "by_quality_failure": dict(by_quality_failure),
         "protected_working_slice_count": protected,
         "by_action": dict(by_action),
@@ -3567,6 +3990,7 @@ def apply_strategy_reliability(
 
     hydrate_paper_lineage_source_health(candidates, conn)
     _hydrate_portability_paper_evidence(candidates, conn)
+    hydrate_paper_context_loss_statistics(candidates, conn, settings)
     for candidate in candidates:
         _remove_invalid_proxy_confirmation(candidate)
         _record_proxy_short_quality(candidate, settings)
@@ -3576,6 +4000,7 @@ def apply_strategy_reliability(
             for candidate in candidates
             for record in [
                 _apply_portability_quarantine(candidate, config=settings)
+                or _apply_context_loss_quarantine(candidate, config=settings, conn=conn)
                 or _apply_family_quarantine(candidate, config=settings)
                 or _apply_lineage_source_health(candidate, config=settings)
             ]
@@ -3591,7 +4016,7 @@ def apply_strategy_reliability(
 
     adjusted = []
     for candidate in candidates:
-        reliability = _apply_one(candidate, config=settings)
+        reliability = _apply_one(candidate, config=settings, conn=conn)
         if reliability:
             adjusted.append(reliability)
     candidates.sort(key=lambda row: row.get("score", 0), reverse=True)

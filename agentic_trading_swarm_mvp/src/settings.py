@@ -56,6 +56,20 @@ DEFAULT_SETTINGS = {
     "paper_route_registry": {
         "enabled": True,
     },
+    "paper_context_loss_quarantine": {
+        "enabled": True,
+        "rolling_window_closed_trades": 30,
+        "min_closed_trades": 12,
+        "max_expectancy_bps": 0.0,
+        "max_win_rate": 0.45,
+        "max_tail_average_bps": -20.0,
+        "max_worst_loss_bps": -80.0,
+        "cooldown_hours": 24,
+        "recovery_min_closed_trades": 8,
+        "recovery_min_expectancy_bps": 0.0,
+        "recovery_min_win_rate": 0.50,
+        "recovery_min_tail_average_bps": -20.0,
+    },
     "paper_context_cost_floor": {
         "enabled": True,
         "min_net_edge_buffer_bps": 2.0,
