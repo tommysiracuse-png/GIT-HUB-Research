@@ -2558,6 +2558,34 @@ def _runtime_universe_contract_mismatch(
     }
 
 
+def _runtime_entry_invalidation_contract_mismatch(
+    feasibility: dict,
+    program_diagnostic: dict,
+    generated_candidate_count: int,
+) -> dict | None:
+    """Detect contracts whose invalidation rule cancels every valid entry."""
+
+    entry_candidate_count = int(feasibility.get("candidate_count") or 0)
+    invalidated_candidate_count = int(
+        (program_diagnostic.get("reject_reasons") or {}).get(
+            "invalidation_expression_true", 0
+        )
+    )
+    if (
+        generated_candidate_count != 0
+        or entry_candidate_count <= 0
+        or invalidated_candidate_count < entry_candidate_count
+    ):
+        return None
+    return {
+        "repairable": True,
+        "reason": "entry_invalidation_overlap",
+        "entry_candidate_count": entry_candidate_count,
+        "invalidated_candidate_count": invalidated_candidate_count,
+        "owner_objective": "repair_runtime_contract",
+    }
+
+
 def _runtime_contract_program(feasibility: dict, raw_logic: dict) -> dict:
     """Keep contract diagnosis independent from transient profiler payloads."""
 
@@ -2745,6 +2773,13 @@ def generate_strategy_lab_candidates(
                 observation_frames,
                 program_diagnostic,
                 feasibility,
+            )
+            runtime_contract_mismatch = runtime_contract_mismatch or (
+                _runtime_entry_invalidation_contract_mismatch(
+                    feasibility,
+                    program_diagnostic,
+                    len(program_candidates),
+                )
             )
             compatible_program_candidates: list[dict] = []
             for candidate in program_candidates:

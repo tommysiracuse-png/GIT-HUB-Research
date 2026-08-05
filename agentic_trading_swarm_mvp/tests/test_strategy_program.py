@@ -21,6 +21,7 @@ from strategy_lab import (  # noqa: E402
     _observation_program_inputs,
     _queue_promotion,
     _runtime_contract_program,
+    _runtime_entry_invalidation_contract_mismatch,
     _runtime_universe_contract_mismatch,
     generate_strategy_lab_candidates,
     ingest_strategy_lab_recommendation,
@@ -553,6 +554,49 @@ class StrategyProgramTests(unittest.TestCase):
 
         self.assertTrue(mismatch["repairable"])
         self.assertEqual("market_type", mismatch["mismatches"][0]["runtime_field"])
+
+    def test_entry_invalidation_overlap_routes_contract_to_repair(self) -> None:
+        cfg = settings()
+        logic = program_logic()
+        logic["entry_expression"] = "quality_score >= 60"
+        logic["invalidation_expression"] = "quality_score >= 60"
+        logic["long_expression"] = "quality_score >= 60"
+        recommendation = lab_recommendation("entry_invalidation_overlap_v1", logic)
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [observation(100.0, now.isoformat())],
+            )
+            row = conn.execute(
+                "select status, evaluation_json from strategy_lab_experiments where strategy_lab_id = ?",
+                ("entry_invalidation_overlap_v1",),
+            ).fetchone()
+
+        self.assertEqual([], generated)
+        self.assertEqual("needs_contract_revision", row["status"])
+        self.assertEqual(
+            "needs_contract_revision",
+            report["status_by_experiment"]["entry_invalidation_overlap_v1"],
+        )
+        mismatch = json.loads(row["evaluation_json"])["generation_diagnostic"][
+            "runtime_contract_mismatch"
+        ]
+        self.assertEqual("entry_invalidation_overlap", mismatch["reason"])
+        self.assertTrue(mismatch["repairable"])
+        self.assertEqual("repair_runtime_contract", mismatch["owner_objective"])
+
+    def test_partial_invalidation_is_not_a_contract_mismatch(self) -> None:
+        mismatch = _runtime_entry_invalidation_contract_mismatch(
+            {"candidate_count": 3},
+            {"reject_reasons": {"invalidation_expression_true": 2}},
+            0,
+        )
+        self.assertIsNone(mismatch)
 
     def test_universe_repair_is_not_hidden_by_missing_expression_features(self) -> None:
         mismatch = _runtime_universe_contract_mismatch(
