@@ -47,6 +47,31 @@ def fake_chart(symbol: str, *args: object, **kwargs: object) -> dict:
 
 
 class GlobalMarketDiscoveryScannerTests(unittest.TestCase):
+    def test_short_proxy_route_tags_unverified_borrow_without_suppression(self) -> None:
+        requirements = scanner._route_requirements_packet(
+            {
+                "route_blockers": ["broker_route", "venue_api_access"],
+                "route_requirements": {
+                    "fee_tiers": {"taker_fee_bps": 4.0, "evidence_source": "public_fee_page"}
+                },
+            },
+            venue="CME_GROUP",
+            inst_id="CME_GROUP:SPY",
+            direction="short_proxy",
+            proxy_symbol="SPY",
+        )
+
+        self.assertEqual(requirements["borrow_availability"]["status"], "unknown")
+        self.assertTrue(requirements["borrow_availability"]["required_for_direct_route"])
+        self.assertTrue(requirements["margin_constraints"]["short_or_levered_route"])
+        self.assertEqual(requirements["fee_tiers"]["taker_fee_bps"], 4.0)
+        self.assertEqual(requirements["fee_tiers"]["evidence_source"], "public_fee_page")
+        self.assertEqual(
+            requirements["venue_permissions"]["unresolved_blockers"],
+            ["broker_route", "venue_api_access"],
+        )
+        self.assertFalse(requirements["suppression_eligible"])
+
     def test_latest_report_does_not_hide_durable_discovery_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_report = scanner.RESEARCH_REPORT_JSON
@@ -207,10 +232,26 @@ class GlobalMarketDiscoveryScannerTests(unittest.TestCase):
                 self.assertGreater(first["proxy_depth_notional_usd"], 0.0)
                 self.assertEqual(first["proxy_depth_basis"], "recent_traded_notional")
                 self.assertEqual(first["proxy_venue_health_status"], "healthy")
+                requirements = first["route_requirements"]
+                self.assertEqual(requirements["schema_version"], "paper_route_requirements.v1")
+                self.assertTrue(requirements["paper_only"])
+                self.assertFalse(requirements["suppression_eligible"])
+                self.assertEqual(requirements["paper_ranking_action"], "tag_route_requirements")
+                self.assertEqual(
+                    set(requirements["categories"]),
+                    set(scanner.ROUTE_REQUIREMENT_CATEGORIES),
+                )
+                self.assertEqual(requirements["venue_permissions"]["status"], "unknown")
+                self.assertEqual(requirements["borrow_availability"]["status"], "not_applicable")
+                self.assertEqual(requirements["margin_constraints"]["status"], "unknown")
+                self.assertEqual(requirements["fee_tiers"]["status"], "unknown")
+                self.assertEqual(requirements["api_product_access"]["status"], "public_data_only")
+                self.assertEqual(requirements["settlement_custody_constraints"]["status"], "unknown")
                 self.assertTrue(any(row["inst_id"] == first["inst_id"] for row in batch.observations))
                 self.assertTrue(scanner.REPORT_JSON.exists())
                 report = json.loads(scanner.REPORT_JSON.read_text(encoding="utf-8"))
                 self.assertGreater(report["summary"]["priceable_candidates"], 0)
+                self.assertIn("route_requirements", report["candidates"][0])
             finally:
                 scanner.RESEARCH_REPORT_JSON = old_report
                 scanner.DISCOVERY_JSONL = old_jsonl
@@ -265,6 +306,10 @@ class GlobalMarketDiscoveryScannerTests(unittest.TestCase):
 
                 self.assertEqual(len(batch.candidates), 1)
                 self.assertEqual(batch.candidates[0]["direction"], "watch_only")
+                requirements = batch.candidates[0]["route_requirements"]
+                self.assertEqual(requirements["route_kind"], "unpriced_discovery")
+                self.assertFalse(requirements["suppression_eligible"])
+                self.assertEqual(requirements["api_product_access"]["status"], "public_data_only")
                 self.assertEqual(batch.observations, [])
                 self.assertEqual(batch.metadata["global_market_discovery_scan"]["watch_only_candidates"], 1)
             finally:

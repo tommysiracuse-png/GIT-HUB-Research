@@ -38,6 +38,19 @@ REPORT_JSON = RUNS_DIR / "global_market_discovery_scan_latest.json"
 REPORT_MD = RUNS_DIR / "global_market_discovery_scan_report.md"
 
 
+# These packets deliberately describe what has *not* been verified for a
+# discovered route. They are attached before ranking so paper consumers do not
+# mistake public-price discovery for broker capability.
+ROUTE_REQUIREMENT_CATEGORIES = (
+    "venue_permissions",
+    "borrow_availability",
+    "margin_constraints",
+    "fee_tiers",
+    "api_product_access",
+    "settlement_custody_constraints",
+)
+
+
 DEFAULT_PROXY_MAP: dict[str, list[dict[str, Any]]] = {
     "Australian Securities Exchange": [
         {"symbol": "EWA", "label": "Australia ETF proxy", "surface": "equity_index_proxy"},
@@ -477,6 +490,118 @@ def _venue_key(venue: str) -> str:
     )
 
 
+def _string_list(value: Any) -> list[str]:
+    """Return a stable list for public discovery metadata fields."""
+
+    if value is None:
+        return []
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple, set)):
+        return [str(values)]
+    return list(dict.fromkeys(str(item) for item in values if item not in (None, "")))
+
+
+def _requirement_packet_entry(default: dict[str, Any], supplied: Any) -> dict[str, Any]:
+    """Merge public requirement hints without upgrading unknown evidence."""
+
+    entry = dict(default)
+    if isinstance(supplied, dict):
+        entry.update(supplied)
+    elif supplied not in (None, ""):
+        entry["discovery_hint"] = str(supplied)
+    return entry
+
+
+def _route_requirements_packet(
+    discovery: dict[str, Any],
+    *,
+    venue: str,
+    inst_id: str,
+    direction: str,
+    proxy_symbol: str | None = None,
+) -> dict[str, Any]:
+    """Build a paper-only route-requirements packet for a discovery candidate.
+
+    A public proxy quote makes a paper observation priceable; it does not
+    confirm venue permissions, broker access, or settlement capability.  The
+    packet keeps those direct-route requirements explicit without blocking a
+    priceable paper experiment merely because they remain unverified.
+    """
+
+    supplied = discovery.get("route_requirements")
+    supplied = supplied if isinstance(supplied, dict) else {}
+    blockers = _string_list(discovery.get("route_blockers"))
+    short_route = str(direction or "").lower().startswith("short")
+    source = "public_discovery_metadata"
+    categories = {
+        "venue_permissions": {
+            "status": "unknown",
+            "required_for_direct_route": True,
+            "permissions": ["venue_or_broker_access", "jurisdiction_eligibility"],
+            "unresolved_blockers": [
+                blocker
+                for blocker in blockers
+                if blocker in {"broker_route", "venue_api_access", "jurisdiction_eligibility"}
+            ],
+            "evidence_source": source,
+        },
+        "borrow_availability": {
+            "status": "unknown" if short_route else "not_applicable",
+            "required_for_direct_route": short_route,
+            "asset_or_instrument": inst_id,
+            "paper_assumption": (
+                "synthetic_paper_proxy_does_not_confirm_borrow"
+                if short_route
+                else "not_required_for_long_proxy_observation"
+            ),
+            "evidence_source": source,
+        },
+        "margin_constraints": {
+            "status": "unknown",
+            "required_for_direct_route": "unknown",
+            "short_or_levered_route": short_route,
+            "evidence_source": source,
+        },
+        "fee_tiers": {
+            "status": "unknown",
+            "maker_fee_bps": "unknown",
+            "taker_fee_bps": "unknown",
+            "tier_or_schedule": "unverified",
+            "evidence_source": source,
+        },
+        "api_product_access": {
+            "status": "public_data_only",
+            "direct_order_api_status": "unknown",
+            "required_product": "venue_or_broker_execution_product",
+            "proxy_market_data_symbol": proxy_symbol or "not_applicable",
+            "credentials_collected": False,
+            "evidence_source": source,
+        },
+        "settlement_custody_constraints": {
+            "status": "unknown",
+            "settlement_cycle": "unknown",
+            "custody_or_clearing_route": "unknown",
+            "required_for_direct_route": True,
+            "evidence_source": source,
+        },
+    }
+    packet = {
+        "schema_version": "paper_route_requirements.v1",
+        "paper_only": True,
+        "route_kind": "synthetic_paper_proxy" if proxy_symbol else "unpriced_discovery",
+        "venue": venue,
+        "inst_id": inst_id,
+        "direct_route_status": "unverified",
+        "paper_ranking_action": "tag_route_requirements",
+        "suppression_eligible": False,
+        "unresolved_route_blockers": blockers,
+        "categories": list(ROUTE_REQUIREMENT_CATEGORIES),
+    }
+    for category in ROUTE_REQUIREMENT_CATEGORIES:
+        packet[category] = _requirement_packet_entry(categories[category], supplied.get(category))
+    return packet
+
+
 def _stale_minutes(last_seen: dt.datetime) -> float:
     return max(0.0, (dt.datetime.now(dt.timezone.utc) - last_seen).total_seconds() / 60.0)
 
@@ -724,6 +849,13 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
         "surface_type_classified": discovery.get("surface_type_classified"),
         "recommended_next_action": discovery.get("recommended_next_action"),
         "route_blockers": discovery.get("route_blockers", []),
+        "route_requirements": _route_requirements_packet(
+            discovery,
+            venue=_venue_key(venue),
+            inst_id=inst_id,
+            direction=direction,
+            proxy_symbol=symbol,
+        ),
         "risk_notes": [
             "paper-trade only",
             "uses a public Yahoo-priced proxy for the discovered global market surface",
@@ -744,11 +876,13 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
 
 def _watch_only_candidate(discovery: dict[str, Any]) -> dict[str, Any]:
     venue = str(discovery.get("venue_or_source") or "unknown")
+    venue_key = _venue_key(venue)
+    inst_id = f"{venue_key}:{discovery.get('candidate_id', 'watch')}"
     return {
         "seen_at": _utc_now(),
-        "venue": _venue_key(venue),
+        "venue": venue_key,
         "venue_display_name": venue,
-        "inst_id": f"{_venue_key(venue)}:{discovery.get('candidate_id', 'watch')}",
+        "inst_id": inst_id,
         "name": f"{venue} watch-only global discovery",
         "region": discovery.get("region", "Global"),
         "country": discovery.get("country", "unknown"),
@@ -768,7 +902,7 @@ def _watch_only_candidate(discovery: dict[str, Any]) -> dict[str, Any]:
         "spread_bps": 999.0,
         "stale_minutes": 999.0,
         "score": min(35.0, float(discovery.get("priority") or 0.0) / 3.0),
-        "market_key": f"global_discovery|{_venue_key(venue)}",
+        "market_key": f"global_discovery|{venue_key}",
         "discovery_candidate_id": discovery.get("candidate_id"),
         "discovery_priority": int(discovery.get("priority") or 0),
         "discovery_confidence": float(discovery.get("confidence") or 0.0),
@@ -776,6 +910,12 @@ def _watch_only_candidate(discovery: dict[str, Any]) -> dict[str, Any]:
         "surface_type_classified": discovery.get("surface_type_classified"),
         "recommended_next_action": discovery.get("recommended_next_action"),
         "route_blockers": discovery.get("route_blockers", []),
+        "route_requirements": _route_requirements_packet(
+            discovery,
+            venue=venue_key,
+            inst_id=inst_id,
+            direction="watch_only",
+        ),
         "candidate_reject_reason": "global_discovery_unpriced_watch_only",
         "risk_notes": [
             "watch-only global discovery",
