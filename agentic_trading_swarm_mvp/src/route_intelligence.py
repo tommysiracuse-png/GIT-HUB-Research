@@ -34,6 +34,7 @@ ROUTE_REQUIREMENT_FIELDS = (
     "borrow_fee_bps_estimate_or_unknown",
     "margin_required",
     "venue_api_requirement",
+    "endpoint_constraints",
     "jurisdiction_requirement",
     "fee_bps_per_side_or_unknown",
     "slippage_bps_per_side_or_unknown",
@@ -86,8 +87,9 @@ def build_route_requirements_matrix(
 
     rows = []
     for opportunity in opportunities:
-        row = _build_route_requirement_row(opportunity)
-        rows.append(_annotate_route_feasibility_fields(opportunity, row))
+        normalized = _route_requirement_opportunity(opportunity)
+        row = _build_route_requirement_row(normalized)
+        rows.append(_annotate_route_feasibility_fields(normalized, row))
     return sorted(rows, key=_route_priority_key)
 
 
@@ -99,6 +101,16 @@ def build_route_requirements_report(
     opportunities = list(opportunities)
     return {
         "paper_only": True,
+        "read_only": True,
+        "report_scope": "pre_promotion_route_requirements",
+        "promotion_review": {
+            "required_before_route_promotion": True,
+            "mode": "report_only",
+            "rule": (
+                "Review permission, borrow, fee, margin, and endpoint constraints "
+                "before promoting a route; this report does not change promotion or execution state."
+            ),
+        },
         "safety_constraints": list(PAPER_ONLY_CONSTRAINTS),
         "fields": list(ROUTE_REQUIREMENT_FIELDS),
         "routes": build_route_requirements_matrix(opportunities),
@@ -1064,7 +1076,7 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
         "route_status": route_status,
         "route_blockers": blockers,
         "required_account_type": "; ".join(account_requirements) if account_requirements else UNKNOWN,
-        "required_permissions": _required_permissions(requirement_flags),
+        "required_permissions": _route_required_permissions(opportunity, requirement_flags),
         "borrow_required": borrow_required,
         "borrow_asset": _borrow_asset(inst_id) if borrow_required else "not_applicable",
         "borrow_fee_bps_estimate_or_unknown": _first_known(
@@ -1075,6 +1087,7 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
         ),
         "margin_required": _margin_required(opportunity, borrow_required),
         "venue_api_requirement": _venue_api_requirement(blockers),
+        "endpoint_constraints": _endpoint_constraints(opportunity, blockers),
         "jurisdiction_requirement": _jurisdiction_requirement(blockers),
         "fee_bps_per_side_or_unknown": _first_known(
             opportunity,
@@ -1414,10 +1427,42 @@ def _required_permissions(blockers: list[str]) -> list[str]:
     return permissions or [UNKNOWN]
 
 
+def _route_required_permissions(opportunity: dict[str, Any], blockers: list[str]) -> Any:
+    """Prefer the resolver's explicit permission list when it is available."""
+
+    explicit = opportunity.get("required_permissions")
+    if explicit not in (None, "", [], {}):
+        return explicit
+    return _required_permissions(blockers)
+
+
 def _venue_api_requirement(blockers: list[str]) -> str:
     if "venue_api_access" in blockers:
         return "external_venue_api_access_confirmation_required_no_credentials_stored"
     return "not_required_for_paper_report"
+
+
+def _endpoint_constraints(opportunity: dict[str, Any], blockers: list[str]) -> Any:
+    """Describe known endpoint limits without probing or calling an endpoint."""
+
+    explicit = _first_known(
+        opportunity,
+        "endpoint_constraints",
+        "api_endpoint_constraints",
+        "order_endpoint_constraints",
+        "endpoint_status",
+    )
+    if explicit != UNKNOWN:
+        return explicit
+
+    api_access_status = str(opportunity.get("api_access_status") or "").strip().lower()
+    if api_access_status == "public_data_only":
+        return "public_data_only_private_or_order_endpoint_unconfirmed"
+    if api_access_status in {"unknown", "not_checked"}:
+        return "endpoint_availability_unknown"
+    if "venue_api_access" in blockers:
+        return "venue_trade_endpoint_access_unconfirmed"
+    return "public_market_data_only"
 
 
 def _jurisdiction_requirement(blockers: list[str]) -> str:
@@ -1437,6 +1482,45 @@ def _first_known(opportunity: dict[str, Any], *keys: str) -> Any:
         if key in opportunity and opportunity[key] not in (None, ""):
             return opportunity[key]
     return UNKNOWN
+
+
+def _route_requirement_opportunity(opportunity: dict[str, Any]) -> dict[str, Any]:
+    """Flatten resolver metadata for a report without changing the candidate.
+
+    The resolver intentionally stores its route decision in nested packets so
+    execution consumers have a single authoritative object.  Reports need the
+    same constraints at the top level to make them visible before promotion.
+    This copy-only projection never mutates the supplied candidate or route.
+    """
+
+    normalized = dict(opportunity)
+    route = opportunity.get("execution_route")
+    feasibility = opportunity.get("execution_feasibility")
+    route = route if isinstance(route, dict) else {}
+    feasibility = feasibility if isinstance(feasibility, dict) else {}
+
+    for key in (
+        "route_status",
+        "required_permissions",
+        "borrow_required",
+        "margin_required",
+        "api_access_status",
+        "fee_model_status",
+        "route_id",
+    ):
+        if normalized.get(key) in (None, "", [], {}):
+            value = route.get(key, feasibility.get(key))
+            if value not in (None, "", [], {}):
+                normalized[key] = value
+
+    if normalized.get("route_blockers") in (None, "", [], {}):
+        blockers = route.get("missing_permissions") or route.get("route_blockers")
+        if not blockers:
+            blockers = feasibility.get("route_blockers") or feasibility.get("missing_requirements")
+        if blockers:
+            normalized["route_blockers"] = blockers
+
+    return normalized
 
 
 def _markdown_value(value: Any) -> str:

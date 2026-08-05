@@ -19,6 +19,11 @@ from paper_context_cost import annotate_paper_context_cost
 from paper_route_registry import apply_paper_route_registry
 
 try:
+    from route_intelligence import build_route_requirements_report
+except ModuleNotFoundError:  # pragma: no cover - package import fallback
+    from .route_intelligence import build_route_requirements_report
+
+try:
     from storage import RUNS_DIR
 except ModuleNotFoundError:  # pragma: no cover - fallback for isolated test imports
     from src.storage import RUNS_DIR
@@ -2691,7 +2696,57 @@ def _do_nothing_consequence(blocker: str) -> str:
     return consequences.get(blocker, "The system continues shadow testing without route activation.")
 
 
-def _route_intelligence_markdown(report: dict) -> str:
+def _route_requirements_intel_markdown(requirements_intel: dict) -> list[str]:
+    """Render the pre-promotion constraint block for paper reports only."""
+
+    promotion_review = requirements_intel.get("promotion_review") or {}
+    fields = (
+        "venue",
+        "inst_id",
+        "direction",
+        "required_permissions",
+        "borrow_required",
+        "borrow_fee_bps_estimate_or_unknown",
+        "fee_bps_per_side_or_unknown",
+        "margin_required",
+        "endpoint_constraints",
+        "venue_api_requirement",
+        "paper_recommendation_action",
+    )
+    lines = [
+        "## Pre-Promotion Route Requirements Intel",
+        "",
+        "Read-only paper-report block. It does not collect credentials, probe private endpoints, change route permissions, or promote a route.",
+        (
+            "- Review required before route promotion: "
+            f"`{promotion_review.get('required_before_route_promotion', False)}`"
+        ),
+        f"- Rule: {promotion_review.get('rule', 'unknown')}",
+        "",
+        "| " + " | ".join(fields) + " |",
+        "| " + " | ".join("---" for _ in fields) + " |",
+    ]
+    routes = requirements_intel.get("routes") or []
+    if not routes:
+        lines.append("| " + " | ".join("unknown" for _ in fields) + " |")
+    for route in routes:
+        lines.append(
+            "| "
+            + " | ".join(_report_markdown_value(route.get(field, "unknown")) for field in fields)
+            + " |"
+        )
+    return lines
+
+
+def _report_markdown_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, set)):
+        value = ", ".join(str(item) for item in value) if value else "unknown"
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _route_intelligence_markdown(report: dict, requirements_intel: dict | None = None) -> str:
     lines = [
         "# Route Intelligence Report",
         "",
@@ -2734,6 +2789,8 @@ def _route_intelligence_markdown(report: dict) -> str:
         )
         lines.append(f"  - manual action: {item.get('required_manual_action')}")
         lines.append(f"  - do nothing: {item.get('do_nothing_consequence')}")
+    if requirements_intel is not None:
+        lines.extend(["", *_route_requirements_intel_markdown(requirements_intel)])
     return "\n".join(lines) + "\n"
 
 
@@ -2741,12 +2798,14 @@ def write_route_resolver_report(candidates: list[dict], settings: dict, limit: i
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     considered = candidates[:limit]
     summary = summarize_routes(considered)
+    requirements_intel = build_route_requirements_report(considered)
     report = {
         "generated_at": _utc_now(),
         "mode": settings.get("mode"),
         "live_trading_allowed": bool(settings.get("allow_live_trading", False)),
         "summary": summary,
         "route_intelligence": summarize_route_intelligence(considered),
+        "route_requirements_intel": requirements_intel,
         "routes_registry": str(CUSTOM_ROUTES_PATH if CUSTOM_ROUTES_PATH.exists() else EXAMPLE_ROUTES_PATH),
         "hard_limits": [
             "Read-only resolver; no broker API actions are performed.",
@@ -2756,8 +2815,15 @@ def write_route_resolver_report(candidates: list[dict], settings: dict, limit: i
     }
     REPORT_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
     REPORT_MD.write_text(_markdown(report), encoding="utf-8")
-    ROUTE_INTELLIGENCE_JSON.write_text(json.dumps(report["route_intelligence"], indent=2), encoding="utf-8")
-    ROUTE_INTELLIGENCE_MD.write_text(_route_intelligence_markdown(report["route_intelligence"]), encoding="utf-8")
+    intelligence_sidecar = {
+        **report["route_intelligence"],
+        "route_requirements_intel": requirements_intel,
+    }
+    ROUTE_INTELLIGENCE_JSON.write_text(json.dumps(intelligence_sidecar, indent=2), encoding="utf-8")
+    ROUTE_INTELLIGENCE_MD.write_text(
+        _route_intelligence_markdown(report["route_intelligence"], requirements_intel),
+        encoding="utf-8",
+    )
     return report
 
 
@@ -2833,6 +2899,7 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Blockers: `{intelligence.get('blocker_counts', {})}`")
     lines.append(f"- Spot-borrow assets: `{intelligence.get('spot_borrow_assets', {})}`")
     lines.append(f"- Human route decision pack: `{intelligence.get('route_decision_pack', {})}`")
+    lines.extend(["", *_route_requirements_intel_markdown(report.get("route_requirements_intel", {}))])
     for status in ("conditional", "route_unknown", "blocked", "standard"):
         lines.extend(["", f"## {status.replace('_', ' ').title()} Samples", ""])
         samples = summary.get("samples", {}).get(status, [])

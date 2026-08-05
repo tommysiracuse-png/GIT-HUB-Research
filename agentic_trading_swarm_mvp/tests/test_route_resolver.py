@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import pathlib
 import sys
 import tempfile
@@ -225,6 +226,11 @@ class RouteResolverTests(unittest.TestCase):
             route_resolver.ROUTE_INTELLIGENCE_MD = pathlib.Path(tmp) / "route_intel.md"
             try:
                 report = route_resolver.write_route_resolver_report(candidates, settings())
+                primary_markdown = route_resolver.REPORT_MD.read_text(encoding="utf-8")
+                intelligence_markdown = route_resolver.ROUTE_INTELLIGENCE_MD.read_text(encoding="utf-8")
+                intelligence_sidecar = json.loads(
+                    route_resolver.ROUTE_INTELLIGENCE_JSON.read_text(encoding="utf-8")
+                )
             finally:
                 route_resolver.REPORT_JSON = old_json
                 route_resolver.REPORT_MD = old_md
@@ -245,6 +251,25 @@ class RouteResolverTests(unittest.TestCase):
             report["route_intelligence"]["route_decision_pack"]["spot_borrow"]["route_feasibility"],
             "potentially_executable_after_borrow_or_margin_route_confirmation",
         )
+        requirements_intel = report["route_requirements_intel"]
+        self.assertTrue(requirements_intel["paper_only"])
+        self.assertTrue(requirements_intel["promotion_review"]["required_before_route_promotion"])
+        self.assertEqual("report_only", requirements_intel["promotion_review"]["mode"])
+        short_spot = next(
+            row
+            for row in requirements_intel["routes"]
+            if row["direction"] == "long_perp_short_spot"
+        )
+        self.assertIn("spot_borrow", short_spot["route_blockers"])
+        self.assertTrue(short_spot["borrow_required"])
+        self.assertTrue(short_spot["margin_required"])
+        self.assertEqual(
+            "public_data_only_private_or_order_endpoint_unconfirmed",
+            short_spot["endpoint_constraints"],
+        )
+        self.assertIn("Pre-Promotion Route Requirements Intel", primary_markdown)
+        self.assertIn("Pre-Promotion Route Requirements Intel", intelligence_markdown)
+        self.assertIn("route_requirements_intel", intelligence_sidecar)
 
     def test_route_intelligence_is_read_only_and_ranks_blockers(self) -> None:
         candidates = route_resolver.enrich_candidates(
