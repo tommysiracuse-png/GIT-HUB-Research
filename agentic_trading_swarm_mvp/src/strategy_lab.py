@@ -2484,11 +2484,9 @@ def _runtime_universe_contract_mismatch(
 ) -> dict | None:
     """Describe a compiled universe contract that cannot match available rows."""
 
-    reject_reasons = program_diagnostic.get("reject_reasons") or {}
     if (
         not observation_frames
         or int(feasibility.get("universe_match_count") or 0) != 0
-        or set(reject_reasons) != {"universe_mismatch"}
         or program_diagnostic.get("missing_features")
     ):
         return None

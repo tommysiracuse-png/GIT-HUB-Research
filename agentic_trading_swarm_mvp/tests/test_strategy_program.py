@@ -20,6 +20,7 @@ from storage import init_db  # noqa: E402
 from strategy_lab import (  # noqa: E402
     _observation_program_inputs,
     _queue_promotion,
+    _runtime_universe_contract_mismatch,
     generate_strategy_lab_candidates,
     ingest_strategy_lab_recommendation,
 )
@@ -540,6 +541,17 @@ class StrategyProgramTests(unittest.TestCase):
         )
         self.assertEqual(["PERP"], market_type["required_values"])
         self.assertEqual(["<MISSING>"], market_type["observed_values"])
+
+    def test_contract_repair_uses_feasibility_when_generator_diagnostic_is_empty(self) -> None:
+        mismatch = _runtime_universe_contract_mismatch(
+            {"universe": {"venues": ["OKX"], "market_types": ["perp"]}},
+            [{"venue": "OKX", "market_type": None}],
+            {},
+            {"feasibility_status": "missing_surface_data", "universe_match_count": 0},
+        )
+
+        self.assertTrue(mismatch["repairable"])
+        self.assertEqual("market_type", mismatch["mismatches"][0]["runtime_field"])
 
     def test_program_input_join_does_not_copy_cached_route_eligibility(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
