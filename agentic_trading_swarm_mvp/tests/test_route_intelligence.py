@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 
 from route_intelligence import (  # noqa: E402
     ROUTE_REQUIREMENT_FIELDS,
+    build_candidate_route_requirement_summary,
     build_conditional_short_route_intelligence,
     build_conditional_short_route_diagnostics,
     build_frontier_short_spot_route_intelligence,
@@ -205,6 +206,50 @@ class RouteIntelligenceTests(unittest.TestCase):
         self.assertFalse(row["paper_sizing_guidance"]["routing_decision_changed"])
         self.assertTrue(row["guard_value_measurement"]["enabled"])
         self.assertFalse(annotation["guard_value_measurement"]["routing_decision_changed"])
+
+    def test_candidate_summary_exposes_all_required_route_fields_without_suppression(self) -> None:
+        opportunity = {
+            "venue": "OKX",
+            "inst_id": "OKX:ARC-USDT",
+            "direction": "long_perp_short_spot",
+            "route_status": "conditional",
+            "route_blockers": ["spot_borrow"],
+            "required_permissions": ["crypto_derivatives", "spot_borrow"],
+            "borrow_available": "unknown",
+            "borrow_fee_bps_estimate": 12.5,
+            "maker_fee_bps": 1.0,
+            "taker_fee_bps": 3.0,
+            "margin_required": True,
+            "margin_mode": "isolated",
+            "api_access_status": "public_data_only",
+            "freshness_state": "fresh",
+            "freshness_age_seconds": 4.0,
+        }
+
+        row = build_route_requirements_matrix([opportunity])[0]
+        summary = build_candidate_route_requirement_summary(opportunity, row=row)
+
+        self.assertTrue(summary["paper_only"])
+        self.assertTrue(summary["read_only"])
+        self.assertTrue(summary["candidate_remains_priceable"])
+        self.assertFalse(summary["routing_decision_changed"])
+        self.assertEqual("OKX", summary["candidate"]["venue"])
+        self.assertIn(
+            "spot_borrow",
+            summary["broker_venue_eligibility"]["required_permissions"],
+        )
+        self.assertEqual(
+            "unconfirmed",
+            summary["short_borrow_availability"]["availability_status"],
+        )
+        self.assertEqual("isolated", summary["margin_mode"]["mode"])
+        self.assertEqual(3.0, summary["fee_estimate"]["taker_bps"])
+        self.assertEqual(
+            "public_data_only",
+            summary["api_entitlement"]["entitlement_status"],
+        )
+        self.assertEqual("fresh", summary["freshness"]["state"])
+        self.assertEqual(4.0, summary["freshness"]["age_seconds"])
 
     def test_spot_borrow_routes_are_paper_only_prioritized_with_unknowns(self) -> None:
         rows = build_route_requirements_matrix(

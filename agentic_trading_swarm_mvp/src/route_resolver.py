@@ -2075,6 +2075,9 @@ def enrich_candidate_with_route(
     route["conditional_short_route_diagnostics"] = conditional_short_diagnostics
     route["route_requirements_panel"] = route_requirements_annotation
     route["paper_route_requirement_report"] = paper_route_requirement_report
+    route["paper_route_requirement_summary"] = route_requirements_annotation[
+        "route_requirement_summary"
+    ]
     route["frontier_short_spot_route_intelligence"] = frontier_short_spot_route_intelligence
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
@@ -2135,6 +2138,9 @@ def enrich_candidate_with_route(
             "conditional_short_route_diagnostics": conditional_short_diagnostics,
             "route_requirements_panel": route_requirements_annotation,
             "paper_route_requirement_report": paper_route_requirement_report,
+            "paper_route_requirement_summary": route_requirements_annotation[
+                "route_requirement_summary"
+            ],
             "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
         }
     )
@@ -2163,6 +2169,9 @@ def enrich_candidate_with_route(
     # candidate/route facts on every enrichment pass and is the common source
     # for route-aware ranking and sizing.
     enriched["paper_route_requirement_report"] = paper_route_requirement_report
+    enriched["paper_route_requirement_summary"] = route_requirements_annotation[
+        "route_requirement_summary"
+    ]
     enriched["frontier_short_spot_route_intelligence"] = frontier_short_spot_route_intelligence
     enriched["route_validation_status"] = frontier_short_spot_route_intelligence["route_validation_status"]
     enriched["route_validation_notes"] = list(frontier_short_spot_route_intelligence["route_validation_notes"])
@@ -2943,6 +2952,44 @@ def _route_requirements_intel_markdown(requirements_intel: dict) -> list[str]:
             + " | ".join(_report_markdown_value(route.get(field, "unknown")) for field in fields)
             + " |"
         )
+    summary_fields = (
+        "broker_venue_eligibility",
+        "short_borrow_availability",
+        "margin_mode",
+        "fee_estimate",
+        "api_entitlement",
+        "freshness",
+    )
+    lines.extend(
+        [
+            "",
+            "## Candidate Route Requirement Summary",
+            "",
+            "Per-candidate paper-only route facts for ranking and guard-value measurement. "
+            "Unknown values remain observable and never suppress a priceable paper candidate.",
+            "",
+            "| venue | inst_id | direction | " + " | ".join(summary_fields) + " |",
+            "| " + " | ".join("---" for _ in range(3 + len(summary_fields))) + " |",
+        ]
+    )
+    if not routes:
+        lines.append("| " + " | ".join("unknown" for _ in range(3 + len(summary_fields))) + " |")
+    for route in routes:
+        summary = route.get("route_requirement_summary")
+        summary = summary if isinstance(summary, dict) else {}
+        lines.append(
+            "| "
+            + " | ".join(
+                _report_markdown_value(value)
+                for value in (
+                    route.get("venue", "unknown"),
+                    route.get("inst_id", "unknown"),
+                    route.get("direction", "unknown"),
+                    *(summary.get(field, "unknown") for field in summary_fields),
+                )
+            )
+            + " |"
+        )
     return lines
 
 
@@ -2951,6 +2998,8 @@ def _report_markdown_value(value: object) -> str:
         return "true" if value else "false"
     if isinstance(value, (list, tuple, set)):
         value = ", ".join(str(item) for item in value) if value else "unknown"
+    if isinstance(value, dict):
+        value = json.dumps(value, sort_keys=True, separators=(",", ":"))
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 

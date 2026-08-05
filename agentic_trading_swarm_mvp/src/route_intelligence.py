@@ -82,6 +82,7 @@ ROUTE_REQUIREMENT_FIELDS = (
     "route_validation_notes",
     "freshness_latency_status",
     "freshness_latency_notes",
+    "route_requirement_summary",
 )
 
 # These are the route facts that an opportunity report must carry forward to a
@@ -320,6 +321,10 @@ def build_route_requirements_matrix(
                 "freshness_latency_notes": frontier_intelligence["freshness_latency_notes"],
             }
         )
+        annotated["route_requirement_summary"] = build_candidate_route_requirement_summary(
+            normalized,
+            row=annotated,
+        )
         rows.append(annotated)
     return sorted(rows, key=_route_priority_key)
 
@@ -362,6 +367,18 @@ def build_route_requirements_annotation(opportunity: dict[str, Any]) -> dict[str
         "route_validation_notes": frontier_intelligence["route_validation_notes"],
         "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
         "freshness_latency_notes": frontier_intelligence["freshness_latency_notes"],
+        "route_requirement_summary": build_candidate_route_requirement_summary(
+            normalized,
+            row={
+                **annotated,
+                **panel,
+                "frontier_short_spot_route_intelligence": frontier_intelligence,
+                "route_validation_status": frontier_intelligence["route_validation_status"],
+                "route_validation_notes": frontier_intelligence["route_validation_notes"],
+                "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
+                "freshness_latency_notes": frontier_intelligence["freshness_latency_notes"],
+            },
+        ),
     }
 
 
@@ -568,6 +585,15 @@ def build_paper_route_requirement_report(
         annotation=panel,
         diagnostics=diagnostics,
     )
+    route_requirement_summary = panel.get("route_requirement_summary")
+    if not isinstance(route_requirement_summary, dict):
+        route_requirement_summary = build_candidate_route_requirement_summary(
+            source,
+            row={
+                **panel,
+                "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
+            },
+        )
     return {
         "report_version": "paper_route_requirements_v1",
         "paper_only": True,
@@ -582,6 +608,7 @@ def build_paper_route_requirement_report(
         "paper_allocation_multiplier": rank_multiplier,
         "paper_sizing_guidance": sizing_guidance,
         "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
+        "route_requirement_summary": route_requirement_summary,
         "hard_blocking": False,
         "entry_blocked": False,
         "routing_decision_changed": False,
@@ -744,12 +771,104 @@ def _route_fact_status(value: Any, *, required: bool, unresolved: bool) -> str:
     return str(value)
 
 
+def build_candidate_route_requirement_summary(
+    opportunity: dict[str, Any],
+    *,
+    row: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the six route facts every paper candidate report must display.
+
+    The summary is a read-only projection of observed and maintained route
+    metadata.  In particular, an unknown entitlement, borrow fact, fee, or
+    freshness observation stays visible for paper ranking and guard-value
+    measurement; it cannot suppress the candidate or alter routing.
+    """
+
+    source = dict(opportunity or {})
+    facts = dict(row or {})
+    diagnostics = facts.get("conditional_short_route_diagnostics")
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    frontier = facts.get("frontier_short_spot_route_intelligence")
+    frontier = frontier if isinstance(frontier, dict) else {}
+    fee_stack = facts.get("fee_stack_bps_estimate_or_unknown")
+    fee_stack = fee_stack if isinstance(fee_stack, dict) else {}
+    freshness_notes = facts.get("freshness_latency_notes")
+    if not isinstance(freshness_notes, list):
+        freshness_notes = _freshness_latency_notes(source)["notes"]
+
+    maker_fee = facts.get("maker_fee_bps_or_unknown", diagnostics.get("maker_taker_fee_stack_bps", {}).get("maker_bps", UNKNOWN))
+    taker_fee = facts.get("taker_fee_bps_or_unknown", diagnostics.get("maker_taker_fee_stack_bps", {}).get("taker_bps", UNKNOWN))
+    round_trip_taker_fee = fee_stack.get(
+        "estimated_round_trip_taker_bps",
+        diagnostics.get("maker_taker_fee_stack_bps", {}).get("estimated_round_trip_taker_bps", UNKNOWN),
+    )
+    api_status = facts.get("api_route_status", diagnostics.get("api_route_status", _first_known(source, "api_access_status", "venue_api_status")))
+    borrow_status = facts.get(
+        "borrow_availability_status",
+        diagnostics.get("borrow_availability", _first_known(source, "borrow_availability_status", "borrow_available", "borrowable")),
+    )
+    margin_mode = facts.get("margin_mode", diagnostics.get("margin_mode", _first_known(source, "margin_mode", "margin_account_mode")))
+    freshness_status = facts.get("freshness_latency_status", frontier.get("freshness_latency_status", _freshness_latency_notes(source)["status"]))
+
+    return {
+        "summary_version": "paper_route_requirement_summary_v1",
+        "paper_only": True,
+        "read_only": True,
+        "non_blocking": True,
+        "candidate_remains_priceable": True,
+        "use": "paper_ranking_and_guard_value_measurement_only",
+        "routing_decision_changed": False,
+        "candidate": {
+            "venue": facts.get("venue", _venue(source)),
+            "inst_id": facts.get("inst_id", source.get("inst_id") or UNKNOWN),
+            "direction": facts.get("direction", source.get("direction") or UNKNOWN),
+        },
+        "broker_venue_eligibility": {
+            "route_status": facts.get("route_status", source.get("route_status") or UNKNOWN),
+            "broker_permission_status": facts.get("broker_permission_status", UNKNOWN),
+            "required_permissions": facts.get("required_permissions", _first_known(source, "required_permissions")),
+            "route_blockers": facts.get("route_blockers", _route_blockers(source)),
+        },
+        "short_borrow_availability": {
+            "short_required": bool(facts.get("requires_spot_borrow") or facts.get("borrow_required")),
+            "borrow_required": bool(facts.get("borrow_required")),
+            "borrow_asset": facts.get("borrow_asset", UNKNOWN),
+            "availability_status": borrow_status,
+            "borrow_fee_bps_estimate": facts.get("borrow_fee_bps_estimate_or_unknown", UNKNOWN),
+        },
+        "margin_mode": {
+            "required": facts.get("margin_required", _first_known(source, "margin_required")),
+            "mode": margin_mode,
+        },
+        "fee_estimate": {
+            "maker_bps": maker_fee,
+            "taker_bps": taker_fee,
+            "estimated_round_trip_taker_bps": round_trip_taker_fee,
+            "route_cost_bps_paper": facts.get("route_cost_bps_paper", UNKNOWN),
+        },
+        "api_entitlement": {
+            "venue_api_requirement": facts.get("venue_api_requirement", UNKNOWN),
+            "entitlement_status": api_status,
+            "path_readiness": facts.get("api_path_readiness", UNKNOWN),
+            "endpoint_constraints": facts.get("endpoint_constraints", UNKNOWN),
+        },
+        "freshness": {
+            "status": freshness_status,
+            "state": _first_known(source, "freshness_state", "data_freshness_state"),
+            "age_seconds": _first_known(source, "freshness_age_seconds", "data_age_seconds"),
+            "notes": list(freshness_notes),
+            "stale_flags": list(facts.get("stale_data_flags") or []),
+        },
+    }
+
+
 def build_route_requirements_report(
     opportunities: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
     """Return a JSON-serializable paper-only route requirements report."""
 
     opportunities = list(opportunities)
+    routes = build_route_requirements_matrix(opportunities)
     return {
         "paper_only": True,
         "read_only": True,
@@ -774,7 +893,15 @@ def build_route_requirements_report(
         },
         "safety_constraints": list(PAPER_ONLY_CONSTRAINTS),
         "fields": list(ROUTE_REQUIREMENT_FIELDS),
-        "routes": build_route_requirements_matrix(opportunities),
+        "routes": routes,
+        # A stable, concise view for report consumers.  It repeats no routing
+        # decision and is deliberately suitable only for paper ranking and
+        # counterfactual guard-value measurement.
+        "candidate_route_requirement_summaries": [
+            dict(row["route_requirement_summary"])
+            for row in routes
+            if isinstance(row.get("route_requirement_summary"), dict)
+        ],
         "playbook_summary": build_route_playbook_summary(opportunities),
         "paper_feasibility_summary": build_route_feasibility_summary(opportunities),
     }

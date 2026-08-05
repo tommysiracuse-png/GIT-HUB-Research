@@ -457,6 +457,22 @@ class RouteResolverTests(unittest.TestCase):
         self.assertIn("guard_value_measurement", intelligence_markdown)
         self.assertIn("route_requirement_gaps", short_spot)
         self.assertIn("route_requirements_intel", intelligence_sidecar)
+        self.assertEqual(
+            requirements_intel["candidate_route_requirement_summaries"],
+            [row["route_requirement_summary"] for row in requirements_intel["routes"]],
+        )
+        summary = short_spot["route_requirement_summary"]
+        self.assertTrue(summary["paper_only"])
+        self.assertTrue(summary["candidate_remains_priceable"])
+        self.assertFalse(summary["routing_decision_changed"])
+        self.assertIn("broker_venue_eligibility", summary)
+        self.assertIn("short_borrow_availability", summary)
+        self.assertIn("margin_mode", summary)
+        self.assertIn("fee_estimate", summary)
+        self.assertIn("api_entitlement", summary)
+        self.assertIn("freshness", summary)
+        self.assertIn("Candidate Route Requirement Summary", primary_markdown)
+        self.assertIn("Candidate Route Requirement Summary", intelligence_markdown)
 
     def test_route_intelligence_is_read_only_and_ranks_blockers(self) -> None:
         candidates = route_resolver.enrich_candidates(
