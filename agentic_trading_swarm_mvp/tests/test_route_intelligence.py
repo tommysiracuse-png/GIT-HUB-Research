@@ -141,6 +141,27 @@ class RouteIntelligenceTests(unittest.TestCase):
         self.assertIn("route_validation_status", markdown)
         self.assertIn("needs route validation", markdown)
 
+    def test_raw_frontier_short_matrix_uses_maintained_venue_status_without_a_route_probe(self) -> None:
+        rows = build_route_requirements_matrix(
+            [
+                {
+                    "venue": venue,
+                    "inst_id": f"{venue}:BTC-USDT",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "direction": "short_frontier_spot",
+                }
+                for venue in ("MEXC", "VALR")
+            ]
+        )
+
+        self.assertEqual(2, len(rows))
+        for row in rows:
+            report = row["frontier_short_spot_route_requirements_report"]
+            self.assertTrue(report["paper_only"])
+            self.assertTrue(report["prepared_before_ranking_and_sizing"])
+            self.assertEqual("unsupported", report["per_venue_status"]["status"])
+            self.assertFalse(report["entry_blocked"])
+
     def test_short_proxy_report_is_non_blocking_and_supplies_rank_and_size(self) -> None:
         report = build_paper_route_requirement_report(
             {

@@ -64,6 +64,16 @@
       "reason": "Spot borrow and instrument-level margin eligibility are not confirmed for the paper route."
     },
     {
+      "venue": "VALR",
+      "trade_type": "frontier_crypto_venue_map",
+      "direction": "short_frontier_spot",
+      "support_status": "unsupported",
+      "required_permissions": ["crypto_spot", "margin_spot", "spot_short", "spot_borrow"],
+      "required_account_modes": ["margin"],
+      "estimated_cost_bps": {"fee_round_trip": null, "slippage_round_trip": 12.0, "borrow": null},
+      "reason": "The maintained VALR public paper route has no confirmed margin, spot-short, or borrow path."
+    },
+    {
       "venue": "LUNO",
       "trade_type": "frontier_crypto_venue_map",
       "direction": "short_frontier_spot",

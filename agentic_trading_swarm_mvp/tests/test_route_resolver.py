@@ -108,6 +108,40 @@ class RouteResolverTests(unittest.TestCase):
             enriched["execution_route"]["frontier_short_spot_route_intelligence"],
         )
 
+    def test_frontier_short_route_requirements_report_is_ready_before_ranking_for_mexc_and_valr(self) -> None:
+        for venue in ("MEXC", "VALR"):
+            with self.subTest(venue=venue):
+                enriched = route_resolver.enrich_candidate_with_route(
+                    {
+                        "venue": venue,
+                        "inst_id": f"{venue}:BTC-USDT",
+                        "trade_type": "frontier_crypto_venue_map",
+                        "direction": "short_frontier_spot",
+                        "asset_class": "crypto_spot",
+                        "score": 80.0,
+                        "freshness_state": "fresh",
+                        "freshness_age_seconds": 3.0,
+                        "latency_ms": 12.0,
+                    },
+                    settings(),
+                )
+
+                report = enriched["frontier_short_spot_route_requirements_report"]
+                self.assertTrue(report["paper_only"])
+                self.assertTrue(report["prepared_before_ranking_and_sizing"])
+                self.assertEqual("unsupported", report["per_venue_status"]["status"])
+                self.assertEqual("unavailable", report["borrow_availability"])
+                self.assertEqual("unsupported", report["margin_eligibility"]["mode"])
+                self.assertEqual("unconfirmed", report["api_connectivity"]["status"])
+                self.assertEqual("observed", report["route_freshness"]["status"])
+                self.assertIn("maker_fee_bps", report["fee_tiers"])
+                self.assertFalse(report["entry_blocked"])
+                self.assertFalse(enriched.get("paper_entry_blocked", False))
+                self.assertEqual(
+                    report,
+                    enriched["execution_route"]["frontier_short_spot_route_requirements_report"],
+                )
+
     def test_enrichment_tags_requirements_gaps_without_changing_route_decision(self) -> None:
         candidate = {
             "venue": "OKX",

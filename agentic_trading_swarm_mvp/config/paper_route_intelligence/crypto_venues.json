@@ -84,6 +84,22 @@
     "estimated_maker_fee_bps": 2,
     "api_execution_confidence": 0.84
   },
+  "VALR": {
+    "supports_spot_short": false,
+    "supports_margin_spot": false,
+    "supports_borrow_check": false,
+    "supports_basis_path": false,
+    "supports_spot_long": true,
+    "supports_spot_short_margin": false,
+    "margin_supported": false,
+    "borrow_supported": false,
+    "supports_perpetuals": false,
+    "supports_basis_carry": false,
+    "requires_borrow": true,
+    "borrow_fee_known": false,
+    "estimated_taker_fee_bps": null,
+    "estimated_maker_fee_bps": null
+  },
   "BINANCE_US": {
     "supports_spot_short": false,
     "supports_margin_spot": false,

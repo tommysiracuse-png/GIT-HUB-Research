@@ -10,6 +10,11 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable
 
+try:  # Support both direct ``src`` imports and package-style imports.
+    from paper_route_registry import assess_paper_route_registry
+except ModuleNotFoundError:  # pragma: no cover - package import fallback
+    from .paper_route_registry import assess_paper_route_registry
+
 
 UNKNOWN = "unknown"
 
@@ -78,6 +83,7 @@ ROUTE_REQUIREMENT_FIELDS = (
     "paper_sizing_guidance",
     "guard_value_measurement",
     "frontier_short_spot_route_intelligence",
+    "frontier_short_spot_route_requirements_report",
     "route_validation_status",
     "route_validation_notes",
     "freshness_latency_status",
@@ -189,6 +195,14 @@ def build_conditional_short_route_intelligence(
         borrow_raw = resolved_route.get("borrow_status", UNKNOWN)
     if str(borrow_raw).strip().lower() in {"required_unconfirmed", "not_checked"}:
         borrow_raw = "unconfirmed"
+    # A direct route that did not itself require borrow is not evidence that a
+    # frontier spot short has no borrow requirement.  Preserve that gap as an
+    # unconfirmed paper diagnostic instead of misreporting it as not required.
+    if borrow_required and str(borrow_raw).strip().lower() in {
+        "not_required",
+        "not_applicable",
+    }:
+        borrow_raw = UNKNOWN
     borrow_availability = _route_fact_status(
         borrow_raw,
         required=borrow_required,
@@ -483,9 +497,15 @@ def build_route_requirements_matrix(
             annotation=panel,
             diagnostics=diagnostics,
         )
+        frontier_requirements_report = _frontier_short_spot_route_requirements_report(
+            normalized,
+            {},
+            frontier_intelligence,
+        )
         annotated.update(
             {
                 "frontier_short_spot_route_intelligence": frontier_intelligence,
+                "frontier_short_spot_route_requirements_report": frontier_requirements_report,
                 "route_validation_status": frontier_intelligence["route_validation_status"],
                 "route_validation_notes": frontier_intelligence["route_validation_notes"],
                 "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
@@ -531,9 +551,15 @@ def build_route_requirements_annotation(opportunity: dict[str, Any]) -> dict[str
         annotation=panel,
         diagnostics=diagnostics,
     )
+    frontier_requirements_report = _frontier_short_spot_route_requirements_report(
+        normalized,
+        {},
+        frontier_intelligence,
+    )
     return {
         **panel,
         "frontier_short_spot_route_intelligence": frontier_intelligence,
+        "frontier_short_spot_route_requirements_report": frontier_requirements_report,
         "route_validation_status": frontier_intelligence["route_validation_status"],
         "route_validation_notes": frontier_intelligence["route_validation_notes"],
         "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
@@ -756,6 +782,11 @@ def build_paper_route_requirement_report(
         annotation=panel,
         diagnostics=diagnostics,
     )
+    frontier_short_spot_route_requirements_report = _frontier_short_spot_route_requirements_report(
+        source,
+        resolved_route,
+        frontier_short_spot_route_intelligence,
+    )
     route_requirement_summary = panel.get("route_requirement_summary")
     if not isinstance(route_requirement_summary, dict):
         route_requirement_summary = build_candidate_route_requirement_summary(
@@ -779,6 +810,7 @@ def build_paper_route_requirement_report(
         "paper_allocation_multiplier": rank_multiplier,
         "paper_sizing_guidance": sizing_guidance,
         "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
+        "frontier_short_spot_route_requirements_report": frontier_short_spot_route_requirements_report,
         "route_requirement_summary": route_requirement_summary,
         "hard_blocking": False,
         "entry_blocked": False,
@@ -840,6 +872,11 @@ def build_frontier_short_spot_route_intelligence(
         "broker_permission_status": broker_permission_status,
         "borrow_availability": route_diagnostics.get("borrow_availability", UNKNOWN),
         "fee_estimates": fee_estimates,
+        "margin_required": bool(
+            resolved_route.get("margin_required")
+            or source.get("margin_required")
+            or direction == "short_frontier_spot"
+        ),
         "margin_mode": route_diagnostics.get("margin_mode", UNKNOWN),
         "api_route_status": route_diagnostics.get("api_route_status", UNKNOWN),
     }
@@ -881,6 +918,90 @@ def build_frontier_short_spot_route_intelligence(
         "missing_route_metadata": missing_route_metadata,
         "route_validation_status": validation_status,
         "route_validation_notes": validation_notes,
+        "hard_blocking": False,
+        "entry_blocked": False,
+        "routing_decision_changed": False,
+    }
+
+
+def _frontier_short_spot_route_requirements_report(
+    source: dict[str, Any],
+    route: dict[str, Any],
+    intelligence: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the stable pre-ranking route snapshot for one frontier short.
+
+    The snapshot deliberately reflects only metadata already on the paper
+    candidate or its resolved paper route.  In particular, ``api_connectivity``
+    is a reported API-path state, not an API probe, and every unknown remains a
+    non-blocking diagnostic.
+    """
+
+    registry = source.get("paper_route_registry")
+    registry = registry if isinstance(registry, dict) else {}
+    registry_status = str(
+        registry.get("support_status")
+        or source.get("paper_route_registry_status")
+        or UNKNOWN
+    ).strip().lower()
+    if registry_status == UNKNOWN:
+        # Batch reports can be built directly from scanner output before the
+        # resolver has attached its registry annotation.  Consult the same
+        # read-only paper registry here so venue status remains visible in
+        # that pre-enrichment reporting path as well.
+        registry_status = str(
+            assess_paper_route_registry(source).get("support_status") or UNKNOWN
+        ).strip().lower()
+    resolved_status = str(
+        route.get("route_status") or source.get("route_status") or UNKNOWN
+    ).strip().lower()
+    venue_status = registry_status if registry_status != UNKNOWN else resolved_status
+    api_status = intelligence.get("api_route_status", UNKNOWN)
+    margin_mode = intelligence.get("margin_mode", UNKNOWN)
+    freshness_status = intelligence.get("freshness_latency_status", UNKNOWN)
+    fee_estimates = dict(intelligence.get("fee_estimates") or {})
+    return {
+        "report_version": "frontier_short_spot_route_requirements_v1",
+        "paper_only": True,
+        "read_only": True,
+        "prepared_before_ranking_and_sizing": True,
+        "applies": bool(intelligence.get("applies")),
+        "candidate": {
+            "venue": str(source.get("venue") or route.get("venue") or UNKNOWN),
+            "inst_id": str(source.get("inst_id") or route.get("inst_id") or UNKNOWN),
+            "direction": str(source.get("direction") or route.get("direction") or UNKNOWN),
+        },
+        "per_venue_status": {
+            "status": venue_status,
+            "registry_status": registry_status,
+            "resolved_route_status": resolved_status,
+            "capability_profile": str(
+                (source.get("venue_capabilities") or {}).get("capability_profile")
+                if isinstance(source.get("venue_capabilities"), dict)
+                else UNKNOWN
+            ),
+        },
+        "borrow_availability": intelligence.get("borrow_availability", UNKNOWN),
+        "fee_tiers": fee_estimates,
+        "margin_eligibility": {
+            "required": bool(intelligence.get("margin_required")),
+            "mode": margin_mode,
+        },
+        "api_connectivity": {
+            "status": api_status,
+            "path_readiness": (
+                "unconfirmed"
+                if str(api_status).lower() in {UNKNOWN, "public_data_only", "not_checked", "unconfirmed"}
+                else "unavailable"
+                if str(api_status).lower() in {"unavailable", "unsupported", "missing", "blocked"}
+                else "observed"
+            ),
+            "probe_performed": False,
+        },
+        "route_freshness": {
+            "status": freshness_status,
+            "notes": list(intelligence.get("freshness_latency_notes") or []),
+        },
         "hard_blocking": False,
         "entry_blocked": False,
         "routing_decision_changed": False,

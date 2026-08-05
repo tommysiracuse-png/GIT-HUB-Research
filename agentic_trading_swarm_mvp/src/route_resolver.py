@@ -2085,6 +2085,9 @@ def enrich_candidate_with_route(
     frontier_short_spot_route_intelligence = dict(
         paper_route_requirement_report["frontier_short_spot_route_intelligence"]
     )
+    frontier_short_spot_route_requirements_report = dict(
+        paper_route_requirement_report["frontier_short_spot_route_requirements_report"]
+    )
     eligibility = _conditional_short_paper_observation_eligibility(
         eligibility,
         conditional_short_route_intelligence,
@@ -2101,6 +2104,7 @@ def enrich_candidate_with_route(
         "route_requirement_summary"
     ]
     route["frontier_short_spot_route_intelligence"] = frontier_short_spot_route_intelligence
+    route["frontier_short_spot_route_requirements_report"] = frontier_short_spot_route_requirements_report
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
     route["paper_route_registry"] = enriched["paper_route_registry"]
@@ -2164,6 +2168,7 @@ def enrich_candidate_with_route(
                 "route_requirement_summary"
             ],
             "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
+            "frontier_short_spot_route_requirements_report": frontier_short_spot_route_requirements_report,
             "route_requirement_extraction": route["route_requirement_extraction"],
             "route_recommendation_status": route["route_recommendation_status"],
             "route_actionability": route["route_actionability"],
@@ -2205,6 +2210,7 @@ def enrich_candidate_with_route(
         "route_requirement_summary"
     ]
     enriched["frontier_short_spot_route_intelligence"] = frontier_short_spot_route_intelligence
+    enriched["frontier_short_spot_route_requirements_report"] = frontier_short_spot_route_requirements_report
     enriched["route_validation_status"] = frontier_short_spot_route_intelligence["route_validation_status"]
     enriched["route_validation_notes"] = list(frontier_short_spot_route_intelligence["route_validation_notes"])
     # Read-only candidate tags for paper sizing and route-guard value
