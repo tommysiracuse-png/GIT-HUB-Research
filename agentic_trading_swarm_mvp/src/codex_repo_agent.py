@@ -206,6 +206,7 @@ _API_QUOTA_MARKERS = (
     "insufficient_quota",
     "billing_hard_limit_reached",
     "exceeded your current quota",
+    "you have no credits remaining",
     "credit balance",
     "quota has been exceeded",
 )

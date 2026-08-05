@@ -169,7 +169,14 @@ class CodexRepoAgentTests(unittest.TestCase):
         quota = subprocess.CompletedProcess(
             ["codex"],
             1,
-            stdout=json.dumps({"type": "error", "message": "429 insufficient_quota"}),
+            stdout=json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "message": "stream disconnected before completion: You have no credits remaining. Add credits to continue using the API."
+                    },
+                }
+            ),
             stderr="",
         )
         events = "\n".join(
