@@ -2492,6 +2492,22 @@ def _observation_program_inputs(
                     embedded[field] = source[field]
         if embedded:
             row["candidate"] = embedded
+        # Raw frontier observations deliberately remain provider-native, while
+        # the Strategy Lab program contract groups paper-only spot candidates
+        # under the frontier venue-map trade type.  Supply that contract label
+        # here only when the raw row has no explicit type and its own or joined
+        # candidate metadata unambiguously identifies crypto spot.  This keeps
+        # observation-program evaluation broad without rewriting scanner data
+        # or changing explicitly typed/non-spot observations.
+        if not str(row.get("trade_type") or "").strip():
+            market_type = str(
+                row.get("market_type") or embedded.get("market_type") or ""
+            ).strip().lower()
+            asset_class = str(
+                row.get("asset_class") or embedded.get("asset_class") or ""
+            ).strip().lower()
+            if market_type == "spot" and asset_class in {"crypto", "crypto_spot"}:
+                row["trade_type"] = "frontier_crypto_venue_map"
         rows.append(row)
     return rows
 

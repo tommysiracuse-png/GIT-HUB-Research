@@ -684,6 +684,135 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertNotIn("hedge_venue", embedded)
         self.assertNotIn("paper_leg_mapping_valid", embedded)
 
+    def test_program_inputs_normalize_only_untyped_crypto_spot_rows(self) -> None:
+        rows = _observation_program_inputs(
+            [
+                {
+                    "venue": "OKX_SPOT",
+                    "inst_id": "OKX_SPOT:BTC-USDT",
+                    "market_type": "spot",
+                    "asset_class": "crypto_spot",
+                    "last": 100.0,
+                },
+                {
+                    "venue": "OKX",
+                    "inst_id": "OKX:BTC-USDT-SWAP",
+                    "market_type": "perp",
+                    "asset_class": "crypto_derivatives",
+                    "last": 100.0,
+                },
+                {
+                    "venue": "FIXTURE",
+                    "inst_id": "FIXTURE:BTC-USDT",
+                    "market_type": "spot",
+                    "asset_class": "crypto_spot",
+                    "trade_type": "explicit_fixture_type",
+                    "last": 100.0,
+                },
+            ],
+            [],
+        )
+
+        self.assertEqual("frontier_crypto_venue_map", rows[0]["trade_type"])
+        self.assertNotIn("trade_type", rows[1])
+        self.assertEqual("explicit_fixture_type", rows[2]["trade_type"])
+
+    def test_untyped_crypto_spot_panic_program_emits_paper_long_candidate(self) -> None:
+        cfg = settings()
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        logic = {
+            "type": "observation_program",
+            "universe": {
+                "asset_classes": ["crypto_spot"],
+                "market_types": ["spot"],
+                "trade_types": ["frontier_crypto_venue_map"],
+                "quotes": ["USDT"],
+            },
+            "calculated_features": {
+                "shock_sigma": "-return_60m_bps / max(volatility_60m_bps, 10)",
+                "recovery_slope": "return_1m_bps - return_5m_bps / 5",
+                "cost_adjusted_snapback": "max(0, min(-return_15m_bps, 150) - 2 * spread_bps)",
+            },
+            "direction": "long",
+            "entry_expression": (
+                "microstructure_history_ready >= 1 and shock_sigma >= 1.5 "
+                "and price_zscore_60m <= -1.25 and return_15m_bps <= -40 "
+                "and return_60m_bps >= -500 and return_60m_bps <= -25 "
+                "and return_1m_bps > 0 and return_5m_bps > 0 and recovery_slope > 0 "
+                "and relative_volume_1m_60m >= 1.5 and spread_bps <= 8 "
+                "and liquidity_score >= 0.65 and quality_score >= 60 and stale_minutes <= 2"
+            ),
+            "invalidation_expression": (
+                "return_1m_bps <= -20 or spread_bps > 12 or return_60m_bps < -650 "
+                "or price_zscore_60m > 0.5"
+            ),
+            "edge_expression": "cost_adjusted_snapback",
+            "score_expression": "clip(40 + 10 * shock_sigma + recovery_slope - spread_bps, 0, 100)",
+            "route_surface": "spot",
+        }
+        recommendation = {
+            "recommendation_id": "rec_frontier_spot_input_contract",
+            "payload": {
+                "action": "propose_strategy_lab_experiment",
+                "strategy_lab_experiment": {
+                    "strategy_lab_id": "frontier_spot_input_contract",
+                    "version": 1,
+                    "experiment_type": "market_strategy",
+                    "hypothesis": "Untyped raw crypto spot observations retain paper-only panic-snapback coverage.",
+                    "source_surface": "spot",
+                    "permitted_target_surface": ["spot"],
+                    "strategy_logic": logic,
+                    "data_requirements": {"paper_only": True},
+                    "risk_gates": {"paper_only": True, "long_only": True},
+                    "promotion_rules": {},
+                },
+            },
+        }
+
+        def spot_observation(price: float, observed_at: str, *, return_1m_bps: float = 0.0) -> dict:
+            return {
+                "venue": "OKX_SPOT",
+                "inst_id": "OKX_SPOT:BTC-USDT",
+                "market_type": "spot",
+                "asset_class": "crypto_spot",
+                "base": "BTC",
+                "quote": "USDT",
+                "last": price,
+                "spread_bps": 2.0,
+                "liquidity_score": 0.8,
+                "quality_score": 80.0,
+                "stale_minutes": 1.0,
+                "microstructure_history_ready": 1.0,
+                "relative_volume_1m_60m": 2.0,
+                "return_1m_bps": return_1m_bps,
+                "data_status": "reachable",
+                "observed_at": observed_at,
+                "price_source": "fixture",
+            }
+
+        history_prices = [100.0] * 8 + [99.5, 99.0, 97.0, 97.5]
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            for index, price in enumerate(history_prices):
+                record_feature_snapshots(
+                    conn,
+                    [spot_observation(price, (now - dt.timedelta(minutes=60 - index * 5)).isoformat())],
+                    cfg,
+                )
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [spot_observation(97.9, now.isoformat(), return_1m_bps=15.0)],
+            )
+
+        self.assertEqual(1, len(generated), report)
+        self.assertTrue(generated[0]["paper_only"])
+        self.assertEqual("frontier_crypto_venue_map", generated[0]["trade_type"])
+        self.assertEqual("long_frontier_spot", generated[0]["direction"])
+        self.assertEqual("spot", generated[0]["target_surface"])
+
     def test_sorted_shock_reversal_contract_activates_without_feature_extension(self) -> None:
         cfg = settings()
         now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
