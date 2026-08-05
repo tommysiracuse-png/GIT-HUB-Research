@@ -51,6 +51,16 @@ from adapters.venues.casablanca_stock_exchange_futures_market import (
     CasablancaStockExchangeFuturesMarketAdapter,
     parse_casablanca_masi20_future,
 )
+from adapters.venues.california_air_resources_board import (
+    AUCTION_INFORMATION_URL as CARB_AUCTION_INFORMATION_URL,
+    DATA_DASHBOARD_FILES_URL as CARB_DATA_DASHBOARD_FILES_URL,
+    MAY_2026_NOTICE_URL as CARB_MAY_2026_NOTICE_URL,
+    RESULTS_SUMMARY_URL as CARB_RESULTS_SUMMARY_URL,
+    CaliforniaAirResourcesBoardAdapter,
+    parse_carb_auction_information,
+    parse_carb_auction_notice,
+    parse_carb_auction_results,
+)
 from adapters.venues.dc_department_of_energy_environment import (
     FINAL_SALES_URL as DC_SRC_FINAL_SALES_URL,
     FOR_SALE_URL as DC_SRC_FOR_SALE_URL,
@@ -2071,6 +2081,111 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual(3900.0, rows[0]["last"])
         self.assertEqual("Event 401", rows[0]["event_id"])
 
+    def test_carb_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "california_air_resources_board_cap_and_invest"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsInstance(adapter, CaliforniaAirResourcesBoardAdapter)
+        self.assertEqual("CARB_CA_QC", adapter.info.venue)
+        self.assertEqual(CARB_AUCTION_INFORMATION_URL, adapter.info.docs_url)
+        self.assertIn("auction_settlement_price", adapter.info.capabilities)
+        self.assertIn("reserve_sale", adapter.info.capabilities)
+        self.assertNotIn("order_book", adapter.info.capabilities)
+
+    def test_carb_parsers_normalize_schedule_results_vintages_and_reserve_sale(self) -> None:
+        auction_page = """
+        <html><body><h1>Auction Information</h1>
+        <h2>May 2026 Joint Auction #47 – May 20, 2026 10:00 AM to 1:00 PM PT</h2>
+        <p>Updated Auction Notice</p><p>Summary Results Report</p>
+        <p>Current Auction and Advance Auction allowances will be auctioned.</p>
+        </body></html>
+        """
+        schedule = parse_carb_auction_information(
+            auction_page, received_at="2026-05-15T12:00:00+00:00"
+        )
+        self.assertEqual(2, len(schedule))
+        self.assertEqual("CARB:CA_QC_AUCTION:47:CURRENT:2026-05-20", schedule[0]["inst_id"])
+        self.assertEqual("results_published", schedule[0]["session_status"])
+        self.assertTrue(schedule[0]["summary_results_report_published"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in schedule))
+
+        results = parse_carb_auction_results(
+            """
+            CALIFORNIA CAP-AND-INVEST PROGRAM SUMMARY OF CALIFORNIA-QUEBEC JOINT AUCTION
+            SETTLEMENT PRICES AND RESULTS
+            May 2026 Joint Auction #47 May 20, 2026
+            Current Auction Total Allowances Offered 49,647,415 Total Allowances Sold
+            49,647,415 Current Auction Settlement Price $28.81
+            Advance Auction Total Allowances Offered 6,481,750 Total Allowances Sold
+            6,481,750 Advance Auction Settlement Price $28.76
+            """,
+            received_at="2026-05-27T19:00:00+00:00",
+        )
+        current = next(row for row in results if row["allowance_category"] == "current")
+        advance = next(row for row in results if row["allowance_category"] == "advance")
+        self.assertEqual(28.81, current["auction_settlement_price_usd"])
+        self.assertEqual(49_647_415.0, current["allowances_sold"])
+        self.assertEqual(28.76, advance["last"])
+        self.assertEqual("closed", advance["session_status"])
+
+        notice = parse_carb_auction_notice(
+            """
+            California Cap-and-Invest Program Notice of May 2026 Joint Auction #47
+            Auction Date May 20, 2026. Current Auction vintage 2024 and vintage 2026.
+            Advance Auction vintage 2029. Price Containment Reserve Sale vintage 2026.
+            """,
+            received_at="2026-03-21T12:00:00+00:00",
+        )
+        reserve = next(row for row in notice if row["allowance_category"] == "reserve")
+        self.assertEqual((2026,), reserve["vintage_years"])
+        self.assertTrue(reserve["reserve_sale"])
+        self.assertEqual(CARB_MAY_2026_NOTICE_URL, parse_carb_auction_notice.__kwdefaults__["source_url"])
+
+    def test_carb_adapter_preserves_parser_and_fetch_evidence(self) -> None:
+        auction_page = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<h1>Auction Information</h1><p>May 2026 Joint Auction #47 – May 20, 2026</p><p>Current Auction Advance Auction</p>",
+            "received_at": "2026-05-15T12:00:00+00:00",
+            "latency_ms": 3.0,
+        }
+        malformed_dashboard = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>replacement page</body></html>",
+            "received_at": "2026-05-15T12:00:01+00:00",
+            "latency_ms": 3.0,
+        }
+        result_pdf = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "content": b"",
+            "received_at": "2026-05-15T12:00:02+00:00",
+            "latency_ms": 3.0,
+        }
+        notice_pdf = {**result_pdf, "status": "unavailable", "http_status": 503}
+        with mock.patch(
+            "adapters.venues.california_air_resources_board.fetch_text",
+            side_effect=[auction_page, malformed_dashboard],
+        ), mock.patch(
+            "adapters.venues.california_air_resources_board.fetch_bytes",
+            side_effect=[result_pdf, notice_pdf],
+        ):
+            batch = CaliforniaAirResourcesBoardAdapter().scan({})
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["auction_information"]["fetch_status"])
+        self.assertEqual("blocked", batch.metadata["fetch_status"]["results_summary"]["fetch_status"])
+        self.assertIn("data dashboard markers", batch.metadata["parser_failures"][0]["error"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        self.assertTrue(any(row.get("parser_failure") for row in batch.observations))
+        self.assertTrue(any(row.get("source_url") == CARB_DATA_DASHBOARD_FILES_URL for row in batch.observations))
+        self.assertTrue(any(row.get("source_url") == CARB_RESULTS_SUMMARY_URL for row in batch.observations))
+
     def test_eex_eu_ets_plugin_is_runtime_discoverable_and_watch_only(self) -> None:
         self.assertIn("eex_eua_primary_auction_spot_public", discover_adapters())
         adapter = get_adapter("eex_eua_primary_auction_spot_public")
@@ -2709,6 +2824,30 @@ class AdapterCapabilityTests(unittest.TestCase):
         self.assertEqual("fully_covered", match["match_status"])
         self.assertEqual("dc_department_of_energy_environment", match["adapter_id"])
         self.assertIn("event_price_reference", match["available_capabilities"])
+
+    def test_carb_adapter_closes_spec_1079_with_auction_result_references_only(self) -> None:
+        spec = {
+            "title": "Implement public adapter #1079: California Air Resources Board",
+            "market_key": "global_discovery|California Air Resources Board",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "California Air Resources Board",
+                    "public_docs_url": CARB_AUCTION_INFORMATION_URL,
+                    "asset_or_event": (
+                        "California Cap-and-Invest joint auction of GHG allowances "
+                        "(California/Québec), vintage allowances, and Reserve sales"
+                    ),
+                    "why_interesting": "auction settlement prices, results, and proceeds publication timing",
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("california_air_resources_board_cap_and_invest", match["adapter_id"])
+        self.assertIn("event_price_reference", match["available_capabilities"])
+        self.assertNotIn("entry_quality_quote", match["available_capabilities"])
 
     def test_esx_adapter_closes_listing_spec_without_quote_claims(self) -> None:
         spec = {
