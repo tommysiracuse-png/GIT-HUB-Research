@@ -41,6 +41,34 @@ class RouteResolverTests(unittest.TestCase):
         self.assertFalse(enriched.get("paper_entry_blocked", False))
         self.assertTrue(enriched["conditional_short_execution_risk_downrank_applied"])
 
+    def test_conditional_short_is_enriched_with_per_venue_route_intelligence(self) -> None:
+        enriched = route_resolver.enrich_candidate_with_route(
+            {
+                "venue": "MEXC",
+                "trade_type": "frontier_crypto_venue_map",
+                "direction": "short_frontier_spot",
+                "asset_class": "crypto_spot",
+                "score": 80.0,
+                "data_status": "reachable",
+            },
+            settings(),
+        )
+
+        packet = enriched["conditional_short_route_intelligence"]
+        self.assertTrue(packet["paper_only"])
+        self.assertTrue(packet["read_only"])
+        self.assertEqual("MEXC", packet["venue"])
+        self.assertIn("spot_short", packet["shorting_requirements"])
+        self.assertEqual("unavailable", packet["borrow_availability"])
+        self.assertEqual("unsupported", packet["margin_mode"])
+        self.assertEqual("maintained_paper_route_registry", packet["fee_class"])
+        self.assertEqual(2, packet["maker_fee_bps"])
+        self.assertEqual(10, packet["taker_fee_bps"])
+        self.assertEqual("public_data_only", packet["api_permission_status"])
+        self.assertEqual(packet, enriched["execution_route"]["conditional_short_route_intelligence"])
+        self.assertEqual("down_rank_only", packet["ranking_action"])
+        self.assertFalse(packet["hard_blocking"])
+
     def test_okx_short_perp_route_is_standard(self) -> None:
         candidate = {
             "venue": "OKX",

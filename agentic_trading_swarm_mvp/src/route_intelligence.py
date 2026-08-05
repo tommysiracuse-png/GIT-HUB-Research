@@ -97,6 +97,167 @@ CONDITIONAL_SHORT_DECAY_FLIP_GUARD = {
 }
 
 
+def build_conditional_short_route_intelligence(
+    opportunity: dict[str, Any],
+    *,
+    route: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach the read-only venue facts needed to review a conditional short.
+
+    The packet deliberately describes the direct route as it is currently
+    modeled.  It neither probes a venue nor changes candidate admissibility;
+    unknown and unsupported facts remain visible for paper ranking and route
+    cost review.
+    """
+
+    source = dict(opportunity or {})
+    resolved_route = dict(route or {})
+    route_status = str(
+        resolved_route.get("route_status")
+        or source.get("route_status")
+        or UNKNOWN
+    ).strip().lower()
+    direction = str(
+        resolved_route.get("direction")
+        or source.get("direction")
+        or UNKNOWN
+    ).strip().lower()
+    applies = "short" in direction and route_status in {
+        "conditional",
+        "route_unknown",
+        "unsupported_or_unknown",
+        "paper_testable_via_proxy",
+        "blocked_until_requirements_confirmed",
+    }
+
+    def _items(*values: Any) -> list[str]:
+        output: list[str] = []
+        for value in values:
+            items = (value,) if isinstance(value, str) else (value or [])
+            for item in items:
+                text = str(item or "").strip()
+                if text and text not in output:
+                    output.append(text)
+        return output
+
+    requirements = _items(
+        resolved_route.get("required_permissions"),
+        source.get("paper_route_required_permissions"),
+        source.get("required_permissions"),
+    )
+    missing_requirements = _items(
+        resolved_route.get("missing_permissions"),
+        source.get("missing_requirements"),
+        source.get("route_blockers"),
+    )
+    borrow_required = bool(
+        resolved_route.get("borrow_required")
+        or source.get("borrow_required")
+        or "spot_borrow" in requirements
+        or "spot_borrow" in missing_requirements
+    )
+    borrow_raw = _first_known(
+        source,
+        "borrow_availability_status",
+        "borrow_available",
+        "borrowable",
+        "borrow_supported",
+    )
+    venue_capabilities = source.get("venue_capabilities")
+    if borrow_raw == UNKNOWN and isinstance(venue_capabilities, dict):
+        borrow_raw = _first_known(
+            venue_capabilities,
+            "supports_borrow_check",
+            "borrow_supported",
+            "borrow_inventory_supported",
+        )
+    if borrow_raw == UNKNOWN:
+        borrow_raw = resolved_route.get("borrow_status", UNKNOWN)
+    if str(borrow_raw).strip().lower() in {"required_unconfirmed", "not_checked"}:
+        borrow_raw = "unconfirmed"
+    borrow_availability = _route_fact_status(
+        borrow_raw,
+        required=borrow_required,
+        unresolved=borrow_required,
+    )
+
+    margin_mode = _first_known(source, "margin_mode", "margin_account_mode", "leverage_mode")
+    account_modes = _items(source.get("paper_route_required_account_modes"))
+    margin_required = bool(
+        resolved_route.get("margin_required")
+        or source.get("margin_required")
+        or borrow_required
+        or any("margin" in mode.lower() for mode in account_modes)
+    )
+    if margin_mode == UNKNOWN and margin_required:
+        margin_supported = (
+            _first_known(
+                venue_capabilities,
+                "supports_margin_spot",
+                "margin_supported",
+                "supports_margin",
+            )
+            if isinstance(venue_capabilities, dict)
+            else UNKNOWN
+        )
+        margin_mode = "unsupported" if margin_supported is False else "required_unconfirmed"
+
+    maker_fee = _first_known(source, "maker_fee_bps", "estimated_maker_fee_bps")
+    taker_fee = _first_known(source, "taker_fee_bps", "estimated_taker_fee_bps")
+    if isinstance(venue_capabilities, dict):
+        if maker_fee == UNKNOWN:
+            maker_fee = _first_known(
+                venue_capabilities,
+                "estimated_maker_fee_bps",
+                "maker_fee_bps",
+            )
+        if taker_fee == UNKNOWN:
+            taker_fee = _first_known(
+                venue_capabilities,
+                "estimated_taker_fee_bps",
+                "taker_fee_bps",
+            )
+    route_costs = source.get("paper_route_estimated_cost_bps")
+    fee_class = _first_known(source, "fee_class", "fee_model", "fee_model_status")
+    if fee_class == UNKNOWN:
+        if maker_fee != UNKNOWN or taker_fee != UNKNOWN:
+            fee_class = "maker_taker_estimate"
+        elif isinstance(route_costs, dict) and route_costs.get("estimated_total") is not None:
+            fee_class = "maintained_paper_route_estimate"
+
+    api_permission_status = _first_known(
+        source,
+        "api_permission_status",
+        "api_access_status",
+        "venue_api_status",
+        "endpoint_status",
+    )
+    if api_permission_status == UNKNOWN:
+        api_permission_status = str(resolved_route.get("api_access_status") or UNKNOWN)
+
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "applies": applies,
+        "venue": str(resolved_route.get("venue") or source.get("venue") or UNKNOWN),
+        "direction": direction,
+        "route_status": route_status,
+        "shorting_requirements": requirements,
+        "missing_shorting_requirements": missing_requirements,
+        "borrow_required": borrow_required,
+        "borrow_availability": borrow_availability,
+        "margin_required": margin_required,
+        "margin_mode": margin_mode,
+        "fee_class": fee_class,
+        "maker_fee_bps": maker_fee,
+        "taker_fee_bps": taker_fee,
+        "api_permission_status": api_permission_status,
+        "source": "maintained_paper_route_metadata",
+        "ranking_action": "down_rank_only" if applies else "no_rank_adjustment",
+        "hard_blocking": False,
+    }
+
+
 def build_route_requirements_matrix(
     opportunities: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -144,6 +305,22 @@ def build_conditional_short_route_diagnostics(
 
     source = dict(row or {})
     source.update({key: value for key, value in opportunity.items() if value not in (None, "")})
+    route_packet = source.get("conditional_short_route_intelligence")
+    if isinstance(route_packet, dict):
+        # Prefer a specific venue packet over the resolver's generic
+        # ``required_unconfirmed`` shorthand.  This only supplies ranking
+        # inputs; it cannot turn a route fact into an entry block.
+        for target, packet_key in (
+            ("borrow_availability_status", "borrow_availability"),
+            ("margin_mode", "margin_mode"),
+            ("api_permission_status", "api_permission_status"),
+            ("api_route_status", "api_permission_status"),
+            ("maker_fee_bps", "maker_fee_bps"),
+            ("taker_fee_bps", "taker_fee_bps"),
+        ):
+            current = source.get(target)
+            if current in (None, "", UNKNOWN, "required_unconfirmed", "not_checked"):
+                source[target] = route_packet.get(packet_key, current)
     blockers = _route_blockers(source)
     direction = str(source.get("direction") or UNKNOWN).lower()
     route_status = str(source.get("route_status") or _paper_route_status(source, blockers=blockers)).lower()

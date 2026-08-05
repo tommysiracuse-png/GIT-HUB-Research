@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 
 from route_intelligence import (  # noqa: E402
     ROUTE_REQUIREMENT_FIELDS,
+    build_conditional_short_route_intelligence,
     build_conditional_short_route_diagnostics,
     build_route_requirements_matrix,
     render_route_requirements_markdown,
@@ -20,6 +21,44 @@ from route_intelligence import (  # noqa: E402
 
 
 class RouteIntelligenceTests(unittest.TestCase):
+    def test_conditional_short_packet_keeps_venue_requirements_read_only(self) -> None:
+        packet = build_conditional_short_route_intelligence(
+            {
+                "venue": "MEXC",
+                "direction": "short_frontier_spot",
+                "route_status": "conditional",
+                "paper_route_required_permissions": [
+                    "crypto_spot",
+                    "margin_spot",
+                    "spot_short",
+                    "spot_borrow",
+                ],
+                "paper_route_required_account_modes": ["margin"],
+                "paper_route_estimated_cost_bps": {"estimated_total": 30.0},
+                "api_access_status": "public_data_only",
+            },
+            route={
+                "venue": "MEXC",
+                "direction": "short_frontier_spot",
+                "route_status": "conditional",
+                "required_permissions": ["crypto_spot", "spot_borrow"],
+                "missing_permissions": ["spot_borrow"],
+                "borrow_required": True,
+                "margin_required": True,
+                "borrow_status": "required_unconfirmed",
+                "api_access_status": "public_data_only",
+            },
+        )
+
+        self.assertTrue(packet["applies"])
+        self.assertIn("spot_borrow", packet["shorting_requirements"])
+        self.assertEqual("unconfirmed", packet["borrow_availability"])
+        self.assertEqual("required_unconfirmed", packet["margin_mode"])
+        self.assertEqual("maintained_paper_route_estimate", packet["fee_class"])
+        self.assertEqual("public_data_only", packet["api_permission_status"])
+        self.assertEqual("down_rank_only", packet["ranking_action"])
+        self.assertFalse(packet["hard_blocking"])
+
     def test_conditional_short_diagnostics_expose_route_requirements_and_only_down_rank(self) -> None:
         opportunity = {
             "venue": "OKX",

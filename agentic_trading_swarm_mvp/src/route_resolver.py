@@ -34,11 +34,13 @@ except ModuleNotFoundError:  # pragma: no cover - package import fallback
 
 try:
     from route_intelligence import (
+        build_conditional_short_route_intelligence,
         build_conditional_short_route_diagnostics,
         build_route_requirements_report,
     )
 except ModuleNotFoundError:  # pragma: no cover - package import fallback
     from .route_intelligence import (
+        build_conditional_short_route_intelligence,
         build_conditional_short_route_diagnostics,
         build_route_requirements_report,
     )
@@ -2040,10 +2042,16 @@ def enrich_candidate_with_route(
             "route_blockers": route.get("route_blockers", []),
         }
     )
+    conditional_short_route_intelligence = build_conditional_short_route_intelligence(
+        diagnostic_input,
+        route=route,
+    )
+    diagnostic_input["conditional_short_route_intelligence"] = conditional_short_route_intelligence
     conditional_short_diagnostics = build_conditional_short_route_diagnostics(diagnostic_input)
     route["route_sensitive"] = route_sensitive
     route["route_sensitivity_reasons"] = route_sensitivity_reasons
     route["route_feasibility_score"] = route_feasibility_score
+    route["conditional_short_route_intelligence"] = conditional_short_route_intelligence
     route["conditional_short_route_diagnostics"] = conditional_short_diagnostics
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
@@ -2100,6 +2108,7 @@ def enrich_candidate_with_route(
             "paper_route_notes": eligibility["paper_route_notes"],
             "rank_contribution_cap": eligibility["rank_contribution_cap"],
             "rank_contribution": eligibility["rank_contribution"],
+            "conditional_short_route_intelligence": conditional_short_route_intelligence,
             "conditional_short_route_diagnostics": conditional_short_diagnostics,
         }
     )
@@ -2122,6 +2131,7 @@ def enrich_candidate_with_route(
     enriched["paper_route_notes"] = eligibility["paper_route_notes"]
     enriched["rank_contribution_cap"] = eligibility["rank_contribution_cap"]
     enriched["rank_contribution"] = eligibility["rank_contribution"]
+    enriched["conditional_short_route_intelligence"] = conditional_short_route_intelligence
     enriched["conditional_short_route_diagnostics"] = conditional_short_diagnostics
     if eligibility["suppressed"]:
         if "score" in enriched:
