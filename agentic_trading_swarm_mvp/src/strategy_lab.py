@@ -17,6 +17,7 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from horizon_selection import candidate_horizons, prior_selected_horizon, select_sticky_horizon
+from paper_exploration import exploration_enabled
 from route_resolver import evaluate_route_intelligence
 from paper_context_cost import realized_paper_cost_audit
 from frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
@@ -2412,6 +2413,7 @@ def _compile_strategy_lab_contracts(
 
 def _paper_route_eligible_candidates(
     candidates: list[dict],
+    settings: dict | None = None,
 ) -> tuple[list[dict], list[dict], Counter, Counter]:
     eligible: list[dict] = []
     blocked: list[dict] = []
@@ -2442,6 +2444,11 @@ def _paper_route_eligible_candidates(
                 "blocker_reasons": reasons,
             }
         )
+        if exploration_enabled(settings):
+            annotated["paper_route_would_block"] = verdict
+            annotated["promotion_eligible"] = False
+            annotated["_hunter_bucket"] = "diagnose"
+            eligible.append(annotated)
     return eligible, blocked, missing_counts, blocker_counts
 
 
@@ -2523,6 +2530,12 @@ def _lineage_source_health_rank_guard(
     if not review.get("paper_rank_eligible"):
         annotated["paper_entry_blocked"] = True
         annotated["paper_fill_allowed"] = False
+        if exploration_enabled(settings):
+            annotated["paper_entry_blocked"] = False
+            annotated["paper_fill_allowed"] = True
+            annotated["paper_source_health_would_block"] = review
+            annotated["_hunter_bucket"] = "diagnose"
+            return annotated, review
         return None, review
     return annotated, review
 
@@ -2630,13 +2643,15 @@ def _runtime_entry_invalidation_contract_mismatch(
 
     entry_candidate_count = int(feasibility.get("candidate_count") or 0)
     invalidated_candidate_count = int(
-        (program_diagnostic.get("reject_reasons") or {}).get(
+        (program_diagnostic.get("lifecycle_diagnostic_counts") or {}).get(
+            "invalidation_active_at_entry", 0
+        )
+        or (program_diagnostic.get("reject_reasons") or {}).get(
             "invalidation_expression_true", 0
         )
     )
     if (
-        generated_candidate_count != 0
-        or entry_candidate_count <= 0
+        entry_candidate_count <= 0
         or invalidated_candidate_count < entry_candidate_count
     ):
         return None
@@ -2645,6 +2660,7 @@ def _runtime_entry_invalidation_contract_mismatch(
         "reason": "entry_invalidation_overlap",
         "entry_candidate_count": entry_candidate_count,
         "invalidated_candidate_count": invalidated_candidate_count,
+        "paper_testing_continues": generated_candidate_count > 0,
         "owner_objective": "repair_runtime_contract",
     }
 
@@ -2698,7 +2714,14 @@ def generate_strategy_lab_candidates(
                     "matched_on": source_veto["matched_on"],
                 }
             )
-            continue
+            if not exploration_enabled(settings):
+                continue
+            candidate = {
+                **candidate,
+                "paper_source_veto_diagnostic": source_veto,
+                "promotion_eligible": False,
+                "_hunter_bucket": "diagnose",
+            }
         ranked_candidate, source_health = _lineage_source_health_rank_guard(
             candidate,
             conn,
@@ -2722,7 +2745,10 @@ def generate_strategy_lab_candidates(
             candidate, settings
         )
         yahoo_lineage = paper_source_veto_record(candidate, {"mode": "paper"})
-        lineage_shadow = transplant_review.get("quarantine_status") == "shadow_quarantined"
+        lineage_shadow = (
+            transplant_review.get("quarantine_status") == "shadow_quarantined"
+            or (exploration_enabled(settings) and yahoo_lineage is not None)
+        )
         if (
             (yahoo_lineage is not None or lineage_shadow)
             and transplant_review.get("applies")
@@ -2748,7 +2774,7 @@ def generate_strategy_lab_candidates(
                     ],
                 }
             )
-            if yahoo_lineage is not None:
+            if yahoo_lineage is not None and not exploration_enabled(settings):
                 continue
         if lineage_shadow:
             candidate = {
@@ -2761,7 +2787,7 @@ def generate_strategy_lab_candidates(
             }
         source_rank_candidates.append(candidate)
     eligible_candidates, route_blocked, route_missing_counts, route_blocker_counts = (
-        _paper_route_eligible_candidates(source_rank_candidates)
+        _paper_route_eligible_candidates(source_rank_candidates, settings)
     )
     if cfg.get("observation_programs_enabled", True):
         observation_frames, snapshot_summary = record_feature_snapshots(
@@ -2788,6 +2814,13 @@ def generate_strategy_lab_candidates(
                 "matched_on": source_veto["matched_on"],
             }
         )
+        if exploration_enabled(settings):
+            experiments.append(
+                {
+                    **experiment,
+                    "paper_source_veto_diagnostic": source_veto,
+                }
+            )
     max_total = int(cfg.get("max_candidates_per_loop", 25))
     max_per_experiment = int(cfg.get("max_candidates_per_experiment", 5))
     default_bonus = float(cfg.get("candidate_score_bonus", 1.0))
@@ -2897,7 +2930,10 @@ def generate_strategy_lab_candidates(
                 yahoo_lineage = paper_source_veto_record(
                     transplant_subject, {"mode": "paper"}
                 )
-                lineage_shadow = transplant_review.get("quarantine_status") == "shadow_quarantined"
+                lineage_shadow = (
+                    transplant_review.get("quarantine_status") == "shadow_quarantined"
+                    or (exploration_enabled(settings) and yahoo_lineage is not None)
+                )
                 if (
                     (yahoo_lineage is not None or lineage_shadow)
                     and transplant_review.get("applies")
@@ -2914,7 +2950,7 @@ def generate_strategy_lab_candidates(
                             "paper_diagnostics": transplant_review.get("lineage_quarantine"),
                         }
                     )
-                    if yahoo_lineage is not None:
+                    if yahoo_lineage is not None and not exploration_enabled(settings):
                         continue
                 if lineage_shadow:
                     candidate = {
@@ -2932,7 +2968,7 @@ def generate_strategy_lab_candidates(
                 program_route_blocked,
                 program_missing_counts,
                 program_blocker_counts,
-            ) = _paper_route_eligible_candidates(program_candidates)
+            ) = _paper_route_eligible_candidates(program_candidates, settings)
             route_blocked.extend(program_route_blocked)
             route_missing_counts.update(program_missing_counts)
             route_blocker_counts.update(program_blocker_counts)
@@ -3017,7 +3053,10 @@ def generate_strategy_lab_candidates(
                 yahoo_lineage = paper_source_veto_record(
                     transplant_subject, {"mode": "paper"}
                 )
-                lineage_shadow = transplant_review.get("quarantine_status") == "shadow_quarantined"
+                lineage_shadow = (
+                    transplant_review.get("quarantine_status") == "shadow_quarantined"
+                    or (exploration_enabled(settings) and yahoo_lineage is not None)
+                )
                 if (
                     (yahoo_lineage is not None or lineage_shadow)
                     and transplant_review.get("applies")
@@ -3034,7 +3073,7 @@ def generate_strategy_lab_candidates(
                             "paper_diagnostics": transplant_review.get("lineage_quarantine"),
                         }
                     )
-                    if yahoo_lineage is not None:
+                    if yahoo_lineage is not None and not exploration_enabled(settings):
                         continue
                 if lineage_shadow:
                     annotated["candidate_status"] = "shadow_quarantined"

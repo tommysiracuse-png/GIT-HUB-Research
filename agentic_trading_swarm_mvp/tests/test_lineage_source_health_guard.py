@@ -162,7 +162,7 @@ class LineageSourceHealthGuardTests(unittest.TestCase):
             rows[0]["paper_lineage_source_health"]["reason"],
         )
 
-    def test_strategy_lab_excludes_negative_parent_before_source_ranking(self) -> None:
+    def test_strategy_lab_keeps_negative_parent_as_exploration_diagnostic(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         init_db(conn)
@@ -179,7 +179,7 @@ class LineageSourceHealthGuardTests(unittest.TestCase):
 
         self.assertEqual([], generated)
         self.assertEqual(1, report["lineage_source_health_guarded_candidate_count"])
-        self.assertEqual(0, report["route_eligible_source_candidate_count"])
+        self.assertEqual(1, report["route_eligible_source_candidate_count"])
 
     def test_rejected_cooldown_descendant_is_in_static_yahoo_lineage(self) -> None:
         veto = paper_source_veto_record(

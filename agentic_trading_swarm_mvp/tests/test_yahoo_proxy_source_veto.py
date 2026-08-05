@@ -175,7 +175,7 @@ class YahooProxySourceVetoTests(unittest.TestCase):
         self.assertEqual("paper_source_family_veto", result[0]["reason"])
         self.assertEqual("strategy_lab_name_prefix", result[0]["source_veto"]["matched_on"]["type"])
 
-    def test_excludes_direct_source_from_strategy_lab_ranking(self) -> None:
+    def test_keeps_direct_source_available_for_isolated_exploration(self) -> None:
         direct = {
             "market_key": "YAHOO_PROXY|global_proxy_momentum|short_proxy|conditional",
             "venue": "OKX_SPOT",
@@ -191,9 +191,9 @@ class YahooProxySourceVetoTests(unittest.TestCase):
 
         self.assertEqual([], generated)
         self.assertEqual(1, report["source_vetoed_candidate_count"])
-        self.assertEqual(0, report["route_eligible_source_candidate_count"])
+        self.assertEqual(1, report["route_eligible_source_candidate_count"])
 
-    def test_existing_cross_surface_experiment_is_excluded_from_ranking(self) -> None:
+    def test_existing_cross_surface_experiment_is_synthetic_not_promotable(self) -> None:
         rec = recommendation(
             market_key="OKX_SPOT|frontier_crypto_venue_map",
             lab_id="okx_transport_child",
@@ -217,7 +217,9 @@ class YahooProxySourceVetoTests(unittest.TestCase):
             generated, report = generate_strategy_lab_candidates(conn, settings(), [healthy])
 
         self.assertEqual("created", created[0]["action_status"])
-        self.assertEqual([], generated)
+        self.assertEqual(1, len(generated))
+        self.assertEqual("shadow_quarantined", generated[0]["candidate_status"])
+        self.assertFalse(generated[0]["promotion_eligible"])
         self.assertEqual(1, report["source_vetoed_experiment_count"])
 
     def test_recovered_source_still_requires_proxy_regime_and_local_frontier_confirmation(self) -> None:
@@ -283,14 +285,18 @@ class YahooProxySourceVetoTests(unittest.TestCase):
             )
 
         self.assertEqual("created", created[0]["action_status"])
-        self.assertEqual([], blocked)
+        self.assertEqual(1, len(blocked))
+        self.assertEqual("shadow_quarantined", blocked[0]["candidate_status"])
+        self.assertFalse(blocked[0]["promotion_eligible"])
         self.assertEqual(1, blocked_report["proxy_frontier_quarantined_candidate_count"])
         self.assertEqual(
             "native_yahoo_proxy_regime_non_positive",
             blocked_report["proxy_frontier_quarantined_candidates"][0]["reason"],
         )
         self.assertEqual(1, len(admitted))
-        self.assertEqual(0, admitted_report["proxy_frontier_quarantined_candidate_count"])
+        self.assertEqual("shadow_quarantined", admitted[0]["candidate_status"])
+        self.assertFalse(admitted[0]["promotion_eligible"])
+        self.assertEqual(1, admitted_report["proxy_frontier_quarantined_candidate_count"])
 
     def test_recovery_requires_both_scopes_and_all_sustained_windows(self) -> None:
         passing_window = {

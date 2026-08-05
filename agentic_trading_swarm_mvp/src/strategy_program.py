@@ -838,6 +838,7 @@ def generate_program_candidates(
     )
     generated: list[dict] = []
     rejects: dict[str, int] = defaultdict(int)
+    lifecycle_diagnostics: dict[str, int] = defaultdict(int)
     limit = max_candidates or int(settings.get("strategy_lab", {}).get("max_candidates_per_experiment", 10))
     for frame in frames:
         if len(generated) >= limit:
@@ -853,9 +854,11 @@ def generate_program_candidates(
             if not bool(evaluate_expression(program["entry_expression"], values)):
                 rejects["entry_expression_false"] += 1
                 continue
-            if bool(evaluate_expression(program["invalidation_expression"], values)):
-                rejects["invalidation_expression_true"] += 1
-                continue
+            invalidation_active_at_entry = bool(
+                evaluate_expression(program["invalidation_expression"], values)
+            )
+            if invalidation_active_at_entry:
+                lifecycle_diagnostics["invalidation_active_at_entry"] += 1
             side = str(program.get("direction") or "").lower()
             if not side:
                 long_signal = bool(evaluate_expression(program["long_expression"], values))
@@ -927,6 +930,12 @@ def generate_program_candidates(
             "strategy_lab_source_trade_type": source_trade_type,
             "strategy_lab_output_trade_type": trade_type,
             "strategy_lab_program_signature": signature,
+            "strategy_lab_invalidation_expression": program["invalidation_expression"],
+            "strategy_lab_invalidation_active_at_entry": invalidation_active_at_entry,
+            "strategy_lab_contract_warning": (
+                "entry_invalidation_overlap" if invalidation_active_at_entry else None
+            ),
+            "promotion_eligible": not invalidation_active_at_entry,
             "strategy_reliability_allocation_multiplier": experimental_allocation,
             "strategy_lab_relaxation": risk_gates.get("adaptive_relaxation") or {},
             "strategy_lab_program_features": {
@@ -947,6 +956,7 @@ def generate_program_candidates(
         "source_observation_count": len(frames),
         "generated_candidate_count": min(len(generated), limit),
         "reject_reasons": dict(rejects),
+        "lifecycle_diagnostic_counts": dict(lifecycle_diagnostics),
     }
 
 

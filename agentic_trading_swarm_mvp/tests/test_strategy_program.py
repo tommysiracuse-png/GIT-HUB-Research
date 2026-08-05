@@ -19,6 +19,7 @@ from radar_loop import _select_runtime_strategy_lab_candidates  # noqa: E402
 from storage import init_db  # noqa: E402
 from strategy_lab import (  # noqa: E402
     _observation_program_inputs,
+    _paper_route_eligible_candidates,
     _queue_promotion,
     _runtime_contract_program,
     _runtime_entry_invalidation_contract_mismatch,
@@ -555,12 +556,13 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertTrue(mismatch["repairable"])
         self.assertEqual("market_type", mismatch["mismatches"][0]["runtime_field"])
 
-    def test_entry_invalidation_overlap_routes_contract_to_repair(self) -> None:
+    def test_entry_invalidation_overlap_is_tested_and_flagged_for_repair(self) -> None:
         cfg = settings()
         logic = program_logic()
         logic["entry_expression"] = "quality_score >= 60"
         logic["invalidation_expression"] = "quality_score >= 60"
         logic["long_expression"] = "quality_score >= 60"
+        logic["edge_expression"] = "1"
         recommendation = lab_recommendation("entry_invalidation_overlap_v1", logic)
         now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
 
@@ -577,18 +579,47 @@ class StrategyProgramTests(unittest.TestCase):
                 ("entry_invalidation_overlap_v1",),
             ).fetchone()
 
-        self.assertEqual([], generated)
-        self.assertEqual("needs_contract_revision", row["status"])
+        self.assertEqual(1, len(generated))
+        self.assertEqual("active_testing", row["status"])
         self.assertEqual(
-            "needs_contract_revision",
+            "active_testing",
             report["status_by_experiment"]["entry_invalidation_overlap_v1"],
         )
+        self.assertTrue(generated[0]["strategy_lab_invalidation_active_at_entry"])
+        self.assertEqual("entry_invalidation_overlap", generated[0]["strategy_lab_contract_warning"])
+        self.assertFalse(generated[0]["promotion_eligible"])
         mismatch = json.loads(row["evaluation_json"])["generation_diagnostic"][
             "runtime_contract_mismatch"
         ]
         self.assertEqual("entry_invalidation_overlap", mismatch["reason"])
         self.assertTrue(mismatch["repairable"])
+        self.assertTrue(mismatch["paper_testing_continues"])
         self.assertEqual("repair_runtime_contract", mismatch["owner_objective"])
+
+    def test_exploration_keeps_route_blocked_lab_candidate_for_synthetic_paper(self) -> None:
+        candidate = {
+            "inst_id": "BTC-USDT-SWAP",
+            "venue": "OKX",
+            "trade_type": "perp_funding_basis",
+            "direction": "funding_capture_short_perp",
+            "paper_route_eligibility": {
+                "applies": True,
+                "suppressed": True,
+                "missing_prerequisites": ["account_permission"],
+                "blocker_reasons": ["route_not_confirmed"],
+            },
+        }
+
+        eligible, blocked, missing, blockers = _paper_route_eligible_candidates(
+            [candidate], settings()
+        )
+
+        self.assertEqual(1, len(eligible))
+        self.assertEqual(1, len(blocked))
+        self.assertFalse(eligible[0]["promotion_eligible"])
+        self.assertEqual("diagnose", eligible[0]["_hunter_bucket"])
+        self.assertEqual(1, missing["account_permission"])
+        self.assertEqual(1, blockers["route_not_confirmed"])
 
     def test_partial_invalidation_is_not_a_contract_mismatch(self) -> None:
         mismatch = _runtime_entry_invalidation_contract_mismatch(
