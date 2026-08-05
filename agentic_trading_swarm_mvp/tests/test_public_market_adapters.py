@@ -40,6 +40,13 @@ from adapters.venues.aib_eex_france import (
     parse_aib_eex_france_cpb_workbook,
     parse_aib_eex_france_cpb_reporting,
 )
+from adapters.venues.australian_office_of_financial_management_aofm import (
+    DATA_HUB_URL as AOFM_DATA_HUB_URL,
+    FORTHCOMING_TRANSACTIONS_URL as AOFM_FORTHCOMING_TRANSACTIONS_URL,
+    AustralianOfficeOfFinancialManagementAofmAdapter,
+    parse_aofm_forthcoming_transactions,
+    parse_aofm_treasury_bond_issuance_workbook,
+)
 from adapters.venues.bahrain_cross_listings import cross_listing_observations
 from adapters.venues.bank_of_canada import (
     API_URL as BANK_OF_CANADA_TBILL_API_URL,
@@ -383,6 +390,51 @@ def _aib_eex_france_cpb_workbook_fixture() -> bytes:
     return output.getvalue()
 
 
+def _aofm_tender_results_workbook_fixture() -> bytes:
+    values = [
+        [
+            "Date Held",
+            "Tender Number",
+            "Maturity",
+            "Coupon",
+            "ISIN",
+            "Amount Offered",
+            "Amount Allotted",
+            "Coverage Ratio",
+            "Weighted Average Yield (%)",
+            "Date Settled",
+        ],
+        [
+            "5/08/2026",
+            "TB2026-12",
+            "21/03/2047",
+            "3.00",
+            "AU000XCLWAM8",
+            "1000000000",
+            "1000000000",
+            "2.15",
+            "4.321",
+            "7/08/2026",
+        ],
+    ]
+    cells = []
+    for row_index, row in enumerate(values, 1):
+        row_cells = "".join(
+            f'<c r="{chr(65 + column)}{row_index}" t="inlineStr"><is><t>{value}</t></is></c>'
+            for column, value in enumerate(row)
+        )
+        cells.append(f'<row r="{row_index}">{row_cells}</row>')
+    worksheet = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(cells)}</sheetData></worksheet>'
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+    return output.getvalue()
+
+
 class PublicAdapterParserTests(unittest.TestCase):
     def test_public_fetch_retries_certificate_failure_with_system_trust(self) -> None:
         class Response:
@@ -466,6 +518,7 @@ class PublicAdapterParserTests(unittest.TestCase):
             "b3_public_data_hub",
             "bank_of_canada_regular_treasury_bills",
             "central_bank_of_bahrain_treasury_bills",
+            "australian_office_of_financial_management_aofm",
             "stock_exchange_of_thailand_yuanta_securities_thailand",
             "republican_stock_exchange_toshkent_public",
             "dc_department_of_energy_environment",
@@ -3596,6 +3649,116 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
         report = batch.metadata["public_market_adapters"]
         self.assertEqual(adapter_id, report["adapters"][0]["adapter_id"])
         self.assertEqual("reachable", report["adapters"][0]["source_status"])
+
+    def test_aofm_parsers_normalize_scheduled_tender_and_result_workbook(self) -> None:
+        forthcoming = """
+        <html><body><h1>Forthcoming Transactions</h1><h2>Treasury Bonds</h2>
+        <table>
+          <tr><th>Series Offered</th><td>3.00% 21 March 2047</td><td>4.25% 21 October 2036</td></tr>
+          <tr><th>Offered to Public ($million)</th><td>1,000</td><td>800</td></tr>
+          <tr><th>ISIN</th><td>AU000XCLWAM8</td><td>AU000XCLWAF4</td></tr>
+          <tr><th>Tender Date</th><td>Wednesday, 5 August 2026</td><td>Friday, 7 August 2026</td></tr>
+          <tr><th>Time to Submit Bids</th><td>10:45 - 11:00 AM AEST</td><td>10:45 - 11:00 AM AEST</td></tr>
+          <tr><th>Settlement Date</th><td>Friday, 7 August 2026</td><td>Tuesday, 11 August 2026</td></tr>
+        </table></body></html>
+        """
+        scheduled = parse_aofm_forthcoming_transactions(
+            forthcoming, received_at="2026-08-04T12:00:00+00:00"
+        )
+        self.assertEqual(2, len(scheduled))
+        self.assertEqual("AU000XCLWAM8", scheduled[0]["isin"])
+        self.assertEqual(1000.0, scheduled[0]["offered_to_public_millions_aud"])
+        self.assertEqual("tender_scheduled", scheduled[0]["session_status"])
+        self.assertEqual("watch_only", scheduled[0]["direction"])
+
+        results = parse_aofm_treasury_bond_issuance_workbook(
+            _aofm_tender_results_workbook_fixture(),
+            received_at="2026-08-06T12:00:00+00:00",
+        )
+        self.assertEqual(1, len(results))
+        self.assertEqual("AU000XCLWAM8", results[0]["isin"])
+        self.assertEqual("3.00% 21 March 2047", results[0]["series_offered"])
+        self.assertEqual("TB2026-12", results[0]["tender_number"])
+        self.assertEqual(0.0, results[0]["last"])
+        self.assertEqual(4.321, results[0]["weighted_average_yield_pct"])
+        self.assertEqual(1000.0, results[0]["allotted_millions_aud"])
+        self.assertEqual("results_published", results[0]["session_status"])
+
+    def test_aofm_adapter_preserves_parser_failure_as_watch_only_health_evidence(self) -> None:
+        reachable_schedule = {
+            "ok": True, "status": "reachable", "http_status": 200,
+            "text": "<html><body><h1>Treasury Bonds</h1></body></html>",
+            "received_at": "2026-08-04T16:00:00+00:00", "latency_ms": 4.0,
+        }
+        reachable_bad_hub = {
+            "ok": True, "status": "reachable", "http_status": 200,
+            "text": "<html><body>Data Hub</body></html>",
+            "received_at": "2026-08-04T16:00:01+00:00", "latency_ms": 5.0,
+        }
+        with mock.patch(
+            "adapters.venues.australian_office_of_financial_management_aofm.fetch_text",
+            side_effect=[reachable_schedule, reachable_bad_hub],
+        ):
+            batch = AustralianOfficeOfFinancialManagementAofmAdapter().scan({})
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["data_hub"]["fetch_status"])
+        self.assertTrue(batch.metadata["parser_failures"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        self.assertTrue(any(row.get("parser_failure") for row in batch.observations))
+
+    def test_aofm_plugin_is_auto_discovered_by_adapter_runtime(self) -> None:
+        adapter_id = "australian_office_of_financial_management_aofm"
+        forthcoming = """
+        <html><body><h1>Forthcoming Transactions</h1><h2>Treasury Bonds</h2><table>
+        <tr><th>Series Offered</th><td>2.75% 21 November 2028</td></tr>
+        <tr><th>Offered to Public ($million)</th><td>1,000</td></tr>
+        <tr><th>ISIN</th><td>AU000XCLWAA9</td></tr>
+        <tr><th>Tender Date</th><td>Wednesday, 5 August 2026</td></tr>
+        <tr><th>Time to Submit Bids</th><td>10:45 - 11:00 AM AEST</td></tr>
+        <tr><th>Settlement Date</th><td>Friday, 7 August 2026</td></tr>
+        </table></body></html>
+        """
+        data_hub = '<html><body><a href="/files/treasury%20bonds%20-%20issuance.xlsx">treasury bonds - issuance.xlsx</a></body></html>'
+        text_result = lambda text: {
+            "ok": True, "status": "reachable", "http_status": 200, "text": text,
+            "received_at": "2026-08-04T16:30:00+00:00", "latency_ms": 4.0,
+        }
+        workbook_result = {
+            "ok": True, "status": "reachable", "http_status": 200,
+            "content": _aofm_tender_results_workbook_fixture(),
+            "received_at": "2026-08-04T16:30:01+00:00", "latency_ms": 5.0,
+            "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+        original_discover = adapter_runtime.discover_adapters
+
+        def discover_only_aofm() -> list[str]:
+            return [entry for entry in original_discover() if entry == adapter_id]
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "adapters.venues.australian_office_of_financial_management_aofm.fetch_text",
+            side_effect=[text_result(forthcoming), text_result(data_hub)],
+        ), mock.patch(
+            "adapters.venues.australian_office_of_financial_management_aofm.fetch_bytes",
+            return_value=workbook_result,
+        ), mock.patch.object(adapter_runtime, "RUNS_DIR", pathlib.Path(tmp)), mock.patch.object(
+            adapter_runtime, "CACHE_DIR", pathlib.Path(tmp) / "cache"
+        ), mock.patch.object(adapter_runtime, "REPORT_JSON", pathlib.Path(tmp) / "report.json"), mock.patch.object(
+            adapter_runtime, "REPORT_MD", pathlib.Path(tmp) / "report.md"
+        ), mock.patch.object(adapter_runtime, "discover_adapters", side_effect=discover_only_aofm):
+            batch = adapter_runtime.build_scan_batch(
+                {"public_market_adapters": {"enabled": True, "workers": 1, "adapters": {adapter_id: {"cache_minutes": 0}}}}
+            )
+
+        self.assertIn(adapter_id, discover_adapters())
+        self.assertIsInstance(get_adapter(adapter_id), AustralianOfficeOfFinancialManagementAofmAdapter)
+        self.assertTrue(batch.observations)
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        self.assertTrue(any(row["source_url"] == AOFM_FORTHCOMING_TRANSACTIONS_URL for row in batch.observations))
+        report = batch.metadata["public_market_adapters"]
+        self.assertEqual(adapter_id, report["adapters"][0]["adapter_id"])
+        self.assertEqual("reachable", report["adapters"][0]["source_status"])
+        self.assertEqual(AOFM_DATA_HUB_URL, get_adapter(adapter_id).info.docs_url)
 
     def test_catalog_adapters_never_invent_prices(self) -> None:
         rows = contract_observations("blocked") + cross_listing_observations("reachable")
