@@ -277,6 +277,23 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         self.assertEqual(1, complete_call.call_count)
         self.assertNotIn("run_structured_codex_turn", str(complete_call.call_args))
 
+    def test_contract_intake_reclaims_quota_paused_prose_task(self) -> None:
+        owner.enqueue_recommendation(self.conn, self._recommendation("rec-quota-resume"), self.settings)
+        self.conn.execute(
+            "update strategy_owner_tasks set status='waiting_quota', next_retry_at=?",
+            ((owner._parse_iso(owner._utc_now()) - owner.dt.timedelta(minutes=1)).isoformat(),),
+        )
+        self.conn.commit()
+
+        claimed = owner._claim_contract_intake_tasks(
+            self.conn,
+            {**self.settings, "strategy_implementation_owner": {**self.settings["strategy_implementation_owner"], "contract_intake_batch_size": 2}},
+        )
+
+        self.assertEqual(1, len(claimed))
+        self.assertEqual("claimed", claimed[0]["status"])
+        self.assertEqual("strategy_contract_intake", claimed[0]["claimed_by"])
+
     def test_code_decision_reuses_owner_codex_session(self) -> None:
         rec = self._recommendation()
         owner.enqueue_recommendation(self.conn, rec, self.settings)

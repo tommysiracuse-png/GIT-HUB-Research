@@ -834,7 +834,7 @@ def _claim_contract_intake_tasks(conn: sqlite3.Connection, settings: dict) -> li
     rows = conn.execute(
         """
         select * from strategy_owner_tasks
-        where status='queued'
+        where status in ('queued','waiting_quota','waiting_network','implementation_paused')
           and objective_type='materialize_hypothesis'
           and strategy_lab_id is null
           and code_proposal_id is null
