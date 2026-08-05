@@ -230,6 +230,8 @@ class RouteIntelligenceTests(unittest.TestCase):
                 "freshness_state": "fresh",
                 "freshness_age_seconds": 2.0,
                 "spread_bps": 4.0,
+                "available_depth_usd": 40000.0,
+                "min_depth_usd": 20000.0,
                 "estimated_slippage_bps": 1.5,
             }
         )
@@ -244,11 +246,52 @@ class RouteIntelligenceTests(unittest.TestCase):
         self.assertEqual("isolated", telemetry["margin"]["mode"])
         self.assertEqual("available", telemetry["shortability_status"])
         self.assertEqual("public_data_only", telemetry["shortability_api_status"])
+        self.assertEqual("public_data_only", telemetry["api_permission"]["status"])
         self.assertEqual("observed", telemetry["quote_freshness"]["status"])
+        self.assertEqual(2.0, telemetry["quote_freshness"]["age_seconds"])
         self.assertEqual(4.0, telemetry["market_impact_proxies"]["spread_bps"])
+        self.assertEqual(40000.0, telemetry["market_impact_proxies"]["depth_usd"])
+        self.assertEqual("observed", telemetry["market_impact_proxies"]["depth_status"])
         self.assertEqual(1.5, telemetry["market_impact_proxies"]["slippage_bps_per_side"])
         self.assertEqual(0.0, telemetry["ranking_hook"]["score_adjustment"])
+        self.assertLess(telemetry["sizing_hook"]["recommended_paper_allocation_multiplier"], 1.0)
         self.assertFalse(telemetry["entry_blocked"])
+
+    def test_route_economics_depth_adjusts_paper_size_without_changing_entry_status(self) -> None:
+        report = build_paper_route_requirement_report(
+            {
+                "venue": "BITSO",
+                "inst_id": "BITSO:THIN-USDT",
+                "direction": "short_frontier_spot",
+                "route_status": "conditional",
+                "borrow_available": True,
+                "maker_fee_bps": 1.0,
+                "taker_fee_bps": 2.0,
+                "margin_mode": "isolated",
+                "api_access_status": "public_data_only",
+                "freshness_state": "fresh",
+                "available_depth_usd": 5000.0,
+                "min_depth_usd": 20000.0,
+                "spread_bps": 3.0,
+                "estimated_slippage_bps": 1.0,
+            }
+        )
+
+        telemetry = report["route_economics_telemetry"]
+        self.assertEqual(
+            "thin_relative_to_declared_minimum",
+            telemetry["market_impact_proxies"]["depth_status"],
+        )
+        self.assertLess(
+            report["paper_allocation_multiplier"],
+            report["paper_rank_multiplier"],
+        )
+        self.assertEqual(
+            report["paper_allocation_multiplier"],
+            report["paper_sizing_guidance"]["recommended_paper_allocation_multiplier"],
+        )
+        self.assertFalse(report["entry_blocked"])
+        self.assertFalse(report["routing_decision_changed"])
 
     def test_frontier_short_spot_validation_is_visible_in_the_paper_matrix(self) -> None:
         candidate = {

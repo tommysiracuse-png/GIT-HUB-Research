@@ -1024,9 +1024,29 @@ def build_paper_route_requirement_report(
         row=annotation,
         diagnostics=diagnostics,
     )
+    panel = dict(annotation or build_route_requirements_annotation(source))
+    frontier_short_spot_route_intelligence = build_frontier_short_spot_route_intelligence(
+        source,
+        route=resolved_route,
+        annotation=panel,
+        diagnostics=diagnostics,
+    )
+    route_economics_telemetry = dict(
+        frontier_short_spot_route_intelligence.get("route_economics_telemetry") or {}
+    )
     rank_multiplier = float(friction.get("paper_rank_multiplier") or 1.0) if applies else 1.0
     rank_multiplier = round(max(0.35, min(1.0, rank_multiplier)), 4)
-    panel = dict(annotation or build_route_requirements_annotation(source))
+    sizing_hook = route_economics_telemetry.get("sizing_hook")
+    telemetry_allocation = _float_or_none(
+        sizing_hook.get("recommended_paper_allocation_multiplier")
+        if isinstance(sizing_hook, dict)
+        else None
+    )
+    allocation_multiplier = min(
+        rank_multiplier,
+        max(0.35, min(1.0, telemetry_allocation)),
+    ) if applies and telemetry_allocation is not None else rank_multiplier
+    allocation_multiplier = round(allocation_multiplier, 4)
     sizing_guidance = dict(panel.get("paper_sizing_guidance") or {})
     gaps = list(panel.get("route_requirement_gaps") or [])
     sizing_guidance.update(
@@ -1034,18 +1054,13 @@ def build_paper_route_requirement_report(
             "paper_only": True,
             "non_blocking": True,
             "route_requirement_report_multiplier": rank_multiplier,
-            "recommended_paper_allocation_multiplier": rank_multiplier,
+            "route_economics_telemetry_multiplier": telemetry_allocation if telemetry_allocation is not None else 1.0,
+            "recommended_paper_allocation_multiplier": allocation_multiplier,
             "action": (
                 "route_aware_paper_sizing" if applies else sizing_guidance.get("action", "standard_paper_sizing_review")
             ),
             "routing_decision_changed": False,
         }
-    )
-    frontier_short_spot_route_intelligence = build_frontier_short_spot_route_intelligence(
-        source,
-        route=resolved_route,
-        annotation=panel,
-        diagnostics=diagnostics,
     )
     frontier_short_spot_route_requirements_report = _frontier_short_spot_route_requirements_report(
         source,
@@ -1073,13 +1088,11 @@ def build_paper_route_requirement_report(
         "route_friction_summary": friction,
         "route_requirement_gaps": gaps,
         "paper_rank_multiplier": rank_multiplier,
-        "paper_allocation_multiplier": rank_multiplier,
+        "paper_allocation_multiplier": allocation_multiplier,
         "paper_sizing_guidance": sizing_guidance,
         "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
         "frontier_short_spot_route_requirements_report": frontier_short_spot_route_requirements_report,
-        "route_economics_telemetry": dict(
-            frontier_short_spot_route_intelligence.get("route_economics_telemetry") or {}
-        ),
+        "route_economics_telemetry": route_economics_telemetry,
         "route_requirement_summary": route_requirement_summary,
         "hard_blocking": False,
         "entry_blocked": False,
@@ -1223,6 +1236,9 @@ def build_frontier_short_spot_route_telemetry(
     applies = direction == "short_frontier_spot"
     route_diagnostics = dict(diagnostics or build_conditional_short_route_diagnostics(source))
     freshness = dict(freshness_latency or _freshness_latency_notes(source))
+    quote_age_seconds = _float_or_none(
+        _first_known(source, "freshness_age_seconds", "data_age_seconds")
+    )
     outcome_diagnostic = source.get("short_frontier_spot_route_outcome_diagnostic")
     if not isinstance(outcome_diagnostic, dict):
         outcome_diagnostic = source.get("route_outcome_diagnostic")
@@ -1244,8 +1260,44 @@ def build_frontier_short_spot_route_telemetry(
         "slippage_bps_per_side_or_unknown",
         "slippage_bps_per_side",
         "estimated_slippage_bps",
+        "entry_slippage_bps_estimate",
         "projected_slippage_bps",
     )
+    depth_usd = number(
+        "available_depth_usd",
+        "book_depth_usd",
+        "top_of_book_depth_usd",
+        "depth_usd",
+        "liquidity_usd",
+    )
+    minimum_depth_usd = number(
+        "minimum_liquidity_usd",
+        "min_liquidity_usd",
+        "min_depth_usd",
+        "liquidity_floor_usd",
+    )
+    depth_value = _float_or_none(depth_usd)
+    minimum_depth_value = _float_or_none(minimum_depth_usd)
+    if depth_value is None:
+        depth_status = UNKNOWN
+        depth_ratio = UNKNOWN
+        depth_penalty = 0.0
+    elif depth_value <= 0.0:
+        depth_status = "unavailable"
+        depth_ratio = 0.0
+        depth_penalty = 25.0
+    elif minimum_depth_value is not None and minimum_depth_value > 0.0:
+        depth_ratio = round(depth_value / minimum_depth_value, 6)
+        if depth_value < minimum_depth_value:
+            depth_status = "thin_relative_to_declared_minimum"
+            depth_penalty = min(25.0, (1.0 - max(0.0, depth_ratio)) * 25.0)
+        else:
+            depth_status = "observed"
+            depth_penalty = 0.0
+    else:
+        depth_status = "observed"
+        depth_ratio = UNKNOWN
+        depth_penalty = 0.0
     shortability_raw = _first_known(
         source,
         "shortability_status",
@@ -1296,13 +1348,19 @@ def build_frontier_short_spot_route_telemetry(
         "shortability_api_status": shortability_api_status,
         "quote_freshness_status": freshness.get("status", UNKNOWN),
         "spread_bps": spread_bps,
+        "depth_usd": depth_usd,
         "slippage_bps_per_side": slippage_bps,
     }
     missing = [key for key, value in observed.items() if _route_metadata_unconfirmed(value)]
     # A bounded, diagnostic ordering signal.  This is intentionally separate
     # from the candidate score so route economics cannot become an entry gate.
     cost_value = _float_or_none(known_one_way_cost_bps)
-    ranking_score = 100.0 - min(70.0, max(0.0, cost_value or 0.0)) - min(45.0, len(missing) * 5.0)
+    ranking_score = (
+        100.0
+        - min(70.0, max(0.0, cost_value or 0.0))
+        - min(45.0, len(missing) * 5.0)
+        - depth_penalty
+    )
     outcome_rank_score = _float_or_none(outcome_ranking.get("outcome_rank_score"))
     # Outcome evidence is deliberately a bounded secondary ranking input.  It
     # cannot erase a priceable candidate or override the current route facts.
@@ -1324,15 +1382,44 @@ def build_frontier_short_spot_route_telemetry(
         "margin": {
             "required": bool(resolved_route.get("margin_required") or source.get("margin_required") or applies),
             "mode": margin_mode,
+            "eligibility": _route_fact_status(
+                margin_mode,
+                required=bool(resolved_route.get("margin_required") or source.get("margin_required") or applies),
+                unresolved=applies,
+            ),
         },
         "shortability_status": shortability_status,
         "shortability_api_status": shortability_api_status,
+        # Keep canonical values alongside the grouped packet so report,
+        # ranking, and size consumers do not have to infer a field path.
+        "borrow_availability": borrow_availability,
+        "maker_fee_bps": maker_fee_bps,
+        "taker_fee_bps": taker_fee_bps,
+        "margin_eligibility": _route_fact_status(
+            margin_mode,
+            required=bool(resolved_route.get("margin_required") or source.get("margin_required") or applies),
+            unresolved=applies,
+        ),
+        "api_permission_status": shortability_api_status,
+        "quote_freshness_status": freshness.get("status", UNKNOWN),
+        "spread_bps": spread_bps,
+        "depth_usd": depth_usd,
+        "slippage_estimate_bps": slippage_bps,
+        "api_permission": {
+            "status": shortability_api_status,
+            "private_api_probe_performed": False,
+        },
         "quote_freshness": {
             "status": freshness.get("status", UNKNOWN),
             "notes": list(freshness.get("notes") or []),
+            "age_seconds": quote_age_seconds if quote_age_seconds is not None else UNKNOWN,
         },
         "market_impact_proxies": {
             "spread_bps": spread_bps,
+            "depth_usd": depth_usd,
+            "minimum_depth_usd": minimum_depth_usd,
+            "depth_ratio_to_declared_minimum": depth_ratio,
+            "depth_status": depth_status,
             "slippage_bps_per_side": slippage_bps,
             "known_one_way_cost_bps": known_one_way_cost_bps,
         },
@@ -1350,6 +1437,14 @@ def build_frontier_short_spot_route_telemetry(
                 and (missing or cost_value is not None or (outcome_rank_score is not None and outcome_rank_score < 50.0))
                 else "no_rank_adjustment"
             ),
+        },
+        "sizing_hook": {
+            "mode": "paper_notional_scaling_only",
+            "recommended_paper_allocation_multiplier": round(
+                max(0.35, min(1.0, ranking_score / 100.0)), 4
+            ) if applies else 1.0,
+            "depth_penalty_bps_equivalent": round(depth_penalty, 4),
+            "routing_decision_changed": False,
         },
         "hard_blocking": False,
         "entry_blocked": False,

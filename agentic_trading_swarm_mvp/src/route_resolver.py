@@ -2106,6 +2106,9 @@ def enrich_candidate_with_route(
     route["conditional_short_route_diagnostics"] = conditional_short_diagnostics
     route["route_requirements_panel"] = route_requirements_annotation
     route["paper_route_requirement_report"] = paper_route_requirement_report
+    route["paper_route_sizing_guidance"] = dict(
+        paper_route_requirement_report["paper_sizing_guidance"]
+    )
     route["paper_route_requirement_summary"] = route_requirements_annotation[
         "route_requirement_summary"
     ]
@@ -2172,6 +2175,9 @@ def enrich_candidate_with_route(
             "conditional_short_route_diagnostics": conditional_short_diagnostics,
             "route_requirements_panel": route_requirements_annotation,
             "paper_route_requirement_report": paper_route_requirement_report,
+            "paper_route_sizing_guidance": dict(
+                paper_route_requirement_report["paper_sizing_guidance"]
+            ),
             "paper_route_requirement_summary": route_requirements_annotation[
                 "route_requirement_summary"
             ],
@@ -2240,7 +2246,7 @@ def enrich_candidate_with_route(
         route_requirements_annotation["route_requirement_gap_reason_codes"]
     )
     enriched["paper_route_sizing_guidance"] = dict(
-        route_requirements_annotation["paper_sizing_guidance"]
+        paper_route_requirement_report["paper_sizing_guidance"]
     )
     enriched["paper_route_guard_value_measurement"] = dict(
         route_requirements_annotation["guard_value_measurement"]

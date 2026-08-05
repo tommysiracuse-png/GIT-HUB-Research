@@ -87,6 +87,14 @@ class RouteResolverTests(unittest.TestCase):
         self.assertIn("spot_borrow", friction["required_broker_permissions"])
         self.assertEqual("stale_and_illiquid", friction["stale_illiquid_diagnostics"]["status"])
         self.assertFalse(friction["entry_blocked"])
+        self.assertIn(
+            "route_economics_telemetry_multiplier",
+            enriched["paper_route_sizing_guidance"],
+        )
+        self.assertEqual(
+            enriched["paper_allocation_multiplier"],
+            enriched["paper_route_sizing_guidance"]["recommended_paper_allocation_multiplier"],
+        )
         self.assertFalse(enriched.get("paper_entry_blocked", False))
 
     def test_conditional_short_is_enriched_with_per_venue_route_intelligence(self) -> None:
