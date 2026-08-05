@@ -6961,6 +6961,10 @@ REGIONAL_FIAT_QUOTES = {
 LATAM_FIAT_QUOTES = {"MXN", "BRL", "CLP", "COP", "PEN", "ARS"}
 PAPER_ONLY_REVIEW_FIAT_QUOTES = LATAM_FIAT_QUOTES | {"TZS", "UGX"}
 QUOTE_ASSETS = USD_LIKE_QUOTES | REGIONAL_FIAT_QUOTES
+# These venues publish spot prices in a local fiat currency.  The flag is
+# deliberately descriptive: a fresh, priceable local quote remains a paper
+# candidate and is ranked with its FX/premium telemetry rather than discarded.
+LOCAL_FIAT_CEX_VENUES = frozenset({"INDODAX", "BITSO", "VALR", "LUNO", "BUDA"})
 
 DEFAULT_FRONTIER_MARKETABILITY_GATES = {
     "enabled": True,
@@ -7939,6 +7943,12 @@ def _base_observation(target: dict, result: dict, symbol: str | None = None) -> 
         "next_funding_time": None,
         "quote_volume_24h": None,
         "spread_bps": None,
+        "quote_ccy": quote,
+        "fx_to_usd": None,
+        "fx_age_minutes": None,
+        "normalized_mid_usd": None,
+        "premium_vs_reference_bps": None,
+        "local_quote_flag": False,
         "usd_normalized_last": None,
         "native_quote_currency": quote,
         "canonical_quote_currency": None,
@@ -8949,6 +8959,72 @@ def _set_quote_suppression(output: dict, status: str, reason: str) -> None:
     output["suppression_reason"] = reason
 
 
+def _local_quote_normalization_telemetry(row: dict) -> dict:
+    """Expose stable paper-only FX fields alongside legacy normalization data."""
+    output = dict(row)
+    quote = str(output.get("quote") or "").upper() or None
+    venue = str(output.get("venue") or "").upper()
+    is_local_quote = bool(venue in LOCAL_FIAT_CEX_VENUES and quote in REGIONAL_FIAT_QUOTES)
+    raw_last = as_float(output.get("last"), None)
+    normalized_last = as_float(output.get("usd_normalized_last"), None)
+    bid = as_float(output.get("bid"), None)
+    ask = as_float(output.get("ask"), None)
+    native_mid = (
+        (bid + ask) / 2.0
+        if bid is not None and ask is not None and bid > 0 and ask > 0 and bid <= ask
+        else raw_last
+    )
+    fx_to_usd = None
+    if quote in USD_LIKE_QUOTES:
+        fx_to_usd = 1.0
+    elif raw_last is not None and raw_last > 0 and normalized_last is not None and normalized_last > 0:
+        # Both external FX and same-venue USDT references express local quote
+        # units per USD, so the conversion to USD is the observed ratio.
+        fx_to_usd = normalized_last / raw_last
+    fx_age_seconds = as_float(output.get("fx_age_seconds"), None)
+    output.update(
+        {
+            "quote_ccy": quote,
+            "fx_to_usd": round(fx_to_usd, 12) if fx_to_usd is not None else None,
+            "fx_age_minutes": round(fx_age_seconds / 60.0, 3) if fx_age_seconds is not None else None,
+            "normalized_mid_usd": (
+                round(native_mid * fx_to_usd, 12)
+                if native_mid is not None and native_mid > 0 and fx_to_usd is not None
+                else None
+            ),
+            "premium_vs_reference_bps": output.get("premium_vs_reference_bps"),
+            "local_quote_flag": is_local_quote,
+        }
+    )
+    return output
+
+
+def _annotate_local_quote_premiums(observations: list[dict]) -> list[dict]:
+    """Add leave-local-venue-out premium telemetry without affecting eligibility."""
+    reference_prices: dict[str, list[float]] = collections.defaultdict(list)
+    for row in observations:
+        if (
+            row.get("data_status") == "reachable"
+            and row.get("market_type") == "spot"
+            and not row.get("local_quote_flag")
+        ):
+            normalized_mid = as_float(row.get("normalized_mid_usd"), None)
+            if row.get("comparison_key") and normalized_mid is not None and normalized_mid > 0:
+                reference_prices[str(row["comparison_key"])].append(normalized_mid)
+
+    annotated = []
+    for row in observations:
+        output = dict(row)
+        reference = reference_prices.get(str(output.get("comparison_key") or ""), [])
+        normalized_mid = as_float(output.get("normalized_mid_usd"), None)
+        if output.get("local_quote_flag") and reference and normalized_mid is not None and normalized_mid > 0:
+            output["premium_vs_reference_bps"] = round(bps(normalized_mid, statistics.median(reference)), 3)
+        else:
+            output["premium_vs_reference_bps"] = None
+        annotated.append(output)
+    return annotated
+
+
 def _normalize_regional_quotes(
     observations: list[dict],
     fx_references: dict[str, dict] | None = None,
@@ -9083,7 +9159,7 @@ def _normalize_regional_quotes(
         else:
             _set_quote_suppression(output, "unsupported_quote", "unmatched_quote_currency")
         normalized.append(output)
-    return normalized
+    return [_local_quote_normalization_telemetry(row) for row in normalized]
 
 
 def _select_observations(observations: list[dict], registry: dict) -> list[dict]:
@@ -9201,6 +9277,7 @@ def scan_venues(
         fx_references=fx_references,
         policy=registry.get("filters", {}),
     )
+    observations = _annotate_local_quote_premiums(observations)
     required_inst_ids = required_inst_ids or set()
     supported = [
         row
@@ -9486,10 +9563,11 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         base_score = as_float(candidate.get("score"), 0.0) or 0.0
         effective_edge = as_float(candidate.get("effective_edge_bps"), None)
         effective_edge_score = max(0.0, effective_edge or 0.0)
+        local_quote_penalty = max(0.0, as_float(candidate.get("local_quote_score_penalty"), 0.0) or 0.0)
         candidate["paper_ranking_score"] = round(
-            effective_edge_score + quality_weight * quality_score
+            effective_edge_score + quality_weight * quality_score - local_quote_penalty
             if effective_edge is not None
-            else (1.0 - quality_weight) * base_score + quality_weight * quality_score,
+            else (1.0 - quality_weight) * base_score + quality_weight * quality_score - local_quote_penalty,
             3,
         )
         candidate["paper_quality_cohort"] = (
@@ -10263,6 +10341,7 @@ def _candidate_from_observation(
         and (freshness_age is None or float(freshness_age) <= block_stale)
     )
     regional_candidate_gate_status = "not_applicable"
+    regional_candidate_diagnostics = []
     regional_quote = observation.get("quote") in REGIONAL_FIAT_QUOTES
     if regional_quote and observation.get("quote_normalization_status") == "external_fx_reference":
         required_snapshots = int(quality_cfg.get("min_verified_snapshots_for_regional_candidate", 3))
@@ -10277,17 +10356,33 @@ def _candidate_from_observation(
         else:
             regional_candidate_gate_status = "passed"
         if regional_candidate_gate_status != "passed":
-            quality_action = "shadow_only"
-            paper_entry_blocked = True
-            quality_allocation_multiplier = 0.0
-            promotion_eligible = False
             anomaly_flags = sorted(set([*anomaly_flags, regional_candidate_gate_status]))
+            regional_candidate_diagnostics.append(regional_candidate_gate_status)
+    local_premium_bps = as_float(observation.get("premium_vs_reference_bps"), None)
+    fx_age_minutes = as_float(observation.get("fx_age_minutes"), None)
+    local_quote_score_penalty = 0.0
+    if observation.get("local_quote_flag"):
+        if local_premium_bps is None:
+            regional_candidate_diagnostics.append("local_premium_reference_unavailable")
+            local_quote_score_penalty += 2.0
+        else:
+            local_quote_score_penalty += min(15.0, abs(local_premium_bps) / 20.0)
+            if abs(local_premium_bps) >= 25.0:
+                regional_candidate_diagnostics.append("local_premium_vs_reference")
+        if fx_age_minutes is not None:
+            local_quote_score_penalty += min(5.0, max(0.0, fx_age_minutes) / 720.0)
+        else:
+            regional_candidate_diagnostics.append("local_fx_age_unavailable")
+    local_quote_score_penalty = round(local_quote_score_penalty, 3)
     actionable = direction != "watch_only" and observation.get("data_status") == "reachable" and not reject_reason
     score = 0.0
     if actionable:
         score = min(100.0, 24.0 + edge * 1.25 + liq * 18.0 - min(spread * 1.2, 20.0) + min(source_venue_count, 8))
         if quality_score is not None:
             score += (float(quality_score) - 50.0) * 0.25
+        # Local premium telemetry is a paper-only ordering signal.  It does
+        # not turn an otherwise priceable observation into a watch-only row.
+        score -= local_quote_score_penalty
         score = max(0.0, min(100.0, score))
     elif observation.get("data_status") == "reachable":
         score = min(25.0, 8.0 + abs(deviation) * 0.3 + liq * 10.0)
@@ -10313,6 +10408,7 @@ def _candidate_from_observation(
         "region": observation.get("region"),
         "base": observation.get("base"),
         "quote": observation.get("quote"),
+        "quote_ccy": observation.get("quote_ccy") or observation.get("quote"),
         "comparison_key": observation.get("comparison_key"),
         "source_venue_count": source_venue_count,
         "asset_class": "crypto_derivatives" if observation["market_type"] == "perp" else "crypto_spot",
@@ -10331,6 +10427,13 @@ def _candidate_from_observation(
         "quote_normalization_source": observation.get("quote_normalization_source"),
         "fx_source": observation.get("fx_source"),
         "fx_age_seconds": observation.get("fx_age_seconds"),
+        "fx_to_usd": observation.get("fx_to_usd"),
+        "fx_age_minutes": observation.get("fx_age_minutes"),
+        "normalized_mid_usd": observation.get("normalized_mid_usd"),
+        "premium_vs_reference_bps": observation.get("premium_vs_reference_bps"),
+        "local_quote_flag": bool(observation.get("local_quote_flag")),
+        "local_quote_score_penalty": local_quote_score_penalty,
+        "local_quote_diagnostics": regional_candidate_diagnostics,
         "suppression_reason": observation.get("suppression_reason"),
         "product_metadata_validated": bool(observation.get("product_metadata_validated")),
         "conversion_path_validated": bool(observation.get("conversion_path_validated")),
@@ -10580,6 +10683,9 @@ def summarize(
     depth_latency_values = []
     buy_slippage_values = []
     sell_slippage_values = []
+    local_quote_premiums = []
+    local_quote_fx_ages = []
+    local_quote_by_venue: collections.Counter[str] = collections.Counter()
     for row in observations:
         anomaly_counts.update(
             flag
@@ -10597,6 +10703,14 @@ def summarize(
             buy_slippage_values.append(float(buy))
         if sell is not None:
             sell_slippage_values.append(float(sell))
+        if row.get("local_quote_flag"):
+            local_quote_by_venue[str(row.get("venue") or "unknown")] += 1
+            premium = as_float(row.get("premium_vs_reference_bps"), None)
+            if premium is not None:
+                local_quote_premiums.append(premium)
+            fx_age_minutes = as_float(row.get("fx_age_minutes"), None)
+            if fx_age_minutes is not None:
+                local_quote_fx_ages.append(fx_age_minutes)
     for row in candidates:
         for blocker in (row.get("execution_feasibility") or {}).get("route_blockers", []):
             route_blockers[blocker] += 1
@@ -10757,6 +10871,13 @@ def summarize(
             "dislocation_quality_diagnostics": row.get("dislocation_quality_diagnostics", []),
             "paper_quality_rank": row.get("paper_quality_rank"),
             "paper_quality_cohort": row.get("paper_quality_cohort"),
+            "quote_ccy": row.get("quote_ccy"),
+            "fx_to_usd": row.get("fx_to_usd"),
+            "fx_age_minutes": row.get("fx_age_minutes"),
+            "normalized_mid_usd": row.get("normalized_mid_usd"),
+            "premium_vs_reference_bps": row.get("premium_vs_reference_bps"),
+            "local_quote_flag": row.get("local_quote_flag"),
+            "local_quote_diagnostics": row.get("local_quote_diagnostics", []),
         }
         for row in candidates[:20]
     ]
@@ -10776,6 +10897,18 @@ def summarize(
         "by_quote_normalization": dict(by_quote_normalization),
         "by_quote_suppression": dict(by_quote_suppression),
         "regional_observation_count": sum(1 for row in observations if row.get("quote") in REGIONAL_FIAT_QUOTES),
+        "local_quote_normalization": {
+            "paper_only": True,
+            "supported_venues": sorted(LOCAL_FIAT_CEX_VENUES),
+            "observation_count": sum(local_quote_by_venue.values()),
+            "by_venue": dict(local_quote_by_venue),
+            "premium_vs_reference_bps": _distribution(local_quote_premiums),
+            "fx_age_minutes": _distribution(local_quote_fx_ages),
+            "diagnostic_pattern": (
+                "Bilateral failure across long and synthetic-short frontier spot signals suggests structural "
+                "pricing/context error rather than a clean directional edge."
+            ),
+        },
         "regional_candidate_count": sum(1 for row in candidates if row.get("quote") in REGIONAL_FIAT_QUOTES),
         "active_paper_review_candidate_count": active_candidate_count,
         "shadow_or_observe_only_candidate_count": shadow_only_candidate_count,
@@ -10883,6 +11016,8 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Quotes: `{summary.get('by_quote', {})}`")
     lines.append(f"- Quote normalization: `{summary.get('by_quote_normalization', {})}`")
     lines.append(f"- Quote suppression: `{summary.get('by_quote_suppression', {})}`")
+    local_quote = summary.get("local_quote_normalization", {})
+    lines.append(f"- Local-fiat telemetry: `{local_quote}`")
     lines.extend(["", "## Route Blockers", ""])
     blockers = summary.get("by_route_blocker", {})
     if not blockers:
@@ -10953,6 +11088,9 @@ def _markdown(report: dict) -> str:
             f"quote_norm=`{row.get('quote_normalization_status')}` "
             f"native_quote=`{row.get('native_quote_currency')}` canonical_price=`{row.get('canonical_normalized_price')}` "
             f"fx_source=`{row.get('fx_source')}` fx_age=`{row.get('fx_age_seconds')}` suppress=`{row.get('suppression_reason')}` "
+            f"quote_ccy=`{row.get('quote_ccy')}` fx_to_usd=`{row.get('fx_to_usd')}` "
+            f"normalized_mid_usd=`{row.get('normalized_mid_usd')}` premium_bps=`{row.get('premium_vs_reference_bps')}` "
+            f"local_quote=`{row.get('local_quote_flag')}` "
             f"route=`{row.get('route_status')}` blockers={row.get('route_blockers')} "
             f"route_health_confirmed=`{row.get('route_health_confirmed')}` "
             f"simulated_allocation=`{row.get('simulated_order_allocation')}`"
@@ -10965,6 +11103,9 @@ def _markdown(report: dict) -> str:
             f"last=`{row.get('last')}` spread=`{row.get('spread_bps')}`bps volume=`{row.get('quote_volume_24h')}` "
             f"native_quote=`{row.get('native_quote_currency')}` canonical_price=`{row.get('canonical_normalized_price')}` "
             f"fx_source=`{row.get('fx_source')}` fx_age=`{row.get('fx_age_seconds')}` suppress=`{row.get('suppression_reason')}` "
+            f"quote_ccy=`{row.get('quote_ccy')}` fx_to_usd=`{row.get('fx_to_usd')}` "
+            f"normalized_mid_usd=`{row.get('normalized_mid_usd')}` premium_bps=`{row.get('premium_vs_reference_bps')}` "
+            f"local_quote=`{row.get('local_quote_flag')}` "
             f"quality=`{row.get('quality_score')}` qstatus=`{row.get('quality_status')}` anomalies={row.get('anomaly_flags', [])}"
         )
     return "\n".join(lines) + "\n"

@@ -306,9 +306,56 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertTrue(luno["conversion_path_validated"])
         self.assertEqual(luno["quote_normalization_status"], "external_fx_reference")
         self.assertEqual(candidate["regional_candidate_gate_status"], "insufficient_verified_depth_snapshots")
-        self.assertTrue(candidate["paper_entry_blocked"])
+        self.assertIn("insufficient_verified_depth_snapshots", candidate["local_quote_diagnostics"])
+        self.assertFalse(candidate["paper_entry_blocked"])
         self.assertEqual(ready["regional_candidate_gate_status"], "passed")
         self.assertFalse(ready["paper_entry_blocked"])
+
+    def test_local_fiat_telemetry_is_normalized_and_only_downranks_paper_candidate(self) -> None:
+        cfg = settings()
+        local = self._obs("LUNO", "XBTZAR", "BTC", "ZAR", 1_818_000.0, 1_800_000, region="africa")
+        peer = self._obs("COINBASE", "BTC-USD", "BTC", "USD", 100_000.0, 10_000_000)
+        normalized = frontier._annotate_local_quote_premiums(
+            frontier._normalize_regional_quotes(
+                [local, peer],
+                fx_references={
+                    "ZAR": {
+                        "rate": 18.0,
+                        "provider": "public_fx",
+                        "age_seconds": 10.0,
+                        "source_url": "https://example.test/fx",
+                    }
+                },
+            )
+        )
+        luno = next(row for row in normalized if row["venue"] == "LUNO")
+        luno.update(
+            {
+                "quality_status": "verified",
+                "quality_score": 90.0,
+                "venue_health_score": 90.0,
+                "venue_health": {"venue_quality_score": 90.0},
+                "verified_depth_snapshot_count": 3,
+                "simulated_fills": {
+                    "buy": {"1000": {"filled": True, "slippage_bps": 1.0}},
+                    "sell": {"1000": {"filled": True, "slippage_bps": 1.0}},
+                },
+                "anomaly_flags": [],
+                "critical_anomaly_flags": [],
+            }
+        )
+
+        candidate = frontier._candidate_from_observation(luno, cfg, 100_000.0, 2, reference_observations=normalized)
+
+        self.assertEqual(luno["quote_ccy"], "ZAR")
+        self.assertTrue(luno["local_quote_flag"])
+        self.assertAlmostEqual(luno["fx_to_usd"], 1.0 / 18.0)
+        self.assertAlmostEqual(luno["fx_age_minutes"], 10.0 / 60.0, places=3)
+        self.assertAlmostEqual(luno["normalized_mid_usd"], 101_000.0)
+        self.assertAlmostEqual(luno["premium_vs_reference_bps"], 100.0)
+        self.assertEqual(candidate["premium_vs_reference_bps"], 100.0)
+        self.assertGreater(candidate["local_quote_score_penalty"], 0.0)
+        self.assertFalse(candidate["paper_entry_blocked"])
 
     def test_stale_external_fx_is_quarantined_before_reference_scoring(self) -> None:
         cfg = settings()
