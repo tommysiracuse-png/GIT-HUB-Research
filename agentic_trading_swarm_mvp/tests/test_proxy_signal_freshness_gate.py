@@ -93,6 +93,8 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
             local_short_horizon_trend_bps=3.0,
             destination_spread_bps=3.0,
             destination_liquidity_score=0.8,
+            source_signal_key="YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
+            target_route_key="BITGET_PERP",
             target_surface_paper_evidence={
                 "paper_only": True,
                 "target_surface": "BITGET_PERP",
@@ -100,6 +102,12 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
                 "expectancy_net_bps": 2.0,
                 "quality_pass_rate": 0.6,
                 "observed_at": "2026-08-04T14:00:00+00:00",
+                "realized_paper_outcomes": True,
+                "transfer_mapping_key": (
+                    "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard->BITGET_PERP"
+                ),
+                "transfer_window_count": 3,
+                "positive_transfer_windows": 3,
             },
         )
 

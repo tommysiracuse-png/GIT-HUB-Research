@@ -171,6 +171,7 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
             inst_id="OKX:BTC-USDT-SWAP",
             source_family="yahoo_proxy",
             signal_family="global_proxy_momentum",
+            source_signal_key="YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
             destination_family_paper_stats={
                 "closed_count": 24,
                 "expectancy_net_bps": 3.0,
@@ -195,6 +196,12 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
             "expectancy_net_bps": 3.0,
             "quality_pass_rate": 0.6,
             "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "realized_paper_outcomes": True,
+            "transfer_mapping_key": (
+                "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard->OKX:BTC-USDT-SWAP"
+            ),
+            "transfer_window_count": 3,
+            "positive_transfer_windows": 3,
         }
         candidate["native_yahoo_proxy_regime"] = {
             "momentum_bps": 8.0,

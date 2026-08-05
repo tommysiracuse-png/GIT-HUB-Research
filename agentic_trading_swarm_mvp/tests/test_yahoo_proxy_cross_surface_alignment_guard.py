@@ -28,6 +28,7 @@ def cross_surface_candidate(**overrides: object) -> dict[str, object]:
         "direction": "long_frontier_perp",
         "source_family": "yahoo_proxy",
         "signal_family": "global_proxy_momentum",
+        "source_signal_key": "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
         "local_short_horizon_trend_bps": 3.0,
         "spread_bps": 4.0,
         "liquidity_score": 0.8,
@@ -59,6 +60,12 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
             "expectancy_net_bps": 2.5,
             "quality_pass_rate": 0.58,
             "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "realized_paper_outcomes": True,
+            "transfer_mapping_key": (
+                "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard->OKX:BTC-USDT-SWAP"
+            ),
+            "transfer_window_count": 3,
+            "positive_transfer_windows": 3,
         }
         proof.update(overrides)
         return proof
@@ -107,6 +114,40 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
             "fresh_target_surface_paper_evidence_validated",
             review["reason"],
         )
+
+    def test_surface_aggregate_without_same_realized_mapping_stays_quarantined(self) -> None:
+        proof = self.target_proof()
+        proof.pop("transfer_mapping_key")
+        proof.pop("realized_paper_outcomes")
+
+        review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(target_surface_paper_evidence=proof)
+        )
+
+        self.assertFalse(review["eligible"])
+        self.assertTrue(review["blocked"])
+        self.assertIn(
+            "same_source_target_mapping",
+            review["target_surface_paper_evidence_review"]["failed_checks"],
+        )
+        self.assertIn(
+            "realized_transfer_outcomes",
+            review["target_surface_paper_evidence_review"]["failed_checks"],
+        )
+
+    def test_negative_native_and_transferred_outcomes_mark_mapping_incompatible(self) -> None:
+        proof = self.target_proof(expectancy_net_bps=-2.0)
+        review = paper_only_yahoo_proxy_cross_surface_alignment_guard(
+            cross_surface_candidate(
+                target_surface_paper_evidence=proof,
+                native_yahoo_proxy_paper_evidence={"expectancy_net_bps": -3.0},
+                native_yahoo_proxy_regime={"momentum_bps": -4.0, "regime_stable": True},
+            )
+        )
+
+        self.assertFalse(review["eligible"])
+        self.assertTrue(review["target_surface_paper_evidence_review"]["source_target_incompatible"])
+        self.assertEqual("yahoo_proxy_frontier_source_target_incompatible", review["reason"])
 
     def test_source_regime_must_be_decisively_positive_and_stable(self) -> None:
         non_positive = paper_only_yahoo_proxy_cross_surface_alignment_guard(
@@ -251,7 +292,7 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertFalse(other_crypto["emit_route"])
         self.assertEqual("BITGET_PERP", other_crypto["target_surface"])
         self.assertEqual(
-            "decisively_positive_stable_native_proxy_regime_and_independent_local_frontier_spread_liquidity_trend_confirmation",
+            "stable_positive_realized_paper_outcomes_for_same_source_target_mapping_and_native_proxy_regime_and_local_frontier_confirmation",
             spot["reenable_condition"],
         )
 
@@ -294,10 +335,12 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertEqual(0.0, policy["min_target_surface_expectancy_net_bps"])
         self.assertEqual(0.5, policy["min_target_surface_quality_rate"])
         self.assertEqual(168.0, policy["max_target_surface_evidence_age_hours"])
+        self.assertEqual(3, policy["min_realized_transfer_windows"])
+        self.assertEqual(0.67, policy["min_realized_transfer_positive_window_rate"])
         self.assertEqual(5.0, policy["min_native_proxy_momentum_bps"])
         self.assertEqual(0.65, policy["min_destination_liquidity_score"])
         self.assertEqual(
-            "decisively_positive_stable_native_proxy_regime_and_independent_local_frontier_spread_liquidity_trend_confirmation",
+            "stable_positive_realized_paper_outcomes_for_same_source_target_mapping_and_native_proxy_regime_and_local_frontier_confirmation",
             policy["reenable_condition"],
         )
 

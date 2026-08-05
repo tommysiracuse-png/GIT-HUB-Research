@@ -234,11 +234,18 @@ class YahooProxySourceVetoTests(unittest.TestCase):
             "expectancy_net_bps": 2.0,
             "quality_pass_rate": 0.6,
             "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "realized_paper_outcomes": True,
+            "transfer_mapping_key": (
+                "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard->ABC-USDT"
+            ),
+            "transfer_window_count": 3,
+            "positive_transfer_windows": 3,
         }
         candidate = {
             "market_key": "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
             "source_family": "yahoo_proxy",
             "signal_family": "global_proxy_momentum",
+            "source_signal_key": "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
             "venue": "OKX_SPOT",
             "inst_id": "ABC-USDT",
             "trade_type": "frontier_crypto_venue_map",

@@ -146,8 +146,8 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "quarantined_target_surfaces": ["OKX_SPOT", "OKX_PERP"],
                 "allow_native_proxy_monitoring": True,
                 "reenable_condition": (
-                    "decisively_positive_stable_native_proxy_regime_and_independent_local_"
-                    "frontier_spread_liquidity_trend_confirmation"
+                    "stable_positive_realized_paper_outcomes_for_same_source_target_mapping_and_"
+                    "native_proxy_regime_and_local_frontier_confirmation"
                 ),
             }
 
@@ -5694,6 +5694,8 @@ def paper_only_yahoo_proxy_crypto_momentum_gate(
     destination_venue: str = "OKX",
     source_family: str = "yahoo_proxy",
     feature_family: str = "global_proxy_momentum",
+    source_signal_key: str | None = None,
+    target_route_key: str | None = None,
     proxy_valid_for_reuse: bool | None = None,
     target_surface_paper_evidence: dict | None = None,
     native_proxy_momentum_bps: float | None = None,
@@ -5716,6 +5718,8 @@ def paper_only_yahoo_proxy_crypto_momentum_gate(
             "execution_mode": execution_mode,
             "source_family": source_family,
             "feature_family": feature_family,
+            "source_signal_key": source_signal_key,
+            "target_route_key": target_route_key,
             "target_surface": destination_surface,
             "target_venue": destination_venue,
             "source_quote_timestamp": source_quote_timestamp,

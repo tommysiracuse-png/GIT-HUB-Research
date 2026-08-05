@@ -126,9 +126,11 @@ DEFAULT_SETTINGS = {
         "min_target_surface_expectancy_net_bps": 0.0,
         "min_target_surface_quality_rate": 0.5,
         "max_target_surface_evidence_age_hours": 168.0,
+        "min_realized_transfer_windows": 3,
+        "min_realized_transfer_positive_window_rate": 0.67,
         "reenable_condition": (
-            "decisively_positive_stable_native_proxy_regime_and_independent_local_frontier_"
-            "spread_liquidity_trend_confirmation"
+            "stable_positive_realized_paper_outcomes_for_same_source_target_mapping_and_"
+            "native_proxy_regime_and_local_frontier_confirmation"
         ),
     },
     "paper_portability_quarantine": {

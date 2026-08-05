@@ -597,9 +597,14 @@ _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY = {
     "min_target_surface_expectancy_net_bps": 0.0,
     "min_target_surface_quality_rate": 0.5,
     "max_target_surface_evidence_age_hours": 168.0,
+    # A positive aggregate on a crypto surface is not evidence that this
+    # particular Yahoo-derived signal transfers.  Release requires a stable
+    # series of *realized* paper outcomes for the exact source-to-route map.
+    "min_realized_transfer_windows": 3,
+    "min_realized_transfer_positive_window_rate": 0.67,
     "reenable_condition": (
-        "decisively_positive_stable_native_proxy_regime_and_independent_local_frontier_"
-        "spread_liquidity_trend_confirmation"
+        "stable_positive_realized_paper_outcomes_for_same_source_target_mapping_and_"
+        "native_proxy_regime_and_local_frontier_confirmation"
     ),
 }
 
@@ -699,11 +704,13 @@ def paper_only_yahoo_proxy_okx_target_review(record, profile=None):
 
 
 def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, now=None):
-    """Validate fresh, exact-surface paper proof for a proxy transfer.
+    """Validate fresh, stable realized paper proof for a proxy transfer.
 
     Evidence is accepted only from an explicit nested paper-proof packet.  A
     candidate's current quote, local alignment, or inherited proxy metrics are
     not target-surface observations and therefore cannot release quarantine.
+    The proof must also identify the same Yahoo source-to-target mapping; a
+    surface-wide aggregate cannot promote an unproven translated route.
     """
 
     record = record if isinstance(record, dict) else {}
@@ -832,6 +839,8 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
             "min_target_surface_expectancy_net_bps",
             "min_target_surface_quality_rate",
             "max_target_surface_evidence_age_hours",
+            "min_realized_transfer_windows",
+            "min_realized_transfer_positive_window_rate",
         ):
             if container.get(key) is not None:
                 policy[key] = container[key]
@@ -886,6 +895,19 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
             "paper_trade_outcomes",
             "target_surface_paper_observations",
         }
+
+    def _mapping_token(value):
+        text = str(value or "").strip().lower()
+        # Preserve the source-to-target separator while normalizing hyphens in
+        # each identity component (for example, BTC-USDT-SWAP).
+        return text.replace("->", "\x00").replace("-", "_").replace(" ", "_").replace("\x00", "->") or None
+
+    def _first_from(containers, *keys):
+        for container in containers:
+            value = _first(container, *keys)
+            if value not in (None, "", [], {}, ()):
+                return value
+        return None
 
     def _surface(mapping):
         raw = _paper_only_route_intelligence_tag(
@@ -947,6 +969,86 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
     )
     age_hours = max(0.0, raw_age_hours) if raw_age_hours is not None else None
 
+    source_containers = [record]
+    destination_containers = [record]
+    for field in ("source_context", "lineage_context", "recommendation_lineage", "proxy_context"):
+        nested = record.get(field)
+        if isinstance(nested, dict):
+            source_containers.append(nested)
+    for field in ("destination_context", "route_context", "candidate"):
+        nested = record.get(field)
+        if isinstance(nested, dict):
+            destination_containers.append(nested)
+    source_signal_key = _mapping_token(
+        _first_from(
+            source_containers,
+            "source_signal_key",
+            "origin_signal_key",
+            "parent_signal_key",
+            "lineage_source_signal_key",
+            "source_market_key",
+        )
+    )
+    target_route_key = _mapping_token(
+        _first_from(
+            destination_containers,
+            "target_route_key",
+            "route_id",
+            "inst_id",
+            "instrument_id",
+            "symbol",
+        )
+    ) or _mapping_token(target_surface)
+    expected_mapping_key = (
+        f"{source_signal_key}->{target_route_key}"
+        if source_signal_key and target_route_key
+        else None
+    )
+    evidence_mapping_key = _mapping_token(
+        _first(evidence, "transfer_mapping_key", "source_target_mapping_key", "mapping_key")
+    )
+    evidence_source_key = _mapping_token(
+        _first(evidence, "source_signal_key", "origin_signal_key", "parent_signal_key")
+    )
+    evidence_target_route = _mapping_token(
+        _first(evidence, "target_route_key", "route_id", "inst_id", "instrument_id", "symbol")
+    ) or _mapping_token(evidence_surface)
+    same_mapping = bool(
+        expected_mapping_key
+        and (
+            evidence_mapping_key == expected_mapping_key
+            or (evidence_source_key == source_signal_key and evidence_target_route == target_route_key)
+        )
+    )
+    realized_transfer = bool(
+        _first(evidence, "realized_paper_outcomes", "realized_transfer_outcomes", "is_realized") is True
+        or _paper_only_route_intelligence_tag(_first(evidence, "evidence_source", "source"))
+        in {"paper_trade_outcomes", "persisted_paper_signal_stats", "realized_paper_outcomes"}
+    )
+    transfer_window_count = _number(
+        _first(evidence, "transfer_window_count", "realized_window_count", "window_count", "stability_windows")
+    )
+    positive_transfer_windows = _number(
+        _first(evidence, "positive_transfer_windows", "positive_window_count", "positive_windows")
+    )
+    transfer_positive_window_rate = _number(
+        _first(evidence, "transfer_positive_window_rate", "positive_window_rate", "stable_positive_window_rate")
+    )
+    if transfer_positive_window_rate is None and transfer_window_count and positive_transfer_windows is not None:
+        transfer_positive_window_rate = positive_transfer_windows / transfer_window_count
+
+    source_evidence = _first_from(
+        source_containers,
+        "source_realized_paper_evidence",
+        "native_yahoo_proxy_paper_evidence",
+        "lineage_source_health",
+    )
+    source_expectancy = _number(
+        _first(source_evidence, "expectancy_net_bps", "after_cost_expectancy_bps", "avg_pnl_bps")
+        if isinstance(source_evidence, dict)
+        else _first_from(source_containers, "source_expectancy_net_bps", "native_proxy_expectancy_net_bps")
+    )
+
     min_closed_count = max(1, int(_number(policy["min_target_surface_closed_count"]) or 20))
     min_expectancy = _number(policy["min_target_surface_expectancy_net_bps"])
     min_expectancy = 0.0 if min_expectancy is None else min_expectancy
@@ -954,13 +1056,35 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
     min_quality_rate = 0.5 if min_quality_rate is None else min_quality_rate
     max_age_hours = _number(policy["max_target_surface_evidence_age_hours"])
     max_age_hours = 168.0 if max_age_hours is None or max_age_hours <= 0.0 else max_age_hours
+    min_transfer_windows = max(1, int(_number(policy["min_realized_transfer_windows"]) or 3))
+    min_transfer_positive_window_rate = _number(policy["min_realized_transfer_positive_window_rate"])
+    min_transfer_positive_window_rate = (
+        0.67
+        if min_transfer_positive_window_rate is None
+        else max(0.0, min(1.0, min_transfer_positive_window_rate))
+    )
+    source_target_incompatible = bool(
+        source_expectancy is not None
+        and source_expectancy < 0.0
+        and expectancy is not None
+        and expectancy < 0.0
+    )
 
     checks = {
         "paper_observations": bool(evidence is not None and _paper_evidence(evidence)),
+        "realized_transfer_outcomes": realized_transfer,
         "exact_target_surface": bool(target_surface and evidence_surface == target_surface),
+        "same_source_target_mapping": same_mapping,
         "minimum_closed_count": bool(closed_count is not None and closed_count >= min_closed_count),
         "positive_net_expectancy": bool(expectancy is not None and expectancy > min_expectancy),
         "quality_rate": bool(quality_rate is not None and quality_rate >= min_quality_rate),
+        "stable_positive_transfer_windows": bool(
+            transfer_window_count is not None
+            and transfer_window_count >= min_transfer_windows
+            and transfer_positive_window_rate is not None
+            and transfer_positive_window_rate >= min_transfer_positive_window_rate
+        ),
+        "source_target_compatible": not source_target_incompatible,
         "fresh_observations": bool(
             raw_age_hours is not None and -(5.0 / 60.0) <= raw_age_hours <= max_age_hours
         ),
@@ -979,6 +1103,8 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
         "reason": (
             "not_applicable"
             if not applies
+            else "yahoo_proxy_frontier_source_target_incompatible"
+            if source_target_incompatible
             else "fresh_target_surface_paper_evidence_validated"
             if proof_valid
             else "target_surface_paper_evidence_required"
@@ -988,6 +1114,20 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
         "evidence_field": evidence_field,
         "target_surface": target_surface,
         "evidence_surface": evidence_surface,
+        "expected_transfer_mapping_key": expected_mapping_key,
+        "evidence_transfer_mapping_key": evidence_mapping_key,
+        "source_signal_key": source_signal_key,
+        "target_route_key": target_route_key,
+        "evidence_source_signal_key": evidence_source_key,
+        "evidence_target_route_key": evidence_target_route,
+        "realized_transfer_outcomes": realized_transfer,
+        "transfer_window_count": int(transfer_window_count) if transfer_window_count is not None else None,
+        "min_transfer_windows": min_transfer_windows,
+        "positive_transfer_windows": int(positive_transfer_windows) if positive_transfer_windows is not None else None,
+        "transfer_positive_window_rate": transfer_positive_window_rate,
+        "min_transfer_positive_window_rate": min_transfer_positive_window_rate,
+        "source_expectancy_net_bps": source_expectancy,
+        "source_target_incompatible": source_target_incompatible,
         "closed_count": int(closed_count) if closed_count is not None else None,
         "min_closed_count": min_closed_count,
         "expectancy_net_bps": expectancy,
@@ -1436,6 +1576,10 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
     blocked = bool(applies and not eligible)
     if not applies:
         reason = "disabled" if not enabled else "non_paper_mode" if not paper_mode else "not_applicable"
+    elif target_surface_evidence.get("source_target_incompatible"):
+        # Two negative realized legs identify an incompatibility between the
+        # source and destination, rather than a transient threshold miss.
+        reason = "yahoo_proxy_frontier_source_target_incompatible"
     elif not native_regime_decisively_positive:
         reason = "native_yahoo_proxy_regime_non_positive"
     elif not native_regime_stable:
