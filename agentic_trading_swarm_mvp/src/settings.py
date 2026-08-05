@@ -130,6 +130,17 @@ DEFAULT_SETTINGS = {
             "near_threshold_band": 10.0,
             "near_threshold_allocation_multiplier": 0.50,
         },
+        "context_attribution_scoring": {
+            "enabled": True,
+            "venue_quality_floor_multiplier": 0.65,
+            "liquidity_floor_multiplier": 0.65,
+            "regime_stability_floor_multiplier": 0.65,
+            "spread_burden_scale_bps": 25.0,
+            "max_spread_burden_penalty": 0.25,
+            "carry_burden_scale_bps": 25.0,
+            "max_carry_burden_penalty": 0.25,
+            "max_signal_age_penalty": 0.25,
+        },
     },
     "yahoo_proxy_reuse_gate": {
         "enabled": True,

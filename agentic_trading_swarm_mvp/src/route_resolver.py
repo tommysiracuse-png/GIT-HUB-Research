@@ -15,7 +15,7 @@ import json
 import pathlib
 from typing import Iterable
 
-from paper_context_cost import annotate_paper_context_cost
+from paper_context_cost import annotate_paper_context_cost, rank_paper_candidates_by_context
 from paper_route_registry import apply_paper_route_registry
 
 try:
@@ -2351,7 +2351,13 @@ def enrich_candidates(candidates: Iterable[dict], settings: dict) -> list[dict]:
         )
         for candidate in candidates
     ]
-    return activate_paper_proxy_candidates(enriched, settings)
+    activated = activate_paper_proxy_candidates(enriched, settings)
+    # Context attribution is deliberately a paper-review ordering only.  It
+    # keeps every candidate available for exploration while finite review
+    # capacity favors transportable net edge over a gross-alpha illusion.
+    if str(settings.get("mode") or "paper").strip().lower() == "paper":
+        return rank_paper_candidates_by_context(activated, settings)
+    return activated
 
 
 def _requirement_counter_to_dict(counter: collections.Counter[tuple[str, str]]) -> dict:

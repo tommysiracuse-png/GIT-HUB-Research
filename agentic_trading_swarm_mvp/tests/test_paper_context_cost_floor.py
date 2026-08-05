@@ -20,7 +20,9 @@ from paper_context_cost import (  # noqa: E402
     annotate_paper_context_cost,
     paper_context_cost_gate,
     paper_context_cost_report,
+    paper_context_attribution_score,
     paper_context_transfer_score,
+    rank_paper_candidates_by_context,
     realized_paper_cost_audit,
 )
 from settings import DEFAULT_SETTINGS  # noqa: E402
@@ -52,6 +54,48 @@ def frontier_candidate(**overrides: object) -> dict:
 
 
 class PaperContextCostFloorTests(unittest.TestCase):
+    def test_context_attribution_down_ranks_fragile_net_edge_without_blocking_exploration(self) -> None:
+        healthy = frontier_candidate(
+            gross_edge_bps_estimate=100.0,
+            venue_quality={"venue_quality_score": 95.0},
+            liquidity_score=0.9,
+            spread_bps=2.0,
+            freshness_age_seconds=5.0,
+            regime_stability_score=0.95,
+        )
+        fragile = frontier_candidate(
+            inst_id="COINBASE:ETH-USD",
+            gross_edge_bps_estimate=100.0,
+            venue_quality={"venue_quality_score": 35.0},
+            liquidity_score=0.15,
+            spread_bps=20.0,
+            freshness_age_seconds=80.0,
+            regime_stability="unstable",
+            borrow_cost_bps_horizon=12.0,
+        )
+
+        healthy_attribution = paper_context_attribution_score(healthy, DEFAULT_SETTINGS)
+        fragile_attribution = paper_context_attribution_score(fragile, DEFAULT_SETTINGS)
+
+        self.assertTrue(healthy_attribution["paper_only"])
+        self.assertTrue(healthy_attribution["ranking_only"])
+        self.assertGreater(
+            healthy_attribution["context_adjusted_expected_net_edge_bps"],
+            fragile_attribution["context_adjusted_expected_net_edge_bps"],
+        )
+        self.assertIn("low_venue_quality", fragile_attribution["ranking_reasons"])
+        self.assertIn("wide_spread_burden", fragile_attribution["ranking_reasons"])
+        self.assertIn("thin_liquidity_depth", fragile_attribution["ranking_reasons"])
+        self.assertIn("unstable_regime", fragile_attribution["ranking_reasons"])
+        self.assertNotIn("paper_entry_blocked", fragile_attribution)
+
+        ranked = rank_paper_candidates_by_context([fragile, healthy], DEFAULT_SETTINGS)
+        self.assertEqual("COINBASE:BTC-USD", ranked[0]["inst_id"])
+        self.assertEqual(
+            healthy_attribution["context_adjusted_expected_net_edge_bps"],
+            ranked[0]["paper_context_rank_score"],
+        )
+
     def test_effective_cost_is_additive_and_buffer_comparison_is_strict(self) -> None:
         settings = copy.deepcopy(DEFAULT_SETTINGS)
         settings["paper_context_cost_floor"].update(

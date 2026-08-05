@@ -148,6 +148,46 @@ class RouteResolverTests(unittest.TestCase):
         self.assertEqual(route["missing_permissions"], [])
         self.assertIn("Global discovery proxy exposure", route["route_notes"][0])
 
+    def test_paper_enrichment_ranks_context_adjusted_net_edge_without_entry_block(self) -> None:
+        common = {
+            "venue": "B3",
+            "trade_type": "global_market_discovery_proxy",
+            "direction": "long_proxy",
+            "asset_class": "equity_or_proxy",
+            "gross_edge_bps_estimate": 80.0,
+            "liquidity_score": 0.9,
+            "spread_bps": 2.0,
+            "freshness_age_seconds": 5.0,
+            "regime_stability_score": 0.9,
+        }
+        candidates = route_resolver.enrich_candidates(
+            [
+                {
+                    **common,
+                    "inst_id": "B3:FRAGILE",
+                    "score": 95.0,
+                    "venue_quality": {"venue_quality_score": 30.0},
+                    "liquidity_score": 0.1,
+                    "spread_bps": 20.0,
+                    "freshness_age_seconds": 800.0,
+                    "regime_stability": "unstable",
+                },
+                {
+                    **common,
+                    "inst_id": "B3:TRANSPORTABLE",
+                    "score": 60.0,
+                    "venue_quality": {"venue_quality_score": 95.0},
+                },
+            ],
+            settings(),
+        )
+
+        self.assertEqual("B3:TRANSPORTABLE", candidates[0]["inst_id"])
+        fragile = candidates[1]
+        self.assertIn("paper_context_attribution", fragile)
+        self.assertIn("thin_liquidity_depth", fragile["paper_context_ranking_reasons"])
+        self.assertNotIn("paper_entry_blocked", fragile)
+
     def test_global_proxy_shock_reversal_uses_only_the_existing_paper_equity_routes(self) -> None:
         long_route = route_resolver.resolve_candidate_route(
             {

@@ -71,6 +71,19 @@ DEFAULT_PAPER_CONTEXT_COST_POLICY = {
         "near_threshold_band": 10.0,
         "near_threshold_allocation_multiplier": 0.50,
     },
+    # This is a ranking attribution, not an admission rule.  Unknown inputs
+    # stay neutral so priceable paper candidates continue to collect evidence.
+    "context_attribution_scoring": {
+        "enabled": True,
+        "venue_quality_floor_multiplier": 0.65,
+        "liquidity_floor_multiplier": 0.65,
+        "regime_stability_floor_multiplier": 0.65,
+        "spread_burden_scale_bps": 25.0,
+        "max_spread_burden_penalty": 0.25,
+        "carry_burden_scale_bps": 25.0,
+        "max_carry_burden_penalty": 0.25,
+        "max_signal_age_penalty": 0.25,
+    },
 }
 
 _PAPER_CONTEXT_FAMILIES = {
@@ -137,6 +150,16 @@ def _transfer_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
     """Merge transfer-scoring defaults without sharing nested settings state."""
     defaults = DEFAULT_PAPER_CONTEXT_COST_POLICY["context_transfer_scoring"]
     configured = policy.get("context_transfer_scoring")
+    return {
+        **defaults,
+        **(configured if isinstance(configured, Mapping) else {}),
+    }
+
+
+def _attribution_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge ranking-attribution defaults without changing admission policy."""
+    defaults = DEFAULT_PAPER_CONTEXT_COST_POLICY["context_attribution_scoring"]
+    configured = policy.get("context_attribution_scoring")
     return {
         **defaults,
         **(configured if isinstance(configured, Mapping) else {}),
@@ -566,6 +589,245 @@ def _quality_floor(
         "min_liquidity_score": min_liquidity,
         "max_freshness_age_seconds": max_freshness,
         "reasons": reasons,
+    }
+
+
+def _nested_number(
+    candidate: Mapping[str, Any],
+    containers: tuple[str, ...],
+    *fields: str,
+) -> tuple[str | None, float | None]:
+    """Find a finite number at the candidate level or in known diagnostics."""
+    field, value = _first_number(candidate, *fields)
+    if value is not None:
+        return field, value
+    for container_name in containers:
+        container = candidate.get(container_name)
+        if not isinstance(container, Mapping):
+            continue
+        field, value = _first_number(container, *fields)
+        if value is not None:
+            return f"{container_name}.{field}", value
+    return None, None
+
+
+def _normalized_score(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if value > 1.0 and value <= 100.0:
+        value /= 100.0
+    if value < 0.0:
+        return 0.0
+    return min(1.0, value)
+
+
+def _context_linear_multiplier(value: float | None, floor: float) -> float:
+    """Return a neutral multiplier for missing evidence, never a veto."""
+    if value is None:
+        return 1.0
+    floor = max(0.0, min(1.0, floor))
+    return floor + (1.0 - floor) * max(0.0, min(1.0, value))
+
+
+def _regime_stability(candidate: Mapping[str, Any]) -> tuple[str | None, float | None]:
+    field, value = _nested_number(
+        candidate,
+        ("regime", "market_regime", "signal_context"),
+        "regime_stability_score",
+        "market_regime_stability_score",
+        "stability_score",
+    )
+    normalized = _normalized_score(value)
+    if normalized is not None:
+        return field, normalized
+
+    volatility_field, volatility = _nested_number(
+        candidate,
+        ("regime", "market_regime", "signal_context"),
+        "realized_volatility",
+        "regime_realized_volatility",
+        "cross_market_realized_volatility",
+    )
+    threshold_field, threshold = _nested_number(
+        candidate,
+        ("regime", "market_regime", "signal_context"),
+        "volatility_stress_threshold",
+        "regime_stress_threshold",
+        "paper_volatility_stress_threshold",
+    )
+    if volatility is not None and threshold is not None and threshold > 0.0:
+        return f"{volatility_field}/{threshold_field}", max(0.0, min(1.0, threshold / volatility))
+
+    for field_name in ("regime_stability", "regime_status", "market_regime_status"):
+        token = str(candidate.get(field_name) or "").strip().lower()
+        if token in {"stable", "calm", "confirmed"}:
+            return field_name, 1.0
+        if token in {"unstable", "volatile", "decaying", "transition"}:
+            return field_name, 0.4
+    return None, None
+
+
+def paper_context_attribution_score(
+    candidate: Mapping[str, Any],
+    settings: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attribute cross-market paper ranking to transport and cost context.
+
+    The result is intentionally diagnostic and ranking-only.  It does not set
+    paper eligibility, alter a route, suppress a candidate, or affect live
+    trading.  In particular, missing public context is recorded as an unknown
+    diagnostic with a neutral multiplier rather than becoming a paper block.
+    """
+    policy = _policy(settings)
+    attribution_policy = _attribution_policy(policy)
+    family = paper_context_family(candidate)
+    paper_mode = str((settings or {}).get("mode", "paper")).lower() == "paper"
+    enabled = bool(attribution_policy.get("enabled", True)) and paper_mode and not bool(
+        (settings or {}).get("allow_live_trading", False)
+    )
+    if family is None:
+        return {
+            "paper_only": True,
+            "applicable": False,
+            "enabled": False,
+            "ranking_only": True,
+            "context_adjusted_expected_net_edge_bps": None,
+            "ranking_reasons": [],
+        }
+
+    stored_gate = candidate.get("paper_context_cost_gate")
+    gate = dict(stored_gate) if isinstance(stored_gate, Mapping) else paper_context_cost_gate(candidate, settings)
+    raw_alpha = _finite_float(gate.get("gross_edge_bps"))
+    expected_net_edge = _finite_float(gate.get("net_edge_bps"))
+    components = gate.get("components_bps") if isinstance(gate.get("components_bps"), Mapping) else {}
+    inputs = gate.get("inputs") if isinstance(gate.get("inputs"), Mapping) else {}
+
+    venue_field, venue_quality = _nested_number(
+        candidate,
+        ("venue_health", "venue_quality", "market_context"),
+        "venue_quality_score",
+        "venue_health_score",
+    )
+    venue_quality = _normalized_score(venue_quality)
+    liquidity_field = inputs.get("liquidity_field")
+    liquidity = _normalized_score(_finite_float(inputs.get("liquidity_score")))
+    spread_burden = max(0.0, _finite_float(components.get("round_trip_spread_bps")) or 0.0)
+    _, explicit_borrow_or_carry = _first_number(
+        candidate,
+        "borrow_cost_bps_horizon",
+        "expected_borrow_cost_bps",
+        "carry_bps_horizon",
+        "expected_carry_cost_bps",
+    )
+    carry_burden = max(
+        0.0,
+        _finite_float(components.get("carry_bps_horizon")) or 0.0,
+        _finite_float(components.get("route")) or 0.0,
+        explicit_borrow_or_carry or 0.0,
+    )
+    age = _finite_float(gate.get("signal_age_seconds"))
+    max_age = _finite_float(gate.get("max_signal_age_seconds"))
+    regime_field, regime_stability = _regime_stability(candidate)
+
+    spread_penalty = min(
+        max(0.0, float(attribution_policy["max_spread_burden_penalty"])),
+        spread_burden / max(0.001, float(attribution_policy["spread_burden_scale_bps"])),
+    )
+    carry_penalty = min(
+        max(0.0, float(attribution_policy["max_carry_burden_penalty"])),
+        carry_burden / max(0.001, float(attribution_policy["carry_burden_scale_bps"])),
+    )
+    age_penalty = 0.0
+    if age is not None and max_age is not None and max_age > 0.0:
+        age_penalty = min(
+            max(0.0, float(attribution_policy["max_signal_age_penalty"])),
+            max(0.0, age / max_age) * float(attribution_policy["max_signal_age_penalty"]),
+        )
+
+    multipliers = {
+        "venue_quality": _context_linear_multiplier(
+            venue_quality,
+            float(attribution_policy["venue_quality_floor_multiplier"]),
+        ),
+        "spread_burden": 1.0 - spread_penalty,
+        "liquidity_depth": _context_linear_multiplier(
+            liquidity,
+            float(attribution_policy["liquidity_floor_multiplier"]),
+        ),
+        "borrow_or_carry_burden": 1.0 - carry_penalty,
+        "signal_age": 1.0 - age_penalty,
+        "regime_stability": _context_linear_multiplier(
+            regime_stability,
+            float(attribution_policy["regime_stability_floor_multiplier"]),
+        ),
+    }
+    multiplier = 1.0
+    for value in multipliers.values():
+        multiplier *= max(0.0, min(1.0, value))
+    multiplier = max(0.0, min(1.0, multiplier)) if enabled else 1.0
+
+    if expected_net_edge is None:
+        adjusted_net_edge = None
+    elif expected_net_edge >= 0.0:
+        adjusted_net_edge = expected_net_edge * multiplier
+    else:
+        # Do not let a confidence discount make an already-negative setup look
+        # less bad than its cost-adjusted expected edge.
+        adjusted_net_edge = expected_net_edge / max(multiplier, 0.001)
+
+    reasons: list[str] = []
+    if venue_quality is None:
+        reasons.append("venue_quality_unknown")
+    elif venue_quality < 0.6:
+        reasons.append("low_venue_quality")
+    if inputs.get("spread_bps") is None:
+        reasons.append("spread_burden_estimated_from_default")
+    elif spread_penalty > 0.10:
+        reasons.append("wide_spread_burden")
+    if liquidity is None:
+        reasons.append("liquidity_depth_unknown")
+    elif liquidity < 0.5:
+        reasons.append("thin_liquidity_depth")
+    if carry_burden > 0.0:
+        reasons.append("borrow_or_carry_burden")
+    if age is None or max_age is None:
+        reasons.append("signal_age_unknown")
+    elif age_penalty > 0.10:
+        reasons.append("signal_age_decay")
+    if regime_stability is None:
+        reasons.append("regime_stability_unknown")
+    elif regime_stability < 0.6:
+        reasons.append("unstable_regime")
+    if expected_net_edge is None:
+        reasons.append("expected_net_edge_unavailable")
+    elif expected_net_edge <= 0.0:
+        reasons.append("context_cost_exceeds_raw_alpha")
+
+    return {
+        "paper_only": True,
+        "applicable": True,
+        "enabled": enabled,
+        "ranking_only": True,
+        "raw_alpha_bps": round(raw_alpha, 3) if raw_alpha is not None else None,
+        "expected_net_edge_bps": round(expected_net_edge, 3) if expected_net_edge is not None else None,
+        "context_adjusted_expected_net_edge_bps": (
+            round(adjusted_net_edge, 3) if adjusted_net_edge is not None else None
+        ),
+        "context_multiplier": round(multiplier, 6),
+        "component_multipliers": {key: round(value, 6) for key, value in multipliers.items()},
+        "inputs": {
+            "venue_quality_field": venue_field,
+            "venue_quality_score": venue_quality,
+            "spread_burden_bps": round(spread_burden, 3),
+            "liquidity_depth_field": liquidity_field,
+            "liquidity_depth_score": liquidity,
+            "borrow_or_carry_burden_bps": round(carry_burden, 3),
+            "signal_age_seconds": round(age, 3) if age is not None else None,
+            "max_signal_age_seconds": round(max_age, 3) if max_age is not None else None,
+            "regime_stability_field": regime_field,
+            "regime_stability_score": regime_stability,
+        },
+        "ranking_reasons": reasons,
     }
 
 
@@ -1115,11 +1377,64 @@ def annotate_paper_context_cost(
             if marker not in notes:
                 notes.append(marker)
             annotated["risk_notes"] = notes
+    attribution = paper_context_attribution_score(annotated, settings)
+    annotated["paper_context_attribution"] = attribution
+    annotated["context_adjusted_expected_net_edge_bps"] = attribution.get(
+        "context_adjusted_expected_net_edge_bps"
+    )
+    # This is a separate rank key so contextual uncertainty never changes a
+    # priceable candidate into a rejection or paper-entry block.
+    annotated["paper_context_rank_score"] = attribution.get(
+        "context_adjusted_expected_net_edge_bps"
+    )
+    if attribution.get("ranking_reasons"):
+        annotated["paper_context_ranking_reasons"] = list(attribution["ranking_reasons"])
     notes = list(annotated.get("risk_notes") or [])
     marker = "paper-only gross edge must clear the market-context cost floor"
     if marker not in notes:
         notes.append(marker)
     annotated["risk_notes"] = notes
+    return annotated
+
+
+def rank_paper_candidates_by_context(
+    candidates: Iterable[Mapping[str, Any]],
+    settings: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Order paper candidates by context-adjusted expected net edge.
+
+    Candidates without a usable edge estimate retain their ordinary score as a
+    fallback.  This intentionally preserves exploration: it only controls the
+    ordering used when review capacity is finite.
+    """
+    annotated: list[dict[str, Any]] = []
+    for candidate in candidates:
+        row = dict(candidate)
+        attribution = row.get("paper_context_attribution")
+        if not isinstance(attribution, Mapping):
+            attribution = paper_context_attribution_score(row, settings)
+            if attribution.get("applicable"):
+                row["paper_context_attribution"] = attribution
+                row["context_adjusted_expected_net_edge_bps"] = attribution.get(
+                    "context_adjusted_expected_net_edge_bps"
+                )
+                row["paper_context_rank_score"] = attribution.get(
+                    "context_adjusted_expected_net_edge_bps"
+                )
+                row["paper_context_ranking_reasons"] = list(attribution.get("ranking_reasons") or [])
+        edge = _finite_float((attribution or {}).get("context_adjusted_expected_net_edge_bps"))
+        score = _finite_float(row.get("score"))
+        # Known net edge ranks ahead of gross-score-only rows; unknown data is
+        # still retained and ordered by its existing paper score.
+        row["_paper_context_rank_key"] = (
+            1 if edge is not None else 0,
+            edge if edge is not None else (score if score is not None else float("-inf")),
+            score if score is not None else float("-inf"),
+        )
+        annotated.append(row)
+    annotated.sort(key=lambda row: row["_paper_context_rank_key"], reverse=True)
+    for row in annotated:
+        row.pop("_paper_context_rank_key", None)
     return annotated
 
 
@@ -1133,6 +1448,7 @@ def paper_context_cost_report(
     reason_counts: dict[str, int] = {}
     family_counts: dict[str, int] = {}
     transfer_reason_counts: dict[str, int] = {}
+    attribution_reason_counts: dict[str, int] = {}
     for candidate in candidates:
         stored = candidate.get("paper_context_cost_gate")
         gate = dict(stored) if isinstance(stored, Mapping) else paper_context_cost_gate(candidate)
@@ -1145,9 +1461,16 @@ def paper_context_cost_report(
         transfer = candidate.get("paper_context_transfer_score")
         if not isinstance(transfer, Mapping):
             transfer = paper_context_transfer_score(candidate)
+        attribution = candidate.get("paper_context_attribution")
+        if not isinstance(attribution, Mapping):
+            attribution = paper_context_attribution_score(candidate)
         for transfer_reason in transfer.get("reasons") or []:
             transfer_reason_counts[str(transfer_reason)] = (
                 transfer_reason_counts.get(str(transfer_reason), 0) + 1
+            )
+        for attribution_reason in attribution.get("ranking_reasons") or []:
+            attribution_reason_counts[str(attribution_reason)] = (
+                attribution_reason_counts.get(str(attribution_reason), 0) + 1
             )
         rows.append(
             {
@@ -1161,6 +1484,11 @@ def paper_context_cost_report(
                 "gross_edge_bps": gate.get("gross_edge_bps"),
                 "modeled_cost_bps": gate.get("modeled_cost_bps"),
                 "net_edge_bps": gate.get("net_edge_bps"),
+                "context_adjusted_expected_net_edge_bps": attribution.get(
+                    "context_adjusted_expected_net_edge_bps"
+                ),
+                "context_multiplier": attribution.get("context_multiplier"),
+                "context_ranking_reasons": attribution.get("ranking_reasons", []),
                 "freshness_minutes": gate.get("freshness_minutes"),
                 "gating_reason": reason,
                 "context_transfer_multiplier": transfer.get("confidence_multiplier"),
@@ -1171,7 +1499,11 @@ def paper_context_cost_report(
     rows.sort(
         key=lambda row: (
             bool(row["paper_eligible"]),
-            row["net_edge_bps"] if row["net_edge_bps"] is not None else float("-inf"),
+            row["context_adjusted_expected_net_edge_bps"]
+            if row["context_adjusted_expected_net_edge_bps"] is not None
+            else row["net_edge_bps"]
+            if row["net_edge_bps"] is not None
+            else float("-inf"),
         )
     )
     gated_count = sum(not row["paper_eligible"] for row in rows)
@@ -1183,6 +1515,7 @@ def paper_context_cost_report(
         "by_family_kind": family_counts,
         "by_gating_reason": reason_counts,
         "by_context_transfer_reason": transfer_reason_counts,
+        "by_context_ranking_reason": attribution_reason_counts,
         "candidates": rows[: max(0, int(limit))],
     }
 
