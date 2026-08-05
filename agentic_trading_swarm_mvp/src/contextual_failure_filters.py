@@ -341,6 +341,83 @@ def _observation_profile(trade: dict) -> str | None:
     return None
 
 
+def _candidate_observation_profile(candidate: dict) -> str | None:
+    """Resolve a live candidate to the same research surface as closed trades."""
+    return _observation_profile(
+        {
+            "signal_key": candidate.get("signal_key"),
+            "candidate": candidate,
+            "features": build_context_features(candidate),
+        }
+    )
+
+
+def annotate_candidates_with_cross_context_diagnostics(
+    candidates: Iterable[dict],
+    observations: Iterable[dict],
+    settings: dict,
+) -> list[dict]:
+    """Attach recurring-loss attribution without suppressing paper experiments.
+
+    Persistent cross-context failures lower the rank and allocation of an
+    otherwise priceable paper candidate and make the reason visible to
+    downstream research.  They never set a rejection, quarantine, or
+    entry-block field; fresh observations continue to provide the
+    rehabilitation window.
+    """
+    cfg = settings.get("contextual_failure_filters", {})
+    allocation_cap = max(
+        0.01,
+        min(1.0, float(cfg.get("cross_context_failure_allocation_multiplier", 0.25))),
+    )
+    ranking_multiplier = max(
+        0.0,
+        min(1.0, float(cfg.get("cross_context_failure_score_multiplier", 0.75))),
+    )
+    by_context = {
+        str(item.get("context")): item
+        for item in observations
+        if item.get("state") in {"persistent_failure", "rehabilitated"}
+    }
+    annotated = []
+    for raw_candidate in candidates:
+        candidate = dict(raw_candidate)
+        context = _candidate_observation_profile(candidate)
+        observation = by_context.get(str(context))
+        if not observation:
+            annotated.append(candidate)
+            continue
+
+        diagnostic = {
+            "context": context,
+            "state": observation.get("state"),
+            "closed_count": observation.get("closed_count"),
+            "avg_pnl_bps": observation.get("avg_pnl_bps"),
+            "win_rate": observation.get("win_rate"),
+            "research_note": observation.get("research_note"),
+            "recommendation_handling": "diagnostic_ranking_and_sizing_only",
+            "paper_entry_blocked": False,
+            "rehabilitation_criteria": observation.get("rehabilitation_criteria", {}),
+        }
+        candidate["cross_context_failure_diagnostic"] = diagnostic
+        if observation.get("state") == "persistent_failure":
+            try:
+                candidate["score"] = round(float(candidate["score"]) * ranking_multiplier, 3)
+                candidate["cross_context_failure_score_multiplier"] = ranking_multiplier
+            except (KeyError, TypeError, ValueError):
+                pass
+            existing = candidate.get("paper_allocation_multiplier")
+            try:
+                existing_allocation = float(existing)
+            except (TypeError, ValueError):
+                existing_allocation = 1.0
+            if existing_allocation > 0.0:
+                candidate["paper_allocation_multiplier"] = min(existing_allocation, allocation_cap)
+            candidate["cross_context_failure_allocation_cap"] = allocation_cap
+        annotated.append(candidate)
+    return annotated
+
+
 def _direction_side(value: object) -> str:
     normalized = str(value or "").lower()
     if "long" in normalized:

@@ -1494,6 +1494,23 @@ def _compact_contextual_failures(report: dict) -> dict:
         "route_or_data_quality_failures": [
             compact_context(item) for item in report.get("route_or_data_quality_failures", [])[:10]
         ],
+        "cross_context_observations": [
+            {
+                "context": item.get("context"),
+                "state": item.get("state"),
+                "closed_count": item.get("closed_count"),
+                "avg_pnl_bps": item.get("avg_pnl_bps"),
+                "win_rate": item.get("win_rate"),
+                "directions": item.get("directions", []),
+                "venues": item.get("venues", []),
+                "sub_modes": item.get("sub_modes", []),
+                "research_note": item.get("research_note"),
+                "recommendation_handling": "diagnostic_ranking_and_sizing_only",
+                "paper_entry_blocked": False,
+                "rehabilitation_criteria": item.get("rehabilitation_criteria", {}),
+            }
+            for item in report.get("cross_context_observations", [])[:10]
+        ],
         "report": str(RUNS_DIR / "contextual_failure_report.md"),
     }
 

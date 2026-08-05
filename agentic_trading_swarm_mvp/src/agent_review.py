@@ -121,6 +121,7 @@ def review_candidate(
     warnings = []
     hard_blocks = []
     applied_policies = []
+    cross_context_diagnostic = candidate.get("cross_context_failure_diagnostic") or {}
     allocation_multiplier = max(
         0.0,
         min(
@@ -216,6 +217,14 @@ def review_candidate(
         evidence.append(
             f"frontier executable quality {candidate['quality_score']} "
             f"({candidate.get('quality_status', 'unknown')})"
+        )
+    if cross_context_diagnostic:
+        warnings.append(
+            "cross-context paper diagnostic "
+            f"{cross_context_diagnostic.get('context')}: {cross_context_diagnostic.get('state')} "
+            f"(n={cross_context_diagnostic.get('closed_count')}, "
+            f"avg={cross_context_diagnostic.get('avg_pnl_bps')} bps); "
+            "retained for paper exploration"
         )
     if strategy_reliability:
         action = strategy_reliability.get("action")
@@ -356,6 +365,7 @@ def review_candidate(
         ),
         "paper_context_cost_gate": context_cost_gate,
         "paper_allocation_multiplier": round(allocation_multiplier, 4),
+        "cross_context_failure_diagnostic": cross_context_diagnostic,
         "applied_policies": applied_policies,
         "context_features": context_features,
         "feasibility_status": feasibility_status,

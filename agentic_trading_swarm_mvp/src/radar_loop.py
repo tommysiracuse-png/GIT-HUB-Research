@@ -23,7 +23,10 @@ from agent_review import review_candidate
 from adapter_capabilities import reconcile_adapter_specs
 from adapter_runtime import build_scan_batch as build_public_adapter_scan_batch
 from autonomous_builder import run_autonomous_builder
-from contextual_failure_filters import run_contextual_failure_filters
+from contextual_failure_filters import (
+    annotate_candidates_with_cross_context_diagnostics,
+    run_contextual_failure_filters,
+)
 from crypto_venue_scanner import scan as scan_crypto_venues, write_outputs as write_crypto_venue_health
 from execution_engine import execute_order
 from frontier_crypto_adapter import REPORT_JSON as FRONTIER_CRYPTO_REPORT_JSON
@@ -539,6 +542,11 @@ def run_once(settings: dict) -> dict:
         auto_improvement = run_auto_improvement(conn, settings, include_code_changes=False)
         signal_safety_governor = run_signal_safety_governor(conn, settings)
         contextual_failure_filters = run_contextual_failure_filters(conn, settings)
+        candidates = annotate_candidates_with_cross_context_diagnostics(
+            candidates,
+            contextual_failure_filters.get("cross_context_observations", []),
+            settings,
+        )
         policies = active_signal_policies(conn)
         review_limit = int(scan_cfg["review_top"])
         reserved_lab_candidates, strategy_lab_review_reserve = _reserve_strategy_lab_review_candidates(

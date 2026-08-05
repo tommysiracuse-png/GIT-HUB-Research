@@ -714,6 +714,8 @@ DEFAULT_SETTINGS = {
         "release_min_avg_pnl_bps": 10.0,
         "release_min_win_rate": 0.55,
         "release_max_worst_bps": -500.0,
+        "cross_context_failure_allocation_multiplier": 0.25,
+        "cross_context_failure_score_multiplier": 0.75,
     },
 }
 
