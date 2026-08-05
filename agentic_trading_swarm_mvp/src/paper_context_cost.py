@@ -571,6 +571,7 @@ def paper_context_cost_gate(
             gross_edge is not None
             and gross_edge > required_edge
             and age_passed
+            and not route_blocked
         )
     )
 

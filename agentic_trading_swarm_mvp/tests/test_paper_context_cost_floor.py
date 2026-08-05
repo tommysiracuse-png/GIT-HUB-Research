@@ -410,6 +410,20 @@ class PaperContextCostFloorTests(unittest.TestCase):
             18.0 - audit["realized_cost_backfill_bps"],
         )
 
+    def test_blocked_paper_route_cannot_clear_context_cost_gate(self) -> None:
+        candidate = frontier_candidate(
+            gross_edge_bps_estimate=200.0,
+            execution_feasibility={"status": "blocked"},
+        )
+
+        gate = paper_context_cost_gate(candidate, DEFAULT_SETTINGS)
+        annotated = annotate_paper_context_cost(candidate, DEFAULT_SETTINGS)
+
+        self.assertFalse(gate["eligible"])
+        self.assertEqual("route_status_not_paper_promotable", gate["gating_reason"])
+        self.assertFalse(annotated["paper_eligible"])
+        self.assertLess(annotated["score"], candidate["score"])
+
     def test_policy_is_paper_only_configurable_and_scope_limited(self) -> None:
         disabled = copy.deepcopy(DEFAULT_SETTINGS)
         disabled["paper_context_cost_floor"]["enabled"] = False
