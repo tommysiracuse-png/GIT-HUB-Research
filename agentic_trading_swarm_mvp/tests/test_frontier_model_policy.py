@@ -279,6 +279,48 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(rec["retry_count"], 1)
         self.assertEqual(rec["initial_parse_status"], "truncated_json")
 
+    def test_strategy_lab_prompt_puts_invention_evidence_before_generic_state(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": ["propose_strategy_lab_experiment", "no_action"],
+            "summary": {"closed": 100, "avg_pnl_bps": -5},
+            "strategy_lab": {
+                "recent": [
+                    {
+                        "strategy_lab_id": "existing_okx",
+                        "status": "active_testing",
+                        "source_surface": "perp_funding_basis",
+                        "hypothesis": "Persistent OKX funding carry.",
+                    }
+                ]
+            },
+            "global_market_discovery": {
+                "top_candidates": [
+                    {
+                        "surface_type_classified": "commodity_auction",
+                        "venue_or_source": "NZX",
+                        "region": "Oceania",
+                    }
+                ]
+            },
+        }
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "strategy_lab")
+
+        prompt = llm_swarm_runner.agent_prompt(agent, packet, [])
+
+        self.assertIn("CURRENT INVENTION CONTEXT", prompt)
+        self.assertIn("commodity_auction", prompt)
+        self.assertIn("observation_program", prompt)
+        self.assertNotIn("action must be allowed action", prompt)
+
+    def test_strategy_lab_schema_retry_requires_complete_contract_and_valid_action(self) -> None:
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "strategy_lab")
+
+        prompt = llm_swarm_runner._schema_retry_prompt(agent, '{"action":"refine"}')
+
+        self.assertIn("propose_strategy_lab_experiment", prompt)
+        self.assertIn("permitted_target_surface", prompt)
+        self.assertIn("Do not use refine", prompt)
+
     def test_build_planner_unstructured_output_is_not_fake_code_change(self) -> None:
         packet = {
             "allowed_recommendation_actions": [

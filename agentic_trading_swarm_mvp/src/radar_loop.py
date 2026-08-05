@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -177,6 +178,26 @@ def _strategy_lab_surface_rank_eligible(item: dict) -> bool:
     return strategy_lab_surface_activation_eligible(item)
 
 
+def _strategy_lab_lineage_root_id(candidate: dict) -> str:
+    explicit = str(candidate.get("strategy_lab_lineage_root_id") or "").strip()
+    if explicit:
+        return explicit
+    relaxation = candidate.get("strategy_lab_relaxation")
+    parent = relaxation.get("parent") if isinstance(relaxation, dict) else None
+    current = str(
+        candidate.get("strategy_lab_root_id")
+        or candidate.get("parent_strategy_lab_id")
+        or parent
+        or candidate.get("strategy_lab_id")
+        or ""
+    ).strip()
+    previous = None
+    while current and current != previous:
+        previous = current
+        current = re.sub(r"__relaxed_r\d+$", "", current)
+    return current
+
+
 def _strategy_lab_runtime_selection_summary(
     candidates: list[dict],
     *,
@@ -207,6 +228,7 @@ def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: di
     limit = min(max(0, int(total_slots)), requested)
     selected: list[dict] = []
     selected_experiments: set[str] = set()
+    selected_roots: set[str] = set()
     selected_sources: set[tuple[str, str, str, str]] = set()
 
     def route_rank(row: dict) -> int:
@@ -219,6 +241,7 @@ def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: di
         return {"standard": 0, "feasible": 0, "paper_proxy": 1, "conditional": 2}.get(status, 3)
 
     by_experiment: dict[str, list[dict]] = {}
+    by_root: dict[str, list[dict]] = {}
     for candidate in candidates:
         strategy_lab_id = str(candidate.get("strategy_lab_id") or "").strip()
         if not strategy_lab_id:
@@ -230,11 +253,12 @@ def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: di
         if not _strategy_lab_surface_rank_eligible(candidate):
             continue
         by_experiment.setdefault(strategy_lab_id, []).append(candidate)
+        by_root.setdefault(_strategy_lab_lineage_root_id(candidate) or strategy_lab_id, []).append(candidate)
 
-    for strategy_lab_id, experiment_candidates in by_experiment.items():
+    def select_one(options: list[dict]) -> tuple[dict | None, tuple[str, str, str, str] | None]:
         candidate = None
         source_key = None
-        for option in sorted(experiment_candidates, key=lambda row: (route_rank(row), -float(row.get("score") or 0.0))):
+        for option in sorted(options, key=lambda row: (route_rank(row), -float(row.get("score") or 0.0))):
             option_key = (
                 str(option.get("venue") or ""),
                 str(option.get("inst_id") or ""),
@@ -245,21 +269,48 @@ def _reserve_strategy_lab_review_candidates(candidates: list[dict], settings: di
                 candidate = option
                 source_key = option_key
                 break
+        return candidate, source_key
+
+    for root_id, root_candidates in by_root.items():
+        candidate, source_key = select_one(root_candidates)
         if candidate is None or source_key is None:
             continue
         row = dict(candidate)
         row["_hunter_bucket"] = "explore"
         row["_hunter_directive_id"] = None
         row["_hunter_allocation_reason"] = "strategy_lab_distinct_experiment_reserve"
+        row["strategy_lab_lineage_root_id"] = root_id
         selected.append(row)
-        selected_experiments.add(strategy_lab_id)
+        selected_experiments.add(str(candidate.get("strategy_lab_id") or ""))
+        selected_roots.add(root_id)
         selected_sources.add(source_key)
         if len(selected) >= limit:
             break
+    if len(selected) < limit:
+        for strategy_lab_id, experiment_candidates in by_experiment.items():
+            if strategy_lab_id in selected_experiments:
+                continue
+            candidate, source_key = select_one(experiment_candidates)
+            if candidate is None or source_key is None:
+                continue
+            root_id = _strategy_lab_lineage_root_id(candidate) or strategy_lab_id
+            row = dict(candidate)
+            row["_hunter_bucket"] = "explore"
+            row["_hunter_directive_id"] = None
+            row["_hunter_allocation_reason"] = "strategy_lab_additional_descendant_reserve"
+            row["strategy_lab_lineage_root_id"] = root_id
+            selected.append(row)
+            selected_experiments.add(strategy_lab_id)
+            selected_roots.add(root_id)
+            selected_sources.add(source_key)
+            if len(selected) >= limit:
+                break
     return selected, {
         "configured_slots": requested,
         "reserved_count": len(selected),
         "strategy_lab_ids": sorted(selected_experiments),
+        "strategy_lab_lineage_roots": sorted(selected_roots),
+        "distinct_lineage_root_count": len(selected_roots),
         "distinct_source_count": len(selected_sources),
     }
 

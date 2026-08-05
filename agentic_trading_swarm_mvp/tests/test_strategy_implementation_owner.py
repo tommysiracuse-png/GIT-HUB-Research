@@ -180,6 +180,103 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         ).fetchone()[0])
         self.assertEqual(0, self.conn.execute("select count(*) from code_evolution_proposals").fetchone()[0])
 
+    def test_contract_intake_materializes_diverse_batch_without_codex_writer(self) -> None:
+        rec_a = self._recommendation("rec-frontier-intake")
+        rec_a["payload"].update(
+            {
+                "market_key": "frontier_crypto_spot",
+                "proposed_change": {"entry_logic": "Cross-venue washout then rebound."},
+            }
+        )
+        self.conn.execute(
+            "update llm_recommendations set payload_json=? where recommendation_id=?",
+            (json.dumps(rec_a["payload"]), rec_a["recommendation_id"]),
+        )
+        owner.enqueue_recommendation(self.conn, rec_a, self.settings)
+        payload_b = {
+            "action": "propose_strategy_lab_experiment",
+            "priority": 90,
+            "title": "Proxy residual reversal",
+            "rationale": "Test residual reversal after market-relative overextension.",
+            "market_key": "global_proxy_momentum",
+            "proposed_change": {"entry_logic": "Fade extreme SPY-relative residuals after deceleration."},
+        }
+        add_llm_recommendation(
+            self.conn,
+            "rec-proxy-intake",
+            payload_b["action"],
+            payload_b["title"],
+            payload_b["rationale"],
+            payload_b,
+        )
+        rec_b = {
+            "recommendation_id": "rec-proxy-intake",
+            "title": payload_b["title"],
+            "rationale": payload_b["rationale"],
+            "payload": payload_b,
+        }
+        owner.enqueue_recommendation(self.conn, rec_b, self.settings)
+        decisions = {
+            "items": [
+                {
+                    "task_id": row["task_id"],
+                    "decision": "materialize_experiment",
+                    "rationale": "Runnable with current candidate fields.",
+                    "strategy_experiment": {
+                        "strategy_lab_id": f"intake_{index}",
+                        "version": 1,
+                        "experiment_type": "market_strategy",
+                        "hypothesis": "A reusable conditional pattern has positive paper expectancy.",
+                        "source_surface": "frontier_crypto_spot" if index == 1 else "global_proxy_momentum",
+                        "permitted_target_surface": ["frontier_crypto_spot" if index == 1 else "global_proxy_momentum"],
+                        "strategy_logic": {
+                            "type": "candidate_filter",
+                            "trade_types": ["frontier_crypto_venue_map" if index == 1 else "global_proxy_momentum"],
+                            "directions": ["long_frontier_spot" if index == 1 else "long_proxy"],
+                        },
+                        "data_requirements": {"paper_only": True},
+                        "risk_gates": {},
+                        "promotion_rules": {},
+                    },
+                    "code_goal": None,
+                    "dependencies": [],
+                    "acceptance_criteria": ["Experiment persists"],
+                    "tests_to_run": [],
+                    "blocker": None,
+                    "memory_note": "Compiled without a repository coding session.",
+                }
+                for index, row in enumerate(
+                    self.conn.execute(
+                        "select task_id from strategy_owner_tasks order by task_id"
+                    ).fetchall(),
+                    start=1,
+                )
+            ]
+        }
+        model_result = mock.Mock(
+            text=json.dumps(decisions),
+            status="model_call:responses",
+            model_name="openai/gpt-5.4",
+            model_tier="standard",
+            reasoning_effort="medium",
+            estimated_cost_usd=0.04,
+        )
+
+        with mock.patch.object(owner, "complete", return_value=model_result) as complete_call, mock.patch.object(
+            owner, "_record_memory"
+        ):
+            result = owner.process_contract_intake_batch(
+                self.conn,
+                {**self.settings, "strategy_implementation_owner": {**self.settings["strategy_implementation_owner"], "contract_intake_batch_size": 6}},
+                cycle_id="contract-cycle",
+            )
+
+        self.assertEqual("processed", result["status"])
+        self.assertEqual(2, result["by_status"]["active_testing"])
+        self.assertEqual(2, self.conn.execute("select count(*) from strategy_lab_experiments").fetchone()[0])
+        self.assertEqual(1, complete_call.call_count)
+        self.assertNotIn("run_structured_codex_turn", str(complete_call.call_args))
+
     def test_code_decision_reuses_owner_codex_session(self) -> None:
         rec = self._recommendation()
         owner.enqueue_recommendation(self.conn, rec, self.settings)

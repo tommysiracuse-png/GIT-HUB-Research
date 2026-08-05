@@ -17,6 +17,7 @@ from typing import Any
 
 from codex_repo_agent import run_structured_codex_turn
 from code_evolution import process_code_change_recommendation
+from cost_router import complete
 from storage import (
     ROOT,
     RUNS_DIR,
@@ -95,6 +96,12 @@ def _cfg(settings: dict) -> dict:
         "salvage_limit_per_cycle": 12,
         "stalled_testing_hours": 24,
         "minimum_concurrent_experiments": 8,
+        "contract_intake_enabled": True,
+        "contract_intake_batch_size": 6,
+        "contract_intake_model_tier": "standard",
+        "contract_intake_reasoning_effort": "medium",
+        "contract_intake_timeout_seconds": 180,
+        "contract_intake_max_output_tokens": 9000,
         "task_worktree_dir": str(RUNS_DIR / "strategy_owner_worktrees"),
         "report_limit": 100,
     }
@@ -799,6 +806,294 @@ def _prompt(task: dict, chain: dict, memories: list[dict]) -> str:
     )
 
 
+def _contract_intake_source_key(task: dict) -> str:
+    dependencies = task.get("dependencies") if isinstance(task.get("dependencies"), dict) else {}
+    payload = dependencies.get("source_payload") if isinstance(dependencies.get("source_payload"), dict) else {}
+    value = (
+        payload.get("market_key")
+        or payload.get("signal_key")
+        or payload.get("source_surface")
+        or payload.get("strategy_family")
+        or task.get("hypothesis")
+        or task.get("task_id")
+    )
+    return re.sub(r"\s+", " ", str(value or "unknown").strip().lower())[:240]
+
+
+def _claim_contract_intake_tasks(conn: sqlite3.Connection, settings: dict) -> list[dict]:
+    """Claim a diverse batch of prose-only tasks without taking the Codex write lock."""
+
+    cfg = _cfg(settings)
+    batch_size = max(0, int(cfg.get("contract_intake_batch_size", 6)))
+    if not cfg.get("contract_intake_enabled", True) or batch_size <= 0:
+        return []
+    _reclaim_dead_leases(conn)
+    now = _utc_now()
+    lease_until = (_parse_iso(now) + dt.timedelta(seconds=int(cfg["lease_seconds"]))).isoformat()
+    conn.execute("begin immediate")
+    rows = conn.execute(
+        """
+        select * from strategy_owner_tasks
+        where status='queued'
+          and objective_type='materialize_hypothesis'
+          and strategy_lab_id is null
+          and code_proposal_id is null
+          and codex_session_id is null
+          and claimed_by is null
+          and (next_retry_at is null or next_retry_at <= ?)
+        order by priority desc, updated_at asc
+        limit ?
+        """,
+        (now, max(batch_size, batch_size * 8)),
+    ).fetchall()
+    candidates = [_row_dict(row) for row in rows]
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+    seen_sources: set[str] = set()
+    for task in candidates:
+        source_key = _contract_intake_source_key(task)
+        if source_key in seen_sources:
+            continue
+        selected.append(task)
+        selected_ids.add(str(task["task_id"]))
+        seen_sources.add(source_key)
+        if len(selected) >= batch_size:
+            break
+    if len(selected) < batch_size:
+        for task in candidates:
+            if str(task["task_id"]) in selected_ids:
+                continue
+            selected.append(task)
+            selected_ids.add(str(task["task_id"]))
+            if len(selected) >= batch_size:
+                break
+    for task in selected:
+        conn.execute(
+            """
+            update strategy_owner_tasks
+            set claimed_by='strategy_contract_intake', claimed_pid=?, status='claimed',
+                lease_expires_at=?, heartbeat_at=?, updated_at=?, attempt_count=attempt_count+1
+            where task_id=? and claimed_by is null
+            """,
+            (os.getpid(), lease_until, now, now, task["task_id"]),
+        )
+    conn.commit()
+    return [
+        _row_dict(conn.execute("select * from strategy_owner_tasks where task_id=?", (task["task_id"],)).fetchone())
+        for task in selected
+    ]
+
+
+def _contract_intake_json(text: str) -> dict | None:
+    try:
+        value = json.loads(text or "")
+        return value if isinstance(value, dict) else None
+    except (TypeError, json.JSONDecodeError):
+        pass
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text or ""):
+        try:
+            value, _ = decoder.raw_decode((text or "")[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _contract_intake_prompt(conn: sqlite3.Connection, tasks: list[dict]) -> str:
+    packet_path = RUNS_DIR / "llm_state_packet.json"
+    packet = _json(packet_path.read_text(encoding="utf-8") if packet_path.exists() else "{}", {})
+    active_rows = conn.execute(
+        """
+        select strategy_lab_id,status,source_surface,hypothesis,strategy_logic_json
+        from strategy_lab_experiments
+        where experiment_type='market_strategy'
+          and status in ('active_testing','needs_more_evidence','needs_contract_revision','promote_candidate')
+        order by updated_at desc limit 30
+        """
+    ).fetchall()
+    active = []
+    for row in active_rows:
+        logic = _json(row["strategy_logic_json"], {})
+        active.append(
+            {
+                "strategy_lab_id": row["strategy_lab_id"],
+                "status": row["status"],
+                "source_surface": row["source_surface"],
+                "logic_type": logic.get("type") if isinstance(logic, dict) else None,
+                "hypothesis": str(row["hypothesis"] or "")[:500],
+            }
+        )
+    task_inputs = []
+    for task in tasks:
+        chain = _source_context(conn, task)
+        recommendation = chain.get("recommendation") or {}
+        payload = recommendation.get("payload") if isinstance(recommendation.get("payload"), dict) else {}
+        task_inputs.append(
+            {
+                "task_id": task["task_id"],
+                "priority": task.get("priority"),
+                "hypothesis": task.get("hypothesis"),
+                "title": recommendation.get("title"),
+                "rationale": recommendation.get("rationale"),
+                "market_key": payload.get("market_key"),
+                "signal_key": payload.get("signal_key"),
+                "agent_name": payload.get("agent_name"),
+                "evidence": payload.get("evidence"),
+                "proposed_change": payload.get("proposed_change"),
+            }
+        )
+    evidence_snapshot = {
+        "paper_summary": packet.get("summary"),
+        "top_reviewed": (packet.get("top_reviewed") or [])[:8],
+        "contextual_stats": (packet.get("contextual_stats") or [])[:16],
+        "strategy_lab_status": {
+            key: (packet.get("strategy_lab") or {}).get(key)
+            for key in ("status_counts", "compile_status_counts", "novelty_status_counts")
+        },
+        "global_discovery": {
+            "by_surface_type": (packet.get("global_market_discovery") or {}).get("by_surface_type"),
+            "by_region": (packet.get("global_market_discovery") or {}).get("by_region"),
+            "top_candidates": ((packet.get("global_market_discovery") or {}).get("top_candidates") or [])[:8],
+        },
+    }
+    return "\n\n".join(
+        [
+            "You compile a diverse batch of Strategy Lab research recommendations into executable paper-only contracts. This is contract design, not repository coding.",
+            "Return one JSON object with an items array and exactly one item for every task_id. Each item has decision, rationale, strategy_experiment, code_goal, dependencies, acceptance_criteria, tests_to_run, blocker, and memory_note.",
+            "Allowed decisions here are materialize_experiment, implement_code, wait_for_data, and wait_for_route. Do not return completed, retire, or monitor_evidence for an objective that has no experiment artifact.",
+            "Use materialize_experiment when current normalized observations can test the idea now. The strategy_experiment must include strategy_lab_id, version, experiment_type='market_strategy', hypothesis, source_surface, a non-empty permitted_target_surface, strategy_logic, data_requirements, risk_gates, and promotion_rules.",
+            "Prefer a reusable observation_program over another narrow filter of an existing strategy. Its strategy_logic defines universe, calculated_features, entry_expression, optional invalidation_expression, direction or long_expression/short_expression, edge_expression, score_expression, and route_surface. Use implement_code only when a genuinely missing feature prevents testing.",
+            "Preserve behavioral diversity. Do not materialize six renamings of the same OKX funding, frontier washout, or proxy reversal idea. Use the batch and active portfolio to make each accepted contract structurally distinct by market surface or causal mechanism. A strategy must generalize beyond one ticker.",
+            "Never enable live trading, broker writes, real notional, or secrets. Weak route feasibility may use synthetic paper research and should not erase an otherwise testable hypothesis.",
+            "TASKS\n" + json.dumps(task_inputs, sort_keys=True, default=str),
+            "CURRENT ACTIVE PORTFOLIO\n" + json.dumps(active, sort_keys=True, default=str),
+            "CURRENT EVIDENCE SNAPSHOT\n" + json.dumps(evidence_snapshot, sort_keys=True, default=str),
+        ]
+    )
+
+
+def process_contract_intake_batch(conn: sqlite3.Connection, settings: dict, *, cycle_id: str) -> dict:
+    tasks = _claim_contract_intake_tasks(conn, settings)
+    if not tasks:
+        return {"status": "no_contract_intake_tasks", "claimed": 0, "processed": 0}
+    cfg = _cfg(settings)
+    result = complete(
+        "strategy_contract_compiler",
+        _contract_intake_prompt(conn, tasks),
+        system="Compile Strategy Lab contracts. Return JSON only.",
+        tier_override=str(cfg.get("contract_intake_model_tier") or "standard"),
+        operation="strategy_contract_batch_intake",
+        reasoning_effort_override=str(cfg.get("contract_intake_reasoning_effort") or "medium"),
+        structured_json=True,
+        max_output_tokens_override=int(cfg.get("contract_intake_max_output_tokens", 9000)),
+        timeout_seconds_override=float(cfg.get("contract_intake_timeout_seconds", 180)),
+    )
+    if not str(result.status or "").startswith("model_call:"):
+        reason = str(result.status or "contract_intake_model_unavailable")
+        lowered = reason.lower()
+        status = "waiting_quota" if any(term in lowered for term in ("quota", "429", "budget")) else "waiting_network" if any(term in lowered for term in ("connect", "network", "dns")) else "implementation_paused"
+        for task in tasks:
+            recorded = {
+                "status": status,
+                "reason": reason,
+                "model": result.model_name,
+                "decision": {},
+                "estimated_cost_usd": result.estimated_cost_usd,
+            }
+            _release_claim(conn, task["task_id"], status=status, result=recorded, error={"reason": reason}, retry=True)
+            _record_run(conn, task, cycle_id, "claimed", status, recorded)
+        return {"status": status, "claimed": len(tasks), "processed": 0, "reason": reason}
+
+    parsed = _contract_intake_json(result.text)
+    items = parsed.get("items") if isinstance(parsed, dict) else None
+    decisions = {
+        str(item.get("task_id")): item
+        for item in (items or [])
+        if isinstance(item, dict) and item.get("task_id")
+    }
+    summary = Counter()
+    details = []
+    for task in tasks:
+        raw_decision = decisions.get(str(task["task_id"]))
+        if not isinstance(raw_decision, dict):
+            status = "queued"
+            handled = {"validation_error": "contract_intake_missing_task_decision"}
+            decision = {}
+            retry = True
+        else:
+            normalized = {
+                "decision": raw_decision.get("decision"),
+                "rationale": str(raw_decision.get("rationale") or ""),
+                "strategy_experiment": raw_decision.get("strategy_experiment"),
+                "code_goal": raw_decision.get("code_goal"),
+                "dependencies": raw_decision.get("dependencies") or [],
+                "acceptance_criteria": raw_decision.get("acceptance_criteria") or [],
+                "tests_to_run": raw_decision.get("tests_to_run") or [],
+                "blocker": raw_decision.get("blocker"),
+                "memory_note": str(raw_decision.get("memory_note") or ""),
+            }
+            try:
+                decision = _decode_decision_payload(normalized)
+            except ValueError as exc:
+                decision = normalized
+                status = "analyzing"
+                handled = {"validation_error": str(exc)}
+                retry = False
+            else:
+                choice = str(decision.get("decision") or "")
+                if choice == "materialize_experiment":
+                    status, handled = _handle_materialize(conn, task, decision, settings)
+                    retry = status == "analyzing"
+                elif choice == "implement_code":
+                    dependencies = dict(task.get("dependencies") or {})
+                    dependencies["contract_intake_decision"] = decision
+                    conn.execute(
+                        "update strategy_owner_tasks set dependency_json=?, updated_at=? where task_id=?",
+                        (json.dumps(dependencies, sort_keys=True, default=str), _utc_now(), task["task_id"]),
+                    )
+                    conn.commit()
+                    status = "analyzing"
+                    handled = {"code_goal": decision.get("code_goal"), "contract_intake_compiled": True}
+                    retry = False
+                elif choice == "wait_for_data":
+                    status = "waiting_data"
+                    handled = {"blocker": decision.get("blocker"), "dependencies": decision.get("dependencies")}
+                    retry = False
+                elif choice == "wait_for_route":
+                    status = "waiting_route"
+                    handled = {"blocker": decision.get("blocker"), "dependencies": decision.get("dependencies")}
+                    retry = False
+                else:
+                    status = "analyzing"
+                    handled = {"validation_error": f"contract_intake_unsupported_decision:{choice}"}
+                    retry = False
+        recorded = {
+            "status": status,
+            "decision": decision,
+            "handled": handled,
+            "model": result.model_name,
+            "model_tier": result.model_tier,
+            "reasoning_effort": result.reasoning_effort,
+            "estimated_cost_usd": round(float(result.estimated_cost_usd or 0.0) / max(1, len(tasks)), 8),
+        }
+        _release_claim(conn, task["task_id"], status=status, result=recorded, error=handled if "validation_error" in handled else None, retry=retry)
+        _record_run(conn, task, cycle_id, "claimed", status, recorded)
+        _record_memory(conn, task, recorded, status)
+        summary[status] += 1
+        details.append({"task_id": task["task_id"], "status": status, **handled})
+    return {
+        "status": "processed",
+        "claimed": len(tasks),
+        "processed": len(tasks),
+        "by_status": dict(summary),
+        "model": result.model_name,
+        "estimated_cost_usd": result.estimated_cost_usd,
+        "details": details,
+    }
+
+
 def _journal(task: dict, entry: dict) -> list[dict]:
     journal = list(task.get("recovery_journal") or [])
     journal.append({"at": _utc_now(), **entry})
@@ -1195,6 +1490,32 @@ def process_one(conn: sqlite3.Connection, settings: dict, *, cycle_id: str) -> d
     )
     conn.commit()
     task.update({"worktree_path": str(worktree.parent), "branch_name": branch, "memory_ids": memory_ids, "memory_context_hash": context_hash})
+    precompiled = (
+        task.get("dependencies", {}).get("contract_intake_decision")
+        if isinstance(task.get("dependencies"), dict)
+        else None
+    )
+    if isinstance(precompiled, dict) and precompiled.get("decision") == "implement_code":
+        status, handled = _handle_code(conn, task, precompiled, settings, None)
+        result = {
+            "status": "completed",
+            "decision": precompiled,
+            "handled": handled,
+            "model": "strategy_contract_compiler",
+            "reasoning_effort": _cfg(settings).get("contract_intake_reasoning_effort"),
+            "contract_intake_reused": True,
+        }
+        _release_claim(
+            conn,
+            task["task_id"],
+            status=status,
+            result=result,
+            retry=status in {"analyzing", "coding", "implementation_paused", "waiting_quota", "waiting_network"},
+        )
+        _record_run(conn, task, cycle_id, before, status, result)
+        _record_memory(conn, task, result, status)
+        return {"status": status, "task_id": task["task_id"], "decision": "implement_code", **handled}
+
     def record_codex_pid(pid: int) -> None:
         conn.execute(
             "update strategy_owner_tasks set codex_pid=?, heartbeat_at=?, updated_at=? where task_id=?",
@@ -1352,9 +1673,18 @@ def write_report(conn: sqlite3.Connection, *, cycle: dict | None = None, schedul
 def run_once(conn: sqlite3.Connection, settings: dict, *, execute_turn: bool = True, cycle_id: str | None = None, scheduler: dict | None = None) -> dict:
     if not _cfg(settings).get("enabled", True):
         return write_report(conn, cycle={"status": "disabled"}, scheduler=scheduler, settings=settings)
+    effective_cycle_id = cycle_id or str(uuid.uuid4())
     sync = sync_backlog(conn, settings)
     monitored = monitor_tasks(conn)
-    cycle = process_one(conn, settings, cycle_id=cycle_id or str(uuid.uuid4())) if execute_turn else {"status": "monitor_only"}
+    if execute_turn:
+        cycle = process_one(conn, settings, cycle_id=effective_cycle_id)
+    else:
+        intake = process_contract_intake_batch(
+            conn,
+            settings,
+            cycle_id=f"{effective_cycle_id}:contract-intake",
+        )
+        cycle = {"status": "monitor_only", "contract_intake": intake}
     cycle["backlog_sync"] = sync
     cycle["monitoring"] = monitored
     return write_report(conn, cycle=cycle, scheduler=scheduler, settings=settings)

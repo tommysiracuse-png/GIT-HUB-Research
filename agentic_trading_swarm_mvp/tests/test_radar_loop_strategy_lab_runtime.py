@@ -137,6 +137,45 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
         self.assertEqual({"BTC-USDT", "ETHUSD"}, {row["inst_id"] for row in selected})
         self.assertEqual(2, summary["distinct_source_count"])
 
+    def test_review_reserve_prioritizes_distinct_roots_before_relaxed_descendants(self):
+        candidates = [
+            {
+                "strategy_lab_id": f"carry_root__relaxed_r{index}",
+                "strategy_lab_logic_type": "candidate_filter",
+                "venue": "OKX",
+                "inst_id": f"COIN{index}-USDT-SWAP",
+                "direction": "funding_capture_short_perp",
+                "trade_type": "perp_funding_basis",
+                "route_status": "standard",
+                "score": 100 - index,
+                "strategy_lab_surface_policy": self.SURFACE_POLICY,
+            }
+            for index in range(5)
+        ]
+        candidates.append(
+            {
+                "strategy_lab_id": "proxy_residual_reversal",
+                "strategy_lab_logic_type": "observation_program",
+                "venue": "YAHOO_PROXY",
+                "inst_id": "EWZ",
+                "direction": "long_proxy",
+                "trade_type": "global_proxy_momentum",
+                "route_status": "standard",
+                "score": 60,
+                "strategy_lab_surface_policy": self.SURFACE_POLICY,
+            }
+        )
+
+        selected, summary = self.reserve_review_candidates(
+            candidates,
+            {"strategy_lab": {"runtime_review_reserved_slots": 2}},
+            total_slots=25,
+        )
+
+        self.assertEqual({"carry_root", "proxy_residual_reversal"}, set(summary["strategy_lab_lineage_roots"]))
+        self.assertEqual(2, summary["distinct_lineage_root_count"])
+        self.assertEqual({"OKX", "YAHOO_PROXY"}, {row["venue"] for row in selected})
+
 
 class GlobalProxyRuntimeIntegrationTests(unittest.TestCase):
     def test_open_shock_reversal_instruments_are_kept_in_the_yahoo_scan(self):

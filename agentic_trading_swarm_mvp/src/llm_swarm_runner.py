@@ -270,7 +270,154 @@ def _attach_execution_route_requirement_summary(rec: dict, summary: dict) -> dic
     return decorated
 
 
+def _strategy_invention_context(packet: dict, memory: list[dict]) -> dict:
+    lab = packet.get("strategy_lab") if isinstance(packet.get("strategy_lab"), dict) else {}
+    recent_experiments = []
+    for item in (lab.get("recent") or [])[:18]:
+        if not isinstance(item, dict):
+            continue
+        logic = item.get("compiled_strategy_logic") or item.get("strategy_logic") or {}
+        recent_experiments.append(
+            {
+                "strategy_lab_id": item.get("strategy_lab_id"),
+                "status": item.get("status"),
+                "source_surface": item.get("source_surface"),
+                "logic_type": logic.get("type") if isinstance(logic, dict) else None,
+                "hypothesis": str(item.get("hypothesis") or "")[:420],
+            }
+        )
+    observed_surfaces: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in (packet.get("top_reviewed") or [])[:30]:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("trade_type") or ""),
+            str(item.get("venue") or ""),
+            str(item.get("direction") or ""),
+        )
+        if not any(key) or key in seen:
+            continue
+        seen.add(key)
+        observed_surfaces.append(
+            {
+                "trade_type": key[0],
+                "venue": key[1],
+                "direction": key[2],
+                "decision": item.get("decision"),
+                "net_edge_bps": item.get("net_edge_bps"),
+                "route_status": item.get("route_status"),
+            }
+        )
+        if len(observed_surfaces) >= 16:
+            break
+    discovery = packet.get("global_market_discovery") if isinstance(packet.get("global_market_discovery"), dict) else {}
+    discovered_surfaces = [
+        {
+            "surface": item.get("surface_type_classified"),
+            "venue": item.get("venue_or_source"),
+            "region": item.get("region"),
+            "next_action": item.get("recommended_next_action"),
+        }
+        for item in (discovery.get("top_candidates") or [])[:12]
+        if isinstance(item, dict)
+    ]
+    recent_text = " ".join(
+        str(item.get("hypothesis") or "") for item in recent_experiments
+    ).lower()
+    underrepresented = []
+    for item in discovered_surfaces:
+        surface = str(item.get("surface") or "").strip()
+        venue = str(item.get("venue") or "").strip()
+        if (surface and surface.lower() not in recent_text) or (venue and venue.lower() not in recent_text):
+            underrepresented.append(item)
+    relevant_memory = []
+    for item in memory[:24]:
+        if not isinstance(item, dict):
+            continue
+        encoded = json.dumps(item, sort_keys=True, default=str)
+        if any(term in encoded.lower() for term in ("strategy", "paper outcome", "market", "signal")):
+            relevant_memory.append(encoded[:900])
+        if len(relevant_memory) >= 8:
+            break
+    reliable_outcomes = [
+        {
+            "trade_id": item.get("trade_id"),
+            "horizon_minutes": item.get("horizon_minutes"),
+            "pnl_bps": item.get("pnl_bps"),
+            "measurement_status": item.get("measurement_status"),
+            "price_source": item.get("price_source"),
+        }
+        for item in (packet.get("horizon_outcomes") or [])[:12]
+        if isinstance(item, dict)
+    ]
+    current_outputs = [
+        {
+            "agent_name": item.get("agent_name"),
+            "action": item.get("action"),
+            "title": item.get("title"),
+            "market_key": item.get("market_key"),
+            "rationale": str(item.get("rationale") or "")[:500],
+        }
+        for item in (packet.get("current_cycle_agent_outputs") or [])[:8]
+        if isinstance(item, dict)
+    ]
+    current_critiques = [
+        {
+            "agent_name": item.get("agent_name"),
+            "title": item.get("title"),
+            "rationale": str(item.get("rationale") or "")[:500],
+        }
+        for item in (packet.get("current_cycle_critiques") or [])[:8]
+        if isinstance(item, dict)
+    ]
+    return {
+        "paper_summary": packet.get("summary"),
+        "strategy_lab_counts": {
+            key: lab.get(key)
+            for key in ("status_counts", "compile_status_counts", "novelty_status_counts")
+        },
+        "recent_experiments": recent_experiments,
+        "observed_runtime_surfaces": observed_surfaces,
+        "underrepresented_discoveries": underrepresented[:10],
+        "reliable_outcome_examples": reliable_outcomes,
+        "contextual_performance": (packet.get("contextual_stats") or [])[:16],
+        "current_cycle_agent_outputs": current_outputs,
+        "current_cycle_critiques": current_critiques,
+        "relevant_memory": relevant_memory,
+    }
+
+
+def _strategy_lab_agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
+    context = _strategy_invention_context(packet, memory)
+    return (
+        f"You are {agent['name']}. Your job is to invent one genuinely reusable paper-testable trading hypothesis from the current evidence.\n"
+        "Return exactly one JSON object. action must be propose_strategy_lab_experiment or no_action. "
+        "Do not return refine, modify, hold, or prose outside JSON. priority must be an integer from 1 to 100.\n"
+        "The recommendation object requires action, priority, title, rationale, market_key, evidence, proposed_change, and strategy_lab_experiment.\n"
+        "strategy_lab_experiment requires strategy_lab_id, version, experiment_type='market_strategy', hypothesis, source_surface, "
+        "a non-empty permitted_target_surface, strategy_logic, data_requirements, risk_gates, and promotion_rules.\n"
+        "experiment_type must be one of market_strategy, risk_filter, execution_filter, system_repair, or reporting_quality; this invention agent should normally use market_strategy. "
+        "trade_types are scanner families and directions are trade actions. Do not put a direction in trade_types.\n"
+        "Paper exploration is enabled: use weak performance as evidence and do not propose new hard quarantines for priceable candidates.\n"
+        "Prefer strategy_logic.type='observation_program' so the idea can operate on normalized observations rather than merely filtering an old scanner. "
+        "Define universe, calculated_features, entry_expression, optional invalidation_expression, direction or long_expression/short_expression, "
+        "edge_expression, score_expression, and route_surface. Available features include returns and momentum at 5m/15m/60m/4h/1d, "
+        "volatility, z-scores, relative strength, spread, liquidity, quality, funding, basis, and cross-venue dislocation. "
+        "Use implementable safe expressions with arithmetic, comparisons, boolean logic, abs/min/max/round/sqrt/log/log1p/clip.\n"
+        "Invent a market behavior, not a one-ticker trade and not another renamed quality gate. Compare against recent experiments below. "
+        "Prefer an underrepresented market surface or a different causal mechanism such as cross-sectional relative value, term structure, "
+        "volatility regime, event response, reversal, continuation, seasonality, or carry when the evidence supports it. These are examples, not an allowlist. "
+        "If an idea needs a missing feature, state it in data_requirements; do not pretend the feature already exists. "
+        "Keep live trading disabled and keep route limits diagnostic so synthetic paper research remains possible.\n"
+        "CURRENT INVENTION CONTEXT\n"
+        + json.dumps(context, sort_keys=True, default=str)
+    )
+
+
 def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
+    if agent.get("name") == "strategy_lab":
+        return _strategy_lab_agent_prompt(agent, packet, memory)
     compact = {
         "summary": packet.get("summary"),
         "execution_summary": packet.get("execution_summary"),
@@ -303,6 +450,11 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "current_cycle_critiques": packet.get("current_cycle_critiques", [])[:10],
         "current_cycle_ranked_actions": packet.get("current_cycle_ranked_actions", [])[:10],
         "repository_grounding": packet.get("repository_grounding", {}),
+        "strategy_invention_context": (
+            _strategy_invention_context(packet, memory)
+            if "propose_strategy_lab_experiment" in set(agent.get("allowed_actions") or [])
+            else {}
+        ),
     }
     build_planner_instruction = ""
     if agent["name"] == "build_planner":
@@ -341,12 +493,20 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         )
     dynamic_instruction = ""
     if agent.get("dynamic_agent_id"):
+        invention_context = ""
+        if "propose_strategy_lab_experiment" in set(agent.get("allowed_actions") or []):
+            invention_context = (
+                "Current strategy-invention context: "
+                + json.dumps(_strategy_invention_context(packet, memory), sort_keys=True, default=str)[:6000]
+                + "\n"
+            )
         dynamic_instruction = (
             f"You are persistent specialist {agent.get('display_name')}. Your durable objective is: {agent['role']}\n"
             f"Your allowed actions are exactly: {agent.get('allowed_actions', [])}. "
             f"Use these evidence inputs when present: {agent.get('evidence_inputs', [])}. "
             f"Your success measure is: {agent.get('success_measure', {})}. "
             "You may propose code, but all code must go through the normal serialized code-evolution path.\n"
+            f"{invention_context}"
         )
     return (
         f"You are {agent['name']}. Role: {agent['role']}\n"
@@ -872,11 +1032,25 @@ def _should_retry_schema(rec: dict, model: dict) -> bool:
 
 
 def _schema_retry_prompt(agent: dict, original_text: str) -> str:
+    allowed_actions = list(agent.get("allowed_actions") or [agent.get("default_action")])
+    allowed_actions = [str(action) for action in allowed_actions if action]
+    allowed_actions.append("no_action")
+    strategy_contract = ""
+    if agent.get("name") == "strategy_lab" or "propose_strategy_lab_experiment" in allowed_actions:
+        strategy_contract = (
+            " If action is propose_strategy_lab_experiment, include strategy_lab_experiment with "
+            "strategy_lab_id, version, experiment_type='market_strategy', hypothesis, source_surface, "
+            "non-empty permitted_target_surface, strategy_logic, data_requirements, risk_gates, and promotion_rules."
+        )
     return (
         f"The previous {agent['name']} response was not a complete valid JSON recommendation. "
         "Return exactly one complete JSON object with: action, priority, title, rationale, "
-        "market_key, evidence, proposed_change, and optional code_change or variant_config. "
-        "No markdown, no commentary, no arrays. Keep it paper-only.\n\n"
+        "market_key, evidence, proposed_change, and optional code_change, variant_config, "
+        "strategy_lab_experiment, or agent_spec. "
+        f"action must be one of {sorted(set(allowed_actions))}; priority must be an integer 1-100."
+        f"{strategy_contract} "
+        "Do not use refine, modify, hold, revise_recommendation, or any other action. "
+        "No markdown, no commentary, no top-level arrays. Keep it paper-only.\n\n"
         f"Previous response preview:\n{(original_text or '')[:1200]}"
     )
 

@@ -705,6 +705,12 @@ DEFAULT_SETTINGS = {
         "salvage_limit_per_cycle": 12,
         "stalled_testing_hours": 24,
         "minimum_concurrent_experiments": 8,
+        "contract_intake_enabled": True,
+        "contract_intake_batch_size": 6,
+        "contract_intake_model_tier": "standard",
+        "contract_intake_reasoning_effort": "medium",
+        "contract_intake_timeout_seconds": 180,
+        "contract_intake_max_output_tokens": 9000,
         "report_limit": 100,
     },
     "research_worker": {

@@ -2308,6 +2308,39 @@ def _execute_diagnostic_hypothesis(conn: sqlite3.Connection, rec: dict) -> list[
 
 
 def _execute_strategy_lab_experiment(conn: sqlite3.Connection, rec: dict, settings: dict) -> list[dict]:
+    normalized_rec = dict(rec)
+    normalized_payload = _normalize_strategy_lab_recommendation_payload(
+        dict(rec.get("payload") or {})
+    )
+    normalized_rec["payload"] = normalized_payload
+    contract = normalized_payload.get("strategy_lab_experiment")
+    required_contract_fields = {
+        "strategy_lab_id",
+        "experiment_type",
+        "hypothesis",
+        "source_surface",
+        "permitted_target_surface",
+        "strategy_logic",
+        "data_requirements",
+        "risk_gates",
+        "promotion_rules",
+    }
+    if (
+        isinstance(contract, dict)
+        and required_contract_fields.issubset(contract)
+        and isinstance(contract.get("strategy_logic"), dict)
+        and isinstance(contract.get("data_requirements"), dict)
+        and isinstance(contract.get("risk_gates"), dict)
+        and isinstance(contract.get("promotion_rules"), dict)
+        and bool(contract.get("permitted_target_surface"))
+    ):
+        artifacts = ingest_strategy_lab_recommendation(conn, normalized_rec, settings)
+        if any(
+            item.get("artifact") == "strategy_lab_experiment"
+            and item.get("action_status") in {"created", "quarantined"}
+            for item in artifacts
+        ):
+            return artifacts
     return [enqueue_strategy_owner_recommendation(conn, rec, settings)]
 
 
@@ -2449,8 +2482,24 @@ def run_auto_improvement(
 
         if task_type == "strategy_lab_experiment" and created:
             artifact = created[0]
-            artifact_id = artifact.get("task_id") or rec["recommendation_id"]
-            bind_artifact(conn, topic.topic_key, "strategy_owner_tasks", artifact_id)
+            materialized = artifact.get("artifact") == "strategy_lab_experiment"
+            artifact_id = (
+                artifact.get("strategy_lab_id")
+                if materialized
+                else artifact.get("task_id")
+            ) or rec["recommendation_id"]
+            bind_artifact(
+                conn,
+                topic.topic_key,
+                "strategy_lab_experiments" if materialized else "strategy_owner_tasks",
+                artifact_id,
+            )
+            if materialized:
+                update_llm_recommendation_status(
+                    conn,
+                    rec["recommendation_id"],
+                    "experiment_materialized",
+                )
             consumed.append(
                 {
                     "recommendation_id": rec["recommendation_id"],
@@ -2460,8 +2509,8 @@ def run_auto_improvement(
                     "created": created,
                 }
             )
-            # The Strategy Owner sets owner_queued or linked_existing_task. Do
-            # not collapse that durable lifecycle into a premature executed flag.
+            # Complete contracts materialize directly. Incomplete prose remains
+            # owned by the durable Strategy Owner and keeps its queued lifecycle.
             continue
 
         created_artifacts = [item for item in created if item.get("action_status", "created") == "created"]
