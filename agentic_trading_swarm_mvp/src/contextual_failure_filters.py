@@ -310,6 +310,174 @@ def _metrics(items: list[dict]) -> dict:
     }
 
 
+def _observation_profile(trade: dict) -> str | None:
+    """Return a named research surface for broad, paper-only attribution.
+
+    These labels intentionally describe the source/model surface rather than a
+    tradable symbol.  A bad result on one symbol is not enough to characterize
+    a surface; the diversity checks in ``cross_context_failure_observations``
+    below make that distinction explicit.
+    """
+    candidate = trade.get("candidate") or {}
+    features = trade.get("features") or {}
+    text = " ".join(
+        str(value or "")
+        for value in (
+            trade.get("signal_key"),
+            candidate.get("venue"),
+            candidate.get("trade_type"),
+            candidate.get("market_surface"),
+            candidate.get("strategy_family"),
+            features.get("venue"),
+            features.get("trade_type"),
+        )
+    ).lower()
+    if "yahoo_proxy" in text and "global_proxy_momentum" in text:
+        return "yahoo_proxy_momentum"
+    if "frontier_crypto_venue_map" in text:
+        return "frontier_spot_venue_map"
+    if "okx" in text and "perp_funding_basis" in text and ("basis" in text or "funding" in text):
+        return "okx_basis_or_funding"
+    return None
+
+
+def _direction_side(value: object) -> str:
+    normalized = str(value or "").lower()
+    if "long" in normalized:
+        return "long"
+    if "short" in normalized:
+        return "short"
+    return "unknown"
+
+
+def _observation_sub_mode(trade: dict) -> str:
+    candidate = trade.get("candidate") or {}
+    text = " ".join(
+        str(value or "")
+        for value in (trade.get("signal_key"), candidate.get("direction"), candidate.get("trade_type"))
+    ).lower()
+    if "funding" in text:
+        return "funding"
+    if "basis" in text:
+        return "basis"
+    return str(candidate.get("trade_type") or (trade.get("features") or {}).get("trade_type") or "unknown")
+
+
+def cross_context_failure_observations(trades: list[dict], settings: dict) -> list[dict]:
+    """Attribute recurring paper losses without suppressing paper experiments.
+
+    A context is only called persistently failing after losses recur on both
+    directional sides or across the relevant independent surfaces.  The result
+    is report/ranking evidence, never a candidate filter, quarantine, or
+    paper-entry block.  This preserves the fresh paper validation window that
+    is required to discover rehabilitation.
+    """
+    cfg = settings.get("contextual_failure_filters", {})
+    min_closed = int(cfg.get("cross_context_min_closed", cfg.get("min_closed_for_filter", 5)))
+    validation_window = max(1, int(cfg.get("cross_context_validation_window", 5)))
+    release_avg = float(cfg.get("release_min_avg_pnl_bps", 10.0))
+    release_win_rate = float(cfg.get("release_min_win_rate", 0.55))
+    grouped: dict[str, list[dict]] = collections.defaultdict(list)
+    for trade in trades:
+        profile = _observation_profile(trade)
+        if profile:
+            grouped[profile].append(trade)
+
+    observations = []
+    for profile, items in grouped.items():
+        metrics = _metrics(items)
+        directions = sorted(
+            {
+                _direction_side(
+                    (item.get("features") or {}).get("direction")
+                    or (item.get("candidate") or {}).get("direction")
+                )
+                for item in items
+            }
+        )
+        directions = [direction for direction in directions if direction != "unknown"]
+        venues = sorted(
+            {
+                str(
+                    (item.get("features") or {}).get("venue")
+                    or (item.get("candidate") or {}).get("venue")
+                    or "unknown"
+                )
+                for item in items
+            }
+        )
+        sub_modes = sorted({_observation_sub_mode(item) for item in items})
+        recent_items = items[-validation_window:]
+        recent_metrics = _metrics(recent_items)
+        prior_items = items[:-validation_window]
+        prior_metrics = _metrics(prior_items)
+        both_directions = {"long", "short"}.issubset(directions)
+        multi_venue = len(venues) >= 2
+        multi_sub_mode = len(sub_modes) >= 2
+        coverage_met = (
+            both_directions
+            if profile == "yahoo_proxy_momentum"
+            else multi_venue or both_directions
+            if profile == "frontier_spot_venue_map"
+            else multi_sub_mode or both_directions
+        )
+        prior_failure = (
+            int(metrics.get("closed_count") or 0) >= min_closed
+            and bool(prior_items)
+            and float(prior_metrics.get("avg_pnl_bps") or 0.0) < 0.0
+            and coverage_met
+        )
+        rehabilitation_met = (
+            prior_failure
+            and len(recent_items) >= validation_window
+            and float(recent_metrics.get("avg_pnl_bps") or 0.0) >= release_avg
+            and float(recent_metrics.get("win_rate") or 0.0) >= release_win_rate
+        )
+        persistent_failure = (
+            int(metrics.get("closed_count") or 0) >= min_closed
+            and float(metrics.get("avg_pnl_bps") or 0.0) < 0.0
+            and coverage_met
+            and not rehabilitation_met
+        )
+        state = "rehabilitated" if rehabilitation_met else "persistent_failure" if persistent_failure else "observe"
+        observations.append(
+            {
+                "context": profile,
+                "state": state,
+                "closed_count": metrics["closed_count"],
+                "avg_pnl_bps": metrics["avg_pnl_bps"],
+                "win_rate": metrics["win_rate"],
+                "directions": directions,
+                "venues": venues,
+                "sub_modes": sub_modes,
+                "coverage": {
+                    "both_directions": both_directions,
+                    "multi_venue": multi_venue,
+                    "multi_sub_mode": multi_sub_mode,
+                    "coverage_met": coverage_met,
+                },
+                "fresh_validation": recent_metrics,
+                "research_note": (
+                    "Recurring paper losses are attributed to this model surface; keep priceable candidates "
+                    "emitted for paper exploration, attach this diagnostic, and use ranking/sizing or synthetic routing."
+                    if persistent_failure
+                    else "Fresh paper validation meets the stated expectancy and stability criteria."
+                    if rehabilitation_met
+                    else "Evidence is not yet diverse or large enough to attribute a persistent model-surface failure."
+                ),
+                "recommendation_handling": "diagnostic_ranking_and_sizing_only",
+                "paper_entry_blocked": False,
+                "rehabilitation_criteria": {
+                    "validation_window_closed_trades": validation_window,
+                    "min_avg_pnl_bps": release_avg,
+                    "min_win_rate": release_win_rate,
+                },
+            }
+        )
+    observations.sort(key=lambda item: (item["state"] != "persistent_failure", item["avg_pnl_bps"] or 0.0))
+    return observations
+
+
 def _failure_score(metrics: dict) -> float:
     count = int(metrics.get("closed_count") or 0)
     avg = float(metrics.get("avg_pnl_bps") or 0.0)
@@ -778,6 +946,7 @@ def run_contextual_failure_filters(conn: sqlite3.Connection, settings: dict) -> 
 
     trades = _closed_trade_rows(conn)
     groups = _build_groups(trades, settings)
+    cross_context_observations = cross_context_failure_observations(trades, settings)
     _augment_counts(conn, groups)
     _upsert_contextual_stats(conn, groups)
     capped = _consolidate_contextual_policy_caps(conn, settings)
@@ -811,6 +980,12 @@ def run_contextual_failure_filters(conn: sqlite3.Connection, settings: dict) -> 
             "recovery_candidate_count": len(recovery),
             "protected_working_slice_count": len(protected),
             "route_or_data_quality_failure_count": len(route_or_data),
+            "persistent_cross_context_failure_count": sum(
+                item["state"] == "persistent_failure" for item in cross_context_observations
+            ),
+            "rehabilitated_cross_context_count": sum(
+                item["state"] == "rehabilitated" for item in cross_context_observations
+            ),
             "low_sample_observe_count": len([item for item in watched if item["status"] == "low_sample_observe"]),
             "created_policy_count": len(created),
             "skipped_policy_count": len(skipped),
@@ -832,11 +1007,12 @@ def run_contextual_failure_filters(conn: sqlite3.Connection, settings: dict) -> 
         "recovery_candidates": recovery[:20],
         "protected_working_slices": protected[:20],
         "route_or_data_quality_failures": route_or_data[:20],
+        "cross_context_observations": cross_context_observations,
         "watch_contexts": watched[:20],
         "hard_limits": [
             "Paper-only contextual policies.",
             "No live trading or broker/API actions.",
-            "No hard filter from fewer than the configured minimum closed trades.",
+            "Cross-context failure evidence is diagnostic/ranking/sizing only; it never blocks a priceable paper experiment.",
             "Every contextual policy uses TTL and recovery probes.",
             "Route/data-quality failures are diagnosed separately from signal-quality failures.",
             "Working and recovery slices are reported so broad filters do not erase changing markets.",
@@ -898,6 +1074,17 @@ def _markdown(report: dict) -> str:
         lines.append("No recovery candidates yet.")
     for item in recovery[:15]:
         lines.append(f"- {_context_line(item)} recovery_score=`{item.get('recovery_score')}`")
+
+    lines.extend(["", "## Cross-Context Paper Attribution", ""])
+    observations = report.get("cross_context_observations", [])
+    if not observations:
+        lines.append("No targeted cross-context observations yet.")
+    for item in observations:
+        lines.append(
+            f"- `{item.get('context')}` state=`{item.get('state')}` n=`{item.get('closed_count')}` "
+            f"avg=`{item.get('avg_pnl_bps')}`bps directions=`{item.get('directions')}` "
+            f"venues=`{item.get('venues')}` modes=`{item.get('sub_modes')}`; {item.get('research_note')}"
+        )
 
     lines.extend(["", "## Protected Working Slices", ""])
     protected = report.get("protected_working_slices", [])
