@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import pathlib
 import sys
 import tempfile
@@ -19,9 +20,14 @@ from paper_exploration import (
     fair_lineage_order,
     prepare_candidate_for_exploration,
 )
+from paper_exploration_report import (
+    _reason_category,
+    build_paper_exploration_report,
+    compact_paper_exploration_report,
+)
 from route_resolver import _hedged_structure_dependency
 from settings import DEFAULT_SETTINGS
-from storage import connect, open_paper_trade, performance_summary, signal_key
+from storage import connect, open_paper_trade, performance_summary, save_opportunity, signal_key
 
 
 class PaperExplorationTests(unittest.TestCase):
@@ -200,6 +206,35 @@ class PaperExplorationTests(unittest.TestCase):
         comparison = compare_replays(before, after)
         self.assertFalse(comparison["passed"])
         self.assertTrue(comparison["collapsed_lineages"])
+
+    def test_report_canonicalizes_guard_values_and_excludes_legacy_rejections(self) -> None:
+        self.assertEqual(
+            "paper context cost floor not cleared",
+            _reason_category("paper context cost floor not cleared: gross edge 12.2 bps must exceed 50.7 bps"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            try:
+                seen_at = dt.datetime.now(dt.timezone.utc).isoformat()
+                current = prepare_candidate_for_exploration(
+                    self.candidate(seen_at=seen_at, last=0.0),
+                    self.settings,
+                )
+                current_review = review_candidate(current, self.settings, {}, policies=[])
+                legacy = self.candidate(seen_at=seen_at)
+                legacy_review = dict(current_review, decision="reject", hard_blocks=["legacy score block"])
+                save_opportunity(conn, legacy, legacy_review)
+                save_opportunity(conn, current, current_review)
+                report = build_paper_exploration_report(conn, self.settings)
+                self.assertEqual(1, report["summary"]["true_invalid_data_rejections_24h"])
+                self.assertNotIn("legacy score block", report["true_rejection_reasons_24h"])
+                compact = compact_paper_exploration_report(
+                    dict(report, guard_value=[{"guard_reason": str(index)} for index in range(20)])
+                )
+                self.assertEqual(10, len(compact["top_guard_value"]))
+                self.assertNotIn("guard_value", compact)
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

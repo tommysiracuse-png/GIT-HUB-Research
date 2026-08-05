@@ -42,7 +42,7 @@ from okx_perp_scanner import build_scan_batch as build_okx_scan_batch
 from paper_context_cost import paper_context_cost_report
 from okx_signal_research import run_okx_signal_research
 from paper_exploration import exploration_enabled, fair_lineage_order, prepare_candidate_for_exploration
-from paper_exploration_report import write_paper_exploration_report
+from paper_exploration_report import compact_paper_exploration_report, write_paper_exploration_report
 from prediction_market_scanner import build_scan_batch as build_prediction_market_scan_batch
 from route_resolver import enrich_candidates, write_route_resolver_report
 from scan_batch import merge_observations, normalize_observation
@@ -659,6 +659,7 @@ def run_once(settings: dict) -> dict:
 
         signal_safety_governor = run_signal_safety_governor(conn, settings)
         paper_exploration = write_paper_exploration_report(conn, settings, reviewed=reviewed)
+        paper_exploration_packet = compact_paper_exploration_report(paper_exploration)
         market_admission = run_market_admission_monitor(
             conn,
             settings,
@@ -682,7 +683,7 @@ def run_once(settings: dict) -> dict:
         auto_improvement["market_admission_bridge"] = market_admission_bridge.get("summary", {})
         auto_improvement["expansion_map"] = expansion_map
         auto_improvement["self_improvement_open_pack"] = self_improvement_open_pack
-        auto_improvement["paper_exploration"] = paper_exploration
+        auto_improvement["paper_exploration"] = paper_exploration_packet
         auto_improvement = write_self_improvement_reports(conn, auto_improvement)
         summary = performance_summary(conn)
         maintenance = perform_maintenance(conn, settings)
@@ -704,7 +705,7 @@ def run_once(settings: dict) -> dict:
             "market_admission": market_admission,
             "market_admission_bridge": market_admission_bridge,
             "opened": opened,
-            "paper_exploration": paper_exploration,
+            "paper_exploration": paper_exploration_packet,
             "summary": summary,
             "execution_summary": execution_summary(conn),
             "maintenance": maintenance,

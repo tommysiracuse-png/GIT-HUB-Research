@@ -4,10 +4,31 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 from collections import Counter, defaultdict
 
 from storage import RUNS_DIR
+
+
+_GUARD_REASON_PATTERNS = (
+    (re.compile(r"^learned score below threshold", re.I), "learned score below threshold"),
+    (re.compile(r"^estimated net edge too small after costs", re.I), "estimated net edge too small after costs"),
+    (re.compile(r"^liquidity score below minimum", re.I), "liquidity score below minimum"),
+    (re.compile(r"^self-improvement min learned score", re.I), "self-improvement minimum learned score not met"),
+    (re.compile(r"^self-improvement min net edge", re.I), "self-improvement minimum net edge not met"),
+    (re.compile(r"^self-improvement max spread", re.I), "self-improvement maximum spread exceeded"),
+    (re.compile(r"^paper context cost floor not cleared", re.I), "paper context cost floor not cleared"),
+    (re.compile(r"^market data dangerously stale", re.I), "market data dangerously stale"),
+)
+
+
+def _reason_category(reason: object) -> str:
+    text = str(reason or "unknown").strip()
+    for pattern, category in _GUARD_REASON_PATTERNS:
+        if pattern.search(text):
+            return category
+    return text
 
 
 def _load_json(value: object) -> dict:
@@ -57,7 +78,7 @@ def build_paper_exploration_report(
         scope = str(candidate.get("signal_stats_scope") or review.get("signal_stats_scope") or "direct")
         trade_scopes[scope] += 1
         reasons = review.get("would_block_reasons") or candidate.get("paper_exploration_would_block_reasons") or []
-        for reason in dict.fromkeys(str(item) for item in reasons if item):
+        for reason in dict.fromkeys(_reason_category(item) for item in reasons if item):
             guard_trade_counts[reason] += 1
             if row["measurement_status"] == "valid" and row["horizon_pnl_bps"] is not None:
                 guard_pnls[reason].append(float(row["horizon_pnl_bps"]))
@@ -80,14 +101,21 @@ def build_paper_exploration_report(
         )
 
     opportunity_rows = conn.execute(
-        "select decision, review_json from opportunities where seen_at >= datetime('now', '-24 hours')"
+        """
+        select decision, candidate_json, review_json
+        from opportunities
+        where seen_at >= datetime('now', '-24 hours')
+          and candidate_json like '%\"paper_exploration_enabled\": true%'
+        """
     ).fetchall()
     decisions: Counter[str] = Counter(str(row["decision"] or "unknown") for row in opportunity_rows)
     true_rejections: Counter[str] = Counter()
     for row in opportunity_rows:
         review = _load_json(row["review_json"])
+        if str(row["decision"] or "") not in {"reject", "reject_invalid_data"}:
+            continue
         for reason in review.get("hard_blocks") or []:
-            true_rejections[str(reason)] += 1
+            true_rejections[_reason_category(reason)] += 1
 
     prior_streaks: dict[str, int] = {}
     prior_path = RUNS_DIR / "paper_exploration_report.json"
@@ -194,3 +222,18 @@ def write_paper_exploration_report(
         )
     (RUNS_DIR / "paper_exploration_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report
+
+
+def compact_paper_exploration_report(report: dict, guard_limit: int = 10) -> dict:
+    """Return the bounded view embedded in state packets and LLM context."""
+    return {
+        "generated_at": report.get("generated_at"),
+        "enabled": report.get("enabled"),
+        "horizon_minutes": report.get("horizon_minutes"),
+        "summary": report.get("summary") or {},
+        "decisions_24h": report.get("decisions_24h") or {},
+        "true_rejection_reasons_24h": report.get("true_rejection_reasons_24h") or {},
+        "top_guard_value": list(report.get("guard_value") or [])[: max(0, int(guard_limit))],
+        "current_cycle_lineages": report.get("current_cycle_lineages") or {},
+        "admission_zero_streaks": report.get("admission_zero_streaks") or {},
+    }
