@@ -2487,7 +2487,6 @@ def _runtime_universe_contract_mismatch(
     if (
         not observation_frames
         or int(feasibility.get("universe_match_count") or 0) != 0
-        or program_diagnostic.get("missing_features")
     ):
         return None
     universe = program.get("universe") if isinstance(program.get("universe"), dict) else {}
@@ -2522,7 +2521,7 @@ def _runtime_universe_contract_mismatch(
         "reason": "compiled_universe_does_not_match_available_observations",
         "observation_count": len(observation_frames),
         "universe_match_count": 0,
-        "missing_features": [],
+        "missing_features": list(program_diagnostic.get("missing_features") or []),
         "mismatches": mismatches,
         "owner_objective": "repair_runtime_contract",
     }

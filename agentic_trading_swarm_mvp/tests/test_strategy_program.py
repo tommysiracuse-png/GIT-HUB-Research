@@ -554,6 +554,17 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertTrue(mismatch["repairable"])
         self.assertEqual("market_type", mismatch["mismatches"][0]["runtime_field"])
 
+    def test_universe_repair_is_not_hidden_by_missing_expression_features(self) -> None:
+        mismatch = _runtime_universe_contract_mismatch(
+            {"universe": {"market_types": ["perp"]}},
+            [{"market_type": None}],
+            {"missing_features": ["funding_history_count"]},
+            {"feasibility_status": "missing_surface_data", "universe_match_count": 0},
+        )
+
+        self.assertTrue(mismatch["repairable"])
+        self.assertEqual(["funding_history_count"], mismatch["missing_features"])
+
     def test_runtime_contract_falls_back_to_persisted_logic(self) -> None:
         raw_logic = {"universe": {"market_types": ["perp"]}}
 
