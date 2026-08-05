@@ -5202,12 +5202,40 @@ def paper_only_cross_market_review_state(evidence=None, signal_state=None, requi
     }
 
 
+PAPER_RECOMMENDATION_ROUTE_REQUIREMENT_FIELDS = (
+    "broker_permissions",
+    "borrow_availability",
+    "fees",
+    "margin",
+    "api_coverage",
+)
+
+
+def _paper_recommendation_route_requirement_gaps(payload):
+    """Return missing route checklist fields without contacting any route API."""
+
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    checklist = payload.get("route_requirement_checklist")
+    if not isinstance(checklist, dict):
+        checklist = evidence.get("route_requirement_checklist")
+    if not isinstance(checklist, dict):
+        return list(PAPER_RECOMMENDATION_ROUTE_REQUIREMENT_FIELDS)
+
+    return [
+        field
+        for field in PAPER_RECOMMENDATION_ROUTE_REQUIREMENT_FIELDS
+        if checklist.get(field) in (None, "", [], {}, ())
+    ]
+
+
 def validate_paper_recommendation_payload(payload=None, confidence_threshold=0.65):
     """
     Paper-only safety gate for machine-actionable recommendations.
 
-    If the payload is incomplete or confidence is below threshold, return a
-    complete hold recommendation instead of a directional action.
+    If the payload, its read-only route requirement checklist, or confidence
+    is incomplete, return a complete hold recommendation instead of a
+    directional action.  Unknown route values are allowed when explicitly
+    represented in the checklist; absent categories are not.
     """
     payload = payload or {}
     required_fields = (
@@ -5220,6 +5248,7 @@ def validate_paper_recommendation_payload(payload=None, confidence_threshold=0.6
         "title",
     )
     missing_fields = [field for field in required_fields if payload.get(field) in (None, "", [], {}, ())]
+    missing_route_requirement_fields = _paper_recommendation_route_requirement_gaps(payload)
 
     raw_confidence = payload.get("confidence", payload.get("confidence_score", 0.0))
     try:
@@ -5227,7 +5256,7 @@ def validate_paper_recommendation_payload(payload=None, confidence_threshold=0.6
     except (TypeError, ValueError):
         confidence = 0.0
 
-    if missing_fields or confidence < float(confidence_threshold or 0.0):
+    if missing_fields or missing_route_requirement_fields or confidence < float(confidence_threshold or 0.0):
         return {
             "action": "hold",
             "title": "Insufficient evidence for directional paper recommendation",
@@ -5236,6 +5265,7 @@ def validate_paper_recommendation_payload(payload=None, confidence_threshold=0.6
             "evidence": {
                 "issue_type": "insufficient_recommendation_evidence",
                 "missing_fields": missing_fields,
+                "missing_route_requirement_fields": missing_route_requirement_fields,
                 "confidence": round(confidence, 3),
                 "confidence_threshold": float(confidence_threshold or 0.0),
                 "paper_scope": "Paper-trading only; no live orders.",
@@ -5243,7 +5273,7 @@ def validate_paper_recommendation_payload(payload=None, confidence_threshold=0.6
             "proposed_change": {
                 "default_fallback": "hold",
                 "objective": "Emit only fully-formed paper recommendations with stronger gating.",
-                "rule": "Fallback to hold when confidence or required fields are missing.",
+                "rule": "Fallback to hold when confidence, required fields, or route checklist categories are missing.",
             },
             "rationale": "Recommendation was incomplete or below confidence threshold; safe fallback is hold.",
         }

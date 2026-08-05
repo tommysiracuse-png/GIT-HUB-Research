@@ -310,6 +310,13 @@ class ProxySignalFreshnessGateTests(unittest.TestCase):
             },
             "proposed_change": {"objective": "suppress stale proxy signals"},
             "rationale": "Fail closed when proxy mapping quality is too low.",
+            "route_requirement_checklist": {
+                "broker_permissions": {"status": "unknown", "value": "unknown"},
+                "borrow_availability": {"status": "not_applicable", "value": "not_applicable"},
+                "fees": {"status": "unknown", "value": "unknown"},
+                "margin": {"status": "not_applicable", "value": "not_applicable"},
+                "api_coverage": {"status": "unknown", "value": "public_market_data_only"},
+            },
         }
 
         validated = fca.validate_paper_recommendation_payload(payload)

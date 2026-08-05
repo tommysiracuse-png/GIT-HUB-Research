@@ -26,6 +26,12 @@ class PaperOnlyRouteIntelligenceAnnotationTests(unittest.TestCase):
         self.assertEqual(row["order_api_surface_mapped"], "satisfied")
         self.assertEqual(row["paper_recommendation_action"], "downgrade_confidence_and_label_unverified_route")
         self.assertEqual(row["paper_recommendation_reason"], "venue_supports_margin_or_equivalent_unverified")
+        self.assertTrue(row["route_requirement_checklist_complete"])
+        self.assertEqual(
+            set(row["route_requirement_checklist"]),
+            {"broker_permissions", "borrow_availability", "fees", "margin", "api_coverage"},
+        )
+        self.assertTrue(row["route_requirement_checklist"]["broker_permissions"]["read_only"])
 
     def test_funding_capture_profile_reports_perp_and_collateral_requirements(self):
         candidate = {

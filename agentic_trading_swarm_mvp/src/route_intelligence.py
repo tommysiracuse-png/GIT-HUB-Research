@@ -58,6 +58,20 @@ ROUTE_REQUIREMENT_FIELDS = (
     "api_surface_required",
     "requires_spot_borrow",
     "requires_margin_permission",
+    "route_requirement_checklist",
+    "route_requirement_checklist_complete",
+)
+
+# These are the route facts that an opportunity report must carry forward to a
+# machine-actionable paper recommendation.  They are intentionally about
+# route metadata, rather than trade quality: an unknown fact remains visible
+# as ``unknown`` and does not remove the opportunity from paper observation.
+ROUTE_REQUIREMENT_CHECKLIST_FIELDS = (
+    "broker_permissions",
+    "borrow_availability",
+    "fees",
+    "margin",
+    "api_coverage",
 )
 
 _PRIORITY_SPOT_BORROW_INST_IDS = (
@@ -103,6 +117,16 @@ def build_route_requirements_report(
         "paper_only": True,
         "read_only": True,
         "report_scope": "pre_promotion_route_requirements",
+        "route_requirement_checklist_fields": list(ROUTE_REQUIREMENT_CHECKLIST_FIELDS),
+        "paper_recommendation_output_policy": {
+            "required_checklist_fields": list(ROUTE_REQUIREMENT_CHECKLIST_FIELDS),
+            "rule": (
+                "A paper recommendation must carry every route-requirement "
+                "checklist field; unknown values remain read-only diagnostics "
+                "and do not suppress the underlying paper opportunity."
+            ),
+            "missing_checklist_action": "hold_paper_recommendation",
+        },
         "promotion_review": {
             "required_before_route_promotion": True,
             "mode": "report_only",
@@ -575,6 +599,116 @@ def _route_requirement_gap_fields(requirement_checklist: dict[str, str]) -> tupl
     return missing_fields, unknown_fields
 
 
+def _route_requirement_checklist(
+    opportunity: dict[str, Any],
+    *,
+    blockers: list[str],
+    borrow_required: bool,
+    requires_margin_permission: bool | str,
+    operational_checklist: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Project route facts into a stable, read-only recommendation checklist.
+
+    Every category is emitted even when its value is unknown or not applicable.
+    This makes the difference between absent metadata and unresolved metadata
+    explicit, without probing accounts, brokers, or private endpoints.
+    """
+
+    broker_permissions_confirmed = _bool_flag(
+        _first_known(
+            opportunity,
+            "broker_permissions_confirmed",
+            "venue_permissions_confirmed",
+            "account_permissions_confirmed",
+        )
+    )
+    borrow_available = _bool_flag(
+        _first_known(
+            opportunity,
+            "borrow_available",
+            "borrowable",
+            "borrow_supported",
+            "spot_borrow_supported",
+        )
+    )
+    margin_available = _bool_flag(
+        _first_known(
+            opportunity,
+            "margin_available",
+            "margin_supported",
+            "spot_margin_supported",
+        )
+    )
+    api_coverage_mapped = _bool_flag(
+        _first_known(
+            opportunity,
+            "api_coverage_mapped",
+            "order_api_surface_mapped",
+            "api_surface_mapped",
+        )
+    )
+    fees_modeled = operational_checklist.get("fees_modeled", UNKNOWN)
+
+    def entry(*, required: bool, status: str, value: Any) -> dict[str, Any]:
+        return {
+            "required_for_direct_route": required,
+            "status": status,
+            "value": value if value not in (None, "", [], {}, ()) else UNKNOWN,
+            "read_only": True,
+        }
+
+    return {
+        "broker_permissions": entry(
+            required=True,
+            status=_requirement_check_status(required=True, satisfied=broker_permissions_confirmed),
+            value=_route_required_permissions(opportunity, blockers),
+        ),
+        "borrow_availability": entry(
+            required=borrow_required,
+            status=_requirement_check_status(required=borrow_required, satisfied=borrow_available),
+            value=_first_known(opportunity, "borrow_asset", "borrowable", "borrow_available", "borrow_supported"),
+        ),
+        "fees": entry(
+            required=True,
+            status=str(fees_modeled or UNKNOWN),
+            value={
+                "fee_bps_per_side": _first_known(opportunity, "fee_bps_per_side_or_unknown", "fee_bps_per_side"),
+                "slippage_bps_per_side": _first_known(opportunity, "slippage_bps_per_side_or_unknown", "slippage_bps_per_side"),
+            },
+        ),
+        "margin": entry(
+            required=requires_margin_permission is True,
+            status=_requirement_check_status(
+                required=requires_margin_permission is True,
+                satisfied=margin_available,
+            ),
+            value=_first_known(opportunity, "margin_required", "margin_available", "margin_supported"),
+        ),
+        "api_coverage": entry(
+            required=True,
+            status=_requirement_check_status(required=True, satisfied=api_coverage_mapped),
+            value=_first_known(
+                opportunity,
+                "api_surface_required",
+                "endpoint_constraints",
+                "api_access_status",
+            ),
+        ),
+    }
+
+
+def _route_requirement_checklist_complete(checklist: Any) -> bool:
+    """Return whether all required checklist categories are structurally present."""
+
+    if not isinstance(checklist, dict):
+        return False
+    for field in ROUTE_REQUIREMENT_CHECKLIST_FIELDS:
+        item = checklist.get(field)
+        if not isinstance(item, dict) or item.get("status") in (None, "") or "value" not in item:
+            return False
+    return True
+
+
 def _paper_route_confidence(
     requirement_checklist: dict[str, str],
     *,
@@ -667,6 +801,17 @@ def _annotate_route_feasibility_fields(
         feasibility_state=str(row["feasibility_state"] or UNKNOWN),
     )
     row.update(checklist)
+    route_requirement_checklist = _route_requirement_checklist(
+        opportunity,
+        blockers=blockers,
+        borrow_required=borrow_required,
+        requires_margin_permission=requires_margin_permission,
+        operational_checklist=checklist,
+    )
+    row["route_requirement_checklist"] = route_requirement_checklist
+    row["route_requirement_checklist_complete"] = _route_requirement_checklist_complete(
+        route_requirement_checklist
+    )
     row["paper_recommendation_action"] = _paper_recommendation_action(
         opportunity,
         feasibility_state=str(row["feasibility_state"] or UNKNOWN),

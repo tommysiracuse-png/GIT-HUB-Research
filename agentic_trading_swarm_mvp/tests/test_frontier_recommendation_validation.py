@@ -3,6 +3,15 @@ import unittest
 from src.frontier_crypto_adapter import validate_paper_recommendation_payload
 
 
+ROUTE_REQUIREMENT_CHECKLIST = {
+    "broker_permissions": {"status": "unknown", "value": "unknown"},
+    "borrow_availability": {"status": "not_applicable", "value": "not_applicable"},
+    "fees": {"status": "unknown", "value": "unknown"},
+    "margin": {"status": "not_applicable", "value": "not_applicable"},
+    "api_coverage": {"status": "unknown", "value": "public_market_data_only"},
+}
+
+
 class TestFrontierRecommendationValidation(unittest.TestCase):
     def test_falls_back_to_hold_when_required_fields_missing(self):
         payload = {
@@ -27,11 +36,35 @@ class TestFrontierRecommendationValidation(unittest.TestCase):
             "proposed_change": {"default_fallback": "hold"},
             "rationale": "complete",
             "title": "complete",
+            "route_requirement_checklist": ROUTE_REQUIREMENT_CHECKLIST,
         }
 
         result = validate_paper_recommendation_payload(payload, confidence_threshold=0.65)
 
         self.assertEqual(result, payload)
+
+    def test_falls_back_to_hold_when_route_requirement_checklist_is_incomplete(self):
+        payload = {
+            "action": "buy",
+            "confidence": 0.9,
+            "evidence": {"note": "complete"},
+            "market_key": "paper.market.radar.signal_quality",
+            "priority": 90,
+            "proposed_change": {"default_fallback": "hold"},
+            "rationale": "complete",
+            "title": "complete",
+            "route_requirement_checklist": {
+                "broker_permissions": {"status": "unknown", "value": "unknown"},
+            },
+        }
+
+        result = validate_paper_recommendation_payload(payload, confidence_threshold=0.65)
+
+        self.assertEqual(result["action"], "hold")
+        self.assertEqual(
+            result["evidence"]["missing_route_requirement_fields"],
+            ["borrow_availability", "fees", "margin", "api_coverage"],
+        )
 
     def test_falls_back_to_hold_when_confidence_below_threshold(self):
         payload = {
@@ -43,6 +76,7 @@ class TestFrontierRecommendationValidation(unittest.TestCase):
             "proposed_change": {"default_fallback": "hold"},
             "rationale": "complete",
             "title": "complete",
+            "route_requirement_checklist": ROUTE_REQUIREMENT_CHECKLIST,
         }
 
         result = validate_paper_recommendation_payload(payload, confidence_threshold=0.65)
