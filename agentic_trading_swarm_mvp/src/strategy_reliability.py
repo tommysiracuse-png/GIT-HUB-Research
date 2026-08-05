@@ -1089,7 +1089,56 @@ def _paper_cell_asymmetric_direction_reasons(record: dict[str, Any], cell: dict[
         reasons.append("short_proxy")
     if short_direction and "discovery" in haystack:
         reasons.append("short_discovery")
+    if (
+        short_direction
+        and "frontier" in haystack
+        and "conditional" in haystack
+    ):
+        reasons.append("conditional_frontier_short")
     return reasons
+
+
+def _paper_cell_promotion_confidence_review(
+    closed_count: int,
+    settings: dict[str, Any],
+    asymmetric_direction_reasons: list[str],
+) -> dict[str, Any]:
+    """Measure conditional-frontier-short sample confidence for promotion only.
+
+    This is intentionally a promotion/probation diagnostic.  It never changes
+    paper entry eligibility, candidate emission, or routing.
+    """
+
+    applies = "conditional_frontier_short" in asymmetric_direction_reasons
+    if not applies:
+        return {
+            "applies": False,
+            "sample_confidence": 1.0,
+            "minimum_confidence": None,
+            "target_closed_trades": None,
+            "confidence_penalty_bps": 0.0,
+        }
+
+    target_closed_trades = max(
+        1,
+        _as_int(settings.get("conditional_frontier_short_confidence_target_closed_trades"), 20),
+    )
+    minimum_confidence = max(
+        0.0,
+        min(1.0, _as_float(settings.get("conditional_frontier_short_min_promotion_confidence"), 0.8)),
+    )
+    max_penalty_bps = max(
+        0.0,
+        _as_float(settings.get("conditional_frontier_short_confidence_penalty_bps"), 2.0),
+    )
+    sample_confidence = min(1.0, max(0.0, closed_count / target_closed_trades))
+    return {
+        "applies": True,
+        "sample_confidence": round(sample_confidence, 3),
+        "minimum_confidence": minimum_confidence,
+        "target_closed_trades": target_closed_trades,
+        "confidence_penalty_bps": round(max_penalty_bps * (1.0 - sample_confidence), 3),
+    }
 
 
 def _paper_cell_quality_audit(
@@ -1204,9 +1253,9 @@ def evaluate_paper_cell_policy(
     )
     avg_pnl_bps = _as_float(cost_audit.get("adjusted_pnl_bps"), reported_avg_pnl_bps)
     portability = paper_portability_quarantine_record(record, config=config)
-    promotion_min_closed_trades = min_closed_trades
     asymmetric_direction_reasons = _paper_cell_asymmetric_direction_reasons(record, cell)
-    if asymmetric_direction_reasons:
+    promotion_min_closed_trades = min_closed_trades
+    if any(reason in {"short_proxy", "short_discovery"} for reason in asymmetric_direction_reasons):
         promotion_min_closed_trades = max(
             promotion_min_closed_trades,
             max(1, _as_int(settings.get("asymmetric_direction_min_closed_trades"), 20)),
@@ -1217,6 +1266,24 @@ def evaluate_paper_cell_policy(
             promote_min_avg_pnl_bps,
             max(1.0, _as_float(settings.get("asymmetric_direction_min_avg_pnl_bps"), 1.0)),
         )
+    if "conditional_frontier_short" in asymmetric_direction_reasons:
+        promotion_min_closed_trades = max(
+            promotion_min_closed_trades,
+            max(1, _as_int(settings.get("conditional_frontier_short_min_closed_trades"), 12)),
+        )
+        promote_min_avg_pnl_bps = max(
+            promote_min_avg_pnl_bps,
+            max(1.0, _as_float(settings.get("conditional_frontier_short_min_avg_pnl_bps"), 1.0)),
+        )
+    promotion_confidence = _paper_cell_promotion_confidence_review(
+        closed_count,
+        settings,
+        asymmetric_direction_reasons,
+    )
+    promotion_avg_pnl_bps = avg_pnl_bps - _as_float(
+        promotion_confidence.get("confidence_penalty_bps"),
+        0.0,
+    )
 
     promotion_blockers = []
     if closed_count < promotion_min_closed_trades:
@@ -1225,9 +1292,15 @@ def evaluate_paper_cell_policy(
             if asymmetric_direction_reasons
             else "insufficient_closed_trades"
         )
-    if avg_pnl_bps < promote_min_avg_pnl_bps:
+    if promotion_confidence["applies"] and (
+        promotion_confidence["sample_confidence"] < promotion_confidence["minimum_confidence"]
+    ):
+        promotion_blockers.append("conditional_frontier_short_promotion_confidence_below_floor")
+    if promotion_avg_pnl_bps < promote_min_avg_pnl_bps:
         promotion_blockers.append(
-            "direction_specific_realized_edge_below_floor"
+            "conditional_frontier_short_confidence_adjusted_edge_below_floor"
+            if promotion_confidence["applies"]
+            else "direction_specific_realized_edge_below_floor"
             if asymmetric_direction_reasons
             else "realized_edge_below_floor"
         )
@@ -1251,7 +1324,7 @@ def evaluate_paper_cell_policy(
     elif (
         not promotion_blockers
         and closed_count >= promotion_min_closed_trades
-        and avg_pnl_bps >= promote_min_avg_pnl_bps
+        and promotion_avg_pnl_bps >= promote_min_avg_pnl_bps
         and (win_rate is None or win_rate >= promote_min_win_rate)
     ):
         decision = "promoted"
@@ -1271,6 +1344,7 @@ def evaluate_paper_cell_policy(
         "action": action,
         "closed_count": closed_count,
         "avg_pnl_bps": avg_pnl_bps,
+        "promotion_avg_pnl_bps": promotion_avg_pnl_bps,
         "reported_avg_pnl_bps": reported_avg_pnl_bps,
         "win_rate": None if win_rate is None or win_rate < 0.0 else win_rate,
         "prior_state": prior_state,
@@ -1283,6 +1357,7 @@ def evaluate_paper_cell_policy(
             "min_closed_trades": promotion_min_closed_trades,
             "min_avg_pnl_bps": promote_min_avg_pnl_bps,
             "min_win_rate": promote_min_win_rate,
+            "promotion_confidence": promotion_confidence,
             "blockers": promotion_blockers,
             "quality_audit": quality_audit,
             "realized_cost_audit": cost_audit,

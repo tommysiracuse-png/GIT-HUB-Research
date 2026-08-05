@@ -136,6 +136,54 @@ class TestSelfImprovementCellScope(unittest.TestCase):
         self.assertEqual(result["decision"], "promoted")
         self.assertEqual(result["promotion_gate"]["blockers"], [])
 
+    def test_conditional_frontier_short_stays_in_probation_with_sparse_positive_sample(self) -> None:
+        result = evaluate_paper_cell_policy(
+            {
+                "signal_key": "BITGET|frontier_crypto_venue_map|short_frontier_spot|conditional",
+                "signal_family": "frontier_crypto_venue_map",
+                "trade_type": "conditional",
+                "venue": "BITGET",
+                "direction": "short_frontier_spot",
+                "paper_route_status": "executable",
+                "closed_count": 12,
+                "avg_pnl_bps": 2.0,
+                "avg_pnl_cost_basis": "after_cost",
+                "win_rate": 0.60,
+            }
+        )
+
+        self.assertEqual(result["decision"], "probation")
+        self.assertEqual(result["action"], "retain_cell_probation")
+        confidence = result["promotion_gate"]["promotion_confidence"]
+        self.assertTrue(confidence["applies"])
+        self.assertEqual(confidence["sample_confidence"], 0.6)
+        self.assertGreater(confidence["confidence_penalty_bps"], 0.0)
+        self.assertIn(
+            "conditional_frontier_short_promotion_confidence_below_floor",
+            result["promotion_gate"]["blockers"],
+        )
+
+    def test_conditional_frontier_short_promotes_only_after_stable_sample(self) -> None:
+        result = evaluate_paper_cell_policy(
+            {
+                "signal_key": "BITGET|frontier_crypto_venue_map|short_frontier_spot|conditional",
+                "signal_family": "frontier_crypto_venue_map",
+                "trade_type": "conditional",
+                "venue": "BITGET",
+                "direction": "short_frontier_spot",
+                "paper_route_status": "executable",
+                "closed_count": 20,
+                "avg_pnl_bps": 2.0,
+                "avg_pnl_cost_basis": "after_cost",
+                "win_rate": 0.60,
+            }
+        )
+
+        self.assertEqual(result["decision"], "promoted")
+        confidence = result["promotion_gate"]["promotion_confidence"]
+        self.assertEqual(confidence["sample_confidence"], 1.0)
+        self.assertEqual(confidence["confidence_penalty_bps"], 0.0)
+
     def test_short_proxy_gross_edge_does_not_promote_after_cost_backfill(self) -> None:
         result = evaluate_paper_cell_policy(
             {

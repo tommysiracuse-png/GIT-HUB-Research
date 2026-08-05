@@ -13,11 +13,38 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def is_conditional_frontier_short_signal(signal_key: object) -> bool:
+    """Return whether a signal key identifies a conditional frontier short cell.
+
+    Synthetic research keys retain their direct signal key after the prefix, so
+    token matching keeps their learning calibration isolated from unrelated
+    synthetic experiments.
+    """
+
+    tokens = {token for token in str(signal_key or "").lower().split("|") if token}
+    return (
+        "frontier_crypto_venue_map" in tokens
+        and "conditional" in tokens
+        and any("short_frontier" in token for token in tokens)
+    )
+
+
+def adjustment_sample_requirement(signal_key: object, learning_cfg: dict) -> int:
+    """Return the evidence requirement before a learned score can be trusted."""
+
+    generic_minimum = max(1, int(learning_cfg["min_samples_for_adjustment"]))
+    if not is_conditional_frontier_short_signal(signal_key):
+        return generic_minimum
+    return max(
+        generic_minimum,
+        int(learning_cfg.get("conditional_frontier_short_min_samples_for_adjustment", 20)),
+    )
+
+
 def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, dict]:
     learning_cfg = settings["learning"]
     max_adj = float(learning_cfg["max_adjustment_bps"])
     scale = float(learning_cfg["score_adjustment_scale"])
-    min_samples = int(learning_cfg["min_samples_for_adjustment"])
 
     rows = conn.execute(
         """
@@ -36,7 +63,8 @@ def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, d
         wins = sum(1 for pnl in pnls if pnl > 0)
         avg = sum(pnls) / closed_count if closed_count else 0.0
         win_rate = wins / closed_count if closed_count else 0.0
-        if closed_count >= min_samples:
+        adjustment_min_samples = adjustment_sample_requirement(key, learning_cfg)
+        if closed_count >= adjustment_min_samples:
             adjustment = clamp((avg * scale) + ((win_rate - 0.5) * 12.0), -max_adj, max_adj)
         else:
             adjustment = 0.0
@@ -61,6 +89,10 @@ def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, d
             "avg_pnl_bps": round(avg, 3),
             "win_rate": round(win_rate, 3),
             "score_adjustment": round(adjustment, 3),
+            "score_adjustment_min_samples": adjustment_min_samples,
+            "score_adjustment_sample_confidence": round(
+                min(1.0, closed_count / adjustment_min_samples), 3
+            ),
         }
     conn.commit()
     update_contextual_stats(conn)
