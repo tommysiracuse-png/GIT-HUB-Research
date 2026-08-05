@@ -698,7 +698,7 @@ def paper_context_attribution_score(
     stored_gate = candidate.get("paper_context_cost_gate")
     gate = dict(stored_gate) if isinstance(stored_gate, Mapping) else paper_context_cost_gate(candidate, settings)
     raw_alpha = _finite_float(gate.get("gross_edge_bps"))
-    expected_net_edge = _finite_float(gate.get("net_edge_bps"))
+    modeled_net_edge = _finite_float(gate.get("net_edge_bps"))
     components = gate.get("components_bps") if isinstance(gate.get("components_bps"), Mapping) else {}
     inputs = gate.get("inputs") if isinstance(gate.get("inputs"), Mapping) else {}
 
@@ -712,17 +712,36 @@ def paper_context_attribution_score(
     liquidity_field = inputs.get("liquidity_field")
     liquidity = _normalized_score(_finite_float(inputs.get("liquidity_score")))
     spread_burden = max(0.0, _finite_float(components.get("round_trip_spread_bps")) or 0.0)
-    _, explicit_borrow_or_carry = _first_number(
+    borrow_or_carry_field, explicit_borrow_or_carry = _nested_number(
         candidate,
+        (
+            "execution_feasibility",
+            "execution_route",
+            "paper_route_eligibility",
+            "route_intelligence",
+        ),
         "borrow_cost_bps_horizon",
         "expected_borrow_cost_bps",
         "carry_bps_horizon",
         "expected_carry_cost_bps",
     )
+    modeled_carry = max(0.0, _finite_float(components.get("carry_bps_horizon")) or 0.0)
+    # Most carry candidates model funding in the base net edge, but spot-borrow
+    # estimates can arrive as route context rather than as a generic carry
+    # field.  Deduct only the portion not already represented by the cost gate
+    # so ranking does not double-charge the same public estimate.
+    unmodeled_borrow_or_carry = max(
+        0.0,
+        (explicit_borrow_or_carry or 0.0) - modeled_carry,
+    )
+    expected_net_edge = (
+        None
+        if modeled_net_edge is None
+        else modeled_net_edge - unmodeled_borrow_or_carry
+    )
     carry_burden = max(
         0.0,
-        _finite_float(components.get("carry_bps_horizon")) or 0.0,
-        _finite_float(components.get("route")) or 0.0,
+        modeled_carry,
         explicit_borrow_or_carry or 0.0,
     )
     age = _finite_float(gate.get("signal_age_seconds"))
@@ -790,6 +809,8 @@ def paper_context_attribution_score(
         reasons.append("thin_liquidity_depth")
     if carry_burden > 0.0:
         reasons.append("borrow_or_carry_burden")
+    if unmodeled_borrow_or_carry > 0.0:
+        reasons.append("borrow_or_carry_deducted_from_expected_net_edge")
     if age is None or max_age is None:
         reasons.append("signal_age_unknown")
     elif age_penalty > 0.10:
@@ -809,6 +830,7 @@ def paper_context_attribution_score(
         "enabled": enabled,
         "ranking_only": True,
         "raw_alpha_bps": round(raw_alpha, 3) if raw_alpha is not None else None,
+        "modeled_net_edge_bps": round(modeled_net_edge, 3) if modeled_net_edge is not None else None,
         "expected_net_edge_bps": round(expected_net_edge, 3) if expected_net_edge is not None else None,
         "context_adjusted_expected_net_edge_bps": (
             round(adjusted_net_edge, 3) if adjusted_net_edge is not None else None
@@ -821,7 +843,9 @@ def paper_context_attribution_score(
             "spread_burden_bps": round(spread_burden, 3),
             "liquidity_depth_field": liquidity_field,
             "liquidity_depth_score": liquidity,
+            "borrow_or_carry_field": borrow_or_carry_field,
             "borrow_or_carry_burden_bps": round(carry_burden, 3),
+            "unmodeled_borrow_or_carry_bps": round(unmodeled_borrow_or_carry, 3),
             "signal_age_seconds": round(age, 3) if age is not None else None,
             "max_signal_age_seconds": round(max_age, 3) if max_age is not None else None,
             "regime_stability_field": regime_field,
@@ -878,12 +902,16 @@ def paper_context_cost_gate(
         "spread_bps",
         "effective_spread_bps",
         "quoted_spread_bps",
+        "estimated_spread_bps",
+        "estimated_bid_ask_spread_bps",
     )
     liquidity_field, liquidity = _first_number(
         candidate,
         "liquidity_score",
         "depth_liquidity_score",
         "liquidity_proxy",
+        "liquidity_depth_proxy",
+        "order_book_depth_score",
     )
     depth_liquidity = _finite_float(candidate.get("depth_liquidity_score"))
     if depth_liquidity is not None and (liquidity is None or depth_liquidity < liquidity):

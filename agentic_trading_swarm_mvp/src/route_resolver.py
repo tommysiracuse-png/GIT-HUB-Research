@@ -15,7 +15,11 @@ import json
 import pathlib
 from typing import Iterable
 
-from paper_context_cost import annotate_paper_context_cost, rank_paper_candidates_by_context
+from paper_context_cost import (
+    annotate_paper_context_cost,
+    paper_context_cost_report,
+    rank_paper_candidates_by_context,
+)
 from paper_route_registry import apply_paper_route_registry
 
 try:
@@ -2811,6 +2815,11 @@ def write_route_resolver_report(candidates: list[dict], settings: dict, limit: i
     considered = candidates[:limit]
     summary = summarize_routes(considered)
     requirements_intel = build_route_requirements_report(considered)
+    paper_context_ranking = (
+        paper_context_cost_report(considered)
+        if str(settings.get("mode") or "paper").strip().lower() == "paper"
+        else {"paper_only": True, "enabled": False, "candidate_count": 0, "candidates": []}
+    )
     report = {
         "generated_at": _utc_now(),
         "mode": settings.get("mode"),
@@ -2818,6 +2827,10 @@ def write_route_resolver_report(candidates: list[dict], settings: dict, limit: i
         "summary": summary,
         "route_intelligence": summarize_route_intelligence(considered),
         "route_requirements_intel": requirements_intel,
+        # Context evidence only orders paper review.  It is deliberately kept
+        # separate from route status so weak transport assumptions remain
+        # observable candidates rather than becoming a new route block.
+        "paper_context_ranking": paper_context_ranking,
         "routes_registry": str(CUSTOM_ROUTES_PATH if CUSTOM_ROUTES_PATH.exists() else EXAMPLE_ROUTES_PATH),
         "hard_limits": [
             "Read-only resolver; no broker API actions are performed.",
@@ -2911,6 +2924,21 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Blockers: `{intelligence.get('blocker_counts', {})}`")
     lines.append(f"- Spot-borrow assets: `{intelligence.get('spot_borrow_assets', {})}`")
     lines.append(f"- Human route decision pack: `{intelligence.get('route_decision_pack', {})}`")
+    context_ranking = report.get("paper_context_ranking", {})
+    lines.extend(["", "## Paper Context Ranking", ""])
+    lines.append(f"- Paper candidates attributed: `{context_ranking.get('candidate_count', 0)}`")
+    lines.append(
+        f"- Ranking reasons: `{context_ranking.get('by_context_ranking_reason', {})}`"
+    )
+    for candidate in context_ranking.get("candidates", [])[:10]:
+        reasons = candidate.get("context_ranking_reasons") or []
+        if not reasons:
+            continue
+        lines.append(
+            f"- `{candidate.get('inst_id')}` context-net="
+            f"`{candidate.get('context_adjusted_expected_net_edge_bps')}` "
+            f"reasons={reasons}"
+        )
     lines.extend(["", *_route_requirements_intel_markdown(report.get("route_requirements_intel", {}))])
     for status in ("conditional", "route_unknown", "blocked", "standard"):
         lines.extend(["", f"## {status.replace('_', ' ').title()} Samples", ""])

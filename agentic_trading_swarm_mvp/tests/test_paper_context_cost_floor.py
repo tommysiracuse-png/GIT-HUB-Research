@@ -96,6 +96,37 @@ class PaperContextCostFloorTests(unittest.TestCase):
             ranked[0]["paper_context_rank_score"],
         )
 
+    def test_attribution_deducts_unmodeled_borrow_before_context_ranking(self) -> None:
+        candidate = frontier_candidate(
+            gross_edge_bps_estimate=100.0,
+            estimated_round_trip_cost_bps=20.0,
+            venue_quality={"venue_quality_score": 100.0},
+            liquidity_score=1.0,
+            spread_bps=0.0,
+            freshness_age_seconds=0.0,
+            regime_stability_score=1.0,
+            execution_feasibility={
+                "status": "standard",
+                "borrow_cost_bps_horizon": 12.0,
+            },
+        )
+
+        attribution = paper_context_attribution_score(candidate, DEFAULT_SETTINGS)
+
+        self.assertEqual(
+            attribution["modeled_net_edge_bps"] - 12.0,
+            attribution["expected_net_edge_bps"],
+        )
+        self.assertEqual(
+            12.0,
+            attribution["inputs"]["unmodeled_borrow_or_carry_bps"],
+        )
+        self.assertIn(
+            "borrow_or_carry_deducted_from_expected_net_edge",
+            attribution["ranking_reasons"],
+        )
+        self.assertNotIn("paper_entry_blocked", attribution)
+
     def test_effective_cost_is_additive_and_buffer_comparison_is_strict(self) -> None:
         settings = copy.deepcopy(DEFAULT_SETTINGS)
         settings["paper_context_cost_floor"].update(
