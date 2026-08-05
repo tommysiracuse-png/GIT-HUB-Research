@@ -41,6 +41,11 @@ from adapters.venues.bank_of_canada import (
     parse_bank_of_canada_treasury_bill_auctions,
 )
 from adapters.venues.bursa_derivatives import contract_observations
+from adapters.venues.casablanca_stock_exchange_futures_market import (
+    SOURCE_URL as CASABLANCA_FUTURES_SOURCE_URL,
+    CasablancaStockExchangeFuturesMarketAdapter,
+    parse_casablanca_masi20_future,
+)
 from adapters.venues.dc_department_of_energy_environment import (
     FINAL_SALES_URL as DC_SRC_FINAL_SALES_URL,
     FOR_SALE_URL as DC_SRC_FOR_SALE_URL,
@@ -902,6 +907,139 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual("blocked", unavailable_batch.observations[0]["fetch_status"])
         self.assertEqual(
             ESX_FIXED_INCOME_INSTRUMENTS_URL,
+            unavailable_batch.observations[0]["source_url"],
+        )
+
+    def test_casablanca_futures_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "casablanca_stock_exchange_futures_market"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsInstance(adapter, CasablancaStockExchangeFuturesMarketAdapter)
+        self.assertEqual("CASABLANCA_FUTURES", adapter.info.venue)
+        self.assertEqual(CASABLANCA_FUTURES_SOURCE_URL, adapter.info.docs_url)
+        self.assertIn("delayed_quote", adapter.info.capabilities)
+        self.assertNotIn("entry_quality_quote", adapter.info.capabilities)
+
+    def test_casablanca_futures_parser_normalizes_official_masi20_contract(self) -> None:
+        document = """
+        <html><body>
+          <section><strong>Session closed</strong><span>Monday, June 8, 2026</span></section>
+          <p>Prices are delayed by 15 minutes</p>
+          <h1>MASI20 FUTURE JUI26</h1>
+          <table>
+            <tr><td>Ticker</td><td>FMASI20JUI26</td></tr>
+            <tr><td>Contract</td><td>MASI20 FUTURE</td></tr>
+            <tr><td>ISIN</td><td>MA0009000037</td></tr>
+            <tr><td>Type of Underlying Asset</td><td>INDX</td></tr>
+            <tr><td>Maturity</td><td>juin</td></tr>
+            <tr><td>Last Trading Day</td><td>19/06/2026</td></tr>
+            <tr><td>Payment Method</td><td>Cash</td></tr>
+            <tr><td>Underlying Asset</td><td>MASI20</td></tr>
+            <tr><td>Trading Unit (MAD)</td><td>10</td></tr>
+            <tr><td>Initial Deposit</td><td>1500</td></tr>
+          </table>
+          <table>
+            <tr><td>Price</td><td>1 320,00</td></tr>
+            <tr><td>Change</td><td>0,77 %</td></tr>
+            <tr><td>Opening</td><td>-</td></tr>
+            <tr><td>Low</td><td>-</td></tr>
+            <tr><td>High</td><td>-</td></tr>
+            <tr><td>Previous closing price</td><td>1 320,00</td></tr>
+            <tr><td>Volume</td><td>-</td></tr>
+            <tr><td>Quantity traded</td><td>-</td></tr>
+            <tr><td>Number of transactions</td><td>-</td></tr>
+          </table>
+        </body></html>
+        """
+        rows = parse_casablanca_masi20_future(
+            document,
+            received_at="2026-06-08T16:00:00+00:00",
+        )
+
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        self.assertEqual("CASABLANCA_FUTURES:FMASI20JUI26", row["inst_id"])
+        self.assertEqual(1320.0, row["last"])
+        self.assertEqual(0.77, row["change_pct"])
+        self.assertEqual("MA0009000037", row["isin"])
+        self.assertEqual("2026-06-19", row["last_trading_date"])
+        self.assertEqual(10.0, row["contract_multiplier_mad_per_index_point"])
+        self.assertEqual(1500.0, row["initial_deposit_mad"])
+        self.assertEqual("closed", row["session_status"])
+        self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual("reachable", row["fetch_status"])
+        self.assertEqual(CASABLANCA_FUTURES_SOURCE_URL, row["source_url"])
+        self.assertEqual("watch_only", row["direction"])
+
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": document,
+            "received_at": "2026-06-08T16:00:00+00:00",
+            "latency_ms": 3.0,
+        }
+        with mock.patch(
+            "adapters.venues.casablanca_stock_exchange_futures_market.fetch_text",
+            return_value=result,
+        ):
+            batch = CasablancaStockExchangeFuturesMarketAdapter().scan({})
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("fresh", batch.metadata["freshness_state"])
+        self.assertEqual("closed", batch.metadata["session_state"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertEqual(956, batch.metadata["adapter_spec_id"])
+        self.assertTrue(batch.metadata["paper_only"])
+
+    def test_casablanca_futures_adapter_preserves_parser_and_fetch_failures(self) -> None:
+        parser_result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>replacement page</body></html>",
+            "received_at": "2026-08-04T16:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.casablanca_stock_exchange_futures_market.fetch_text",
+            return_value=parser_result,
+        ):
+            parser_batch = CasablancaStockExchangeFuturesMarketAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable", parser_batch.metadata["fetch_status"]["instrument"]["fetch_status"]
+        )
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual("watch_only", parser_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_futures_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+        self.assertTrue(parser_batch.observations[0]["parser_failure"])
+
+        unavailable_result = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "error": "blocked",
+            "text": "",
+            "received_at": "2026-08-04T16:01:00+00:00",
+            "latency_ms": 5.0,
+        }
+        with mock.patch(
+            "adapters.venues.casablanca_stock_exchange_futures_market.fetch_text",
+            return_value=unavailable_result,
+        ):
+            unavailable_batch = CasablancaStockExchangeFuturesMarketAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("unknown", unavailable_batch.metadata["freshness_state"])
+        self.assertEqual("unknown", unavailable_batch.metadata["session_state"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual("blocked", unavailable_batch.observations[0]["fetch_status"])
+        self.assertEqual(
+            CASABLANCA_FUTURES_SOURCE_URL,
             unavailable_batch.observations[0]["source_url"],
         )
 
@@ -2221,6 +2359,26 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
 
 
 class AdapterCapabilityTests(unittest.TestCase):
+    def test_casablanca_futures_adapter_closes_spec_956_without_entry_quote_claim(self) -> None:
+        spec = {
+            "title": "Implement public adapter #956: Casablanca Stock Exchange / Futures market",
+            "market_key": "global_discovery|Casablanca Stock Exchange / Futures market",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "Casablanca Stock Exchange / Futures market",
+                    "public_docs_url": CASABLANCA_FUTURES_SOURCE_URL,
+                    "asset_or_event": "MASI 20 futures contract FMASI20SEP26",
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("casablanca_stock_exchange_futures_market", match["adapter_id"])
+        self.assertIn("delayed_quote", match["available_capabilities"])
+        self.assertNotIn("entry_quality_quote", match["available_capabilities"])
+
     def test_dc_doee_adapter_closes_src_registry_price_spec(self) -> None:
         spec = {
             "title": "Implement public adapter #1254: DC DOEE SRC sale prices",
