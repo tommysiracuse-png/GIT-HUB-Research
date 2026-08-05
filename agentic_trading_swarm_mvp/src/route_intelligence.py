@@ -35,18 +35,24 @@ ROUTE_REQUIREMENT_FIELDS = (
     "route_blockers",
     "required_account_type",
     "required_permissions",
+    "shortability_status",
     "borrow_required",
     "borrow_asset",
     "borrow_fee_bps_estimate_or_unknown",
     "borrow_availability_status",
+    "margin_spot_constraints",
+    "fee_tier",
+    "fee_tier_status",
     "maker_fee_bps_or_unknown",
     "taker_fee_bps_or_unknown",
     "fee_stack_bps_estimate_or_unknown",
     "margin_required",
     "margin_mode",
     "venue_api_requirement",
+    "api_permission_status",
     "api_route_status",
     "endpoint_constraints",
+    "order_type_support",
     "minimum_liquidity_usd_or_unknown",
     "jurisdiction_requirement",
     "fee_bps_per_side_or_unknown",
@@ -98,10 +104,12 @@ ROUTE_REQUIREMENT_FIELDS = (
 # as ``unknown`` and does not remove the opportunity from paper observation.
 ROUTE_REQUIREMENT_CHECKLIST_FIELDS = (
     "broker_permissions",
+    "shortability",
     "borrow_availability",
     "fees",
     "margin",
     "api_coverage",
+    "order_type_support",
 )
 
 _PRIORITY_SPOT_BORROW_INST_IDS = (
@@ -1283,6 +1291,25 @@ def build_candidate_route_requirement_summary(
     borrow_asset = facts.get("borrow_asset", UNKNOWN)
     if borrow_required and borrow_asset in (None, "", "not_applicable", UNKNOWN):
         borrow_asset = _borrow_asset(str(facts.get("inst_id") or source.get("inst_id") or ""))
+    short_required = "short" in str(facts.get("direction", source.get("direction", ""))).lower() or borrow_required
+    shortability = facts.get("shortability_status")
+    if shortability in (None, ""):
+        shortability = _shortability_status(source, short_required=short_required)
+    order_type_support = facts.get("order_type_support")
+    if not isinstance(order_type_support, dict):
+        order_type_support = _order_type_support(source)
+    margin_spot_constraints = facts.get("margin_spot_constraints")
+    if not isinstance(margin_spot_constraints, dict):
+        margin_spot_constraints = {
+            "margin_required": facts.get("margin_required", _first_known(source, "margin_required")),
+            "margin_mode": margin_mode,
+            "spot_leg_required": "spot" in str(facts.get("direction", source.get("direction", ""))).lower(),
+        }
+    fee_tier = facts.get(
+        "fee_tier",
+        _first_known(source, "fee_tier", "fee_tier_name", "maker_taker_fee_tier", "fee_class", "fee_model"),
+    )
+    api_permission_status = facts.get("api_permission_status", api_status)
 
     return {
         "summary_version": "paper_route_requirement_summary_v1",
@@ -1305,6 +1332,7 @@ def build_candidate_route_requirement_summary(
         },
         "short_borrow_availability": {
             "short_required": borrow_required,
+            "shortability_status": shortability,
             "borrow_required": borrow_required,
             "borrow_asset": borrow_asset,
             "availability_status": borrow_status,
@@ -1313,8 +1341,10 @@ def build_candidate_route_requirement_summary(
         "margin_mode": {
             "required": facts.get("margin_required", _first_known(source, "margin_required")),
             "mode": margin_mode,
+            "spot_constraints": margin_spot_constraints,
         },
         "fee_estimate": {
+            "fee_tier": fee_tier,
             "maker_bps": maker_fee,
             "taker_bps": taker_fee,
             "estimated_round_trip_taker_bps": round_trip_taker_fee,
@@ -1322,10 +1352,11 @@ def build_candidate_route_requirement_summary(
         },
         "api_entitlement": {
             "venue_api_requirement": facts.get("venue_api_requirement", UNKNOWN),
-            "entitlement_status": api_status,
+            "entitlement_status": api_permission_status,
             "path_readiness": facts.get("api_path_readiness", UNKNOWN),
             "endpoint_constraints": facts.get("endpoint_constraints", UNKNOWN),
         },
+        "order_type_support": order_type_support,
         "freshness": {
             "status": freshness_status,
             "state": _first_known(source, "freshness_state", "data_freshness_state"),
@@ -1886,6 +1917,20 @@ def _route_requirement_checklist(
         )
     )
     fees_modeled = operational_checklist.get("fees_modeled", UNKNOWN)
+    short_required = "short" in str(opportunity.get("direction") or "").lower() or borrow_required
+    shortability = _shortability_status(opportunity, short_required=short_required)
+    order_type_support = _order_type_support(opportunity)
+
+    shortability_satisfied = (
+        True if shortability in {"available", "confirmed", "supported"}
+        else False if shortability in {"unavailable", "unsupported", "missing", "blocked"}
+        else None
+    )
+    order_type_satisfied = (
+        True if order_type_support["status"] == "supported"
+        else False if order_type_support["status"] == "unsupported"
+        else None
+    )
 
     def entry(*, required: bool, status: str, value: Any) -> dict[str, Any]:
         return {
@@ -1900,6 +1945,14 @@ def _route_requirement_checklist(
             required=True,
             status=_requirement_check_status(required=True, satisfied=broker_permissions_confirmed),
             value=_route_required_permissions(opportunity, blockers),
+        ),
+        "shortability": entry(
+            required=short_required,
+            status=_requirement_check_status(
+                required=short_required,
+                satisfied=shortability_satisfied,
+            ),
+            value=shortability,
         ),
         "borrow_availability": entry(
             required=borrow_required,
@@ -1931,6 +1984,14 @@ def _route_requirement_checklist(
                 "endpoint_constraints",
                 "api_access_status",
             ),
+        ),
+        "order_type_support": entry(
+            required=bool(order_type_support["required_order_types"] != [UNKNOWN]),
+            status=_requirement_check_status(
+                required=bool(order_type_support["required_order_types"] != [UNKNOWN]),
+                satisfied=order_type_satisfied,
+            ),
+            value=order_type_support,
         ),
     }
 
@@ -2627,6 +2688,32 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
     paper_proxy_route = _paper_proxy_route(opportunity, blockers=blockers)
     paper_feasibility = _paper_feasibility(opportunity, blockers=blockers, paper_proxy_route=paper_proxy_route)
     route_cost_bps_paper, route_cost_reason_codes = _paper_route_cost_bps(opportunity, blockers=blockers, paper_proxy_route=paper_proxy_route)
+    short_required = "short" in str(opportunity.get("direction") or "").lower() or borrow_required
+    shortability = _shortability_status(opportunity, short_required=short_required)
+    margin_required = _margin_required(opportunity, borrow_required)
+    margin_mode = _first_known(
+        opportunity,
+        "margin_mode",
+        "margin_account_mode",
+        "leverage_mode",
+    )
+    fee_tier = _first_known(
+        opportunity,
+        "fee_tier",
+        "fee_tier_name",
+        "maker_taker_fee_tier",
+        "fee_class",
+        "fee_model",
+        "fee_model_status",
+    )
+    api_permission_status = _first_known(
+        opportunity,
+        "api_permission_status",
+        "api_access_status",
+        "venue_api_status",
+        "endpoint_status",
+    )
+    order_type_support = _order_type_support(opportunity)
 
     return {
         "venue": venue,
@@ -2636,6 +2723,7 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
         "route_blockers": blockers,
         "required_account_type": "; ".join(account_requirements) if account_requirements else UNKNOWN,
         "required_permissions": _route_required_permissions(opportunity, requirement_flags),
+        "shortability_status": shortability,
         "borrow_required": borrow_required,
         "borrow_asset": _borrow_asset(inst_id) if borrow_required else "not_applicable",
         "borrow_fee_bps_estimate_or_unknown": _first_known(
@@ -2644,9 +2732,27 @@ def _build_route_requirement_row(opportunity: dict[str, Any]) -> dict[str, Any]:
             "borrow_fee_bps_estimate",
             "borrow_fee_bps",
         ),
-        "margin_required": _margin_required(opportunity, borrow_required),
+        "margin_required": margin_required,
+        "margin_spot_constraints": {
+            "margin_required": margin_required,
+            "margin_mode": margin_mode,
+            "spot_leg_required": "spot" in str(opportunity.get("direction") or "").lower()
+            or "spot" in route_type.lower(),
+            "required_account_modes": _string_list(
+                _first_known(
+                    opportunity,
+                    "paper_route_required_account_modes",
+                    "required_account_modes",
+                )
+            )
+            or [UNKNOWN],
+        },
+        "fee_tier": fee_tier,
+        "fee_tier_status": "observed" if fee_tier != UNKNOWN else UNKNOWN,
         "venue_api_requirement": _venue_api_requirement(blockers),
+        "api_permission_status": api_permission_status,
         "endpoint_constraints": _endpoint_constraints(opportunity, blockers),
+        "order_type_support": order_type_support,
         "jurisdiction_requirement": _jurisdiction_requirement(blockers),
         "fee_bps_per_side_or_unknown": _first_known(
             opportunity,
@@ -2793,6 +2899,111 @@ def _bool_flag(value: Any) -> bool | None:
     if text in {"0", "false", "no", "n", "unsupported", "blocked"}:
         return False
     return None
+
+
+def _shortability_status(
+    opportunity: dict[str, Any],
+    *,
+    short_required: bool,
+) -> str:
+    """Return observed shortability without treating it as an entry gate."""
+
+    value = _first_known(
+        opportunity,
+        "shortability_status",
+        "shortable_status",
+        "is_shortable",
+        "instrument_shortable",
+        "instrument_margin_shortable",
+        "spot_short_supported",
+        "supports_spot_short",
+    )
+    if value == UNKNOWN and isinstance(opportunity.get("venue_capabilities"), dict):
+        value = _first_known(
+            opportunity["venue_capabilities"],
+            "supports_spot_short",
+            "spot_short_supported",
+            "shortability",
+        )
+    return _route_fact_status(
+        value,
+        required=short_required,
+        unresolved=short_required,
+    )
+
+
+def _string_list(value: Any) -> list[str]:
+    """Normalize declared route metadata lists without inferring support."""
+
+    values = (value,) if isinstance(value, str) else (value or [])
+    result: list[str] = []
+    for item in values:
+        text = str(item or "").strip().lower()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _order_type_support(opportunity: dict[str, Any]) -> dict[str, Any]:
+    """Project declared order-type support from existing route metadata.
+
+    This is intentionally a report of configuration and public observations;
+    it never probes a private order API or implies permission to submit an
+    order.  Unknown support stays visible as a non-blocking paper diagnostic.
+    """
+
+    required = _string_list(
+        _first_known(
+            opportunity,
+            "required_order_types",
+            "required_order_type",
+            "route_required_order_types",
+        )
+    )
+    supported = _string_list(
+        _first_known(
+            opportunity,
+            "supported_order_types",
+            "order_types_supported",
+            "venue_order_types",
+            "order_type_supports",
+        )
+    )
+    capabilities = opportunity.get("venue_capabilities")
+    if not supported and isinstance(capabilities, dict):
+        supported = _string_list(
+            _first_known(
+                capabilities,
+                "supported_order_types",
+                "order_types_supported",
+                "venue_order_types",
+            )
+        )
+    explicit_status = _first_known(
+        opportunity,
+        "order_type_support_status",
+        "order_type_status",
+        "order_api_support_status",
+    )
+    if explicit_status != UNKNOWN:
+        status = _route_fact_status(explicit_status, required=bool(required), unresolved=bool(required))
+    elif not required:
+        status = "not_required_for_paper_report"
+    elif not supported:
+        status = "unconfirmed"
+    elif all(item in supported for item in required):
+        status = "supported"
+    else:
+        status = "unsupported"
+    return {
+        "status": status,
+        "required_order_types": required or [UNKNOWN],
+        "supported_order_types": supported or [UNKNOWN],
+        "source": "declared_route_metadata_only",
+        "private_api_probe_performed": False,
+        "paper_only": True,
+        "non_blocking": True,
+    }
 
 
 def _route_blockers(opportunity: dict[str, Any]) -> list[str]:
@@ -3067,7 +3278,14 @@ def _route_requirement_opportunity(opportunity: dict[str, Any]) -> dict[str, Any
         "margin_required",
         "margin_mode",
         "api_access_status",
+        "api_permission_status",
         "fee_model_status",
+        "fee_tier",
+        "required_order_types",
+        "required_order_type",
+        "supported_order_types",
+        "order_types_supported",
+        "order_type_support_status",
         "route_id",
     ):
         if normalized.get(key) in (None, "", [], {}):

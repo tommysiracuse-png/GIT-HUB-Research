@@ -3007,6 +3007,7 @@ def _route_requirements_intel_markdown(requirements_intel: dict) -> list[str]:
         "margin_mode",
         "fee_estimate",
         "api_entitlement",
+        "order_type_support",
         "freshness",
     )
     lines.extend(

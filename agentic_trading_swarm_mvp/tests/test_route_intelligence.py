@@ -364,6 +364,45 @@ class RouteIntelligenceTests(unittest.TestCase):
         self.assertEqual("fresh", summary["freshness"]["state"])
         self.assertEqual(4.0, summary["freshness"]["age_seconds"])
 
+    def test_candidate_report_exposes_short_fee_api_and_order_type_friction_metadata(self) -> None:
+        """Every paper candidate carries route facts without becoming an entry gate."""
+
+        opportunity = {
+            "venue": "TEST_VENUE",
+            "inst_id": "TEST_VENUE:ARC-USDT",
+            "direction": "long_perp_short_spot",
+            "route_status": "conditional",
+            "route_blockers": ["spot_borrow"],
+            "required_permissions": ["crypto_spot", "margin_spot", "spot_borrow"],
+            "shortability_status": True,
+            "borrow_available": True,
+            "margin_required": True,
+            "margin_mode": "isolated",
+            "fee_tier": "vip_1",
+            "maker_fee_bps": 1.0,
+            "taker_fee_bps": 3.0,
+            "api_permission_status": "trade_permission_unconfirmed",
+            "required_order_types": ["limit", "ioc"],
+            "supported_order_types": ["market", "limit", "ioc"],
+        }
+
+        row = build_route_requirements_matrix([opportunity])[0]
+        summary = build_candidate_route_requirement_summary(opportunity, row=row)
+
+        self.assertEqual("available", row["shortability_status"])
+        self.assertEqual("available", row["borrow_availability_status"])
+        self.assertEqual("isolated", row["margin_spot_constraints"]["margin_mode"])
+        self.assertEqual("vip_1", row["fee_tier"])
+        self.assertEqual("trade_permission_unconfirmed", row["api_permission_status"])
+        self.assertEqual("supported", row["order_type_support"]["status"])
+        self.assertEqual(["limit", "ioc"], row["order_type_support"]["required_order_types"])
+        self.assertEqual("available", summary["short_borrow_availability"]["shortability_status"])
+        self.assertEqual("vip_1", summary["fee_estimate"]["fee_tier"])
+        self.assertEqual("trade_permission_unconfirmed", summary["api_entitlement"]["entitlement_status"])
+        self.assertEqual("supported", summary["order_type_support"]["status"])
+        self.assertTrue(summary["candidate_remains_priceable"])
+        self.assertFalse(summary["routing_decision_changed"])
+
     def test_spot_borrow_routes_are_paper_only_prioritized_with_unknowns(self) -> None:
         rows = build_route_requirements_matrix(
             [
