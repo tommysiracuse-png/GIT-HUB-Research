@@ -116,6 +116,32 @@ class TestSelfImprovementCellScope(unittest.TestCase):
         self.assertIn("insufficient_direction_specific_closed_trades", gate["blockers"])
         self.assertIn("direction_specific_realized_edge_below_floor", gate["blockers"])
 
+    def test_sparse_cme_negative_evidence_defers_rollback_and_records_audit(self) -> None:
+        result = evaluate_paper_cell_policy(
+            {
+                "signal_key": "CME_GROUP|global_market_discovery_proxy|short_proxy|standard",
+                "signal_family": "global_market_discovery_proxy",
+                "venue": "CME_GROUP",
+                "direction": "short_proxy",
+                "paper_route_status": "standard",
+                "closed_count": 11,
+                "avg_pnl_bps": -6.613,
+                "win_rate": 0.545,
+            }
+        )
+
+        self.assertEqual(result["decision"], "probation")
+        self.assertEqual(result["action"], "retain_cell_probation")
+        audit = result["promotion_gate"]["negative_retention_audit"]
+        self.assertTrue(audit["negative_retention_signal"])
+        self.assertFalse(audit["negative_adjustment_evidence_floor_met"])
+        self.assertTrue(audit["negative_adjustment_deferred"])
+        self.assertEqual(audit["confidence_status"], "evidence_limited")
+        score = result["promotion_score_components"]
+        self.assertEqual(score["pre_sample_size_adjustment_bps"], -6.613)
+        self.assertEqual(score["post_sample_size_adjustment_bps"], -6.613)
+        self.assertEqual(score["confidence_status"], "evidence_limited")
+
     def test_short_discovery_proxy_promotes_after_stable_positive_edge(self) -> None:
         result = evaluate_paper_cell_policy(
             {
@@ -158,7 +184,35 @@ class TestSelfImprovementCellScope(unittest.TestCase):
         self.assertTrue(confidence["applies"])
         self.assertEqual(confidence["sample_confidence"], 0.6)
         self.assertGreater(confidence["confidence_penalty_bps"], 0.0)
+        self.assertEqual(confidence["raw_confidence_penalty_bps"], confidence["confidence_penalty_bps"])
         self.assertIn(
+            "conditional_frontier_short_promotion_confidence_below_floor",
+            result["promotion_gate"]["blockers"],
+        )
+
+    def test_sparse_conditional_sample_downgrades_confidence_without_penalty_or_hard_failure(self) -> None:
+        result = evaluate_paper_cell_policy(
+            {
+                "signal_key": "BITGET|frontier_crypto_venue_map|short_frontier_spot|conditional",
+                "signal_family": "frontier_crypto_venue_map",
+                "trade_type": "conditional",
+                "venue": "BITGET",
+                "direction": "short_frontier_spot",
+                "paper_route_status": "executable",
+                "closed_count": 5,
+                "avg_pnl_bps": -8.0,
+                "avg_pnl_cost_basis": "after_cost",
+                "win_rate": 0.40,
+            }
+        )
+
+        self.assertEqual(result["decision"], "probation")
+        confidence = result["promotion_gate"]["promotion_confidence"]
+        self.assertEqual(confidence["confidence_status"], "evidence_limited")
+        self.assertGreater(confidence["raw_confidence_penalty_bps"], 0.0)
+        self.assertEqual(confidence["confidence_penalty_bps"], 0.0)
+        self.assertTrue(confidence["confidence_penalty_deferred"])
+        self.assertNotIn(
             "conditional_frontier_short_promotion_confidence_below_floor",
             result["promotion_gate"]["blockers"],
         )

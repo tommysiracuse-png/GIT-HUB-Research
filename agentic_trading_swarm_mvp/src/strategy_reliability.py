@@ -1102,6 +1102,7 @@ def _paper_cell_promotion_confidence_review(
     closed_count: int,
     settings: dict[str, Any],
     asymmetric_direction_reasons: list[str],
+    negative_adjustment_evidence_floor: int,
 ) -> dict[str, Any]:
     """Measure conditional-frontier-short sample confidence for promotion only.
 
@@ -1132,12 +1133,30 @@ def _paper_cell_promotion_confidence_review(
         _as_float(settings.get("conditional_frontier_short_confidence_penalty_bps"), 2.0),
     )
     sample_confidence = min(1.0, max(0.0, closed_count / target_closed_trades))
+    raw_penalty_bps = max_penalty_bps * (1.0 - sample_confidence)
+    evidence_floor_met = closed_count >= negative_adjustment_evidence_floor
+    # A sparse outcome set can lower confidence, but it must not impose a
+    # score penalty that makes a paper cell look conclusively weak.  The
+    # regular promotion minimum still keeps the cell in probation until it
+    # has enough observations.
+    applied_penalty_bps = raw_penalty_bps if evidence_floor_met else 0.0
     return {
         "applies": True,
         "sample_confidence": round(sample_confidence, 3),
         "minimum_confidence": minimum_confidence,
         "target_closed_trades": target_closed_trades,
-        "confidence_penalty_bps": round(max_penalty_bps * (1.0 - sample_confidence), 3),
+        "negative_adjustment_evidence_floor": negative_adjustment_evidence_floor,
+        "negative_adjustment_evidence_floor_met": evidence_floor_met,
+        "raw_confidence_penalty_bps": round(raw_penalty_bps, 3),
+        "confidence_penalty_bps": round(applied_penalty_bps, 3),
+        "confidence_penalty_deferred": bool(raw_penalty_bps and not evidence_floor_met),
+        "confidence_status": (
+            "confirmed"
+            if sample_confidence >= minimum_confidence
+            else "evidence_limited"
+            if not evidence_floor_met
+            else "developing"
+        ),
     }
 
 
@@ -1275,15 +1294,54 @@ def evaluate_paper_cell_policy(
             promote_min_avg_pnl_bps,
             max(1.0, _as_float(settings.get("conditional_frontier_short_min_avg_pnl_bps"), 1.0)),
         )
+    # Discovery and conditional-frontier cells already need this many closed
+    # paper outcomes before promotion.  Use the same floor before applying a
+    # strong negative retention decision so a small, noisy cohort remains
+    # observable.  Keep the legacy generic short-proxy probation-expiry
+    # behavior unchanged.
+    negative_adjustment_evidence_applies = any(
+        reason in {"short_discovery", "conditional_frontier_short"}
+        for reason in asymmetric_direction_reasons
+    )
+    negative_adjustment_evidence_floor = (
+        promotion_min_closed_trades if negative_adjustment_evidence_applies else 0
+    )
+    negative_adjustment_evidence_floor_met = closed_count >= negative_adjustment_evidence_floor
+    evidence_confidence = (
+        min(1.0, closed_count / negative_adjustment_evidence_floor)
+        if negative_adjustment_evidence_floor
+        else 1.0
+    )
     promotion_confidence = _paper_cell_promotion_confidence_review(
         closed_count,
         settings,
         asymmetric_direction_reasons,
+        negative_adjustment_evidence_floor,
     )
     promotion_avg_pnl_bps = avg_pnl_bps - _as_float(
         promotion_confidence.get("confidence_penalty_bps"),
         0.0,
     )
+    score_components = {
+        "pre_sample_size_adjustment_bps": round(avg_pnl_bps, 3),
+        "raw_sample_size_penalty_bps": _as_float(
+            promotion_confidence.get("raw_confidence_penalty_bps"), 0.0
+        ),
+        "applied_sample_size_penalty_bps": _as_float(
+            promotion_confidence.get("confidence_penalty_bps"), 0.0
+        ),
+        "post_sample_size_adjustment_bps": round(promotion_avg_pnl_bps, 3),
+        "negative_adjustment_evidence_floor": negative_adjustment_evidence_floor,
+        "negative_adjustment_evidence_floor_met": negative_adjustment_evidence_floor_met,
+        "evidence_confidence": round(evidence_confidence, 3),
+        "confidence_status": (
+            promotion_confidence.get("confidence_status", "confirmed")
+            if promotion_confidence["applies"]
+            else "evidence_limited"
+            if not negative_adjustment_evidence_floor_met
+            else "confirmed"
+        ),
+    }
 
     promotion_blockers = []
     if closed_count < promotion_min_closed_trades:
@@ -1294,7 +1352,7 @@ def evaluate_paper_cell_policy(
         )
     if promotion_confidence["applies"] and (
         promotion_confidence["sample_confidence"] < promotion_confidence["minimum_confidence"]
-    ):
+    ) and negative_adjustment_evidence_floor_met:
         promotion_blockers.append("conditional_frontier_short_promotion_confidence_below_floor")
     if promotion_avg_pnl_bps < promote_min_avg_pnl_bps:
         promotion_blockers.append(
@@ -1318,7 +1376,32 @@ def evaluate_paper_cell_policy(
     if portability is not None and not portability["promotion_eligible"]:
         promotion_blockers.append(portability["reason"])
 
-    if closed_count >= min_closed_trades and avg_pnl_bps <= revert_avg_pnl_bps:
+    negative_retention_signal = avg_pnl_bps <= revert_avg_pnl_bps
+    probation_negative_signal = (
+        probation_expired and avg_pnl_bps < 0.0 and prior_state in {"probation", "new"}
+    )
+    negative_retention_deferred = bool(
+        not negative_adjustment_evidence_floor_met
+        and (negative_retention_signal or probation_negative_signal)
+    )
+    retention_audit = {
+        "pre_adjustment_avg_pnl_bps": round(avg_pnl_bps, 3),
+        "revert_avg_pnl_bps": revert_avg_pnl_bps,
+        "negative_retention_signal": negative_retention_signal,
+        "probation_negative_signal": probation_negative_signal,
+        "negative_adjustment_evidence_floor": negative_adjustment_evidence_floor,
+        "negative_adjustment_evidence_floor_met": negative_adjustment_evidence_floor_met,
+        "evidence_confidence": round(evidence_confidence, 3),
+        "confidence_status": score_components["confidence_status"],
+        "negative_adjustment_deferred": negative_retention_deferred,
+        "post_adjustment_decision": "probation" if negative_retention_deferred else None,
+    }
+
+    if (
+        closed_count >= min_closed_trades
+        and negative_retention_signal
+        and negative_adjustment_evidence_floor_met
+    ):
         decision = "reverted"
         action = "rollback_cell"
     elif (
@@ -1329,7 +1412,7 @@ def evaluate_paper_cell_policy(
     ):
         decision = "promoted"
         action = "promote_cell"
-    elif probation_expired and avg_pnl_bps < 0.0 and prior_state in {"probation", "new"}:
+    elif probation_negative_signal and negative_adjustment_evidence_floor_met:
         decision = "reverted"
         action = "rollback_cell"
     else:
@@ -1345,6 +1428,7 @@ def evaluate_paper_cell_policy(
         "closed_count": closed_count,
         "avg_pnl_bps": avg_pnl_bps,
         "promotion_avg_pnl_bps": promotion_avg_pnl_bps,
+        "promotion_score_components": score_components,
         "reported_avg_pnl_bps": reported_avg_pnl_bps,
         "win_rate": None if win_rate is None or win_rate < 0.0 else win_rate,
         "prior_state": prior_state,
@@ -1358,6 +1442,8 @@ def evaluate_paper_cell_policy(
             "min_avg_pnl_bps": promote_min_avg_pnl_bps,
             "min_win_rate": promote_min_win_rate,
             "promotion_confidence": promotion_confidence,
+            "promotion_score_components": score_components,
+            "negative_retention_audit": retention_audit,
             "blockers": promotion_blockers,
             "quality_audit": quality_audit,
             "realized_cost_audit": cost_audit,
