@@ -40,7 +40,12 @@ from adapters.venues.bank_of_canada import (
     BankOfCanadaRegularTreasuryBillsAdapter,
     parse_bank_of_canada_treasury_bill_auctions,
 )
-from adapters.venues.bursa_derivatives import contract_observations
+from adapters.venues.bursa_derivatives import (
+    SOURCE_URL as BURSA_DERIVATIVES_SOURCE_URL,
+    BursaMalaysiaDerivativesBerhadAdapter,
+    contract_observations,
+    parse_bursa_derivatives_contract_catalog,
+)
 from adapters.venues.casablanca_stock_exchange_futures_market import (
     SOURCE_URL as CASABLANCA_FUTURES_SOURCE_URL,
     CasablancaStockExchangeFuturesMarketAdapter,
@@ -366,6 +371,114 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertIn("stop_out_yield", adapter.info.capabilities)
         self.assertIn("award_size", adapter.info.capabilities)
         self.assertNotIn("candidate_generation", adapter.info.capabilities)
+
+    def test_bursa_derivatives_parser_normalizes_published_contract_catalog(self) -> None:
+        document = """
+        <html><body>
+          <h1>Rules of Bursa Malaysia Derivatives Berhad</h1>
+          <h2>Schedule 1 Commodity Contracts</h2>
+          <p>FCPO Crude Palm Oil Futures Contract</p>
+          <h2>Schedule 2 Equity Contracts</h2>
+          <p>FKLI FTSE Bursa Malaysia KLCI Futures Contract</p>
+          <p>OKLI Option on FTSE Bursa Malaysia KLCI Futures</p>
+          <p>FM70 Mini FTSE Bursa Malaysia Mid 70 Index Futures Contract</p>
+          <p>F4GM FTSE4Good Bursa Malaysia Index Futures Contract</p>
+          <p>FMG5 Mini Gold Futures Contract</p>
+        </body></html>
+        """
+        rows = parse_bursa_derivatives_contract_catalog(
+            document,
+            received_at="2026-08-04T05:30:00+00:00",
+        )
+
+        self.assertEqual({"FCPO", "FKLI", "OKLI", "FM70", "F4GM", "FMG5"}, {row["symbol"] for row in rows})
+        fcpo = next(row for row in rows if row["symbol"] == "FCPO")
+        okli = next(row for row in rows if row["symbol"] == "OKLI")
+        self.assertEqual("BURSA_MALAYSIA_DERIVATIVES:FCPO", fcpo["inst_id"])
+        self.assertEqual("commodity_futures", fcpo["asset_class"])
+        self.assertEqual("options_catalog", okli["market_type"])
+        self.assertEqual("reference_only", fcpo["session_status"])
+        self.assertEqual("fresh", fcpo["freshness_state"])
+        self.assertEqual(BURSA_DERIVATIVES_SOURCE_URL, fcpo["source_url"])
+        self.assertEqual("watch_only", fcpo["direction"])
+        self.assertEqual(0.0, fcpo["last"])
+
+    def test_bursa_derivatives_runtime_emits_catalog_observations_for_reachable_source(self) -> None:
+        document = b"""
+        Rules of Bursa Malaysia Derivatives Berhad
+        FCPO FKLI OKLI FM70 F4GM FMG5
+        """
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "content": document,
+            "received_at": "2026-08-04T05:30:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch("adapters.venues.bursa_derivatives.fetch_bytes", return_value=result):
+            batch = BursaMalaysiaDerivativesBerhadAdapter().scan({})
+
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["rules"]["fetch_status"])
+        self.assertEqual("fresh", batch.metadata["freshness_state"])
+        self.assertEqual("reference_only", batch.metadata["session_state"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertEqual(6, len(batch.observations))
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        self.assertTrue(all(row["last"] == 0.0 for row in batch.observations))
+
+    def test_bursa_derivatives_plugin_is_discoverable_and_preserves_failures(self) -> None:
+        adapter_id = "bursa_derivatives_contract_catalog"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsInstance(adapter, BursaMalaysiaDerivativesBerhadAdapter)
+        self.assertEqual(BURSA_DERIVATIVES_SOURCE_URL, adapter.info.docs_url)
+        self.assertIn("settlement_reference", adapter.info.capabilities)
+
+        reachable_result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "content": b"Rules of Bursa Malaysia Derivatives Berhad replacement document",
+            "received_at": "2026-08-04T05:30:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.bursa_derivatives.fetch_bytes", return_value=reachable_result
+        ):
+            parser_batch = BursaMalaysiaDerivativesBerhadAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual("reachable", parser_batch.metadata["fetch_status"]["rules"]["fetch_status"])
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual("watch_only", parser_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_bursa_derivatives_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+
+        unavailable_result = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "error": "blocked",
+            "content": b"",
+            "received_at": "2026-08-04T05:31:00+00:00",
+            "latency_ms": 5.0,
+        }
+        with mock.patch(
+            "adapters.venues.bursa_derivatives.fetch_bytes", return_value=unavailable_result
+        ):
+            unavailable_batch = BursaMalaysiaDerivativesBerhadAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("unknown", unavailable_batch.metadata["freshness_state"])
+        self.assertEqual("unknown", unavailable_batch.metadata["session_state"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_bursa_derivatives_source_unavailable",
+            unavailable_batch.observations[0]["candidate_reject_reason"],
+        )
 
     def test_bank_of_canada_tbill_parser_normalizes_calls_and_results(self) -> None:
         payload = {
