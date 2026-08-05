@@ -33,6 +33,13 @@ from adapters.venues.b3 import (
     B3PublicDataHubAdapter,
     parse_b3_public_data_hub,
 )
+from adapters.venues.aib_eex_france import (
+    EEX_CPB_PAGE_URL,
+    SOURCE_URL as AIB_EEX_FRANCE_SOURCE_URL,
+    AibEexFranceBiomethaneCpbAdapter,
+    parse_aib_eex_france_cpb_workbook,
+    parse_aib_eex_france_cpb_reporting,
+)
 from adapters.venues.bahrain_cross_listings import cross_listing_observations
 from adapters.venues.bank_of_canada import (
     API_URL as BANK_OF_CANADA_TBILL_API_URL,
@@ -303,6 +310,67 @@ def _eex_uka_contract_fixture() -> str:
       </table>
     </body></html>
     """
+
+
+def _aib_eex_france_cpb_protocol_fixture() -> str:
+    return """
+    Association of Issuing Bodies
+    EECS DOMAIN PROTOCOL FOR EEX - FRANCE
+    Date 21 January 2026
+    IV. NATIONAL BIOGAS CERTIFICATES
+    G. Activity Reporting
+    G.1 Public reports
+    EEX publishes on a monthly basis the list of CPBs which have been issued in
+    the registry. Data includes: the date of commissioning of the installation;
+    the quantity of biomethane, expressed in MWh, for which the certificate was
+    issued; the start and end dates of the injection period for the batch of
+    biomethane; and the date of issuance of the certificate. Furthermore, EEX
+    publishes on a monthly basis the average price at which these certificates
+    have been purchased or sold.
+    """
+
+
+def _aib_eex_france_cpb_workbook_fixture() -> bytes:
+    def sheet(rows: list[list[str]]) -> str:
+        cells = []
+        for row_index, values in enumerate(rows, 1):
+            row_cells = "".join(
+                f'<c r="{chr(65 + column)}{row_index}" t="inlineStr"><is><t>{value}</t></is></c>'
+                for column, value in enumerate(values)
+            )
+            cells.append(f'<row r="{row_index}">{row_cells}</row>')
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<sheetData>{"".join(cells)}</sheetData></worksheet>'
+        )
+
+    price_sheet = sheet(
+        [
+            ["Mois de publication", "Certificats 2025", "Certificats 2026"],
+            ["Janvier 2026", "/", "83,03 €"],
+            ["Février 2026", "/", "84,49 €"],
+        ]
+    )
+    issuance_sheet = sheet(
+        [
+            [
+                "Date d'émission",
+                "Volume des certificats",
+                "Unité",
+                "Volume en MWh",
+                "Date de début de production",
+                "Date de fin de production",
+                "Date de mise en service",
+            ],
+            ["46189", "7371", "CPB", "7371", "46113", "46142", "44916"],
+        ]
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("xl/worksheets/sheet1.xml", price_sheet)
+        archive.writestr("xl/worksheets/sheet2.xml", issuance_sheet)
+    return output.getvalue()
 
 
 class PublicAdapterParserTests(unittest.TestCase):
@@ -2462,6 +2530,106 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertIn("public_market_data_file", adapter.info.capabilities)
         self.assertNotIn("candidate_generation", adapter.info.capabilities)
 
+    def test_aib_eex_france_cpb_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "aib_eex_france_biomethane_cpb_public"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsInstance(adapter, AibEexFranceBiomethaneCpbAdapter)
+        self.assertEqual("AIB_EEX_FRANCE", adapter.info.venue)
+        self.assertEqual(AIB_EEX_FRANCE_SOURCE_URL, adapter.info.docs_url)
+        self.assertIn("monthly_issued_certificate_list", adapter.info.capabilities)
+        self.assertIn("monthly_average_transaction_price", adapter.info.capabilities)
+        self.assertNotIn("order_book", adapter.info.capabilities)
+
+    def test_aib_eex_france_cpb_protocol_parser_normalizes_monthly_reporting_surface(self) -> None:
+        rows = parse_aib_eex_france_cpb_reporting(
+            _aib_eex_france_cpb_protocol_fixture(),
+            received_at="2026-02-01T12:00:00+00:00",
+        )
+
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        self.assertEqual("AIB_EEX_FRANCE:CPB:MONTHLY_REPORTING", row["inst_id"])
+        self.assertEqual("france_biomethane_cpb_monthly_reporting", row["market_surface"])
+        self.assertTrue(row["monthly_issued_list_available"])
+        self.assertTrue(row["monthly_average_purchase_sale_price_available"])
+        self.assertEqual("2026-01-21", row["protocol_date"])
+        self.assertIsNone(row["reported_price"])
+        self.assertEqual("watch_only", row["direction"])
+        self.assertEqual(AIB_EEX_FRANCE_SOURCE_URL, row["source_url"])
+
+    def test_aib_eex_france_cpb_workbook_parser_normalizes_price_and_issuance_rows(self) -> None:
+        rows = parse_aib_eex_france_cpb_workbook(
+            _aib_eex_france_cpb_workbook_fixture(),
+            source_url="https://www.eex.com/fileadmin/WEB_CPBs_Janvier_2026.xlsx",
+            received_at="2026-02-15T12:00:00+00:00",
+        )
+        price = next(row for row in rows if row["trade_type"] == "official_monthly_average_transaction_price")
+        issuance = next(row for row in rows if row["trade_type"] == "official_monthly_issued_certificate_list")
+        self.assertEqual("AIB_EEX_FRANCE:CPB:AVERAGE_PRICE:2026:2026-01", price["inst_id"])
+        self.assertEqual(83.03, price["last"])
+        self.assertEqual("2026-01", price["reporting_month"])
+        self.assertEqual("2026-06-16", issuance["issuance_date"])
+        self.assertEqual(7371.0, issuance["issued_cpb_volume"])
+        self.assertEqual(7371.0, issuance["issued_biomethane_mwh"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in rows))
+
+    def test_aib_eex_france_cpb_adapter_preserves_fetch_and_parser_evidence(self) -> None:
+        publication_page = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": '<a href="/fileadmin/EEX/Downloads/Registry_Services/French_registry_for_Biogas_Production_Certificates/WEB_CPBs_Janvier_2026.xlsx">xlsx</a>',
+            "received_at": "2026-02-01T12:00:00+00:00",
+            "latency_ms": 3.0,
+        }
+        reachable = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "content": _aib_eex_france_cpb_workbook_fixture(),
+            "received_at": "2026-02-01T12:00:01+00:00",
+            "latency_ms": 3.0,
+            "content_type": "application/pdf",
+        }
+        with mock.patch("adapters.venues.aib_eex_france.fetch_text", return_value=publication_page), mock.patch(
+            "adapters.venues.aib_eex_france.fetch_bytes", return_value=reachable
+        ):
+            batch = AibEexFranceBiomethaneCpbAdapter().scan({})
+        self.assertEqual([], batch.candidates)
+        self.assertEqual(1512, batch.metadata["adapter_spec_id"])
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable", batch.metadata["fetch_status"]["cpb_publication_page"]["fetch_status"]
+        )
+        self.assertEqual(
+            "reachable", batch.metadata["fetch_status"]["cpb_issuance_price_workbook"]["fetch_status"]
+        )
+        self.assertEqual("monthly_reported", batch.metadata["session_state"])
+        self.assertEqual(3, batch.metadata["real_observation_count"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+
+        malformed = {**reachable, "content": b"not an xlsx"}
+        with mock.patch("adapters.venues.aib_eex_france.fetch_text", return_value=publication_page), mock.patch(
+            "adapters.venues.aib_eex_france.fetch_bytes", return_value=malformed
+        ):
+            parser_batch = AibEexFranceBiomethaneCpbAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual("reachable", parser_batch.metadata["fetch_status"]["cpb_issuance_price_workbook"]["fetch_status"])
+        self.assertEqual(
+            "public_cpb_reporting_protocol_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+
+        blocked = {**publication_page, "ok": False, "status": "blocked", "http_status": 403, "text": ""}
+        with mock.patch("adapters.venues.aib_eex_france.fetch_text", return_value=blocked):
+            unavailable_batch = AibEexFranceBiomethaneCpbAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual("blocked", unavailable_batch.observations[0]["fetch_status"])
+        self.assertEqual(EEX_CPB_PAGE_URL, unavailable_batch.observations[0]["source_url"])
+
     def test_eex_uka_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
         adapter_id = "eex_uka_futures_options_public"
         self.assertIn(adapter_id, discover_adapters())
@@ -3242,6 +3410,29 @@ class AdapterCapabilityTests(unittest.TestCase):
         self.assertIn("contract_catalog", match["available_capabilities"])
         self.assertNotIn("ticker", match["available_capabilities"])
         self.assertNotIn("order_book", match["available_capabilities"])
+
+    def test_aib_eex_france_cpb_adapter_closes_spec_1512_with_reporting_price_reference(self) -> None:
+        spec = {
+            "title": "Implement public adapter #1512: AIB / EEX France",
+            "market_key": "global_discovery|AIB / EEX France",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "AIB / EEX France",
+                    "public_docs_url": AIB_EEX_FRANCE_SOURCE_URL,
+                    "asset_or_event": (
+                        "France biomethane CPBs (certificats de production de biomethane) "
+                        "with monthly issued list and monthly average purchase/sale price"
+                    ),
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("aib_eex_france_biomethane_cpb_public", match["adapter_id"])
+        self.assertIn("monthly_average_transaction_price", match["available_capabilities"])
+        self.assertNotIn("entry_quality_quote", match["available_capabilities"])
 
     def test_casablanca_futures_adapter_closes_spec_956_without_entry_quote_claim(self) -> None:
         spec = {
