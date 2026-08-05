@@ -650,6 +650,19 @@ class FrontierModelPolicyTests(unittest.TestCase):
                 llm_swarm_runner.INBOX = old_inbox
                 llm_swarm_runner.RUNS_DIR = old_runs
 
+    def test_post_model_database_lock_preserves_generated_recommendations(self) -> None:
+        llm_swarm_runner.LAST_SWARM_STATE = {"ranked_actions": [{"title": "paid result"}]}
+        with mock.patch.object(
+            llm_swarm_runner,
+            "connect",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            llm_swarm_runner._record_post_model_state({}, "cycle:test", {"matched_agents": []})
+
+        deferred = llm_swarm_runner.LAST_SWARM_STATE["post_model_persistence"]
+        self.assertEqual("database_busy_retry_later", deferred["status"])
+        self.assertEqual([{"title": "paid result"}], llm_swarm_runner.LAST_SWARM_STATE["ranked_actions"])
+
 
 class LlmCostStorageTests(unittest.TestCase):
     def test_cost_summary_groups_by_model_and_operation(self) -> None:

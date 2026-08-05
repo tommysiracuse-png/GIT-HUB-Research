@@ -62,6 +62,27 @@ class EvolutionWorkerSeparationTests(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 evolution_worker._run_research_stage({})
 
+    def test_locked_swarm_database_degrades_without_crashing_worker(self) -> None:
+        with mock.patch.object(
+            evolution_worker,
+            "run_llm_swarm_once",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            recommendations, error = evolution_worker._run_swarm_stage({}, force=True)
+
+        self.assertEqual([], recommendations)
+        self.assertEqual("llm_swarm", error["stage"])
+        self.assertEqual("database_busy_retry_later", error["status"])
+
+    def test_non_lock_swarm_database_error_is_not_hidden(self) -> None:
+        with mock.patch.object(
+            evolution_worker,
+            "run_llm_swarm_once",
+            side_effect=sqlite3.OperationalError("malformed database schema"),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                evolution_worker._run_swarm_stage({})
+
     def test_recommendation_fetch_can_exclude_code_changes_for_radar(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

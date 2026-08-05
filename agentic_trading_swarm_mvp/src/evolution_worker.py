@@ -86,6 +86,22 @@ def _run_research_stage(settings: dict) -> tuple[dict, dict | None]:
         }
 
 
+def _run_swarm_stage(settings: dict, *, force: bool = False) -> tuple[list[dict], dict | None]:
+    """Defer a pre-model swarm lock without aborting the rest of the worker cycle."""
+
+    try:
+        return run_llm_swarm_once(settings=settings, force=force), None
+    except sqlite3.OperationalError as exc:
+        if not _database_locked(exc):
+            raise
+        return [], {
+            "status": "database_busy_retry_later",
+            "stage": "llm_swarm",
+            "attempts": 1,
+            "reason": str(exc),
+        }
+
+
 def _write_report(report: dict) -> dict:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_JSON.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
@@ -223,7 +239,7 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         "run_every_evolution_cycle", True
     ):
         research_worker_report, research_error = _run_research_stage(worker_settings)
-    llm_swarm_generated = run_llm_swarm_once(settings=settings, force=force_swarm)
+    llm_swarm_generated, swarm_error = _run_swarm_stage(settings, force=force_swarm)
     newly_ingested, new_ingest_error = _run_db_stage(
         "ingest_new_llm_recommendations",
         lambda conn: ingest_llm_recommendations(conn, settings),
@@ -248,6 +264,7 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
             builder_error,
             scheduler_error,
             research_error,
+            swarm_error,
             new_ingest_error,
             cost_error,
             inbox_error,

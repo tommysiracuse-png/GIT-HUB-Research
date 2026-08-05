@@ -1439,6 +1439,43 @@ def mark_auto_run() -> None:
     (RUNS_DIR / "llm_swarm_last_run.txt").write_text(dt.datetime.now(dt.timezone.utc).isoformat(), encoding="utf-8")
 
 
+def _database_locked(exc: BaseException) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def _record_post_model_state(settings: dict, cycle_id: str, dynamic_cycle: dict) -> None:
+    """Persist swarm bookkeeping when possible without discarding paid model output."""
+
+    global LAST_SWARM_STATE
+    try:
+        with connect() as conn:
+            reflection = reflect_swarm(conn, LAST_SWARM_STATE, cycle_id, settings)
+            dynamic_run_report = record_dynamic_agent_runs(conn, LAST_SWARM_STATE, dynamic_cycle, cycle_id)
+            dynamic_summary = write_dynamic_agent_reports(conn, settings)
+            graphiti = sync_graphiti(conn, settings)
+            write_memory_exports(conn, settings)
+    except sqlite3.OperationalError as exc:
+        if not _database_locked(exc):
+            raise
+        deferred = {
+            "status": "database_busy_retry_later",
+            "stage": "post_model_persistence",
+            "reason": str(exc),
+        }
+        LAST_SWARM_STATE["memory_reflection"] = deferred
+        LAST_SWARM_STATE["dynamic_agent_cycle"] = {
+            **dynamic_cycle,
+            "run_recording": deferred,
+        }
+        LAST_SWARM_STATE["dynamic_agents"] = deferred
+        LAST_SWARM_STATE["post_model_persistence"] = deferred
+        return
+    LAST_SWARM_STATE["memory_reflection"] = {**reflection, "graphiti": graphiti}
+    LAST_SWARM_STATE["dynamic_agent_cycle"] = {**dynamic_cycle, "run_recording": dynamic_run_report}
+    LAST_SWARM_STATE["dynamic_agents"] = dynamic_summary
+    LAST_SWARM_STATE["post_model_persistence"] = {"status": "recorded"}
+
+
 def run_once(settings: dict | None = None, force: bool = False) -> list[dict]:
     global LAST_SWARM_STATE
     settings = settings or load_settings()
@@ -1481,15 +1518,7 @@ def run_once(settings: dict | None = None, force: bool = False) -> list[dict]:
         dynamic_agents=dynamic_agents,
         dynamic_cycle=dynamic_cycle,
     )
-    with connect() as conn:
-        reflection = reflect_swarm(conn, LAST_SWARM_STATE, cycle_id, settings)
-        dynamic_run_report = record_dynamic_agent_runs(conn, LAST_SWARM_STATE, dynamic_cycle, cycle_id)
-        dynamic_summary = write_dynamic_agent_reports(conn, settings)
-        graphiti = sync_graphiti(conn, settings)
-        write_memory_exports(conn, settings)
-    LAST_SWARM_STATE["memory_reflection"] = {**reflection, "graphiti": graphiti}
-    LAST_SWARM_STATE["dynamic_agent_cycle"] = {**dynamic_cycle, "run_recording": dynamic_run_report}
-    LAST_SWARM_STATE["dynamic_agents"] = dynamic_summary
+    _record_post_model_state(settings, cycle_id, dynamic_cycle)
     write_recommendations(
         recommendations,
         int(settings.get("llm_swarm", {}).get("max_recommendations_per_run", 10)),
