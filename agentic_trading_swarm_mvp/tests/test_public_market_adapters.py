@@ -122,6 +122,11 @@ from adapters.venues.kalshi import (
     parse_kalshi_markets,
     parse_kalshi_order_book,
 )
+from adapters.venues.ministry_of_finance_uae_federal_debt_management_office import (
+    SOURCE_URL as UAE_MOF_ISSUANCE_PROGRAMME_URL,
+    MinistryOfFinanceUaeFederalDebtManagementOfficeAdapter,
+    parse_uae_federal_debt_issuance_programme,
+)
 from adapters.venues.norwegian_block_exchange_nbx import (
     DOCS_URL as NBX_DOCS_URL,
     NorwegianBlockExchangeNbxAdapter,
@@ -2796,6 +2801,151 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
             unavailable_batch.observations[0]["candidate_reject_reason"],
         )
 
+    def test_uae_mof_issuance_programme_parser_normalizes_t_bonds_and_t_sukuk(self) -> None:
+        document = """
+        <html><body><h1>Issuance Programme</h1>
+        <h2>Institutional Issuance Calendar - Year 2026</h2>
+        <table>
+          <tr><th>Security Type</th><th>ISIN</th><th>Maturity Date</th>
+              <th>Total Outstanding Domestic Debt (As of 31st December 2025)</th>
+              <th>27th Jan</th><th>17th Feb</th><th>Total AED Issuances for Year 2026</th>
+              <th>Institutional Redemptions in 2026</th>
+              <th>Total Outstanding Institutional Domestic Debt (As of 29th July 2026)</th>
+              <th>Total Outstanding Institutional Domestic Debt (As of 31st December 2026)</th></tr>
+          <tr><td>T-Bonds</td><td>AED01089C228</td><td>14 Sep 2027</td><td>2,050</td>
+              <td>550</td><td>â€“</td><td>550</td><td>â€“</td><td>2,600</td><td>2,600</td></tr>
+          <tr><td>T-Sukuk</td><td>AED01283C235</td><td>24 Aug 2028</td><td>4,400</td>
+              <td>â€“</td><td>550</td><td>550</td><td>â€“</td><td>4,950</td><td>4,950</td></tr>
+        </table>
+        <h2>Retail Issuance Calendar - Year 2026</h2>
+        <table>
+          <tr><th>Security Type</th><th>ISIN</th><th>Maturity Date</th>
+              <th>Total Outstanding Domestic Debt</th><th>July</th><th>Aug</th>
+              <th>Total AED Issuances for Year 2026</th><th>Retail Redemptions in 2026</th>
+              <th>Total Outstanding Retail Domestic Debt</th><th>Total Outstanding Retail Domestic Debt</th></tr>
+          <tr><td>T-Sukuk</td><td>TBA</td><td>1 July 2028</td><td>â€“</td>
+              <td>100</td><td>â€“</td><td>100</td><td>â€“</td><td>100</td><td>100</td></tr>
+        </table></body></html>
+        """
+        rows = parse_uae_federal_debt_issuance_programme(
+            document, received_at="2026-08-04T16:30:00+00:00"
+        )
+
+        self.assertEqual(3, len(rows))
+        bond = rows[0]
+        self.assertEqual("UAE_MOF_FDMO:T_BONDS:AED01089C228", bond["inst_id"])
+        self.assertEqual("AED01089C228", bond["isin"])
+        self.assertEqual("14 Sep 2027", bond["maturity_date"])
+        self.assertEqual("2027-09-14", bond["maturity_date_iso"])
+        self.assertEqual(2600.0, bond["total_outstanding_domestic_debt_millions_aed"])
+        self.assertEqual("27th Jan", bond["scheduled_issuance_tranches"][0]["auction_label"])
+        self.assertEqual("official_issuance_calendar_reference", bond["quality_status"])
+        self.assertEqual("watch_only", bond["direction"])
+        self.assertEqual("retail", rows[-1]["calendar_segment"])
+        self.assertEqual("TBA", rows[-1]["isin"])
+
+    def test_uae_mof_plugin_is_runtime_discoverable_and_preserves_failures(self) -> None:
+        adapter_id = "ministry_of_finance_uae_federal_debt_management_office"
+        self.assertIn(adapter_id, discover_adapters())
+        discovered = get_adapter(adapter_id)
+        self.assertIsInstance(discovered, MinistryOfFinanceUaeFederalDebtManagementOfficeAdapter)
+        self.assertEqual(UAE_MOF_ISSUANCE_PROGRAMME_URL, discovered.info.docs_url)
+        self.assertIn("outstanding_debt_reference", discovered.info.capabilities)
+
+        reachable = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>Issuance Programme</body></html>",
+            "received_at": "2026-08-04T16:30:00+00:00",
+            "latency_ms": 5.0,
+        }
+        with mock.patch(
+            "adapters.venues.ministry_of_finance_uae_federal_debt_management_office.fetch_text",
+            return_value=reachable,
+        ):
+            parser_batch = MinistryOfFinanceUaeFederalDebtManagementOfficeAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable", parser_batch.metadata["fetch_status"]["issuance_programme"]["fetch_status"]
+        )
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual("watch_only", parser_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_issuance_calendar_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+
+        unavailable = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "error": "blocked",
+            "text": "",
+            "received_at": "2026-08-04T16:31:00+00:00",
+            "latency_ms": 7.0,
+        }
+        with mock.patch(
+            "adapters.venues.ministry_of_finance_uae_federal_debt_management_office.fetch_text",
+            return_value=unavailable,
+        ):
+            unavailable_batch = MinistryOfFinanceUaeFederalDebtManagementOfficeAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("unknown", unavailable_batch.metadata["freshness_state"])
+        self.assertEqual("unknown", unavailable_batch.metadata["session_state"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+
+    def test_uae_mof_plugin_is_auto_discovered_by_adapter_runtime(self) -> None:
+        adapter_id = "ministry_of_finance_uae_federal_debt_management_office"
+        document = """
+        <html><body><h1>Issuance Programme</h1><p>Issuance Calendar - Year 2026</p>
+        <table><tr><th>Security Type</th><th>ISIN</th><th>Maturity Date</th>
+        <th>Total Outstanding Domestic Debt</th><th>27th Jan</th>
+        <th>Total AED Issuances for Year 2026</th><th>Redemptions</th>
+        <th>Total Outstanding Domestic Debt</th><th>Total Outstanding Domestic Debt</th></tr>
+        <tr><td>T-Bonds</td><td>AED01089C228</td><td>14 Sep 2027</td><td>2,050</td>
+        <td>550</td><td>550</td><td>â€“</td><td>2,600</td><td>2,600</td></tr></table>
+        </body></html>
+        """
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": document,
+            "received_at": "2026-08-04T16:30:00+00:00",
+            "latency_ms": 4.0,
+        }
+        original_discover = adapter_runtime.discover_adapters
+
+        def discover_only_uae() -> list[str]:
+            return [adapter_id for adapter_id in original_discover() if adapter_id == "ministry_of_finance_uae_federal_debt_management_office"]
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "adapters.venues.ministry_of_finance_uae_federal_debt_management_office.fetch_text",
+            return_value=result,
+        ), mock.patch.object(adapter_runtime, "RUNS_DIR", pathlib.Path(tmp)), mock.patch.object(
+            adapter_runtime, "CACHE_DIR", pathlib.Path(tmp) / "cache"
+        ), mock.patch.object(adapter_runtime, "REPORT_JSON", pathlib.Path(tmp) / "report.json"), mock.patch.object(
+            adapter_runtime, "REPORT_MD", pathlib.Path(tmp) / "report.md"
+        ), mock.patch.object(adapter_runtime, "discover_adapters", side_effect=discover_only_uae):
+            batch = adapter_runtime.build_scan_batch(
+                {
+                    "public_market_adapters": {
+                        "enabled": True,
+                        "workers": 1,
+                        "adapters": {adapter_id: {"cache_minutes": 0}},
+                    }
+                }
+            )
+
+        self.assertEqual(1, len(batch.observations))
+        self.assertEqual("UAE_MOF_FDMO", batch.observations[0]["venue"])
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        report = batch.metadata["public_market_adapters"]
+        self.assertEqual(adapter_id, report["adapters"][0]["adapter_id"])
+        self.assertEqual("reachable", report["adapters"][0]["source_status"])
+
     def test_catalog_adapters_never_invent_prices(self) -> None:
         rows = contract_observations("blocked") + cross_listing_observations("reachable")
         self.assertTrue(rows)
@@ -2842,6 +2992,29 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
 
 
 class AdapterCapabilityTests(unittest.TestCase):
+    def test_uae_mof_adapter_closes_spec_674_without_secondary_quote_claims(self) -> None:
+        spec = {
+            "title": "Implement public adapter #674: Ministry of Finance UAE / Federal Debt Management Office",
+            "market_key": "global_discovery|Ministry of Finance UAE / Federal Debt Management Office",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "Ministry of Finance UAE / Federal Debt Management Office",
+                    "public_docs_url": UAE_MOF_ISSUANCE_PROGRAMME_URL,
+                    "asset_or_event": (
+                        "UAE federal T-Bonds and T-Sukuk issuance programme; issuance table with "
+                        "Security Type, ISIN, Maturity Date, and total outstanding domestic debt"
+                    ),
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("ministry_of_finance_uae_federal_debt_management_office", match["adapter_id"])
+        self.assertIn("outstanding_debt_reference", match["available_capabilities"])
+        self.assertNotIn("entry_quality_quote", match["available_capabilities"])
+
     def test_kase_global_adapter_closes_spec_1239_with_reference_quotes_only(self) -> None:
         spec = {
             "title": "Implement public adapter #1239: Kazakhstan Stock Exchange (KASE)",
