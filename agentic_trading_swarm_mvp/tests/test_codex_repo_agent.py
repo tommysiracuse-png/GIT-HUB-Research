@@ -46,6 +46,16 @@ class CodexRepoAgentTests(unittest.TestCase):
         self.assertIn("src/not_real.py", prompt)
         self.assertIn("run focused tests", prompt)
 
+    def test_default_is_terra_high_with_shared_account_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = codex_repo_agent.codex_repo_agent_config({}, pathlib.Path(tmp))
+
+        self.assertEqual("gpt-5.6-terra", cfg["model"])
+        self.assertEqual("high", cfg["reasoning_effort"])
+        self.assertEqual(pathlib.Path.home() / ".codex", pathlib.Path(cfg["codex_home"]))
+        self.assertTrue(cfg["chatgpt_account_fallback_enabled"])
+        self.assertTrue(cfg["fallback_on_api_quota"])
+
     def test_runtime_resolution_prefers_python_bundled_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             executable = pathlib.Path(tmp) / "codex-bundled.exe"
@@ -154,6 +164,108 @@ class CodexRepoAgentTests(unittest.TestCase):
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
         self.assertIn("--ignore-rules", command)
         self.assertIn("host_tests", run.call_args.kwargs["input"])
+
+    def test_api_quota_retries_same_turn_with_chatgpt_account(self) -> None:
+        quota = subprocess.CompletedProcess(
+            ["codex"],
+            1,
+            stdout=json.dumps({"type": "error", "message": "429 insufficient_quota"}),
+            stderr="",
+        )
+        events = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "account-thread"}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 8}}),
+            ]
+        )
+        account = subprocess.CompletedProcess(["codex"], 0, stdout=events, stderr="")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            codex_repo_agent,
+            "ensure_codex_runtime",
+            return_value={"available": True, "command_prefix": ["codex-test"], "source": "test"},
+        ), mock.patch.object(
+            codex_repo_agent.subprocess, "run", side_effect=[quota, account]
+        ) as run, mock.patch.dict(
+            os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True
+        ):
+            result = codex_repo_agent.run_codex_repo_agent(
+                proposal_id="proposal:quota-fallback",
+                payload={"title": "Continue through quota"},
+                preflight_hints={},
+                worktree_root=pathlib.Path(tmp),
+                settings=self._settings(tmp),
+                runs_dir=pathlib.Path(tmp),
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("account-thread", result["session_id"])
+        self.assertEqual("chatgpt_account_fallback", result["auth_mode"])
+        self.assertTrue(result["api_quota_fallback"])
+        self.assertEqual(2, run.call_count)
+        self.assertEqual("test-key", run.call_args_list[0].kwargs["env"]["CODEX_API_KEY"])
+        self.assertNotIn("CODEX_API_KEY", run.call_args_list[1].kwargs["env"])
+        self.assertEqual(
+            run.call_args_list[0].kwargs["env"]["CODEX_HOME"],
+            run.call_args_list[1].kwargs["env"]["CODEX_HOME"],
+        )
+
+    def test_transient_rate_limit_does_not_switch_auth(self) -> None:
+        limited = subprocess.CompletedProcess(
+            ["codex"],
+            1,
+            stdout=json.dumps({"type": "error", "message": "429 rate_limit_exceeded; retry later"}),
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            codex_repo_agent,
+            "ensure_codex_runtime",
+            return_value={"available": True, "command_prefix": ["codex-test"], "source": "test"},
+        ), mock.patch.object(
+            codex_repo_agent.subprocess, "run", return_value=limited
+        ) as run, mock.patch.dict(
+            os.environ, {"CODEX_API_KEY": "test-key"}, clear=True
+        ):
+            result = codex_repo_agent.run_codex_repo_agent(
+                proposal_id="proposal:rate-limit",
+                payload={"title": "Do not switch auth"},
+                preflight_hints={},
+                worktree_root=pathlib.Path(tmp),
+                settings=self._settings(tmp),
+                runs_dir=pathlib.Path(tmp),
+            )
+
+        self.assertEqual("failed", result["status"])
+        self.assertFalse(result["api_quota_fallback"])
+        self.assertEqual("api_key", result["auth_mode"])
+        self.assertEqual(1, run.call_count)
+
+    def test_missing_api_key_uses_cached_chatgpt_account(self) -> None:
+        events = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "account-only"}),
+                json.dumps({"type": "turn.completed", "usage": {}}),
+            ]
+        )
+        completed = subprocess.CompletedProcess(["codex"], 0, stdout=events, stderr="")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            codex_repo_agent,
+            "ensure_codex_runtime",
+            return_value={"available": True, "command_prefix": ["codex-test"], "source": "test"},
+        ), mock.patch.object(
+            codex_repo_agent.subprocess, "run", return_value=completed
+        ) as run, mock.patch.dict(os.environ, {}, clear=True):
+            result = codex_repo_agent.run_codex_repo_agent(
+                proposal_id="proposal:account-only",
+                payload={"title": "Use cached account"},
+                preflight_hints={},
+                worktree_root=pathlib.Path(tmp),
+                settings=self._settings(tmp),
+                runs_dir=pathlib.Path(tmp),
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual("chatgpt_account", result["auth_mode"])
+        self.assertNotIn("CODEX_API_KEY", run.call_args.kwargs["env"])
 
     def test_timeout_with_thread_becomes_resumable_pause(self) -> None:
         partial = json.dumps({"type": "thread.started", "thread_id": "thread-timeout"}) + "\n"

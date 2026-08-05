@@ -586,7 +586,7 @@ DEFAULT_SETTINGS = {
     },
     "codex_repo_agent": {
         "enabled": True,
-        "model": "gpt-5.6-sol",
+        "model": "gpt-5.6-terra",
         "reasoning_effort": "high",
         "timeout_seconds": 1800,
         "resume_cooldown_seconds": 300,
@@ -599,6 +599,9 @@ DEFAULT_SETTINGS = {
         "auto_install_npm_fallback": False,
         "network_access": True,
         "api_key_envs": ["CODEX_API_KEY", "OPENAI_API_KEY"],
+        "codex_home": "~/.codex",
+        "chatgpt_account_fallback_enabled": True,
+        "fallback_on_api_quota": True,
     },
     "code_evolution": {
         "enabled": True,
@@ -609,7 +612,7 @@ DEFAULT_SETTINGS = {
         "auto_merge_paper_only": True,
         "max_auto_merges_per_loop": 12,
         "require_frontier_model": False,
-        "required_model": "openai/gpt-5.6-sol",
+        "required_model": "openai/gpt-5.6-terra",
         "min_priority": 50,
         "run_full_regression": True,
         "probation_loops": 1,

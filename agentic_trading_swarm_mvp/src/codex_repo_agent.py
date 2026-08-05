@@ -21,7 +21,8 @@ from typing import Any, Callable, Iterator
 
 PINNED_CODEX_PACKAGE = "openai-codex==0.144.4"
 PINNED_CODEX_NPM_FALLBACK = "@openai/codex@0.146.0"
-DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_MODEL = "gpt-5.6-terra"
+DEFAULT_CODEX_HOME = pathlib.Path.home() / ".codex"
 SECRET_ENV_NAMES = (
     "CODEX_API_KEY",
     "OPENAI_API_KEY",
@@ -51,11 +52,15 @@ def codex_repo_agent_config(settings: dict, runs_dir: pathlib.Path) -> dict[str,
         "npm_fallback_enabled": True,
         "auto_install_npm_fallback": False,
         "runtime_dir": str(runs_dir / "codex_runtime"),
-        "codex_home": str(runs_dir / "codex_home"),
+        # A shared home keeps resumable sessions available when one turn uses
+        # an API key and a quota fallback uses the cached ChatGPT login.
+        "codex_home": str(DEFAULT_CODEX_HOME),
         "session_log_dir": str(runs_dir / "codex_sessions"),
         "lock_path": str(runs_dir / "codex_repo_agent.lock"),
         "lock_stale_seconds": 2400,
         "api_key_envs": ["CODEX_API_KEY", "OPENAI_API_KEY"],
+        "chatgpt_account_fallback_enabled": True,
+        "fallback_on_api_quota": True,
         "cli_path": None,
         "node_path": None,
         "pnpm_path": None,
@@ -184,16 +189,184 @@ def _api_key(cfg: dict[str, Any]) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _child_environment(cfg: dict[str, Any], api_key: str) -> dict[str, str]:
+def _child_environment(cfg: dict[str, Any], api_key: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     for name in SECRET_ENV_NAMES:
         env.pop(name, None)
-    env["CODEX_API_KEY"] = api_key
+    if api_key:
+        env["CODEX_API_KEY"] = api_key
     env["CODEX_HOME"] = str(pathlib.Path(str(cfg["codex_home"])).expanduser().resolve())
     env["CODEX_NON_INTERACTIVE"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     return env
+
+
+_API_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "exceeded your current quota",
+    "credit balance",
+    "quota has been exceeded",
+)
+_MISSING_SESSION_MARKERS = (
+    "session not found",
+    "thread not found",
+    "rollout not found",
+    "no rollout found",
+)
+
+
+def _output_contains(completed: subprocess.CompletedProcess[str], markers: tuple[str, ...]) -> bool:
+    text = f"{completed.stdout or ''}\n{completed.stderr or ''}".lower()
+    return any(marker in text for marker in markers)
+
+
+def _run_codex_process(
+    command: list[str],
+    *,
+    cwd: pathlib.Path,
+    env: dict[str, str],
+    prompt: str,
+    timeout: int,
+    process_started: Callable[[int], None] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if process_started is None:
+        return subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            input=prompt,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    process_started(process.pid)
+    try:
+        stdout, stderr = process.communicate(input=prompt, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        stdout, stderr = process.communicate()
+        exc.stdout = stdout
+        exc.stderr = stderr
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+
+
+def _execute_with_auth_fallback(
+    *,
+    command_for_session: Callable[[str | None], list[str]],
+    session_id: str | None,
+    worktree_root: pathlib.Path,
+    cfg: dict[str, Any],
+    source_env: str | None,
+    api_key: str | None,
+    prompt: str,
+    process_started: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """Run API-first, falling back only for API-credit exhaustion.
+
+    The fallback is intentionally non-sticky: each later turn starts with the
+    API key again, so replenished Platform credits are picked up automatically.
+    """
+
+    account_enabled = bool(cfg.get("chatgpt_account_fallback_enabled", True))
+    if not api_key and not account_enabled:
+        return {"available": False, "reason": "missing_codex_api_key"}
+    timeout = int(cfg.get("timeout_seconds", 1800))
+    attempts: list[dict[str, Any]] = []
+    log_parts: list[str] = []
+
+    def run(auth_mode: str, key: str | None, resume_id: str | None) -> subprocess.CompletedProcess[str]:
+        completed = _run_codex_process(
+            command_for_session(resume_id),
+            cwd=worktree_root,
+            env=_child_environment(cfg, key),
+            prompt=prompt,
+            timeout=timeout,
+            process_started=process_started,
+        )
+        missing_session = bool(resume_id) and _output_contains(completed, _MISSING_SESSION_MARKERS)
+        attempts.append(
+            {
+                "auth_mode": auth_mode,
+                "returncode": int(completed.returncode),
+                "quota_exhausted": _output_contains(completed, _API_QUOTA_MARKERS),
+                "missing_session": missing_session,
+            }
+        )
+        log_parts.append(completed.stdout or "")
+        if missing_session:
+            completed = _run_codex_process(
+                command_for_session(None),
+                cwd=worktree_root,
+                env=_child_environment(cfg, key),
+                prompt=prompt,
+                timeout=timeout,
+                process_started=process_started,
+            )
+            attempts.append(
+                {
+                    "auth_mode": auth_mode,
+                    "returncode": int(completed.returncode),
+                    "quota_exhausted": _output_contains(completed, _API_QUOTA_MARKERS),
+                    "missing_session": False,
+                    "fresh_thread_recovery": True,
+                }
+            )
+            log_parts.append(completed.stdout or "")
+        return completed
+
+    auth_mode = "api_key" if api_key else "chatgpt_account"
+    completed = run(auth_mode, api_key, session_id)
+    quota_fallback = False
+    if (
+        api_key
+        and account_enabled
+        and bool(cfg.get("fallback_on_api_quota", True))
+        and _output_contains(completed, _API_QUOTA_MARKERS)
+    ):
+        quota_fallback = True
+        parsed = _parse_events(completed.stdout or "")
+        fallback_session = parsed.get("session_id") or session_id
+        log_parts.append(
+            json.dumps(
+                {
+                    "type": "host.auth_fallback",
+                    "from": "api_key",
+                    "to": "chatgpt_account",
+                    "reason": "api_quota_exhausted",
+                    "at": _utc_now(),
+                },
+                sort_keys=True,
+            )
+        )
+        auth_mode = "chatgpt_account_fallback"
+        completed = run(auth_mode, None, fallback_session)
+
+    return {
+        "available": True,
+        "completed": completed,
+        "auth_mode": auth_mode,
+        "api_key_source": source_env,
+        "api_quota_fallback": quota_fallback,
+        "auth_attempts": attempts,
+        "log_output": "\n".join(part for part in log_parts if part),
+    }
 
 
 def _pid_alive(pid: object) -> bool:
@@ -426,32 +599,32 @@ def run_codex_repo_agent(
     if not runtime.get("available"):
         return {"status": "unavailable", "reason": runtime.get("reason"), "runtime": runtime}
     source_env, key = _api_key(cfg)
-    if not key:
+    if not key and not cfg.get("chatgpt_account_fallback_enabled", True):
         return {"status": "unavailable", "reason": "missing_codex_api_key", "runtime": runtime}
 
     pathlib.Path(str(cfg["codex_home"])).expanduser().mkdir(parents=True, exist_ok=True)
     log_path = pathlib.Path(str(cfg["session_log_dir"])) / f"{proposal_id.replace(':', '_')}.jsonl"
-    command = _command(runtime, cfg, worktree_root.resolve(), session_id)
+    command_for_session = lambda resume_id: _command(runtime, cfg, worktree_root.resolve(), resume_id)
     prompt = build_implementation_prompt(payload, preflight_hints, failure_context)
     started_at = _utc_now()
     runtime_meta = {name: value for name, value in runtime.items() if name != "command_prefix"}
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(worktree_root),
-            env=_child_environment(cfg, key),
-            input=prompt,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=int(cfg.get("timeout_seconds", 1800)),
-            check=False,
+        execution = _execute_with_auth_fallback(
+            command_for_session=command_for_session,
+            session_id=session_id,
+            worktree_root=worktree_root.resolve(),
+            cfg=cfg,
+            source_env=source_env,
+            api_key=key,
+            prompt=prompt,
         )
+        if not execution.get("available"):
+            return {"status": "unavailable", "reason": execution.get("reason"), "runtime": runtime_meta}
+        completed = execution["completed"]
         stdout = _scrub_secret_text(completed.stdout or "", key)
         stderr = _scrub_secret_text(completed.stderr or "", key)
         parsed = _parse_events(stdout)
-        _write_event_log(log_path, stdout)
+        _write_event_log(log_path, _scrub_secret_text(str(execution.get("log_output") or stdout), key))
         status = "completed" if completed.returncode == 0 and parsed["turn_completed"] else "failed"
         if status == "failed" and (parsed.get("session_id") or session_id):
             status = "implementation_paused"
@@ -465,6 +638,9 @@ def run_codex_repo_agent(
             "model": str(cfg["model"]),
             "reasoning_effort": str(cfg["reasoning_effort"]),
             "api_key_source": source_env,
+            "auth_mode": execution.get("auth_mode"),
+            "api_quota_fallback": bool(execution.get("api_quota_fallback")),
+            "auth_attempts": execution.get("auth_attempts") or [],
             "runtime": runtime_meta,
             "event_log": str(log_path),
             "event_summary": parsed,
@@ -520,7 +696,7 @@ def run_structured_codex_turn(
     if not runtime.get("available"):
         return {"status": "unavailable", "reason": runtime.get("reason"), "runtime": runtime}
     source_env, key = _api_key(cfg)
-    if not key:
+    if not key and not cfg.get("chatgpt_account_fallback_enabled", True):
         return {"status": "unavailable", "reason": "missing_codex_api_key", "runtime": runtime}
 
     safe_id = task_id.replace(":", "_").replace("/", "_")
@@ -530,11 +706,11 @@ def run_structured_codex_turn(
     message_path = session_dir / f"{safe_id}.last_message.json"
     log_path = session_dir / f"{safe_id}.jsonl"
     schema_path.write_text(json.dumps(output_schema, indent=2, sort_keys=True), encoding="utf-8")
-    command = _command(
+    command_for_session = lambda resume_id: _command(
         runtime,
         cfg,
         worktree_root.resolve(),
-        session_id,
+        resume_id,
         output_schema=schema_path,
         output_last_message=message_path,
     )
@@ -544,36 +720,12 @@ def run_structured_codex_turn(
         with codex_write_lock(cfg, f"strategy-owner:{task_id}") as lock:
             if not lock.get("acquired"):
                 return {"status": "implementation_paused", "reason": lock.get("reason"), **lock}
-            if process_started is None:
-                completed = subprocess.run(
-                    command,
-                    cwd=str(worktree_root),
-                    env=_child_environment(cfg, key),
-                    input=prompt,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    timeout=int(cfg.get("timeout_seconds", 1800)),
-                    check=False,
-                )
-            else:
-                process = subprocess.Popen(
-                    command,
-                    cwd=str(worktree_root),
-                    env=_child_environment(cfg, key),
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
+            def record_started(pid: int) -> None:
                 pathlib.Path(str(cfg["lock_path"])).write_text(
                     json.dumps(
                         {
                             "owner": f"strategy-owner:{task_id}",
-                            "pid": process.pid,
+                            "pid": pid,
                             "host_pid": os.getpid(),
                             "acquired_at": started_at,
                         },
@@ -581,22 +733,26 @@ def run_structured_codex_turn(
                     ),
                     encoding="utf-8",
                 )
-                process_started(process.pid)
-                try:
-                    stdout, stderr = process.communicate(
-                        input=prompt, timeout=int(cfg.get("timeout_seconds", 1800))
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                    exc.stdout = stdout
-                    exc.stderr = stderr
-                    raise
-                completed = subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+                if process_started is not None:
+                    process_started(pid)
+
+            execution = _execute_with_auth_fallback(
+                command_for_session=command_for_session,
+                session_id=session_id,
+                worktree_root=worktree_root.resolve(),
+                cfg=cfg,
+                source_env=source_env,
+                api_key=key,
+                prompt=prompt,
+                process_started=record_started if process_started is not None else None,
+            )
+            if not execution.get("available"):
+                return {"status": "unavailable", "reason": execution.get("reason"), "runtime": runtime_meta}
+            completed = execution["completed"]
         stdout = _scrub_secret_text(completed.stdout or "", key)
         stderr = _scrub_secret_text(completed.stderr or "", key)
         parsed = _parse_events(stdout)
-        _write_event_log(log_path, stdout)
+        _write_event_log(log_path, _scrub_secret_text(str(execution.get("log_output") or stdout), key))
         decision: dict[str, Any] | None = None
         parse_error = None
         try:
@@ -617,6 +773,9 @@ def run_structured_codex_turn(
             "model": str(cfg["model"]),
             "reasoning_effort": str(cfg["reasoning_effort"]),
             "api_key_source": source_env,
+            "auth_mode": execution.get("auth_mode"),
+            "api_quota_fallback": bool(execution.get("api_quota_fallback")),
+            "auth_attempts": execution.get("auth_attempts") or [],
             "runtime": runtime_meta,
             "event_log": str(log_path),
             "last_message_artifact": str(message_path),

@@ -2235,7 +2235,7 @@ def _cfg(settings: dict) -> dict:
         "auto_merge_paper_only": True,
         "max_auto_merges_per_loop": 12,
         "require_frontier_model": False,
-        "required_model": "openai/gpt-5.6-sol",
+        "required_model": "openai/gpt-5.6-terra",
         "min_priority": 50,
         "run_full_regression": True,
         "probation_loops": 1,
@@ -3558,7 +3558,7 @@ def _frontier_model_called(patch_generation: dict | None) -> bool:
 
 
 def _frontier_requirement_satisfied(payload: dict, patch_generation: dict | None, cfg: dict) -> bool:
-    required_model = str(cfg.get("required_model", "openai/gpt-5.6-sol"))
+    required_model = str(cfg.get("required_model", "openai/gpt-5.6-terra"))
     if _model_name(payload) == required_model:
         return True
     if not patch_generation:
@@ -5133,7 +5133,7 @@ def _candidate_worktree_diff(release: CandidateRelease, timeout: int) -> tuple[s
 def _codex_patch_generation(agent: dict) -> dict:
     return {
         "status": f"codex_repo_agent:{agent.get('status')}",
-        "model_name": f"openai/{agent.get('model') or 'gpt-5.6-sol'}",
+        "model_name": f"openai/{agent.get('model') or 'gpt-5.6-terra'}",
         "model_tier": "frontier",
         "requested_model_tier": "frontier",
         "reasoning_effort": agent.get("reasoning_effort"),
