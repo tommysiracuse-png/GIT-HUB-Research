@@ -464,6 +464,90 @@ def build_conditional_short_route_diagnostics(
     }
 
 
+def build_paper_route_requirement_report(
+    opportunity: dict[str, Any],
+    *,
+    route: dict[str, Any] | None = None,
+    annotation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the refreshed, non-blocking route report for a paper candidate.
+
+    Conditional shorts and short proxy routes need the same route facts even
+    when the maintained proxy route is labelled ``standard``.  The report is
+    intentionally the only place that converts those facts into paper ranking
+    and sizing guidance: it cannot alter eligibility, route status, or live
+    execution capability.
+    """
+
+    source = dict(opportunity or {})
+    resolved_route = dict(route or {})
+    if resolved_route:
+        source.setdefault("route_status", resolved_route.get("route_status"))
+        source.setdefault("route_blockers", resolved_route.get("route_blockers"))
+        source.setdefault("required_permissions", resolved_route.get("required_permissions"))
+
+    direction = str(
+        resolved_route.get("direction") or source.get("direction") or ""
+    ).strip().lower()
+    descriptors = " ".join(
+        str(source.get(key) or "")
+        for key in (
+            "trade_type",
+            "route_type",
+            "market_key",
+            "signal_key",
+            "strategy",
+            "strategy_profile",
+        )
+    ).lower().replace("-", "_")
+    short_proxy = direction == "short_proxy" or (
+        "short" in direction and "proxy" in descriptors
+    )
+
+    # Reuse the established risk accounting.  A standard paper proxy still
+    # needs a conditional diagnostic view, but only in this read-only report;
+    # do not relabel the candidate's actual route status.
+    diagnostics_source = dict(source)
+    if short_proxy and str(diagnostics_source.get("route_status") or "").lower() == "standard":
+        diagnostics_source["route_status"] = "conditional"
+    diagnostics = build_conditional_short_route_diagnostics(diagnostics_source)
+    applies = bool(diagnostics.get("applies") or short_proxy)
+    rank_multiplier = float(diagnostics.get("paper_rank_multiplier") or 1.0) if applies else 1.0
+    rank_multiplier = round(max(0.35, min(1.0, rank_multiplier)), 4)
+    panel = dict(annotation or build_route_requirements_annotation(source))
+    sizing_guidance = dict(panel.get("paper_sizing_guidance") or {})
+    gaps = list(panel.get("route_requirement_gaps") or [])
+    sizing_guidance.update(
+        {
+            "paper_only": True,
+            "non_blocking": True,
+            "route_requirement_report_multiplier": rank_multiplier,
+            "recommended_paper_allocation_multiplier": rank_multiplier,
+            "action": (
+                "route_aware_paper_sizing" if applies else sizing_guidance.get("action", "standard_paper_sizing_review")
+            ),
+            "routing_decision_changed": False,
+        }
+    )
+    return {
+        "report_version": "paper_route_requirements_v1",
+        "paper_only": True,
+        "read_only": True,
+        "applies": applies,
+        "route_status_observed": str(source.get("route_status") or UNKNOWN).lower(),
+        "candidate_kind": "short_proxy" if short_proxy else "conditional_short" if applies else "other",
+        "route_requirements": panel,
+        "diagnostics": diagnostics,
+        "route_requirement_gaps": gaps,
+        "paper_rank_multiplier": rank_multiplier,
+        "paper_allocation_multiplier": rank_multiplier,
+        "paper_sizing_guidance": sizing_guidance,
+        "hard_blocking": False,
+        "entry_blocked": False,
+        "routing_decision_changed": False,
+    }
+
+
 def _conditional_short_route_applies(
     direction: str,
     route_status: str,

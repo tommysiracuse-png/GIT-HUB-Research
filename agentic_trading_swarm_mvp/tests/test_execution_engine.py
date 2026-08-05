@@ -12,12 +12,34 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from execution_engine import execute_order  # noqa: E402
+from execution_engine import build_order_ticket, execute_order  # noqa: E402
 from settings import DEFAULT_SETTINGS  # noqa: E402
 from storage import init_db  # noqa: E402
 
 
 class ExecutionEnginePaperGuardTests(unittest.TestCase):
+    def test_route_requirement_report_sizes_paper_ticket_without_blocking_it(self) -> None:
+        candidate = {
+            "venue": "CME_GROUP",
+            "inst_id": "CME_GROUP:PROXY",
+            "direction": "short_proxy",
+            "trade_type": "global_market_discovery_proxy",
+            "last": 10.0,
+            "paper_route_requirement_report": {
+                "paper_only": True,
+                "read_only": True,
+                "applies": True,
+                "paper_allocation_multiplier": 0.6,
+                "hard_blocking": False,
+            },
+        }
+        review = {"paper_allocation_multiplier": 1.0}
+
+        ticket = build_order_ticket(candidate, review, DEFAULT_SETTINGS)
+
+        self.assertEqual(600.0, ticket["notional_usd"])
+        self.assertEqual("ready_for_paper_execution", ticket["status"])
+
     def test_unconfirmed_frontier_spot_borrow_creates_isolated_synthetic_fill(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

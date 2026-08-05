@@ -67,6 +67,16 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
     mode = settings.get("mode", "paper")
     notional = float(risk.get("paper_notional_usd", 1000.0))
     if mode == "paper":
+        route_requirement_report = candidate.get("paper_route_requirement_report") or {}
+        report_multiplier = 1.0
+        if isinstance(route_requirement_report, dict) and route_requirement_report.get("applies"):
+            try:
+                report_multiplier = max(
+                    0.0,
+                    min(1.0, float(route_requirement_report.get("paper_allocation_multiplier", 1.0))),
+                )
+            except (TypeError, ValueError):
+                report_multiplier = 1.0
         review_multiplier = max(
             0.0,
             min(1.0, float(review.get("paper_allocation_multiplier", 1.0))),
@@ -80,7 +90,9 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         )
         if exploration_enabled(settings):
             registry_multiplier = max(registry_multiplier, review_multiplier)
-        notional *= min(review_multiplier, registry_multiplier)
+        # Route-requirement evidence is a paper-only sizing input.  It never
+        # changes admission or makes a live route reachable.
+        notional *= min(review_multiplier, registry_multiplier, report_multiplier)
     if mode == "live":
         notional = min(notional, float(risk.get("max_live_notional_usd", 0.0)))
 

@@ -36,6 +36,7 @@ try:
     from route_intelligence import (
         build_conditional_short_route_intelligence,
         build_conditional_short_route_diagnostics,
+        build_paper_route_requirement_report,
         build_route_requirements_annotation,
         build_route_requirements_report,
     )
@@ -43,6 +44,7 @@ except ModuleNotFoundError:  # pragma: no cover - package import fallback
     from .route_intelligence import (
         build_conditional_short_route_intelligence,
         build_conditional_short_route_diagnostics,
+        build_paper_route_requirement_report,
         build_route_requirements_annotation,
         build_route_requirements_report,
     )
@@ -2053,6 +2055,11 @@ def enrich_candidate_with_route(
     route_requirements_input = dict(diagnostic_input)
     route_requirements_input["execution_route"] = route
     route_requirements_annotation = build_route_requirements_annotation(route_requirements_input)
+    paper_route_requirement_report = build_paper_route_requirement_report(
+        diagnostic_input,
+        route=route,
+        annotation=route_requirements_annotation,
+    )
     eligibility = _conditional_short_paper_observation_eligibility(
         eligibility,
         conditional_short_route_intelligence,
@@ -2064,6 +2071,7 @@ def enrich_candidate_with_route(
     route["conditional_short_route_intelligence"] = conditional_short_route_intelligence
     route["conditional_short_route_diagnostics"] = conditional_short_diagnostics
     route["route_requirements_panel"] = route_requirements_annotation
+    route["paper_route_requirement_report"] = paper_route_requirement_report
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
     route["paper_route_registry"] = enriched["paper_route_registry"]
@@ -2122,6 +2130,7 @@ def enrich_candidate_with_route(
             "conditional_short_route_intelligence": conditional_short_route_intelligence,
             "conditional_short_route_diagnostics": conditional_short_diagnostics,
             "route_requirements_panel": route_requirements_annotation,
+            "paper_route_requirement_report": paper_route_requirement_report,
         }
     )
     enriched["execution_feasibility"] = existing
@@ -2145,9 +2154,12 @@ def enrich_candidate_with_route(
     enriched["rank_contribution"] = eligibility["rank_contribution"]
     enriched["conditional_short_route_intelligence"] = conditional_short_route_intelligence
     enriched["conditional_short_route_diagnostics"] = conditional_short_diagnostics
+    # The report is paper-only and non-blocking.  It refreshes from the current
+    # candidate/route facts on every enrichment pass and is the common source
+    # for route-aware ranking and sizing.
+    enriched["paper_route_requirement_report"] = paper_route_requirement_report
     # Read-only candidate tags for paper sizing and route-guard value
-    # measurement.  They intentionally do not feed route eligibility, score,
-    # allocation, or any order path.
+    # measurement.  They intentionally do not feed route eligibility.
     enriched["route_requirements_panel"] = route_requirements_annotation
     enriched["route_requirement_gaps"] = list(
         route_requirements_annotation["route_requirement_gaps"]
@@ -2191,17 +2203,28 @@ def enrich_candidate_with_route(
         )
         enriched["paper_route_assumption_penalty_applied"] = True
     if (
-        conditional_short_diagnostics.get("applies")
+        paper_route_requirement_report.get("applies")
         and not eligibility["suppressed"]
-        and not eligibility["assumption_penalty_applied"]
-        and not enriched.get("conditional_short_execution_risk_downrank_applied")
     ):
-        risk_multiplier = float(conditional_short_diagnostics["paper_rank_multiplier"])
-        if risk_multiplier < 1.0 and _eligibility_number(enriched, "score") is not None:
+        risk_multiplier = float(paper_route_requirement_report["paper_rank_multiplier"])
+        if (
+            not eligibility["assumption_penalty_applied"]
+            and not enriched.get("conditional_short_execution_risk_downrank_applied")
+            and risk_multiplier < 1.0
+            and _eligibility_number(enriched, "score") is not None
+        ):
             enriched.setdefault("score_before_conditional_short_execution_risk", enriched["score"])
             enriched["score"] = round(float(enriched["score"]) * risk_multiplier, 6)
             enriched["conditional_short_execution_risk_downrank_applied"] = True
             enriched["conditional_short_execution_risk_multiplier"] = risk_multiplier
+        existing_allocation = _eligibility_number(enriched, "paper_allocation_multiplier")
+        report_allocation = float(paper_route_requirement_report["paper_allocation_multiplier"])
+        enriched["paper_route_requirement_report_allocation_multiplier"] = report_allocation
+        enriched["paper_allocation_multiplier"] = (
+            min(existing_allocation, report_allocation)
+            if existing_allocation is not None and existing_allocation > 0.0
+            else report_allocation
+        )
     prior_context_gate = enriched.get("paper_context_cost_gate") or {}
     prior_context_multiplier = float(prior_context_gate.get("score_multiplier", 1.0) or 1.0)
     refresh_context_cost = bool(prior_context_gate) or enriched.get("trade_type") in {

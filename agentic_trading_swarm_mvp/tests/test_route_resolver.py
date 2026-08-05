@@ -22,6 +22,27 @@ def settings() -> dict:
 
 
 class RouteResolverTests(unittest.TestCase):
+    def test_standard_short_proxy_receives_refreshed_route_report_and_paper_sizing(self) -> None:
+        enriched = route_resolver.enrich_candidate_with_route(
+            {
+                "venue": "CME_GROUP",
+                "trade_type": "global_market_discovery_proxy",
+                "direction": "short_proxy",
+                "asset_class": "equity_or_proxy",
+                "score": 100.0,
+            },
+            settings(),
+        )
+
+        report = enriched["paper_route_requirement_report"]
+        self.assertTrue(report["applies"])
+        self.assertEqual("short_proxy", report["candidate_kind"])
+        self.assertEqual(report, enriched["execution_route"]["paper_route_requirement_report"])
+        self.assertLess(enriched["score"], 100.0)
+        self.assertGreater(enriched["paper_allocation_multiplier"], 0.0)
+        self.assertLess(enriched["paper_allocation_multiplier"], 1.0)
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
+
     def test_unmapped_conditional_short_is_down_ranked_without_a_new_paper_block(self) -> None:
         enriched = route_resolver.enrich_candidate_with_route(
             {

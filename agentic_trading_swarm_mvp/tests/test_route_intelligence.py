@@ -14,6 +14,7 @@ from route_intelligence import (  # noqa: E402
     ROUTE_REQUIREMENT_FIELDS,
     build_conditional_short_route_intelligence,
     build_conditional_short_route_diagnostics,
+    build_paper_route_requirement_report,
     build_route_requirements_annotation,
     build_route_requirements_matrix,
     render_route_requirements_markdown,
@@ -22,6 +23,28 @@ from route_intelligence import (  # noqa: E402
 
 
 class RouteIntelligenceTests(unittest.TestCase):
+    def test_short_proxy_report_is_non_blocking_and_supplies_rank_and_size(self) -> None:
+        report = build_paper_route_requirement_report(
+            {
+                "venue": "CME_GROUP",
+                "trade_type": "global_market_discovery_proxy",
+                "direction": "short_proxy",
+                "route_status": "standard",
+                "api_access_status": "public_data_only",
+            }
+        )
+
+        self.assertTrue(report["paper_only"])
+        self.assertTrue(report["read_only"])
+        self.assertTrue(report["applies"])
+        self.assertEqual("short_proxy", report["candidate_kind"])
+        self.assertLess(report["paper_rank_multiplier"], 1.0)
+        self.assertEqual(
+            report["paper_rank_multiplier"], report["paper_allocation_multiplier"]
+        )
+        self.assertFalse(report["hard_blocking"])
+        self.assertFalse(report["entry_blocked"])
+
     def test_conditional_short_packet_keeps_venue_requirements_read_only(self) -> None:
         packet = build_conditional_short_route_intelligence(
             {
