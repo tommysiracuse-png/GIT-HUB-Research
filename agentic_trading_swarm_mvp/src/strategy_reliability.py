@@ -3553,6 +3553,19 @@ def _repair_okx_candidate(candidate: dict) -> dict | None:
             reasons.append(f"borrow_or_route_status={route_status}")
         if funding < 8.0 and basis < 75.0:
             reasons.append("reverse_basis_not_extreme")
+        if candidate.get("paper_proxy_activated") and candidate.get("paper_proxy_not_live_equivalent"):
+            diagnostic_reasons = reasons or ["reverse_basis_proxy_quality_measured"]
+            return _annotate(
+                candidate,
+                profile="okx_reverse_basis",
+                action="reverse_basis_proxy_counterfactual",
+                reasons=[
+                    *diagnostic_reasons,
+                    "paper_proxy_quality_and_outcomes_are_counterfactual_not_live_route_evidence",
+                ],
+                score_delta=0.0,
+                allocation_multiplier=0.25,
+            )
         if reasons:
             return _annotate(
                 candidate,

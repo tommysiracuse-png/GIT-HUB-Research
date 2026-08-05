@@ -12,6 +12,7 @@ from __future__ import annotations
 import collections
 import datetime as dt
 import json
+import math
 import pathlib
 from typing import Iterable
 
@@ -2456,6 +2457,105 @@ def _direct_candidate_signal_key(candidate: dict, feasibility: dict) -> str:
     return "|".join(str(value) for value in parts)
 
 
+def _bounded_proxy_score(value: object, *, default: float = 50.0) -> float:
+    """Normalize a paper-quality input to the candidate-score scale."""
+
+    numeric = _eligibility_number({"value": value}, "value")
+    if numeric is None or not math.isfinite(numeric):
+        return default
+    if 0.0 <= numeric <= 1.0:
+        numeric *= 100.0
+    return max(0.0, min(100.0, numeric))
+
+
+def _paper_proxy_quality(candidate: dict, alternative: dict, direct_score: object) -> dict:
+    """Score an explicitly labeled paper proxy without treating it as a live route.
+
+    The direct route can have its score clamped to zero solely because spot
+    borrow is unavailable.  That clamp is correct for the direct route, but it
+    should not erase the quality evidence of a separately modeled OKX paper
+    perpetual.  Missing non-critical quality inputs use neutral values and are
+    surfaced as diagnostics; invalid or dangerously stale prices are still
+    handled by the paper-exploration immutable rejection checks.
+    """
+
+    diagnostics: list[str] = [
+        "proxy_not_live_equivalent",
+        "spot_borrow_blocker_replaced_by_derivatives_paper_proxy",
+    ]
+    raw_score = _bounded_proxy_score(direct_score, default=0.0)
+    quality_score = _bounded_proxy_score(candidate.get("quality_score"))
+    liquidity_score = _bounded_proxy_score(candidate.get("liquidity_score"))
+
+    spread = _eligibility_number(candidate, "spread_bps")
+    if spread is None:
+        spread_score = 50.0
+        diagnostics.append("spread_unavailable_neutral_proxy_penalty")
+    else:
+        spread_score = max(0.0, min(100.0, 100.0 - max(0.0, spread) * 5.0))
+
+    freshness = _eligibility_number(candidate, "freshness_age_seconds")
+    if freshness is None:
+        stale_minutes = _eligibility_number(candidate, "stale_minutes")
+        freshness = None if stale_minutes is None else stale_minutes * 60.0
+    if freshness is None:
+        freshness_score = 50.0
+        diagnostics.append("freshness_unavailable_neutral_proxy_penalty")
+    else:
+        freshness_score = max(0.0, min(100.0, 100.0 - max(0.0, freshness) / 0.9))
+
+    if candidate.get("quality_score") is None:
+        diagnostics.append("quality_unavailable_neutral_proxy_penalty")
+    if candidate.get("liquidity_score") is None:
+        diagnostics.append("liquidity_unavailable_neutral_proxy_penalty")
+    if raw_score <= 0.0:
+        diagnostics.append("direct_score_zero_replaced_by_proxy_quality_evidence")
+
+    components = {
+        "direct_signal_score": round(raw_score, 3),
+        "market_quality": round(quality_score, 3),
+        "liquidity": round(liquidity_score, 3),
+        "spread": round(spread_score, 3),
+        "freshness": round(freshness_score, 3),
+        "route_feasibility": round(PAPER_PROXY_ROUTE_FEASIBILITY_SCORE * 100.0, 3),
+    }
+    weights = {
+        "direct_signal_score": 0.20,
+        "market_quality": 0.30,
+        "liquidity": 0.15,
+        "spread": 0.15,
+        "freshness": 0.10,
+        "route_feasibility": 0.10,
+    }
+    score = sum(components[name] * weights[name] for name in components)
+    penalty_components = [
+        {"component": name, "score": value}
+        for name, value in sorted(
+            (
+                (name, components[name])
+                for name in ("market_quality", "liquidity", "spread", "freshness")
+            ),
+            key=lambda item: item[1],
+        )
+        if value < 75.0
+    ]
+    diagnostics.extend(
+        f"proxy_quality_penalty:{item['component']}"
+        for item in penalty_components[:2]
+    )
+    return {
+        "score": round(max(0.0, min(100.0, score)), 3),
+        "components": components,
+        "weights": weights,
+        "diagnostics": diagnostics,
+        "penalty_components": penalty_components,
+        "paper_only": True,
+        "execution_semantics": PAPER_PROXY_EXECUTION_SEMANTICS,
+        "route_id": alternative.get("route_id"),
+        "paper_allocation_multiplier": alternative.get("paper_allocation_multiplier"),
+    }
+
+
 def activate_paper_proxy_candidate(candidate: dict, settings: dict) -> dict:
     """Replace one borrow-blocked direct attempt with its labeled paper proxy.
 
@@ -2489,6 +2589,8 @@ def activate_paper_proxy_candidate(candidate: dict, settings: dict) -> dict:
         direct_score = activated.get("score_before_conditional_short_execution_risk")
     if direct_score is None:
         direct_score = activated.get("score", 0.0)
+    proxy_quality = _paper_proxy_quality(activated, alternative, direct_score)
+    proxy_score = proxy_quality["score"]
 
     proxy_eligibility = dict(direct_eligibility)
     proxy_eligibility.update(
@@ -2508,7 +2610,7 @@ def activate_paper_proxy_candidate(candidate: dict, settings: dict) -> dict:
             "route_status": "paper_testable_proxy",
             "candidate_status": "paper_proxy_active",
             "rank_contribution_cap": 1.0,
-            "rank_contribution": round(max(0.0, float(direct_score)), 6),
+            "rank_contribution": proxy_score,
             "assumption_penalty_applied": False,
             "paper_score_multiplier": 1.0,
             "execution_semantics": PAPER_PROXY_EXECUTION_SEMANTICS,
@@ -2545,7 +2647,13 @@ def activate_paper_proxy_candidate(candidate: dict, settings: dict) -> dict:
 
     activated.update(
         {
-            "score": float(direct_score),
+            "score": proxy_score,
+            "pre_paper_proxy_score": direct_score,
+            "proxy_quality_score": proxy_score,
+            "proxy_quality_components": proxy_quality["components"],
+            "proxy_quality_diagnostics": proxy_quality["diagnostics"],
+            "paper_proxy_counterfactual": proxy_quality,
+            "paper_proxy_ranking_score": proxy_score,
             "signal_key": proxy_signal_key,
             "direct_signal_key": direct_signal_key,
             "direct_source_signal_key": source_signal_key,
@@ -2574,6 +2682,8 @@ def activate_paper_proxy_candidate(candidate: dict, settings: dict) -> dict:
             "execution_eligibility": "eligible",
             "route_intelligence_status": "paper_testable_proxy",
             "candidate_status": "paper_proxy_active",
+            "rank_contribution_cap": 1.0,
+            "rank_contribution": proxy_score,
             "blocking_reason": None,
             "paper_entry_blocked": False,
             "promotion_eligible": False,

@@ -218,6 +218,14 @@ def review_candidate(
             f"frontier executable quality {candidate['quality_score']} "
             f"({candidate.get('quality_status', 'unknown')})"
         )
+    if candidate.get("paper_proxy_activated") and candidate.get("proxy_quality_score") is not None:
+        evidence.append(
+            "paper proxy quality score "
+            f"{candidate['proxy_quality_score']} on {candidate.get('paper_proxy_route', {}).get('route_id')}"
+        )
+        warnings.append(
+            "proxy quality is a counterfactual paper measurement and does not validate the direct borrow route"
+        )
     if cross_context_diagnostic:
         warnings.append(
             "cross-context paper diagnostic "
