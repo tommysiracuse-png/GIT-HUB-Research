@@ -79,6 +79,29 @@ class RouteResolverTests(unittest.TestCase):
         self.assertLess(enriched["score"], 80.0)
         self.assertFalse(enriched.get("paper_entry_blocked", False))
 
+    def test_enrichment_tags_requirements_gaps_without_changing_route_decision(self) -> None:
+        candidate = {
+            "venue": "OKX",
+            "trade_type": "perp_funding_basis",
+            "direction": "long_perp_short_spot",
+            "asset_class": "crypto_derivatives",
+            "score": 73.0,
+            "freshness_state": "stale",
+        }
+        resolved = route_resolver.resolve_candidate_route(candidate, settings())
+        enriched = route_resolver.enrich_candidate_with_route(candidate, settings())
+
+        panel = enriched["route_requirements_panel"]
+        self.assertEqual(resolved["route_status"], enriched["route_status"])
+        self.assertEqual(panel, enriched["execution_route"]["route_requirements_panel"])
+        self.assertIn("borrow_availability", enriched["route_requirement_gaps"])
+        self.assertIn("stale_data", enriched["route_requirement_gaps"])
+        self.assertEqual("stale", panel["stale_data_status"])
+        self.assertTrue(enriched["paper_route_sizing_guidance"]["non_blocking"])
+        self.assertFalse(enriched["paper_route_sizing_guidance"]["routing_decision_changed"])
+        self.assertTrue(enriched["paper_route_guard_value_measurement"]["enabled"])
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
+
     def test_okx_short_perp_route_is_standard(self) -> None:
         candidate = {
             "venue": "OKX",
@@ -401,6 +424,9 @@ class RouteResolverTests(unittest.TestCase):
         )
         self.assertIn("Pre-Promotion Route Requirements Intel", primary_markdown)
         self.assertIn("Pre-Promotion Route Requirements Intel", intelligence_markdown)
+        self.assertIn("api_path_readiness", primary_markdown)
+        self.assertIn("guard_value_measurement", intelligence_markdown)
+        self.assertIn("route_requirement_gaps", short_spot)
         self.assertIn("route_requirements_intel", intelligence_sidecar)
 
     def test_route_intelligence_is_read_only_and_ranks_blockers(self) -> None:

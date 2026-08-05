@@ -14,6 +14,7 @@ from route_intelligence import (  # noqa: E402
     ROUTE_REQUIREMENT_FIELDS,
     build_conditional_short_route_intelligence,
     build_conditional_short_route_diagnostics,
+    build_route_requirements_annotation,
     build_route_requirements_matrix,
     render_route_requirements_markdown,
     route_requirements_json,
@@ -91,6 +92,35 @@ class RouteIntelligenceTests(unittest.TestCase):
         self.assertEqual("isolated", row["margin_mode"])
         self.assertEqual(3.0, row["taker_fee_bps_or_unknown"])
         self.assertIn("conditional_short_route_diagnostics", row)
+
+    def test_requirements_panel_reports_gaps_staleness_and_measurement_without_a_route_gate(self) -> None:
+        opportunity = {
+            "venue": "OKX",
+            "inst_id": "OKX:ARC-USDT",
+            "direction": "long_perp_short_spot",
+            "route_status": "conditional",
+            "route_blockers": ["spot_borrow"],
+            "borrow_available": "unknown",
+            "maker_fee_bps": 1.0,
+            "taker_fee_bps": 3.0,
+            "margin_mode": "isolated",
+            "api_access_status": "public_data_only",
+            "freshness_state": "stale",
+        }
+
+        row = build_route_requirements_matrix([opportunity])[0]
+        annotation = build_route_requirements_annotation(opportunity)
+
+        self.assertEqual("unknown", row["broker_permission_status"])
+        self.assertEqual("unconfirmed", row["api_path_readiness"])
+        self.assertEqual("stale", row["stale_data_status"])
+        self.assertIn("freshness_state:stale", row["stale_data_flags"])
+        self.assertIn("borrow_availability", row["route_requirement_gaps"])
+        self.assertIn("stale_data", row["route_requirement_gaps"])
+        self.assertTrue(row["paper_sizing_guidance"]["non_blocking"])
+        self.assertFalse(row["paper_sizing_guidance"]["routing_decision_changed"])
+        self.assertTrue(row["guard_value_measurement"]["enabled"])
+        self.assertFalse(annotation["guard_value_measurement"]["routing_decision_changed"])
 
     def test_spot_borrow_routes_are_paper_only_prioritized_with_unknowns(self) -> None:
         rows = build_route_requirements_matrix(

@@ -80,6 +80,15 @@ class LLMStatePacketTests(unittest.TestCase):
             groups["equity_short"]["playbook"]["route_family"],
             "equity_short_or_options_proxy",
         )
+        route_row = next(
+            row for row in report["routes"] if row["inst_id"] == "POLYMARKET:EVENT"
+        )
+        self.assertIn("broker_permission_status", route_row)
+        self.assertIn("api_path_readiness", route_row)
+        self.assertIn("stale_data_flags", route_row)
+        self.assertIn("route_requirement_gaps", route_row)
+        self.assertTrue(route_row["paper_sizing_guidance"]["non_blocking"])
+        self.assertFalse(route_row["guard_value_measurement"]["routing_decision_changed"])
         self.assertLessEqual(
             len(groups["venue_api_access"]["affected_instruments_top_10"]),
             summary["max_affected_instruments_per_group"],

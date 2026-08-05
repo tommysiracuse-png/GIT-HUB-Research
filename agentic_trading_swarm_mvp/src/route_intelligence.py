@@ -69,6 +69,14 @@ ROUTE_REQUIREMENT_FIELDS = (
     "route_requirement_checklist",
     "route_requirement_checklist_complete",
     "conditional_short_route_diagnostics",
+    "broker_permission_status",
+    "api_path_readiness",
+    "stale_data_status",
+    "stale_data_flags",
+    "route_requirement_gaps",
+    "route_requirement_gap_reason_codes",
+    "paper_sizing_guidance",
+    "guard_value_measurement",
 )
 
 # These are the route facts that an opportunity report must carry forward to a
@@ -291,8 +299,37 @@ def build_route_requirements_matrix(
                 "conditional_short_route_diagnostics": diagnostics,
             }
         )
+        annotated.update(_route_requirements_panel(normalized, annotated))
         rows.append(annotated)
     return sorted(rows, key=_route_priority_key)
+
+
+def build_route_requirements_annotation(opportunity: dict[str, Any]) -> dict[str, Any]:
+    """Return a read-only route-requirements tag for one paper candidate.
+
+    This is the candidate-facing form of the report panel.  It deliberately
+    describes evidence and counterfactual measurements only: callers may use
+    it for paper sizing review or guard-value analysis, but it does not alter
+    routing, eligibility, allocation, or execution semantics.
+    """
+
+    normalized = _route_requirement_opportunity(opportunity)
+    row = _build_route_requirement_row(normalized)
+    annotated = _annotate_route_feasibility_fields(normalized, row)
+    diagnostics = build_conditional_short_route_diagnostics(normalized, row=annotated)
+    annotated.update(
+        {
+            "borrow_availability_status": diagnostics["borrow_availability"],
+            "maker_fee_bps_or_unknown": diagnostics["maker_taker_fee_stack_bps"]["maker_bps"],
+            "taker_fee_bps_or_unknown": diagnostics["maker_taker_fee_stack_bps"]["taker_bps"],
+            "fee_stack_bps_estimate_or_unknown": diagnostics["maker_taker_fee_stack_bps"],
+            "margin_mode": diagnostics["margin_mode"],
+            "api_route_status": diagnostics["api_route_status"],
+            "minimum_liquidity_usd_or_unknown": diagnostics["minimum_liquidity_usd"],
+            "conditional_short_route_diagnostics": diagnostics,
+        }
+    )
+    return _route_requirements_panel(normalized, annotated)
 
 
 def build_conditional_short_route_diagnostics(
@@ -1082,6 +1119,113 @@ def _route_requirement_checklist_complete(checklist: Any) -> bool:
         if not isinstance(item, dict) or item.get("status") in (None, "") or "value" not in item:
             return False
     return True
+
+
+def _route_requirements_panel(
+    opportunity: dict[str, Any],
+    row: dict[str, Any],
+) -> dict[str, Any]:
+    """Project a matrix row into a non-blocking candidate/report panel."""
+
+    checklist = row.get("route_requirement_checklist")
+    checklist = checklist if isinstance(checklist, dict) else {}
+    category_statuses = {
+        category: str((checklist.get(category) or {}).get("status") or UNKNOWN)
+        for category in ROUTE_REQUIREMENT_CHECKLIST_FIELDS
+    }
+    gaps = [
+        category
+        for category, status in category_statuses.items()
+        if status.lower() in {UNKNOWN, "missing", "unconfirmed", "unavailable", "unsupported"}
+    ]
+    stale_data = _stale_data_diagnostics(opportunity)
+    if stale_data["status"] == "stale":
+        gaps.append("stale_data")
+    gaps = list(dict.fromkeys(gaps))
+    reason_codes = [f"{category}_gap" for category in gaps]
+    api_status = str(row.get("api_route_status") or UNKNOWN).strip().lower()
+    if api_status in {"available", "ready", "mapped", "confirmed"}:
+        api_path_readiness = "ready"
+    elif api_status in {"unknown", "unconfirmed", "not_checked", "public_data_only"}:
+        api_path_readiness = "unconfirmed"
+    elif api_status in {"missing", "unavailable", "unsupported", "blocked"}:
+        api_path_readiness = "unavailable"
+    else:
+        api_path_readiness = api_status or UNKNOWN
+
+    # These fields are intentionally recommendations for measurement consumers,
+    # not instructions to the router.  A gap can inform a paper-size experiment
+    # or a counterfactual guard-value calculation without excluding a candidate.
+    sizing_guidance = {
+        "paper_only": True,
+        "non_blocking": True,
+        "action": (
+            "retain_candidate_for_route_aware_paper_sizing_review"
+            if gaps
+            else "standard_paper_sizing_review"
+        ),
+        "route_requirement_gap_count": len(gaps),
+        "routing_decision_changed": False,
+    }
+    guard_value_measurement = {
+        "paper_only": True,
+        "non_blocking": True,
+        "measure": "route_requirement_gap_counterfactual",
+        "enabled": bool(gaps),
+        "gap_categories": list(gaps),
+        "routing_decision_changed": False,
+    }
+    return {
+        "broker_permission_status": category_statuses["broker_permissions"],
+        "api_path_readiness": api_path_readiness,
+        "stale_data_status": stale_data["status"],
+        "stale_data_flags": stale_data["flags"],
+        "route_requirement_gaps": gaps,
+        "route_requirement_gap_reason_codes": reason_codes,
+        "paper_sizing_guidance": sizing_guidance,
+        "guard_value_measurement": guard_value_measurement,
+    }
+
+
+def _stale_data_diagnostics(opportunity: dict[str, Any]) -> dict[str, Any]:
+    """Expose stale-data evidence without imposing a route or entry gate."""
+
+    flags: list[str] = []
+    freshness_state = str(
+        _first_known(opportunity, "freshness_state", "data_freshness_state")
+    ).strip().lower()
+    data_status = str(_first_known(opportunity, "data_status", "source_status")).strip().lower()
+    stale_minutes = _float_or_none(_first_known(opportunity, "stale_minutes"))
+    freshness_age_seconds = _float_or_none(
+        _first_known(opportunity, "freshness_age_seconds", "data_age_seconds")
+    )
+    stale_after_seconds = _float_or_none(
+        _first_known(opportunity, "stale_after_seconds", "max_freshness_age_seconds")
+    )
+
+    if freshness_state in {"stale", "dangerously_stale", "expired"}:
+        flags.append(f"freshness_state:{freshness_state}")
+    if data_status in {"stale", "expired"}:
+        flags.append(f"data_status:{data_status}")
+    if stale_minutes is not None and stale_minutes > 90.0:
+        flags.append("stale_minutes_over_90")
+    if (
+        freshness_age_seconds is not None
+        and stale_after_seconds is not None
+        and freshness_age_seconds > stale_after_seconds
+    ):
+        flags.append("freshness_age_exceeds_declared_limit")
+
+    if flags:
+        status = "stale"
+    elif any(
+        value not in (UNKNOWN, "")
+        for value in (freshness_state, data_status)
+    ) or stale_minutes is not None or freshness_age_seconds is not None:
+        status = "fresh"
+    else:
+        status = UNKNOWN
+    return {"status": status, "flags": flags}
 
 
 def _paper_route_confidence(

@@ -36,12 +36,14 @@ try:
     from route_intelligence import (
         build_conditional_short_route_intelligence,
         build_conditional_short_route_diagnostics,
+        build_route_requirements_annotation,
         build_route_requirements_report,
     )
 except ModuleNotFoundError:  # pragma: no cover - package import fallback
     from .route_intelligence import (
         build_conditional_short_route_intelligence,
         build_conditional_short_route_diagnostics,
+        build_route_requirements_annotation,
         build_route_requirements_report,
     )
 
@@ -2048,6 +2050,9 @@ def enrich_candidate_with_route(
     )
     diagnostic_input["conditional_short_route_intelligence"] = conditional_short_route_intelligence
     conditional_short_diagnostics = build_conditional_short_route_diagnostics(diagnostic_input)
+    route_requirements_input = dict(diagnostic_input)
+    route_requirements_input["execution_route"] = route
+    route_requirements_annotation = build_route_requirements_annotation(route_requirements_input)
     eligibility = _conditional_short_paper_observation_eligibility(
         eligibility,
         conditional_short_route_intelligence,
@@ -2058,6 +2063,7 @@ def enrich_candidate_with_route(
     route["route_feasibility_score"] = route_feasibility_score
     route["conditional_short_route_intelligence"] = conditional_short_route_intelligence
     route["conditional_short_route_diagnostics"] = conditional_short_diagnostics
+    route["route_requirements_panel"] = route_requirements_annotation
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
     route["paper_route_registry"] = enriched["paper_route_registry"]
@@ -2115,6 +2121,7 @@ def enrich_candidate_with_route(
             "rank_contribution": eligibility["rank_contribution"],
             "conditional_short_route_intelligence": conditional_short_route_intelligence,
             "conditional_short_route_diagnostics": conditional_short_diagnostics,
+            "route_requirements_panel": route_requirements_annotation,
         }
     )
     enriched["execution_feasibility"] = existing
@@ -2138,6 +2145,22 @@ def enrich_candidate_with_route(
     enriched["rank_contribution"] = eligibility["rank_contribution"]
     enriched["conditional_short_route_intelligence"] = conditional_short_route_intelligence
     enriched["conditional_short_route_diagnostics"] = conditional_short_diagnostics
+    # Read-only candidate tags for paper sizing and route-guard value
+    # measurement.  They intentionally do not feed route eligibility, score,
+    # allocation, or any order path.
+    enriched["route_requirements_panel"] = route_requirements_annotation
+    enriched["route_requirement_gaps"] = list(
+        route_requirements_annotation["route_requirement_gaps"]
+    )
+    enriched["route_requirement_gap_reason_codes"] = list(
+        route_requirements_annotation["route_requirement_gap_reason_codes"]
+    )
+    enriched["paper_route_sizing_guidance"] = dict(
+        route_requirements_annotation["paper_sizing_guidance"]
+    )
+    enriched["paper_route_guard_value_measurement"] = dict(
+        route_requirements_annotation["guard_value_measurement"]
+    )
     if eligibility["suppressed"]:
         if "score" in enriched:
             enriched.setdefault(
@@ -2854,13 +2877,15 @@ def _route_requirements_intel_markdown(requirements_intel: dict) -> list[str]:
         "inst_id",
         "direction",
         "required_permissions",
-        "borrow_required",
-        "borrow_fee_bps_estimate_or_unknown",
-        "fee_bps_per_side_or_unknown",
-        "margin_required",
-        "endpoint_constraints",
-        "venue_api_requirement",
-        "paper_recommendation_action",
+        "broker_permission_status",
+        "borrow_availability_status",
+        "fee_stack_bps_estimate_or_unknown",
+        "margin_mode",
+        "api_path_readiness",
+        "stale_data_flags",
+        "route_requirement_gaps",
+        "paper_sizing_guidance",
+        "guard_value_measurement",
     )
     lines = [
         "## Pre-Promotion Route Requirements Intel",
