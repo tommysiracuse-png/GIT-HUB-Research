@@ -2060,6 +2060,9 @@ def enrich_candidate_with_route(
         route=route,
         annotation=route_requirements_annotation,
     )
+    frontier_short_spot_route_intelligence = dict(
+        paper_route_requirement_report["frontier_short_spot_route_intelligence"]
+    )
     eligibility = _conditional_short_paper_observation_eligibility(
         eligibility,
         conditional_short_route_intelligence,
@@ -2072,6 +2075,7 @@ def enrich_candidate_with_route(
     route["conditional_short_route_diagnostics"] = conditional_short_diagnostics
     route["route_requirements_panel"] = route_requirements_annotation
     route["paper_route_requirement_report"] = paper_route_requirement_report
+    route["frontier_short_spot_route_intelligence"] = frontier_short_spot_route_intelligence
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
     route["paper_route_registry"] = enriched["paper_route_registry"]
@@ -2131,6 +2135,7 @@ def enrich_candidate_with_route(
             "conditional_short_route_diagnostics": conditional_short_diagnostics,
             "route_requirements_panel": route_requirements_annotation,
             "paper_route_requirement_report": paper_route_requirement_report,
+            "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
         }
     )
     enriched["execution_feasibility"] = existing
@@ -2158,6 +2163,9 @@ def enrich_candidate_with_route(
     # candidate/route facts on every enrichment pass and is the common source
     # for route-aware ranking and sizing.
     enriched["paper_route_requirement_report"] = paper_route_requirement_report
+    enriched["frontier_short_spot_route_intelligence"] = frontier_short_spot_route_intelligence
+    enriched["route_validation_status"] = frontier_short_spot_route_intelligence["route_validation_status"]
+    enriched["route_validation_notes"] = list(frontier_short_spot_route_intelligence["route_validation_notes"])
     # Read-only candidate tags for paper sizing and route-guard value
     # measurement.  They intentionally do not feed route eligibility.
     enriched["route_requirements_panel"] = route_requirements_annotation
@@ -2905,6 +2913,9 @@ def _route_requirements_intel_markdown(requirements_intel: dict) -> list[str]:
         "fee_stack_bps_estimate_or_unknown",
         "margin_mode",
         "api_path_readiness",
+        "route_validation_status",
+        "freshness_latency_status",
+        "freshness_latency_notes",
         "stale_data_flags",
         "route_requirement_gaps",
         "paper_sizing_guidance",

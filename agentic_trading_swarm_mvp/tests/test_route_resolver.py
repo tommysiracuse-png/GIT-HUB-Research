@@ -99,6 +99,14 @@ class RouteResolverTests(unittest.TestCase):
         self.assertGreater(enriched["score"], 0.0)
         self.assertLess(enriched["score"], 80.0)
         self.assertFalse(enriched.get("paper_entry_blocked", False))
+        frontier_intelligence = enriched["frontier_short_spot_route_intelligence"]
+        self.assertEqual("needs route validation", frontier_intelligence["route_validation_status"])
+        self.assertFalse(frontier_intelligence["entry_blocked"])
+        self.assertEqual(10, frontier_intelligence["fee_estimates"]["taker_fee_bps"])
+        self.assertEqual(
+            frontier_intelligence,
+            enriched["execution_route"]["frontier_short_spot_route_intelligence"],
+        )
 
     def test_enrichment_tags_requirements_gaps_without_changing_route_decision(self) -> None:
         candidate = {

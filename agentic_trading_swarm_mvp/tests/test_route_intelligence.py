@@ -14,6 +14,7 @@ from route_intelligence import (  # noqa: E402
     ROUTE_REQUIREMENT_FIELDS,
     build_conditional_short_route_intelligence,
     build_conditional_short_route_diagnostics,
+    build_frontier_short_spot_route_intelligence,
     build_paper_route_requirement_report,
     build_route_requirements_annotation,
     build_route_requirements_matrix,
@@ -23,6 +24,66 @@ from route_intelligence import (  # noqa: E402
 
 
 class RouteIntelligenceTests(unittest.TestCase):
+    def test_frontier_short_spot_pass_attaches_route_validation_and_quote_notes(self) -> None:
+        intelligence = build_frontier_short_spot_route_intelligence(
+            {
+                "venue": "BITSO",
+                "inst_id": "BITSO:BTC-MXN",
+                "direction": "short_frontier_spot",
+                "route_status": "conditional",
+                "required_permissions": ["crypto_spot", "margin_spot", "spot_borrow"],
+                "route_blockers": ["spot_borrow"],
+                "borrow_available": "unknown",
+                "maker_fee_bps": 2.0,
+                "taker_fee_bps": 8.0,
+                "margin_mode": "required_unconfirmed",
+                "api_access_status": "public_data_only",
+                "freshness_state": "fresh",
+                "freshness_age_seconds": 4.0,
+                "latency_ms": 31.5,
+                "depth_latency_ms": 44.0,
+            }
+        )
+
+        self.assertTrue(intelligence["paper_only"])
+        self.assertTrue(intelligence["read_only"])
+        self.assertTrue(intelligence["applies"])
+        self.assertEqual(
+            ["crypto_spot", "margin_spot", "spot_borrow"],
+            intelligence["broker_permissions"],
+        )
+        self.assertEqual("unconfirmed", intelligence["borrow_availability"])
+        self.assertEqual(8.0, intelligence["fee_estimates"]["taker_fee_bps"])
+        self.assertEqual("required_unconfirmed", intelligence["margin_mode"])
+        self.assertEqual("public_data_only", intelligence["api_route_status"])
+        self.assertEqual("needs route validation", intelligence["route_validation_status"])
+        self.assertIn("latency_ms:31.5", intelligence["freshness_latency_notes"])
+        self.assertIn("depth_latency_ms:44.0", intelligence["freshness_latency_notes"])
+        self.assertFalse(intelligence["hard_blocking"])
+        self.assertFalse(intelligence["entry_blocked"])
+
+    def test_frontier_short_spot_validation_is_visible_in_the_paper_matrix(self) -> None:
+        candidate = {
+            "venue": "BITSO",
+            "inst_id": "BITSO:BTC-MXN",
+            "direction": "short_frontier_spot",
+            "route_status": "conditional",
+            "route_blockers": ["spot_borrow"],
+            "required_permissions": ["crypto_spot", "spot_borrow"],
+            "api_access_status": "public_data_only",
+            "freshness_state": "fresh",
+            "latency_ms": 19.0,
+        }
+
+        row = build_route_requirements_matrix([candidate])[0]
+        markdown = render_route_requirements_markdown([candidate])
+
+        self.assertEqual("needs route validation", row["route_validation_status"])
+        self.assertIn("borrow_availability", row["frontier_short_spot_route_intelligence"]["missing_route_metadata"])
+        self.assertIn("latency_ms:19.0", row["freshness_latency_notes"])
+        self.assertIn("route_validation_status", markdown)
+        self.assertIn("needs route validation", markdown)
+
     def test_short_proxy_report_is_non_blocking_and_supplies_rank_and_size(self) -> None:
         report = build_paper_route_requirement_report(
             {

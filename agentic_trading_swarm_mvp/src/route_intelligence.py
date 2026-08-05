@@ -77,6 +77,11 @@ ROUTE_REQUIREMENT_FIELDS = (
     "route_requirement_gap_reason_codes",
     "paper_sizing_guidance",
     "guard_value_measurement",
+    "frontier_short_spot_route_intelligence",
+    "route_validation_status",
+    "route_validation_notes",
+    "freshness_latency_status",
+    "freshness_latency_notes",
 )
 
 # These are the route facts that an opportunity report must carry forward to a
@@ -299,7 +304,22 @@ def build_route_requirements_matrix(
                 "conditional_short_route_diagnostics": diagnostics,
             }
         )
-        annotated.update(_route_requirements_panel(normalized, annotated))
+        panel = _route_requirements_panel(normalized, annotated)
+        annotated.update(panel)
+        frontier_intelligence = build_frontier_short_spot_route_intelligence(
+            normalized,
+            annotation=panel,
+            diagnostics=diagnostics,
+        )
+        annotated.update(
+            {
+                "frontier_short_spot_route_intelligence": frontier_intelligence,
+                "route_validation_status": frontier_intelligence["route_validation_status"],
+                "route_validation_notes": frontier_intelligence["route_validation_notes"],
+                "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
+                "freshness_latency_notes": frontier_intelligence["freshness_latency_notes"],
+            }
+        )
         rows.append(annotated)
     return sorted(rows, key=_route_priority_key)
 
@@ -329,7 +349,20 @@ def build_route_requirements_annotation(opportunity: dict[str, Any]) -> dict[str
             "conditional_short_route_diagnostics": diagnostics,
         }
     )
-    return _route_requirements_panel(normalized, annotated)
+    panel = _route_requirements_panel(normalized, annotated)
+    frontier_intelligence = build_frontier_short_spot_route_intelligence(
+        normalized,
+        annotation=panel,
+        diagnostics=diagnostics,
+    )
+    return {
+        **panel,
+        "frontier_short_spot_route_intelligence": frontier_intelligence,
+        "route_validation_status": frontier_intelligence["route_validation_status"],
+        "route_validation_notes": frontier_intelligence["route_validation_notes"],
+        "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
+        "freshness_latency_notes": frontier_intelligence["freshness_latency_notes"],
+    }
 
 
 def build_conditional_short_route_diagnostics(
@@ -529,6 +562,12 @@ def build_paper_route_requirement_report(
             "routing_decision_changed": False,
         }
     )
+    frontier_short_spot_route_intelligence = build_frontier_short_spot_route_intelligence(
+        source,
+        route=resolved_route,
+        annotation=panel,
+        diagnostics=diagnostics,
+    )
     return {
         "report_version": "paper_route_requirements_v1",
         "paper_only": True,
@@ -542,6 +581,108 @@ def build_paper_route_requirement_report(
         "paper_rank_multiplier": rank_multiplier,
         "paper_allocation_multiplier": rank_multiplier,
         "paper_sizing_guidance": sizing_guidance,
+        "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
+        "hard_blocking": False,
+        "entry_blocked": False,
+        "routing_decision_changed": False,
+    }
+
+
+def build_frontier_short_spot_route_intelligence(
+    opportunity: dict[str, Any],
+    *,
+    route: dict[str, Any] | None = None,
+    annotation: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project read-only route facts for a frontier spot-short candidate.
+
+    This pass only reads the candidate, maintained route registry data, and
+    public-observation metadata already attached by the scanner.  It makes
+    incomplete route facts explicit as ``needs route validation`` while
+    retaining the candidate for paper exploration.
+    """
+
+    source = dict(opportunity or {})
+    resolved_route = dict(route or {})
+    for key in (
+        "route_status",
+        "route_blockers",
+        "required_permissions",
+        "borrow_status",
+        "margin_required",
+        "api_access_status",
+    ):
+        if source.get(key) in (None, "", [], {}):
+            source[key] = resolved_route.get(key)
+    direction = str(
+        resolved_route.get("direction") or source.get("direction") or UNKNOWN
+    ).strip().lower()
+    applies = direction == "short_frontier_spot"
+    panel = dict(annotation or build_route_requirements_annotation(source))
+    route_diagnostics = dict(diagnostics or build_conditional_short_route_diagnostics(source))
+    blockers = _route_blockers(source)
+    broker_permissions = _route_required_permissions(source, blockers)
+    if broker_permissions == UNKNOWN:
+        broker_permissions = resolved_route.get("required_permissions", UNKNOWN)
+    broker_permission_status = panel.get("broker_permission_status", UNKNOWN)
+    if broker_permission_status == UNKNOWN and broker_permissions not in (UNKNOWN, None, "", [], {}):
+        broker_permission_status = "needs_route_validation"
+
+    fee_estimates = {
+        "maker_fee_bps": route_diagnostics.get("maker_taker_fee_stack_bps", {}).get("maker_bps", UNKNOWN),
+        "taker_fee_bps": route_diagnostics.get("maker_taker_fee_stack_bps", {}).get("taker_bps", UNKNOWN),
+        "estimated_round_trip_taker_bps": route_diagnostics.get("maker_taker_fee_stack_bps", {}).get(
+            "estimated_round_trip_taker_bps", UNKNOWN
+        ),
+        "borrow_fee_bps": route_diagnostics.get("estimated_borrow_fee_bps", UNKNOWN),
+    }
+    route_metadata = {
+        "broker_permissions": broker_permissions,
+        "broker_permission_status": broker_permission_status,
+        "borrow_availability": route_diagnostics.get("borrow_availability", UNKNOWN),
+        "fee_estimates": fee_estimates,
+        "margin_mode": route_diagnostics.get("margin_mode", UNKNOWN),
+        "api_route_status": route_diagnostics.get("api_route_status", UNKNOWN),
+    }
+    missing_route_metadata = []
+    if applies:
+        for field, value in route_metadata.items():
+            if field == "fee_estimates":
+                values = value.values()
+                incomplete = all(_route_metadata_unconfirmed(item) for item in values)
+            else:
+                incomplete = _route_metadata_unconfirmed(value)
+            if incomplete:
+                missing_route_metadata.append(field)
+
+    freshness_latency = _freshness_latency_notes(source)
+    validation_status = (
+        "needs route validation"
+        if applies and missing_route_metadata
+        else "route metadata observed"
+        if applies
+        else "not_applicable"
+    )
+    validation_notes = []
+    if applies and missing_route_metadata:
+        validation_notes.append(
+            "Missing route metadata is a read-only paper diagnostic; paper testing remains eligible."
+        )
+    if applies and freshness_latency["status"] != "observed":
+        validation_notes.append(
+            "Freshness/latency evidence is incomplete and should be reviewed during route validation."
+        )
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "applies": applies,
+        **route_metadata,
+        "freshness_latency_status": freshness_latency["status"],
+        "freshness_latency_notes": freshness_latency["notes"],
+        "missing_route_metadata": missing_route_metadata,
+        "route_validation_status": validation_status,
+        "route_validation_notes": validation_notes,
         "hard_blocking": False,
         "entry_blocked": False,
         "routing_decision_changed": False,
@@ -621,7 +762,7 @@ def build_route_requirements_report(
                 "checklist field; unknown values remain read-only diagnostics "
                 "and do not suppress the underlying paper opportunity."
             ),
-            "missing_checklist_action": "hold_paper_recommendation",
+            "missing_checklist_action": "needs_route_validation",
         },
         "promotion_review": {
             "required_before_route_promotion": True,
@@ -1310,6 +1451,61 @@ def _stale_data_diagnostics(opportunity: dict[str, Any]) -> dict[str, Any]:
     else:
         status = UNKNOWN
     return {"status": status, "flags": flags}
+
+
+def _route_metadata_unconfirmed(value: Any) -> bool:
+    """Return whether a route fact still needs read-only validation."""
+
+    if value in (None, "", [], {}, ()):
+        return True
+    return str(value).strip().lower() in {
+        UNKNOWN,
+        "needs_route_validation",
+        "unconfirmed",
+        "required_unconfirmed",
+        "not_checked",
+        "not_applicable",
+        "missing",
+        "unavailable",
+        "unsupported",
+        "blocked",
+        "public_data_only",
+    }
+
+
+def _freshness_latency_notes(opportunity: dict[str, Any]) -> dict[str, Any]:
+    """Summarize existing quote freshness and latency without setting a gate."""
+
+    notes: list[str] = []
+    freshness_state = _first_known(opportunity, "freshness_state", "data_freshness_state")
+    freshness_age = _float_or_none(
+        _first_known(opportunity, "freshness_age_seconds", "data_age_seconds")
+    )
+    quote_age = _float_or_none(_first_known(opportunity, "quote_age_ms"))
+    latency = _float_or_none(_first_known(opportunity, "latency_ms", "fetch_latency_ms"))
+    depth_latency = _float_or_none(_first_known(opportunity, "depth_latency_ms"))
+    stale = _stale_data_diagnostics(opportunity)
+
+    if freshness_state != UNKNOWN:
+        notes.append(f"freshness_state:{freshness_state}")
+    if freshness_age is not None:
+        notes.append(f"freshness_age_seconds:{round(freshness_age, 3)}")
+    if quote_age is not None:
+        notes.append(f"quote_age_ms:{round(quote_age, 3)}")
+    if latency is not None:
+        notes.append(f"latency_ms:{round(latency, 3)}")
+    if depth_latency is not None:
+        notes.append(f"depth_latency_ms:{round(depth_latency, 3)}")
+    notes.extend(f"freshness_flag:{flag}" for flag in stale["flags"])
+
+    if stale["status"] == "stale":
+        status = "stale"
+    elif notes:
+        status = "observed"
+    else:
+        status = UNKNOWN
+        notes.append("freshness_latency_metadata_unavailable")
+    return {"status": status, "notes": list(dict.fromkeys(notes))}
 
 
 def _paper_route_confidence(
