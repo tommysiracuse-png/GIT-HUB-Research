@@ -13,7 +13,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from src import storage
-from src.frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
+from src.frontier_data_quality import (
+    paper_only_yahoo_proxy_crypto_lineage_quarantine,
+    paper_only_yahoo_proxy_cross_surface_alignment_guard,
+)
 from src.paper_order_router import apply_frontier_paper_guard
 from src.settings import DEFAULT_SETTINGS
 
@@ -69,6 +72,45 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         }
         proof.update(overrides)
         return proof
+
+    def test_explicit_family_root_okx_remap_is_shadow_quarantined_with_diagnostics(self) -> None:
+        candidate = cross_surface_candidate(
+            family_root="YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
+            target_surface="OKX",
+            native_surface={"closed_count": 176, "avg_pnl_bps": -3.9},
+            remapped_okx={"closed_count": 48, "avg_pnl_bps": -7.1},
+        )
+
+        review = paper_only_yahoo_proxy_crypto_lineage_quarantine(candidate)
+        guarded = apply_frontier_paper_guard(candidate)
+
+        self.assertTrue(review["applies"])
+        self.assertTrue(review["quarantined"])
+        self.assertEqual("shadow_quarantined", review["status"])
+        self.assertIn("native_surface_positive", review["failed_checks"])
+        self.assertTrue(
+            paper_only_yahoo_proxy_cross_surface_alignment_guard(candidate)["emit_recommendation"]
+        )
+        self.assertTrue(guarded["paper_fill_allowed"])
+        self.assertFalse(guarded["promotion_eligible"])
+        self.assertEqual("shadow_quarantined", guarded["paper_quarantine_status"])
+        self.assertEqual("synthetic_paper", guarded["paper_execution_mode"])
+
+    def test_explicit_family_root_releases_only_after_comparative_positive_samples(self) -> None:
+        review = paper_only_yahoo_proxy_crypto_lineage_quarantine(
+            {
+                "execution_mode": "paper",
+                "family_root": "YAHOO_PROXY|global_proxy_momentum|recovered",
+                "target_surface": "OKX_SPOT",
+                "native_surface": {"closed_count": 24, "avg_pnl_bps": 1.5},
+                "remapped_okx_spot": {"closed_count": 22, "avg_pnl_bps": 1.5},
+            }
+        )
+
+        self.assertTrue(review["applies"])
+        self.assertFalse(review["quarantined"])
+        self.assertTrue(review["eligible"])
+        self.assertEqual([], review["failed_checks"])
 
     def test_local_quality_is_diagnostic_but_cannot_release_route(self) -> None:
         aligned = paper_only_yahoo_proxy_cross_surface_alignment_guard(cross_surface_candidate())

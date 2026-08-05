@@ -608,6 +608,163 @@ _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY = {
     ),
 }
 
+_PAPER_ONLY_YAHOO_CRYPTO_LINEAGE_QUARANTINE_POLICY = {
+    "family_root": "YAHOO_PROXY|global_proxy_momentum",
+    "target_surfaces": ("OKX", "OKX_SPOT"),
+    "min_closed_count": 20,
+}
+
+
+def paper_only_yahoo_proxy_crypto_lineage_quarantine(record, profile=None):
+    """Quarantine explicit Yahoo-momentum remaps until comparative evidence recovers.
+
+    This deliberately keys off the structured ``family_root`` and
+    ``target_surface`` fields used by variant generation. It is separate from
+    the broader alignment guard because a remap must demonstrate both a
+    positive native family and a meaningful target sample that is no worse
+    than that native result before it can leave paper shadow quarantine.
+    """
+
+    record = record if isinstance(record, dict) else {}
+    profile = profile if isinstance(profile, dict) else {}
+    containers = [record]
+    for root in (record, profile):
+        for key in (
+            "candidate",
+            "destination_context",
+            "route_context",
+            "recommendation_lineage",
+            "lineage_context",
+            "source_context",
+        ):
+            nested = root.get(key) if isinstance(root, dict) else None
+            if isinstance(nested, dict):
+                containers.append(nested)
+
+    def _first(*keys):
+        for container in containers:
+            for key in keys:
+                value = container.get(key)
+                if value not in (None, "", [], {}, ()):
+                    return value
+        return None
+
+    def _number(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if math.isfinite(numeric) else None
+
+    def _performance(*keys):
+        evidence = _first(*keys)
+        evidence = evidence if isinstance(evidence, dict) else {}
+        closed_count = _number(
+            _paper_only_route_intelligence_first(
+                evidence, ("closed_count", "closed_trades", "sample_size", "trade_count")
+            )
+        )
+        expectancy = _number(
+            _paper_only_route_intelligence_first(
+                evidence,
+                (
+                    "avg_pnl_bps",
+                    "expectancy_net_bps",
+                    "net_expectancy_bps",
+                    "after_cost_expectancy_bps",
+                ),
+            )
+        )
+        return {
+            "closed_count": int(closed_count) if closed_count is not None else None,
+            "avg_pnl_bps": expectancy,
+            "evidence": evidence or None,
+        }
+
+    family_root = str(_first("family_root", "source_family_root", "parent_family_root") or "").strip()
+    expected_root = _PAPER_ONLY_YAHOO_CRYPTO_LINEAGE_QUARANTINE_POLICY["family_root"].upper()
+    root_matches = family_root.upper().startswith(expected_root)
+    target_surface = str(
+        _first("target_surface", "destination_surface", "execution_surface") or ""
+    ).strip().upper().replace("-", "_")
+    target_matches = target_surface in _PAPER_ONLY_YAHOO_CRYPTO_LINEAGE_QUARANTINE_POLICY[
+        "target_surfaces"
+    ]
+    execution_mode = str(
+        _first("execution_mode", "trading_mode", "mode", "runner_mode") or "paper"
+    ).strip().lower().replace("-", "_")
+    paper_mode = execution_mode in {"paper", "paper_only", "simulation", "sim", "review", ""}
+    applies = bool(root_matches and target_matches and paper_mode)
+
+    native = _performance(
+        "native_surface",
+        "native_surface_paper_evidence",
+        "native_yahoo_proxy_paper_evidence",
+        "family_health",
+        "source_family_paper_stats",
+    )
+    remapped_keys = (
+        ("remapped_okx_spot", "target_surface_paper_evidence", "remapped_paper_evidence")
+        if target_surface == "OKX_SPOT"
+        else ("remapped_okx", "target_surface_paper_evidence", "remapped_paper_evidence")
+    )
+    remapped = _performance(*remapped_keys)
+    min_closed_count = _PAPER_ONLY_YAHOO_CRYPTO_LINEAGE_QUARANTINE_POLICY["min_closed_count"]
+    native_sample_meaningful = bool(
+        native["closed_count"] is not None and native["closed_count"] >= min_closed_count
+    )
+    remapped_sample_meaningful = bool(
+        remapped["closed_count"] is not None and remapped["closed_count"] >= min_closed_count
+    )
+    native_positive = bool(native["avg_pnl_bps"] is not None and native["avg_pnl_bps"] > 0.0)
+    remapped_no_worse = bool(
+        remapped["avg_pnl_bps"] is not None
+        and native["avg_pnl_bps"] is not None
+        and remapped["avg_pnl_bps"] >= native["avg_pnl_bps"]
+    )
+    recovered = bool(
+        native_sample_meaningful
+        and remapped_sample_meaningful
+        and native_positive
+        and remapped_no_worse
+    )
+    quarantined = bool(applies and not recovered)
+    checks = {
+        "native_surface_meaningful_closed_sample": native_sample_meaningful,
+        "native_surface_positive": native_positive,
+        "remapped_surface_meaningful_closed_sample": remapped_sample_meaningful,
+        "remapped_outcomes_no_worse_than_native": remapped_no_worse,
+    }
+    return {
+        "guard": "paper_only_yahoo_proxy_crypto_lineage_quarantine",
+        "paper_only": True,
+        "applies": applies,
+        "eligible": not quarantined,
+        "quarantined": quarantined,
+        "status": "shadow_quarantined" if quarantined else "eligible",
+        "reason": (
+            "yahoo_proxy_crypto_remap_shadow_quarantined"
+            if quarantined
+            else "yahoo_proxy_crypto_remap_recovered"
+            if applies
+            else "not_applicable"
+        ),
+        "family_root": family_root or None,
+        "target_surface": target_surface or None,
+        "native_surface": native,
+        "remapped_surface": remapped,
+        "min_closed_count": min_closed_count,
+        "checks": checks,
+        "failed_checks": [name for name, passed in checks.items() if not passed],
+        "release_condition": (
+            "Native family paper performance is positive and both native and remapped "
+            "surfaces have meaningful closed-trade samples with remapped average PnL "
+            "no worse than native."
+        ),
+    }
+
 def paper_only_yahoo_proxy_okx_target_review(record, profile=None):
     """Classify the destination for the bounded Yahoo-to-OKX quarantine.
 
@@ -1303,7 +1460,7 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
             _profile_lookup("execution_mode", "trading_mode", "mode", "destination_mode", "runner_mode")
         )
     paper_mode = execution_mode in {None, "paper", "paper_only", "simulation", "sim", "review"}
-    applies = bool(
+    alignment_applies = bool(
         enabled
         and paper_mode
         and source_is_proxy
@@ -1311,6 +1468,8 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         and target_surface_evidence.get("applies")
         and not destination_is_native_proxy
     )
+    lineage_quarantine = paper_only_yahoo_proxy_crypto_lineage_quarantine(record, profile)
+    applies = bool(alignment_applies or lineage_quarantine["applies"])
 
     direction_value = _paper_only_route_intelligence_tag(
         _lookup("destination_direction", "candidate_direction", "position_side", "direction", "side")
@@ -1564,8 +1723,8 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
     # The transplant is released only when the source itself is robust and a
     # separate destination observation confirms executable local conditions.
     # Exact-surface paper outcomes remain an additional portability safeguard.
-    eligible = bool(
-        not applies
+    alignment_eligible = bool(
+        not alignment_applies
         or (
             target_surface_evidence.get("eligible")
             and native_regime_decisively_positive
@@ -1573,23 +1732,30 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
             and local_confirmation_passed
         )
     )
+    # A lineage quarantine is a promotion hold, not an experiment veto. Keep
+    # the paper candidate priceable so remapped outcomes continue to refresh.
+    eligible = bool(lineage_quarantine["applies"] or (
+        lineage_quarantine["eligible"] and alignment_eligible
+    ))
     blocked = bool(applies and not eligible)
-    if not applies:
+    if lineage_quarantine["quarantined"]:
+        reason = lineage_quarantine["reason"]
+    elif not applies:
         reason = "disabled" if not enabled else "non_paper_mode" if not paper_mode else "not_applicable"
-    elif target_surface_evidence.get("source_target_incompatible"):
+    elif alignment_applies and target_surface_evidence.get("source_target_incompatible"):
         # Two negative realized legs identify an incompatibility between the
         # source and destination, rather than a transient threshold miss.
         reason = "yahoo_proxy_frontier_source_target_incompatible"
-    elif not native_regime_decisively_positive:
+    elif alignment_applies and not native_regime_decisively_positive:
         reason = "native_yahoo_proxy_regime_non_positive"
-    elif not native_regime_stable:
+    elif alignment_applies and not native_regime_stable:
         reason = "native_yahoo_proxy_regime_unstable"
-    elif not local_confirmation_passed:
+    elif alignment_applies and not local_confirmation_passed:
         reason = "local_frontier_confirmation_failed"
-    elif eligible:
+    elif alignment_applies and eligible:
         reason = "fresh_target_surface_paper_evidence_validated"
     else:
-        reason = "yahoo_proxy_cross_surface_quarantined"
+        reason = lineage_quarantine["reason"] if lineage_quarantine["applies"] else "yahoo_proxy_cross_surface_quarantined"
 
     if direction is None:
         alignment_reason = "missing_destination_direction"
@@ -1628,7 +1794,7 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "entry_allowed": eligible,
         "emit_recommendation": eligible,
         "emit_route": eligible,
-        "promotion_eligible": eligible,
+        "promotion_eligible": bool(eligible and not lineage_quarantine["quarantined"]),
         "creation_allowed": eligible,
         "paper_score_eligible": eligible,
         "paper_rank_eligible": eligible,
@@ -1638,16 +1804,24 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         # or emit a route until that exact-surface proof is fresh and meets
         # the configured quality thresholds.
         "sandbox_rank_eligible": bool(
-            not applies or target_surface_evidence.get("sandbox_rank_eligible", False)
+            not applies
+            or (
+                not lineage_quarantine["quarantined"]
+                and target_surface_evidence.get("sandbox_rank_eligible", False)
+            )
         ),
         "activation_allowed": eligible,
         "paper_allocation_multiplier": 1.0 if eligible else 0.0,
         "maximum_stage": (
-            target_surface_evidence.get("maximum_stage")
-            if applies
+            "shadow_quarantined"
+            if lineage_quarantine["quarantined"]
+            else target_surface_evidence.get("maximum_stage")
+            if alignment_applies
             else None
         ),
         "reason": reason,
+        "quarantine_status": lineage_quarantine.get("status") if lineage_quarantine["applies"] else None,
+        "lineage_quarantine": lineage_quarantine,
         "alignment_reason": alignment_reason,
         "source_family": (
             "yahoo_proxy"
@@ -1658,7 +1832,11 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         ),
         "signal_family": "global_proxy_momentum" if momentum_family else None,
         "destination_venue": destination_venue,
-        "target_surface": target_surface_evidence.get("target_surface") or target_review.get("target_surface"),
+        "target_surface": (
+            lineage_quarantine.get("target_surface")
+            or target_surface_evidence.get("target_surface")
+            or target_review.get("target_surface")
+        ),
         "quarantined_target_surfaces": quarantined_target_surfaces,
         "allow_native_proxy_monitoring": target_review.get("allow_native_proxy_monitoring"),
         "reenable_condition": target_review.get("reenable_condition"),
@@ -1687,7 +1865,13 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "local_confirmation_passed": local_confirmation_passed,
         "entry_was_confirmed": entry_was_confirmed,
         "force_paper_exit": force_paper_exit,
-        "exit_reason": "yahoo_proxy_cross_surface_quarantined" if force_paper_exit else None,
+        "exit_reason": (
+            reason
+            if force_paper_exit and lineage_quarantine["quarantined"]
+            else "yahoo_proxy_cross_surface_quarantined"
+            if force_paper_exit
+            else None
+        ),
     }
 
 

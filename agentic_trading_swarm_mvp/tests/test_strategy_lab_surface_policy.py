@@ -297,6 +297,38 @@ class StrategyLabSurfacePolicyTests(unittest.TestCase):
         self.assertEqual("quarantined_surface_policy", row["status"])
         self.assertEqual("surface_quarantined", row["compile_status"])
 
+    def test_family_root_okx_spot_remap_is_logged_as_shadow_quarantined(self) -> None:
+        rec = recommendation()
+        experiment = rec["payload"]["strategy_lab_experiment"]
+        experiment["permitted_target_surface"] = ["OKX_SPOT"]
+        remap = candidate("BTC-USDT", "OKX_SPOT")
+        remap.update(
+            {
+                "family_root": "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
+                "native_surface": {"closed_count": 176, "avg_pnl_bps": -3.9},
+                "remapped_okx_spot": {"closed_count": 35, "avg_pnl_bps": -6.0},
+            }
+        )
+
+        with connection() as conn:
+            ingest_strategy_lab_recommendation(conn, rec)
+            generated, report = generate_strategy_lab_candidates(
+                conn, self.settings(), [remap]
+            )
+
+        self.assertEqual(["BTC-USDT"], [row["inst_id"] for row in generated])
+        self.assertEqual("shadow_quarantined", generated[0]["paper_quarantine_status"])
+        self.assertFalse(generated[0]["promotion_eligible"])
+        self.assertEqual("synthetic_paper", generated[0]["paper_execution_mode"])
+        self.assertEqual(1, report["proxy_frontier_quarantined_candidate_count"])
+        diagnostic = report["proxy_frontier_quarantined_candidates"][0]
+        self.assertEqual("shadow_quarantined", diagnostic["status"])
+        self.assertEqual("yahoo_proxy_crypto_remap_shadow_quarantined", diagnostic["reason"])
+        self.assertEqual(
+            "shadow_quarantined",
+            diagnostic["paper_diagnostics"]["status"],
+        )
+
     def test_incompatible_and_missing_targets_are_excluded_from_construction(self) -> None:
         with connection() as conn:
             ingest_strategy_lab_recommendation(conn, recommendation())

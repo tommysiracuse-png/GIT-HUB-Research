@@ -959,6 +959,15 @@ def frontier_shadow_filter_reason(
     alignment_guard = _paper_yahoo_proxy_cross_surface_alignment_guard(candidate, config)
     if (
         isinstance(alignment_guard, Mapping)
+        and alignment_guard.get("quarantine_status") == "shadow_quarantined"
+    ):
+        # This lineage status is intentionally observational. Keep a
+        # priceable synthetic-paper route available while withholding only
+        # promotion; weak paper results are diagnostic evidence, not a reason
+        # to suppress exploration.
+        return None
+    if (
+        isinstance(alignment_guard, Mapping)
         and _as_bool(alignment_guard.get("applies"), False)
         and not _as_bool(alignment_guard.get("eligible"), False)
     ):
@@ -1265,7 +1274,13 @@ def apply_frontier_paper_guard(
         guarded["local_cross_surface_confirmation"] = alignment_guard.get(
             "local_direction_confirmed"
         )
-        if not alignment_guard.get("eligible"):
+        if alignment_guard.get("quarantine_status") == "shadow_quarantined":
+            guarded["candidate_status"] = "shadow_quarantined"
+            guarded["paper_quarantine_status"] = "shadow_quarantined"
+            guarded["paper_shadow_diagnostics"] = dict(alignment_guard.get("lineage_quarantine") or {})
+            guarded["paper_execution_mode"] = "synthetic_paper"
+            guarded["promotion_eligible"] = False
+        elif not alignment_guard.get("eligible"):
             guarded["paper_entry_blocked"] = True
             guarded["promotion_eligible"] = False
             guarded["paper_allocation_multiplier"] = 0.0
@@ -1275,6 +1290,15 @@ def apply_frontier_paper_guard(
     guarded = _apply_route_feasibility_metadata(guarded) if (
         is_frontier_crypto_candidate(guarded) and route_guard_enabled
     ) else guarded
+    if isinstance(alignment_guard, Mapping) and alignment_guard.get("quarantine_status") == "shadow_quarantined":
+        guarded["candidate_status"] = "shadow_quarantined"
+        guarded["paper_quarantine_status"] = "shadow_quarantined"
+        guarded["paper_shadow_diagnostics"] = dict(alignment_guard.get("lineage_quarantine") or {})
+        guarded["paper_execution_mode"] = "synthetic_paper"
+        guarded["promotion_eligible"] = False
+        guarded["paper_fill_allowed"] = bool(
+            guarded.get("paper_fill_allowed_by_route", guarded.get("paper_fill_allowed", True))
+        )
     reason = frontier_shadow_filter_reason(guarded, config)
     if reason is not None:
         return _annotate_shadow_filtered_candidate(guarded, reason, "frontier_paper_guard")

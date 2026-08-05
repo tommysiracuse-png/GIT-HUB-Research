@@ -2722,10 +2722,11 @@ def generate_strategy_lab_candidates(
             candidate, settings
         )
         yahoo_lineage = paper_source_veto_record(candidate, {"mode": "paper"})
+        lineage_shadow = transplant_review.get("quarantine_status") == "shadow_quarantined"
         if (
-            yahoo_lineage is not None
+            (yahoo_lineage is not None or lineage_shadow)
             and transplant_review.get("applies")
-            and not transplant_review.get("eligible")
+            and (lineage_shadow or not transplant_review.get("eligible"))
         ):
             proxy_frontier_quarantined_candidates.append(
                 {
@@ -2736,6 +2737,8 @@ def generate_strategy_lab_candidates(
                     "market_key": candidate.get("market_key"),
                     "strategy_lab_id": candidate.get("strategy_lab_id"),
                     "reason": transplant_review.get("reason"),
+                    "status": transplant_review.get("quarantine_status") or "shadow_quarantined",
+                    "paper_diagnostics": transplant_review.get("lineage_quarantine"),
                     "failed_local_checks": [
                         key
                         for key, passed in (
@@ -2745,7 +2748,17 @@ def generate_strategy_lab_candidates(
                     ],
                 }
             )
-            continue
+            if yahoo_lineage is not None:
+                continue
+        if lineage_shadow:
+            candidate = {
+                **candidate,
+                "candidate_status": "shadow_quarantined",
+                "paper_quarantine_status": "shadow_quarantined",
+                "paper_shadow_diagnostics": transplant_review.get("lineage_quarantine"),
+                "paper_execution_mode": "synthetic_paper",
+                "promotion_eligible": False,
+            }
         source_rank_candidates.append(candidate)
     eligible_candidates, route_blocked, route_missing_counts, route_blocker_counts = (
         _paper_route_eligible_candidates(source_rank_candidates)
@@ -2884,10 +2897,11 @@ def generate_strategy_lab_candidates(
                 yahoo_lineage = paper_source_veto_record(
                     transplant_subject, {"mode": "paper"}
                 )
+                lineage_shadow = transplant_review.get("quarantine_status") == "shadow_quarantined"
                 if (
-                    yahoo_lineage is not None
+                    (yahoo_lineage is not None or lineage_shadow)
                     and transplant_review.get("applies")
-                    and not transplant_review.get("eligible")
+                    and (lineage_shadow or not transplant_review.get("eligible"))
                 ):
                     rejects[experiment_id]["proxy_frontier_quarantine"] += 1
                     proxy_frontier_quarantined_candidates.append(
@@ -2896,9 +2910,21 @@ def generate_strategy_lab_candidates(
                             "inst_id": candidate.get("inst_id"),
                             "venue": candidate.get("venue"),
                             "reason": transplant_review.get("reason"),
+                            "status": transplant_review.get("quarantine_status") or "shadow_quarantined",
+                            "paper_diagnostics": transplant_review.get("lineage_quarantine"),
                         }
                     )
-                    continue
+                    if yahoo_lineage is not None:
+                        continue
+                if lineage_shadow:
+                    candidate = {
+                        **candidate,
+                        "candidate_status": "shadow_quarantined",
+                        "paper_quarantine_status": "shadow_quarantined",
+                        "paper_shadow_diagnostics": transplant_review.get("lineage_quarantine"),
+                        "paper_execution_mode": "synthetic_paper",
+                        "promotion_eligible": False,
+                    }
                 admitted_program_candidates.append(candidate)
             program_candidates = admitted_program_candidates
             (
@@ -2991,10 +3017,11 @@ def generate_strategy_lab_candidates(
                 yahoo_lineage = paper_source_veto_record(
                     transplant_subject, {"mode": "paper"}
                 )
+                lineage_shadow = transplant_review.get("quarantine_status") == "shadow_quarantined"
                 if (
-                    yahoo_lineage is not None
+                    (yahoo_lineage is not None or lineage_shadow)
                     and transplant_review.get("applies")
-                    and not transplant_review.get("eligible")
+                    and (lineage_shadow or not transplant_review.get("eligible"))
                 ):
                     rejects[experiment["strategy_lab_id"]]["proxy_frontier_quarantine"] += 1
                     proxy_frontier_quarantined_candidates.append(
@@ -3003,9 +3030,18 @@ def generate_strategy_lab_candidates(
                             "inst_id": candidate.get("inst_id"),
                             "venue": candidate.get("venue"),
                             "reason": transplant_review.get("reason"),
+                            "status": transplant_review.get("quarantine_status") or "shadow_quarantined",
+                            "paper_diagnostics": transplant_review.get("lineage_quarantine"),
                         }
                     )
-                    continue
+                    if yahoo_lineage is not None:
+                        continue
+                if lineage_shadow:
+                    annotated["candidate_status"] = "shadow_quarantined"
+                    annotated["paper_quarantine_status"] = "shadow_quarantined"
+                    annotated["paper_shadow_diagnostics"] = transplant_review.get("lineage_quarantine")
+                    annotated["paper_execution_mode"] = "synthetic_paper"
+                    annotated["promotion_eligible"] = False
                 surface_rank_pool.append(annotated)
                 continue
             surface_quarantine_reasons[compatibility["reason"]] += 1
@@ -3152,6 +3188,17 @@ def generate_strategy_lab_candidates(
         )
     conn.commit()
 
+    proxy_frontier_quarantine_diagnostics = list(
+        {
+            (
+                str(item.get("inst_id") or ""),
+                str(item.get("venue") or ""),
+                str(item.get("reason") or ""),
+                str(item.get("status") or ""),
+            ): item
+            for item in proxy_frontier_quarantined_candidates
+        }.values()
+    )
     report = {
         "enabled": True,
         "generated_at": _utc(),
@@ -3174,9 +3221,9 @@ def generate_strategy_lab_candidates(
         ),
         "lineage_source_health_guarded_candidates": lineage_source_health_guarded_candidates[:20],
         "proxy_frontier_quarantined_candidate_count": len(
-            proxy_frontier_quarantined_candidates
+            proxy_frontier_quarantine_diagnostics
         ),
-        "proxy_frontier_quarantined_candidates": proxy_frontier_quarantined_candidates[:20],
+        "proxy_frontier_quarantined_candidates": proxy_frontier_quarantine_diagnostics[:20],
         "paper_source_veto_recovery": paper_source_veto_recovery_status(settings),
         "route_eligible_source_candidate_count": len(eligible_candidates),
         "route_ineligible_candidate_count": len(route_blocked),
