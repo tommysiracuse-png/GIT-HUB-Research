@@ -1452,11 +1452,28 @@ def rank_paper_candidates_by_context(
                 row["paper_context_ranking_reasons"] = list(attribution.get("ranking_reasons") or [])
         edge = _finite_float((attribution or {}).get("context_adjusted_expected_net_edge_bps"))
         score = _finite_float(row.get("score"))
+        route_economics = row.get("route_economics_telemetry")
+        route_economics = route_economics if isinstance(route_economics, Mapping) else {}
+        economics_applies = bool(route_economics.get("applies"))
+        economics_score = _finite_float(
+            (route_economics.get("ranking_hook") or {}).get("route_economics_rank_score")
+            if isinstance(route_economics.get("ranking_hook"), Mapping)
+            else row.get("route_economics_rank_score")
+        )
+        # Frontier spot shorts carry their route-economics snapshot before this
+        # ordering pass.  Use it only to break paper-ranking ties/priority; a
+        # missing or weak route fact remains an emitted candidate.
+        route_ordering_score = (
+            economics_score
+            if economics_applies and economics_score is not None
+            else (score if score is not None else float("-inf"))
+        )
         # Known net edge ranks ahead of gross-score-only rows; unknown data is
         # still retained and ordered by its existing paper score.
         row["_paper_context_rank_key"] = (
             1 if edge is not None else 0,
-            edge if edge is not None else (score if score is not None else float("-inf")),
+            edge if edge is not None else route_ordering_score,
+            route_ordering_score,
             score if score is not None else float("-inf"),
         )
         annotated.append(row)

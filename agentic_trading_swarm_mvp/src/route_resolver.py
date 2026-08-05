@@ -2088,6 +2088,9 @@ def enrich_candidate_with_route(
     frontier_short_spot_route_requirements_report = dict(
         paper_route_requirement_report["frontier_short_spot_route_requirements_report"]
     )
+    route_economics_telemetry = dict(
+        frontier_short_spot_route_intelligence.get("route_economics_telemetry") or {}
+    )
     eligibility = _conditional_short_paper_observation_eligibility(
         eligibility,
         conditional_short_route_intelligence,
@@ -2105,6 +2108,7 @@ def enrich_candidate_with_route(
     ]
     route["frontier_short_spot_route_intelligence"] = frontier_short_spot_route_intelligence
     route["frontier_short_spot_route_requirements_report"] = frontier_short_spot_route_requirements_report
+    route["route_economics_telemetry"] = route_economics_telemetry
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
     route["paper_route_registry"] = enriched["paper_route_registry"]
@@ -2169,6 +2173,7 @@ def enrich_candidate_with_route(
             ],
             "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
             "frontier_short_spot_route_requirements_report": frontier_short_spot_route_requirements_report,
+            "route_economics_telemetry": route_economics_telemetry,
             "route_requirement_extraction": route["route_requirement_extraction"],
             "route_recommendation_status": route["route_recommendation_status"],
             "route_actionability": route["route_actionability"],
@@ -2211,6 +2216,12 @@ def enrich_candidate_with_route(
     ]
     enriched["frontier_short_spot_route_intelligence"] = frontier_short_spot_route_intelligence
     enriched["frontier_short_spot_route_requirements_report"] = frontier_short_spot_route_requirements_report
+    # Route economics is collected before the paper-context ordering pass.  It
+    # is a read-only ordering hook and deliberately never feeds eligibility.
+    enriched["route_economics_telemetry"] = route_economics_telemetry
+    ranking_hook = route_economics_telemetry.get("ranking_hook")
+    if isinstance(ranking_hook, dict):
+        enriched["route_economics_rank_score"] = ranking_hook.get("route_economics_rank_score")
     enriched["route_validation_status"] = frontier_short_spot_route_intelligence["route_validation_status"]
     enriched["route_validation_notes"] = list(frontier_short_spot_route_intelligence["route_validation_notes"])
     # Read-only candidate tags for paper sizing and route-guard value

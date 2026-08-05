@@ -119,6 +119,42 @@ class RouteIntelligenceTests(unittest.TestCase):
         self.assertFalse(intelligence["hard_blocking"])
         self.assertFalse(intelligence["entry_blocked"])
 
+    def test_frontier_short_spot_telemetry_collects_economics_before_ranking(self) -> None:
+        intelligence = build_frontier_short_spot_route_intelligence(
+            {
+                "venue": "BITSO",
+                "inst_id": "BITSO:BTC-MXN",
+                "direction": "short_frontier_spot",
+                "borrow_available": True,
+                "borrow_fee_bps_estimate": 7.5,
+                "maker_fee_bps": 1.0,
+                "taker_fee_bps": 3.0,
+                "margin_mode": "isolated",
+                "is_shortable": True,
+                "api_access_status": "public_data_only",
+                "freshness_state": "fresh",
+                "freshness_age_seconds": 2.0,
+                "spread_bps": 4.0,
+                "estimated_slippage_bps": 1.5,
+            }
+        )
+
+        telemetry = intelligence["route_economics_telemetry"]
+        self.assertTrue(telemetry["paper_only"])
+        self.assertTrue(telemetry["prepared_before_ranking"])
+        self.assertEqual("available", telemetry["borrow"]["availability"])
+        self.assertEqual(7.5, telemetry["borrow"]["estimated_fee_bps"])
+        self.assertEqual(1.0, telemetry["fees"]["maker_bps"])
+        self.assertEqual(3.0, telemetry["fees"]["taker_bps"])
+        self.assertEqual("isolated", telemetry["margin"]["mode"])
+        self.assertEqual("available", telemetry["shortability_status"])
+        self.assertEqual("public_data_only", telemetry["shortability_api_status"])
+        self.assertEqual("observed", telemetry["quote_freshness"]["status"])
+        self.assertEqual(4.0, telemetry["market_impact_proxies"]["spread_bps"])
+        self.assertEqual(1.5, telemetry["market_impact_proxies"]["slippage_bps_per_side"])
+        self.assertEqual(0.0, telemetry["ranking_hook"]["score_adjustment"])
+        self.assertFalse(telemetry["entry_blocked"])
+
     def test_frontier_short_spot_validation_is_visible_in_the_paper_matrix(self) -> None:
         candidate = {
             "venue": "BITSO",

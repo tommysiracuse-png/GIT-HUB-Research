@@ -142,6 +142,33 @@ class RouteResolverTests(unittest.TestCase):
                     enriched["execution_route"]["frontier_short_spot_route_requirements_report"],
                 )
 
+    def test_frontier_short_economics_hook_orders_paper_review_without_blocking(self) -> None:
+        ranked = route_resolver.rank_paper_candidates_by_context(
+            [
+                {
+                    "inst_id": "MEXC:EXPENSIVE",
+                    "score": 99.0,
+                    "route_economics_telemetry": {
+                        "applies": True,
+                        "ranking_hook": {"route_economics_rank_score": 20.0},
+                    },
+                },
+                {
+                    "inst_id": "MEXC:PRICEABLE",
+                    "score": 5.0,
+                    "route_economics_telemetry": {
+                        "applies": True,
+                        "ranking_hook": {"route_economics_rank_score": 90.0},
+                    },
+                },
+            ],
+            settings(),
+        )
+
+        self.assertEqual("MEXC:PRICEABLE", ranked[0]["inst_id"])
+        self.assertEqual(2, len(ranked))
+        self.assertNotIn("paper_entry_blocked", ranked[1])
+
     def test_enrichment_tags_requirements_gaps_without_changing_route_decision(self) -> None:
         candidate = {
             "venue": "OKX",

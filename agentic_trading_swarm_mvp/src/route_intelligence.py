@@ -84,6 +84,7 @@ ROUTE_REQUIREMENT_FIELDS = (
     "guard_value_measurement",
     "frontier_short_spot_route_intelligence",
     "frontier_short_spot_route_requirements_report",
+    "route_economics_telemetry",
     "route_validation_status",
     "route_validation_notes",
     "freshness_latency_status",
@@ -506,6 +507,7 @@ def build_route_requirements_matrix(
             {
                 "frontier_short_spot_route_intelligence": frontier_intelligence,
                 "frontier_short_spot_route_requirements_report": frontier_requirements_report,
+                "route_economics_telemetry": frontier_intelligence["route_economics_telemetry"],
                 "route_validation_status": frontier_intelligence["route_validation_status"],
                 "route_validation_notes": frontier_intelligence["route_validation_notes"],
                 "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
@@ -811,6 +813,9 @@ def build_paper_route_requirement_report(
         "paper_sizing_guidance": sizing_guidance,
         "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
         "frontier_short_spot_route_requirements_report": frontier_short_spot_route_requirements_report,
+        "route_economics_telemetry": dict(
+            frontier_short_spot_route_intelligence.get("route_economics_telemetry") or {}
+        ),
         "route_requirement_summary": route_requirement_summary,
         "hard_blocking": False,
         "entry_blocked": False,
@@ -892,6 +897,12 @@ def build_frontier_short_spot_route_intelligence(
                 missing_route_metadata.append(field)
 
     freshness_latency = _freshness_latency_notes(source)
+    route_economics_telemetry = build_frontier_short_spot_route_telemetry(
+        source,
+        route=resolved_route,
+        diagnostics=route_diagnostics,
+        freshness_latency=freshness_latency,
+    )
     validation_status = (
         "needs route validation"
         if applies and missing_route_metadata
@@ -915,9 +926,148 @@ def build_frontier_short_spot_route_intelligence(
         **route_metadata,
         "freshness_latency_status": freshness_latency["status"],
         "freshness_latency_notes": freshness_latency["notes"],
+        "route_economics_telemetry": route_economics_telemetry,
         "missing_route_metadata": missing_route_metadata,
         "route_validation_status": validation_status,
         "route_validation_notes": validation_notes,
+        "hard_blocking": False,
+        "entry_blocked": False,
+        "routing_decision_changed": False,
+    }
+
+
+def build_frontier_short_spot_route_telemetry(
+    opportunity: dict[str, Any],
+    *,
+    route: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+    freshness_latency: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Collect pre-ranking economics evidence for a frontier spot short.
+
+    This is deliberately a projection of scanner and maintained-route facts;
+    it does not probe an account, venue, or order endpoint.  The score hook is
+    an ordering signal only.  It never changes candidate emission, paper-route
+    selection, or paper-entry eligibility.
+    """
+
+    source = dict(opportunity or {})
+    resolved_route = dict(route or {})
+    direction = str(
+        resolved_route.get("direction") or source.get("direction") or UNKNOWN
+    ).strip().lower()
+    applies = direction == "short_frontier_spot"
+    route_diagnostics = dict(diagnostics or build_conditional_short_route_diagnostics(source))
+    freshness = dict(freshness_latency or _freshness_latency_notes(source))
+
+    def number(*keys: str) -> float | str:
+        value = _numeric_field(source, *keys)
+        return value if value is not None else UNKNOWN
+
+    spread_bps = number("spread_bps", "effective_spread_bps", "quoted_spread_bps")
+    if spread_bps == UNKNOWN:
+        bid = _float_or_none(_first_known(source, "best_bid", "bid", "bid_price"))
+        ask = _float_or_none(_first_known(source, "best_ask", "ask", "ask_price"))
+        if bid is not None and ask is not None and bid > 0.0 and ask > 0.0:
+            spread_bps = round((ask - bid) / ((ask + bid) / 2.0) * 10_000.0, 4)
+    slippage_bps = number(
+        "slippage_bps_per_side_or_unknown",
+        "slippage_bps_per_side",
+        "estimated_slippage_bps",
+        "projected_slippage_bps",
+    )
+    shortability_raw = _first_known(
+        source,
+        "shortability_status",
+        "shortable_status",
+        "is_shortable",
+        "instrument_shortable",
+        "instrument_margin_shortable",
+        "supports_spot_short",
+    )
+    if shortability_raw == UNKNOWN and isinstance(source.get("venue_capabilities"), dict):
+        shortability_raw = _first_known(
+            source["venue_capabilities"],
+            "supports_spot_short",
+            "spot_short_support",
+            "shortability",
+        )
+    shortability_status = _route_fact_status(
+        shortability_raw,
+        required=applies,
+        unresolved=applies,
+    )
+    maker_fee_bps = route_diagnostics.get("maker_taker_fee_stack_bps", {}).get("maker_bps", UNKNOWN)
+    taker_fee_bps = route_diagnostics.get("maker_taker_fee_stack_bps", {}).get("taker_bps", UNKNOWN)
+    borrow_fee_bps = route_diagnostics.get("estimated_borrow_fee_bps", UNKNOWN)
+    borrow_availability = route_diagnostics.get("borrow_availability", UNKNOWN)
+    margin_mode = route_diagnostics.get("margin_mode", UNKNOWN)
+    shortability_api_status = route_diagnostics.get("api_route_status", UNKNOWN)
+
+    cost_parts = [
+        _float_or_none(taker_fee_bps),
+        _float_or_none(slippage_bps),
+    ]
+    spread_value = _float_or_none(spread_bps)
+    if spread_value is not None:
+        cost_parts.append(spread_value / 2.0)
+    known_one_way_cost_bps = (
+        round(sum(value for value in cost_parts if value is not None), 4)
+        if any(value is not None for value in cost_parts)
+        else UNKNOWN
+    )
+    observed = {
+        "borrow_availability": borrow_availability,
+        "estimated_borrow_fee_bps": borrow_fee_bps,
+        "maker_fee_bps": maker_fee_bps,
+        "taker_fee_bps": taker_fee_bps,
+        "margin_mode": margin_mode,
+        "shortability_status": shortability_status,
+        "shortability_api_status": shortability_api_status,
+        "quote_freshness_status": freshness.get("status", UNKNOWN),
+        "spread_bps": spread_bps,
+        "slippage_bps_per_side": slippage_bps,
+    }
+    missing = [key for key, value in observed.items() if _route_metadata_unconfirmed(value)]
+    # A bounded, diagnostic ordering signal.  This is intentionally separate
+    # from the candidate score so route economics cannot become an entry gate.
+    cost_value = _float_or_none(known_one_way_cost_bps)
+    ranking_score = 100.0 - min(70.0, max(0.0, cost_value or 0.0)) - min(45.0, len(missing) * 5.0)
+    return {
+        "telemetry_version": "frontier_short_spot_route_economics_v1",
+        "paper_only": True,
+        "read_only": True,
+        "prepared_before_ranking": True,
+        "applies": applies,
+        "venue": str(source.get("venue") or resolved_route.get("venue") or UNKNOWN),
+        "inst_id": str(source.get("inst_id") or resolved_route.get("inst_id") or UNKNOWN),
+        "borrow": {
+            "availability": borrow_availability,
+            "estimated_fee_bps": borrow_fee_bps,
+        },
+        "fees": {"maker_bps": maker_fee_bps, "taker_bps": taker_fee_bps},
+        "margin": {
+            "required": bool(resolved_route.get("margin_required") or source.get("margin_required") or applies),
+            "mode": margin_mode,
+        },
+        "shortability_status": shortability_status,
+        "shortability_api_status": shortability_api_status,
+        "quote_freshness": {
+            "status": freshness.get("status", UNKNOWN),
+            "notes": list(freshness.get("notes") or []),
+        },
+        "market_impact_proxies": {
+            "spread_bps": spread_bps,
+            "slippage_bps_per_side": slippage_bps,
+            "known_one_way_cost_bps": known_one_way_cost_bps,
+        },
+        "missing_telemetry": missing,
+        "ranking_hook": {
+            "mode": "paper_ordering_only",
+            "score_adjustment": 0.0,
+            "route_economics_rank_score": round(max(0.0, ranking_score), 4),
+            "ranking_action": "down_rank_only" if applies and (missing or cost_value is not None) else "no_rank_adjustment",
+        },
         "hard_blocking": False,
         "entry_blocked": False,
         "routing_decision_changed": False,
@@ -1002,6 +1152,7 @@ def _frontier_short_spot_route_requirements_report(
             "status": freshness_status,
             "notes": list(intelligence.get("freshness_latency_notes") or []),
         },
+        "route_economics_telemetry": dict(intelligence.get("route_economics_telemetry") or {}),
         "hard_blocking": False,
         "entry_blocked": False,
         "routing_decision_changed": False,
