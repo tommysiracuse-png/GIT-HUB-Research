@@ -6965,6 +6965,12 @@ QUOTE_ASSETS = USD_LIKE_QUOTES | REGIONAL_FIAT_QUOTES
 DEFAULT_FRONTIER_MARKETABILITY_GATES = {
     "enabled": True,
     "paper_only": True,
+    # Health evidence changes simulated routing and sizing.  It must not
+    # discard a priceable paper experiment: exploration remains available
+    # through the conservative counterfactual route below.
+    "diagnostic_only": True,
+    "confirmed_route_allocation_multiplier": 1.0,
+    "conservative_route_allocation_multiplier": 0.25,
     "max_book_age_seconds": 30.0,
     "max_spread_bps": 8.0,
     "min_top_of_book_notional_usd": 1000.0,
@@ -9522,7 +9528,7 @@ def frontier_marketability_gate_review(
     settings: dict,
     reference_observations: list[dict] | None = None,
 ) -> dict:
-    """Fail-closed marketability review for paper-only frontier spot emission."""
+    """Paper-only marketability diagnostics for frontier simulated routing."""
 
     policy = _frontier_marketability_policy(settings)
     applicable = bool(
@@ -9662,27 +9668,44 @@ def _apply_frontier_marketability_gate(
     )
     candidate["marketability_gate"] = review
     candidate["marketability_gate_status"] = review["status"]
-    if (
-        review.get("applicable")
-        and not review.get("passed")
-        and candidate.get("direction") != "watch_only"
-        and not candidate.get("paper_entry_blocked")
-    ):
-        failed = list(review.get("failed_checks") or [])
-        candidate["direction"] = "watch_only"
-        candidate["candidate_reject_reason"] = "marketability_" + (failed[0] if failed else "failed")
-        candidate["marketability_reject_reasons"] = [f"marketability_{name}" for name in failed]
-        candidate["score"] = min(float(candidate.get("score") or 0.0), 25.0)
-        candidate["quality_action"] = "shadow_only"
-        candidate["quality_allocation_multiplier"] = 0.0
-        candidate["paper_entry_blocked"] = True
-        candidate["promotion_eligible"] = False
-        candidate["execution_feasibility"] = _preliminary_feasibility(
-            "watch_only",
-            str(observation.get("market_type") or "spot"),
-            str(observation.get("data_status") or "unknown"),
-            settings,
-        )
+    if not review.get("applicable"):
+        return candidate
+
+    policy = review.get("policy") if isinstance(review.get("policy"), dict) else {}
+    failed = list(review.get("failed_checks") or [])
+    route_health_confirmed = not failed
+    confirmed_multiplier = as_float(policy.get("confirmed_route_allocation_multiplier"), 1.0)
+    conservative_multiplier = as_float(policy.get("conservative_route_allocation_multiplier"), 0.25)
+    confirmed_multiplier = max(0.0, min(1.0, confirmed_multiplier if confirmed_multiplier is not None else 1.0))
+    # A nonzero fallback preserves the paper experiment while clearly marking
+    # it as a counterfactual route rather than a trusted simulated allocation.
+    conservative_multiplier = max(0.01, min(1.0, conservative_multiplier if conservative_multiplier is not None else 0.25))
+    route_multiplier = confirmed_multiplier if route_health_confirmed else conservative_multiplier
+    quality_multiplier = as_float(candidate.get("quality_allocation_multiplier"), 1.0)
+    quality_multiplier = max(0.0, min(1.0, quality_multiplier if quality_multiplier is not None else 1.0))
+
+    candidate["marketability_diagnostic_reasons"] = [f"marketability_{name}" for name in failed]
+    candidate["route_health_confirmation"] = {
+        "diagnostic_only": bool(policy.get("diagnostic_only", True)),
+        "required_for_primary_simulated_allocation": True,
+        "confirmed": route_health_confirmed,
+        "failed_checks": failed,
+        "mode": "confirmed_simulated_route" if route_health_confirmed else "conservative_counterfactual_route",
+    }
+    candidate["simulated_order_allocation"] = {
+        "paper_only": True,
+        "mode": "primary" if route_health_confirmed else "counterfactual_guard_value",
+        "route_health_confirmed": route_health_confirmed,
+        "route_allocation_multiplier": round(route_multiplier, 6),
+        "quality_allocation_multiplier": round(quality_multiplier, 6),
+        "allocation_multiplier": round(route_multiplier * quality_multiplier, 6),
+        "failed_route_health_checks": failed,
+    }
+    candidate["paper_allocation_multiplier"] = candidate["simulated_order_allocation"]["allocation_multiplier"]
+    if failed:
+        candidate["risk_notes"] = list(candidate.get("risk_notes") or []) + [
+            "venue-health or route-quality evidence is unconfirmed; use conservative counterfactual paper routing",
+        ]
     return candidate
 
 
@@ -10219,8 +10242,8 @@ def summarize(
             for gate, count in regional_candidate_blockers.items()
             if gate not in {"passed", "not_applicable"}
         ),
-        "marketability_admitted_candidates": marketability_statuses.get("passed", 0),
-        "marketability_blocked_candidates": marketability_statuses.get("failed", 0),
+        "marketability_confirmed_route_candidates": marketability_statuses.get("passed", 0),
+        "marketability_conservative_route_candidates": marketability_statuses.get("failed", 0),
     }
     expansion_map.update(
         {
@@ -10264,6 +10287,8 @@ def summarize(
             "suppression_reason": row.get("suppression_reason"),
             "marketability_gate_status": row.get("marketability_gate_status"),
             "marketability_failed_checks": (row.get("marketability_gate") or {}).get("failed_checks", []),
+            "route_health_confirmed": (row.get("route_health_confirmation") or {}).get("confirmed"),
+            "simulated_order_allocation": row.get("simulated_order_allocation"),
         }
         for row in candidates[:20]
     ]
@@ -10451,7 +10476,9 @@ def _markdown(report: dict) -> str:
             f"quote_norm=`{row.get('quote_normalization_status')}` "
             f"native_quote=`{row.get('native_quote_currency')}` canonical_price=`{row.get('canonical_normalized_price')}` "
             f"fx_source=`{row.get('fx_source')}` fx_age=`{row.get('fx_age_seconds')}` suppress=`{row.get('suppression_reason')}` "
-            f"route=`{row.get('route_status')}` blockers={row.get('route_blockers')}"
+            f"route=`{row.get('route_status')}` blockers={row.get('route_blockers')} "
+            f"route_health_confirmed=`{row.get('route_health_confirmed')}` "
+            f"simulated_allocation=`{row.get('simulated_order_allocation')}`"
         )
     lines.extend(["", "## Venue Health Sample", ""])
     for row in report.get("observations", [])[:60]:

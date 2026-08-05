@@ -213,6 +213,9 @@ DEFAULT_SETTINGS = {
         "marketability_gates": {
             "enabled": True,
             "paper_only": True,
+            "diagnostic_only": True,
+            "confirmed_route_allocation_multiplier": 1.0,
+            "conservative_route_allocation_multiplier": 0.25,
             "max_book_age_seconds": 30.0,
             "max_spread_bps": 8.0,
             "min_top_of_book_notional_usd": 1000.0,

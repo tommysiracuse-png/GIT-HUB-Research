@@ -497,10 +497,14 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                 "net_edge_bps",
                 "freshness_minutes",
                 "gating_reason",
+                "route_health_confirmed",
+                "simulated_order_allocation",
             }.issubset(summary["top_dislocations"][0])
         )
         self.assertIn("spot_borrow", summary["by_route_blocker"])
         self.assertIn("candidate_activity", summary)
+        self.assertIn("marketability_confirmed_route_candidates", summary["candidate_activity"])
+        self.assertIn("marketability_conservative_route_candidates", summary["candidate_activity"])
         self.assertEqual(summary["expansion_map"]["worker_count"], 16)
         self.assertEqual(summary["expansion_map"]["selection_limits"]["max_symbols_per_cycle"], 300)
         self.assertEqual(summary["expansion_map"]["venue_quota_report"]["A"]["status"], "partial")
@@ -602,8 +606,11 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual("short_frontier_spot", candidate["direction"])
         self.assertEqual("passed", candidate["marketability_gate_status"])
         self.assertTrue(all(check["passed"] for check in candidate["marketability_gate"]["checks"].values()))
+        self.assertTrue(candidate["route_health_confirmation"]["confirmed"])
+        self.assertEqual("primary", candidate["simulated_order_allocation"]["mode"])
+        self.assertEqual(1.0, candidate["paper_allocation_multiplier"])
 
-    def test_marketability_gate_fails_closed_for_stale_or_thin_book(self) -> None:
+    def test_marketability_diagnostics_use_conservative_route_for_stale_or_thin_book(self) -> None:
         cfg = settings()
         peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
         stale = self._quality_obs("STALE", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
@@ -629,12 +636,17 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             reference_observations=[thin, peer],
         )
 
-        self.assertEqual("marketability_book_freshness", stale_candidate["candidate_reject_reason"])
-        self.assertTrue(stale_candidate["paper_entry_blocked"])
+        self.assertEqual("short_frontier_spot", stale_candidate["direction"])
+        self.assertFalse(stale_candidate["paper_entry_blocked"])
+        self.assertFalse(stale_candidate["route_health_confirmation"]["confirmed"])
+        self.assertEqual("counterfactual_guard_value", stale_candidate["simulated_order_allocation"]["mode"])
+        self.assertEqual(0.25, stale_candidate["paper_allocation_multiplier"])
         self.assertIn("top_of_book_depth", thin_candidate["marketability_gate"]["failed_checks"])
-        self.assertEqual("watch_only", thin_candidate["direction"])
+        self.assertEqual("short_frontier_spot", thin_candidate["direction"])
+        self.assertFalse(thin_candidate["paper_entry_blocked"])
+        self.assertEqual("conservative_counterfactual_route", thin_candidate["route_health_confirmation"]["mode"])
 
-    def test_marketability_gate_rejects_bad_print_wide_spread_and_unknown_route(self) -> None:
+    def test_marketability_diagnostics_preserve_bad_print_wide_spread_and_unknown_route(self) -> None:
         cfg = settings()
         cfg["risk"]["max_spread_bps"] = 100.0
         peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.0, 1_000_000, quality_score=90)
@@ -674,7 +686,14 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertIn("cross_venue_price_confirmation", bad_candidate["marketability_gate"]["failed_checks"])
         self.assertIn("spread_sanity", wide_candidate["marketability_gate"]["failed_checks"])
         self.assertIn("route_confidence", route_candidate["marketability_gate"]["failed_checks"])
-        self.assertTrue(all(row["paper_entry_blocked"] for row in (bad_candidate, wide_candidate, route_candidate)))
+        self.assertTrue(all(row["direction"] == "short_frontier_spot" for row in (bad_candidate, wide_candidate, route_candidate)))
+        self.assertTrue(all(not row["paper_entry_blocked"] for row in (bad_candidate, wide_candidate, route_candidate)))
+        self.assertTrue(
+            all(
+                row["simulated_order_allocation"]["mode"] == "counterfactual_guard_value"
+                for row in (bad_candidate, wide_candidate, route_candidate)
+            )
+        )
 
     def test_marketability_gate_thresholds_are_configurable(self) -> None:
         cfg = settings()
@@ -698,7 +717,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             candidate["marketability_gate"]["failed_checks"],
         )
 
-    def test_marketability_gate_requires_healthy_venue_telemetry(self) -> None:
+    def test_marketability_diagnostics_downsize_unhealthy_venue_telemetry(self) -> None:
         cfg = settings()
         peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
         unhealthy = self._quality_obs("UNHEALTHY", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
@@ -716,10 +735,12 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         check = candidate["marketability_gate"]["checks"]["venue_health_score"]
         self.assertFalse(check["passed"])
         self.assertTrue(check["telemetry_present"])
-        self.assertEqual("marketability_venue_health_score", candidate["candidate_reject_reason"])
-        self.assertTrue(candidate["paper_entry_blocked"])
+        self.assertIsNone(candidate["candidate_reject_reason"])
+        self.assertFalse(candidate["paper_entry_blocked"])
+        self.assertEqual(0.25, candidate["paper_allocation_multiplier"])
+        self.assertIn("marketability_venue_health_score", candidate["marketability_diagnostic_reasons"])
 
-    def test_marketability_gate_fails_closed_when_venue_telemetry_is_missing(self) -> None:
+    def test_marketability_diagnostics_preserve_exploration_when_venue_telemetry_is_missing(self) -> None:
         cfg = settings()
         peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
         local = self._quality_obs("NO_HEALTH", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
@@ -736,8 +757,10 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
 
         check = candidate["marketability_gate"]["checks"]["venue_health_score"]
         self.assertFalse(check["telemetry_present"])
-        self.assertEqual("watch_only", candidate["direction"])
-        self.assertTrue(candidate["paper_entry_blocked"])
+        self.assertEqual("short_frontier_spot", candidate["direction"])
+        self.assertFalse(candidate["paper_entry_blocked"])
+        self.assertFalse(candidate["route_health_confirmation"]["confirmed"])
+        self.assertEqual("counterfactual_guard_value", candidate["simulated_order_allocation"]["mode"])
 
     def _obs(
         self,
