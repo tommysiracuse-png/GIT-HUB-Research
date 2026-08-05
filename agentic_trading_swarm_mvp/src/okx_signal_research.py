@@ -12,8 +12,10 @@ import random
 import sqlite3
 import statistics
 
+from horizon_selection import candidate_horizons, prior_selected_horizon, select_sticky_horizon
 from paper_loop import direction_sign
 from storage import RUNS_DIR, add_memory_fact, add_self_improvement_experiment, signal_key, utc_now
+from variant_horizon_outcomes import load_variant_horizon_outcomes
 
 
 REPORT_JSON = RUNS_DIR / "okx_signal_research_report.json"
@@ -830,9 +832,16 @@ def _variant_outcomes(conn: sqlite3.Connection, variant_id: str, horizon: int = 
     }
 
 
-def _bootstrap_lower_bound(differences: list[float], samples: int = 800) -> float | None:
+def _bootstrap_lower_bound(
+    differences: list[float],
+    samples: int = 800,
+    exact_max_pairs: int = 2000,
+) -> float | None:
     if not differences:
         return None
+    if len(differences) > exact_max_pairs:
+        standard_error = statistics.stdev(differences) / math.sqrt(len(differences))
+        return statistics.fmean(differences) - 1.96 * standard_error
     rng = random.Random(154)
     means = []
     for _ in range(samples):
@@ -850,7 +859,11 @@ def _evaluate_pair(challenger: dict, incumbent: dict, settings: dict) -> dict:
     paired_new = _metrics(challenger_values)
     paired_old = _metrics(incumbent_values)
     uplift = statistics.fmean(differences) if differences else None
-    lower = _bootstrap_lower_bound(differences)
+    exact_max_pairs = int(cfg.get("bootstrap_exact_max_pairs", 2000))
+    lower = _bootstrap_lower_bound(differences, exact_max_pairs=exact_max_pairs)
+    confidence_method = (
+        "normal_approximation" if len(differences) > exact_max_pairs else "seeded_bootstrap"
+    )
     coverage = challenger["total_trials"] / incumbent["total_trials"] if incumbent["total_trials"] else 0.0
     elapsed_hours = 0.0
     if challenger["first_trial_at"] and challenger["last_trial_at"]:
@@ -910,9 +923,72 @@ def _evaluate_pair(challenger: dict, incumbent: dict, settings: dict) -> dict:
         "paired_incumbent_metrics": paired_old,
         "paired_uplift_bps": round(uplift, 3) if uplift is not None else None,
         "bootstrap_lower_95_bps": round(lower, 3) if lower is not None else None,
+        "confidence_lower_bound_method": confidence_method if differences else None,
         "win_rate_delta": round(win_delta, 3) if win_delta is not None else None,
         "worst_decile_delta_bps": round(tail_delta, 3) if tail_delta is not None else None,
     }
+
+
+def _evaluate_horizons(
+    conn: sqlite3.Connection,
+    challenger_id: str,
+    incumbent_id: str,
+    settings: dict,
+    previous_evaluation: dict | None = None,
+    outcome_cache: dict[tuple[str, int], dict] | None = None,
+) -> dict:
+    cache = outcome_cache if outcome_cache is not None else {}
+
+    def outcomes(variant_id: str, horizon: int) -> dict:
+        key = (variant_id, int(horizon))
+        if key not in cache:
+            cache[key] = _variant_outcomes(conn, variant_id, int(horizon))
+        return cache[key]
+
+    horizon_evaluations = {}
+    for horizon in candidate_horizons(settings, "signal_redesign"):
+        evaluation = _evaluate_pair(
+            outcomes(challenger_id, horizon),
+            outcomes(incumbent_id, horizon),
+            settings,
+        )
+        paired = evaluation.get("paired_challenger_metrics") or {}
+        robust_values = [
+            value
+            for value in (paired.get("avg_pnl_bps"), paired.get("trimmed_mean_bps"))
+            if value is not None
+        ]
+        bootstrap_lower = evaluation.get("bootstrap_lower_95_bps")
+        evaluation.update(
+            {
+                "horizon_minutes": int(horizon),
+                "selection_score_bps": (
+                    float(bootstrap_lower)
+                    if bootstrap_lower is not None
+                    else (min(float(value) for value in robust_values) if robust_values else None)
+                ),
+                "evidence_count": int(
+                    (evaluation.get("prerequisites") or {}).get("paired_valid_trials") or 0
+                ),
+            }
+        )
+        horizon_evaluations[int(horizon)] = evaluation
+
+    prior_horizon = prior_selected_horizon(previous_evaluation)
+    selection = select_sticky_horizon(
+        horizon_evaluations,
+        prior_horizon,
+        float(settings.get("signal_redesign", {}).get("horizon_switch_uplift_bps", 6.0)),
+    )
+    selected = dict(selection.pop("selected_evaluation"))
+    ready = [item for item in horizon_evaluations.values() if item.get("ready")]
+    selected.update(selection)
+    selected["horizon_evaluations"] = {
+        str(horizon): item for horizon, item in horizon_evaluations.items()
+    }
+    selected["any_horizon_passed"] = any(item.get("passed") for item in ready)
+    selected["regressed"] = bool(ready) and all(item.get("regressed") for item in ready)
+    return selected
 
 
 def evaluate_variants(conn: sqlite3.Connection, settings: dict) -> list[dict]:
@@ -920,17 +996,31 @@ def evaluate_variants(conn: sqlite3.Connection, settings: dict) -> list[dict]:
     active = next((item for item in variants if item["status"] == "active"), None)
     if not active:
         return []
-    active_outcomes = _variant_outcomes(conn, active["variant_id"])
     results = []
+    horizons = candidate_horizons(settings, "signal_redesign")
+    outcome_cache = load_variant_horizon_outcomes(
+        conn,
+        [item["variant_id"] for item in variants],
+        horizons,
+        _metrics,
+        _percentile,
+    )
     required_passes = int(settings.get("signal_redesign", {}).get("consecutive_passes_to_promote", 2))
     for challenger in variants:
         if challenger["variant_id"] == active["variant_id"] or challenger["status"] not in {"shadow", "retired"}:
             continue
-        outcomes = _variant_outcomes(conn, challenger["variant_id"])
-        evaluation = _evaluate_pair(outcomes, active_outcomes, settings)
+        previous_horizon = prior_selected_horizon(challenger.get("evaluation"))
+        evaluation = _evaluate_horizons(
+            conn,
+            challenger["variant_id"],
+            active["variant_id"],
+            settings,
+            challenger.get("evaluation"),
+            outcome_cache,
+        )
         passes = int(challenger.get("consecutive_passes") or 0)
         if evaluation["passed"]:
-            passes += 1
+            passes = passes + 1 if previous_horizon == evaluation["selected_horizon_minutes"] else 1
         elif evaluation["ready"]:
             passes = 0
         status = challenger["status"]
@@ -1340,6 +1430,7 @@ def _markdown(report: dict) -> str:
         lines.append(
             f"- `{variant.get('variant_id')}` status=`{variant.get('status')}` "
             f"passes=`{variant.get('consecutive_passes')}` actionable=`{variant_summary.get('actionable_count')}` "
+            f"horizon=`{(variant.get('evaluation') or {}).get('selected_horizon_minutes')}`m "
             f"rejects=`{variant_summary.get('reject_counts', {})}`"
         )
     lines.extend(["", "## Evaluations", ""])

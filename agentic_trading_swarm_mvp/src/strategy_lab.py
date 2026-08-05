@@ -12,9 +12,11 @@ import hashlib
 import json
 import math
 import sqlite3
+import statistics
 from collections import Counter, defaultdict
 from typing import Any
 
+from horizon_selection import candidate_horizons, prior_selected_horizon, select_sticky_horizon
 from route_resolver import evaluate_route_intelligence
 from paper_context_cost import realized_paper_cost_audit
 from frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
@@ -1517,12 +1519,18 @@ def ingest_strategy_lab_recommendation(
     ]
 
 
-def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
+def _active_experiments(
+    conn: sqlite3.Connection,
+    include_retired_for_evaluation: bool = False,
+) -> list[dict]:
+    statuses = "'active_testing', 'needs_more_evidence', 'needs_contract_revision'"
+    if include_retired_for_evaluation:
+        statuses += ", 'retired_bad_evidence'"
     rows = conn.execute(
-        """
+        f"""
         select *
         from strategy_lab_experiments
-        where status in ('active_testing', 'needs_more_evidence', 'needs_contract_revision')
+        where status in ({statuses})
           and experiment_type = 'market_strategy'
           and compile_status = 'compiled'
         order by updated_at desc
@@ -3207,6 +3215,8 @@ def _pnl_stats(values: list[float]) -> dict:
         return {
             "count": 0,
             "avg_pnl_bps": None,
+            "median_pnl_bps": None,
+            "trimmed_mean_bps": None,
             "win_rate": None,
             "worst_decile_pnl_bps": None,
             "min_pnl_bps": None,
@@ -3215,10 +3225,14 @@ def _pnl_stats(values: list[float]) -> dict:
     ordered = sorted(values)
     decile_n = max(1, int(math.ceil(len(ordered) * 0.1)))
     worst_decile = ordered[:decile_n]
+    trim_n = int(len(ordered) * 0.1)
+    trimmed = ordered[trim_n : len(ordered) - trim_n] if trim_n and len(ordered) > trim_n * 2 else ordered
     wins = sum(1 for value in values if value > 0)
     return {
         "count": len(values),
         "avg_pnl_bps": round(sum(values) / len(values), 3),
+        "median_pnl_bps": round(statistics.median(values), 3),
+        "trimmed_mean_bps": round(sum(trimmed) / len(trimmed), 3),
         "win_rate": round(wins / len(values), 3),
         "worst_decile_pnl_bps": round(sum(worst_decile) / len(worst_decile), 3),
         "min_pnl_bps": round(min(values), 3),
@@ -3360,8 +3374,12 @@ def _experiment_outcomes(
 def _rules(settings: dict, experiment: dict) -> dict:
     defaults = settings.get("strategy_lab", {})
     custom = experiment.get("promotion_rules") or {}
+    horizons = candidate_horizons(settings, "strategy_lab", custom)
     rules = {
         "horizon_minutes": int(custom.get("horizon_minutes", defaults.get("evaluation_horizon_minutes", 60))),
+        "horizon_mode": str(custom.get("horizon_mode") or defaults.get("evaluation_horizon_mode") or "best_reliable"),
+        "candidate_horizons_minutes": horizons,
+        "horizon_switch_uplift_bps": float(custom.get("horizon_switch_uplift_bps", defaults.get("horizon_switch_uplift_bps", 6.0))),
         "expand_min_labels": int(custom.get("expand_min_labels", defaults.get("expand_min_labels", 12))),
         "expand_min_avg_pnl_bps": float(custom.get("expand_min_avg_pnl_bps", defaults.get("expand_min_avg_pnl_bps", 6.0))),
         "expand_min_win_rate": float(custom.get("expand_min_win_rate", defaults.get("expand_min_win_rate", 0.52))),
@@ -3460,6 +3478,89 @@ def _direction_promotion_gate(experiment: dict, outcomes: dict, rules: dict) -> 
         "required_directions": required,
         "thresholds": thresholds,
         "checks": checks,
+    }
+
+
+def _evaluate_strategy_horizons(
+    conn: sqlite3.Connection,
+    experiment: dict,
+    rules: dict,
+    settings: dict,
+    active_hours: float,
+) -> dict:
+    horizon_evaluations = {}
+    for horizon in rules["candidate_horizons_minutes"]:
+        outcomes = _experiment_outcomes(
+            conn,
+            experiment["strategy_lab_id"],
+            int(horizon),
+            experiment,
+            settings,
+        )
+        metrics = outcomes["metrics"]
+        count = int(metrics.get("count") or 0)
+        avg = metrics.get("avg_pnl_bps")
+        win_rate = metrics.get("win_rate")
+        worst_decile = metrics.get("worst_decile_pnl_bps")
+        blocked_routes = int(outcomes.get("route_status_counts", {}).get("blocked", 0))
+        direction_promotion = _direction_promotion_gate(experiment, outcomes, rules)
+        promote_ready = (
+            count >= rules["promote_min_labels"]
+            and active_hours >= rules["promote_min_active_hours"]
+            and (avg is not None and avg >= rules["promote_min_avg_pnl_bps"])
+            and (win_rate is not None and win_rate >= rules["promote_min_win_rate"])
+            and (worst_decile is not None and worst_decile > rules["promote_worst_decile_floor_bps"])
+            and outcomes["valid_label_rate"] >= rules["promote_min_valid_label_rate"]
+            and blocked_routes == 0
+            and direction_promotion["passed"]
+        )
+        retire_ready = (
+            count >= rules["retire_min_labels"]
+            and (
+                (avg is not None and avg <= rules["retire_max_avg_pnl_bps"])
+                or (win_rate is not None and win_rate <= rules["retire_max_win_rate"])
+            )
+        )
+        expand_ready = (
+            count >= rules["expand_min_labels"]
+            and (avg is not None and avg > rules["expand_min_avg_pnl_bps"])
+            and (win_rate is not None and win_rate >= rules["expand_min_win_rate"])
+            and (worst_decile is None or worst_decile > rules["promote_worst_decile_floor_bps"])
+        )
+        robust_values = [
+            value
+            for value in (metrics.get("avg_pnl_bps"), metrics.get("trimmed_mean_bps"))
+            if value is not None
+        ]
+        horizon_evaluations[int(horizon)] = {
+            "horizon_minutes": int(horizon),
+            "ready": count >= rules["expand_min_labels"],
+            "passed": promote_ready,
+            "regressed": retire_ready,
+            "promote_ready": promote_ready,
+            "expand_ready": expand_ready,
+            "retire_ready": retire_ready,
+            "selection_score_bps": min(float(value) for value in robust_values) if robust_values else None,
+            "evidence_count": count,
+            "outcomes": outcomes,
+            "direction_promotion": direction_promotion,
+        }
+
+    previous_horizon = prior_selected_horizon(experiment.get("evaluation"))
+    selection = select_sticky_horizon(
+        horizon_evaluations,
+        previous_horizon,
+        rules["horizon_switch_uplift_bps"],
+    )
+    selected = selection.pop("selected_evaluation")
+    return {
+        **selection,
+        "selected": selected,
+        "horizon_evaluations": {
+            str(horizon): item for horizon, item in horizon_evaluations.items()
+        },
+        "all_horizons_retire_ready": bool(horizon_evaluations)
+        and all(item["retire_ready"] for item in horizon_evaluations.values()),
     }
 
 
@@ -3681,7 +3782,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
     cfg = settings.get("strategy_lab", {})
     if not cfg.get("enabled", True):
         return {"enabled": False}
-    experiments = _active_experiments(conn)
+    experiments = _active_experiments(conn, include_retired_for_evaluation=True)
     evaluations = []
     for experiment in experiments:
         source_veto = paper_source_veto_record(experiment, settings)
@@ -3697,58 +3798,44 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             )
             continue
         rules = _rules(settings, experiment)
-        outcomes = _experiment_outcomes(
-            conn,
-            experiment["strategy_lab_id"],
-            rules["horizon_minutes"],
-            experiment,
-            settings,
+        active_hours = _age_hours(experiment.get("created_at"))
+        horizon_selection = _evaluate_strategy_horizons(
+            conn, experiment, rules, settings, active_hours
         )
+        selected_horizon = int(horizon_selection["selected_horizon_minutes"])
+        selected_evaluation = horizon_selection["selected"]
+        outcomes = selected_evaluation["outcomes"]
         metrics = outcomes["metrics"]
         count = int(metrics.get("count") or 0)
-        avg = metrics.get("avg_pnl_bps")
-        win_rate = metrics.get("win_rate")
-        worst_decile = metrics.get("worst_decile_pnl_bps")
-        active_hours = _age_hours(experiment.get("created_at"))
-        blocked_routes = int(outcomes.get("route_status_counts", {}).get("blocked", 0))
-        direction_promotion = _direction_promotion_gate(experiment, outcomes, rules)
+        direction_promotion = selected_evaluation["direction_promotion"]
         generation_diagnostic = (experiment.get("evaluation") or {}).get("generation_diagnostic") or {}
         diagnostic_status = str(generation_diagnostic.get("status") or experiment.get("status") or "active_testing")
         decision = diagnostic_status if diagnostic_status in {"needs_data", "needs_route", "needs_more_evidence"} else "needs_more_evidence"
         status = diagnostic_status if diagnostic_status in {"needs_data", "needs_route", "needs_more_evidence"} else "active_testing"
+        was_retired = experiment.get("status") == "retired_bad_evidence"
+        if was_retired:
+            status = "retired_bad_evidence"
         passes = int(experiment.get("consecutive_passes") or 0)
+        previous_horizon = horizon_selection.get("previous_horizon_minutes")
+        if previous_horizon is None and passes:
+            previous_horizon = int(rules["horizon_minutes"])
         promotion_id = None
         children = []
 
-        promote_ready = (
-            count >= rules["promote_min_labels"]
-            and active_hours >= rules["promote_min_active_hours"]
-            and (avg is not None and avg >= rules["promote_min_avg_pnl_bps"])
-            and (win_rate is not None and win_rate >= rules["promote_min_win_rate"])
-            and (worst_decile is not None and worst_decile > rules["promote_worst_decile_floor_bps"])
-            and outcomes["valid_label_rate"] >= rules["promote_min_valid_label_rate"]
-            and blocked_routes == 0
-            and direction_promotion["passed"]
-        )
-        retire_ready = (
-            count >= rules["retire_min_labels"]
-            and (
-                (avg is not None and avg <= rules["retire_max_avg_pnl_bps"])
-                or (win_rate is not None and win_rate <= rules["retire_max_win_rate"])
-            )
-        )
-        expand_ready = (
-            count >= rules["expand_min_labels"]
-            and (avg is not None and avg > rules["expand_min_avg_pnl_bps"])
-            and (win_rate is not None and win_rate >= rules["expand_min_win_rate"])
-            and (worst_decile is None or worst_decile > rules["promote_worst_decile_floor_bps"])
-        )
+        promote_ready = bool(selected_evaluation["promote_ready"])
+        retire_ready = bool(horizon_selection["all_horizons_retire_ready"])
+        expand_ready = bool(selected_evaluation["expand_ready"])
 
         if promote_ready:
-            passes += 1
+            if was_retired:
+                status = "active_testing"
+            passes = passes + 1 if previous_horizon == selected_horizon else 1
             decision = "promotion_gate_passed"
             if passes >= rules["consecutive_passes_to_promote"]:
-                promotion_id = _queue_promotion(conn, experiment, outcomes, rules, settings)
+                selected_rules = {**rules, "horizon_minutes": selected_horizon}
+                promotion_id = _queue_promotion(
+                    conn, experiment, outcomes, selected_rules, settings
+                )
                 status = "promotion_queued"
                 decision = "promotion_queued" if promotion_id else "promotion_already_queued"
         elif retire_ready:
@@ -3756,16 +3843,22 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             passes = 0
             decision = "retired_bad_evidence"
         elif expand_ready:
-            decision = "expand_testing_modestly"
+            status = "active_testing"
+            decision = "revived_timeframe_specific_testing" if was_retired else "expand_testing_modestly"
         elif count >= rules["retire_min_labels"]:
-            children = _maybe_split_children(conn, experiment, outcomes, settings)
-            if children:
-                status = "split_into_children"
-                decision = "split_into_children"
+            if was_retired:
+                decision = "retired_waiting_horizon_evidence"
             else:
-                decision = "mixed_keep_testing"
+                children = _maybe_split_children(conn, experiment, outcomes, settings)
+                if children:
+                    status = "split_into_children"
+                    decision = "split_into_children"
+                else:
+                    decision = "mixed_keep_testing"
             passes = 0
         else:
+            if was_retired:
+                decision = "retired_waiting_horizon_evidence"
             passes = 0
 
         evaluation = {
@@ -3779,6 +3872,11 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             "child_strategy_lab_ids": children,
             "generation_diagnostic": generation_diagnostic,
             "direction_promotion": direction_promotion,
+            "selected_horizon_minutes": selected_horizon,
+            "previous_horizon_minutes": horizon_selection.get("previous_horizon_minutes"),
+            "horizon_changed": horizon_selection.get("horizon_changed", False),
+            "horizon_selection_reason": horizon_selection.get("selection_reason"),
+            "horizon_evaluations": horizon_selection["horizon_evaluations"],
         }
         conn.execute(
             """
@@ -3806,6 +3904,7 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
                 "status": status,
                 "decision": decision,
                 "metrics": metrics,
+                "selected_horizon_minutes": selected_horizon,
                 "valid_label_rate": outcomes["valid_label_rate"],
                 "realized_cost_backfill": outcomes["realized_cost_backfill"],
                 "direction_promotion": direction_promotion,
@@ -4015,6 +4114,7 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         lines.append(
             f"- `{item['strategy_lab_id']}` type=`{item.get('experiment_type')}` "
             f"status=`{item['status']}` decision=`{decision}` "
+            f"horizon=`{latest.get('selected_horizon_minutes')}`m "
             f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
             f"win=`{metrics.get('win_rate')}` cost_backfills=`{cost_backfill.get('applied_count', 0)}` "
             f"hypothesis={item.get('hypothesis')}"
@@ -4049,6 +4149,7 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         lines.append(
             f"- `{item['strategy_lab_id']}` type=`{item.get('experiment_type')}` "
             f"status=`{item['status']}` decision=`{decision}` "
+            f"horizon=`{latest.get('selected_horizon_minutes')}`m "
             f"labels=`{metrics.get('count', 0)}` avg=`{metrics.get('avg_pnl_bps')}` "
             f"win=`{metrics.get('win_rate')}` cost_backfills=`{cost_backfill.get('applied_count', 0)}` "
             f"hypothesis={item.get('hypothesis')}"

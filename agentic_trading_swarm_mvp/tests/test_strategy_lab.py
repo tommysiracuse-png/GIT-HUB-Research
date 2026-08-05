@@ -725,6 +725,51 @@ class StrategyLabTest(unittest.TestCase):
             self.assertEqual("strategy_lab_promotion", payload["change_category"])
             self.assertEqual("promotion_queued", report["evaluated"][0]["decision"])
 
+    def test_evaluator_promotes_at_profitable_strategy_specific_horizon(self):
+        settings = base_settings()
+        settings["strategy_lab"]["candidate_horizons_minutes"] = [60, 240]
+        created_at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            generate_strategy_lab_candidates(conn, settings, [candidate()])
+            conn.execute(
+                "update strategy_lab_experiments set created_at = ?, status = 'retired_bad_evidence' where strategy_lab_id = ?",
+                (created_at, "okx_spot_survivor_lab_v1"),
+            )
+            for idx in range(30):
+                lab_candidate = candidate(
+                    inst_id=f"HORIZON-{idx}",
+                    strategy_lab_id="okx_spot_survivor_lab_v1",
+                    strategy_lab_version=1,
+                )
+                review = {
+                    "learned_score": 75.0,
+                    "decision": "approve_paper_trade",
+                    "route_status": "standard",
+                    "hard_blocks": [],
+                }
+                trade_id = open_paper_trade(conn, lab_candidate, review, settings=settings)
+                for horizon, pnl in ((60, -20.0), (240, 14.0)):
+                    conn.execute(
+                        """
+                        insert into paper_trade_outcomes (
+                            trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                            context_json, target_at, observed_at, delay_seconds,
+                            measurement_status, price_source
+                        ) values (?, ?, ?, 4.0, ?, '{}', ?, ?, 0, 'valid', 'test')
+                        """,
+                        (trade_id, horizon, created_at, pnl, created_at, created_at),
+                    )
+            conn.commit()
+
+            first = evaluate_strategy_lab(conn, settings)["evaluated"][0]
+            second = evaluate_strategy_lab(conn, settings)["evaluated"][0]
+
+        self.assertEqual(240, first["selected_horizon_minutes"])
+        self.assertEqual("promotion_gate_passed", first["decision"])
+        self.assertEqual("active_testing", first["status"])
+        self.assertEqual("promotion_queued", second["decision"])
+
     def test_evaluator_backfills_route_cost_before_promotion(self):
         settings = base_settings()
         created_at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()

@@ -440,12 +440,14 @@ class SignalVariantTests(unittest.TestCase):
         challenger_id: str,
         incumbent_pnls: list[float],
         challenger_pnls: list[float],
+        horizon_minutes: int = 60,
+        pair_prefix: str = "pair",
     ) -> None:
         created = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
         for index, (incumbent_pnl, challenger_pnl) in enumerate(
             zip(incumbent_pnls, challenger_pnls)
         ):
-            pair_key = f"pair-{index}"
+            pair_key = f"{pair_prefix}-{index}"
             for variant_id, pnl in (
                 (incumbent_id, incumbent_pnl),
                 (challenger_id, challenger_pnl),
@@ -465,12 +467,12 @@ class SignalVariantTests(unittest.TestCase):
                     (
                         (created + dt.timedelta(minutes=index)).isoformat(),
                         f"scan-{index}",
-                        f"bucket-{index}",
+                        f"{pair_prefix}-bucket-{index}",
                         pair_key,
                         variant_id,
                         signal_redesign.SIGNAL_FAMILY,
                         "GATE|frontier_crypto_venue_map|short_frontier_spot|conditional",
-                        f"GATE:TEST{index}_USDT",
+                        f"GATE:{pair_prefix.upper()}TEST{index}_USDT",
                         "GATE",
                         "short_frontier_spot",
                         100.0,
@@ -483,16 +485,107 @@ class SignalVariantTests(unittest.TestCase):
                         trial_id, horizon_minutes, target_at, observed_at,
                         delay_seconds, measurement_status, price, pnl_bps,
                         price_source
-                    ) values (?, 60, ?, ?, 30, 'valid', 99, ?, 'test')
+                    ) values (?, ?, ?, ?, 30, 'valid', 99, ?, 'test')
                     """,
                     (
                         cur.lastrowid,
+                        horizon_minutes,
                         created.isoformat(),
                         created.isoformat(),
                         pnl,
                     ),
                 )
         conn.commit()
+
+    def test_variant_promotion_uses_profitable_horizon_instead_of_fixed_60m(self) -> None:
+        conn = memory_conn()
+        cfg = settings()
+        cfg["signal_redesign"].update(
+            {
+                "candidate_horizons_minutes": [60, 240],
+                "min_paired_trials": 3,
+                "min_observation_hours": 0,
+                "min_valid_label_rate": 0.95,
+                "min_opportunity_coverage": 0.3,
+                "consecutive_passes_to_promote": 2,
+            }
+        )
+        signal_redesign.ensure_initial_variants(conn)
+        self._insert_paired_outcomes(
+            conn,
+            "frontier_v1_incumbent",
+            "frontier_v3_quality_short",
+            [10.0, 12.0, 14.0],
+            [-20.0, -18.0, -16.0],
+            60,
+            "h60",
+        )
+        self._insert_paired_outcomes(
+            conn,
+            "frontier_v1_incumbent",
+            "frontier_v3_quality_short",
+            [-10.0, -8.0, -6.0],
+            [20.0, 22.0, 24.0],
+            240,
+            "h240",
+        )
+
+        first = next(
+            row
+            for row in signal_redesign.evaluate_variants(conn, cfg)
+            if row["variant_id"] == "frontier_v3_quality_short"
+        )
+        second = next(
+            row
+            for row in signal_redesign.evaluate_variants(conn, cfg)
+            if row["variant_id"] == "frontier_v3_quality_short"
+        )
+
+        self.assertEqual(240, first["evaluation"]["selected_horizon_minutes"])
+        self.assertFalse(first["evaluation"]["horizon_evaluations"]["60"]["passed"])
+        self.assertTrue(first["evaluation"]["horizon_evaluations"]["240"]["passed"])
+        self.assertEqual("promoted", second["decision"])
+
+    def test_okx_variant_promotion_uses_profitable_longer_horizon(self) -> None:
+        conn = memory_conn()
+        cfg = settings()
+        cfg["signal_redesign"].update(
+            {
+                "candidate_horizons_minutes": [60, 1440],
+                "min_paired_trials": 3,
+                "min_observation_hours": 0,
+                "min_valid_label_rate": 0.95,
+                "min_opportunity_coverage": 0.3,
+            }
+        )
+        okx_signal_research.ensure_initial_variants(conn)
+        self._insert_paired_outcomes(
+            conn,
+            "okx_v1_incumbent",
+            "okx_v2_funding_alignment",
+            [8.0, 9.0, 10.0],
+            [-12.0, -10.0, -8.0],
+            60,
+            "okx60",
+        )
+        self._insert_paired_outcomes(
+            conn,
+            "okx_v1_incumbent",
+            "okx_v2_funding_alignment",
+            [-6.0, -5.0, -4.0],
+            [18.0, 20.0, 22.0],
+            1440,
+            "okx1d",
+        )
+
+        evaluation = next(
+            row
+            for row in okx_signal_research.evaluate_variants(conn, cfg)
+            if row["variant_id"] == "okx_v2_funding_alignment"
+        )["evaluation"]
+
+        self.assertEqual(1440, evaluation["selected_horizon_minutes"])
+        self.assertTrue(evaluation["passed"])
 
 
 class OkxSignalResearchTests(unittest.TestCase):
