@@ -45,6 +45,8 @@ class CodexRepoAgentTests(unittest.TestCase):
         self.assertIn("Search the repository", prompt)
         self.assertIn("src/not_real.py", prompt)
         self.assertIn("run focused tests", prompt)
+        self.assertIn("Preserve priceable candidate emission", prompt)
+        self.assertIn("counterfactual guard-value measurement", prompt)
 
     def test_default_is_terra_high_with_shared_account_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

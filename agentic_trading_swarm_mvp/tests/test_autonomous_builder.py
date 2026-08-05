@@ -18,6 +18,17 @@ from cost_router import ModelResult
 
 
 class AutonomousBuilderTests(unittest.TestCase):
+    def test_builder_prompts_preserve_paper_exploration(self) -> None:
+        plan_prompt = autonomous_builder._build_plan_prompt("state")
+        implementation_prompt = autonomous_builder._build_implementation_prompt(
+            {"plan": "diagnose a weak family"},
+            "state",
+        )
+
+        for prompt in (plan_prompt, implementation_prompt):
+            self.assertIn("preserve priceable candidate", prompt.lower())
+            self.assertIn("hard quarantine", prompt.lower())
+
     def test_windows_pid_probe_system_error_is_treated_as_not_alive(self) -> None:
         with mock.patch.object(autonomous_builder.os, "kill", side_effect=SystemError("win32 pid probe")):
             self.assertFalse(autonomous_builder._pid_alive(999999))

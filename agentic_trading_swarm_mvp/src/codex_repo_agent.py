@@ -427,6 +427,7 @@ def build_implementation_prompt(
         "Supplied paths, tests, and patch text are non-authoritative hints. Correct them by searching the repository and choose any tracked files needed for a complete implementation.",
         "Never inspect, print, persist, transmit, or modify credentials or secret-bearing environment variables. Do not edit .git, runs, runtime databases, or local secret configuration.",
         "Keep live trading disabled. Do not make broker/order writes or nonzero real-money execution reachable from paper mode.",
+        "Paper exploration is the active runtime policy. Do not turn weak performance, route limits, low quality, spread, liquidity, or cost evidence into a new hard candidate suppression, quarantine, or paper-entry block. Preserve priceable candidate emission and express that evidence as diagnostics, ranking, sizing, synthetic-paper routing, or counterfactual guard-value measurement. Only invalid or dangerously stale prices, critically malformed data, undefined PnL, missing required leg prices without a proxy, duplicate exposure, or capacity deferral may prevent a paper experiment.",
         "You may change source, tests, configuration, dependency manifests, migrations, worker/startup code, and self-repair logic when the goal requires it.",
         "Finish with changed behavior and tests. If the turn must stop early, leave coherent work in place and state the exact next action.",
         "IMPLEMENTATION CONTRACT\n" + json.dumps(contract, sort_keys=True, default=str),

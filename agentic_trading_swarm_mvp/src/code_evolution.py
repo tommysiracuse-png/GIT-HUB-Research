@@ -4854,12 +4854,16 @@ def _run_candidate_tests(payload: dict, cfg: dict, app_root: pathlib.Path) -> di
 _PAPER_ADMISSION_SENSITIVE_FILES = {
     "src/agent_review.py",
     "src/execution_engine.py",
+    "src/frontier_crypto_adapter.py",
+    "src/frontier_data_quality.py",
     "src/paper_context_cost.py",
     "src/paper_exploration.py",
     "src/paper_order_router.py",
     "src/paper_route_registry.py",
+    "src/radar_loop.py",
     "src/route_resolver.py",
     "src/signal_safety.py",
+    "src/strategy_lab.py",
     "src/strategy_reliability.py",
 }
 

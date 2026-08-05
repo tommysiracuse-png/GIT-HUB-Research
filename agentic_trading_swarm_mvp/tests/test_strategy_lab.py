@@ -566,6 +566,8 @@ class StrategyLabTest(unittest.TestCase):
         self.assertIn("trade_types are scanner families", prompt)
         self.assertIn("Do not put a direction in trade_types", prompt)
         self.assertIn("experiment_type must be one of", prompt)
+        self.assertIn("Paper exploration is enabled", prompt)
+        self.assertIn("do not propose new hard quarantines", prompt)
 
     def test_lab_id_persists_through_opportunity_and_paper_trade(self):
         settings = base_settings()

@@ -201,6 +201,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         f"You are {agent['name']}. Role: {agent['role']}\n"
         f"{dynamic_instruction}"
         f"{build_planner_instruction}"
+        "Paper exploration is enabled. Treat weak performance, route limits, low quality, spread, liquidity, and cost as diagnostic evidence, ranking, sizing, synthetic-paper routing, or guard-value measurement; do not propose new hard quarantines, candidate suppression, or paper-entry blocks for priceable candidates. Only invalid or dangerously stale prices, critically malformed data, undefined PnL, missing required multi-leg prices without a proxy, duplicate exposure, or capacity deferral may prevent a paper experiment.\n"
         "Return exactly one JSON object matching this schema:\n"
         "{"
         "\"action\": allowed action, "
