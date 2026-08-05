@@ -140,6 +140,84 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(tier, "standard")
         self.assertIn("Route blockers", reason)
 
+    def test_route_hunter_attaches_read_only_requirement_summary_before_ranking(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": ["propose_hunter_directive"],
+            "short_frontier_spot_route_outcomes": {
+                "paper_only": True,
+                "routes": [
+                    {
+                        "venue": "MEXC",
+                        "signal_key": "SYNTHETIC_RESEARCH|MEXC|frontier_crypto_venue_map|short_frontier_spot|conditional",
+                        "direction": "short_frontier_spot",
+                        "outcome_status": "weak_paper_outcome",
+                        "observed_outcome": {"avg_pnl_bps": -79.377, "closed_count": 17},
+                        "route_requirement_summary": {
+                            "short_borrow_availability": {"availability_status": "available"},
+                            "fee_estimate": {"route_cost_bps_paper": 14.5},
+                            "margin_mode": {"required": True},
+                            "api_entitlement": {"path_readiness": "observed"},
+                        },
+                    },
+                    {
+                        "venue": "VALR",
+                        "signal_key": "SYNTHETIC_RESEARCH|VALR|frontier_crypto_venue_map|short_frontier_spot|conditional",
+                        "direction": "short_frontier_spot",
+                        "outcome_status": "weak_paper_outcome",
+                        "observed_outcome": {"avg_pnl_bps": -41.539, "closed_count": 19},
+                    },
+                ],
+            },
+        }
+        seen_by_hunter: dict = {}
+
+        def fake_run_agent(agent: dict, agent_packet: dict, _memory: list[dict]) -> dict:
+            if agent["name"] == "execution_route_hunter":
+                seen_by_hunter.update(agent_packet.get("execution_route_requirement_summary") or {})
+            return {
+                "action": "propose_hunter_directive",
+                "priority": 50,
+                "title": agent["name"],
+                "rationale": "unit test",
+                "market_key": agent["name"],
+                "evidence": {},
+                "proposed_change": "unit test",
+                "agent_name": agent["name"],
+            }
+
+        with mock.patch.object(llm_swarm_runner, "run_agent", side_effect=fake_run_agent):
+            llm_swarm_runner.run_sequential(packet, [])
+
+        self.assertTrue(seen_by_hunter["prepared_before_recommendation_ranking"])
+        self.assertEqual(
+            seen_by_hunter["labels"],
+            list(llm_swarm_runner.EXECUTION_ROUTE_REQUIREMENT_LABELS),
+        )
+        mexc, valr = seen_by_hunter["routes"]
+        self.assertEqual(mexc["labels"], {
+            "borrow_availability": "available",
+            "fee_pressure": "14.5",
+            "margin_needs": "available",
+            "api_borrow_feasibility": "observed",
+        })
+        self.assertEqual(valr["labels"]["borrow_availability"], "requires_borrow_confirmation")
+        self.assertEqual(valr["labels"]["fee_pressure"], "fee_pressure_unmeasured")
+        self.assertFalse(valr["entry_blocked"])
+
+        hunter_output = next(
+            row["recommendation"]
+            for row in llm_swarm_runner.LAST_SWARM_STATE["agent_outputs"]
+            if row["agent_name"] == "execution_route_hunter"
+        )
+        summary = hunter_output["execution_route_requirement_summary"]
+        self.assertTrue(summary["read_only"])
+        self.assertEqual(summary["ranking_policy"], "diagnostic_only_no_eligibility_or_quarantine_change")
+        self.assertFalse(summary["hard_blocking"])
+        self.assertEqual(
+            hunter_output["evidence"]["execution_route_requirement_summary"],
+            summary,
+        )
+
     def test_swarm_recommendation_includes_frontier_escalation_reason(self) -> None:
         result = ModelResult(
             text='{"action":"propose_diagnostic_hypothesis","priority":88,"title":"Root cause","rationale":"Evidence-backed","evidence":{},"proposed_change":"Test hypothesis"}',

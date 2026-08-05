@@ -52,6 +52,14 @@ LAST_SWARM_STATE: dict[str, Any] = {}
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
+EXECUTION_ROUTE_REQUIREMENT_LABELS = (
+    "borrow_availability",
+    "fee_pressure",
+    "margin_needs",
+    "api_borrow_feasibility",
+)
+
+
 class SwarmState(TypedDict, total=False):
     packet: dict
     memory: list[dict]
@@ -130,6 +138,138 @@ def load_state_packet(path: pathlib.Path = STATE_JSON) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _first_route_value(*values: Any) -> Any:
+    """Return the first non-empty route value without interpreting it as a gate."""
+
+    for value in values:
+        if value not in (None, "", [], {}, ()):
+            return value
+    return None
+
+
+def _route_label(value: Any, fallback: str) -> str:
+    """Normalize a display label while keeping unknown route facts visible."""
+
+    if isinstance(value, bool):
+        return "available" if value else "unavailable"
+    if value in (None, "", [], {}, ()):
+        return fallback
+    return str(value)
+
+
+def build_execution_route_requirement_summary(packet: dict) -> dict:
+    """Build the hunter's read-only pre-ranking route-requirement summary.
+
+    Short-frontier outcome telemetry intentionally contains performance evidence,
+    not account or broker state.  This projection labels missing borrow, fee,
+    margin, and API facts as confirmation work rather than treating them as
+    eligibility gates.  It is attached before recommendation ranking so both
+    the hunter and downstream Build Planner can see the same paper-only facts.
+    """
+
+    outcome_report = packet.get("short_frontier_spot_route_outcomes")
+    outcome_report = outcome_report if isinstance(outcome_report, dict) else {}
+    route_rows = outcome_report.get("routes")
+    route_rows = route_rows if isinstance(route_rows, list) else []
+    summaries: list[dict[str, Any]] = []
+
+    for route in route_rows:
+        if not isinstance(route, dict):
+            continue
+        existing = route.get("route_requirement_summary")
+        existing = existing if isinstance(existing, dict) else {}
+        borrow = existing.get("short_borrow_availability")
+        borrow = borrow if isinstance(borrow, dict) else {}
+        fee = existing.get("fee_estimate")
+        fee = fee if isinstance(fee, dict) else {}
+        margin = existing.get("margin_mode")
+        margin = margin if isinstance(margin, dict) else {}
+        api = existing.get("api_entitlement")
+        api = api if isinstance(api, dict) else {}
+
+        borrow_value = _first_route_value(
+            borrow.get("availability_status"),
+            route.get("borrow_availability"),
+            route.get("borrow_availability_status"),
+            route.get("borrowable"),
+        )
+        fee_value = _first_route_value(
+            fee.get("pressure"),
+            fee.get("route_cost_bps_paper"),
+            fee.get("estimated_round_trip_taker_bps"),
+            route.get("fee_pressure"),
+            route.get("route_cost_bps_paper"),
+            route.get("estimated_round_trip_cost_bps"),
+        )
+        margin_value = _first_route_value(
+            margin.get("required"),
+            margin.get("mode"),
+            route.get("margin_required"),
+            route.get("margin_mode"),
+        )
+        api_value = _first_route_value(
+            api.get("path_readiness"),
+            api.get("entitlement_status"),
+            route.get("api_borrow_feasibility"),
+            route.get("api_route_status"),
+            route.get("api_access_status"),
+        )
+        summaries.append(
+            {
+                "venue": str(route.get("venue") or "unknown"),
+                "signal_key": str(route.get("signal_key") or "unknown"),
+                "direction": str(route.get("direction") or "short_frontier_spot"),
+                "outcome_status": str(route.get("outcome_status") or "paper_outcome_observed"),
+                "labels": {
+                    "borrow_availability": _route_label(borrow_value, "requires_borrow_confirmation"),
+                    "fee_pressure": _route_label(fee_value, "fee_pressure_unmeasured"),
+                    "margin_needs": _route_label(margin_value, "margin_needs_confirmation"),
+                    "api_borrow_feasibility": _route_label(
+                        api_value,
+                        "requires_api_and_borrow_confirmation",
+                    ),
+                },
+                "observed_outcome": dict(route.get("observed_outcome") or {}),
+                "ranking_input": {
+                    "mode": "paper_ordering_only",
+                    "action": "diagnostic_labels_before_recommendation_ranking",
+                    "score_adjustment": 0.0,
+                },
+                "paper_candidate_emission": "retained_for_paper_exploration",
+                "hard_blocking": False,
+                "entry_blocked": False,
+                "routing_decision_changed": False,
+            }
+        )
+
+    return {
+        "summary_version": "execution_route_hunter_requirements_v1",
+        "paper_only": True,
+        "read_only": True,
+        "prepared_before_recommendation_ranking": True,
+        "labels": list(EXECUTION_ROUTE_REQUIREMENT_LABELS),
+        "route_count": len(summaries),
+        "routes": summaries,
+        "ranking_policy": "diagnostic_only_no_eligibility_or_quarantine_change",
+        "hard_blocking": False,
+        "entry_blocked": False,
+        "routing_decision_changed": False,
+    }
+
+
+def _attach_execution_route_requirement_summary(rec: dict, summary: dict) -> dict:
+    """Attach deterministic route diagnostics to the hunter result pre-ranker."""
+
+    decorated = dict(rec)
+    evidence = decorated.get("evidence")
+    evidence = dict(evidence) if isinstance(evidence, dict) else {}
+    evidence["execution_route_requirement_summary"] = summary
+    evidence["paper_only"] = True
+    decorated["evidence"] = evidence
+    decorated["execution_route_requirement_summary"] = summary
+    return decorated
+
+
 def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
     compact = {
         "summary": packet.get("summary"),
@@ -144,6 +284,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "expansion_map": packet.get("expansion_map", {}),
         "route_intelligence": (packet.get("expansion_map", {}) or {}).get("route_intelligence", {}),
         "short_frontier_spot_route_outcomes": packet.get("short_frontier_spot_route_outcomes", {}),
+        "execution_route_requirement_summary": packet.get("execution_route_requirement_summary", {}),
         "prediction_markets": (packet.get("expansion_map", {}) or {}).get("prediction_markets", {}),
         "hunter_directives": packet.get("hunter_directives", [])[:10],
         "growth_experiments": packet.get("growth_experiments", [])[:10],
@@ -192,8 +333,9 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
     route_hunter_instruction = ""
     if agent["name"] == "execution_route_hunter":
         route_hunter_instruction = (
-            "Use short_frontier_spot_route_outcomes to emit read-only route diagnostics for "
-            "borrow/permissions, fees, margin constraints, API reliability, spread/liquidity, and carry. "
+            "Use execution_route_requirement_summary, prepared before recommendation ranking, to emit read-only "
+            "route diagnostics for borrow availability, fee pressure, margin needs, API/borrow feasibility, "
+            "permissions, spread/liquidity, and carry. "
             "Weak observed paper PnL is route-specific diagnostic and paper-ordering evidence only: retain "
             "candidate emission and do not recommend suppression, quarantine, or a paper-entry block.\n"
         )
@@ -978,6 +1120,10 @@ def _run_agent_node(
     agent_packet["current_cycle_agent_outputs"] = state.get("agent_outputs", [])
     agent_packet["current_cycle_critiques"] = state.get("critiques", [])
     agent_packet["current_cycle_ranked_actions"] = state.get("ranked_actions", [])
+    route_requirement_summary: dict | None = None
+    if agent["name"] == "execution_route_hunter":
+        route_requirement_summary = build_execution_route_requirement_summary(agent_packet)
+        agent_packet["execution_route_requirement_summary"] = route_requirement_summary
     if agent["name"] == "build_planner" or (
         agent.get("dynamic_agent_id") and "propose_code_change" in set(agent.get("allowed_actions") or [])
     ):
@@ -985,6 +1131,8 @@ def _run_agent_node(
     role_memory = runtime_role_memory if runtime_role_memory is not None else state.get("role_memory") or {}
     memory = list(role_memory.get(agent["name"]) or state.get("memory") or [])
     rec = run_agent(agent, agent_packet, memory)
+    if route_requirement_summary is not None:
+        rec = _attach_execution_route_requirement_summary(rec, route_requirement_summary)
     if agent["name"] == "build_planner":
         upstream_runs = [
             item.get("recommendation", {}).get("dynamic_agent_run_id")
