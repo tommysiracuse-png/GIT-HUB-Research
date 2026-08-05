@@ -187,6 +187,90 @@ class StrategyLabTest(unittest.TestCase):
             self.assertEqual("proposed", row["status"])
             self.assertIn("OKX spot", row["hypothesis"])
 
+    def test_repeated_identical_recommendation_preserves_runtime_progress(self):
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set status='active_testing', compile_status='compiled',
+                    compiled_strategy_logic_json=strategy_logic_json,
+                    evaluation_json='{"valid_label_count": 7}'
+                where strategy_lab_id='okx_spot_survivor_lab_v1'
+                """
+            )
+            conn.commit()
+
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            row = conn.execute(
+                """
+                select status,compile_status,compiled_strategy_logic_json,evaluation_json
+                from strategy_lab_experiments
+                where strategy_lab_id='okx_spot_survivor_lab_v1'
+                """
+            ).fetchone()
+
+        self.assertEqual("active_testing", row["status"])
+        self.assertEqual("compiled", row["compile_status"])
+        self.assertTrue(json.loads(row["compiled_strategy_logic_json"]))
+        self.assertEqual(7, json.loads(row["evaluation_json"])["valid_label_count"])
+
+    def test_repeated_source_cannot_rollback_owner_repaired_contract(self):
+        repaired_logic = {
+            "type": "observation_program",
+            "universe": {"venues": ["OKX_SPOT"]},
+            "entry_expression": "return_60m_bps > 5",
+            "invalidation_expression": "return_60m_bps <= 0",
+            "direction": "long",
+            "edge_expression": "return_60m_bps",
+            "score_expression": "quality_score",
+            "route_surface": "frontier_spot",
+        }
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set status='active_testing', compile_status='compiled',
+                    strategy_logic_json=?, compiled_strategy_logic_json=?
+                where strategy_lab_id='okx_spot_survivor_lab_v1'
+                """,
+                (json.dumps(repaired_logic), json.dumps(repaired_logic)),
+            )
+            conn.commit()
+
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            row = conn.execute(
+                """
+                select status,compile_status,strategy_logic_json
+                from strategy_lab_experiments
+                where strategy_lab_id='okx_spot_survivor_lab_v1'
+                """
+            ).fetchone()
+
+        self.assertEqual("active_testing", row["status"])
+        self.assertEqual("compiled", row["compile_status"])
+        self.assertEqual(repaired_logic, json.loads(row["strategy_logic_json"]))
+
+    def test_repairable_compiled_strategy_remains_in_runtime_portfolio(self):
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, lab_rec())
+            generate_strategy_lab_candidates(conn, base_settings(), [candidate()])
+            conn.execute(
+                """
+                update strategy_lab_experiments set status='needs_contract_revision'
+                where strategy_lab_id='okx_spot_survivor_lab_v1'
+                """
+            )
+            conn.commit()
+
+            generated, report = generate_strategy_lab_candidates(
+                conn, base_settings(), [candidate()]
+            )
+
+        self.assertEqual(1, len(generated))
+        self.assertEqual(1, report["active_experiments"])
+
     def test_ingests_explicit_experiment_type(self):
         rec = lab_rec()
         experiment = rec["payload"]["strategy_lab_experiment"]

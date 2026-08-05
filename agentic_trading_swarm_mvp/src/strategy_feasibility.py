@@ -318,6 +318,28 @@ def maybe_create_relaxed_child(
     cfg = settings.get("strategy_lab", {}).get("adaptive_relaxation", {})
     if not cfg.get("enabled", True) or profile.get("candidate_count"):
         return None
+    max_depth = max(0, int(cfg.get("max_lineage_depth", 2)))
+    depth = 0
+    parent_id = experiment.get("parent_strategy_lab_id")
+    seen = {str(experiment.get("strategy_lab_id") or "")}
+    while parent_id and depth <= max_depth:
+        parent_text = str(parent_id)
+        if parent_text in seen:
+            break
+        seen.add(parent_text)
+        depth += 1
+        parent = conn.execute(
+            "select parent_strategy_lab_id from strategy_lab_experiments where strategy_lab_id = ?",
+            (parent_text,),
+        ).fetchone()
+        parent_id = parent["parent_strategy_lab_id"] if parent else None
+    if depth >= max_depth:
+        return {
+            "status": "lineage_depth_reached",
+            "strategy_lab_id": experiment.get("strategy_lab_id"),
+            "lineage_depth": depth,
+            "max_lineage_depth": max_depth,
+        }
     relaxation = profile.get("relaxation") or {}
     changes = list(relaxation.get("changes") or [])
     if not changes or not relaxation.get("complete_repair"):

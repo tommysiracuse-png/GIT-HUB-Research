@@ -355,6 +355,30 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         summary = evolution_owner_scheduler.scheduler_summary(self.conn)
         self.assertEqual({"strategy": 2, "adapter": 2, "general": 2}, summary["turns_by_lane"])
 
+    def test_owner_prioritizes_new_strategy_when_testing_portfolio_is_thin(self) -> None:
+        now = owner._utc_now()
+        for task_id, objective, priority in (
+            ("repair-task", "repair_runtime_contract", 99),
+            ("materialize-task", "materialize_hypothesis", 84),
+        ):
+            self.conn.execute(
+                """
+                insert into strategy_owner_tasks(
+                    task_id,created_at,updated_at,dedupe_key,objective_type,priority,status,
+                    hypothesis,acceptance_json,dependency_json
+                ) values(?,?,?,?,?,?,'queued',?,'{}','{}')
+                """,
+                (task_id, now, now, task_id, objective, priority, objective),
+            )
+        self.conn.commit()
+
+        claimed = owner.claim_task(
+            self.conn,
+            {"strategy_implementation_owner": {"minimum_concurrent_experiments": 8}},
+        )
+
+        self.assertEqual("materialize-task", claimed["task_id"])
+
     def test_invalid_backlog_collapses_by_novelty_signature(self) -> None:
         now = owner._utc_now()
         for suffix in ("a", "b"):

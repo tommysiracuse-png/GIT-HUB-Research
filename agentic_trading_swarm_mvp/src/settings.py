@@ -539,6 +539,7 @@ DEFAULT_SETTINGS = {
             "critical_max_spread_bps": 50.0,
             "paper_allocation_multiplier": 0.10,
             "max_new_children_per_loop": 3,
+            "max_lineage_depth": 2,
         },
         "yahoo_proxy_momentum_source_veto": {
             "min_recovery_windows": 3,
@@ -652,6 +653,7 @@ DEFAULT_SETTINGS = {
         "salvage_invalid_backlog": True,
         "salvage_limit_per_cycle": 12,
         "stalled_testing_hours": 24,
+        "minimum_concurrent_experiments": 8,
         "report_limit": 100,
     },
     "research_worker": {

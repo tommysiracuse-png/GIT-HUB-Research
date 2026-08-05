@@ -94,6 +94,7 @@ def _cfg(settings: dict) -> dict:
         "salvage_invalid_backlog": True,
         "salvage_limit_per_cycle": 12,
         "stalled_testing_hours": 24,
+        "minimum_concurrent_experiments": 8,
         "task_worktree_dir": str(RUNS_DIR / "strategy_owner_worktrees"),
         "report_limit": 100,
     }
@@ -539,7 +540,21 @@ def _reclaim_dead_leases(conn: sqlite3.Connection) -> int:
 def claim_task(conn: sqlite3.Connection, settings: dict) -> dict | None:
     _reclaim_dead_leases(conn)
     now = _utc_now()
-    lease_until = (_parse_iso(now) + dt.timedelta(seconds=int(_cfg(settings)["lease_seconds"]))).isoformat()
+    cfg = _cfg(settings)
+    lease_until = (_parse_iso(now) + dt.timedelta(seconds=int(cfg["lease_seconds"]))).isoformat()
+    healthy_experiments = int(
+        conn.execute(
+            """
+            select count(*) from strategy_lab_experiments
+            where experiment_type = 'market_strategy'
+              and compile_status = 'compiled'
+              and status in ('active_testing', 'needs_more_evidence')
+            """
+        ).fetchone()[0]
+    )
+    prioritize_materialization = healthy_experiments < int(
+        cfg.get("minimum_concurrent_experiments", 8)
+    )
     conn.execute("begin immediate")
     row = conn.execute(
         """
@@ -548,10 +563,13 @@ def claim_task(conn: sqlite3.Connection, settings: dict) -> dict | None:
           and claimed_by is null
           and (next_retry_at is null or next_retry_at <= ?)
         order by case when status = 'implementation_paused' then 0 else 1 end,
+                 case when ? and objective_type in (
+                     'materialize_hypothesis', 'repair_invalid_contract', 'repair_surface_contract'
+                 ) then 0 else 1 end,
                  priority desc, updated_at asc
         limit 1
         """.format(",".join("?" for _ in CLAIMABLE_STATUSES)),
-        (*sorted(CLAIMABLE_STATUSES), now),
+        (*sorted(CLAIMABLE_STATUSES), now, prioritize_materialization),
     ).fetchone()
     if not row:
         conn.commit()

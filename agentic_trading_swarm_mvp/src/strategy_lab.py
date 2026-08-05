@@ -1359,59 +1359,114 @@ def ingest_strategy_lab_recommendation(
         conn.commit()
         created = True
     except sqlite3.IntegrityError:
-        conn.execute(
+        existing = conn.execute(
             """
-            update strategy_lab_experiments
-            set updated_at = ?, status = case
-                    when ? = 'quarantined_surface_policy' then ?
-                    when status in ('promoted_to_code', 'promotion_queued') then status
-                    else ?
-                end,
-                hypothesis = ?,
-                experiment_type = ?,
-                strategy_logic_json = ?,
-                original_strategy_logic_json = ?,
-                compiled_strategy_logic_json = '{}',
-                compile_status = 'uncompiled',
-                compile_diagnostics_json = ?,
-                data_requirements_json = ?,
-                risk_gates_json = ?,
-                promotion_rules_json = ?,
-                source_surface = ?,
-                permitted_target_surfaces_json = ?,
-                surface_policy_json = ?,
-                source_recommendation_id = coalesce(source_recommendation_id, ?)
-            where strategy_lab_id = ?
+            select version, status, compile_status, source_recommendation_id,
+                   strategy_logic_json, source_surface, permitted_target_surfaces_json,
+                   experiment_type
+            from strategy_lab_experiments where strategy_lab_id = ?
             """,
-            (
-                now,
-                contract["status"],
-                contract["status"],
-                contract["status"],
-                contract["hypothesis"],
-                contract["experiment_type"],
-                json.dumps(contract["strategy_logic"], sort_keys=True),
-                json.dumps(contract["strategy_logic"], sort_keys=True),
-                json.dumps(
-                    {
-                        "reason": (
-                            "non_market_experiment_routed_outside_strategy_lab"
-                            if contract["experiment_type"] != "market_strategy"
-                            else "awaiting_runtime_contract_compilation"
-                        )
-                    },
-                    sort_keys=True,
-                ),
-                json.dumps(contract["data_requirements"], sort_keys=True),
-                json.dumps(contract["risk_gates"], sort_keys=True),
-                json.dumps(contract["promotion_rules"], sort_keys=True),
-                contract["source_surface"],
-                json.dumps(contract["permitted_target_surface"], sort_keys=True),
-                json.dumps(contract["surface_policy"], sort_keys=True),
-                rec.get("recommendation_id"),
-                contract["strategy_lab_id"],
-            ),
+            (contract["strategy_lab_id"],),
+        ).fetchone()
+        incoming_logic = json.dumps(contract["strategy_logic"], sort_keys=True)
+        incoming_surfaces = json.dumps(contract["permitted_target_surface"], sort_keys=True)
+        same_contract = bool(
+            existing
+            and json.dumps(_json_loads(existing["strategy_logic_json"], {}), sort_keys=True)
+            == incoming_logic
+            and _normalize_surface(existing["source_surface"])
+            == _normalize_surface(contract["source_surface"])
+            and json.dumps(
+                _surface_values(_json_loads(existing["permitted_target_surfaces_json"], [])),
+                sort_keys=True,
+            )
+            == json.dumps(_surface_values(contract["permitted_target_surface"]), sort_keys=True)
+            and str(existing["experiment_type"] or "") == contract["experiment_type"]
         )
+        same_source = bool(
+            existing
+            and rec.get("recommendation_id")
+            and str(existing["source_recommendation_id"] or "")
+            == str(rec.get("recommendation_id"))
+        )
+        progressed = bool(
+            existing
+            and (
+                str(existing["status"] or "")
+                not in {"proposed", "rejected_invalid", "quarantined_surface_policy"}
+                or str(existing["compile_status"] or "") != "uncompiled"
+            )
+        )
+        preserve_existing = same_contract or (
+            same_source
+            and progressed
+            and int(contract["version"]) <= int(existing["version"] or 1)
+        )
+        if preserve_existing:
+            # A repeated discovery must not erase compilation, runtime evidence,
+            # or a Strategy Owner repair already in progress.
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set source_recommendation_id = coalesce(source_recommendation_id, ?)
+                where strategy_lab_id = ?
+                """,
+                (rec.get("recommendation_id"), contract["strategy_lab_id"]),
+            )
+        else:
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set updated_at = ?, status = case
+                        when ? = 'quarantined_surface_policy' then ?
+                        when status in ('promoted_to_code', 'promotion_queued') then status
+                        else ?
+                    end,
+                    hypothesis = ?,
+                    experiment_type = ?,
+                    strategy_logic_json = ?,
+                    original_strategy_logic_json = ?,
+                    compiled_strategy_logic_json = '{}',
+                    compile_status = 'uncompiled',
+                    compile_diagnostics_json = ?,
+                    data_requirements_json = ?,
+                    risk_gates_json = ?,
+                    promotion_rules_json = ?,
+                    source_surface = ?,
+                    permitted_target_surfaces_json = ?,
+                    surface_policy_json = ?,
+                    source_recommendation_id = coalesce(source_recommendation_id, ?)
+                where strategy_lab_id = ?
+                """,
+                (
+                    now,
+                    contract["status"],
+                    contract["status"],
+                    contract["status"],
+                    contract["hypothesis"],
+                    contract["experiment_type"],
+                    incoming_logic,
+                    incoming_logic,
+                    json.dumps(
+                        {
+                            "reason": (
+                                "non_market_experiment_routed_outside_strategy_lab"
+                                if contract["experiment_type"] != "market_strategy"
+                                else "awaiting_runtime_contract_compilation"
+                            )
+                        },
+                        sort_keys=True,
+                    ),
+                    json.dumps(contract["data_requirements"], sort_keys=True),
+                    json.dumps(contract["risk_gates"], sort_keys=True),
+                    json.dumps(contract["promotion_rules"], sort_keys=True),
+                    contract["source_surface"],
+                    incoming_surfaces,
+                    json.dumps(contract["surface_policy"], sort_keys=True),
+                    rec.get("recommendation_id"),
+                    contract["strategy_lab_id"],
+                ),
+            )
         conn.commit()
         created = False
 
@@ -1467,7 +1522,7 @@ def _active_experiments(conn: sqlite3.Connection) -> list[dict]:
         """
         select *
         from strategy_lab_experiments
-        where status in ('active_testing', 'needs_more_evidence')
+        where status in ('active_testing', 'needs_more_evidence', 'needs_contract_revision')
           and experiment_type = 'market_strategy'
           and compile_status = 'compiled'
         order by updated_at desc

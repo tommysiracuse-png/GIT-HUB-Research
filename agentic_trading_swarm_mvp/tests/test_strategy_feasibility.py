@@ -141,6 +141,32 @@ class StrategyFeasibilityTests(unittest.TestCase):
         self.assertIn("missing_feature_history", {item["reason"] for item in profile["blocking_gates"]})
         self.assertFalse(profile["relaxation"]["complete_repair"])
 
+    def test_adaptive_relaxation_stops_repeating_the_same_lineage(self):
+        self.settings["strategy_lab"]["adaptive_relaxation"]["max_lineage_depth"] = 1
+        profile = profile_observation_program(self.experiment, frames(), self.settings)
+        record_contract_evaluation(
+            self.conn, self.experiment, profile, cycle_id="depth-cycle"
+        )
+        child = maybe_create_relaxed_child(self.conn, self.experiment, profile, self.settings)
+        self.conn.commit()
+        row = self.conn.execute(
+            "select * from strategy_lab_experiments where strategy_lab_id=?",
+            (child["strategy_lab_id"],),
+        ).fetchone()
+        child_experiment = {
+            "strategy_lab_id": row["strategy_lab_id"],
+            "parent_strategy_lab_id": row["parent_strategy_lab_id"],
+            "strategy_logic": json.loads(row["strategy_logic_json"]),
+            "risk_gates": json.loads(row["risk_gates_json"]),
+        }
+
+        blocked = maybe_create_relaxed_child(
+            self.conn, child_experiment, profile, self.settings
+        )
+
+        self.assertEqual("lineage_depth_reached", blocked["status"])
+        self.assertEqual(1, blocked["lineage_depth"])
+
     def test_architect_creates_a_child_after_repeated_gap(self):
         now = storage.utc_now()
         for index in range(3):
