@@ -2048,6 +2048,11 @@ def enrich_candidate_with_route(
     )
     diagnostic_input["conditional_short_route_intelligence"] = conditional_short_route_intelligence
     conditional_short_diagnostics = build_conditional_short_route_diagnostics(diagnostic_input)
+    eligibility = _conditional_short_paper_observation_eligibility(
+        eligibility,
+        conditional_short_route_intelligence,
+        score=_eligibility_number(enriched, "score"),
+    )
     route["route_sensitive"] = route_sensitive
     route["route_sensitivity_reasons"] = route_sensitivity_reasons
     route["route_feasibility_score"] = route_feasibility_score
@@ -2195,6 +2200,68 @@ def enrich_candidate_with_route(
     return enriched
 
 
+def _conditional_short_paper_observation_eligibility(
+    eligibility: dict[str, object],
+    route_intelligence: dict[str, object],
+    *,
+    score: float | None,
+) -> dict[str, object]:
+    """Keep conditional-short route evidence visible without blocking paper tests.
+
+    Explicit venue capability and borrow facts remain valuable context, but
+    they describe the live/direct route rather than data validity.  A
+    conditional short therefore retains the original route verdict as a
+    diagnostic and is down-ranked by route intelligence instead of being
+    suppressed, quarantined, or prevented from entering paper exploration.
+    """
+
+    if not bool(route_intelligence.get("applies")):
+        return eligibility
+
+    original = dict(eligibility)
+    diagnostic_reasons = list(
+        dict.fromkeys(
+            [
+                *[str(value) for value in original.get("blocker_reasons", []) if value],
+                *[str(value) for value in original.get("missing_prerequisites", []) if value],
+            ]
+        )
+    )
+    notes = list(original.get("paper_route_notes", []) or [])
+    notes.append(
+        "Conditional-short route facts are read-only paper diagnostics; they down-rank but do not block exploration."
+    )
+    observed = dict(original)
+    observed.update(
+        {
+            "route_decision": "paper_observation",
+            "feasibility_status": "feasible_with_route_diagnostics",
+            "execution_eligibility": "eligible",
+            "route_eligible": True,
+            "eligible_for_scoring": True,
+            "suppressed": False,
+            "proxy_used": False,
+            "selected_proxy_id": None,
+            "missing_prerequisites": [],
+            "blocker_reasons": [],
+            "blocking_reason": None,
+            "route_status": "diagnostic_only",
+            "candidate_status": "paper_route_diagnostics",
+            "paper_route_notes": list(dict.fromkeys(notes)),
+            "rank_contribution_cap": 1.0,
+            "rank_contribution": (
+                None if score is None else round(max(0.0, score), 6)
+            ),
+            "assumption_penalty_applied": False,
+            "paper_score_multiplier": 1.0,
+            "route_diagnostics_only": True,
+            "route_diagnostic_reasons": diagnostic_reasons,
+            "direct_route_eligibility_diagnostic": original,
+        }
+    )
+    return observed
+
+
 def _activatable_okx_paper_proxy(candidate: dict, settings: dict) -> dict | None:
     """Return the explicit OKX paper proxy that fully replaces a borrow blocker."""
 
@@ -2291,6 +2358,11 @@ def activate_paper_proxy_candidate(candidate: dict, settings: dict) -> dict:
         min(1.0, float(alternative.get("paper_allocation_multiplier") or 0.25)),
     )
     direct_score = activated.get("pre_route_eligibility_score")
+    if direct_score is None:
+        # The direct short's route-risk down-rank is useful for ranking that
+        # route, but must not leak into a separately labeled proxy that
+        # replaces the borrow leg for paper-only observation.
+        direct_score = activated.get("score_before_conditional_short_execution_risk")
     if direct_score is None:
         direct_score = activated.get("score", 0.0)
 
@@ -2564,7 +2636,14 @@ def summarize_route_intelligence(candidates: Iterable[dict], min_interesting_sco
     for candidate in candidates:
         route = candidate.get("execution_route") or {}
         score = float(
-            candidate.get("pre_route_eligibility_score", candidate.get("score")) or 0.0
+            candidate.get(
+                "pre_route_eligibility_score",
+                candidate.get(
+                    "score_before_conditional_short_execution_risk",
+                    candidate.get("score"),
+                ),
+            )
+            or 0.0
         )
         status = route.get("route_status") or candidate.get("route_status") or "unknown"
         route_id = route.get("route_id") or candidate.get("route_id") or "unknown"

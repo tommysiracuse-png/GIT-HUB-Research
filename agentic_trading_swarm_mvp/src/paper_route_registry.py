@@ -3,7 +3,8 @@
 The registry is deliberately descriptive: it never checks credentials, calls a
 venue, changes account state, or authorizes live trading.  It adds conservative
 route requirements and cost assumptions to paper candidates so unsupported
-routes cannot be mistaken for executable alpha.
+direct routes remain visible as route context rather than being mistaken for
+executable alpha.
 """
 
 from __future__ import annotations
@@ -221,8 +222,11 @@ def assess_paper_route_registry(
     action = "tag"
     if enabled and mode == "paper" and in_scope:
         if support_status == "unsupported" and not proxy_present:
-            multiplier = 0.0
-            action = "suppress"
+            # Conditional short route availability is route intelligence, not
+            # evidence that the price or PnL is invalid.  Keep the candidate
+            # in paper exploration and let the resolver attach a read-only
+            # diagnostic/down-rank packet before ranking.
+            action = "diagnose"
         elif support_status == "unspecified" and not candidate_evidence_present:
             multiplier = min(1.0, float(data.get("unspecified_score_multiplier") or DEFAULT_UNSPECIFIED_SCORE_MULTIPLIER))
             action = "penalize"
@@ -293,7 +297,7 @@ def apply_paper_route_registry(
 
     action = assessment["action"]
     multiplier = float(assessment["score_multiplier"])
-    if action in {"suppress", "penalize"}:
+    if action == "penalize":
         raw_score = enriched.get("pre_paper_route_registry_score", enriched.get("score"))
         if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool):
             enriched.setdefault("pre_paper_route_registry_score", raw_score)

@@ -68,6 +68,16 @@ class RouteResolverTests(unittest.TestCase):
         self.assertEqual(packet, enriched["execution_route"]["conditional_short_route_intelligence"])
         self.assertEqual("down_rank_only", packet["ranking_action"])
         self.assertFalse(packet["hard_blocking"])
+        self.assertEqual("MEXC", packet["venue_capability_profile"])
+        self.assertFalse(enriched["paper_route_eligibility"]["suppressed"])
+        self.assertEqual("paper_observation", enriched["paper_route_eligibility"]["route_decision"])
+        self.assertIn(
+            "venue_spot_short_capability_unconfirmed",
+            enriched["paper_route_eligibility"]["route_diagnostic_reasons"],
+        )
+        self.assertGreater(enriched["score"], 0.0)
+        self.assertLess(enriched["score"], 80.0)
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
 
     def test_okx_short_perp_route_is_standard(self) -> None:
         candidate = {

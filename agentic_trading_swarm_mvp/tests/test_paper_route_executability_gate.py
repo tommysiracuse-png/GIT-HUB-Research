@@ -382,7 +382,7 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
             verdict["missing_prerequisites"],
         )
 
-    def test_enrichment_clamps_score_and_reports_exact_route_gaps(self):
+    def test_enrichment_down_ranks_and_reports_exact_route_gaps(self):
         candidate = {
             "venue": "GATE",
             "trade_type": "frontier_crypto_venue_map",
@@ -398,20 +398,18 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
         )
         summary = summarize_routes([enriched])
 
-        self.assertEqual(0.0, enriched["score"])
-        self.assertEqual(88.0, enriched["pre_route_eligibility_score"])
-        self.assertTrue(enriched["paper_entry_blocked"])
-        self.assertFalse(enriched["promotion_eligible"])
-        self.assertEqual(0.0, enriched["paper_route_allocation_multiplier"])
-        self.assertTrue(enriched["paper_route_score_clamped"])
-        self.assertIn("borrowable", enriched["paper_route_eligibility"]["missing_prerequisites"])
+        self.assertGreater(enriched["score"], 0.0)
+        self.assertLess(enriched["score"], 88.0)
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
+        self.assertFalse(enriched["paper_route_eligibility"]["suppressed"])
+        self.assertIn("borrowable", enriched["paper_route_eligibility"]["route_diagnostic_reasons"])
         self.assertEqual(
             1,
-            summary["by_paper_route_eligibility"]["blocked_hard"],
+            summary["by_paper_route_eligibility"]["paper_observation"],
         )
-        self.assertEqual(
-            1,
-            summary["by_paper_route_eligibility_blocker"]["spot_borrow_missing"],
+        self.assertNotIn(
+            "spot_borrow_missing",
+            summary["by_paper_route_eligibility_blocker"],
         )
 
     def test_venue_registry_blocks_short_even_when_account_borrow_is_enabled(self):
@@ -437,11 +435,11 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
             "paper_route_intelligence.crypto_venues",
             enriched["venue_capability_source"],
         )
-        self.assertTrue(enriched["paper_route_eligibility"]["suppressed"])
-        self.assertEqual(0.0, enriched["score"])
+        self.assertFalse(enriched["paper_route_eligibility"]["suppressed"])
+        self.assertGreater(enriched["score"], 0.0)
         self.assertIn(
             "venue_spot_short_capability_unconfirmed",
-            enriched["paper_route_eligibility"]["blocker_reasons"],
+            enriched["paper_route_eligibility"]["route_diagnostic_reasons"],
         )
 
     def test_candidate_capability_flags_cannot_override_maintained_venue_veto(self):
@@ -471,8 +469,8 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
         self.assertFalse(capabilities["supports_spot_short"])
         self.assertFalse(capabilities["supports_margin_spot"])
         self.assertFalse(capabilities["supports_borrow_check"])
-        self.assertEqual("blocked", enriched["execution_eligibility"])
-        self.assertEqual("infeasible_for_paper", enriched["paper_feasibility_status"])
+        self.assertEqual("eligible", enriched["execution_eligibility"])
+        self.assertEqual("feasible_with_route_diagnostics", enriched["paper_feasibility_status"])
 
     def test_borrow_cost_assumption_is_included_in_route_cost_gate(self):
         verdict = evaluate_route_intelligence(
@@ -538,13 +536,12 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
             copy.deepcopy(DEFAULT_SETTINGS),
         )
 
-        self.assertEqual(80.0, enriched["pre_route_eligibility_score"])
-        self.assertEqual(16.0, enriched["score"])
-        self.assertEqual(0.2, enriched["paper_route_allocation_multiplier"])
+        self.assertGreater(enriched["score"], 0.0)
+        self.assertLess(enriched["score"], 80.0)
         self.assertEqual("eligible", enriched["execution_eligibility"])
         self.assertFalse(enriched.get("paper_entry_blocked", False))
 
-    def test_reliability_scoring_cannot_resurrect_blocked_candidate(self):
+    def test_reliability_scoring_keeps_conditional_short_as_paper_diagnostic(self):
         candidate = enrich_candidate_with_route(
             {
                 "venue": "GATE",
@@ -567,15 +564,11 @@ class TestPaperRouteExecutabilityGate(unittest.TestCase):
             protect=True,
         )
 
-        self.assertEqual(0.0, candidate["score"])
-        self.assertFalse(candidate["promotion_eligible"])
-        self.assertTrue(candidate["paper_entry_blocked"])
-        self.assertEqual(0.0, candidate["strategy_reliability_allocation_multiplier"])
-        self.assertTrue(reliability["route_eligibility_enforced"])
-        self.assertFalse(reliability["protect_working_slice"])
-        self.assertEqual(25.0, reliability["requested_score_delta"])
-        self.assertEqual(0.0, reliability["score_delta"])
-        self.assertIn("paper_route_eligibility_blocked", reliability["reasons"])
+        self.assertGreater(candidate["score"], 0.0)
+        self.assertFalse(candidate.get("paper_entry_blocked", False))
+        self.assertNotIn("route_eligibility_enforced", reliability)
+        self.assertEqual(25.0, reliability["score_delta"])
+        self.assertNotIn("paper_route_eligibility_blocked", reliability["reasons"])
 
 
 if __name__ == "__main__":

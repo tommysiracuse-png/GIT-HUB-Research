@@ -201,7 +201,7 @@ class PaperRouteFeasibilityScoreGateTests(unittest.TestCase):
         row = conn.execute("select status from execution_orders").fetchone()
         self.assertEqual("paper_filled", row["status"])
 
-    def test_enriched_candidate_is_attributed_to_score_gate_at_execution_boundary(self) -> None:
+    def test_enriched_conditional_short_stays_diagnostic_only_at_execution_boundary(self) -> None:
         candidate = enrich_candidate_with_route(
             {
                 "venue": "OKX",
@@ -218,11 +218,13 @@ class PaperRouteFeasibilityScoreGateTests(unittest.TestCase):
 
         guarded = apply_frontier_paper_guard(candidate, copy.deepcopy(DEFAULT_SETTINGS))
 
-        self.assertTrue(guarded["shadow_filtered"])
+        self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertFalse(guarded.get("paper_entry_blocked", False))
         self.assertTrue(guarded["paper_route_feasibility_gate"]["applies"])
+        self.assertTrue(guarded["paper_route_feasibility_gate"]["eligible"])
         self.assertEqual(
-            "paper_route_feasibility_score_gate",
-            guarded["candidate_reject_detail"]["guard"],
+            "diagnostic_only",
+            guarded["paper_route_feasibility_gate"]["action"],
         )
 
 

@@ -19,6 +19,7 @@ PAPER_ONLY_CONSTRAINTS = (
     "no_private_api_calls",
     "no_live_trading",
     "no_order_execution_changes",
+    "conditional_short_route_facts_are_non_blocking",
 )
 
 ROUTE_REQUIREMENT_FIELDS = (
@@ -122,14 +123,6 @@ def build_conditional_short_route_intelligence(
         or source.get("direction")
         or UNKNOWN
     ).strip().lower()
-    applies = "short" in direction and route_status in {
-        "conditional",
-        "route_unknown",
-        "unsupported_or_unknown",
-        "paper_testable_via_proxy",
-        "blocked_until_requirements_confirmed",
-    }
-
     def _items(*values: Any) -> list[str]:
         output: list[str] = []
         for value in values:
@@ -149,6 +142,13 @@ def build_conditional_short_route_intelligence(
         resolved_route.get("missing_permissions"),
         source.get("missing_requirements"),
         source.get("route_blockers"),
+    )
+    applies = _conditional_short_route_applies(
+        direction,
+        route_status,
+        source,
+        requirements=requirements,
+        missing_requirements=missing_requirements,
     )
     borrow_required = bool(
         resolved_route.get("borrow_required")
@@ -253,6 +253,11 @@ def build_conditional_short_route_intelligence(
         "taker_fee_bps": taker_fee,
         "api_permission_status": api_permission_status,
         "source": "maintained_paper_route_metadata",
+        "venue_capability_profile": (
+            str(venue_capabilities.get("capability_profile") or UNKNOWN)
+            if isinstance(venue_capabilities, dict)
+            else UNKNOWN
+        ),
         "ranking_action": "down_rank_only" if applies else "no_rank_adjustment",
         "hard_blocking": False,
     }
@@ -324,13 +329,13 @@ def build_conditional_short_route_diagnostics(
     blockers = _route_blockers(source)
     direction = str(source.get("direction") or UNKNOWN).lower()
     route_status = str(source.get("route_status") or _paper_route_status(source, blockers=blockers)).lower()
-    applies = "short" in direction and route_status in {
-        "conditional",
-        "route_unknown",
-        "unsupported_or_unknown",
-        "paper_testable_via_proxy",
-        "blocked_until_requirements_confirmed",
-    }
+    applies = _conditional_short_route_applies(
+        direction,
+        route_status,
+        source,
+        requirements=source.get("required_permissions"),
+        missing_requirements=blockers,
+    )
     borrow_required = _requires_spot_borrow(source, blockers=blockers)
 
     borrow_availability = _route_fact_status(
@@ -420,6 +425,48 @@ def build_conditional_short_route_diagnostics(
         "ranking_action": "down_rank_only" if applies and risk_score else "no_rank_adjustment",
         "hard_blocking": False,
     }
+
+
+def _conditional_short_route_applies(
+    direction: str,
+    route_status: str,
+    source: dict[str, Any],
+    *,
+    requirements: Any,
+    missing_requirements: Any,
+) -> bool:
+    """Identify short routes that need paper-only route context.
+
+    A maintained venue can label a direct route ``standard`` even when the
+    strategy itself is a conditional spot short.  Direction and declared
+    short-route requirements therefore take precedence over that status.
+    """
+
+    if "short" not in str(direction or "").lower():
+        return False
+    conditional_statuses = {
+        "conditional",
+        "route_unknown",
+        "unsupported_or_unknown",
+        "paper_testable_via_proxy",
+        "blocked_until_requirements_confirmed",
+    }
+    if str(route_status or "").lower() in conditional_statuses:
+        return True
+    direction_token = str(direction or "").lower()
+    if direction_token in {"short_frontier_spot", "long_perp_short_spot"}:
+        return True
+    descriptors = " ".join(
+        str(source.get(key) or "")
+        for key in ("market_key", "signal_key", "strategy_profile", "route_type")
+    ).lower()
+    if "conditional" in descriptors:
+        return True
+    def _contains_spot_borrow(value: Any) -> bool:
+        values = (value,) if isinstance(value, str) else (value or [])
+        return any("spot_borrow" in str(item).lower() for item in values)
+
+    return _contains_spot_borrow(requirements) or _contains_spot_borrow(missing_requirements)
 
 
 def _route_fact_status(value: Any, *, required: bool, unresolved: bool) -> str:

@@ -116,7 +116,9 @@ class ProxyRouteActivationTests(unittest.TestCase):
         missing_spot_settings["account_capabilities"]["crypto_spot"] = False
         blocked = enrich_candidates([proxy_candidate()], missing_spot_settings)[0]
         self.assertFalse(blocked.get("paper_proxy_activated", False))
-        self.assertEqual(0.0, blocked["score"])
+        self.assertGreater(blocked["score"], 0.0)
+        self.assertLess(blocked["score"], 80.0)
+        self.assertFalse(blocked.get("paper_entry_blocked", False))
 
     def test_incomplete_proxy_metadata_fails_closed_before_order_emission(self) -> None:
         settings = copy.deepcopy(DEFAULT_SETTINGS)

@@ -43,7 +43,7 @@ def base_candidate(**overrides: object) -> dict:
 
 
 class RouteUnblockerTests(unittest.TestCase):
-    def test_inferred_proxy_does_not_bypass_spot_short_eligibility_gate(self) -> None:
+    def test_inferred_proxy_keeps_spot_short_route_evidence_diagnostic_only(self) -> None:
         cfg = settings()
         enriched = route_resolver.enrich_candidate_with_route(base_candidate(), cfg)
 
@@ -58,14 +58,15 @@ class RouteUnblockerTests(unittest.TestCase):
         self.assertEqual([], review["hard_blocks"])
         self.assertIn(
             "borrowable",
-            enriched["paper_route_eligibility"]["missing_prerequisites"],
+            enriched["paper_route_eligibility"]["route_diagnostic_reasons"],
         )
 
         guarded = paper_order_router.apply_frontier_paper_guard(enriched, cfg)
-        self.assertTrue(guarded.get("shadow_filtered", False))
+        self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertFalse(guarded.get("paper_entry_blocked", False))
         self.assertEqual(
-            guarded["frontier_paper_guard"]["reason"],
-            "paper_route_eligibility_blocked",
+            guarded["paper_route_feasibility_gate"]["action"],
+            "diagnostic_only",
         )
 
     def test_prediction_market_blockers_use_research_paper_route_only(self) -> None:

@@ -30,7 +30,7 @@ class PaperRouteRegistryTests(unittest.TestCase):
         self.assertEqual("unsupported", second["routes"][0]["support_status"])
         self.assertFalse(second["routes"][0]["live_execution_allowed"])
 
-    def test_high_failure_spot_short_is_tagged_and_suppressed(self) -> None:
+    def test_high_failure_spot_short_is_tagged_for_non_blocking_paper_diagnostics(self) -> None:
         candidate = apply_paper_route_registry(
             {
                 "venue": "OKX_SPOT",
@@ -41,10 +41,10 @@ class PaperRouteRegistryTests(unittest.TestCase):
         )
 
         self.assertEqual("unsupported", candidate["paper_route_registry_status"])
-        self.assertEqual("suppress", candidate["paper_route_registry"]["action"])
-        self.assertEqual(0.0, candidate["score"])
-        self.assertTrue(candidate["paper_entry_blocked"])
-        self.assertFalse(candidate["promotion_eligible"])
+        self.assertEqual("diagnose", candidate["paper_route_registry"]["action"])
+        self.assertEqual(80.0, candidate["score"])
+        self.assertFalse(candidate.get("paper_entry_blocked", False))
+        self.assertTrue(candidate.get("promotion_eligible", True))
         self.assertIn("spot_borrow", candidate["paper_route_required_permissions"])
         self.assertIsNone(candidate["paper_route_estimated_cost_bps"]["borrow"])
         self.assertFalse(candidate["paper_route_estimated_cost_bps"]["complete"])

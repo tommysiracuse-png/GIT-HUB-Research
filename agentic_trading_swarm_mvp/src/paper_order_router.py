@@ -262,8 +262,12 @@ def paper_route_feasibility_gate_review(
     scope_reasons = _route_sensitivity_scope(candidate)
     score_source, score = _route_feasibility_score(candidate)
     applies = bool(enabled and mode == "paper" and route_sensitive and conditional and scope_reasons)
-    eligible = not applies or (score is not None and score >= threshold)
-    if not applies:
+    diagnostics_only = _conditional_short_route_diagnostics_only(candidate)
+    eligible = diagnostics_only or not applies or (score is not None and score >= threshold)
+    if diagnostics_only:
+        action = "diagnostic_only"
+        reason = None
+    elif not applies:
         action = "not_applicable"
         reason = None
     elif eligible:
@@ -291,6 +295,7 @@ def paper_route_feasibility_gate_review(
         "paper_fill_allowed": eligible,
         "action": action,
         "reason": reason,
+        "route_diagnostics_only": diagnostics_only,
     }
 
 def _text_contains_frontier_marker(value: Any) -> bool:
@@ -418,6 +423,29 @@ def _paper_assumption_route_allowed(candidate: Mapping[str, Any]) -> bool:
     )
 
 
+def _conditional_short_route_diagnostics_only(candidate: Mapping[str, Any]) -> bool:
+    """Return whether short-route facts must stay paper-only diagnostics."""
+
+    for container in (
+        candidate,
+        candidate.get("execution_feasibility"),
+        candidate.get("execution_route"),
+    ):
+        if not isinstance(container, Mapping):
+            continue
+        packet = container.get("conditional_short_route_intelligence")
+        if not isinstance(packet, Mapping):
+            continue
+        if (
+            _as_bool(packet.get("paper_only"), False)
+            and _as_bool(packet.get("read_only"), False)
+            and _as_bool(packet.get("applies"), False)
+            and not _as_bool(packet.get("hard_blocking"), False)
+        ):
+            return True
+    return False
+
+
 def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize direct-vs-proxy paper route feasibility metadata."""
     blockers = sorted(_route_blockers(candidate))
@@ -466,6 +494,16 @@ def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str,
             )
             or 0.2
         )
+    elif _conditional_short_route_diagnostics_only(candidate):
+        execution_semantics = "route_diagnostics_only"
+        proxy_execution_semantics = "synthetic_research_paper"
+        paper_route_status = "conditional_paper_diagnostics"
+        paper_fill_allowed = True
+        multiplier = _finite_float(
+            (candidate.get("conditional_short_route_diagnostics") or {}).get(
+                "paper_rank_multiplier"
+            )
+        ) or 1.0
     elif direct_status in _ROUTE_RESEARCH_ONLY_STATUSES:
         execution_semantics = "research_only"
         proxy_execution_semantics = None
@@ -575,6 +613,11 @@ def _apply_paper_route_eligibility_metadata(candidate: Mapping[str, Any]) -> dic
 
     annotated = dict(candidate)
     upstream_verdict = annotated.get("paper_route_eligibility")
+    if _conditional_short_route_diagnostics_only(annotated):
+        # Resolver enrichment has already preserved the direct-route verdict
+        # under a read-only diagnostic while keeping the paper candidate
+        # eligible for ranking. Do not re-run the legacy hard route gate.
+        return annotated
     if (
         annotated.get("paper_proxy_activated") is True
         and annotated.get("paper_proxy_not_live_equivalent") is True
@@ -1118,6 +1161,7 @@ def frontier_shadow_filter_reason(
         and _is_short_frontier_spot(candidate)
         and not _is_confirmed_borrow(candidate)
         and not _paper_assumption_route_allowed(candidate)
+        and not _conditional_short_route_diagnostics_only(candidate)
     ):
         checks.append(
             {
@@ -1127,7 +1171,11 @@ def frontier_shadow_filter_reason(
                 "note": "short spot frontier paper fill requires confirmed borrow or equivalent hedge route",
             }
         )
-    if frontier_route_feasibility_guard_enabled(config) and _is_short_frontier_spot(candidate):
+    if (
+        frontier_route_feasibility_guard_enabled(config)
+        and _is_short_frontier_spot(candidate)
+        and not _conditional_short_route_diagnostics_only(candidate)
+    ):
         route_record = frontier_route_feasibility_record(candidate)
         if not route_record.get("paper_fill_allowed", True):
             checks.append(
