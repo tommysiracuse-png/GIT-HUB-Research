@@ -400,6 +400,13 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         self.assertEqual(1, result["historical_experiments_salvaged"])
         self.assertEqual("diagnose_zero_output", task["objective_type"])
         self.assertEqual("queued", task["status"])
+        transitions = owner.monitor_tasks(self.conn)
+        task = self.conn.execute(
+            "select objective_type,status from strategy_owner_tasks where strategy_lab_id='zero-output-child'"
+        ).fetchone()
+        self.assertEqual("analyzing", task["status"])
+        self.assertEqual("diagnose_zero_output", task["objective_type"])
+        self.assertTrue(any(item["task_id"] for item in transitions["transitions"]))
 
 
 if __name__ == "__main__":

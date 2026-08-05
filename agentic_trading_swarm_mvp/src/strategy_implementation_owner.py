@@ -1054,21 +1054,30 @@ def monitor_tasks(conn: sqlite3.Connection) -> dict:
                 }
             )
             continue
-        next_status = {
-            "promote_candidate": "promote_candidate",
-            "promotion_queued": "coding",
-            "promoted_to_code": "completed",
-            "retired_bad_evidence": "retired_bad_evidence",
-            "retired_no_activity": "retired_bad_evidence",
-            "needs_data": "waiting_data",
-            "needs_route": "waiting_route",
-            "needs_contract_revision": "analyzing",
-            "quarantined_surface_policy": "analyzing",
-            "proposed": "analyzing",
-        }.get(
-            experiment_status,
-            "monitoring_evidence" if compile_status == "compiled" else task["status"],
+        zero_output_needs_owner = (
+            str(task.get("objective_type") or "") == "diagnose_zero_output"
+            and _needs_zero_output_diagnosis(
+                {"status": experiment_status, "evaluation": evaluation}
+            )
         )
+        if zero_output_needs_owner:
+            next_status = "analyzing"
+        else:
+            next_status = {
+                "promote_candidate": "promote_candidate",
+                "promotion_queued": "coding",
+                "promoted_to_code": "completed",
+                "retired_bad_evidence": "retired_bad_evidence",
+                "retired_no_activity": "retired_bad_evidence",
+                "needs_data": "waiting_data",
+                "needs_route": "waiting_route",
+                "needs_contract_revision": "analyzing",
+                "quarantined_surface_policy": "analyzing",
+                "proposed": "analyzing",
+            }.get(
+                experiment_status,
+                "monitoring_evidence" if compile_status == "compiled" else task["status"],
+            )
         if next_status != task["status"]:
             conn.execute(
                 "update strategy_owner_tasks set status = ?, updated_at = ?, completed_at = case when ? in ('completed','retired_bad_evidence') then ? else completed_at end where task_id = ?",
