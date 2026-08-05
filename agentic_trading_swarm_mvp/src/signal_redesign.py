@@ -1305,24 +1305,71 @@ def dislocation_quality_cohort_outcomes(conn: sqlite3.Connection, horizon: int =
         """,
         (horizon,),
     ).fetchall()
+    all_frontier = []
     baseline = []
     ranked = []
     diagnostic = []
     for row in rows:
         pnl_bps = float(row["pnl_bps"])
-        baseline.append(pnl_bps)
-        candidate = json.loads(row["candidate_json"] or "{}")
+        all_frontier.append(pnl_bps)
+        try:
+            candidate = json.loads(row["candidate_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            candidate = {}
         cohort = str(candidate.get("paper_quality_cohort") or "baseline")
         if cohort == "quality_ranked":
             ranked.append(pnl_bps)
         elif cohort == "quality_diagnostic":
             diagnostic.append(pnl_bps)
+        else:
+            baseline.append(pnl_bps)
+    baseline_metrics = _metrics(baseline)
+    ranked_metrics = _metrics(ranked)
+    diagnostic_metrics = _metrics(diagnostic)
+
+    def comparison_metrics(cohort_metrics: dict) -> dict:
+        """Expose the acceptance metrics without treating cohort labels as gates."""
+        if not baseline:
+            return {
+                "baseline_available": False,
+                "avg_pnl_bps_delta": None,
+                "hit_rate_delta": None,
+                "tail_loss_bps_delta": None,
+            }
+        return {
+            "baseline_available": True,
+            "avg_pnl_bps_delta": round(
+                float(cohort_metrics["avg_pnl_bps"]) - float(baseline_metrics["avg_pnl_bps"]), 3
+            )
+            if cohort_metrics["avg_pnl_bps"] is not None
+            else None,
+            "hit_rate_delta": round(
+                float(cohort_metrics["win_rate"]) - float(baseline_metrics["win_rate"]), 6
+            )
+            if cohort_metrics["win_rate"] is not None
+            else None,
+            "tail_loss_bps_delta": round(
+                float(cohort_metrics["worst_decile_bps"])
+                - float(baseline_metrics["worst_decile_bps"]),
+                3,
+            )
+            if cohort_metrics["worst_decile_bps"] is not None
+            else None,
+        }
     return {
         "horizon_minutes": horizon,
-        "baseline_all_frontier": _metrics(baseline),
-        "quality_ranked": _metrics(ranked),
-        "quality_diagnostic": _metrics(diagnostic),
-        "comparison_note": "Compare avg_pnl_bps, win_rate, and worst_decile_bps after the next evaluation window; cohorts do not change paper eligibility.",
+        # This legacy inclusive metric stays available for trend continuity.
+        "baseline_all_frontier": _metrics(all_frontier),
+        # The pre-quality cohort is the true comparison baseline; it excludes
+        # score-labeled paper trades so the ranked cohort cannot grade itself.
+        "baseline_pre_quality": baseline_metrics,
+        "quality_ranked": ranked_metrics,
+        "quality_diagnostic": diagnostic_metrics,
+        "comparison": {
+            "quality_ranked_vs_baseline": comparison_metrics(ranked_metrics),
+            "quality_diagnostic_vs_baseline": comparison_metrics(diagnostic_metrics),
+        },
+        "comparison_note": "Compare avg_pnl_bps, hit_rate, and tail_loss_bps after the next evaluation window; cohort labels only prioritize paper review and never change paper eligibility.",
     }
 
 

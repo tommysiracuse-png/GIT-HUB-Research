@@ -92,6 +92,32 @@ class ReliableOutcomeTests(unittest.TestCase):
         self.assertGreater(metrics["quality_ranked"]["avg_pnl_bps"], 0)
         self.assertLess(metrics["quality_diagnostic"]["avg_pnl_bps"], 0)
 
+    def test_dislocation_quality_cohort_comparison_uses_pre_quality_baseline(self) -> None:
+        conn = memory_conn()
+        now = dt.datetime.now(dt.timezone.utc)
+        opened_at = (now - dt.timedelta(minutes=61)).isoformat()
+        insert_trade(conn, opened_at, "BASELINE", {})
+        insert_trade(
+            conn,
+            opened_at,
+            "RANKED",
+            {"paper_quality_cohort": "quality_ranked", "dislocation_quality_score": 82.0},
+        )
+        observations = {
+            "BASELINE": {"inst_id": "BASELINE", "last": 99.0, "observed_at": now.isoformat(), "price_source": "test"},
+            "RANKED": {"inst_id": "RANKED", "last": 101.0, "observed_at": now.isoformat(), "price_source": "test"},
+        }
+        storage.record_due_horizon_outcomes(conn, observations, settings())
+
+        metrics = signal_redesign.dislocation_quality_cohort_outcomes(conn)
+        comparison = metrics["comparison"]["quality_ranked_vs_baseline"]
+
+        self.assertEqual(1, metrics["baseline_pre_quality"]["count"])
+        self.assertTrue(comparison["baseline_available"])
+        self.assertGreater(comparison["avg_pnl_bps_delta"], 0)
+        self.assertGreater(comparison["hit_rate_delta"], 0)
+        self.assertGreater(comparison["tail_loss_bps_delta"], 0)
+
     def test_complete_observation_prices_trade_outside_ranked_candidates(self) -> None:
         observed_at = dt.datetime.now(dt.timezone.utc).isoformat()
         batch = ScanBatch(

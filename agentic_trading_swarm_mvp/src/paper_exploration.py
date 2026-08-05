@@ -269,7 +269,13 @@ def limit_matched_policies(policies: list[dict], settings: Mapping | None) -> li
 
 
 def fair_lineage_order(candidates: list[dict], cycle_index: int, settings: Mapping | None) -> list[dict]:
-    """Interleave signal lineages and rotate the first lineage each cycle."""
+    """Interleave signal lineages and rotate the first lineage each cycle.
+
+    Frontier dislocations retain a paper-only quality score.  Prefer the
+    strongest score across lineages before rotating them, so bounded review
+    capacity can test better corroborated signals first without dropping the
+    lower-quality counterfactual cohort.
+    """
     if not exploration_enabled(settings) or len(candidates) < 2:
         return candidates
     grouped: dict[tuple[str, ...], list[dict]] = defaultdict(list)
@@ -281,22 +287,36 @@ def fair_lineage_order(candidates: list[dict], cycle_index: int, settings: Mappi
             str(candidate.get("signal_variant_id") or candidate.get("strategy_lab_version") or "base"),
         )
         grouped[key].append(candidate)
-    keys = sorted(grouped)
-    offset = int(cycle_index) % len(keys)
-    keys = keys[offset:] + keys[:offset]
+    def priority(row: Mapping) -> float:
+        if (
+            row.get("trade_type") == "frontier_crypto_venue_map"
+            and row.get("paper_ranking_score") is not None
+        ):
+            return float(row.get("paper_ranking_score") or 0.0)
+        return float(row.get("score") or 0.0)
+
     for rows in grouped.values():
         # The frontier quality score is a paper-only ordering input.  It never
         # removes a priceable candidate, but makes bounded review/execution
         # capacity favor independently corroborated, cost-aware dislocations.
-        rows.sort(
-            key=lambda row: float(
-                row.get("paper_ranking_score")
-                if row.get("trade_type") == "frontier_crypto_venue_map"
-                and row.get("paper_ranking_score") is not None
-                else row.get("score") or 0.0
-            ),
-            reverse=True,
-        )
+        rows.sort(key=priority, reverse=True)
+    # Preserve the established cross-family exploration order.  Only reorder
+    # the frontier slots among themselves, where the paper quality score is
+    # meaningful; unrelated signal families retain their existing placement.
+    keys = sorted(grouped)
+    frontier_positions = [
+        index
+        for index, key in enumerate(keys)
+        if grouped[key][0].get("trade_type") == "frontier_crypto_venue_map"
+    ]
+    frontier_keys = sorted(
+        (keys[index] for index in frontier_positions),
+        key=lambda key: (-priority(grouped[key][0]), key),
+    )
+    for index, key in zip(frontier_positions, frontier_keys):
+        keys[index] = key
+    offset = int(cycle_index) % len(keys)
+    keys = keys[offset:] + keys[:offset]
     ordered: list[dict] = []
     while keys:
         remaining = []

@@ -550,6 +550,33 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         )
         self.assertEqual(stable["inst_id"], ordered[0]["inst_id"])
 
+    def test_dislocation_quality_prioritizes_lineages_without_suppressing_diagnostics(self) -> None:
+        cfg = settings()
+        stable = {
+            "inst_id": "STABLE-USDT",
+            "venue": "STABLE",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "score": 45.0,
+            "paper_ranking_score": 80.0,
+            "paper_entry_blocked": False,
+        }
+        fragile = {
+            "inst_id": "FRAGILE-USDT",
+            "venue": "FRAGILE",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "score": 90.0,
+            "paper_ranking_score": 35.0,
+            "paper_entry_blocked": False,
+        }
+
+        ordered = fair_lineage_order([fragile, stable], 0, cfg)
+
+        self.assertEqual("STABLE-USDT", ordered[0]["inst_id"])
+        self.assertEqual({"STABLE-USDT", "FRAGILE-USDT"}, {row["inst_id"] for row in ordered})
+        self.assertFalse(fragile["paper_entry_blocked"])
+
     def test_route_resolver_compatibility_for_frontier_candidate(self) -> None:
         cfg = settings()
         observation = self._obs("C", "ABC-USDT", "ABC", "USDT", 102, 100000)
