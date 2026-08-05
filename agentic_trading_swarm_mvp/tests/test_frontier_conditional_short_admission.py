@@ -56,13 +56,14 @@ class FrontierConditionalShortAdmissionTests(unittest.TestCase):
         self.assertFalse(guarded.get("shadow_filtered", False))
         self.assertNotIn("frontier_route_feasibility", guarded)
 
-    def test_research_only_short_is_filtered_by_default(self):
+    def test_research_only_short_is_retained_with_route_diagnostic(self):
         guarded = apply_frontier_paper_guard(
             _candidate(execution_feasibility={"status": "research_only"})
         )
 
-        self.assertTrue(guarded["shadow_filtered"])
+        self.assertFalse(guarded.get("shadow_filtered", False))
         self.assertEqual(guarded["paper_route_status"], "research_only")
+        self.assertTrue(guarded["paper_route_gate_diagnostic"]["unmet_gates"])
 
 
 if __name__ == "__main__":

@@ -1225,6 +1225,50 @@ def _annotate_shadow_filtered_candidate(
     return guarded
 
 
+def _retain_research_only_route_candidate(
+    guarded: dict[str, Any],
+    reason: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Keep an explicitly research-only route visible without implying execution.
+
+    Exploration mode converts this candidate to an isolated synthetic paper
+    route later.  Outside exploration mode it remains non-fillable, but route
+    limitations are diagnostics instead of a shadow-filtered strategy result.
+    """
+    route_record = frontier_route_feasibility_record(guarded)
+    direct_status = _normalize_route_status(route_record.get("direct_route_status"))
+    if direct_status not in _ROUTE_RESEARCH_ONLY_STATUSES:
+        return None
+
+    unmet_gates: list[str] = []
+    for check in reason.get("checks") or []:
+        if isinstance(check, Mapping) and check.get("code"):
+            unmet_gates.append(str(check["code"]))
+    for field in ("missing_prerequisites", "blocker_reasons"):
+        unmet_gates.extend(str(item) for item in (reason.get(field) or []) if item)
+    if not unmet_gates:
+        unmet_gates.append("direct_route_research_only")
+
+    guarded["paper_route_gate_diagnostic"] = {
+        "paper_only": True,
+        "action": "retain_for_synthetic_research",
+        "direct_route_status": direct_status,
+        "unmet_gates": list(dict.fromkeys(unmet_gates)),
+        "route_feasibility": route_record,
+        "would_block": dict(reason),
+    }
+    guarded["shadow_filtered"] = False
+    guarded["paper_fill_allowed"] = False
+    guarded["paper_action"] = "route_diagnostic"
+    guarded["router_action"] = "route_diagnostic"
+    guarded["candidate_status"] = "research_only_route_diagnostic"
+    guarded["promotion_eligible"] = False
+    guarded["_hunter_bucket"] = "diagnose"
+    guarded.pop("candidate_reject_reason", None)
+    guarded.pop("candidate_reject_detail", None)
+    return guarded
+
+
 def apply_frontier_paper_guard(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -1301,6 +1345,9 @@ def apply_frontier_paper_guard(
         )
     reason = frontier_shadow_filter_reason(guarded, config)
     if reason is not None:
+        retained = _retain_research_only_route_candidate(guarded, reason)
+        if retained is not None:
+            return retained
         return _annotate_shadow_filtered_candidate(guarded, reason, "frontier_paper_guard")
     if registry_gate.get("action") == "suppress":
         reason = {
