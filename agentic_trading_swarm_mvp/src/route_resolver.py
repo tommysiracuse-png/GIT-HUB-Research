@@ -36,6 +36,7 @@ try:
     from route_intelligence import (
         build_conditional_short_route_intelligence,
         build_conditional_short_route_diagnostics,
+        extract_route_requirements,
         build_paper_route_requirement_report,
         build_route_requirements_annotation,
         build_route_requirements_report,
@@ -44,6 +45,7 @@ except ModuleNotFoundError:  # pragma: no cover - package import fallback
     from .route_intelligence import (
         build_conditional_short_route_intelligence,
         build_conditional_short_route_diagnostics,
+        extract_route_requirements,
         build_paper_route_requirement_report,
         build_route_requirements_annotation,
         build_route_requirements_report,
@@ -1718,7 +1720,7 @@ def _paper_route_feasibility_score(candidate: dict, route: dict, eligibility: di
     return round(score, 3)
 
 
-def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | None = None) -> dict:
+def _resolve_candidate_route(candidate: dict, settings: dict, registry: dict | None = None) -> dict:
     registry = registry or load_route_registry()
     caps = settings.get("account_capabilities", {})
     venue = candidate.get("venue", "unknown")
@@ -2005,6 +2007,26 @@ def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | No
     )
 
 
+def resolve_candidate_route(candidate: dict, settings: dict, registry: dict | None = None) -> dict:
+    """Resolve a paper route with an explicit, read-only requirements gate.
+
+    The gate describes direct-route actionability only.  It intentionally does
+    not change the route decision, candidate emission, or paper eligibility.
+    """
+
+    route = _resolve_candidate_route(candidate, settings, registry=registry)
+    requirement_extraction = extract_route_requirements(candidate, route=route)
+    route["route_requirement_extraction"] = requirement_extraction
+    route["route_recommendation_status"] = requirement_extraction[
+        "route_recommendation_status"
+    ]
+    route["route_actionability"] = requirement_extraction["route_actionability"]
+    route["unresolved_route_requirements"] = list(
+        requirement_extraction["unresolved_requirements"]
+    )
+    return route
+
+
 def enrich_candidate_with_route(
     candidate: dict,
     settings: dict,
@@ -2142,6 +2164,10 @@ def enrich_candidate_with_route(
                 "route_requirement_summary"
             ],
             "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
+            "route_requirement_extraction": route["route_requirement_extraction"],
+            "route_recommendation_status": route["route_recommendation_status"],
+            "route_actionability": route["route_actionability"],
+            "unresolved_route_requirements": route["unresolved_route_requirements"],
         }
     )
     enriched["execution_feasibility"] = existing
@@ -2157,6 +2183,12 @@ def enrich_candidate_with_route(
     enriched["paper_route_score_multiplier"] = eligibility["paper_score_multiplier"]
     enriched["route_intelligence_status"] = eligibility["route_status"]
     enriched["candidate_status"] = eligibility["candidate_status"]
+    enriched["route_requirement_extraction"] = route["route_requirement_extraction"]
+    enriched["route_recommendation_status"] = route["route_recommendation_status"]
+    enriched["route_actionability"] = route["route_actionability"]
+    enriched["unresolved_route_requirements"] = list(
+        route["unresolved_route_requirements"]
+    )
     enriched["required_capabilities"] = eligibility["required_capabilities"]
     enriched["route_capability_checks"] = eligibility["capability_checks"]
     enriched["blocking_reason"] = eligibility["blocking_reason"]

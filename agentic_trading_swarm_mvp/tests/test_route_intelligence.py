@@ -15,6 +15,7 @@ from route_intelligence import (  # noqa: E402
     build_candidate_route_requirement_summary,
     build_conditional_short_route_intelligence,
     build_conditional_short_route_diagnostics,
+    extract_route_requirements,
     build_frontier_short_spot_route_intelligence,
     build_paper_route_requirement_report,
     build_route_requirements_annotation,
@@ -25,6 +26,61 @@ from route_intelligence import (  # noqa: E402
 
 
 class RouteIntelligenceTests(unittest.TestCase):
+    def test_requirement_extractor_gates_unresolved_direct_route_but_retains_paper_candidate(self) -> None:
+        extraction = extract_route_requirements(
+            {
+                "venue": "OKX",
+                "direction": "long_perp_short_spot",
+                "borrow_available": "unknown",
+                "margin_mode": "required_unconfirmed",
+                "api_access_status": "public_data_only",
+            },
+            route={
+                "required_permissions": ["crypto_derivatives", "crypto_spot", "spot_borrow"],
+                "missing_permissions": ["spot_borrow"],
+                "requirements": [
+                    {"requirement_id": "crypto_derivatives", "status": "confirmed"},
+                    {"requirement_id": "crypto_spot", "status": "confirmed"},
+                    {"requirement_id": "spot_borrow", "status": "missing"},
+                ],
+                "borrow_required": True,
+                "margin_required": True,
+                "api_access_status": "public_data_only",
+            },
+        )
+
+        self.assertTrue(extraction["paper_only"])
+        self.assertTrue(extraction["read_only"])
+        self.assertEqual("gated", extraction["route_recommendation_status"])
+        self.assertEqual("gated", extraction["route_actionability"])
+        self.assertIn("borrow_availability", extraction["unresolved_requirements"])
+        self.assertIn("api_constraints", extraction["unresolved_requirements"])
+        self.assertFalse(extraction["direct_route_actionable"])
+        self.assertEqual("retained_for_paper_exploration", extraction["paper_candidate_emission"])
+        self.assertFalse(extraction["entry_blocked"])
+
+    def test_requirement_extractor_marks_confirmed_direct_route_actionable(self) -> None:
+        extraction = extract_route_requirements(
+            {
+                "venue": "OKX",
+                "direction": "long_spot",
+                "maker_fee_bps": 1.0,
+                "taker_fee_bps": 2.0,
+                "api_access_status": "confirmed",
+            },
+            route={
+                "required_permissions": ["crypto_spot"],
+                "requirements": [
+                    {"requirement_id": "crypto_spot", "status": "confirmed"},
+                ],
+                "api_access_status": "confirmed",
+            },
+        )
+
+        self.assertEqual("actionable", extraction["route_recommendation_status"])
+        self.assertTrue(extraction["direct_route_actionable"])
+        self.assertEqual([], extraction["unresolved_requirements"])
+
     def test_frontier_short_spot_pass_attaches_route_validation_and_quote_notes(self) -> None:
         intelligence = build_frontier_short_spot_route_intelligence(
             {

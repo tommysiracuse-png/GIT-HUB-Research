@@ -163,6 +163,32 @@ class RouteResolverTests(unittest.TestCase):
         self.assertEqual(route["best_route_alternative"]["route_id"], "okx_derivatives_paper")
         self.assertTrue(route["route_next_actions"])
         self.assertGreaterEqual(route["route_probe_priority"], 70)
+        extraction = route["route_requirement_extraction"]
+        self.assertEqual("gated", extraction["route_recommendation_status"])
+        self.assertIn("broker_permissions", extraction["requirements"])
+        self.assertIn("borrow_availability", extraction["requirements"])
+        self.assertIn("fee_class", extraction["requirements"])
+        self.assertIn("margin_status", extraction["requirements"])
+        self.assertIn("api_constraints", extraction["requirements"])
+
+    def test_enrichment_exposes_gate_without_suppressing_paper_candidate(self) -> None:
+        enriched = route_resolver.enrich_candidate_with_route(
+            {
+                "venue": "OKX",
+                "trade_type": "perp_funding_basis",
+                "direction": "long_perp_short_spot",
+                "asset_class": "crypto_derivatives",
+                "score": 73.0,
+            },
+            settings(),
+        )
+
+        self.assertEqual("gated", enriched["route_actionability"])
+        self.assertEqual(
+            enriched["route_requirement_extraction"],
+            enriched["execution_route"]["route_requirement_extraction"],
+        )
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
 
     def test_polymarket_route_is_conditional_with_account_api_and_jurisdiction(self) -> None:
         candidate = {

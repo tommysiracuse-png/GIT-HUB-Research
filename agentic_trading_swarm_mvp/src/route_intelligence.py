@@ -277,6 +277,177 @@ def build_conditional_short_route_intelligence(
     }
 
 
+def extract_route_requirements(
+    opportunity: dict[str, Any],
+    *,
+    route: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract direct-route requirements without probing a broker or API.
+
+    This is the compact candidate-facing form of route intelligence.  It
+    makes the five facts needed before a direct-route recommendation explicit:
+    broker permissions, borrow, fees, margin, and API constraints.  A missing
+    or unknown fact marks the *direct route* as ``gated``.  That is an
+    informational paper-mode state: it never suppresses the priceable
+    candidate, changes the selected paper route, or authorizes execution.
+    """
+
+    source = dict(opportunity or {})
+    resolved_route = dict(route or {})
+    for key in (
+        "required_permissions",
+        "missing_permissions",
+        "requirements",
+        "borrow_required",
+        "borrow_status",
+        "margin_required",
+        "api_access_status",
+        "fee_model_status",
+        "route_status",
+    ):
+        if source.get(key) in (None, "", [], {}):
+            source[key] = resolved_route.get(key)
+
+    requirements = [
+        dict(item)
+        for item in (resolved_route.get("requirements") or source.get("requirements") or [])
+        if isinstance(item, dict)
+    ]
+    missing_permissions = _items_from_values(
+        resolved_route.get("missing_permissions"),
+        source.get("missing_permissions"),
+        source.get("route_blockers"),
+    )
+    required_permissions = _items_from_values(
+        resolved_route.get("required_permissions"),
+        source.get("required_permissions"),
+    )
+    conditional = build_conditional_short_route_intelligence(source, route=resolved_route)
+
+    def requirement_status(tokens: tuple[str, ...], *, required: bool) -> str:
+        statuses = []
+        for item in requirements:
+            identifier = " ".join(
+                str(item.get(key) or "")
+                for key in ("requirement_id", "capability_key", "category")
+            ).lower()
+            if any(token in identifier for token in tokens):
+                statuses.append(str(item.get("status") or UNKNOWN).lower())
+        if any(any(token in value.lower() for token in tokens) for value in missing_permissions):
+            statuses.append("missing")
+        if not statuses:
+            return UNKNOWN if required else "not_applicable"
+        if any(status in {"missing", "unavailable", "unsupported", "blocked"} for status in statuses):
+            return "missing"
+        if any(status in {UNKNOWN, "unconfirmed", "not_checked"} for status in statuses):
+            return UNKNOWN
+        return "confirmed"
+
+    broker_status = requirement_status(
+        ("account", "permission", "crypto", "equity", "prediction", "specialist"),
+        required=bool(required_permissions or requirements),
+    )
+    if any(
+        token in permission.lower()
+        for permission in missing_permissions
+        for token in ("broker", "permission", "account", "jurisdiction")
+    ):
+        broker_status = "missing"
+    borrow_required = bool(conditional["borrow_required"])
+    borrow_status = str(conditional["borrow_availability"] or UNKNOWN).lower()
+    if borrow_required and borrow_status in {"available", "confirmed"}:
+        borrow_status = "confirmed"
+    elif borrow_required and borrow_status in {"unavailable", "unsupported", "missing"}:
+        borrow_status = "missing"
+    elif borrow_required:
+        borrow_status = UNKNOWN
+    else:
+        borrow_status = "not_applicable"
+
+    fee_class = str(conditional["fee_class"] or UNKNOWN).lower()
+    fee_model_status = str(source.get("fee_model_status") or UNKNOWN).lower()
+    if fee_class == UNKNOWN and fee_model_status not in {UNKNOWN, "not_checked"}:
+        fee_class = fee_model_status
+    fee_status = (
+        "confirmed"
+        if fee_class not in {UNKNOWN, "not_checked", "unconfirmed"}
+        else UNKNOWN
+    )
+    margin_required = bool(conditional["margin_required"])
+    margin_mode = str(conditional["margin_mode"] or UNKNOWN).lower()
+    if not margin_required:
+        margin_status = "not_applicable"
+    elif margin_mode in {"isolated", "cross", "portfolio", "available", "confirmed"}:
+        margin_status = "confirmed"
+    elif margin_mode in {"unsupported", "unavailable", "missing"}:
+        margin_status = "missing"
+    else:
+        margin_status = UNKNOWN
+    api_status = str(conditional["api_permission_status"] or UNKNOWN).lower()
+    if api_status in {"available", "ready", "mapped", "confirmed"}:
+        api_requirement_status = "confirmed"
+    elif api_status in {"unavailable", "unsupported", "missing", "blocked"}:
+        api_requirement_status = "missing"
+    else:
+        # Public-data access is useful for paper observation but deliberately
+        # does not confirm private/order API entitlement.
+        api_requirement_status = UNKNOWN
+
+    extracted = {
+        "broker_permissions": {
+            "status": broker_status,
+            "required_permissions": required_permissions,
+            "missing_permissions": missing_permissions,
+        },
+        "borrow_availability": {
+            "required": borrow_required,
+            "status": borrow_status,
+            "observed": conditional["borrow_availability"],
+        },
+        "fee_class": {"status": fee_status, "value": fee_class},
+        "margin_status": {
+            "required": margin_required,
+            "status": margin_status,
+            "mode": conditional["margin_mode"],
+        },
+        "api_constraints": {
+            "status": api_requirement_status,
+            "observed": conditional["api_permission_status"],
+        },
+    }
+    unresolved = [
+        name
+        for name, detail in extracted.items()
+        if detail["status"] in {UNKNOWN, "missing"}
+    ]
+    recommendation_status = "gated" if unresolved else "actionable"
+    return {
+        "extractor_version": "route_requirements_v1",
+        "paper_only": True,
+        "read_only": True,
+        "requirements": extracted,
+        "unresolved_requirements": unresolved,
+        "route_recommendation_status": recommendation_status,
+        "route_actionability": recommendation_status,
+        "direct_route_actionable": not unresolved,
+        "paper_candidate_emission": "retained_for_paper_exploration",
+        "hard_blocking": False,
+        "entry_blocked": False,
+    }
+
+
+def _items_from_values(*values: Any) -> list[str]:
+    """Return unique, non-empty string values without interpreting them."""
+
+    output: list[str] = []
+    for value in values:
+        for item in (value,) if isinstance(value, str) else (value or []):
+            text = str(item or "").strip()
+            if text and text not in output:
+                output.append(text)
+    return output
+
+
 def build_route_requirements_matrix(
     opportunities: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
