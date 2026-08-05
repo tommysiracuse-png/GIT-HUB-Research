@@ -57,8 +57,10 @@ from adapters.venues.dc_department_of_energy_environment import (
 from adapters.venues.european_energy_exchange_eex import (
     AUCTION_URL as EEX_AUCTION_URL,
     SALES_URL as EEX_SALES_URL,
+    UK_ETS_PAGE_URL as EEX_UK_ETS_PAGE_URL,
     EexEuaPrimaryAuctionSpotAdapter,
     EexGermanNehsAdapter,
+    EexUkaFuturesOptionsAdapter,
     datasource_auction_url,
     datasource_spot_url,
     parse_eex_emissions_spot,
@@ -66,6 +68,7 @@ from adapters.venues.european_energy_exchange_eex import (
     parse_eex_eua_auction_workbook,
     parse_eex_nehs_auction,
     parse_eex_nehs_sales,
+    parse_eex_uka_futures_options,
 )
 from adapters.venues.e_auksion_district_hokimiyat_notices import (
     API_URL as E_AUKSION_API_URL,
@@ -242,6 +245,28 @@ def _eex_auction_workbook_fixture() -> bytes:
     return output.getvalue()
 
 
+def _eex_uka_contract_fixture() -> str:
+    return """
+    <html><body>
+      <h1>UK ETS Futures and Options</h1>
+      <h2>UKA Product Overview</h2>
+      <h3>UKA Futures</h3>
+      <table>
+        <tr><th>Contracts</th><td>UKA Futures</td></tr>
+        <tr><th>Delivery periods</th><td>First delivery starts from December 2026</td></tr>
+        <tr><th>Contract volume</th><td>1,000 UKA</td></tr>
+        <tr><th>Minimum tick</th><td>£0.01 per UKA</td></tr>
+      </table>
+      <h3>UKA Options</h3>
+      <table>
+        <tr><th>Contracts</th><td>UKA Options</td></tr>
+        <tr><th>Underlying</th><td>The underlying is the EEX UKA Dec Futures.</td></tr>
+        <tr><th>Option type</th><td>European</td></tr>
+      </table>
+    </body></html>
+    """
+
+
 class PublicAdapterParserTests(unittest.TestCase):
     def test_public_fetch_retries_certificate_failure_with_system_trust(self) -> None:
         class Response:
@@ -315,6 +340,7 @@ class PublicAdapterParserTests(unittest.TestCase):
             "bahrain_cross_listings_catalog",
             "eex_german_nehs_public",
             "eex_eua_primary_auction_spot_public",
+            "eex_uka_futures_options_public",
             "e_auksion_district_hokimiyat_notices",
             "ethiopian_securities_exchange",
             "norwegian_block_exchange_nbx_public",
@@ -1889,6 +1915,81 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertIn("public_market_data_file", adapter.info.capabilities)
         self.assertNotIn("candidate_generation", adapter.info.capabilities)
 
+    def test_eex_uka_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
+        adapter_id = "eex_uka_futures_options_public"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsInstance(adapter, EexUkaFuturesOptionsAdapter)
+        self.assertEqual("EEX", adapter.info.venue)
+        self.assertEqual(EEX_UK_ETS_PAGE_URL, adapter.info.docs_url)
+        self.assertIn("contract_catalog", adapter.info.capabilities)
+        self.assertNotIn("ticker", adapter.info.capabilities)
+        self.assertNotIn("order_book", adapter.info.capabilities)
+
+    def test_eex_uka_parser_normalizes_december_2026_futures_and_options(self) -> None:
+        rows = parse_eex_uka_futures_options(
+            _eex_uka_contract_fixture(),
+            received_at="2026-08-04T16:00:00+00:00",
+        )
+
+        self.assertEqual(2, len(rows))
+        futures, options = rows
+        self.assertEqual("EEX:UKA:FUTURE:DEC2026", futures["inst_id"])
+        self.assertEqual("futures_catalog", futures["market_type"])
+        self.assertEqual("2026-12", futures["first_tradeable_expiry"])
+        self.assertEqual(1_000, futures["contract_volume_uka"])
+        self.assertEqual(0.01, futures["minimum_tick_gbp_per_uka"])
+        self.assertEqual("EEX:UKA:OPTION:DEC2026", options["inst_id"])
+        self.assertEqual("European", options["option_style"])
+        self.assertEqual("reference_only", options["session_status"])
+        self.assertTrue(all(row["last"] == 0.0 for row in rows))
+        self.assertTrue(all(row["direction"] == "watch_only" for row in rows))
+        self.assertTrue(all(row["source_url"] == EEX_UK_ETS_PAGE_URL for row in rows))
+
+    def test_eex_uka_adapter_retains_source_and_parser_health(self) -> None:
+        reachable = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": _eex_uka_contract_fixture(),
+            "received_at": "2026-08-04T16:00:00+00:00",
+            "latency_ms": 3.0,
+        }
+        with mock.patch(
+            "adapters.venues.european_energy_exchange_eex.fetch_text",
+            return_value=reachable,
+        ):
+            batch = EexUkaFuturesOptionsAdapter().scan({})
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["contract_specification"]["fetch_status"])
+        self.assertEqual("fresh", batch.metadata["freshness_state"])
+        self.assertEqual("reference_only", batch.metadata["session_state"])
+        self.assertEqual(2, batch.metadata["real_observation_count"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+
+        malformed = {**reachable, "text": "<html><body>replacement page</body></html>"}
+        with mock.patch(
+            "adapters.venues.european_energy_exchange_eex.fetch_text",
+            return_value=malformed,
+        ):
+            parser_batch = EexUkaFuturesOptionsAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual("reachable", parser_batch.metadata["fetch_status"]["contract_specification"]["fetch_status"])
+        self.assertEqual("public_reference_parser_failure", parser_batch.observations[0]["candidate_reject_reason"])
+
+        blocked = {**reachable, "ok": False, "status": "blocked", "http_status": 403, "text": ""}
+        with mock.patch(
+            "adapters.venues.european_energy_exchange_eex.fetch_text",
+            return_value=blocked,
+        ):
+            unavailable_batch = EexUkaFuturesOptionsAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual("blocked", unavailable_batch.observations[0]["fetch_status"])
+        self.assertEqual(EEX_UK_ETS_PAGE_URL, unavailable_batch.observations[0]["source_url"])
+
     def test_eex_get_auction_parser_normalizes_documented_json(self) -> None:
         source_url = datasource_auction_url("2026-08-04")
         rows = parse_eex_eu_ets_auction(
@@ -2359,6 +2460,27 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
 
 
 class AdapterCapabilityTests(unittest.TestCase):
+    def test_eex_uka_adapter_closes_spec_1400_without_quote_claims(self) -> None:
+        spec = {
+            "title": "Implement public adapter #1400: European Energy Exchange (EEX)",
+            "market_key": "global_discovery|European Energy Exchange (EEX)",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "European Energy Exchange (EEX)",
+                    "public_docs_url": EEX_UK_ETS_PAGE_URL,
+                    "asset_or_event": "EEX UK Emission Allowance (UKA) Futures and Options December 2026",
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("eex_uka_futures_options_public", match["adapter_id"])
+        self.assertIn("contract_catalog", match["available_capabilities"])
+        self.assertNotIn("ticker", match["available_capabilities"])
+        self.assertNotIn("order_book", match["available_capabilities"])
+
     def test_casablanca_futures_adapter_closes_spec_956_without_entry_quote_claim(self) -> None:
         spec = {
             "title": "Implement public adapter #956: Casablanca Stock Exchange / Futures market",

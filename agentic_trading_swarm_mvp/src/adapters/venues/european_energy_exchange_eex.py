@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import html
 import io
 import re
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
+from html.parser import HTMLParser
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,6 +38,8 @@ EUA_AUCTION_PAGE_URL = (
     "eex-eua-primary-auction-spot-download"
 )
 DATASOURCE_API_ROOT = "https://api1.datasource.eex-group.com"
+UK_ETS_PAGE_URL = "https://www.eex.com/en/markets/environmentals/uk-ets"
+UKA_FIRST_TRADEABLE_EXPIRY = "2026-12"
 
 
 def eua_auction_report_url(year: int) -> str:
@@ -54,6 +58,153 @@ class EexNehsParseError(ValueError):
 
 class EexEuEtsParseError(ValueError):
     """Raised when reachable EU ETS auction or spot data no longer matches its public schema."""
+
+
+class EexUkaParseError(ValueError):
+    """Raised when the public EEX UKA contract-specification page changes schema."""
+
+
+class _EexVisibleTextParser(HTMLParser):
+    """Extract visible EEX page text without treating scripts as contract data."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._suppressed_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in {"script", "style", "noscript"}:
+            self._suppressed_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript"} and self._suppressed_depth:
+            self._suppressed_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._suppressed_depth:
+            self.parts.append(data)
+
+
+def _eex_visible_text(document: str) -> str:
+    if not isinstance(document, str) or not document.strip():
+        raise EexUkaParseError("UK ETS contract page response is empty")
+    parser = _EexVisibleTextParser()
+    try:
+        parser.feed(document)
+        parser.close()
+    except Exception as exc:  # noqa: BLE001 - surface parser evidence rather than losing it.
+        raise EexUkaParseError(f"invalid UK ETS contract page HTML: {exc}") from exc
+    return " ".join(html.unescape(" ".join(parser.parts)).split())
+
+
+def _uka_contract_observation(
+    *,
+    instrument: str,
+    name: str,
+    market_type: str,
+    source_url: str,
+    fetched_at: str,
+    contract_volume_uka: int,
+    minimum_tick_gbp_per_uka: float,
+) -> dict[str, Any]:
+    inst_id = f"EEX:UKA:{instrument}:DEC2026"
+    return {
+        "venue": "EEX",
+        "inst_id": inst_id,
+        "instrument_id": inst_id,
+        "symbol": f"UKA_{instrument}_DEC2026",
+        "name": name,
+        "base": "UKA",
+        "quote": "GBP_PER_UKA",
+        "market_type": market_type,
+        "market_surface": "eex_uk_ets_uka_futures_options",
+        "asset_class": "emission_allowance_derivative",
+        "trade_type": "official_contract_specification",
+        "direction": "watch_only",
+        "last": 0.0,
+        "price_basis": "contract_catalog_only",
+        "underlying": "UK ETS Allowance (UKA)",
+        "underlying_unit": "tonne_co2e",
+        "first_tradeable_expiry": UKA_FIRST_TRADEABLE_EXPIRY,
+        "delivery_month": "December 2026",
+        "contract_volume_uka": contract_volume_uka,
+        "minimum_tick_gbp_per_uka": minimum_tick_gbp_per_uka,
+        "data_status": "reachable",
+        "fetch_status": "reachable",
+        "quality_status": "official_contract_specification",
+        "freshness_state": "fresh",
+        "freshness_basis": "official_contract_specification_page_fetch",
+        "freshness_age_seconds": 0.0,
+        "session_status": "reference_only",
+        "observed_at": fetched_at,
+        "fetched_at": fetched_at,
+        "price_source": "EEX UK ETS Futures and Options contract specifications",
+        "source_url": source_url,
+        "candidate_reject_reason": "public_contract_specification_not_executable_quote",
+    }
+
+
+def parse_eex_uka_futures_options(
+    document: str,
+    *,
+    source_url: str = UK_ETS_PAGE_URL,
+    received_at: str | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize the EEX public UKA Futures and Options contract specifications.
+
+    EEX publishes the contract terms, but not a stable anonymous quote or
+    order-book endpoint on this page.  These are therefore real contract
+    observations only; every row remains explicitly watch-only.
+    """
+
+    text = _eex_visible_text(document)
+    required_terms = ("UK ETS Futures and Options", "UKA Futures", "UKA Options")
+    missing = [term for term in required_terms if term.casefold() not in text.casefold()]
+    if missing:
+        raise EexUkaParseError(f"required UKA contract labels were not found: {', '.join(missing)}")
+    first_expiry = re.search(
+        r"first\s+(?:delivery\s+starts\s+)?(?:from\s+)?December\s+2026",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not first_expiry:
+        raise EexUkaParseError("first UKA tradeable expiry December 2026 was not found")
+    volume_match = re.search(r"Contract\s+volume\s*\|?\s*1\s*,?\s*000\s+UKA", text, flags=re.IGNORECASE)
+    if not volume_match:
+        raise EexUkaParseError("UKA Futures contract volume of 1,000 UKA was not found")
+    tick_match = re.search(r"Minimum\s+tick\s*\|?\s*[£\u00a3]\s*0[.,]01\s+per\s+UKA", text, flags=re.IGNORECASE)
+    if not tick_match:
+        raise EexUkaParseError("UKA Futures minimum tick of GBP 0.01 per UKA was not found")
+    if not re.search(r"Underlying\s*\|?\s*The\s+underlying\s+is\s+the\s+EEX\s+UKA\s+Dec\s+Futures", text, flags=re.IGNORECASE):
+        raise EexUkaParseError("UKA Options underlying EEX UKA Dec Futures was not found")
+
+    fetched_at = _received_time(received_at).isoformat()
+    futures = _uka_contract_observation(
+        instrument="FUTURE",
+        name="EEX UK Emission Allowance (UKA) Futures December 2026",
+        market_type="futures_catalog",
+        source_url=source_url,
+        fetched_at=fetched_at,
+        contract_volume_uka=1_000,
+        minimum_tick_gbp_per_uka=0.01,
+    )
+    options = _uka_contract_observation(
+        instrument="OPTION",
+        name="EEX UK Emission Allowance (UKA) Options on December 2026 Futures",
+        market_type="options_catalog",
+        source_url=source_url,
+        fetched_at=fetched_at,
+        contract_volume_uka=1_000,
+        minimum_tick_gbp_per_uka=0.01,
+    )
+    options.update(
+        {
+            "option_style": "European",
+            "option_underlying": "EEX UKA Dec Futures",
+            "option_expiry_months": ("March", "December"),
+        }
+    )
+    return [futures, options]
 
 
 def _header_token(value: Any) -> str:
@@ -1096,5 +1247,111 @@ class EexEuaPrimaryAuctionSpotAdapter:
         )
 
 
+class EexUkaFuturesOptionsAdapter:
+    """Public EEX UKA contract catalog with no order or quote capability."""
+
+    info = AdapterInfo(
+        adapter_id="eex_uka_futures_options_public",
+        venue="EEX",
+        market_type="emissions_derivatives",
+        source="EEX official UK ETS UKA Futures and Options contract specifications",
+        capabilities=(
+            "public_market_data",
+            "contract_catalog",
+            "contract_identity",
+            "emission_allowance_derivatives",
+            "futures",
+            "options",
+            "source_health",
+        ),
+        aliases=(
+            "european energy exchange",
+            "eex",
+            "uk ets",
+            "uka",
+            "uk emission allowance",
+            "uka futures",
+            "uka options",
+        ),
+        docs_url=UK_ETS_PAGE_URL,
+        runtime_entrypoint="adapters.venues.european_energy_exchange_eex.EexUkaFuturesOptionsAdapter",
+        quote_assets=("GBP_PER_UKA",),
+        default_cache_minutes=360,
+    )
+
+    def scan(self, settings: dict | None = None) -> ScanBatch:
+        cfg = EexEuaPrimaryAuctionSpotAdapter._config(settings, self.info.adapter_id)
+        timeout = max(1, int(cfg.get("timeout_seconds", 15)))
+        source_url = str(cfg.get("source_url") or UK_ETS_PAGE_URL)
+        result = fetch_text(source_url, timeout)
+        parser_failures: list[dict[str, str]] = []
+        source_health = {"contract_specification": _source_evidence(result, source_url)}
+
+        if not result.get("ok"):
+            observations = [
+                _failure_observation(
+                    source_url,
+                    result,
+                    "eex_uk_ets_uka_futures_options",
+                )
+            ]
+            source_status = str(result.get("status") or "unavailable")
+            freshness_state = "unknown"
+            session_state = "unknown"
+        else:
+            try:
+                observations = parse_eex_uka_futures_options(
+                    str(result.get("text") or ""),
+                    source_url=source_url,
+                    received_at=result.get("received_at"),
+                )
+                source_status = "reachable"
+                freshness_state = "fresh"
+                session_state = "reference_only"
+            except (EexUkaParseError, TypeError, ValueError) as exc:
+                message = f"EEX UKA contract-specification parser failed: {exc}"[:300]
+                parser_failures.append({"source_url": source_url, "error": message})
+                observations = [
+                    _failure_observation(
+                        source_url,
+                        result,
+                        "eex_uk_ets_uka_futures_options",
+                        message,
+                    )
+                ]
+                source_status = "degraded"
+                freshness_state = "unknown"
+                session_state = "unknown"
+
+        real_observations = [row for row in observations if row.get("quality_status") != "source_health"]
+        return ScanBatch(
+            source=self.info.source,
+            candidates=[],
+            observations=observations,
+            metadata={
+                "adapter_id": self.info.adapter_id,
+                "adapter_spec_id": 1400,
+                "source_status": source_status,
+                "source_url": source_url,
+                "source_urls": [source_url],
+                "fetch_status": source_health,
+                "freshness_state": freshness_state,
+                "session_state": session_state,
+                "parser_failures": parser_failures,
+                "observation_count": len(observations),
+                "real_observation_count": len(real_observations),
+                "futures_observation_count": sum(
+                    1 for row in real_observations if row.get("market_type") == "futures_catalog"
+                ),
+                "options_observation_count": sum(
+                    1 for row in real_observations if row.get("market_type") == "options_catalog"
+                ),
+                "capability_gap": "public_quotes_and_order_book_not_available",
+                "paper_only": True,
+            },
+        )
+
+
 register_adapter(EexGermanNehsAdapter())
 register_adapter(EexEuaPrimaryAuctionSpotAdapter())
+register_adapter(EexUkaFuturesOptionsAdapter())
