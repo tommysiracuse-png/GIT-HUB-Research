@@ -1059,6 +1059,10 @@ def monitor_tasks(conn: sqlite3.Connection) -> dict:
             and _needs_zero_output_diagnosis(
                 {"status": experiment_status, "evaluation": evaluation}
             )
+            and not (
+                str(task.get("status") or "") == "monitoring_evidence"
+                and int(task.get("attempt_count") or 0) > 0
+            )
         )
         if zero_output_needs_owner:
             next_status = "analyzing"
