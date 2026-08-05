@@ -58,14 +58,15 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
         strategy_reliability.REPORT_MD = self.old_md
         self.tmp.cleanup()
 
-    def test_unproven_translation_is_clamped_to_neutral_and_shadowed(self) -> None:
+    def test_unproven_translation_is_haircut_but_remains_a_paper_observation(self) -> None:
         rows, report = apply_strategy_reliability([translated_candidate()])
 
         candidate = rows[0]
-        self.assertEqual(0.0, candidate["score"])
-        self.assertFalse(candidate["paper_rank_eligible"])
+        self.assertEqual(11.25, candidate["score"])
+        self.assertTrue(candidate["paper_rank_eligible"])
         self.assertFalse(candidate["promotion_eligible"])
-        self.assertTrue(candidate["paper_entry_blocked"])
+        self.assertTrue(candidate["paper_observation_only"])
+        self.assertTrue(candidate.get("paper_fill_allowed", True))
         self.assertEqual(
             "insufficient_destination_family_paper_evidence",
             candidate["paper_portability_quarantine"]["reason"],
@@ -108,7 +109,7 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
         self.assertTrue(record["eligible"])
         self.assertTrue(record["rank_above_neutral_allowed"])
         self.assertEqual("destination_family_proven", record["state"])
-        self.assertEqual(75.0, rows[0]["score"])
+        self.assertEqual(11.25, rows[0]["score"])
         self.assertEqual(0, report["summary"]["portability_quarantine_count"])
 
     def test_runtime_hydrates_destination_proof_from_persisted_paper_stats(self) -> None:
@@ -141,7 +142,7 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
             "persisted_paper_signal_stats",
             rows[0]["destination_family_paper_stats"]["evidence_source"],
         )
-        self.assertEqual(75.0, rows[0]["score"])
+        self.assertEqual(11.25, rows[0]["score"])
 
     def test_native_destination_family_and_live_context_are_out_of_scope(self) -> None:
         native = translated_candidate(
@@ -153,17 +154,17 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
         self.assertIsNone(paper_portability_quarantine_record(native))
         self.assertIsNone(paper_portability_quarantine_record(live))
 
-    def test_router_enforces_generic_cross_family_quarantine(self) -> None:
+    def test_router_keeps_generic_cross_family_translation_observable(self) -> None:
         candidate = translated_candidate(trade_type="frontier_crypto_venue_map")
 
         reason = frontier_shadow_filter_reason(candidate)
         guarded = apply_frontier_paper_guard(candidate)
 
-        self.assertEqual("paper_cross_family_portability_quarantine", reason["guard"])
-        self.assertTrue(guarded["shadow_filtered"])
-        self.assertFalse(guarded["paper_fill_allowed"])
+        self.assertIsNone(reason)
+        self.assertNotIn("shadow_filtered", guarded)
+        self.assertTrue(guarded.get("paper_fill_allowed", True))
         self.assertFalse(guarded["promotion_eligible"])
-        self.assertEqual(0.0, guarded["paper_allocation_multiplier"])
+        self.assertEqual(0.15, guarded["paper_allocation_multiplier"])
 
     def test_proxy_momentum_is_sandbox_ranked_until_source_and_local_checks_pass(self) -> None:
         candidate = translated_candidate(
@@ -181,11 +182,11 @@ class PaperPortabilityQuarantineTests(unittest.TestCase):
         rows, _report = apply_strategy_reliability([candidate])
         review = rows[0]["paper_portability_quarantine"]
 
-        self.assertEqual(75.0, rows[0]["score"])
-        self.assertFalse(rows[0]["paper_rank_eligible"])
+        self.assertEqual(11.25, rows[0]["score"])
+        self.assertTrue(rows[0]["paper_rank_eligible"])
         self.assertTrue(rows[0]["sandbox_rank_eligible"])
         self.assertFalse(rows[0]["promotion_eligible"])
-        self.assertFalse(rows[0]["paper_fill_allowed"])
+        self.assertTrue(rows[0].get("paper_fill_allowed", True))
         self.assertEqual("sandbox_ranking", review["maximum_stage"])
 
         candidate.pop("destination_family_paper_stats")

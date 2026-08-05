@@ -12,7 +12,7 @@ from paper_order_router import _apply_route_feasibility_metadata, frontier_shado
 
 
 class PaperOrderRouterContextPromotionGuardTests(unittest.TestCase):
-    def test_shadow_filter_returns_context_promotion_reason_for_mismatch(self):
+    def test_unconfirmed_translation_remains_observable_not_shadow_filtered(self):
         candidate = {
             "venue": "kraken",
             "direction": "long",
@@ -25,12 +25,13 @@ class PaperOrderRouterContextPromotionGuardTests(unittest.TestCase):
         }
 
         reason = frontier_shadow_filter_reason(candidate)
+        annotated = _apply_route_feasibility_metadata(candidate)
 
-        self.assertIsNotNone(reason)
-        self.assertEqual(reason["reason"], "paper_context_promotion_mismatch")
-        self.assertEqual(reason["guard"], "paper_context_promotion_scope")
-        self.assertFalse(reason["paper_fill_allowed"])
-        self.assertEqual(set(reason["mismatched_fields"]), {"venue", "direction", "trade_family"})
+        self.assertIsNone(reason)
+        self.assertTrue(annotated["paper_observation_only"])
+        self.assertTrue(annotated["paper_fill_allowed_by_route"])
+        self.assertFalse(annotated["paper_context_promotion_eligible"])
+        self.assertEqual(0.15, annotated["paper_score_multiplier"])
 
     def test_apply_route_feasibility_metadata_attaches_context_guard_annotation(self):
         candidate = {
@@ -49,7 +50,7 @@ class PaperOrderRouterContextPromotionGuardTests(unittest.TestCase):
         self.assertIn("paper_context_promotion_guard", annotated)
         self.assertEqual(
             annotated["paper_context_promotion_guard_key"],
-            "paper_context_promotion_scope",
+            "paper_route_lineage_confirmation",
         )
         self.assertTrue(annotated["paper_context_promotion_eligible"])
         self.assertFalse(annotated["paper_context_promotion_blocked"])

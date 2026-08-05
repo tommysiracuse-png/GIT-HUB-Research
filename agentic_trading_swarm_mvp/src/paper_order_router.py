@@ -585,13 +585,15 @@ def _apply_route_feasibility_metadata(candidate: Mapping[str, Any]) -> dict[str,
         annotated["paper_lineage_inherited_boost_allowed"] = lineage_context.get(
             "inherited_score_boost_allowed"
         )
-    context_promotion = _paper_context_promotion_guard(annotated)
-    if context_promotion:
-        annotated["paper_context_promotion_guard"] = context_promotion
-        annotated["paper_context_promotion_guard_key"] = context_promotion.get("guard")
-        annotated["paper_context_promotion_eligible"] = context_promotion.get("eligible")
-        annotated["paper_context_promotion_blocked"] = context_promotion.get("promotion_blocked")
-        annotated["paper_context_promotion_reason"] = context_promotion.get("reason")
+    try:
+        from strategy_reliability import apply_paper_route_lineage_confirmation
+    except Exception:
+        apply_paper_route_lineage_confirmation = None
+    if apply_paper_route_lineage_confirmation is not None:
+        # The helper tags every candidate and turns an unconfirmed translated
+        # route into a paper observation with a score haircut.  It does not
+        # turn route-local evidence gaps into an entry block.
+        apply_paper_route_lineage_confirmation(annotated)
     execution_quality = _paper_frontier_execution_quality_gate(annotated)
     if execution_quality:
         annotated["paper_frontier_execution_quality"] = execution_quality
@@ -1010,24 +1012,6 @@ def frontier_shadow_filter_reason(
             ],
         }
 
-    portability_reason = _paper_portability_quarantine_reason(candidate, config=config)
-    if portability_reason is not None:
-        return {
-            **portability_reason,
-            "reason": portability_reason.get("reason") or "paper_cross_family_portability_quarantine",
-            "paper_only": True,
-            "paper_fill_allowed": False,
-            "guard": "paper_cross_family_portability_quarantine",
-            "candidate": _candidate_reference(candidate),
-            "checks": [
-                {
-                    "code": portability_reason.get("reason"),
-                    "field": "paper_portability_quarantine",
-                }
-            ],
-            "portability_quarantine": portability_reason,
-        }
-
     route_eligibility = candidate.get("paper_route_eligibility") or {}
     if isinstance(route_eligibility, Mapping) and _as_bool(
         route_eligibility.get("suppressed"), False
@@ -1085,25 +1069,6 @@ def frontier_shadow_filter_reason(
             "conviction_cap": carry_gate.get("conviction_cap") or "hold",
             "basis_carry_gate": carry_gate,
         }
-    context_promotion = _paper_context_promotion_guard(candidate, config=config)
-    if context_promotion is not None and not _as_bool(context_promotion.get("eligible"), True):
-        return {
-            "reason": context_promotion.get("reason") or "paper_context_promotion_mismatch",
-            "paper_only": True,
-            "paper_fill_allowed": False,
-            "guard": context_promotion.get("guard") or "paper_context_promotion_scope",
-            "candidate": _candidate_reference(candidate),
-            "cell": _paper_signal_cell(candidate),
-            "source_context": context_promotion.get("source_context") or {},
-            "destination_context": context_promotion.get("destination_context") or {},
-            "mismatched_fields": context_promotion.get("mismatched_fields") or [],
-            "matching_fields": context_promotion.get("matching_fields") or [],
-            "compatibility_rule_logged": _as_bool(
-                context_promotion.get("compatibility_rule_logged"), False
-            ),
-            "context_promotion_guard": context_promotion,
-        }
-
     if not frontier_paper_guard_enabled(config) or not is_frontier_crypto_candidate(candidate):
         return None
 

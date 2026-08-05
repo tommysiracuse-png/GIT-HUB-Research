@@ -100,6 +100,7 @@ PAPER_CONTEXT_PROMOTION_SCOPES = (
     "paper_runtime",
     "strategy_reliability",
 )
+PAPER_TRANSLATED_ROUTE_OBSERVATION_MULTIPLIER = 0.15
 _PAPER_CONTEXT_PROMOTION_SOURCE_FIELDS = (
     "promotion_source_context",
     "source_context",
@@ -268,6 +269,60 @@ def _paper_context_rule_allows(rule: Mapping[str, Any] | None, mismatched_fields
     return explicit_allow and (not allowed_fields or set(mismatched_fields).issubset(allowed_fields))
 
 
+def _route_local_confirmation_flag(candidate: Mapping[str, Any], names: tuple[str, ...]) -> bool:
+    """Read an explicit route-local confirmation without inferring it from quality.
+
+    Price action and liquidity are deliberately separate checks: a strong proxy
+    signal, a tight spread, or a high aggregate quality score is not a
+    substitute for same-market confirmation.
+    """
+    containers: list[Mapping[str, Any]] = [candidate]
+    for field in (
+        "route_local_confirmation",
+        "local_confirmation",
+        "native_route_confirmation",
+        "same_market_confirmation",
+    ):
+        nested = candidate.get(field)
+        if isinstance(nested, Mapping):
+            containers.append(nested)
+    for container in containers:
+        for name in names:
+            if name in container:
+                return _as_bool(container.get(name), False)
+    return False
+
+
+def _route_local_confirmation(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    price_action_confirmed = _route_local_confirmation_flag(
+        candidate,
+        (
+            "native_price_action_confirmed",
+            "same_market_price_action_confirmed",
+            "route_local_price_action_confirmed",
+            "local_price_action_confirmed",
+            "price_action_confirmed",
+        ),
+    )
+    liquidity_confirmed = _route_local_confirmation_flag(
+        candidate,
+        (
+            "native_liquidity_confirmed",
+            "same_market_liquidity_confirmed",
+            "route_local_liquidity_confirmed",
+            "local_liquidity_confirmed",
+            "liquidity_confirmed",
+            "liquidity_checks_passed",
+        ),
+    )
+    return {
+        "native_price_action_confirmed": price_action_confirmed,
+        "native_liquidity_confirmed": liquidity_confirmed,
+        "confirmed": bool(price_action_confirmed and liquidity_confirmed),
+        "required_checks": ["native_price_action", "native_liquidity"],
+    }
+
+
 def paper_context_promotion_guard_record(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -298,21 +353,120 @@ def paper_context_promotion_guard_record(
 
     compatibility_rule = _paper_context_compatibility_rule(candidate)
     allowed_by_rule = _paper_context_rule_allows(compatibility_rule, mismatched_fields)
-    eligible = not mismatched_fields or allowed_by_rule
+    families = _portability_families(candidate)
+    translated_family = bool(
+        families.get("source_family")
+        and families.get("destination_family")
+        and families["source_family"] != families["destination_family"]
+    )
+    if translated_family and "market_family" not in mismatched_fields:
+        mismatched_fields.append("market_family")
+    translated_route = bool(mismatched_fields)
+    local_confirmation = _route_local_confirmation(candidate)
+    eligible = not translated_route or local_confirmation["confirmed"]
     return {
-        "guard": "paper_context_promotion_scope",
-        "reason": None if eligible else "paper_context_promotion_mismatch",
+        "guard": "paper_route_lineage_confirmation",
+        "reason": None if eligible else "route_local_confirmation_missing",
         "paper_only": True,
         "eligible": eligible,
-        "promotion_blocked": bool(mismatched_fields) and not allowed_by_rule,
+        "translated_route": translated_route,
+        "lineage_state": "native" if not translated_route else "confirmed" if eligible else "observation_only",
+        "promotion_blocked": translated_route and not eligible,
         "compatibility_rule_logged": compatibility_rule is not None,
+        "compatibility_rule_allows_translation": allowed_by_rule,
         "compatibility_rule": compatibility_rule,
         "source_context": source_bucket,
         "destination_context": destination_bucket,
         "matching_fields": matching_fields,
         "mismatched_fields": mismatched_fields,
-        "paper_score_multiplier": 1.0 if eligible else 0.0,
-        "paper_fill_allowed": eligible,
+        "source_market_family": families.get("source_family"),
+        "destination_market_family": families.get("destination_family"),
+        "route_local_confirmation": local_confirmation,
+        "paper_score_multiplier": 1.0 if eligible else PAPER_TRANSLATED_ROUTE_OBSERVATION_MULTIPLIER,
+        # This guard changes promotion and ranking treatment only.  It never
+        # suppresses a priceable paper experiment.
+        "paper_fill_allowed": True,
+        "observation_only": translated_route and not eligible,
+    }
+
+
+def paper_route_lineage_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any]:
+    """Attach route lineage to every paper candidate, including native ideas."""
+    source_context = _paper_context_source_context(candidate)
+    destination_context = _paper_context_bucket(candidate)
+    promotion = paper_context_promotion_guard_record(candidate, config=config)
+    if promotion is not None:
+        return {
+            "lineage_type": "translated" if promotion["translated_route"] else "native",
+            "source_context_present": True,
+            "source_context": promotion["source_context"],
+            "destination_context": promotion["destination_context"],
+            "confirmation": promotion["route_local_confirmation"],
+            "confirmation_required": promotion["translated_route"],
+            "confirmation_status": "confirmed" if promotion["eligible"] else "missing",
+            "observation_only": promotion["observation_only"],
+            "promotion_guard": promotion,
+        }
+    # Some scanners carry only source/destination market families rather than
+    # a full source route context.  That is still enough to identify a
+    # translated thesis, but never enough to claim local confirmation.
+    families = _portability_families(candidate)
+    source_family = families.get("source_family")
+    destination_family = families.get("destination_family")
+    translated_family = bool(
+        source_family and destination_family and source_family != destination_family
+    )
+    confirmation = _route_local_confirmation(candidate)
+    if translated_family:
+        family_source = {"market_family": source_family}
+        guard = {
+            "guard": "paper_route_lineage_confirmation",
+            "reason": None if confirmation["confirmed"] else "route_local_confirmation_missing",
+            "paper_only": True,
+            "eligible": confirmation["confirmed"],
+            "translated_route": True,
+            "lineage_state": "confirmed" if confirmation["confirmed"] else "observation_only",
+            "promotion_blocked": not confirmation["confirmed"],
+            "compatibility_rule_logged": False,
+            "compatibility_rule_allows_translation": False,
+            "compatibility_rule": None,
+            "source_context": family_source,
+            "destination_context": destination_context,
+            "matching_fields": [],
+            "mismatched_fields": ["market_family"],
+            "route_local_confirmation": confirmation,
+            "paper_score_multiplier": (
+                1.0 if confirmation["confirmed"] else PAPER_TRANSLATED_ROUTE_OBSERVATION_MULTIPLIER
+            ),
+            "paper_fill_allowed": True,
+            "observation_only": not confirmation["confirmed"],
+        }
+        return {
+            "lineage_type": "translated",
+            "source_context_present": True,
+            "source_context": family_source,
+            "destination_context": destination_context,
+            "confirmation": confirmation,
+            "confirmation_required": True,
+            "confirmation_status": "confirmed" if confirmation["confirmed"] else "missing",
+            "observation_only": not confirmation["confirmed"],
+            "promotion_guard": guard,
+            "source_market_family": source_family,
+            "destination_market_family": destination_family,
+        }
+    return {
+        "lineage_type": "native",
+        "source_context_present": source_context is not None,
+        "source_context": _paper_context_bucket(source_context) if source_context else {},
+        "destination_context": destination_context,
+        "confirmation": _route_local_confirmation(candidate),
+        "confirmation_required": False,
+        "confirmation_status": "not_required",
+        "observation_only": False,
+        "promotion_guard": None,
     }
 
 
@@ -1995,9 +2149,12 @@ def paper_portability_quarantine_record(
         ),
         "promotion_eligible": proven,
         "promotion_blocked": not proven,
-        "paper_fill_allowed": proven,
-        "paper_score_multiplier": 1.0 if proven else 0.0,
-        "paper_allocation_multiplier": 1.0 if proven else 0.0,
+        # Missing transfer proof changes ranking and promotion only.  Keep a
+        # priceable candidate available to the paper loop as an observation.
+        "paper_fill_allowed": True,
+        "paper_score_multiplier": 1.0 if proven else PAPER_TRANSLATED_ROUTE_OBSERVATION_MULTIPLIER,
+        "paper_allocation_multiplier": 1.0 if proven else PAPER_TRANSLATED_ROUTE_OBSERVATION_MULTIPLIER,
+        "observation_only": not proven,
         "neutral_score": _as_float(policy.get("neutral_score"), 0.0),
         "target_surface_paper_evidence_review": (
             target_surface_review if proxy_momentum_frontier_transfer else None
@@ -3864,34 +4021,99 @@ def _apply_portability_quarantine(
     reliability = _annotate(
         candidate,
         profile="cross_family_portability_quarantine",
-        action="destination_family_proof_shadow_only",
+        action="destination_family_proof_observation_only",
         reasons=[quarantine["reason"]],
-        allocation_multiplier=0.0,
-        shadow_only=True,
+        allocation_multiplier=_as_float(quarantine.get("paper_allocation_multiplier"), 1.0),
+        shadow_only=False,
     )
-    sandbox_rank_eligible = bool(quarantine.get("sandbox_rank_eligible"))
-    neutral_score = _as_float(quarantine.get("neutral_score"), 0.0)
+    multiplier = _as_float(
+        quarantine.get("paper_score_multiplier"), PAPER_TRANSLATED_ROUTE_OBSERVATION_MULTIPLIER
+    )
+    score_multiplier = multiplier
+    if isinstance(candidate.get("paper_route_lineage"), Mapping) and candidate["paper_route_lineage"].get(
+        "observation_only"
+    ):
+        # The route-lineage overlay has already applied the translated-route
+        # haircut.  Portability proof remains diagnostic and promotion-gating
+        # evidence, rather than compounding a second penalty.
+        multiplier = 1.0
+        score_multiplier = _as_float(
+            candidate.get("paper_score_multiplier"), PAPER_TRANSLATED_ROUTE_OBSERVATION_MULTIPLIER
+        )
     candidate["pre_portability_quarantine_score"] = pre_quarantine_score
-    candidate["score"] = pre_quarantine_score if sandbox_rank_eligible else min(pre_quarantine_score, neutral_score)
-    # Sandbox ranking is observational.  Do not leak that status into the
-    # paper-score or promotion fields, which downstream order routing treats
-    # as permission to advance a candidate.
-    candidate["paper_score_multiplier"] = 0.0
-    candidate["paper_score_eligible"] = False
-    candidate["paper_rank_eligible"] = False
-    candidate["sandbox_rank_eligible"] = sandbox_rank_eligible
+    candidate["score"] = round(max(0.0, pre_quarantine_score * multiplier), 3)
+    candidate["paper_score_multiplier"] = score_multiplier
+    candidate["paper_score_eligible"] = True
+    candidate["paper_rank_eligible"] = True
+    candidate["sandbox_rank_eligible"] = True
     candidate["promotion_eligible"] = False
-    candidate["paper_fill_allowed"] = False
-    candidate["paper_allocation_multiplier"] = 0.0
-    candidate["candidate_reject_reason"] = "paper_cross_family_portability_quarantine"
+    candidate["paper_observation_only"] = True
+    candidate["paper_observation_reason"] = quarantine["reason"]
+    candidate["paper_allocation_multiplier"] = min(
+        _as_float(candidate.get("paper_allocation_multiplier"), 1.0), score_multiplier
+    )
     reliability["paper_portability_quarantine"] = dict(quarantine)
     reliability["pre_quarantine_score"] = pre_quarantine_score
-    reliability["paper_score_multiplier"] = candidate["paper_score_multiplier"]
-    reliability["paper_rank_eligible"] = False
-    reliability["sandbox_rank_eligible"] = sandbox_rank_eligible
+    reliability["paper_score_multiplier"] = score_multiplier
+    reliability["paper_rank_eligible"] = True
+    reliability["sandbox_rank_eligible"] = True
     reliability["maximum_stage"] = quarantine.get("maximum_stage")
     candidate["strategy_reliability"] = reliability
     _append_note(candidate, f"paper_portability_quarantine:{quarantine['reason']}")
+    return reliability
+
+
+def apply_paper_route_lineage_confirmation(
+    candidate: dict[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    """Apply a severe but non-blocking paper score treatment to translations."""
+    lineage = paper_route_lineage_record(candidate, config=config)
+    candidate["paper_route_lineage"] = lineage
+    candidate["paper_lineage_tags"] = {
+        "lineage_type": lineage["lineage_type"],
+        "confirmation_status": lineage["confirmation_status"],
+    }
+    promotion = lineage.get("promotion_guard")
+    if not isinstance(promotion, Mapping):
+        return None
+    candidate["paper_context_promotion_guard"] = dict(promotion)
+    candidate["paper_context_promotion_guard_key"] = promotion.get("guard")
+    candidate["paper_context_promotion_eligible"] = promotion.get("eligible")
+    candidate["paper_context_promotion_blocked"] = promotion.get("promotion_blocked")
+    candidate["paper_context_promotion_reason"] = promotion.get("reason")
+    if not promotion.get("observation_only"):
+        return None
+
+    pre_score = _as_float(candidate.get("score"), 0.0)
+    multiplier = _as_float(
+        promotion.get("paper_score_multiplier"), PAPER_TRANSLATED_ROUTE_OBSERVATION_MULTIPLIER
+    )
+    reliability = _annotate(
+        candidate,
+        profile="paper_route_lineage_confirmation",
+        action="translated_route_observation_only",
+        reasons=[str(promotion.get("reason") or "route_local_confirmation_missing")],
+        allocation_multiplier=multiplier,
+        shadow_only=False,
+    )
+    candidate["pre_route_lineage_score"] = pre_score
+    candidate["score"] = round(max(0.0, pre_score * multiplier), 3)
+    candidate["paper_score_multiplier"] = multiplier
+    candidate["paper_score_eligible"] = True
+    candidate["paper_rank_eligible"] = True
+    candidate["paper_normal_scoring_eligible"] = False
+    candidate["promotion_eligible"] = False
+    candidate["paper_observation_only"] = True
+    candidate["paper_observation_reason"] = promotion["reason"]
+    candidate["paper_allocation_multiplier"] = min(
+        _as_float(candidate.get("paper_allocation_multiplier"), 1.0), multiplier
+    )
+    # Do not overwrite a route safety verdict.  In particular, missing local
+    # confirmation is not itself a reason to block paper execution.
+    reliability["paper_route_lineage"] = dict(lineage)
+    reliability["pre_route_lineage_score"] = pre_score
+    reliability["paper_score_multiplier"] = multiplier
     return reliability
 
 
@@ -3901,6 +4123,7 @@ def _apply_one(
     conn: Any | None = None,
 ) -> dict | None:
     _record_proxy_short_quality(candidate, config)
+    route_lineage = apply_paper_route_lineage_confirmation(candidate, config=config)
     context_loss_quarantine = _apply_context_loss_quarantine(candidate, config=config, conn=conn)
     if context_loss_quarantine is not None:
         return context_loss_quarantine
@@ -3922,7 +4145,7 @@ def _apply_one(
         return _repair_proxy_shock_reversal_candidate(candidate, config=config)
     if trade_type in PROXY_TRADE_TYPES:
         return _repair_proxy_candidate(candidate, config=config)
-    return None
+    return route_lineage
 
 
 def _summarize(items: list[dict], candidates: list[dict]) -> dict:
