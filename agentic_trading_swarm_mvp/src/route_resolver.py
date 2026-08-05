@@ -2091,6 +2091,9 @@ def enrich_candidate_with_route(
     route_economics_telemetry = dict(
         frontier_short_spot_route_intelligence.get("route_economics_telemetry") or {}
     )
+    route_friction_summary = dict(
+        paper_route_requirement_report.get("route_friction_summary") or {}
+    )
     eligibility = _conditional_short_paper_observation_eligibility(
         eligibility,
         conditional_short_route_intelligence,
@@ -2109,6 +2112,7 @@ def enrich_candidate_with_route(
     route["frontier_short_spot_route_intelligence"] = frontier_short_spot_route_intelligence
     route["frontier_short_spot_route_requirements_report"] = frontier_short_spot_route_requirements_report
     route["route_economics_telemetry"] = route_economics_telemetry
+    route["route_friction_summary"] = route_friction_summary
     route["paper_route_eligibility"] = eligibility
     route["eligibility_missing_prerequisites"] = eligibility["missing_prerequisites"]
     route["paper_route_registry"] = enriched["paper_route_registry"]
@@ -2174,6 +2178,7 @@ def enrich_candidate_with_route(
             "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
             "frontier_short_spot_route_requirements_report": frontier_short_spot_route_requirements_report,
             "route_economics_telemetry": route_economics_telemetry,
+            "route_friction_summary": route_friction_summary,
             "route_requirement_extraction": route["route_requirement_extraction"],
             "route_recommendation_status": route["route_recommendation_status"],
             "route_actionability": route["route_actionability"],
@@ -2219,6 +2224,7 @@ def enrich_candidate_with_route(
     # Route economics is collected before the paper-context ordering pass.  It
     # is a read-only ordering hook and deliberately never feeds eligibility.
     enriched["route_economics_telemetry"] = route_economics_telemetry
+    enriched["route_friction_summary"] = route_friction_summary
     ranking_hook = route_economics_telemetry.get("ranking_hook")
     if isinstance(ranking_hook, dict):
         enriched["route_economics_rank_score"] = ranking_hook.get("route_economics_rank_score")
@@ -2978,6 +2984,7 @@ def _route_requirements_intel_markdown(requirements_intel: dict) -> list[str]:
         "route_requirement_gaps",
         "paper_sizing_guidance",
         "guard_value_measurement",
+        "route_friction_summary",
     )
     lines = [
         "## Pre-Promotion Route Requirements Intel",
@@ -3001,6 +3008,20 @@ def _route_requirements_intel_markdown(requirements_intel: dict) -> list[str]:
             + " | ".join(_report_markdown_value(route.get(field, "unknown")) for field in fields)
             + " |"
         )
+    friction_rollup = requirements_intel.get("route_friction_summary") or {}
+    lines.extend(
+        [
+            "",
+            "## Route Friction Summary",
+            "",
+            "Read-only attribution for paper ranking and sizing; it never blocks a paper experiment.",
+            f"- Applicable candidates: `{friction_rollup.get('applicable_candidate_count', 0)}`",
+            f"- Average friction score: `{friction_rollup.get('average_friction_score', 'unknown')}`",
+            f"- Stale diagnostics: `{friction_rollup.get('stale_diagnostic_count', 0)}`",
+            f"- Illiquid diagnostics: `{friction_rollup.get('illiquid_diagnostic_count', 0)}`",
+            f"- Reasons: `{friction_rollup.get('friction_reason_counts', {})}`",
+        ]
+    )
     summary_fields = (
         "broker_venue_eligibility",
         "short_borrow_availability",

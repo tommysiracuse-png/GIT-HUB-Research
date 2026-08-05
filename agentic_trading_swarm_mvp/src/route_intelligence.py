@@ -108,6 +108,7 @@ ROUTE_REQUIREMENT_FIELDS = (
     "freshness_latency_status",
     "freshness_latency_notes",
     "route_requirement_summary",
+    "route_friction_summary",
 )
 
 # These are the route facts that an opportunity report must carry forward to a
@@ -499,6 +500,11 @@ def build_route_requirements_matrix(
         row = _build_route_requirement_row(normalized)
         annotated = _annotate_route_feasibility_fields(normalized, row)
         diagnostics = build_conditional_short_route_diagnostics(normalized, row=annotated)
+        friction = build_route_friction_summary(
+            normalized,
+            row=annotated,
+            diagnostics=diagnostics,
+        )
         annotated.update(
             {
                 "borrow_availability_status": diagnostics["borrow_availability"],
@@ -509,6 +515,7 @@ def build_route_requirements_matrix(
                 "api_route_status": diagnostics["api_route_status"],
                 "minimum_liquidity_usd_or_unknown": diagnostics["minimum_liquidity_usd"],
                 "conditional_short_route_diagnostics": diagnostics,
+                "route_friction_summary": friction,
             }
         )
         panel = _route_requirements_panel(normalized, annotated)
@@ -555,6 +562,11 @@ def build_route_requirements_annotation(opportunity: dict[str, Any]) -> dict[str
     row = _build_route_requirement_row(normalized)
     annotated = _annotate_route_feasibility_fields(normalized, row)
     diagnostics = build_conditional_short_route_diagnostics(normalized, row=annotated)
+    friction = build_route_friction_summary(
+        normalized,
+        row=annotated,
+        diagnostics=diagnostics,
+    )
     annotated.update(
         {
             "borrow_availability_status": diagnostics["borrow_availability"],
@@ -565,6 +577,7 @@ def build_route_requirements_annotation(opportunity: dict[str, Any]) -> dict[str
             "api_route_status": diagnostics["api_route_status"],
             "minimum_liquidity_usd_or_unknown": diagnostics["minimum_liquidity_usd"],
             "conditional_short_route_diagnostics": diagnostics,
+            "route_friction_summary": friction,
         }
     )
     panel = _route_requirements_panel(normalized, annotated)
@@ -580,6 +593,7 @@ def build_route_requirements_annotation(opportunity: dict[str, Any]) -> dict[str
     )
     return {
         **panel,
+        "route_friction_summary": friction,
         "frontier_short_spot_route_intelligence": frontier_intelligence,
         "frontier_short_spot_route_requirements_report": frontier_requirements_report,
         "route_validation_status": frontier_intelligence["route_validation_status"],
@@ -733,6 +747,230 @@ def build_conditional_short_route_diagnostics(
     }
 
 
+def build_route_friction_summary(
+    opportunity: dict[str, Any],
+    *,
+    row: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project route friction into a non-blocking paper ranking/sizing packet.
+
+    The packet is deliberately built only from observed candidate data and the
+    maintained paper-route registry annotation.  It is not a route probe and
+    does not decide whether a priceable candidate is emitted, routed, or
+    entered.  Unknown borrow, fee, API, freshness, and liquidity facts remain
+    explicit so weak paper outcomes can be attributed to route friction rather
+    than being mistaken for alpha failure.
+    """
+
+    source = dict(row or {})
+    source.update(
+        {key: value for key, value in dict(opportunity or {}).items() if value not in (None, "")}
+    )
+    route_diagnostics = dict(
+        diagnostics or build_conditional_short_route_diagnostics(source, row=row)
+    )
+    applies = bool(route_diagnostics.get("applies"))
+    # The resolver can add a generic route requirement (for example an API
+    # capability) while the maintained paper registry carries the more
+    # specific short/borrow permissions.  Preserve both instead of allowing
+    # one source to mask the other in the attribution report.
+    required_permissions: list[str] = []
+    for permissions in (
+        source.get("required_permissions"),
+        source.get("paper_route_required_permissions"),
+        source.get("registry_required_permissions"),
+    ):
+        for permission in _string_list(permissions):
+            if permission not in required_permissions:
+                required_permissions.append(permission)
+    route_blockers = _route_blockers(source)
+    borrow_required = bool(
+        source.get("borrow_required")
+        or source.get("requires_spot_borrow")
+        or "spot_borrow" in required_permissions
+        or "spot_borrow" in route_blockers
+    )
+    borrow_range = _indicative_borrow_fee_range(source, required=borrow_required)
+    stale_illiquid = _stale_illiquid_route_diagnostics(source)
+    base_score = _float_or_none(route_diagnostics.get("execution_risk_score")) or 0.0
+    friction_reasons = list(route_diagnostics.get("execution_risk_reasons") or [])
+    if applies and stale_illiquid["stale"]:
+        base_score += 10.0
+        friction_reasons.append("stale_market_data")
+    if applies and stale_illiquid["illiquid"]:
+        base_score += 10.0
+        friction_reasons.append("illiquid_market_diagnostic")
+    friction_score = round(min(100.0, max(0.0, base_score)), 4)
+    diagnostic_multiplier = _float_or_none(route_diagnostics.get("paper_rank_multiplier"))
+    friction_multiplier = max(0.35, 1.0 - friction_score / 200.0) if applies else 1.0
+    paper_multiplier = min(
+        diagnostic_multiplier if diagnostic_multiplier is not None else 1.0,
+        friction_multiplier,
+    )
+    route_status = str(
+        source.get("route_status")
+        or source.get("paper_route_registry_status")
+        or UNKNOWN
+    ).strip().lower()
+    registry = source.get("paper_route_registry")
+    registry = registry if isinstance(registry, dict) else {}
+    registry_status = str(
+        registry.get("support_status")
+        or source.get("paper_route_registry_status")
+        or UNKNOWN
+    ).strip().lower()
+    api_status = str(
+        source.get("api_route_status")
+        or route_diagnostics.get("api_route_status")
+        or source.get("api_permission_status")
+        or source.get("api_access_status")
+        or UNKNOWN
+    )
+    fee_model = _first_known(
+        source,
+        "fee_model",
+        "fee_class",
+        "fee_tier",
+        "fee_tier_name",
+        "fee_model_status",
+    )
+    maker_fee = _first_known(source, "maker_fee_bps_or_unknown", "maker_fee_bps", "estimated_maker_fee_bps")
+    taker_fee = _first_known(source, "taker_fee_bps_or_unknown", "taker_fee_bps", "estimated_taker_fee_bps")
+    margin_type = _first_known(source, "margin_mode", "margin_account_mode", "leverage_mode")
+    if margin_type == UNKNOWN:
+        account_modes = _string_list(
+            source.get("paper_route_required_account_modes")
+            or source.get("required_account_modes")
+        )
+        margin_type = account_modes if account_modes else UNKNOWN
+
+    return {
+        "summary_version": "paper_route_friction_v1",
+        "paper_only": True,
+        "read_only": True,
+        "applies": applies,
+        "use": "paper_ranking_and_sizing_only",
+        "required_broker_permissions": required_permissions or [UNKNOWN],
+        "borrow_availability": route_diagnostics.get("borrow_availability", UNKNOWN),
+        "indicative_borrow_fee_bps_range": borrow_range,
+        "margin_type": margin_type,
+        "api_coverage": {
+            "status": api_status,
+            "required_surface": source.get("api_surface_required", UNKNOWN),
+            "probe_performed": False,
+        },
+        "venue_route_status": {
+            "resolved_status": route_status,
+            "registry_status": registry_status,
+        },
+        "fee_model": {
+            "model": fee_model,
+            "maker_fee_bps": maker_fee,
+            "taker_fee_bps": taker_fee,
+            "route_cost_bps_paper": source.get("route_cost_bps_paper", UNKNOWN),
+        },
+        "stale_illiquid_diagnostics": stale_illiquid,
+        "friction_score": friction_score,
+        "friction_reasons": list(dict.fromkeys(friction_reasons)),
+        "paper_rank_multiplier": round(paper_multiplier, 4),
+        "paper_allocation_multiplier": round(paper_multiplier, 4),
+        "ranking_action": "down_rank_and_size_only" if applies and friction_score else "no_rank_adjustment",
+        "hard_blocking": False,
+        "entry_blocked": False,
+        "routing_decision_changed": False,
+        "paper_candidate_emission": "retained_for_paper_exploration",
+    }
+
+
+def _indicative_borrow_fee_range(source: dict[str, Any], *, required: bool) -> dict[str, Any]:
+    """Normalize available borrow-cost evidence without inventing a venue quote."""
+
+    raw_range = source.get("indicative_borrow_fee_bps_range") or source.get("borrow_fee_bps_range")
+    lower = upper = None
+    if isinstance(raw_range, dict):
+        lower = _float_or_none(raw_range.get("lower_bps", raw_range.get("min_bps")))
+        upper = _float_or_none(raw_range.get("upper_bps", raw_range.get("max_bps")))
+    elif isinstance(raw_range, (list, tuple)) and len(raw_range) >= 2:
+        lower, upper = _float_or_none(raw_range[0]), _float_or_none(raw_range[1])
+    estimate = _float_or_none(
+        _first_known(
+            source,
+            "borrow_fee_bps_estimate_or_unknown",
+            "borrow_fee_bps_estimate",
+            "borrow_fee_bps",
+            "borrow_cost_bps",
+        )
+    )
+    route_costs = source.get("paper_route_estimated_cost_bps")
+    if estimate is None and isinstance(route_costs, dict):
+        estimate = _float_or_none(route_costs.get("borrow"))
+    if lower is None and upper is None and estimate is not None:
+        lower = upper = estimate
+    if lower is not None and upper is None:
+        upper = lower
+    if upper is not None and lower is None:
+        lower = upper
+    if lower is not None and upper is not None:
+        lower, upper = min(lower, upper), max(lower, upper)
+        status = "indicative"
+    elif not required:
+        status = "not_applicable"
+    else:
+        status = UNKNOWN
+    return {
+        "status": status,
+        "lower_bps": round(lower, 4) if lower is not None else "not_applicable" if not required else UNKNOWN,
+        "upper_bps": round(upper, 4) if upper is not None else "not_applicable" if not required else UNKNOWN,
+        "source": "maintained_paper_route_metadata_or_candidate_diagnostic",
+    }
+
+
+def _stale_illiquid_route_diagnostics(source: dict[str, Any]) -> dict[str, Any]:
+    """Expose observed stale/illiquid signals without turning them into a gate."""
+
+    stale = _stale_data_diagnostics(source)
+    flags = list(stale["flags"])
+    liquidity_status = str(
+        _first_known(source, "liquidity_status", "market_liquidity_status", "depth_status")
+    ).strip().lower()
+    illiquid = liquidity_status in {"illiquid", "thin", "unavailable", "stale"}
+    if illiquid:
+        flags.append(f"liquidity_status:{liquidity_status}")
+    liquidity_score = _float_or_none(_first_known(source, "liquidity_score", "market_liquidity_score"))
+    if liquidity_score is not None and liquidity_score <= 0.2:
+        illiquid = True
+        flags.append("liquidity_score_at_or_below_0.2")
+    observed_depth = _float_or_none(
+        _first_known(source, "available_depth_usd", "depth_usd", "liquidity_usd")
+    )
+    minimum_depth = _float_or_none(
+        _first_known(source, "minimum_liquidity_usd", "min_liquidity_usd", "liquidity_floor_usd")
+    )
+    if observed_depth is not None and minimum_depth is not None and observed_depth < minimum_depth:
+        illiquid = True
+        flags.append("observed_depth_below_indicative_minimum")
+    if stale["status"] == "stale" and illiquid:
+        status = "stale_and_illiquid"
+    elif stale["status"] == "stale":
+        status = "stale"
+    elif illiquid:
+        status = "illiquid"
+    elif flags:
+        status = "observed"
+    else:
+        status = UNKNOWN
+    return {
+        "status": status,
+        "stale": stale["status"] == "stale",
+        "illiquid": illiquid,
+        "flags": list(dict.fromkeys(flags)),
+        "liquidity_score": liquidity_score if liquidity_score is not None else UNKNOWN,
+        "observed_depth_usd": observed_depth if observed_depth is not None else UNKNOWN,
+        "non_blocking": True,
+    }
+
+
 def build_paper_route_requirement_report(
     opportunity: dict[str, Any],
     *,
@@ -781,7 +1019,12 @@ def build_paper_route_requirement_report(
         diagnostics_source["route_status"] = "conditional"
     diagnostics = build_conditional_short_route_diagnostics(diagnostics_source)
     applies = bool(diagnostics.get("applies") or short_proxy)
-    rank_multiplier = float(diagnostics.get("paper_rank_multiplier") or 1.0) if applies else 1.0
+    friction = build_route_friction_summary(
+        diagnostics_source,
+        row=annotation,
+        diagnostics=diagnostics,
+    )
+    rank_multiplier = float(friction.get("paper_rank_multiplier") or 1.0) if applies else 1.0
     rank_multiplier = round(max(0.35, min(1.0, rank_multiplier)), 4)
     panel = dict(annotation or build_route_requirements_annotation(source))
     sizing_guidance = dict(panel.get("paper_sizing_guidance") or {})
@@ -827,6 +1070,7 @@ def build_paper_route_requirement_report(
         "candidate_kind": "short_proxy" if short_proxy else "conditional_short" if applies else "other",
         "route_requirements": panel,
         "diagnostics": diagnostics,
+        "route_friction_summary": friction,
         "route_requirement_gaps": gaps,
         "paper_rank_multiplier": rank_multiplier,
         "paper_allocation_multiplier": rank_multiplier,
@@ -1490,6 +1734,9 @@ def build_candidate_route_requirement_summary(
         _first_known(source, "fee_tier", "fee_tier_name", "maker_taker_fee_tier", "fee_class", "fee_model"),
     )
     api_permission_status = facts.get("api_permission_status", api_status)
+    route_friction = facts.get("route_friction_summary")
+    if not isinstance(route_friction, dict):
+        route_friction = build_route_friction_summary(source, row=facts, diagnostics=diagnostics)
 
     return {
         "summary_version": "paper_route_requirement_summary_v1",
@@ -1544,6 +1791,7 @@ def build_candidate_route_requirement_summary(
             "notes": list(freshness_notes),
             "stale_flags": list(facts.get("stale_data_flags") or []),
         },
+        "route_friction_summary": route_friction,
     }
 
 
@@ -1587,8 +1835,48 @@ def build_route_requirements_report(
             for row in routes
             if isinstance(row.get("route_requirement_summary"), dict)
         ],
+        "route_friction_summary": summarize_route_friction(routes),
         "playbook_summary": build_route_playbook_summary(opportunities),
         "paper_feasibility_summary": build_route_feasibility_summary(opportunities),
+    }
+
+
+def summarize_route_friction(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate read-only route-friction evidence for paper report consumers."""
+
+    friction_rows = [
+        dict(row.get("route_friction_summary") or {})
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("route_friction_summary"), dict)
+    ]
+    applicable = [row for row in friction_rows if row.get("applies")]
+    reason_counts: dict[str, int] = {}
+    stale_count = illiquid_count = 0
+    scores: list[float] = []
+    for friction in applicable:
+        score = _float_or_none(friction.get("friction_score"))
+        if score is not None:
+            scores.append(score)
+        for reason in friction.get("friction_reasons") or []:
+            reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+        market_data = friction.get("stale_illiquid_diagnostics") or {}
+        stale_count += int(bool(market_data.get("stale")))
+        illiquid_count += int(bool(market_data.get("illiquid")))
+    return {
+        "summary_version": "paper_route_friction_rollup_v1",
+        "paper_only": True,
+        "read_only": True,
+        "use": "paper_ranking_and_sizing_only",
+        "candidate_count": len(friction_rows),
+        "applicable_candidate_count": len(applicable),
+        "average_friction_score": round(sum(scores) / len(scores), 4) if scores else UNKNOWN,
+        "stale_diagnostic_count": stale_count,
+        "illiquid_diagnostic_count": illiquid_count,
+        "friction_reason_counts": dict(sorted(reason_counts.items())),
+        "hard_blocking": False,
+        "entry_blocked": False,
+        "routing_decision_changed": False,
+        "paper_candidate_emission": "retained_for_paper_exploration",
     }
 
 

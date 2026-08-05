@@ -18,8 +18,10 @@ from route_intelligence import (  # noqa: E402
     extract_route_requirements,
     build_frontier_short_spot_route_intelligence,
     build_paper_route_requirement_report,
+    build_route_friction_summary,
     build_route_requirements_annotation,
     build_route_requirements_matrix,
+    build_route_requirements_report,
     build_short_frontier_spot_route_outcome_diagnostics,
     render_route_requirements_markdown,
     route_requirements_json,
@@ -27,6 +29,56 @@ from route_intelligence import (  # noqa: E402
 
 
 class RouteIntelligenceTests(unittest.TestCase):
+    def test_route_friction_summary_attributes_conditional_route_costs_without_blocking(self) -> None:
+        candidate = {
+            "venue": "TEST_VENUE",
+            "inst_id": "TEST_VENUE:ARC-USDT",
+            "direction": "long_perp_short_spot",
+            "route_status": "conditional",
+            "route_blockers": ["spot_borrow"],
+            "required_permissions": ["crypto_spot", "margin_spot", "spot_borrow"],
+            "borrow_available": "unknown",
+            "indicative_borrow_fee_bps_range": {"lower_bps": 8.0, "upper_bps": 16.0},
+            "margin_mode": "isolated",
+            "fee_model": "maker_taker_estimate",
+            "maker_fee_bps": 1.0,
+            "taker_fee_bps": 3.0,
+            "api_access_status": "public_data_only",
+            "freshness_state": "stale",
+            "liquidity_score": 0.1,
+            "available_depth_usd": 1000.0,
+            "min_liquidity_usd": 5000.0,
+        }
+
+        friction = build_route_friction_summary(candidate)
+        report = build_route_requirements_report([candidate])
+
+        self.assertTrue(friction["paper_only"])
+        self.assertTrue(friction["read_only"])
+        self.assertEqual(
+            ["crypto_spot", "margin_spot", "spot_borrow"],
+            friction["required_broker_permissions"],
+        )
+        self.assertEqual("unconfirmed", friction["borrow_availability"])
+        self.assertEqual(
+            {"status": "indicative", "lower_bps": 8.0, "upper_bps": 16.0,
+             "source": "maintained_paper_route_metadata_or_candidate_diagnostic"},
+            friction["indicative_borrow_fee_bps_range"],
+        )
+        self.assertEqual("isolated", friction["margin_type"])
+        self.assertEqual("public_data_only", friction["api_coverage"]["status"])
+        self.assertEqual("conditional", friction["venue_route_status"]["resolved_status"])
+        self.assertEqual("maker_taker_estimate", friction["fee_model"]["model"])
+        self.assertEqual("stale_and_illiquid", friction["stale_illiquid_diagnostics"]["status"])
+        self.assertLess(friction["paper_rank_multiplier"], 1.0)
+        self.assertEqual("down_rank_and_size_only", friction["ranking_action"])
+        self.assertFalse(friction["entry_blocked"])
+        self.assertFalse(friction["routing_decision_changed"])
+        self.assertEqual("retained_for_paper_exploration", friction["paper_candidate_emission"])
+        self.assertEqual(1, report["route_friction_summary"]["applicable_candidate_count"])
+        self.assertEqual(1, report["route_friction_summary"]["stale_diagnostic_count"])
+        self.assertEqual(1, report["route_friction_summary"]["illiquid_diagnostic_count"])
+
     def test_weak_short_frontier_outcomes_become_route_diagnostics_not_entry_blocks(self) -> None:
         diagnostics = build_short_frontier_spot_route_outcome_diagnostics(
             [

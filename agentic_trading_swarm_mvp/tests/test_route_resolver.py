@@ -62,6 +62,33 @@ class RouteResolverTests(unittest.TestCase):
         self.assertFalse(enriched.get("paper_entry_blocked", False))
         self.assertTrue(enriched["conditional_short_execution_risk_downrank_applied"])
 
+    def test_enrichment_exposes_route_friction_for_paper_ranking_and_sizing_only(self) -> None:
+        enriched = route_resolver.enrich_candidate_with_route(
+            {
+                "venue": "MEXC",
+                "inst_id": "MEXC:ARC-USDT",
+                "trade_type": "frontier_crypto_venue_map",
+                "direction": "short_frontier_spot",
+                "asset_class": "crypto_spot",
+                "score": 80.0,
+                "freshness_state": "stale",
+                "liquidity_score": 0.1,
+            },
+            settings(),
+        )
+
+        friction = enriched["route_friction_summary"]
+        self.assertEqual(
+            friction,
+            enriched["execution_route"]["route_friction_summary"],
+        )
+        self.assertTrue(friction["paper_only"])
+        self.assertEqual("paper_ranking_and_sizing_only", friction["use"])
+        self.assertIn("spot_borrow", friction["required_broker_permissions"])
+        self.assertEqual("stale_and_illiquid", friction["stale_illiquid_diagnostics"]["status"])
+        self.assertFalse(friction["entry_blocked"])
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
+
     def test_conditional_short_is_enriched_with_per_venue_route_intelligence(self) -> None:
         enriched = route_resolver.enrich_candidate_with_route(
             {
