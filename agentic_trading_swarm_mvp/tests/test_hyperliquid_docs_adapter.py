@@ -72,6 +72,7 @@ class HyperliquidDocsAdapterTests(unittest.TestCase):
         self.assertIsNotNone(adapter)
         self.assertEqual("HYPERLIQUID", adapter.info.venue)
         self.assertEqual(PERPETUALS_DOCS_URL, adapter.info.docs_url)
+        self.assertIn("public_market_data", adapter.info.capabilities)
         self.assertIn("predicted_fundings", adapter.info.capabilities)
         self.assertIn("hip3_perp_dex_capacity", adapter.info.capabilities)
         self.assertNotIn("order_entry", adapter.info.capabilities)

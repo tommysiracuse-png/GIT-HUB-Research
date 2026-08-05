@@ -297,6 +297,7 @@ class HyperliquidPublicPerpetualsAdapter:
         market_type="perp",
         source="Hyperliquid official public Info API",
         capabilities=(
+            "public_market_data",
             "funding_history",
             "predicted_fundings",
             "cross_venue_funding_diagnostics",
