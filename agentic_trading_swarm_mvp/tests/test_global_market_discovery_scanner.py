@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import global_market_discovery_scanner as scanner  # noqa: E402
+from research_worker import normalize_market_candidate  # noqa: E402
 from settings import DEFAULT_SETTINGS  # noqa: E402
 
 
@@ -47,6 +48,45 @@ def fake_chart(symbol: str, *args: object, **kwargs: object) -> dict:
 
 
 class GlobalMarketDiscoveryScannerTests(unittest.TestCase):
+    def test_normalized_discovery_preserves_safe_route_requirement_evidence(self) -> None:
+        discovery = normalize_market_candidate(
+            {
+                "surface_type_raw": "conditional listed derivatives route",
+                "venue_or_source": "CME Group",
+                "asset_or_event": "equity-index futures proxy",
+                "route_requirements": {
+                    "venue_permissions": {"status": "documented", "permissions": ["futures_enabled"]},
+                    "borrow_availability": {"status": "not_applicable"},
+                    "margin_constraints": {"status": "documented", "initial_margin_pct": 12.5},
+                    "fee_tiers": {"status": "documented", "taker_fee_bps": 3.5},
+                    "api_product_access": {
+                        "status": "documented",
+                        "required_product": "futures_order_api",
+                        "unrecognized_route_detail": "must_not_be_retained",
+                    },
+                    "settlement_custody_constraints": {"status": "documented", "settlement_cycle": "T+1"},
+                },
+            }
+        )
+
+        requirements = scanner._route_requirements_packet(
+            discovery,
+            venue="CME_GROUP",
+            inst_id="CME_GROUP:SPY",
+            direction="long_proxy",
+            proxy_symbol="SPY",
+        )
+
+        self.assertEqual(requirements["venue_permissions"]["permissions"], ["futures_enabled"])
+        self.assertEqual(requirements["borrow_availability"]["status"], "not_applicable")
+        self.assertEqual(requirements["margin_constraints"]["initial_margin_pct"], 12.5)
+        self.assertEqual(requirements["fee_tiers"]["taker_fee_bps"], 3.5)
+        self.assertEqual(requirements["api_product_access"]["required_product"], "futures_order_api")
+        self.assertNotIn("unrecognized_route_detail", requirements["api_product_access"])
+        self.assertEqual(requirements["settlement_custody_constraints"]["settlement_cycle"], "T+1")
+        self.assertEqual(requirements["paper_ranking_action"], "tag_route_requirements")
+        self.assertFalse(requirements["suppression_eligible"])
+
     def test_short_proxy_route_tags_unverified_borrow_without_suppression(self) -> None:
         requirements = scanner._route_requirements_packet(
             {

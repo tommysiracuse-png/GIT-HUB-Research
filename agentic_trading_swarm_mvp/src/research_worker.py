@@ -42,6 +42,80 @@ DATA_ACCESS_TYPES = {"public_no_key", "public_key_required", "broker_account", "
 TRADABILITY_GUESSES = {"directly_tradable", "route_needed", "watch_only", "unknown"}
 NEXT_ACTIONS = {"adapter_spec", "route_probe", "growth_experiment", "hunter_directive", "watchlist", "ignore"}
 
+# Discovery findings may include public evidence about an eventual direct
+# execution route.  Keep this deliberately narrow: these are paper-routing
+# hints, not account configuration, credentials, or permission grants.
+DISCOVERY_ROUTE_REQUIREMENT_CATEGORIES = (
+    "venue_permissions",
+    "borrow_availability",
+    "margin_constraints",
+    "fee_tiers",
+    "api_product_access",
+    "settlement_custody_constraints",
+)
+
+_DISCOVERY_ROUTE_REQUIREMENT_FIELDS = {
+    "venue_permissions": {
+        "status",
+        "required_for_direct_route",
+        "permissions",
+        "unresolved_blockers",
+        "jurisdiction",
+        "evidence_source",
+        "discovery_hint",
+    },
+    "borrow_availability": {
+        "status",
+        "required_for_direct_route",
+        "asset_or_instrument",
+        "availability",
+        "borrow_fee_bps",
+        "borrow_fee_bps_estimate",
+        "paper_assumption",
+        "evidence_source",
+        "discovery_hint",
+    },
+    "margin_constraints": {
+        "status",
+        "required_for_direct_route",
+        "short_or_levered_route",
+        "account_type",
+        "initial_margin_pct",
+        "maintenance_margin_pct",
+        "leverage_limit",
+        "evidence_source",
+        "discovery_hint",
+    },
+    "fee_tiers": {
+        "status",
+        "maker_fee_bps",
+        "taker_fee_bps",
+        "tier_or_schedule",
+        "fee_currency",
+        "evidence_source",
+        "discovery_hint",
+    },
+    "api_product_access": {
+        "status",
+        "direct_order_api_status",
+        "required_product",
+        "product_access",
+        "endpoint_constraints",
+        "evidence_source",
+        "discovery_hint",
+    },
+    "settlement_custody_constraints": {
+        "status",
+        "settlement_cycle",
+        "custody_or_clearing_route",
+        "delivery_method",
+        "transfer_restrictions",
+        "required_for_direct_route",
+        "evidence_source",
+        "discovery_hint",
+    },
+}
+
 DISCOVERY_REGIONS = (
     "West Africa",
     "East Africa",
@@ -1059,6 +1133,14 @@ def _research_prompt(themes: list[dict[str, str]], known: list[dict[str, Any]], 
                 "latency_sensitivity": "low|medium|high|unknown",
                 "liquidity_hint": "what the source indicates",
                 "route_blockers": ["unknown or documented blockers"],
+                "route_requirements": {
+                    "venue_permissions": {"status": "unknown|documented", "permissions": ["public route requirement"]},
+                    "borrow_availability": {"status": "unknown|available|unavailable"},
+                    "margin_constraints": {"status": "unknown|documented"},
+                    "fee_tiers": {"status": "unknown|documented", "taker_fee_bps": "number or unknown"},
+                    "api_product_access": {"status": "public_data_only|unknown|documented"},
+                    "settlement_custody_constraints": {"status": "unknown|documented"},
+                },
                 "priority": "integer 1-100 opportunity priority; this is not a 1-5 rank",
                 "confidence": 0.0,
             }
@@ -1313,6 +1395,29 @@ def _normalize_next_actions(item: dict[str, Any]) -> list[str]:
     return actions
 
 
+def _normalize_discovery_route_requirements(seed: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Retain safe, public route evidence from discovery output.
+
+    The discovery worker is a boundary between unstructured research output and
+    durable candidate records.  Copy only the documented, non-secret fields so
+    later paper routing can label direct-route gaps without ever treating a
+    discovery as account access or retaining arbitrary connection material.
+    """
+
+    nested = seed.get("route_requirements")
+    nested = nested if isinstance(nested, dict) else {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for category in DISCOVERY_ROUTE_REQUIREMENT_CATEGORIES:
+        value = nested.get(category, seed.get(category))
+        if not isinstance(value, dict):
+            continue
+        allowed = _DISCOVERY_ROUTE_REQUIREMENT_FIELDS[category]
+        entry = {key: value[key] for key in allowed if key in value and value[key] not in (None, "")}
+        if entry:
+            normalized[category] = entry
+    return normalized
+
+
 def normalize_market_candidate(seed: dict[str, Any], *, created_at: str | None = None) -> dict[str, Any]:
     created = created_at or _utc_now()
     source_urls = seed.get("source_urls") or ([seed["public_docs_url"]] if seed.get("public_docs_url") else [])
@@ -1333,6 +1438,7 @@ def normalize_market_candidate(seed: dict[str, Any], *, created_at: str | None =
         "latency_sensitivity": str(seed.get("latency_sensitivity") or "unknown"),
         "liquidity_hint": str(seed.get("liquidity_hint") or "unknown"),
         "route_blockers": [str(item) for item in seed.get("route_blockers", [])],
+        "route_requirements": _normalize_discovery_route_requirements(seed),
         "recommended_next_action": str(seed.get("recommended_next_action") or ""),
         "recommended_next_actions": list(seed.get("recommended_next_actions") or []),
         "priority": _normalize_priority(seed.get("priority")),

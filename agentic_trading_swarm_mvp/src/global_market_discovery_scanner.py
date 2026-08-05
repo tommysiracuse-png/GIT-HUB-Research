@@ -24,7 +24,11 @@ from global_proxy_scanner import (
     liquidity_score,
     valid_pairs,
 )
-from research_worker import DEFAULT_GLOBAL_DISCOVERY_SEEDS, normalize_market_candidate
+from research_worker import (
+    DEFAULT_GLOBAL_DISCOVERY_SEEDS,
+    _normalize_discovery_route_requirements,
+    normalize_market_candidate,
+)
 from scan_batch import ScanBatch, observation_from_candidate
 from proxy_signal_quality import enrich_parsed_proxy_quality
 from yahoo_proxy_reuse import evaluate_yahoo_proxy_reuse
@@ -528,8 +532,10 @@ def _route_requirements_packet(
     priceable paper experiment merely because they remain unverified.
     """
 
-    supplied = discovery.get("route_requirements")
-    supplied = supplied if isinstance(supplied, dict) else {}
+    # Reports from older workers can bypass normalization, so sanitize again at
+    # the runtime boundary before writing a scanner report or handing metadata
+    # to paper-route consumers.
+    supplied = _normalize_discovery_route_requirements(discovery)
     blockers = _string_list(discovery.get("route_blockers"))
     short_route = str(direction or "").lower().startswith("short")
     source = "public_discovery_metadata"
