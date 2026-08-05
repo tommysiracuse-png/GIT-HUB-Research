@@ -53,6 +53,11 @@ from adapters.venues.bursa_derivatives import (
     contract_observations,
     parse_bursa_derivatives_contract_catalog,
 )
+from adapters.venues.papua_new_guinea_customs_service import (
+    SOURCE_URL as PNG_CUSTOMS_TSC_SOURCE_URL,
+    PapuaNewGuineaCustomsServiceAdapter,
+    parse_papua_new_guinea_customs_tscs,
+)
 from adapters.venues.casablanca_stock_exchange_futures_market import (
     SOURCE_URL as CASABLANCA_FUTURES_SOURCE_URL,
     CasablancaStockExchangeFuturesMarketAdapter,
@@ -587,6 +592,146 @@ class PublicAdapterParserTests(unittest.TestCase):
             "public_bursa_derivatives_source_unavailable",
             unavailable_batch.observations[0]["candidate_reject_reason"],
         )
+
+    def test_png_customs_tsc_parser_normalizes_vehicle_classification_rows(self) -> None:
+        document = """
+        Papua New Guinea Customs Service
+        Tariff Specification Codes (TSCs) List - Implementation for Motor Vehicles
+        The use of the TSC list is mandatory from 1 June 2023.
+        Toyota Hilux 1KD-FTV 3000cc 2005-2015 Tariff Specification Code: TSC-TOY-001
+        Toyota Corolla 1NZ-FE 1500cc 2006-2012 Tariff Specification Code: TSC-TOY-002
+        Nissan X-Trail QR25-DE 2500cc 2007-2014 Tariff Specification Code: TSC-NIS-010
+        """
+        rows = parse_papua_new_guinea_customs_tscs(
+            document, received_at="2026-08-04T05:30:00+00:00"
+        )
+
+        self.assertEqual(3, len(rows))
+        hilux = next(row for row in rows if row["tariff_specification_code"] == "TSC-TOY-001")
+        self.assertEqual("PNG_CUSTOMS", hilux["venue"])
+        self.assertEqual("Toyota", hilux["vehicle_make"])
+        self.assertEqual("Hilux", hilux["vehicle_model"])
+        self.assertEqual("1KD-FTV", hilux["engine_code"])
+        self.assertEqual(3000, hilux["engine_capacity_cc"])
+        self.assertEqual(2005, hilux["model_year_from"])
+        self.assertEqual(2015, hilux["model_year_to"])
+        self.assertEqual("2023-06-01", hilux["mandatory_from"])
+        self.assertEqual("mandatory_in_force", hilux["session_status"])
+        self.assertEqual(PNG_CUSTOMS_TSC_SOURCE_URL, hilux["source_url"])
+        self.assertEqual("watch_only", hilux["direction"])
+        self.assertEqual(0.0, hilux["last"])
+
+    def test_png_customs_tsc_plugin_is_discoverable_and_preserves_source_failures(self) -> None:
+        adapter_id = "papua_new_guinea_customs_service"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsInstance(adapter, PapuaNewGuineaCustomsServiceAdapter)
+        self.assertEqual(PNG_CUSTOMS_TSC_SOURCE_URL, adapter.info.docs_url)
+        self.assertIn("vehicle_tariff_specification_code", adapter.info.capabilities)
+
+        reachable = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": (
+                "PNG Customs TSC List for Motor Vehicles. Mandatory from 1 June 2023. "
+                "Toyota Vitz 1KR-FE 1000cc 2005-2010 Tariff Specification Code: TSC-TOY-100"
+            ),
+            "received_at": "2026-08-04T05:30:00+00:00",
+            "latency_ms": 4.0,
+        }
+        with mock.patch(
+            "adapters.venues.papua_new_guinea_customs_service.fetch_bytes", return_value=reachable
+        ):
+            batch = PapuaNewGuineaCustomsServiceAdapter().scan({})
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["tsc_list"]["fetch_status"])
+        self.assertEqual("fresh", batch.metadata["freshness_state"])
+        self.assertEqual("mandatory_in_force", batch.metadata["session_state"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertEqual("TSC-TOY-100", batch.observations[0]["tariff_specification_code"])
+
+        malformed = {**reachable, "text": "PNG Customs TSC List for Motor Vehicles"}
+        with mock.patch(
+            "adapters.venues.papua_new_guinea_customs_service.fetch_bytes", return_value=malformed
+        ):
+            parser_batch = PapuaNewGuineaCustomsServiceAdapter().scan({})
+        self.assertEqual("degraded", parser_batch.metadata["source_status"])
+        self.assertEqual("reachable", parser_batch.metadata["fetch_status"]["tsc_list"]["fetch_status"])
+        self.assertTrue(parser_batch.metadata["parser_failures"])
+        self.assertEqual("watch_only", parser_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_png_customs_tsc_parser_failure",
+            parser_batch.observations[0]["candidate_reject_reason"],
+        )
+
+        unavailable = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "error": "blocked",
+            "content": b"",
+            "received_at": "2026-08-04T05:31:00+00:00",
+            "latency_ms": 5.0,
+        }
+        with mock.patch(
+            "adapters.venues.papua_new_guinea_customs_service.fetch_bytes", return_value=unavailable
+        ):
+            unavailable_batch = PapuaNewGuineaCustomsServiceAdapter().scan({})
+        self.assertEqual("blocked", unavailable_batch.metadata["source_status"])
+        self.assertEqual([], unavailable_batch.metadata["parser_failures"])
+        self.assertEqual("unknown", unavailable_batch.metadata["freshness_state"])
+        self.assertEqual("watch_only", unavailable_batch.observations[0]["direction"])
+        self.assertEqual(
+            "public_png_customs_tsc_source_unavailable",
+            unavailable_batch.observations[0]["candidate_reject_reason"],
+        )
+
+    def test_png_customs_tsc_plugin_is_auto_discovered_by_adapter_runtime(self) -> None:
+        target_adapter_id = "papua_new_guinea_customs_service"
+        result = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": (
+                "PNG Customs TSC List for Motor Vehicles. Mandatory from 1 June 2023. "
+                "Toyota Aqua 1NZ-FXE 1500cc 2011-2015 Tariff Specification Code: TSC-TOY-200"
+            ),
+            "received_at": "2026-08-04T05:30:00+00:00",
+            "latency_ms": 4.0,
+        }
+        original_discover = adapter_runtime.discover_adapters
+
+        def discover_only_png() -> list[str]:
+            return [
+                adapter_id
+                for adapter_id in original_discover()
+                if adapter_id == target_adapter_id
+            ]
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "adapters.venues.papua_new_guinea_customs_service.fetch_bytes", return_value=result
+        ), mock.patch.object(adapter_runtime, "RUNS_DIR", pathlib.Path(tmp)), mock.patch.object(
+            adapter_runtime, "CACHE_DIR", pathlib.Path(tmp) / "cache"
+        ), mock.patch.object(adapter_runtime, "REPORT_JSON", pathlib.Path(tmp) / "report.json"), mock.patch.object(
+            adapter_runtime, "REPORT_MD", pathlib.Path(tmp) / "report.md"
+        ), mock.patch.object(adapter_runtime, "discover_adapters", side_effect=discover_only_png):
+            batch = adapter_runtime.build_scan_batch(
+                {
+                    "public_market_adapters": {
+                        "enabled": True,
+                        "workers": 1,
+                        "adapters": {target_adapter_id: {"cache_minutes": 0}},
+                    }
+                }
+            )
+
+        self.assertEqual(1, len(batch.observations))
+        self.assertEqual("PNG_CUSTOMS", batch.observations[0]["venue"])
+        self.assertEqual("watch_only", batch.observations[0]["direction"])
+        report = batch.metadata["public_market_adapters"]
+        self.assertEqual(target_adapter_id, report["adapters"][0]["adapter_id"])
+        self.assertEqual("reachable", report["adapters"][0]["source_status"])
 
     def test_bank_of_canada_tbill_parser_normalizes_calls_and_results(self) -> None:
         payload = {
@@ -3498,6 +3643,29 @@ Datum/Date;Zeit/Time;Verkauf/Sale;Fälligkeit/Vintage;Verkaufspreis/Price €/tC
 
 
 class AdapterCapabilityTests(unittest.TestCase):
+    def test_png_customs_adapter_closes_spec_1042_without_quote_claims(self) -> None:
+        spec = {
+            "title": "Implement public adapter #1042: Papua New Guinea Customs Service",
+            "market_key": "global_discovery|Papua New Guinea Customs Service",
+            "spec": {
+                "candidate": {
+                    "venue_or_source": "Papua New Guinea Customs Service",
+                    "public_docs_url": PNG_CUSTOMS_TSC_SOURCE_URL,
+                    "asset_or_event": (
+                        "Papua New Guinea TSCs for Motor Vehicles: Toyota and other "
+                        "model, engine, and year codes mapped to tariff specification codes"
+                    ),
+                    "data_access_type": "public_no_key",
+                }
+            },
+        }
+
+        match = adapter_capabilities.match_adapter_spec(spec)
+        self.assertEqual("fully_covered", match["match_status"])
+        self.assertEqual("papua_new_guinea_customs_service", match["adapter_id"])
+        self.assertIn("vehicle_tariff_specification_code", match["available_capabilities"])
+        self.assertNotIn("entry_quality_quote", match["available_capabilities"])
+
     def test_uae_mof_adapter_closes_spec_674_without_secondary_quote_claims(self) -> None:
         spec = {
             "title": "Implement public adapter #674: Ministry of Finance UAE / Federal Debt Management Office",
