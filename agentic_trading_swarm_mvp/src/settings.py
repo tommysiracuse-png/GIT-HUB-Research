@@ -134,7 +134,7 @@ DEFAULT_SETTINGS = {
         "min_native_proxy_momentum_bps": 5.0,
         "min_native_proxy_regime_windows": 3,
         "min_native_proxy_positive_window_rate": 0.67,
-        "quarantined_target_surfaces": ["OKX_SPOT", "OKX_CROSS_SURFACE", "OKX_PERP"],
+        "quarantined_target_surfaces": ["OKX_SPOT", "OKX_PERP"],
         "allow_native_proxy_monitoring": True,
         "min_target_surface_closed_count": 20,
         "min_target_surface_expectancy_net_bps": 0.0,

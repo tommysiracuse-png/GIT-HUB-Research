@@ -591,7 +591,7 @@ _PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY = {
     "min_native_proxy_momentum_bps": 5.0,
     "min_native_proxy_regime_windows": 3,
     "min_native_proxy_positive_window_rate": 0.67,
-    "quarantined_target_surfaces": ("OKX_SPOT", "OKX_CROSS_SURFACE", "OKX_PERP"),
+    "quarantined_target_surfaces": ("OKX_SPOT", "OKX_PERP"),
     "allow_native_proxy_monitoring": True,
     "min_target_surface_closed_count": 20,
     "min_target_surface_expectancy_net_bps": 0.0,
@@ -664,12 +664,6 @@ def paper_only_yahoo_proxy_okx_target_review(record, profile=None):
     }
     destination_is_okx = "okx" in destination_tokens
 
-    explicit_surface_values = _values(
-        "target_surface",
-        "destination_surface",
-        "candidate_surface",
-        "execution_surface",
-    )
     perp_tokens = {"perp", "perpetual", "swap", "derivative", "derivatives"}
     spot_evidence = "spot" in destination_tokens
     perp_evidence = bool(destination_tokens.intersection(perp_tokens))
@@ -686,17 +680,7 @@ def paper_only_yahoo_proxy_okx_target_review(record, profile=None):
         elif "frontier_crypto_venue_map" in surface_values:
             spot_evidence = True
 
-    if "okx_cross_surface" in explicit_surface_values:
-        target_surface = "OKX_CROSS_SURFACE"
-    elif "okx_spot" in explicit_surface_values or "okx_cash" in explicit_surface_values:
-        target_surface = "OKX_SPOT"
-    elif (
-        "okx_perp" in explicit_surface_values
-        or "okx_perpetual" in explicit_surface_values
-        or "okx_swap" in explicit_surface_values
-    ):
-        target_surface = "OKX_PERP"
-    elif destination_is_okx and perp_evidence:
+    if destination_is_okx and perp_evidence:
         target_surface = "OKX_PERP"
     elif destination_is_okx and spot_evidence:
         target_surface = "OKX_SPOT"
@@ -767,10 +751,6 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
     )
     source_is_proxy = "proxy" in scope_text or "yahoo" in scope_text
     momentum_family = "momentum" in scope_text
-    source_surface_is_yahoo_proxy = any(
-        _paper_only_route_intelligence_tag(container.get("source_surface")) == "yahoo_proxy"
-        for container in scope_containers
-    )
     execution_mode = _paper_only_route_intelligence_tag(
         _paper_only_route_intelligence_first(
             record, ("execution_mode", "trading_mode", "mode", "runner_mode")
@@ -836,11 +816,9 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
             target_surface = f"{venue_token}_{surface_kind}"
     applies = bool(
         paper_mode
+        and source_is_proxy
+        and momentum_family
         and target_surface is not None
-        and (
-            (source_is_proxy and momentum_family)
-            or source_surface_is_yahoo_proxy
-        )
     )
 
     policy = dict(_PAPER_ONLY_YAHOO_CROSS_SURFACE_ALIGNMENT_POLICY)
@@ -938,8 +916,6 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
         venue = _paper_only_route_intelligence_tag(
             _first(mapping, "target_venue", "execution_venue", "venue")
         )
-        if raw == "okx_cross_surface":
-            return "OKX_CROSS_SURFACE"
         if raw in {"okx_spot", "okx_cash"}:
             return "OKX_SPOT"
         if raw in {"okx_perp", "okx_perpetual", "okx_swap"}:
@@ -1076,9 +1052,6 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
     min_closed_count = max(1, int(_number(policy["min_target_surface_closed_count"]) or 20))
     min_expectancy = _number(policy["min_target_surface_expectancy_net_bps"])
     min_expectancy = 0.0 if min_expectancy is None else min_expectancy
-    # Policy may demand a higher bar, but it may never lower the paper-only
-    # cross-surface promotion floor beneath non-negative expectancy.
-    min_expectancy = max(0.0, min_expectancy)
     min_quality_rate = _number(policy["min_target_surface_quality_rate"])
     min_quality_rate = 0.5 if min_quality_rate is None else min_quality_rate
     max_age_hours = _number(policy["max_target_surface_evidence_age_hours"])
@@ -1103,11 +1076,7 @@ def paper_only_proxy_frontier_target_evidence_review(record, profile=None, *, no
         "exact_target_surface": bool(target_surface and evidence_surface == target_surface),
         "same_source_target_mapping": same_mapping,
         "minimum_closed_count": bool(closed_count is not None and closed_count >= min_closed_count),
-        # A declared cross-surface exception needs non-negative realized
-        # expectancy on this exact target.  Zero is sufficient for the
-        # contract's safety exception; all of the independent freshness,
-        # quality, and mapping checks below still apply.
-        "positive_net_expectancy": bool(expectancy is not None and expectancy >= min_expectancy),
+        "positive_net_expectancy": bool(expectancy is not None and expectancy > min_expectancy),
         "quality_rate": bool(quality_rate is not None and quality_rate >= min_quality_rate),
         "stable_positive_transfer_windows": bool(
             transfer_window_count is not None
@@ -1310,10 +1279,6 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
         "yahoo" in scope_text and "proxy" in scope_text
     )
     source_is_proxy = source_is_yahoo or "proxy" in scope_text
-    source_surface_is_yahoo_proxy = any(
-        _paper_only_route_intelligence_tag(container.get("source_surface")) == "yahoo_proxy"
-        for container in containers
-    )
     momentum_family = "global_proxy_momentum" in scope_text or "yahoo_proxy_momentum" in scope_text or (
         "proxy" in scope_text and "momentum" in scope_text
     )
@@ -1338,18 +1303,13 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
             _profile_lookup("execution_mode", "trading_mode", "mode", "destination_mode", "runner_mode")
         )
     paper_mode = execution_mode in {None, "paper", "paper_only", "simulation", "sim", "review"}
-    cross_surface_allow = _bool(_lookup("cross_surface_allow")) is True
     applies = bool(
         enabled
         and paper_mode
-        and (source_is_proxy and momentum_family or source_surface_is_yahoo_proxy)
+        and source_is_proxy
+        and momentum_family
         and target_surface_evidence.get("applies")
         and not destination_is_native_proxy
-    )
-    contract_target_surface = target_review.get("target_surface")
-    explicit_cross_surface_exception_required = bool(
-        source_surface_is_yahoo_proxy
-        and contract_target_surface in {"OKX_SPOT", "OKX_CROSS_SURFACE"}
     )
 
     direction_value = _paper_only_route_intelligence_tag(
@@ -1607,8 +1567,7 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
     eligible = bool(
         not applies
         or (
-            (not explicit_cross_surface_exception_required or cross_surface_allow)
-            and target_surface_evidence.get("eligible")
+            target_surface_evidence.get("eligible")
             and native_regime_decisively_positive
             and native_regime_stable
             and local_confirmation_passed
@@ -1617,8 +1576,6 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
     blocked = bool(applies and not eligible)
     if not applies:
         reason = "disabled" if not enabled else "non_paper_mode" if not paper_mode else "not_applicable"
-    elif explicit_cross_surface_exception_required and not cross_surface_allow:
-        reason = "cross_surface_allow_required"
     elif target_surface_evidence.get("source_target_incompatible"):
         # Two negative realized legs identify an incompatibility between the
         # source and destination, rather than a transient threshold miss.
@@ -1700,9 +1657,6 @@ def paper_only_yahoo_proxy_cross_surface_alignment_guard(record, profile=None):
             else None
         ),
         "signal_family": "global_proxy_momentum" if momentum_family else None,
-        "source_surface": "YAHOO_PROXY" if source_surface_is_yahoo_proxy else None,
-        "cross_surface_allow": cross_surface_allow,
-        "cross_surface_allow_required": explicit_cross_surface_exception_required,
         "destination_venue": destination_venue,
         "target_surface": target_surface_evidence.get("target_surface") or target_review.get("target_surface"),
         "quarantined_target_surfaces": quarantined_target_surfaces,

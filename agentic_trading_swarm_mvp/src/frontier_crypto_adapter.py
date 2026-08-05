@@ -143,7 +143,7 @@ except ImportError:  # pragma: no cover - fallback for direct module execution
                 "destination_venue": None,
                 "target_surface": None,
                 "quarantined": False,
-                "quarantined_target_surfaces": ["OKX_SPOT", "OKX_CROSS_SURFACE", "OKX_PERP"],
+                "quarantined_target_surfaces": ["OKX_SPOT", "OKX_PERP"],
                 "allow_native_proxy_monitoring": True,
                 "reenable_condition": (
                     "stable_positive_realized_paper_outcomes_for_same_source_target_mapping_and_"

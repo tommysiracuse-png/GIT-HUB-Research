@@ -251,65 +251,7 @@ class YahooProxyCrossSurfaceAlignmentGuardTests(unittest.TestCase):
         self.assertTrue(native["eligible"])
         self.assertTrue(live["eligible"])
         self.assertTrue(native["allow_native_proxy_monitoring"])
-        self.assertEqual(
-            ["OKX_SPOT", "OKX_CROSS_SURFACE", "OKX_PERP"],
-            native["quarantined_target_surfaces"],
-        )
-
-    def test_literal_yahoo_proxy_cross_surface_requires_explicit_allow(self) -> None:
-        for target_surface in ("OKX_SPOT", "OKX_CROSS_SURFACE"):
-            with self.subTest(target_surface=target_surface):
-                candidate = cross_surface_candidate(
-                    source_surface="YAHOO_PROXY",
-                    target_surface=target_surface,
-                )
-                review = paper_only_yahoo_proxy_cross_surface_alignment_guard(candidate)
-
-                self.assertTrue(review["applies"])
-                self.assertTrue(review["cross_surface_allow_required"])
-                self.assertFalse(review["cross_surface_allow"])
-                self.assertFalse(review["promotion_eligible"])
-                self.assertEqual("cross_surface_allow_required", review["reason"])
-
-        routed = apply_frontier_paper_guard(
-            cross_surface_candidate(
-                source_surface="YAHOO_PROXY",
-                target_surface="OKX_CROSS_SURFACE",
-            )
-        )
-        self.assertTrue(routed["shadow_filtered"])
-        self.assertFalse(routed["paper_fill_allowed"])
-
-    def test_literal_yahoo_proxy_cross_surface_requires_non_negative_exact_evidence(self) -> None:
-        candidate = cross_surface_candidate(
-            source_surface="YAHOO_PROXY",
-            target_surface="OKX_CROSS_SURFACE",
-            cross_surface_allow=True,
-            target_surface_paper_evidence=self.target_proof(
-                target_surface="OKX_CROSS_SURFACE",
-                expectancy_net_bps=0.0,
-            ),
-        )
-
-        allowed = paper_only_yahoo_proxy_cross_surface_alignment_guard(candidate)
-        negative = paper_only_yahoo_proxy_cross_surface_alignment_guard(
-            {
-                **candidate,
-                "target_surface_paper_evidence": self.target_proof(
-                    target_surface="OKX_CROSS_SURFACE",
-                    expectancy_net_bps=-0.01,
-                ),
-            }
-        )
-
-        self.assertTrue(allowed["eligible"])
-        self.assertTrue(allowed["promotion_eligible"])
-        self.assertEqual("OKX_CROSS_SURFACE", allowed["target_surface"])
-        self.assertFalse(negative["eligible"])
-        self.assertIn(
-            "positive_net_expectancy",
-            negative["target_surface_paper_evidence_review"]["failed_checks"],
-        )
+        self.assertEqual(["OKX_SPOT", "OKX_PERP"], native["quarantined_target_surfaces"])
 
     def test_quarantine_covers_frontier_crypto_spot_and_perp(self) -> None:
         spot = paper_only_yahoo_proxy_cross_surface_alignment_guard(
