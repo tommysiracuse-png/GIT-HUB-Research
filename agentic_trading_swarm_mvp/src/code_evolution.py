@@ -5509,6 +5509,24 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
     title = str(payload.get("title") or rec.get("title") or "LLM code evolution proposal")[:180]
     evidence = _proposal_evidence(payload)
     proposal_id = _proposal_id(rec.get("recommendation_id"), payload)
+    existing = conn.execute(
+        "select status, candidate_commit from code_evolution_proposals where proposal_id = ?",
+        (proposal_id,),
+    ).fetchone()
+    if existing and str(existing["status"] or "") in SUCCESS_STATUSES:
+        link_recommendation_artifact(
+            conn,
+            rec.get("recommendation_id"),
+            "code_evolution_proposal",
+            proposal_id,
+            "already_materialized_as",
+            {
+                "status": existing["status"],
+                "candidate_commit": existing["candidate_commit"],
+            },
+        )
+        conn.commit()
+        return [_artifact(proposal_id, "already_exists", str(existing["status"]))]
     add_code_evolution_proposal(
         conn,
         proposal_id,

@@ -281,7 +281,8 @@ def reconcile_adapter_specs(conn: sqlite3.Connection) -> dict:
             from adapter_specs
             where status in (
                 'open', 'adapter_capability_gap', 'resolved_existing_adapter_capability',
-                'deployed_waiting_acceptance', 'implementation_failed_review'
+                'deployed_waiting_acceptance', 'deployed_acceptance_failed',
+                'implementation_failed_review'
             )
             order by priority desc, id asc
             """
@@ -304,7 +305,7 @@ def reconcile_adapter_specs(conn: sqlite3.Connection) -> dict:
             elif match["match_status"] == "fully_covered":
                 status = (
                     "implemented_runtime_adapter"
-                    if row.get("status") == "deployed_waiting_acceptance"
+                    if row.get("status") in {"deployed_waiting_acceptance", "deployed_acceptance_failed"}
                     else "resolved_existing_adapter_capability"
                 )
             elif row.get("status") == "deployed_waiting_acceptance":

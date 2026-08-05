@@ -3253,6 +3253,51 @@ class AdapterImplementationOwnerTests(unittest.TestCase):
         )
         conn.close()
 
+    def test_reconciliation_recovers_failed_acceptance_after_capability_is_added(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        docs_url = "https://example.test/perpetuals"
+        storage.add_adapter_spec(
+            conn,
+            "rec-recovered",
+            "global_discovery|Example Perpetuals",
+            90,
+            "Example perpetuals public market data",
+            {
+                "candidate": {
+                    "venue_or_source": "Example Perpetuals",
+                    "public_docs_url": docs_url,
+                }
+            },
+            {},
+        )
+        conn.execute("update adapter_specs set status = 'deployed_acceptance_failed'")
+        conn.commit()
+        inventory = [
+            {
+                "adapter_id": "example_perpetuals",
+                "venue": "EXAMPLE_PERPETUALS",
+                "source": docs_url,
+                "docs_url": docs_url,
+                "aliases": ["Example Perpetuals"],
+                "capabilities": ["public_market_data", "ticker"],
+                "runtime_entrypoint": "adapters.venues.example.ExampleAdapter",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            adapter_capabilities, "capability_inventory", return_value=inventory
+        ), mock.patch.object(
+            adapter_capabilities, "REPORT_JSON", pathlib.Path(tmp) / "inventory.json"
+        ), mock.patch.object(adapter_capabilities, "REPORT_MD", pathlib.Path(tmp) / "inventory.md"):
+            adapter_capabilities.reconcile_adapter_specs(conn)
+
+        row = conn.execute("select status, evidence_json from adapter_specs").fetchone()
+        evidence = json.loads(row["evidence_json"])
+        self.assertEqual("implemented_runtime_adapter", row["status"])
+        self.assertEqual("fully_covered", evidence["adapter_capability_reconciliation"]["match_status"])
+        conn.close()
+
     def test_auto_coder_accepts_new_adapter_plugin_as_runtime_integration(self) -> None:
         payload = {
             "action": "propose_code_change",

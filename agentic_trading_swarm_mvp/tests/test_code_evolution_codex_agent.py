@@ -162,6 +162,47 @@ class CodeEvolutionCodexAgentTests(unittest.TestCase):
             self.assertFalse((app / "src" / "guessed_and_missing.py").exists())
             self.assertEqual(1, run.call_count)
 
+    def test_promoted_proposal_is_not_repaid_from_accepted_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _repo, app = self._repo(tmp)
+            conn = sqlite3.connect(pathlib.Path(tmp) / "radar.sqlite")
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            rec = self._proposal("rec-already-promoted")
+            proposal_id = code_evolution._proposal_id(rec["recommendation_id"], rec["payload"])
+            storage.add_code_evolution_proposal(
+                conn,
+                proposal_id,
+                rec["recommendation_id"],
+                "builder",
+                "model",
+                "frontier",
+                None,
+                rec["payload"]["title"],
+                "runtime_pipeline_integration",
+                90,
+                rec["payload"],
+                {},
+            )
+            storage.update_code_evolution_proposal(
+                conn,
+                proposal_id,
+                status="promoted",
+                candidate_commit="a" * 40,
+            )
+
+            with mock.patch.object(code_evolution, "run_codex_repo_agent") as run:
+                result = code_evolution.process_code_change_recommendation(
+                    conn, rec, self._settings(tmp), root=app
+                )
+            row = storage.code_evolution_recent(conn)[0]
+            conn.close()
+
+            self.assertEqual("already_exists", result[0]["action_status"])
+            self.assertEqual("promoted", result[0]["status"])
+            self.assertEqual("promoted", row["status"])
+            run.assert_not_called()
+
     def test_strategy_owner_prepared_worktree_and_session_are_promoted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, app = self._repo(tmp)
