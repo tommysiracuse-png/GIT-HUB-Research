@@ -746,6 +746,10 @@ class StrategyProgramTests(unittest.TestCase):
                     (rec_id,),
                 ).fetchone()["payload_json"]
             )
+            self.assertTrue(payload["paper_testable_surface"].startswith("paper:strategy_lab:"))
+            self.assertTrue(payload["behavioral_gate"])
+            self.assertTrue(payload["rollback_criteria"])
+            self.assertIn("quality_evidence", payload["evidence"])
         files = payload["code_change"]["expected_files"]
         self.assertIn("src/signals/generated/observation_momentum_v1.py", files)
         self.assertIn("tests/test_generated_strategy_parity.py", files)

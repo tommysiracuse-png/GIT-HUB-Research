@@ -1270,6 +1270,10 @@ def _normalize_code_change_recommendation(rec: dict) -> dict:
             or "Revert if tests fail, reports stop refreshing, or paper-only safety checks fail.",
             "evidence": code_change.get("evidence")
             or (payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}),
+            "paper_testable_surface": code_change.get("paper_testable_surface")
+            or payload.get("paper_testable_surface"),
+            "behavioral_gate": code_change.get("behavioral_gate")
+            or payload.get("behavioral_gate"),
             "target_selection_mode": "explicit" if expected_files else "repo_aware_preflight",
             "consumer_validation": consumer_validation,
         }

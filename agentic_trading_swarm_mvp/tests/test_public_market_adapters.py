@@ -3087,6 +3087,10 @@ class AdapterImplementationOwnerTests(unittest.TestCase):
             "src/adapters/venues/nairobi_coffee_exchange.py",
             payload["code_change"]["expected_files"],
         )
+        self.assertTrue(payload["paper_testable_surface"].startswith("paper:public_adapter:"))
+        self.assertTrue(payload["behavioral_gate"])
+        self.assertTrue(payload["rollback_criteria"])
+        self.assertIn("route_evidence", payload["evidence"])
         status = conn.execute("select status from adapter_specs where id = 2").fetchone()["status"]
         self.assertEqual("deployed_waiting_acceptance", status)
         conn.close()

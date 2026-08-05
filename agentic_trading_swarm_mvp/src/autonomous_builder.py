@@ -306,7 +306,10 @@ def _build_plan_prompt(context: str) -> str:
         "\"title\": \"short title\", "
         "\"priority\": 50-100, "
         "\"expected_behavior_change\": \"what changes in the running paper system\", "
+        "\"paper_testable_surface\": \"one exact paper surface, not a broad strategy label\", "
+        "\"behavioral_gate\": \"one observable paper-mode allow/reject or scoring condition\", "
         "\"evidence\": {\"source\": \"state/report evidence\"}, "
+        "\"route_or_quality_evidence\": {\"route_evidence|quality_evidence\": \"specific supporting record\"}, "
         "\"implementation_notes\": [\"ordered concrete implementation steps\"], "
         "\"expected_files\": [\"repo-relative paths\"], "
         "\"tests_to_run\": [\"python -m unittest ...\"], "
@@ -654,9 +657,14 @@ def _run_with_conn_locked(conn: Any, settings: dict, *, lock_run_id: str | None 
             "tests_to_run": plan.get("tests_to_run") or [],
             "rollback_criteria": plan.get("rollback_criteria")
             or "Revert if tests fail or paper-only safety checks fail.",
+            "paper_testable_surface": plan.get("paper_testable_surface"),
+            "behavioral_gate": plan.get("behavioral_gate"),
             "frontier_escalation_reason": plan.get("frontier_escalation_reason")
             or "Direct outside-flow autonomous code-evolution handoff.",
-            "evidence": plan.get("evidence") if isinstance(plan.get("evidence"), dict) else {"summary": str(plan.get("evidence") or ""), "source": "autonomous_builder_plan"},
+            "evidence": {
+                **(plan.get("evidence") if isinstance(plan.get("evidence"), dict) else {"summary": str(plan.get("evidence") or ""), "source": "autonomous_builder_plan"}),
+                **(plan.get("route_or_quality_evidence") if isinstance(plan.get("route_or_quality_evidence"), dict) else {}),
+            },
         }
         payload = {
             "action": "propose_code_change",
@@ -738,6 +746,12 @@ def _run_with_conn_locked(conn: Any, settings: dict, *, lock_run_id: str | None 
         "expected_files": plan.get("expected_files") or [],
         "tests_to_run": plan.get("tests_to_run") or [],
         "rollback_criteria": plan.get("rollback_criteria") or "Revert if tests fail or paper-only safety checks fail.",
+        "paper_testable_surface": plan.get("paper_testable_surface"),
+        "behavioral_gate": plan.get("behavioral_gate"),
+        "evidence": {
+            **(plan.get("evidence") if isinstance(plan.get("evidence"), dict) else {"source": "autonomous_builder"}),
+            **(plan.get("route_or_quality_evidence") if isinstance(plan.get("route_or_quality_evidence"), dict) else {}),
+        },
         "frontier_escalation_reason": plan.get("frontier_escalation_reason")
         or "Direct outside-flow autonomous code implementation.",
         "unified_diff": diff,
@@ -762,7 +776,7 @@ def _run_with_conn_locked(conn: Any, settings: dict, *, lock_run_id: str | None 
         "priority": int(plan.get("priority") or 95),
         "rationale": plan.get("expected_behavior_change") or plan.get("plan") or "Direct autonomous builder patch.",
         "proposed_change": plan.get("plan") or plan.get("expected_behavior_change") or "",
-        "evidence": plan.get("evidence") if isinstance(plan.get("evidence"), dict) else {"source": "autonomous_builder"},
+        "evidence": code_change["evidence"],
         "frontier_escalation_reason": code_change["frontier_escalation_reason"],
         "model": model,
         "plan_model": plan_model,

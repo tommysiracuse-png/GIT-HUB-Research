@@ -172,6 +172,10 @@ def _proposal_for_spec(row: dict) -> dict:
             "tests/test_public_market_adapters.py",
         ],
         "tests_to_run": ["python -m unittest tests.test_public_market_adapters"],
+        "paper_testable_surface": (
+            f"paper:public_adapter:{venue}:{candidate.get('asset_or_event') or candidate.get('surface_type_raw') or 'market_data'}"
+        ),
+        "behavioral_gate": "Admit the adapter only when public discovery yields a normalized ScanBatch with fresh source provenance.",
         "rollback_criteria": "Revert if adapter discovery, parser tests, full regression, or paper-only safety checks fail.",
         "frontier_escalation_reason": "A high-priority public market adapter spec needs a complete runtime plugin, parser tests, and acceptance path.",
         "adapter_spec_id": spec_id,
@@ -199,7 +203,15 @@ def _proposal_for_spec(row: dict) -> dict:
             "candidate_id": candidate.get("candidate_id"),
             "confidence": candidate.get("confidence"),
             "public_docs_url": candidate.get("public_docs_url"),
+            "route_evidence": {
+                "public_docs_url": candidate.get("public_docs_url"),
+                "data_access_type": candidate.get("data_access_type"),
+                "tradability_guess": candidate.get("tradability_guess"),
+            },
         },
+        "paper_testable_surface": code_change["paper_testable_surface"],
+        "behavioral_gate": code_change["behavioral_gate"],
+        "rollback_criteria": code_change["rollback_criteria"],
         "frontier_escalation_reason": code_change["frontier_escalation_reason"],
         "adapter_spec_id": spec_id,
         "code_change": code_change,

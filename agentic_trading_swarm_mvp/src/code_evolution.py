@@ -3013,6 +3013,7 @@ def _proposal_quality_scorecard(
     used_default_targets: bool,
 ) -> dict:
     runtime_status = _runtime_integration_status(payload, category, target_files)
+    promotion_rubric = _promotion_rubric(payload, category)
     implementation_mode_valid = implementation_mode in IMPLEMENTATION_MODES
     category_valid = category in ALLOWED_CATEGORIES
     if invalid_targets:
@@ -3056,6 +3057,8 @@ def _proposal_quality_scorecard(
         score -= 40
     if not category_valid:
         score -= 55
+    if promotion_rubric["required"] and not promotion_rubric["passed"]:
+        score -= 50
 
     reject_status = None
     if not category_valid:
@@ -3068,6 +3071,8 @@ def _proposal_quality_scorecard(
         reject_status = "rejected_preflight_invalid_tests"
     elif runtime_status in {"missing", "integration_claim_without_target"}:
         reject_status = "rejected_preflight_no_runtime_integration"
+    elif promotion_rubric["required"] and not promotion_rubric["passed"]:
+        reject_status = "quarantined_preflight_promotion_rubric"
 
     return {
         "proposal_quality_score": max(0, min(100, score)),
@@ -3077,12 +3082,114 @@ def _proposal_quality_scorecard(
         "target_path_status": target_path_status,
         "test_command_status": test_command_status,
         "runtime_integration_status": runtime_status,
+        "promotion_rubric": promotion_rubric,
         "expected_behavior_change": _expected_behavior_change(payload, runtime_status),
         "reject_before_model_call": bool(reject_status),
         "preflight_reject_status": reject_status,
         "repair_attempted": bool(path_repairs or test_repairs),
         "repair_successful": bool((path_repairs or test_repairs) and not invalid_targets and not test_issues),
     }
+
+
+def _promotion_rubric(payload: dict, category: str) -> dict:
+    """Evaluate the evidence contract for autonomous strategy promotions.
+
+    Strategy labels are cheap to generate and therefore are not evidence of a
+    useful paper change.  The owner and builder must instead identify a single
+    paper-testable surface, a behavioral gate, a concrete rollback condition,
+    and either route or quality evidence before spending a model call.
+    """
+
+    code_change = _code_change(payload)
+    source = " ".join(
+        str(value or "")
+        for value in (
+            payload.get("agent_name"),
+            payload.get("source_agent"),
+            code_change.get("agent_name"),
+        )
+    ).lower()
+    required = category == "strategy_lab_promotion" or any(
+        name in source for name in ("implementation_owner", "autonomous_builder")
+    )
+    if not required:
+        return {
+            "required": False,
+            "passed": True,
+            "status": "not_required",
+            "reasons": [],
+        }
+
+    surface = _field(payload, "paper_testable_surface")
+    behavioral_gate = _field(payload, "behavioral_gate", "behavioral_test")
+    rollback = _field(payload, "rollback_criteria")
+    evidence = _proposal_evidence(payload)
+    has_route_evidence = _rubric_evidence_present(evidence, "route")
+    has_quality_evidence = _rubric_evidence_present(evidence, "quality")
+    reasons: list[str] = []
+    if not _is_exact_paper_surface(surface):
+        reasons.append("missing_exact_paper_testable_surface")
+    if not _is_concrete_rubric_text(behavioral_gate):
+        reasons.append("missing_behavioral_gate")
+    if not _is_concrete_rubric_text(rollback):
+        reasons.append("missing_rollback_criterion")
+    if not (has_route_evidence or has_quality_evidence):
+        reasons.append("missing_route_or_quality_evidence")
+    if _is_strategy_rename_only(payload):
+        reasons.append("strategy_rename_without_behavior_change")
+    return {
+        "required": True,
+        "passed": not reasons,
+        "status": "passed" if not reasons else "quarantined",
+        "paper_testable_surface": surface if isinstance(surface, str) else None,
+        "behavioral_gate": behavioral_gate if isinstance(behavioral_gate, str) else None,
+        "rollback_criteria": rollback if isinstance(rollback, str) else None,
+        "has_route_evidence": has_route_evidence,
+        "has_quality_evidence": has_quality_evidence,
+        "reasons": reasons,
+    }
+
+
+def _rubric_evidence_present(evidence: dict, kind: str) -> bool:
+    """Accept named, non-empty route/quality evidence without inferring it."""
+
+    for key in (f"{kind}_evidence", kind, f"{kind}_proof"):
+        value = evidence.get(key)
+        if isinstance(value, dict) and any(str(item or "").strip() for item in value.values()):
+            return True
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _is_exact_paper_surface(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    if len(normalized) < 8:
+        return False
+    generic = {"paper", "paper market", "paper system", "all markets", "cross market"}
+    return normalized not in generic
+
+
+def _is_concrete_rubric_text(value: object) -> bool:
+    return isinstance(value, str) and len(value.strip()) >= 12
+
+
+def _is_strategy_rename_only(payload: dict) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            payload.get("title"),
+            payload.get("rationale"),
+            _field(payload, "proposed_change"),
+        )
+    ).lower()
+    rename_terms = ("rename", "renaming", "rename existing", "strategy label", "label only", "alias")
+    behavior_terms = ("gate", "filter", "reject", "allow", "block", "score", "route", "quality", "test")
+    return any(term in text for term in rename_terms) and not any(
+        term in text for term in behavior_terms
+    )
 
 
 def _runtime_integration_status(payload: dict, category: str, target_files: list[str]) -> str:
@@ -6205,6 +6312,11 @@ def code_evolution_summary(conn: Any) -> dict:
     canary_stage_counts: dict[str, int] = {}
     repaired_path_count = 0
     preflight_reject_count = 0
+    promotion_rubric_candidate_count = 0
+    promotion_rubric_pass_count = 0
+    promotion_rubric_quarantine_count = 0
+    duplicate_or_low_utility_promotion_count = 0
+    promotion_rubric_reason_counts: dict[str, int] = {}
     repair_attempt_count = 0
     repair_success_count = 0
     quality_scores: list[float] = []
@@ -6255,6 +6367,19 @@ def code_evolution_summary(conn: Any) -> dict:
         scorecard = safety.get("proposal_scorecard") or preflight.get("quality_scorecard") or {}
         if scorecard.get("reject_before_model_call"):
             preflight_reject_count += 1
+        rubric = scorecard.get("promotion_rubric") or {}
+        if rubric.get("required"):
+            promotion_rubric_candidate_count += 1
+        if rubric.get("status") == "passed":
+            promotion_rubric_pass_count += 1
+        elif rubric.get("status") == "quarantined":
+            promotion_rubric_quarantine_count += 1
+            duplicate_or_low_utility_promotion_count += 1
+            for reason in rubric.get("reasons", []) or []:
+                reason = str(reason)
+                promotion_rubric_reason_counts[reason] = promotion_rubric_reason_counts.get(reason, 0) + 1
+        if row.get("status") == "rejected_duplicate_recent_failure":
+            duplicate_or_low_utility_promotion_count += 1
         if scorecard.get("repair_attempted"):
             repair_attempt_count += 1
         if scorecard.get("repair_successful"):
@@ -6285,6 +6410,14 @@ def code_evolution_summary(conn: Any) -> dict:
         },
         "path_repair_proposal_count": repaired_path_count,
         "preflight_reject_count": preflight_reject_count,
+        "promotion_rubric_candidate_count": promotion_rubric_candidate_count,
+        "promotion_rubric_pass_count": promotion_rubric_pass_count,
+        "promotion_rubric_quarantine_count": promotion_rubric_quarantine_count,
+        "promotion_rubric_quarantine_rate": round(
+            promotion_rubric_quarantine_count / promotion_rubric_candidate_count, 3
+        ) if promotion_rubric_candidate_count else None,
+        "duplicate_or_low_utility_promotion_count": duplicate_or_low_utility_promotion_count,
+        "promotion_rubric_reason_counts": promotion_rubric_reason_counts,
         "proposal_quality_avg": round(sum(quality_scores) / len(quality_scores), 3) if quality_scores else None,
         "repair_attempt_count": repair_attempt_count,
         "repair_success_rate": round(repair_success_count / repair_attempt_count, 3) if repair_attempt_count else None,
@@ -6365,6 +6498,11 @@ def _markdown(report: dict) -> str:
         f"- Failure benchmark: `{summary.get('failure_benchmark', {})}`",
         f"- Path repair proposal count: `{summary.get('path_repair_proposal_count', 0)}`",
         f"- Preflight reject count: `{summary.get('preflight_reject_count', 0)}`",
+        f"- Promotion-rubric candidates / passed: `{summary.get('promotion_rubric_candidate_count', 0)}` / `{summary.get('promotion_rubric_pass_count', 0)}`",
+        f"- Promotion-rubric quarantines: `{summary.get('promotion_rubric_quarantine_count', 0)}`",
+        f"- Promotion-rubric quarantine rate: `{summary.get('promotion_rubric_quarantine_rate')}`",
+        f"- Duplicate or low-utility promotion rejections: `{summary.get('duplicate_or_low_utility_promotion_count', 0)}`",
+        f"- Promotion-rubric reasons: `{summary.get('promotion_rubric_reason_counts', {})}`",
         f"- Proposal quality avg: `{summary.get('proposal_quality_avg')}`",
         f"- Repair success rate: `{summary.get('repair_success_rate')}`",
         f"- Useful merge rate recent: `{summary.get('useful_merge_rate_recent')}`",
@@ -6394,6 +6532,12 @@ def _markdown(report: dict) -> str:
                 f"tests=`{scorecard.get('test_command_status')}` "
                 f"runtime=`{scorecard.get('runtime_integration_status')}`"
             )
+            rubric = scorecard.get("promotion_rubric") or {}
+            if rubric.get("required"):
+                lines.append(
+                    "  - Promotion rubric: "
+                    f"status=`{rubric.get('status')}` reasons=`{rubric.get('reasons', [])}`"
+                )
         patch_generation = safety.get("patch_generation") or {}
         if patch_generation or safety.get("frontier_call_useful") is not None:
             lines.append(

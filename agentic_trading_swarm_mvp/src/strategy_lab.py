@@ -3389,6 +3389,14 @@ def _queue_promotion(
     is_observation_program = str(logic.get("type") or "") == OBSERVATION_PROGRAM
     signal_slug = _slug(str(experiment["strategy_lab_id"]))
     target_module = f"src/signals/generated/{signal_slug}.py"
+    paper_testable_surface = (
+        f"paper:strategy_lab:{experiment.get('source_surface') or experiment['strategy_lab_id']}"
+    )
+    behavioral_gate = (
+        "Generated plugin candidates equal the observation-program interpreter candidates on fixtures."
+        if is_observation_program
+        else "Promoted candidate behavior remains route-compatible on the exact paper surface."
+    )
     expected_files = (
         [target_module, "tests/test_generated_strategy_parity.py"]
         if is_observation_program
@@ -3406,7 +3414,14 @@ def _queue_promotion(
             "experiment_type": experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE),
             "evaluation": evaluation,
             "promotion_rules": rules,
+            "quality_evidence": {
+                "evaluation": evaluation,
+                "promotion_rules": rules,
+            },
         },
+        "paper_testable_surface": paper_testable_surface,
+        "behavioral_gate": behavioral_gate,
+        "rollback_criteria": "Revert if promoted strategy candidates fail validation, reports stop refreshing, or paper-only safety checks fail.",
         "proposed_change": {
             "summary": "Turn the proven Strategy Lab contract into a stable paper-only scanner/strategy implementation.",
             "strategy_contract": {
@@ -3457,6 +3472,8 @@ def _queue_promotion(
                 if is_observation_program
                 else "python -m unittest tests.test_strategy_lab"
             ],
+            "paper_testable_surface": paper_testable_surface,
+            "behavioral_gate": behavioral_gate,
             "runtime_integration": {
                 "entrypoint_file": "src/signals/registry.py" if is_observation_program else "src/radar_loop.py",
                 "entrypoint_symbol": "discover_signals" if is_observation_program else "run_once",
@@ -3467,9 +3484,7 @@ def _queue_promotion(
                 ),
                 "test_file": "tests/test_generated_strategy_parity.py" if is_observation_program else "tests/test_strategy_lab.py",
                 "behavioral_test": (
-                    "Generated plugin candidates equal the observation-program interpreter candidates on fixtures."
-                    if is_observation_program
-                    else "Promoted candidate behavior remains route-compatible."
+                    behavioral_gate
                 ),
             },
             "rollback_criteria": "Revert if promoted strategy candidates fail validation, reports stop refreshing, or paper-only safety checks fail.",
@@ -3477,6 +3492,10 @@ def _queue_promotion(
                 "strategy_lab_id": experiment["strategy_lab_id"],
                 "experiment_type": experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE),
                 "evaluation": evaluation,
+                "quality_evidence": {
+                    "evaluation": evaluation,
+                    "promotion_rules": rules,
+                },
             },
         },
     }

@@ -739,6 +739,7 @@ def _prompt(task: dict, chain: dict, memories: list[dict]) -> str:
             "Own this objective through a concrete runtime artifact. Inspect the repository and current Strategy Lab contracts. This turn is analysis/contract design only: do not edit files. Return exactly the requested JSON schema.",
             "The strategy_experiment, code_goal, dependencies, and blocker fields are JSON-encoded strings. Encode objects/arrays as valid compact JSON strings; use null only for nullable fields and use '[]' for no dependencies.",
             "Prefer a general reusable observation_program over a one-off instrument rule. Preserve novelty. Use current available features when possible. If a required feature is missing, choose implement_code and define an end-to-end code goal. Do not invent broker writes or live trading.",
+            "Every implement_code code_goal must name one exact paper_testable_surface, one behavioral_gate that can be asserted in a paper test, one rollback_criteria condition, and route_evidence or quality_evidence. A strategy rename, alias, or label-only change is not an implementation and must be retired rather than promoted.",
             "A materialize_experiment decision must include a complete strategy_experiment compatible with strategy_lab.ingest_strategy_lab_recommendation: strategy_lab_id, version, experiment_type='market_strategy', hypothesis, source_surface, permitted_target_surface, strategy_logic, data_requirements, risk_gates, and promotion_rules. Surface values must be explicit exact market contexts; missing metadata is quarantined.",
             "An observation program must define a universe, calculated_features, entry_expression, invalidation_expression, direction_logic, edge_formula, and score_formula using supported market feature snapshots. Candidate filters must be broad reusable strategies, not one-off symbols.",
             "TASK CHAIN\n" + json.dumps(chain, sort_keys=True, default=str)[:50000],
@@ -885,6 +886,17 @@ def _handle_code(conn: sqlite3.Connection, task: dict, decision: dict, settings:
         ["git", "rev-parse", "HEAD"], cwd=task_worktree,
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False,
     ).stdout.strip()
+    goal_evidence = goal.get("evidence") if isinstance(goal.get("evidence"), dict) else {}
+    evidence = {
+        "strategy_owner_task_id": task["task_id"],
+        "strategy_lab_id": task.get("strategy_lab_id"),
+        **goal_evidence,
+    }
+    for key in ("route_evidence", "quality_evidence"):
+        if goal.get(key) not in (None, "", {}):
+            evidence[key] = goal[key]
+    category = "strategy_lab_promotion" if task.get("objective_type") == "promote_proven_experiment" else "paper_scoring_logic"
+    rollback_criteria = goal.get("rollback_criteria") or "Revert if paper-only safety, Strategy Lab propagation, tests, or radar health fail."
     payload = {
         "action": "propose_code_change",
         "agent_name": "strategy_implementation_owner",
@@ -892,8 +904,11 @@ def _handle_code(conn: sqlite3.Connection, task: dict, decision: dict, settings:
         "title": str(goal.get("title") or f"Implement strategy owner task {task['task_id']}")[:180],
         "rationale": goal.get("goal") or goal.get("summary") or decision.get("rationale"),
         "proposed_change": goal,
-        "evidence": {"strategy_owner_task_id": task["task_id"], "strategy_lab_id": task.get("strategy_lab_id")},
-        "change_category": "strategy_lab_promotion" if task.get("objective_type") == "promote_proven_experiment" else "paper_signal_logic",
+        "evidence": evidence,
+        "paper_testable_surface": goal.get("paper_testable_surface"),
+        "behavioral_gate": goal.get("behavioral_gate"),
+        "rollback_criteria": rollback_criteria,
+        "change_category": category,
         "implementation_mode": "runtime_active",
         "strategy_owner_codex_session_id": session_id,
         "strategy_owner_release": {
@@ -904,11 +919,14 @@ def _handle_code(conn: sqlite3.Connection, task: dict, decision: dict, settings:
             "status": "implementing",
         },
         "code_change": {
-            "change_category": "strategy_lab_promotion" if task.get("objective_type") == "promote_proven_experiment" else "paper_signal_logic",
+            "change_category": category,
             "implementation_mode": "runtime_active",
             "strategy_owner_codex_session_id": session_id,
             "tests_to_run": decision.get("tests_to_run") or [],
-            "rollback_criteria": "Revert if paper-only safety, Strategy Lab propagation, tests, or radar health fail.",
+            "paper_testable_surface": goal.get("paper_testable_surface"),
+            "behavioral_gate": goal.get("behavioral_gate"),
+            "rollback_criteria": rollback_criteria,
+            "evidence": evidence,
         },
     }
     artifacts = process_code_change_recommendation(
