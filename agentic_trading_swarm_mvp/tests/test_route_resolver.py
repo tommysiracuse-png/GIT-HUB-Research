@@ -169,6 +169,33 @@ class RouteResolverTests(unittest.TestCase):
         self.assertEqual(2, len(ranked))
         self.assertNotIn("paper_entry_blocked", ranked[1])
 
+    def test_frontier_short_outcome_diagnostic_is_a_secondary_paper_ranking_input(self) -> None:
+        enriched = route_resolver.enrich_candidate_with_route(
+            {
+                "venue": "MEXC",
+                "inst_id": "MEXC:BTC-USDT",
+                "trade_type": "frontier_crypto_venue_map",
+                "direction": "short_frontier_spot",
+                "score": 70.0,
+                "short_frontier_spot_route_outcome_diagnostic": {
+                    "ranking_input": {"outcome_rank_score": 10.0},
+                    "entry_blocked": False,
+                    "hard_blocking": False,
+                },
+            },
+            settings(),
+        )
+
+        telemetry = enriched["route_economics_telemetry"]
+        self.assertTrue(telemetry["ranking_hook"]["outcome_ranking_applied"])
+        self.assertEqual(10.0, telemetry["ranking_hook"]["outcome_rank_score"])
+        self.assertEqual("down_rank_only", telemetry["ranking_hook"]["ranking_action"])
+        self.assertEqual(
+            10.0,
+            telemetry["paper_outcome_diagnostic"]["ranking_input"]["outcome_rank_score"],
+        )
+        self.assertFalse(enriched.get("paper_entry_blocked", False))
+
     def test_enrichment_tags_requirements_gaps_without_changing_route_decision(self) -> None:
         candidate = {
             "venue": "OKX",

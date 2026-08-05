@@ -27,6 +27,18 @@ PAPER_ONLY_CONSTRAINTS = (
     "conditional_short_route_facts_are_non_blocking",
 )
 
+# These labels deliberately describe information that must be collected or
+# reviewed for a short-frontier-spot route.  They are not route requirements
+# and must never be interpreted as an execution or paper-entry veto.
+SHORT_FRONTIER_SPOT_ROUTE_DIAGNOSTIC_DIMENSIONS = (
+    "borrow_permissions",
+    "fees",
+    "margin_constraints",
+    "api_reliability",
+    "spread_liquidity",
+    "carry",
+)
+
 ROUTE_REQUIREMENT_FIELDS = (
     "venue",
     "inst_id",
@@ -967,6 +979,12 @@ def build_frontier_short_spot_route_telemetry(
     applies = direction == "short_frontier_spot"
     route_diagnostics = dict(diagnostics or build_conditional_short_route_diagnostics(source))
     freshness = dict(freshness_latency or _freshness_latency_notes(source))
+    outcome_diagnostic = source.get("short_frontier_spot_route_outcome_diagnostic")
+    if not isinstance(outcome_diagnostic, dict):
+        outcome_diagnostic = source.get("route_outcome_diagnostic")
+    outcome_diagnostic = dict(outcome_diagnostic or {})
+    outcome_ranking = outcome_diagnostic.get("ranking_input")
+    outcome_ranking = dict(outcome_ranking) if isinstance(outcome_ranking, dict) else {}
 
     def number(*keys: str) -> float | str:
         value = _numeric_field(source, *keys)
@@ -1041,6 +1059,11 @@ def build_frontier_short_spot_route_telemetry(
     # from the candidate score so route economics cannot become an entry gate.
     cost_value = _float_or_none(known_one_way_cost_bps)
     ranking_score = 100.0 - min(70.0, max(0.0, cost_value or 0.0)) - min(45.0, len(missing) * 5.0)
+    outcome_rank_score = _float_or_none(outcome_ranking.get("outcome_rank_score"))
+    # Outcome evidence is deliberately a bounded secondary ranking input.  It
+    # cannot erase a priceable candidate or override the current route facts.
+    if applies and outcome_rank_score is not None:
+        ranking_score = ranking_score * 0.75 + max(0.0, min(100.0, outcome_rank_score)) * 0.25
     return {
         "telemetry_version": "frontier_short_spot_route_economics_v1",
         "paper_only": True,
@@ -1069,17 +1092,174 @@ def build_frontier_short_spot_route_telemetry(
             "slippage_bps_per_side": slippage_bps,
             "known_one_way_cost_bps": known_one_way_cost_bps,
         },
+        "paper_outcome_diagnostic": outcome_diagnostic,
         "missing_telemetry": missing,
         "ranking_hook": {
             "mode": "paper_ordering_only",
             "score_adjustment": 0.0,
             "route_economics_rank_score": round(max(0.0, ranking_score), 4),
-            "ranking_action": "down_rank_only" if applies and (missing or cost_value is not None) else "no_rank_adjustment",
+            "outcome_rank_score": outcome_rank_score if outcome_rank_score is not None else UNKNOWN,
+            "outcome_ranking_applied": bool(applies and outcome_rank_score is not None),
+            "ranking_action": (
+                "down_rank_only"
+                if applies
+                and (missing or cost_value is not None or (outcome_rank_score is not None and outcome_rank_score < 50.0))
+                else "no_rank_adjustment"
+            ),
         },
         "hard_blocking": False,
         "entry_blocked": False,
         "routing_decision_changed": False,
     }
+
+
+def build_short_frontier_spot_route_outcome_diagnostics(
+    observations: Iterable[dict[str, Any]] | dict[str, Any],
+) -> dict[str, Any]:
+    """Join observed short-frontier paper outcomes to route-review metadata.
+
+    Signal statistics are evidence about a *route slice*, not proof that a
+    candidate should be suppressed.  This helper intentionally creates only
+    read-only diagnostic and paper-ordering inputs for the route hunter and
+    build planner.  It does not mutate candidates, probe venues, access
+    accounts, or return an entry-blocking decision.
+    """
+
+    rows = _route_outcome_observation_rows(observations)
+    diagnostics: list[dict[str, Any]] = []
+    for observation in rows:
+        signal_key = str(observation.get("signal_key") or "")
+        direction = str(observation.get("direction") or "").strip().lower()
+        trade_type = str(observation.get("trade_type") or "").strip().lower()
+        if signal_key:
+            signal_parts = [part.strip() for part in signal_key.split("|")]
+            direction = direction or _signal_part(signal_parts, "short_frontier_spot")
+            trade_type = trade_type or _signal_part(signal_parts, "frontier_crypto_venue_map")
+        if direction != "short_frontier_spot" or trade_type != "frontier_crypto_venue_map":
+            continue
+
+        venue = str(observation.get("venue") or "").strip().upper()
+        if not venue:
+            venue = _short_frontier_venue_from_signal(signal_key)
+        closed_count = _nonnegative_int(observation.get("closed_count"))
+        avg_pnl_bps = _float_or_none(observation.get("avg_pnl_bps"))
+        win_rate = _float_or_none(observation.get("win_rate"))
+        weak_outcome = bool(
+            (avg_pnl_bps is not None and avg_pnl_bps < 0.0)
+            or (closed_count > 0 and win_rate is not None and win_rate < 0.5)
+        )
+        # Preserve unknown metrics as a neutral, visible route-review input.
+        outcome_rank_score = 50.0
+        if avg_pnl_bps is not None:
+            outcome_rank_score += max(-25.0, min(25.0, avg_pnl_bps / 2.0))
+        if win_rate is not None:
+            outcome_rank_score += max(-15.0, min(15.0, (win_rate - 0.5) * 30.0))
+        outcome_rank_score = round(max(0.0, min(100.0, outcome_rank_score)), 4)
+        diagnostic_dimensions = {
+            "borrow_permissions": {
+                "review_fields": ["required_permissions", "borrow_availability", "borrow_fee_bps"],
+                "purpose": "separate borrow or permission friction from observed outcome",
+            },
+            "fees": {
+                "review_fields": ["maker_fee_bps", "taker_fee_bps", "fee_tier"],
+                "purpose": "attribute fee-stack uncertainty without excluding paper observations",
+            },
+            "margin_constraints": {
+                "review_fields": ["margin_required", "margin_mode", "shortability_status"],
+                "purpose": "record margin-route constraints as metadata",
+            },
+            "api_reliability": {
+                "review_fields": ["api_route_status", "freshness_latency_status", "endpoint_constraints"],
+                "purpose": "compare public-data reliability with route assumptions",
+            },
+            "spread_liquidity": {
+                "review_fields": ["spread_bps", "slippage_bps_per_side", "minimum_liquidity_usd"],
+                "purpose": "measure market-impact proxies for paper ordering",
+            },
+            "carry": {
+                "review_fields": ["borrow_fee_bps", "carry_bps_horizon", "funding_drag_bps_horizon"],
+                "purpose": "attribute carry or borrow drag separately from raw paper PnL",
+            },
+        }
+        diagnostics.append(
+            {
+                "paper_only": True,
+                "read_only": True,
+                "venue": venue or UNKNOWN,
+                "signal_key": signal_key or UNKNOWN,
+                "trade_type": trade_type,
+                "direction": direction,
+                "observed_outcome": {
+                    "closed_count": closed_count,
+                    "avg_pnl_bps": round(avg_pnl_bps, 4) if avg_pnl_bps is not None else UNKNOWN,
+                    "win_rate": round(win_rate, 4) if win_rate is not None else UNKNOWN,
+                    "score_adjustment": observation.get("score_adjustment", 0.0),
+                },
+                "outcome_status": "weak_paper_outcome" if weak_outcome else "paper_outcome_observed",
+                "route_diagnostic_dimensions": diagnostic_dimensions,
+                "ranking_input": {
+                    "mode": "paper_ordering_only",
+                    "outcome_rank_score": outcome_rank_score,
+                    "ranking_action": "diagnose_and_down_rank_only" if weak_outcome else "diagnose_only",
+                    "score_adjustment": 0.0,
+                },
+                "paper_candidate_emission": "retained_for_paper_exploration",
+                "hard_blocking": False,
+                "entry_blocked": False,
+                "routing_decision_changed": False,
+            }
+        )
+    diagnostics.sort(
+        key=lambda item: (
+            item["outcome_status"] != "weak_paper_outcome",
+            item["ranking_input"]["outcome_rank_score"],
+            item["venue"],
+        )
+    )
+    return {
+        "diagnostic_version": "short_frontier_spot_route_outcomes_v1",
+        "paper_only": True,
+        "read_only": True,
+        "route_count": len(diagnostics),
+        "diagnostic_dimensions": list(SHORT_FRONTIER_SPOT_ROUTE_DIAGNOSTIC_DIMENSIONS),
+        "routes": diagnostics,
+        "hard_blocking": False,
+        "entry_blocked": False,
+        "paper_policy": "outcomes_are_route_diagnostics_and_ranking_inputs_not_exclusion",
+    }
+
+
+def _route_outcome_observation_rows(
+    observations: Iterable[dict[str, Any]] | dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Normalize list and venue-keyed outcome payloads without I/O."""
+
+    if isinstance(observations, dict):
+        if any(key in observations for key in ("signal_key", "direction", "trade_type")):
+            return [dict(observations)]
+        return [
+            {**dict(value), "venue": value.get("venue") or venue}
+            for venue, value in observations.items()
+            if isinstance(value, dict)
+        ]
+    return [dict(value) for value in observations if isinstance(value, dict)]
+
+
+def _signal_part(parts: list[str], expected: str) -> str:
+    return expected if any(part.lower() == expected for part in parts) else ""
+
+
+def _short_frontier_venue_from_signal(signal_key: str) -> str:
+    parts = [part.strip() for part in str(signal_key or "").split("|")]
+    for index, part in enumerate(parts):
+        if part.lower() == "frontier_crypto_venue_map" and index:
+            return parts[index - 1].upper()
+    return parts[0].upper() if parts else UNKNOWN
+
+
+def _nonnegative_int(value: Any) -> int:
+    number = _float_or_none(value)
+    return max(0, int(number)) if number is not None else 0
 
 
 def _frontier_short_spot_route_requirements_report(

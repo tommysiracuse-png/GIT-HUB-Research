@@ -37,6 +37,11 @@ from strategy_lab import strategy_lab_summary
 from dynamic_agents import dynamic_agent_summary, ingest_spawn_agent_recommendation
 from strategy_implementation_owner import summary as strategy_owner_summary
 
+try:
+    from route_intelligence import build_short_frontier_spot_route_outcome_diagnostics
+except ModuleNotFoundError:  # pragma: no cover - package import fallback
+    from .route_intelligence import build_short_frontier_spot_route_outcome_diagnostics
+
 
 _strategy_lab_summary_original = strategy_lab_summary
 
@@ -1222,6 +1227,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
 
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     stats = _signal_stats(conn)
+    short_frontier_spot_route_outcomes = build_short_frontier_spot_route_outcome_diagnostics(stats)
     contextual_stats = _contextual_stats(conn)
     reliability_cards = payload.get("cross_context_reliability") or cross_context_reliability(conn)
     directives = open_hunter_directives(conn)
@@ -1243,6 +1249,11 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "summary": payload.get("summary", {}),
         "execution_summary": payload.get("execution_summary", {}),
         "route_resolver": _compact_route_resolver(payload.get("route_resolver", {})),
+        # This joins observed signal outcomes to the short-frontier route
+        # review surface.  It is intentionally not a policy or an admission
+        # gate: the route hunter and planner receive it as diagnostic/ranking
+        # evidence only.
+        "short_frontier_spot_route_outcomes": short_frontier_spot_route_outcomes,
         "expansion_map": payload.get("expansion_map", {}),
         "public_market_adapters": (payload.get("public_market_adapters") or {}).get("summary", {}),
         "adapter_capabilities": {

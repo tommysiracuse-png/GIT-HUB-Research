@@ -1,14 +1,57 @@
 import pathlib
+import sqlite3
 import sys
+import tempfile
 import unittest
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
+import llm_bridge
 from llm_bridge import _compact_frontier_execution_quality
+from settings import DEFAULT_SETTINGS
+from storage import init_db, utc_now
 
 
 class FrontierExecutionQualityPacketTests(unittest.TestCase):
+    def test_state_packet_exposes_short_frontier_route_outcomes_to_the_route_hunter(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        conn.execute(
+            """
+            insert into signal_stats
+                (signal_key, closed_count, wins, avg_pnl_bps, win_rate, score_adjustment, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "SYNTHETIC_RESEARCH|MEXC|frontier_crypto_venue_map|short_frontier_spot|conditional",
+                19,
+                5,
+                -41.539,
+                0.263,
+                0.0,
+                utc_now(),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            old_json, old_md = llm_bridge.STATE_JSON, llm_bridge.STATE_MD
+            llm_bridge.STATE_JSON = pathlib.Path(tmp) / "state.json"
+            llm_bridge.STATE_MD = pathlib.Path(tmp) / "state.md"
+            try:
+                packet = llm_bridge.write_llm_state_packet(conn, {}, DEFAULT_SETTINGS)
+            finally:
+                llm_bridge.STATE_JSON, llm_bridge.STATE_MD = old_json, old_md
+
+        outcome_diagnostics = packet["short_frontier_spot_route_outcomes"]
+        self.assertTrue(outcome_diagnostics["paper_only"])
+        self.assertEqual(1, outcome_diagnostics["route_count"])
+        route = outcome_diagnostics["routes"][0]
+        self.assertEqual("MEXC", route["venue"])
+        self.assertEqual("weak_paper_outcome", route["outcome_status"])
+        self.assertEqual("diagnose_and_down_rank_only", route["ranking_input"]["ranking_action"])
+        self.assertFalse(route["entry_blocked"])
+
     def test_compact_frontier_execution_quality_counts_route_and_quote_failures(self):
         research_worker = {
             "candidates": [

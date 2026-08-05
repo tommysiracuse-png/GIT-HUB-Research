@@ -20,12 +20,55 @@ from route_intelligence import (  # noqa: E402
     build_paper_route_requirement_report,
     build_route_requirements_annotation,
     build_route_requirements_matrix,
+    build_short_frontier_spot_route_outcome_diagnostics,
     render_route_requirements_markdown,
     route_requirements_json,
 )
 
 
 class RouteIntelligenceTests(unittest.TestCase):
+    def test_weak_short_frontier_outcomes_become_route_diagnostics_not_entry_blocks(self) -> None:
+        diagnostics = build_short_frontier_spot_route_outcome_diagnostics(
+            [
+                {
+                    "signal_key": "SYNTHETIC_RESEARCH|MEXC|frontier_crypto_venue_map|short_frontier_spot|conditional",
+                    "closed_count": 19,
+                    "avg_pnl_bps": -41.539,
+                    "win_rate": 0.263,
+                    "score_adjustment": 0.0,
+                },
+                {
+                    "signal_key": "SYNTHETIC_RESEARCH|VALR|frontier_crypto_venue_map|short_frontier_spot|conditional",
+                    "closed_count": 19,
+                    "avg_pnl_bps": -41.539,
+                    "win_rate": 0.263,
+                    "score_adjustment": 0.0,
+                },
+            ]
+        )
+
+        self.assertTrue(diagnostics["paper_only"])
+        self.assertTrue(diagnostics["read_only"])
+        self.assertEqual(2, diagnostics["route_count"])
+        self.assertEqual({"MEXC", "VALR"}, {row["venue"] for row in diagnostics["routes"]})
+        for row in diagnostics["routes"]:
+            self.assertEqual("weak_paper_outcome", row["outcome_status"])
+            self.assertEqual(
+                {
+                    "borrow_permissions",
+                    "fees",
+                    "margin_constraints",
+                    "api_reliability",
+                    "spread_liquidity",
+                    "carry",
+                },
+                set(row["route_diagnostic_dimensions"]),
+            )
+            self.assertEqual("diagnose_and_down_rank_only", row["ranking_input"]["ranking_action"])
+            self.assertEqual("retained_for_paper_exploration", row["paper_candidate_emission"])
+            self.assertFalse(row["hard_blocking"])
+            self.assertFalse(row["entry_blocked"])
+
     def test_requirement_extractor_gates_unresolved_direct_route_but_retains_paper_candidate(self) -> None:
         extraction = extract_route_requirements(
             {

@@ -143,6 +143,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "frontier_crypto_venues": packet.get("frontier_crypto_venues", {}),
         "expansion_map": packet.get("expansion_map", {}),
         "route_intelligence": (packet.get("expansion_map", {}) or {}).get("route_intelligence", {}),
+        "short_frontier_spot_route_outcomes": packet.get("short_frontier_spot_route_outcomes", {}),
         "prediction_markets": (packet.get("expansion_map", {}) or {}).get("prediction_markets", {}),
         "hunter_directives": packet.get("hunter_directives", [])[:10],
         "growth_experiments": packet.get("growth_experiments", [])[:10],
@@ -188,6 +189,14 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
             "If a prior generated patch was blocked for malformed diff or test failure, propose a narrower "
             "code change that fixes the failure or makes the previous generated work actually usable.\n"
         )
+    route_hunter_instruction = ""
+    if agent["name"] == "execution_route_hunter":
+        route_hunter_instruction = (
+            "Use short_frontier_spot_route_outcomes to emit read-only route diagnostics for "
+            "borrow/permissions, fees, margin constraints, API reliability, spread/liquidity, and carry. "
+            "Weak observed paper PnL is route-specific diagnostic and paper-ordering evidence only: retain "
+            "candidate emission and do not recommend suppression, quarantine, or a paper-entry block.\n"
+        )
     dynamic_instruction = ""
     if agent.get("dynamic_agent_id"):
         dynamic_instruction = (
@@ -201,6 +210,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         f"You are {agent['name']}. Role: {agent['role']}\n"
         f"{dynamic_instruction}"
         f"{build_planner_instruction}"
+        f"{route_hunter_instruction}"
         "Paper exploration is enabled. Treat weak performance, route limits, low quality, spread, liquidity, and cost as diagnostic evidence, ranking, sizing, synthetic-paper routing, or guard-value measurement; do not propose new hard quarantines, candidate suppression, or paper-entry blocks for priceable candidates. Only invalid or dangerously stale prices, critically malformed data, undefined PnL, missing required multi-leg prices without a proxy, duplicate exposure, or capacity deferral may prevent a paper experiment.\n"
         "Return exactly one JSON object matching this schema:\n"
         "{"
