@@ -1062,6 +1062,12 @@ def monitor_tasks(conn: sqlite3.Connection) -> dict:
         )
         if zero_output_needs_owner:
             next_status = "analyzing"
+        elif (
+            experiment_status == "needs_contract_revision"
+            and isinstance(generation_diagnostic.get("relaxed_child"), dict)
+            and generation_diagnostic["relaxed_child"].get("strategy_lab_id")
+        ):
+            next_status = "monitoring_evidence"
         else:
             next_status = {
                 "promote_candidate": "promote_candidate",
@@ -1080,8 +1086,11 @@ def monitor_tasks(conn: sqlite3.Connection) -> dict:
             )
         if next_status != task["status"]:
             conn.execute(
-                "update strategy_owner_tasks set status = ?, updated_at = ?, completed_at = case when ? in ('completed','retired_bad_evidence') then ? else completed_at end where task_id = ?",
-                (next_status, _utc_now(), next_status, _utc_now(), task["task_id"]),
+                """update strategy_owner_tasks
+                   set status = ?, priority = case when ? then max(priority,96) else priority end,
+                       updated_at = ?, completed_at = case when ? in ('completed','retired_bad_evidence') then ? else completed_at end
+                   where task_id = ?""",
+                (next_status, zero_output_needs_owner, _utc_now(), next_status, _utc_now(), task["task_id"]),
             )
             transitions.append({"task_id": task["task_id"], "from": task["status"], "to": next_status})
     if transitions:

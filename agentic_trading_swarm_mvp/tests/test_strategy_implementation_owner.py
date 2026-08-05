@@ -402,11 +402,46 @@ class StrategyImplementationOwnerTests(unittest.TestCase):
         self.assertEqual("queued", task["status"])
         transitions = owner.monitor_tasks(self.conn)
         task = self.conn.execute(
-            "select objective_type,status from strategy_owner_tasks where strategy_lab_id='zero-output-child'"
+            "select objective_type,status,priority from strategy_owner_tasks where strategy_lab_id='zero-output-child'"
         ).fetchone()
         self.assertEqual("analyzing", task["status"])
         self.assertEqual("diagnose_zero_output", task["objective_type"])
+        self.assertEqual(96, task["priority"])
         self.assertTrue(any(item["task_id"] for item in transitions["transitions"]))
+
+    def test_parent_with_adaptive_child_stays_in_monitoring(self) -> None:
+        now = owner._utc_now()
+        evaluation = {
+            "generation_diagnostic": {
+                "generated_candidate_count": 0,
+                "relaxed_child": {"status": "created", "strategy_lab_id": "repair-child"},
+            }
+        }
+        self.conn.execute(
+            """
+            insert into strategy_lab_experiments (
+                strategy_lab_id,version,experiment_type,status,hypothesis,strategy_logic_json,
+                data_requirements_json,risk_gates_json,promotion_rules_json,source_agent,
+                created_at,updated_at,evaluation_json,compile_status
+            ) values ('repair-parent',1,'market_strategy','needs_contract_revision',?,'{}','{}','{}','{}','test',?,?,?,'compiled')
+            """,
+            ("Parent strategy repaired by an adaptive child", now, now, json.dumps(evaluation)),
+        )
+        self.conn.execute(
+            """
+            insert into strategy_owner_tasks (
+                task_id,created_at,updated_at,dedupe_key,objective_type,priority,status,
+                strategy_lab_id,strategy_lab_version,hypothesis,acceptance_json,dependency_json
+            ) values ('repair-parent-task',?,?,?,'repair_runtime_contract',99,'analyzing','repair-parent',1,?,'{}','{}')
+            """,
+            (now, now, "repair-parent-dedupe", "Parent strategy repaired by an adaptive child"),
+        )
+        self.conn.commit()
+        owner.monitor_tasks(self.conn)
+        task = self.conn.execute(
+            "select status from strategy_owner_tasks where task_id='repair-parent-task'"
+        ).fetchone()
+        self.assertEqual("monitoring_evidence", task["status"])
 
 
 if __name__ == "__main__":
