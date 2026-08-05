@@ -162,6 +162,13 @@ from adapters.venues.vietnam_securities_depository_and_clearing_corporation_hano
     parse_vsdc_carbon_guideline,
     parse_vsdc_carbon_settlement_rules,
 )
+from adapters.venues.hanoi_stock_exchange_state_securities_commission import (
+    CARBON_PORTAL_URL as HNX_SSC_CARBON_PORTAL_URL,
+    SSC_DECREE_URL as HNX_SSC_DECREE_URL,
+    TRADING_NOTICE_URL as HNX_SSC_TRADING_NOTICE_URL,
+    HanoiStockExchangeStateSecuritiesCommissionAdapter,
+    parse_hnx_vn2025_trading_notice,
+)
 from scan_batch import ScanBatch
 from settings import DEFAULT_SETTINGS
 
@@ -815,6 +822,159 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertTrue(batch.metadata["paper_only"])
         self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
         self.assertTrue(any(row.get("parser_failure") for row in batch.observations))
+
+    def test_hnx_ssc_vn2025_plugin_normalizes_calendar_and_is_runtime_discoverable(self) -> None:
+        adapter_id = "hanoi_stock_exchange_state_securities_commission"
+        self.assertIn(adapter_id, discover_adapters())
+        adapter = get_adapter(adapter_id)
+        self.assertIsInstance(adapter, HanoiStockExchangeStateSecuritiesCommissionAdapter)
+        self.assertEqual(HNX_SSC_CARBON_PORTAL_URL, adapter.info.docs_url)
+        self.assertIn("trading_calendar", adapter.info.capabilities)
+        self.assertNotIn("candidate_generation", adapter.info.capabilities)
+
+        notice = """
+        <html><body><h1>Notice on first and last trading dates of carbon emission
+        allowance allocated in 2025-2026 period</h1><p>Greenhouse gas emission
+        allowance code VN2025 has an allocation volume of 511,473,846 tCO2e.</p>
+        <p>First trading date: 29/06/2026. Last trading date: 24/12/2027.</p>
+        </body></html>
+        """
+        rows = parse_hnx_vn2025_trading_notice(
+            notice, received_at="2026-08-04T12:00:00+00:00"
+        )
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        self.assertEqual("VN2025", row["symbol"])
+        self.assertEqual(511_473_846, row["allocation_volume_tco2e"])
+        self.assertEqual("2025-2026", row["compliance_period"])
+        self.assertEqual("2026-06-29", row["first_trading_date"])
+        self.assertEqual("2027-12-24", row["last_trading_date"])
+        self.assertEqual("open", row["session_status"])
+        self.assertEqual(HNX_SSC_TRADING_NOTICE_URL, row["source_url"])
+        self.assertEqual("watch_only", row["direction"])
+
+    def test_hnx_ssc_adapter_preserves_fetch_and_parser_evidence(self) -> None:
+        portal = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>Hanoi Stock Exchange HNX Carbon Market</body></html>",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 2.0,
+        }
+        malformed_notice = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>Carbon market update</body></html>",
+            "received_at": "2026-08-04T12:00:01+00:00",
+            "latency_ms": 3.0,
+        }
+        unavailable_decree = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "content": b"",
+            "received_at": "2026-08-04T12:00:02+00:00",
+            "latency_ms": 4.0,
+            "error": "HTTP Error 403",
+        }
+        unavailable_ssc_portal = {
+            "ok": False,
+            "status": "blocked",
+            "http_status": 403,
+            "text": "",
+            "received_at": "2026-08-04T12:00:02+00:00",
+            "latency_ms": 4.0,
+            "error": "HTTP Error 403",
+        }
+        with mock.patch(
+            "adapters.venues.hanoi_stock_exchange_state_securities_commission.fetch_text",
+            side_effect=[portal, malformed_notice, unavailable_ssc_portal],
+        ), mock.patch(
+            "adapters.venues.hanoi_stock_exchange_state_securities_commission.fetch_bytes",
+            return_value=unavailable_decree,
+        ):
+            batch = HanoiStockExchangeStateSecuritiesCommissionAdapter().scan({})
+
+        self.assertEqual([], batch.candidates)
+        self.assertEqual("degraded", batch.metadata["source_status"])
+        self.assertEqual(
+            "reachable", batch.metadata["fetch_status"]["trading_notice"]["fetch_status"]
+        )
+        self.assertEqual(
+            "blocked", batch.metadata["fetch_status"]["ssc_decree"]["fetch_status"]
+        )
+        self.assertEqual(
+            HNX_SSC_DECREE_URL, batch.metadata["fetch_status"]["ssc_decree"]["source_url"]
+        )
+        self.assertTrue(batch.metadata["parser_failures"])
+        self.assertTrue(batch.metadata["paper_only"])
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        self.assertTrue(any(row.get("parser_failure") for row in batch.observations))
+
+    def test_hnx_ssc_plugin_is_auto_discovered_by_adapter_runtime(self) -> None:
+        adapter_id = "hanoi_stock_exchange_state_securities_commission"
+        portal = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>Hanoi Stock Exchange HNX Carbon Market</body></html>",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 2.0,
+        }
+        notice = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": """<html><body>Notice: greenhouse gas emission allowance VN2025
+            for the 2025-2026 period. Allocation 511,473,846 tCO2e. First trading
+            date: 29/06/2026. Last trading date: 24/12/2027.</body></html>""",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 2.0,
+        }
+        ssc_portal = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body>State Securities Commission of Vietnam SSC</body></html>",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 2.0,
+        }
+        decree = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "content": b"%PDF-1.7 public decree fixture",
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 2.0,
+        }
+        original_discover = adapter_runtime.discover_adapters
+
+        def discover_only_hnx_ssc() -> list[str]:
+            return [entry for entry in original_discover() if entry == adapter_id]
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "adapters.venues.hanoi_stock_exchange_state_securities_commission.fetch_text",
+            side_effect=[portal, notice, ssc_portal],
+        ), mock.patch(
+            "adapters.venues.hanoi_stock_exchange_state_securities_commission.fetch_bytes",
+            return_value=decree,
+        ), mock.patch.object(adapter_runtime, "RUNS_DIR", pathlib.Path(tmp)), mock.patch.object(
+            adapter_runtime, "CACHE_DIR", pathlib.Path(tmp) / "cache"
+        ), mock.patch.object(adapter_runtime, "REPORT_JSON", pathlib.Path(tmp) / "report.json"), mock.patch.object(
+            adapter_runtime, "REPORT_MD", pathlib.Path(tmp) / "report.md"
+        ), mock.patch.object(adapter_runtime, "discover_adapters", side_effect=discover_only_hnx_ssc):
+            batch = adapter_runtime.build_scan_batch(
+                {"public_market_adapters": {"enabled": True, "workers": 1, "adapters": {adapter_id: {"cache_minutes": 0}}}}
+            )
+
+        self.assertEqual(4, len(batch.observations))
+        self.assertTrue(all(row["venue"] == "HNX_SSC" for row in batch.observations))
+        self.assertTrue(all(row["direction"] == "watch_only" for row in batch.observations))
+        report = batch.metadata["public_market_adapters"]
+        self.assertEqual(adapter_id, report["adapters"][0]["adapter_id"])
+        self.assertEqual("reachable", report["adapters"][0]["source_status"])
 
     def test_dc_doee_plugin_is_runtime_discoverable_and_paper_only(self) -> None:
         adapter_id = "dc_department_of_energy_environment"
