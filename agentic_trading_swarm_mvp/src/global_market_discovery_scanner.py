@@ -218,6 +218,140 @@ def _cfg(settings: dict | None) -> dict:
     return (settings or {}).get("global_market_discovery_scanner", {})
 
 
+DEFAULT_PAPER_QUOTE_CONTEXT_POLICY = {
+    "enabled": True,
+    "paper_only": True,
+    "stale_quote_age_ms": 900_000.0,
+    "wide_spread_bps": 8.0,
+    "shallow_depth_notional": 100_000.0,
+    "stale_penalty_points_cap": 8.0,
+    "wide_penalty_points_cap": 6.0,
+    "shallow_penalty_points_cap": 4.0,
+    "synthetic_route_penalty_points": 3.0,
+    "total_penalty_points_cap": 16.0,
+}
+
+
+def _finite_nonnegative(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else None
+
+
+def _paper_quote_context_policy(settings: dict | None) -> dict[str, Any]:
+    """Return the paper-only ranking policy for proxy quote diagnostics."""
+
+    policy = dict(DEFAULT_PAPER_QUOTE_CONTEXT_POLICY)
+    configured = _cfg(settings).get("paper_quote_context")
+    if not isinstance(configured, dict):
+        # Keep the shorter name as a backwards-compatible configuration alias.
+        configured = _cfg(settings).get("quote_context")
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    return policy
+
+
+def _apply_paper_quote_context(candidate: dict[str, Any], settings: dict | None = None) -> dict[str, Any]:
+    """Attach quote/route diagnostics and a capped, non-blocking rank penalty.
+
+    Yahoo chart data is deliberately not represented as an executable order
+    book.  We retain its recent traded notional as a labelled depth *proxy*,
+    while exposing a null top-of-book field so downstream reports cannot infer
+    precision the public source does not provide.  This function never alters
+    candidate direction, emission, paper eligibility, or route selection.
+    """
+
+    policy = _paper_quote_context_policy(settings)
+    quote_age_ms = _finite_nonnegative(candidate.get("quote_age_ms"))
+    if quote_age_ms is None:
+        freshness_age = _finite_nonnegative(candidate.get("freshness_age_seconds"))
+        if freshness_age is not None:
+            quote_age_ms = freshness_age * 1000.0
+    if quote_age_ms is None:
+        stale_minutes = _finite_nonnegative(candidate.get("stale_minutes"))
+        if stale_minutes is not None:
+            quote_age_ms = stale_minutes * 60_000.0
+
+    spread_bps = _finite_nonnegative(candidate.get("spread_bps"))
+    top_of_book_depth = _finite_nonnegative(candidate.get("top_of_book_depth_notional"))
+    proxy_depth = _finite_nonnegative(candidate.get("proxy_depth_notional_usd"))
+    effective_depth = top_of_book_depth if top_of_book_depth is not None else proxy_depth
+    depth_source = "top_of_book" if top_of_book_depth is not None else (
+        str(candidate.get("proxy_depth_basis") or "recent_traded_notional_proxy")
+        if proxy_depth is not None
+        else "unavailable"
+    )
+    synthetic_route = bool(candidate.get("synthetic_route_flag")) or bool(candidate.get("proxy_symbol"))
+
+    stale_threshold = max(1.0, float(policy["stale_quote_age_ms"]))
+    wide_threshold = max(0.001, float(policy["wide_spread_bps"]))
+    shallow_threshold = max(1.0, float(policy["shallow_depth_notional"]))
+    stale_cap = max(0.0, float(policy["stale_penalty_points_cap"]))
+    wide_cap = max(0.0, float(policy["wide_penalty_points_cap"]))
+    shallow_cap = max(0.0, float(policy["shallow_penalty_points_cap"]))
+    synthetic_penalty = max(0.0, float(policy["synthetic_route_penalty_points"])) if synthetic_route else 0.0
+
+    stale_penalty = (
+        stale_cap * min(1.0, max(0.0, quote_age_ms - stale_threshold) / stale_threshold)
+        if quote_age_ms is not None
+        else 0.0
+    )
+    wide_penalty = (
+        wide_cap * min(1.0, max(0.0, spread_bps - wide_threshold) / wide_threshold)
+        if spread_bps is not None
+        else 0.0
+    )
+    shallow_penalty = (
+        shallow_cap * min(1.0, max(0.0, shallow_threshold - effective_depth) / shallow_threshold)
+        if effective_depth is not None
+        else 0.0
+    )
+    total_cap = max(0.0, float(policy["total_penalty_points_cap"]))
+    raw_penalty = stale_penalty + wide_penalty + shallow_penalty + synthetic_penalty
+    ranking_penalty = min(total_cap, raw_penalty) if bool(policy.get("enabled", True)) else 0.0
+
+    reuse_reason = (candidate.get("proxy_reuse_gate") or {}).get("reason")
+    if quote_age_ms is not None and quote_age_ms > stale_threshold:
+        staleness_reason = "quote_age_exceeds_ranking_threshold"
+    elif reuse_reason:
+        staleness_reason = str(reuse_reason)
+    else:
+        staleness_reason = None
+
+    quote_penalty = stale_penalty + wide_penalty + shallow_penalty
+    quote_quality_score = max(0.0, 100.0 - 100.0 * min(1.0, quote_penalty / max(1.0, stale_cap + wide_cap + shallow_cap)))
+    route_quality_score = max(0.0, 100.0 - 100.0 * min(1.0, synthetic_penalty / max(1.0, total_cap)))
+    venue_score = (quote_quality_score * 0.75) + (route_quality_score * 0.25)
+
+    candidate["quote_age_ms"] = round(quote_age_ms, 3) if quote_age_ms is not None else None
+    candidate["top_of_book_depth_notional"] = top_of_book_depth
+    candidate["top_of_book_depth_basis"] = depth_source
+    candidate["synthetic_route_flag"] = synthetic_route
+    candidate["venue_score"] = round(venue_score, 3)
+    candidate["staleness_reason"] = staleness_reason
+    candidate["paper_quote_context"] = {
+        "paper_only": True,
+        "emission_action": "ranked_not_blocked",
+        "quote_quality_score": round(quote_quality_score, 3),
+        "route_quality_score": round(route_quality_score, 3),
+        "effective_depth_notional": round(effective_depth, 2) if effective_depth is not None else None,
+        "depth_source": depth_source,
+        "stale_penalty_points": round(stale_penalty, 3),
+        "wide_penalty_points": round(wide_penalty, 3),
+        "shallow_penalty_points": round(shallow_penalty, 3),
+        "synthetic_route_penalty_points": round(synthetic_penalty, 3),
+        "ranking_penalty_points": round(ranking_penalty, 3),
+        "ranking_penalty_points_cap": round(total_cap, 3),
+    }
+    candidate["score_before_quote_context"] = candidate.get("score")
+    candidate["quote_context_ranking_penalty"] = round(ranking_penalty, 3)
+    if bool(policy.get("enabled", True)):
+        candidate["score"] = round(max(0.0, float(candidate.get("score") or 0.0) - ranking_penalty), 3)
+    return candidate
+
+
 def _read_json(path: pathlib.Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -885,6 +1019,7 @@ def _build_proxy_candidate(discovery: dict[str, Any], proxy: dict[str, Any], set
         },
     }
     enrich_parsed_proxy_quality(candidate)
+    _apply_paper_quote_context(candidate, settings)
     context = proxy_momentum_context_review(candidate, settings)
     candidate["proxy_momentum_context"] = context
     if context.get("applicable"):
@@ -965,10 +1100,48 @@ def _summarize(candidates: list[dict[str, Any]], selected: list[dict[str, Any]],
     by_venue: dict[str, int] = {}
     by_region: dict[str, int] = {}
     by_direction: dict[str, int] = {}
+    quote_context_by_venue: dict[str, dict[str, float | int]] = {}
     for item in candidates:
-        by_venue[item["venue"]] = by_venue.get(item["venue"], 0) + 1
+        venue = str(item["venue"])
+        by_venue[venue] = by_venue.get(venue, 0) + 1
         by_region[str(item.get("region") or "unknown")] = by_region.get(str(item.get("region") or "unknown"), 0) + 1
         by_direction[item["direction"]] = by_direction.get(item["direction"], 0) + 1
+        context = item.get("paper_quote_context") or {}
+        if isinstance(context, dict):
+            venue_context = quote_context_by_venue.setdefault(
+                venue,
+                {
+                    "candidate_count": 0,
+                    "penalized_candidate_count": 0,
+                    "stale_candidate_count": 0,
+                    "synthetic_route_candidate_count": 0,
+                    "venue_score_total": 0.0,
+                    "ranking_penalty_points_total": 0.0,
+                },
+            )
+            venue_context["candidate_count"] += 1
+            venue_context["venue_score_total"] += float(item.get("venue_score") or 0.0)
+            penalty = float(context.get("ranking_penalty_points") or 0.0)
+            venue_context["ranking_penalty_points_total"] += penalty
+            if penalty > 0.0:
+                venue_context["penalized_candidate_count"] += 1
+            if item.get("staleness_reason"):
+                venue_context["stale_candidate_count"] += 1
+            if item.get("synthetic_route_flag"):
+                venue_context["synthetic_route_candidate_count"] += 1
+    venue_quote_context = {
+        venue: {
+            "candidate_count": values["candidate_count"],
+            "penalized_candidate_count": values["penalized_candidate_count"],
+            "stale_candidate_count": values["stale_candidate_count"],
+            "synthetic_route_candidate_count": values["synthetic_route_candidate_count"],
+            "average_venue_score": round(values["venue_score_total"] / max(1, values["candidate_count"]), 3),
+            "average_ranking_penalty_points": round(
+                values["ranking_penalty_points_total"] / max(1, values["candidate_count"]), 3
+            ),
+        }
+        for venue, values in sorted(quote_context_by_venue.items())
+    }
     return {
         "generated_at": _utc_now(),
         "total_candidates": len(candidates),
@@ -979,6 +1152,7 @@ def _summarize(candidates: list[dict[str, Any]], selected: list[dict[str, Any]],
         "by_venue": by_venue,
         "by_region": by_region,
         "by_direction": by_direction,
+        "venue_quote_context": venue_quote_context,
         "active_paper_cohort": [
             {
                 "symbol": item.get("proxy_symbol"),
@@ -1000,6 +1174,9 @@ def _summarize(candidates: list[dict[str, Any]], selected: list[dict[str, Any]],
                 "direction": item.get("direction"),
                 "score": item.get("score"),
                 "edge_bps_estimate": item.get("edge_bps_estimate"),
+                "venue_score": item.get("venue_score"),
+                "quote_context_ranking_penalty": item.get("quote_context_ranking_penalty"),
+                "staleness_reason": item.get("staleness_reason"),
                 "proxy_symbol": item.get("proxy_symbol"),
                 "discovery_priority": item.get("discovery_priority"),
             }
@@ -1034,6 +1211,7 @@ def _write_report(summary: dict[str, Any], candidates: list[dict[str, Any]]) -> 
         f"- Failed proxy fetches: `{summary.get('failed_proxy_fetches')}`",
         f"- By venue: `{summary.get('by_venue', {})}`",
         f"- By region: `{summary.get('by_region', {})}`",
+        f"- Venue quote context: `{summary.get('venue_quote_context', {})}`",
         "",
         "## Top Candidates",
         "",
@@ -1041,7 +1219,8 @@ def _write_report(summary: dict[str, Any], candidates: list[dict[str, Any]]) -> 
     for item in summary.get("top_candidates", [])[:20]:
         lines.append(
             f"- `{item.get('inst_id')}` {item.get('direction')} score=`{item.get('score')}` "
-            f"edge=`{item.get('edge_bps_estimate')}` proxy=`{item.get('proxy_symbol')}` "
+            f"edge=`{item.get('edge_bps_estimate')}` venue_score=`{item.get('venue_score')}` "
+            f"quote_penalty=`{item.get('quote_context_ranking_penalty')}` proxy=`{item.get('proxy_symbol')}` "
             f"discovery_priority=`{item.get('discovery_priority')}`"
         )
     if summary.get("failures"):

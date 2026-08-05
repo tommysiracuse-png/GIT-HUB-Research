@@ -48,6 +48,46 @@ def fake_chart(symbol: str, *args: object, **kwargs: object) -> dict:
 
 
 class GlobalMarketDiscoveryScannerTests(unittest.TestCase):
+    def test_quote_context_is_diagnostic_and_capped_without_suppressing_paper_candidate(self) -> None:
+        candidate = {
+            "score": 75.0,
+            "direction": "long_proxy",
+            "proxy_symbol": "TEST",
+            "spread_bps": 40.0,
+            "freshness_age_seconds": 3_600.0,
+            "proxy_depth_notional_usd": 10.0,
+        }
+
+        result = scanner._apply_paper_quote_context(
+            candidate,
+            {
+                "global_market_discovery_scanner": {
+                    "paper_quote_context": {
+                        "stale_quote_age_ms": 1_000.0,
+                        "wide_spread_bps": 2.0,
+                        "shallow_depth_notional": 1_000.0,
+                        "stale_penalty_points_cap": 8.0,
+                        "wide_penalty_points_cap": 6.0,
+                        "shallow_penalty_points_cap": 4.0,
+                        "synthetic_route_penalty_points": 3.0,
+                        "total_penalty_points_cap": 10.0,
+                    }
+                }
+            },
+        )
+
+        self.assertEqual("long_proxy", result["direction"])
+        self.assertNotIn("paper_entry_blocked", result)
+        self.assertEqual(3_600_000.0, result["quote_age_ms"])
+        self.assertIsNone(result["top_of_book_depth_notional"])
+        self.assertEqual("recent_traded_notional_proxy", result["top_of_book_depth_basis"])
+        self.assertTrue(result["synthetic_route_flag"])
+        self.assertEqual("quote_age_exceeds_ranking_threshold", result["staleness_reason"])
+        self.assertLess(result["venue_score"], 100.0)
+        self.assertEqual(10.0, result["quote_context_ranking_penalty"])
+        self.assertEqual(65.0, result["score"])
+        self.assertEqual("ranked_not_blocked", result["paper_quote_context"]["emission_action"])
+
     def test_normalized_discovery_preserves_safe_route_requirement_evidence(self) -> None:
         discovery = normalize_market_candidate(
             {
@@ -272,6 +312,12 @@ class GlobalMarketDiscoveryScannerTests(unittest.TestCase):
                 self.assertGreater(first["proxy_depth_notional_usd"], 0.0)
                 self.assertEqual(first["proxy_depth_basis"], "recent_traded_notional")
                 self.assertEqual(first["proxy_venue_health_status"], "healthy")
+                self.assertIn("quote_age_ms", first)
+                self.assertIn("top_of_book_depth_notional", first)
+                self.assertTrue(first["synthetic_route_flag"])
+                self.assertIn("venue_score", first)
+                self.assertIn("staleness_reason", first)
+                self.assertEqual("ranked_not_blocked", first["paper_quote_context"]["emission_action"])
                 requirements = first["route_requirements"]
                 self.assertEqual(requirements["schema_version"], "paper_route_requirements.v1")
                 self.assertTrue(requirements["paper_only"])
@@ -291,6 +337,8 @@ class GlobalMarketDiscoveryScannerTests(unittest.TestCase):
                 self.assertTrue(scanner.REPORT_JSON.exists())
                 report = json.loads(scanner.REPORT_JSON.read_text(encoding="utf-8"))
                 self.assertGreater(report["summary"]["priceable_candidates"], 0)
+                self.assertIn("B3", report["summary"]["venue_quote_context"])
+                self.assertIn("average_venue_score", report["summary"]["venue_quote_context"]["B3"])
                 self.assertIn("route_requirements", report["candidates"][0])
             finally:
                 scanner.RESEARCH_REPORT_JSON = old_report

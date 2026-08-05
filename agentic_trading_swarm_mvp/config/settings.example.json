@@ -243,6 +243,18 @@
       "minimum_local_reversal_bps": 1.0,
       "ranking_weight": 0.20,
       "minimum_counterfactual_allocation_multiplier": 0.25
+    },
+    "paper_quote_context": {
+      "enabled": true,
+      "paper_only": true,
+      "stale_quote_age_ms": 90000.0,
+      "wide_spread_bps": 12.0,
+      "shallow_depth_notional": 1000.0,
+      "stale_penalty_points_cap": 8.0,
+      "wide_penalty_points_cap": 6.0,
+      "shallow_penalty_points_cap": 4.0,
+      "synthetic_route_penalty_points": 3.0,
+      "total_penalty_points_cap": 16.0
     }
   },
   "global_market_discovery_scanner": {
@@ -255,7 +267,19 @@
     "workers": 12,
     "merge_default_seeds": true,
     "watch_only_stale_minutes": 180,
-    "priceable_candidate_score_floor": 42.0
+    "priceable_candidate_score_floor": 42.0,
+    "paper_quote_context": {
+      "enabled": true,
+      "paper_only": true,
+      "stale_quote_age_ms": 900000.0,
+      "wide_spread_bps": 8.0,
+      "shallow_depth_notional": 100000.0,
+      "stale_penalty_points_cap": 8.0,
+      "wide_penalty_points_cap": 6.0,
+      "shallow_penalty_points_cap": 4.0,
+      "synthetic_route_penalty_points": 3.0,
+      "total_penalty_points_cap": 16.0
+    }
   },
   "frontier_data_quality": {
     "enabled": true,

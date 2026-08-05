@@ -9537,6 +9537,22 @@ DEFAULT_FRONTIER_SHORT_MARKET_CONTEXT_POLICY = {
     "minimum_counterfactual_allocation_multiplier": 0.25,
 }
 
+# Quote context is intentionally a paper-only ordering signal. A weak public
+# book remains observable for counterfactual measurement rather than becoming
+# a new admission or route gate.
+DEFAULT_FRONTIER_QUOTE_CONTEXT_POLICY = {
+    "enabled": True,
+    "paper_only": True,
+    "stale_quote_age_ms": 90_000.0,
+    "wide_spread_bps": 12.0,
+    "shallow_depth_notional": 1_000.0,
+    "stale_penalty_points_cap": 8.0,
+    "wide_penalty_points_cap": 6.0,
+    "shallow_penalty_points_cap": 4.0,
+    "synthetic_route_penalty_points": 3.0,
+    "total_penalty_points_cap": 16.0,
+}
+
 
 def _frontier_dislocation_quality_policy(settings: dict) -> dict:
     policy = dict(DEFAULT_FRONTIER_DISLOCATION_QUALITY_POLICY)
@@ -9574,6 +9590,102 @@ def _frontier_short_market_context_policy(settings: dict) -> dict:
     if configured is False:
         policy["enabled"] = False
     return policy
+
+
+def _frontier_quote_context_policy(settings: dict) -> dict:
+    policy = dict(DEFAULT_FRONTIER_QUOTE_CONTEXT_POLICY)
+    configured = settings.get("frontier_crypto_adapter", {}).get("paper_quote_context", {})
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    if configured is False:
+        policy["enabled"] = False
+    return policy
+
+
+def _annotate_frontier_quote_context(candidate: dict, observation: dict, settings: dict) -> dict:
+    """Record real quote context and a capped ranking penalty without blocking paper."""
+
+    policy = _frontier_quote_context_policy(settings)
+    quote_age_ms = as_float(observation.get("quote_age_ms"), None)
+    if quote_age_ms is None:
+        freshness_age = as_float(candidate.get("freshness_age_seconds"), None)
+        quote_age_ms = freshness_age * 1000.0 if freshness_age is not None else None
+    quote_age_ms = max(0.0, quote_age_ms) if quote_age_ms is not None else None
+    bid_depth, bid_depth_basis = _top_of_book_notional_usd(observation, "bid")
+    ask_depth, ask_depth_basis = _top_of_book_notional_usd(observation, "ask")
+    depth_levels = [value for value in (bid_depth, ask_depth) if value is not None]
+    top_depth = min(depth_levels) if depth_levels else None
+    depth_basis = "two_sided_top_level" if len(depth_levels) == 2 else (
+        bid_depth_basis if bid_depth is not None else ask_depth_basis if ask_depth is not None else "unavailable"
+    )
+    spread = max(0.0, as_float(candidate.get("spread_bps"), 0.0) or 0.0)
+    route_text = " ".join(
+        str(candidate.get(field) or "")
+        for field in ("route_id", "paper_route_status", "route_status", "paper_execution_semantics")
+    ).lower()
+    synthetic_route = bool(candidate.get("synthetic_research_paper")) or any(
+        token in route_text for token in ("synthetic", "proxy", "counterfactual")
+    )
+    stale_threshold = max(1.0, float(policy["stale_quote_age_ms"]))
+    wide_threshold = max(0.001, float(policy["wide_spread_bps"]))
+    shallow_threshold = max(1.0, float(policy["shallow_depth_notional"]))
+    stale_cap = max(0.0, float(policy["stale_penalty_points_cap"]))
+    wide_cap = max(0.0, float(policy["wide_penalty_points_cap"]))
+    shallow_cap = max(0.0, float(policy["shallow_penalty_points_cap"]))
+    synthetic_penalty = max(0.0, float(policy["synthetic_route_penalty_points"])) if synthetic_route else 0.0
+    stale_penalty = (
+        stale_cap * min(1.0, max(0.0, quote_age_ms - stale_threshold) / stale_threshold)
+        if quote_age_ms is not None
+        else 0.0
+    )
+    wide_penalty = wide_cap * min(1.0, max(0.0, spread - wide_threshold) / wide_threshold)
+    shallow_penalty = (
+        shallow_cap * min(1.0, max(0.0, shallow_threshold - top_depth) / shallow_threshold)
+        if top_depth is not None
+        else 0.0
+    )
+    total_cap = max(0.0, float(policy["total_penalty_points_cap"]))
+    ranking_penalty = min(
+        total_cap,
+        stale_penalty + wide_penalty + shallow_penalty + synthetic_penalty,
+    ) if bool(policy.get("enabled", True)) else 0.0
+    quote_penalty = stale_penalty + wide_penalty + shallow_penalty
+    quote_quality_score = max(
+        0.0,
+        100.0 - 100.0 * min(1.0, quote_penalty / max(1.0, stale_cap + wide_cap + shallow_cap)),
+    )
+    route_quality_score = max(
+        0.0,
+        100.0 - 100.0 * min(1.0, synthetic_penalty / max(1.0, total_cap)),
+    )
+    health_score = as_float(candidate.get("venue_health_score"), None)
+    if health_score is None:
+        health_score = as_float(candidate.get("quality_score"), 50.0) or 50.0
+    health_score = max(0.0, min(100.0, health_score))
+    candidate["quote_age_ms"] = round(quote_age_ms, 3) if quote_age_ms is not None else None
+    candidate["top_of_book_depth_notional"] = round(top_depth, 3) if top_depth is not None else None
+    candidate["top_of_book_depth_basis"] = depth_basis
+    candidate["synthetic_route_flag"] = synthetic_route
+    candidate["venue_score"] = round((health_score * 0.50) + (quote_quality_score * 0.35) + (route_quality_score * 0.15), 3)
+    candidate["staleness_reason"] = (
+        "quote_age_exceeds_ranking_threshold"
+        if quote_age_ms is not None and quote_age_ms > stale_threshold
+        else None
+    )
+    candidate["frontier_quote_context"] = {
+        "paper_only": True,
+        "emission_action": "ranked_not_blocked",
+        "quote_quality_score": round(quote_quality_score, 3),
+        "route_quality_score": round(route_quality_score, 3),
+        "stale_penalty_points": round(stale_penalty, 3),
+        "wide_penalty_points": round(wide_penalty, 3),
+        "shallow_penalty_points": round(shallow_penalty, 3),
+        "synthetic_route_penalty_points": round(synthetic_penalty, 3),
+        "ranking_penalty_points": round(ranking_penalty, 3),
+        "ranking_penalty_points_cap": round(total_cap, 3),
+    }
+    candidate["quote_context_ranking_penalty"] = round(ranking_penalty, 3)
+    return candidate
 
 
 def _frontier_reference_peer_rows(
@@ -9968,6 +10080,9 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         )
         effective_edge_score = max(0.0, ranking_edge or 0.0)
         local_quote_penalty = max(0.0, as_float(candidate.get("local_quote_score_penalty"), 0.0) or 0.0)
+        quote_context_penalty = max(
+            0.0, as_float(candidate.get("quote_context_ranking_penalty"), 0.0) or 0.0
+        )
         context_review = candidate.get("frontier_short_market_context")
         context_score = (
             as_float(context_review.get("score"), None)
@@ -9979,12 +10094,14 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             + quality_weight * quality_score
             + context_weight * ((context_score - 100.0) if context_score is not None else 0.0)
             - local_quote_penalty
+            - quote_context_penalty
             if ranking_edge is not None
             else (
                 (1.0 - quality_weight) * base_score
                 + quality_weight * quality_score
                 + context_weight * ((context_score - 100.0) if context_score is not None else 0.0)
                 - local_quote_penalty
+                - quote_context_penalty
             ),
             3,
         )
@@ -11099,6 +11216,7 @@ def _candidate_from_observation(
     candidate = _apply_frontier_short_market_context(
         candidate, observation, reference_observations, settings
     )
+    _annotate_frontier_quote_context(candidate, observation, settings)
     return _apply_frontier_marketability_gate(candidate, observation, settings, reference_observations)
 
 
@@ -11489,6 +11607,12 @@ def summarize(
             "short_cost_decomposition": row.get("short_cost_decomposition"),
             "frontier_short_market_context": row.get("frontier_short_market_context"),
             "paper_market_context_filter_status": row.get("paper_market_context_filter_status"),
+            "quote_age_ms": row.get("quote_age_ms"),
+            "top_of_book_depth_notional": row.get("top_of_book_depth_notional"),
+            "synthetic_route_flag": row.get("synthetic_route_flag"),
+            "venue_score": row.get("venue_score"),
+            "staleness_reason": row.get("staleness_reason"),
+            "quote_context_ranking_penalty": row.get("quote_context_ranking_penalty"),
             "quote_ccy": row.get("quote_ccy"),
             "fx_to_usd": row.get("fx_to_usd"),
             "fx_age_minutes": row.get("fx_age_minutes"),

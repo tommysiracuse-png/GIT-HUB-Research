@@ -990,6 +990,51 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
 
         self.assertEqual("EXECUTABLE-LEADER", ranked[0]["inst_id"])
 
+    def test_quote_context_records_real_book_diagnostics_and_only_penalizes_ranking(self) -> None:
+        cfg = settings()
+        cfg["frontier_crypto_adapter"]["paper_quote_context"] = {
+            "stale_quote_age_ms": 1_000.0,
+            "wide_spread_bps": 2.0,
+            "shallow_depth_notional": 1_000.0,
+            "stale_penalty_points_cap": 8.0,
+            "wide_penalty_points_cap": 6.0,
+            "shallow_penalty_points_cap": 4.0,
+            "synthetic_route_penalty_points": 3.0,
+            "total_penalty_points_cap": 10.0,
+        }
+        candidate = {
+            "inst_id": "FRONTIER:ABC-USDT",
+            "direction": "long_frontier_spot",
+            "spread_bps": 40.0,
+            "freshness_age_seconds": 3_600.0,
+            "venue_health_score": 80.0,
+            "route_id": "synthetic_frontier_proxy",
+        }
+        observation = {
+            "quote_to_usd_multiplier": 1.0,
+            "book_levels": {
+                "bids": [[100.0, 2.0]],
+                "asks": [[101.0, 3.0]],
+            },
+        }
+
+        annotated = frontier._annotate_frontier_quote_context(candidate, observation, cfg)
+
+        self.assertEqual("long_frontier_spot", annotated["direction"])
+        self.assertNotIn("paper_entry_blocked", annotated)
+        self.assertEqual(3_600_000.0, annotated["quote_age_ms"])
+        self.assertEqual(200.0, annotated["top_of_book_depth_notional"])
+        self.assertEqual("two_sided_top_level", annotated["top_of_book_depth_basis"])
+        self.assertTrue(annotated["synthetic_route_flag"])
+        self.assertEqual("quote_age_exceeds_ranking_threshold", annotated["staleness_reason"])
+        self.assertEqual(10.0, annotated["quote_context_ranking_penalty"])
+        self.assertEqual("ranked_not_blocked", annotated["frontier_quote_context"]["emission_action"])
+
+        annotated.update({"score": 75.0, "dislocation_quality_score": 50.0, "effective_edge_bps": 20.0})
+        ranked = frontier.rank_frontier_paper_candidates([annotated], cfg)
+        self.assertEqual("FRONTIER:ABC-USDT", ranked[0]["inst_id"])
+        self.assertLess(ranked[0]["paper_ranking_score"], 37.5)
+
     def test_marketability_diagnostics_use_conservative_route_for_stale_or_thin_book(self) -> None:
         cfg = settings()
         peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
