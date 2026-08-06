@@ -4891,6 +4891,7 @@ def _paper_only_apply_okx_basis_variant_gate(recommendation=None):
     if not _paper_only_is_okx_basis_market(recommendation):
         return recommendation
 
+    quarantine_reason = "decayed_basis_mean_reversion_quarantine"
     joined = " ".join(
         _paper_only_route_token(recommendation.get(key))
         for key in ("strategy_variant", "variant", "strategy", "signal", "title")
@@ -4928,12 +4929,16 @@ def _paper_only_apply_okx_basis_variant_gate(recommendation=None):
         "variant": blocked_variant or recommendation.get("variant"),
         "parse_status": parse_status,
         "blocked": variant_blocked,
-        "reason": "blocked_okx_basis_mean_reversion_variant" if variant_blocked else "allowed_okx_basis_variant",
+        "shadow_only": variant_blocked,
+        "reason": quarantine_reason if variant_blocked else "allowed_okx_basis_variant",
     }
     if variant_blocked:
-        recommendation["route_confidence"] = 0.0
-        recommendation["route_rejected"] = True
-        recommendation["route_rejection_reason"] = "blocked_okx_basis_mean_reversion_variant"
+        recommendation["route_shadow_only"] = True
+        recommendation["paper_only_shadow_reason"] = quarantine_reason
+        recommendation["route_rejected"] = False
+        recommendation.pop("route_rejection_reason", None)
+        if recommendation.get("route_status") in (None, "", "eligible"):
+            recommendation["route_status"] = "paper_shadow_only"
     return recommendation
 
 def _paper_only_conditional_crypto_route_review(recommendation=None):

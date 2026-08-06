@@ -37,6 +37,50 @@ def result(payload: object) -> dict:
 
 
 class FrontierCryptoAdapterTests(unittest.TestCase):
+    def test_okx_basis_mean_reversion_variant_stays_shadow_only_not_route_rejected(self) -> None:
+        guarded = frontier._paper_only_apply_okx_basis_variant_gate(
+            {
+                "market_key": "OKX|perp_funding_basis|basis_mean_reversion_short_perp|standard",
+                "venue": "OKX",
+                "variant": "basis_mean_reversion_short_perp",
+                "strategy": "perp_funding_basis",
+                "instrument_id": "BTC-USDT-SWAP",
+                "route_confidence": 0.82,
+            }
+        )
+
+        self.assertFalse(guarded.get("route_rejected", False))
+        self.assertTrue(guarded["paper_only_variant_gate"]["blocked"])
+        self.assertTrue(guarded["paper_only_variant_gate"]["shadow_only"])
+        self.assertEqual(
+            "decayed_basis_mean_reversion_quarantine",
+            guarded["paper_only_variant_gate"]["reason"],
+        )
+        self.assertTrue(guarded["route_shadow_only"])
+        self.assertEqual("paper_shadow_only", guarded["route_status"])
+        self.assertEqual(
+            "decayed_basis_mean_reversion_quarantine",
+            guarded["paper_only_shadow_reason"],
+        )
+
+    def test_okx_basis_positive_control_variant_remains_routable(self) -> None:
+        guarded = frontier._paper_only_apply_okx_basis_variant_gate(
+            {
+                "market_key": "OKX|perp_funding_basis|funding_capture_long_perp|conditional",
+                "venue": "OKX",
+                "variant": "funding_capture_long_perp",
+                "strategy": "perp_funding_basis",
+                "instrument_id": "BTC-USDT-SWAP",
+                "route_confidence": 0.91,
+            }
+        )
+
+        self.assertFalse(guarded.get("route_rejected", False))
+        self.assertFalse(guarded["paper_only_variant_gate"]["blocked"])
+        self.assertEqual("allowed_okx_basis_variant", guarded["paper_only_variant_gate"]["reason"])
+        self.assertNotIn("route_shadow_only", guarded)
+        self.assertNotIn("paper_only_shadow_reason", guarded)
+
     def test_scan_batch_can_defer_preliminary_report_until_quality_enrichment(self) -> None:
         cfg = settings()
         observation = self._obs("A", "ABC-USDT", "ABC", "USDT", 100, 100000)
