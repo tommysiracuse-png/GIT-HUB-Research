@@ -4902,15 +4902,37 @@ def _paper_only_enrich_okx_basis_context(recommendation=None):
     return recommendation
 
 
-def _paper_only_apply_okx_basis_variant_gate(recommendation=None):
-    recommendation = _paper_only_enrich_okx_basis_context(recommendation)
-    if not _paper_only_is_okx_basis_market(recommendation):
-        return recommendation
+def _paper_only_okx_basis_variant_match(recommendation=None):
+    recommendation = dict(recommendation or {})
+    blocked_variants = {
+        "basis_mean_reversion_long_perp",
+        "basis_mean_reversion_short_perp",
+    }
+    for key in (
+        "signal_key",
+        "market_key",
+        "route_id",
+        "route_registry_id",
+        "paper_context_key",
+    ):
+        raw = str(recommendation.get(key) or "").strip()
+        if not raw:
+            continue
+        parts = [part.strip() for part in raw.split("|")]
+        if len(parts) < 3:
+            continue
+        if parts[0].upper() != "OKX" or parts[1] != "perp_funding_basis":
+            continue
+        direction = parts[2]
+        return {
+            "matched": True,
+            "blocked_variant": direction if direction in blocked_variants else None,
+            "source": key,
+        }
 
-    quarantine_reason = "decayed_basis_mean_reversion_quarantine"
     joined = " ".join(
         _paper_only_route_token(recommendation.get(key))
-        for key in ("strategy_variant", "variant", "strategy", "signal", "title")
+        for key in ("strategy_variant", "variant", "direction", "strategy", "signal", "title")
         if recommendation.get(key) not in (None, "")
     )
     blocked_variant = None
@@ -4918,6 +4940,21 @@ def _paper_only_apply_okx_basis_variant_gate(recommendation=None):
         blocked_variant = "basis_mean_reversion_long_perp"
     elif "BASIS_MEAN_REVERSION_SHORT_PERP" in joined:
         blocked_variant = "basis_mean_reversion_short_perp"
+    return {
+        "matched": bool(blocked_variant),
+        "blocked_variant": blocked_variant,
+        "source": "descriptive_fields" if blocked_variant else None,
+    }
+
+
+def _paper_only_apply_okx_basis_variant_gate(recommendation=None):
+    recommendation = _paper_only_enrich_okx_basis_context(recommendation)
+    if not _paper_only_is_okx_basis_market(recommendation):
+        return recommendation
+
+    quarantine_reason = "decayed_basis_mean_reversion_quarantine"
+    variant_match = _paper_only_okx_basis_variant_match(recommendation)
+    blocked_variant = variant_match.get("blocked_variant")
 
     parse_status = recommendation.get("parse_status")
     variant_blocked = bool(blocked_variant and _paper_only_okx_parse_status_valid(parse_status))
@@ -4943,6 +4980,7 @@ def _paper_only_apply_okx_basis_variant_gate(recommendation=None):
         "paper_only": True,
         "market_key": recommendation.get("market_key"),
         "variant": blocked_variant or recommendation.get("variant"),
+        "match_source": variant_match.get("source"),
         "parse_status": parse_status,
         "blocked": variant_blocked,
         "shadow_only": variant_blocked,

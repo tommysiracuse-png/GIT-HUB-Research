@@ -63,6 +63,24 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             "decayed_basis_mean_reversion_quarantine",
             guarded["paper_only_shadow_reason"],
         )
+        self.assertEqual("market_key", guarded["paper_only_variant_gate"]["match_source"])
+
+    def test_okx_basis_mean_reversion_signal_key_stays_shadow_only_without_variant_field(self) -> None:
+        guarded = frontier._paper_only_apply_okx_basis_variant_gate(
+            {
+                "signal_key": "OKX|perp_funding_basis|basis_mean_reversion_long_perp|conditional",
+                "venue": "OKX",
+                "strategy": "perp_funding_basis",
+                "instrument_id": "BTC-USDT-SWAP",
+                "route_confidence": 0.79,
+            }
+        )
+
+        self.assertFalse(guarded.get("route_rejected", False))
+        self.assertTrue(guarded["paper_only_variant_gate"]["blocked"])
+        self.assertEqual("basis_mean_reversion_long_perp", guarded["paper_only_variant_gate"]["variant"])
+        self.assertEqual("signal_key", guarded["paper_only_variant_gate"]["match_source"])
+        self.assertEqual("paper_shadow_only", guarded["route_status"])
 
     def test_okx_basis_positive_control_variant_remains_routable(self) -> None:
         guarded = frontier._paper_only_apply_okx_basis_variant_gate(
@@ -81,6 +99,24 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual("allowed_okx_basis_variant", guarded["paper_only_variant_gate"]["reason"])
         self.assertNotIn("route_shadow_only", guarded)
         self.assertNotIn("paper_only_shadow_reason", guarded)
+
+    def test_okx_basis_positive_control_signal_key_wins_over_descriptive_text(self) -> None:
+        guarded = frontier._paper_only_apply_okx_basis_variant_gate(
+            {
+                "signal_key": "OKX|perp_funding_basis|funding_capture_short_perp|standard",
+                "venue": "OKX",
+                "strategy": "perp_funding_basis",
+                "title": "basis_mean_reversion_short_perp diagnostic replay",
+                "instrument_id": "BTC-USDT-SWAP",
+                "route_confidence": 0.88,
+            }
+        )
+
+        self.assertFalse(guarded.get("route_rejected", False))
+        self.assertFalse(guarded["paper_only_variant_gate"]["blocked"])
+        self.assertEqual("signal_key", guarded["paper_only_variant_gate"]["match_source"])
+        self.assertEqual("allowed_okx_basis_variant", guarded["paper_only_variant_gate"]["reason"])
+        self.assertNotIn("route_shadow_only", guarded)
 
     def test_scan_batch_can_defer_preliminary_report_until_quality_enrichment(self) -> None:
         cfg = settings()
