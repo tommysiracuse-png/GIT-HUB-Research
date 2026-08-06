@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import pathlib
 import sys
 import unittest
@@ -16,7 +17,7 @@ import frontier_crypto_adapter as frontier
 from adapters.registry import discover_adapters
 from adapters.venues.crypto_derivatives import funding_candidate
 from adapters.venues.deribit import _normalize_deribit_book, parse_deribit_summaries
-from adapters.venues.whitebit import parse_whitebit_futures
+from adapters.venues.whitebit import WhitebitPerpetualAdapter, parse_whitebit_futures
 from agent_review import review_candidate
 from frontier_data_quality import _extract_depth
 from route_resolver import enrich_candidate_with_route
@@ -173,6 +174,68 @@ class DerivativesAdapterTests(unittest.TestCase):
         self.assertEqual("WHITEBIT:BTC_PERP", rows[0]["inst_id"])
         self.assertEqual(5.0, rows[0]["funding_bps"])
         self.assertEqual(8.0, rows[0]["funding_interval_hours"])
+
+    def test_whitebit_successful_book_records_quality_coverage(self) -> None:
+        futures = {
+            "result": [
+                {
+                    "ticker_id": "BTC_PERP",
+                    "product_type": "Perpetual",
+                    "stock_currency": "BTC",
+                    "money_currency": "USDT",
+                    "last_price": "63000",
+                    "bid": "62999",
+                    "ask": "63001",
+                    "money_volume": "50000000",
+                    "open_interest": "100000",
+                    "index_price": "62990",
+                    "funding_rate": "0.0005",
+                    "funding_interval_minutes": 480,
+                }
+            ]
+        }
+        responses = [
+            {
+                "ok": True,
+                "status": "reachable",
+                "text": json.dumps(futures),
+                "received_at": "2026-07-31T12:00:00+00:00",
+                "latency_ms": 10.0,
+            },
+            {
+                "ok": True,
+                "status": "reachable",
+                "text": json.dumps(
+                    {
+                        "result": {
+                            "bids": [["62999", "1"]],
+                            "asks": [["63001", "1"]],
+                        }
+                    }
+                ),
+                "received_at": "2026-07-31T12:00:01+00:00",
+                "latency_ms": 10.0,
+            },
+        ]
+        settings = {
+            "public_market_adapters": {
+                "whitebit_perpetuals_public": {
+                    "max_instruments": 1,
+                    "max_depth_books": 1,
+                    "depth_levels": 50,
+                    "timeout_seconds": 1,
+                }
+            },
+            "derivatives_market_adapters": {"min_quality_score": 60.0},
+            "risk": {"min_net_edge_bps": 2.0},
+        }
+        with mock.patch("adapters.venues.whitebit.fetch_text", side_effect=responses):
+            batch = WhitebitPerpetualAdapter().scan(settings)
+
+        self.assertEqual("verified", batch.observations[0]["quality_status"])
+        self.assertIsNotNone(batch.observations[0]["quality_score"])
+        self.assertEqual({"verified": 1}, batch.metadata["quality_counts"])
+        self.assertEqual(1, batch.metadata["quality_evaluated_count"])
 
     def test_deribit_future_and_option_are_kept_separate(self) -> None:
         future = parse_deribit_summaries(

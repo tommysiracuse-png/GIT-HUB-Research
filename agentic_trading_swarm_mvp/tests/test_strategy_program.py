@@ -620,6 +620,66 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertEqual("compiled", row["compile_status"])
         self.assertEqual("novel", row["novelty_status"])
 
+    def test_explicit_whitebit_surface_is_preserved_for_verified_paper_programs(self) -> None:
+        cfg = settings()
+        cfg["account_capabilities"]["crypto_derivatives"] = True
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        logic = {
+            "type": "observation_program",
+            "universe": {
+                "venues": ["WHITEBIT"],
+                "market_types": ["perp"],
+                "market_surfaces": ["whitebit_public_perpetuals"],
+            },
+            "calculated_features": {
+                "cost_adjusted_momentum_bps": "return_5m_bps - spread_bps",
+            },
+            "entry_expression": (
+                "market_surface == 'whitebit_public_perpetuals' and quality_status == 'verified' "
+                "and quality_score >= 60 and cost_adjusted_momentum_bps > 5"
+            ),
+            "invalidation_expression": "quality_status != 'verified' or stale_minutes > 5",
+            "direction": "long",
+            "edge_expression": "cost_adjusted_momentum_bps",
+            "score_expression": "clip(50 + cost_adjusted_momentum_bps / 2, 0, 100)",
+            "route_surface": "perp",
+        }
+        recommendation = lab_recommendation("whitebit_quality_momentum_v1", logic)
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["source_surface"] = "whitebit_public_perpetuals"
+        experiment["permitted_target_surface"] = ["whitebit_public_perpetuals"]
+        verified = {
+            **funding_observation(101.0, 0.0, now.isoformat()),
+            "inst_id": "WHITEBIT:BTC_PERP",
+            "venue": "WHITEBIT",
+            "market_type": "perp",
+            "asset_class": "crypto_derivatives",
+            "market_surface": "whitebit_public_perpetuals",
+            "quality_status": "verified",
+            "quality_score": 90.0,
+            "data_status": "reachable",
+        }
+        previous = {**verified, "last": 100.0, "observed_at": (now - dt.timedelta(minutes=5)).isoformat()}
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            record_feature_snapshots(conn, [previous], cfg)
+            generated, report = generate_strategy_lab_candidates(conn, cfg, [], [verified])
+
+        self.assertEqual(1, len(generated), report)
+        self.assertEqual("whitebit_public_perpetuals", generated[0]["source_surface"])
+        self.assertEqual("whitebit_public_perpetuals", generated[0]["target_surface"])
+        self.assertEqual("frontier_crypto_perp_paper", generated[0]["route_id"])
+        self.assertEqual("standard", generated[0]["route_status"])
+
+        unknown_quality = {**verified, "quality_status": "unknown", "quality_score": None}
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            record_feature_snapshots(conn, [previous], cfg)
+            generated, _report = generate_strategy_lab_candidates(conn, cfg, [], [unknown_quality])
+        self.assertEqual([], generated)
+
     def test_available_observations_with_unmatched_universe_request_contract_repair(self) -> None:
         cfg = settings()
         now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)

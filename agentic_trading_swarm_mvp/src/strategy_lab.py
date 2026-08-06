@@ -18,7 +18,7 @@ from typing import Any
 
 from horizon_selection import candidate_horizons, prior_selected_horizon, select_sticky_horizon
 from paper_exploration import exploration_enabled
-from route_resolver import evaluate_route_intelligence
+from route_resolver import enrich_candidate_with_route, evaluate_route_intelligence
 from paper_context_cost import realized_paper_cost_audit
 from frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
 from signals.registry import discover_signals, known_strategy_signatures, promoted_strategy_lab_ids
@@ -2563,6 +2563,7 @@ _PROGRAM_UNIVERSE_FIELDS = {
     "asset_classes": "asset_class",
     "regions": "region",
     "market_types": "market_type",
+    "market_surfaces": "market_surface",
     "quotes": "quote",
     "bases": "base",
 }
@@ -2981,6 +2982,15 @@ def generate_strategy_lab_candidates(
                     }
                 admitted_program_candidates.append(candidate)
             program_candidates = admitted_program_candidates
+            # Observation programs create candidates independently of scanner
+            # candidates, so they must receive the same paper-only route
+            # enrichment before route diagnostics and sizing are evaluated.
+            # This keeps the exact target surface while attaching the
+            # derivatives paper route; it never creates a broker route.
+            program_candidates = [
+                enrich_candidate_with_route(candidate, settings)
+                for candidate in program_candidates
+            ]
             (
                 program_candidates,
                 program_route_blocked,

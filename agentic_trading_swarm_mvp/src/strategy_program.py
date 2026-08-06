@@ -796,6 +796,7 @@ def _universe_matches(frame: dict, universe: dict) -> bool:
         "asset_classes": "asset_class",
         "regions": "region",
         "market_types": "market_type",
+        "market_surfaces": "market_surface",
         "quotes": "quote",
         "bases": "base",
     }
@@ -853,6 +854,25 @@ def _route_mapping(frame: dict, program: dict, side: str) -> tuple[str, str]:
 
 def _target_surface(frame: dict, program: dict) -> str:
     output_trade_type = str(program.get("output_trade_type") or "")
+    universe = program.get("universe") if isinstance(program.get("universe"), dict) else {}
+    requested_surfaces = universe.get("market_surfaces")
+    market_surface = str(frame.get("market_surface") or "").strip().lower()
+    if requested_surfaces and market_surface:
+        requested = {
+            str(value).strip().lower()
+            for value in (
+                requested_surfaces
+                if isinstance(requested_surfaces, list)
+                else [requested_surfaces]
+            )
+            if str(value).strip()
+        }
+        if market_surface in requested:
+            # A program that explicitly selects a concrete market surface must
+            # retain that provenance through paper routing.  Otherwise the
+            # generic route surface (for example, "perp") would make an
+            # exact same-surface contract impossible to evaluate.
+            return market_surface
     if _route_surface(frame, program) in {
         NAV_REFERENCE_ROUTE_SURFACE,
         AUCTION_REFERENCE_ROUTE_SURFACE,

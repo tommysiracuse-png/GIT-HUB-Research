@@ -193,6 +193,10 @@ class WhitebitPerpetualAdapter:
                         continue
         observations = [enriched_by_id.get(row["inst_id"], row) for row in observations]
         candidates = [candidate for row in observations if (candidate := funding_candidate(row, settings))]
+        quality_counts: dict[str, int] = {}
+        for observation in observations:
+            status = str(observation.get("quality_status") or "unknown").lower()
+            quality_counts[status] = quality_counts.get(status, 0) + 1
         return ScanBatch(
             source=self.info.source,
             candidates=candidates,
@@ -201,6 +205,10 @@ class WhitebitPerpetualAdapter:
                 "source_status": result["status"],
                 "observation_count": len(observations),
                 "depth_count": len(enriched_by_id),
+                "quality_counts": quality_counts,
+                "quality_evaluated_count": sum(
+                    quality_counts.get(status, 0) for status in ("verified", "degraded")
+                ),
                 "candidate_count": len(candidates),
                 "paper_only": True,
             },
