@@ -76,6 +76,41 @@ def _lineage(candidate: dict) -> str:
     )
 
 
+def _okx_basis_context_gate(candidate: dict, context: dict | None = None) -> dict | None:
+    direct = candidate.get("paper_okx_basis_context_gate")
+    if isinstance(direct, dict) and str(direct.get("reason") or "").strip():
+        return dict(direct)
+    context = context or {}
+    signal_stats = candidate.get("paper_okx_basis_context_signal_stats")
+    if not isinstance(signal_stats, dict):
+        signal_stats = {}
+    reason = str(
+        candidate.get("paper_context_gate_reason")
+        or context.get("paper_context_gate_reason")
+        or ""
+    ).strip()
+    if not reason:
+        return None
+    return {
+        "reason": reason,
+        "action": candidate.get("paper_context_gate_action") or context.get("paper_context_gate_action"),
+        "promotion_eligible": (
+            candidate.get("paper_context_gate_promotion_eligible")
+            if candidate.get("paper_context_gate_promotion_eligible") is not None
+            else context.get("paper_context_gate_promotion_eligible")
+        ),
+        "paper_fill_allowed": (
+            candidate.get("paper_context_gate_paper_fill_allowed")
+            if candidate.get("paper_context_gate_paper_fill_allowed") is not None
+            else context.get("paper_context_gate_paper_fill_allowed")
+        ),
+        "signal_key": candidate.get("signal_key") or candidate.get("market_key"),
+        "direction": candidate.get("direction") or context.get("direction"),
+        "closed_count": signal_stats.get("closed_count"),
+        "avg_pnl_bps": signal_stats.get("avg_pnl_bps"),
+    }
+
+
 def _maybe_float(value: object) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -524,9 +559,26 @@ def build_paper_exploration_report(
     cycle_quarantined_count = 0
     cycle_would_have_filled_count = 0
     cycle_signal_keys: list[str] = []
+    okx_basis_context_cycle_reason_counts: Counter[str] = Counter()
+    okx_basis_context_cycle_candidates: list[dict] = []
     for item in reviewed or []:
         candidate = (item or {}).get("candidate") or {}
         review = (item or {}).get("review") or {}
+        context_gate = _okx_basis_context_gate(candidate)
+        if isinstance(context_gate, dict):
+            reason = str(context_gate.get("reason") or "").strip()
+            if reason:
+                okx_basis_context_cycle_reason_counts[reason] += 1
+                okx_basis_context_cycle_candidates.append(
+                    {
+                        "signal_key": context_gate.get("signal_key"),
+                        "direction": context_gate.get("direction"),
+                        "reason": reason,
+                        "action": context_gate.get("action"),
+                        "paper_fill_allowed": context_gate.get("paper_fill_allowed"),
+                        "promotion_eligible": context_gate.get("promotion_eligible"),
+                    }
+                )
         record = okx_basis_decay_candidate_record(candidate)
         if (
             not isinstance(record, dict)
@@ -565,11 +617,24 @@ def build_paper_exploration_report(
     trade_scopes: Counter[str] = Counter()
     guard_trade_counts: Counter[str] = Counter()
     guard_pnls: dict[str, list[float]] = defaultdict(list)
+    okx_basis_context_reason_counts: Counter[str] = Counter()
+    okx_basis_context_closed_reason_counts: Counter[str] = Counter()
+    okx_basis_context_valid_outcomes: dict[str, list[float]] = defaultdict(list)
     for row in rows:
         candidate = _load_json(row["candidate_json"])
         review = _load_json(row["review_json"])
+        context = _load_json(row["context_json"])
         scope = str(candidate.get("signal_stats_scope") or review.get("signal_stats_scope") or "direct")
         trade_scopes[scope] += 1
+        context_gate = _okx_basis_context_gate(candidate, context)
+        if isinstance(context_gate, dict):
+            reason = str(context_gate.get("reason") or "").strip()
+            if reason:
+                okx_basis_context_reason_counts[reason] += 1
+                if str(row["status"] or "").strip().lower() == "closed":
+                    okx_basis_context_closed_reason_counts[reason] += 1
+                if row["measurement_status"] == "valid" and row["horizon_pnl_bps"] is not None:
+                    okx_basis_context_valid_outcomes[reason].append(float(row["horizon_pnl_bps"]))
         reasons = review.get("would_block_reasons") or candidate.get("paper_exploration_would_block_reasons") or []
         for reason in dict.fromkeys(_reason_category(item) for item in reasons if item):
             guard_trade_counts[reason] += 1
@@ -668,6 +733,8 @@ def build_paper_exploration_report(
             "capacity_deferrals_24h": int(decisions.get("deferred_capacity", 0)),
             "duplicate_exposure_rejections_24h": int(decisions.get("reject_duplicate_open_exposure", 0)),
             "would_block_guard_count": len(guard_value),
+            "okx_basis_context_gate_trade_count": sum(okx_basis_context_reason_counts.values()),
+            "okx_basis_context_gate_current_cycle_candidate_count": len(okx_basis_context_cycle_candidates),
             "okx_basis_decay_quarantine_active": int(decay_quarantine.get("status") == "active"),
             "okx_basis_decay_quarantine_closed_labels": int(decay_quarantine.get("closed_label_count") or 0),
             "okx_basis_decay_quarantine_quarantined_count": int(decay_quarantine.get("quarantined_count") or 0),
@@ -716,6 +783,20 @@ def build_paper_exploration_report(
             "admitted_or_deferred": dict(current_admitted),
         },
         "admission_zero_streaks": zero_streaks,
+        "okx_basis_context_overlays": {
+            "reason_counts": dict(okx_basis_context_reason_counts),
+            "closed_reason_counts": dict(okx_basis_context_closed_reason_counts),
+            "valid_outcome_counts": {
+                reason: len(pnls) for reason, pnls in sorted(okx_basis_context_valid_outcomes.items())
+            },
+            "avg_pnl_bps_by_reason": {
+                reason: round(sum(pnls) / len(pnls), 3)
+                for reason, pnls in sorted(okx_basis_context_valid_outcomes.items())
+                if pnls
+            },
+            "current_cycle_reason_counts": dict(okx_basis_context_cycle_reason_counts),
+            "current_cycle_candidates": okx_basis_context_cycle_candidates[:25],
+        },
         "okx_basis_decay_quarantine": decay_quarantine,
         "frontier_short_diagnostics": frontier_short_diagnostics,
         "unresolved_route_requirement_shadow": unresolved_route_shadow,
@@ -824,6 +905,32 @@ def write_paper_exploration_report(
             f"- Expires: `{decay_quarantine.get('expires_at')}`",
         ]
     )
+    okx_basis_context = report.get("okx_basis_context_overlays") or {}
+    lines.extend(
+        [
+            "",
+            "## OKX Basis Context Overlays",
+            "",
+            f"- Tracked paper trades: `{summary.get('okx_basis_context_gate_trade_count', 0)}`",
+            f"- Current-cycle candidates: `{summary.get('okx_basis_context_gate_current_cycle_candidate_count', 0)}`",
+            f"- Reason counts: `{okx_basis_context.get('reason_counts', {})}`",
+            f"- Current-cycle reason counts: `{okx_basis_context.get('current_cycle_reason_counts', {})}`",
+        ]
+    )
+    current_cycle_candidates = okx_basis_context.get("current_cycle_candidates") or []
+    if current_cycle_candidates:
+        lines.extend(
+            [
+                "",
+                "| Signal | Reason | Fill allowed | Promotion eligible |",
+                "|---|---|---:|---:|",
+            ]
+        )
+        for item in current_cycle_candidates[:15]:
+            lines.append(
+                f"| {item.get('signal_key')} | {item.get('reason')} | "
+                f"{item.get('paper_fill_allowed')} | {item.get('promotion_eligible')} |"
+            )
     frontier_short = report.get("frontier_short_diagnostics") or {}
     cohort_comparison = frontier_short.get("cohort_comparison") or {}
     lines.extend(
@@ -880,6 +987,7 @@ def compact_paper_exploration_report(report: dict, guard_limit: int = 10) -> dic
         "top_guard_value": list(report.get("guard_value") or [])[: max(0, int(guard_limit))],
         "current_cycle_lineages": report.get("current_cycle_lineages") or {},
         "admission_zero_streaks": report.get("admission_zero_streaks") or {},
+        "okx_basis_context_overlays": report.get("okx_basis_context_overlays") or {},
         "okx_basis_decay_quarantine": report.get("okx_basis_decay_quarantine") or {},
         "unresolved_route_requirement_shadow": report.get("unresolved_route_requirement_shadow") or {},
         "shadow_excluded_from_learning": report.get("shadow_excluded_from_learning") or {},

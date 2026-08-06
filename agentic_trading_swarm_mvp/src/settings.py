@@ -107,6 +107,13 @@ DEFAULT_SETTINGS = {
             "MEXC|long|standard": -12.0,
             "MEXC|long|conditional": -15.0,
         },
+        "okx_basis_context_overlays": {
+            "enabled": True,
+            "conditional_long_perp_short_spot_score_cap": 35.0,
+            "conditional_long_perp_short_spot_allocation_cap": 0.25,
+            "funding_capture_min_closed_trades_for_promotion": 50,
+            "funding_capture_score_cap": 75.0,
+        },
     },
     "paper_route_feasibility_gate": {
         "enabled": True,

@@ -64,7 +64,20 @@ class FrontierExecutionQualityPacketTests(unittest.TestCase):
                                 "current_cycle_signal_keys": [
                                     "OKX|perp_funding_basis|basis_mean_reversion_short_perp|standard"
                                 ],
+                            },
+                            "okx_basis_context_overlays": {
+                                "current_cycle_reason_counts": {
+                                    "okx_standard_short_perp_long_spot_preserved": 1,
+                                },
                             }
+                        },
+                        "strategy_reliability": {
+                            "okx_basis_context_overlays": [
+                                {
+                                    "reason": "okx_standard_short_perp_long_spot_preserved",
+                                    "signal_key": "OKX|perp_funding_basis|short_perp_long_spot|standard",
+                                }
+                            ]
                         },
                     },
                     DEFAULT_SETTINGS,
@@ -87,6 +100,16 @@ class FrontierExecutionQualityPacketTests(unittest.TestCase):
         self.assertEqual(
             "decayed_basis_mean_reversion_quarantine",
             packet["paper_exploration"]["okx_basis_decay_quarantine"]["reason"],
+        )
+        self.assertEqual(
+            1,
+            packet["paper_exploration"]["okx_basis_context_overlays"]["current_cycle_reason_counts"][
+                "okx_standard_short_perp_long_spot_preserved"
+            ],
+        )
+        self.assertEqual(
+            "okx_standard_short_perp_long_spot_preserved",
+            packet["strategy_reliability"]["okx_basis_context_overlays"][0]["reason"],
         )
 
     def test_state_packet_exposes_frontier_gap_summary_to_market_scout(self):

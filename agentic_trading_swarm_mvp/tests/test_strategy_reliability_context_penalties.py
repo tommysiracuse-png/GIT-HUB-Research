@@ -466,6 +466,87 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(reliability["paper_score_context_penalty"]["base_score"], 80.0)
         self.assertNotIn("paper_context_penalty:freshness_penalty", candidate.get("risk_notes", []))
 
+    def test_okx_conditional_reverse_basis_uses_contextual_cap_instead_of_generic_floor(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "inst_id": "OKX:BTC-USDT-SWAP",
+            "direction": "long_perp_short_spot",
+            "trade_type": "perp_funding_basis",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "conditional", "route_status": "conditional"},
+            "paper_okx_basis_context_signal_stats": {
+                "signal_key": "OKX|perp_funding_basis|long_perp_short_spot|conditional",
+                "closed_count": 218,
+                "avg_pnl_bps": -36.215,
+                "score_adjustment": -14.051,
+                "win_rate": 0.385,
+            },
+        }
+
+        detail = sr.apply_paper_context_priors(candidate, {"mode": "paper", "allow_live_trading": False})
+
+        self.assertEqual(35.0, candidate["score"])
+        self.assertEqual("okx_reverse_basis_conditional_route_cap", candidate["paper_context_gate_reason"])
+        self.assertEqual("cap_conditional_reverse_basis", candidate["paper_context_gate_action"])
+        self.assertEqual(0.25, candidate["paper_allocation_multiplier"])
+        self.assertFalse(candidate["promotion_eligible"])
+        self.assertTrue(candidate["paper_context_gate_paper_fill_allowed"])
+        self.assertEqual("okx_reverse_basis_conditional_route_cap", detail["okx_basis_context_gate"]["reason"])
+
+    def test_okx_funding_capture_stays_observable_but_not_promoted_before_fifty_closed_trades(self) -> None:
+        candidate = {
+            "score": 88.0,
+            "venue": "OKX",
+            "inst_id": "OKX:BTC-USDT-SWAP",
+            "direction": "funding_capture_short_perp",
+            "trade_type": "perp_funding_basis",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+            "paper_okx_basis_context_signal_stats": {
+                "signal_key": "OKX|perp_funding_basis|funding_capture_short_perp|standard",
+                "closed_count": 27,
+                "avg_pnl_bps": 52.767,
+                "score_adjustment": 15.0,
+                "win_rate": 0.556,
+            },
+        }
+
+        detail = sr.apply_paper_context_priors(candidate, {"mode": "paper", "allow_live_trading": False})
+
+        self.assertEqual(75.0, candidate["score"])
+        self.assertEqual("okx_funding_capture_observe_until_50_closed", candidate["paper_context_gate_reason"])
+        self.assertFalse(candidate["promotion_eligible"])
+        self.assertTrue(candidate["paper_context_gate_paper_fill_allowed"])
+        self.assertEqual(27, detail["okx_basis_context_gate"]["closed_count"])
+
+    def test_okx_standard_short_perp_long_spot_is_explicitly_preserved(self) -> None:
+        candidate = {
+            "score": 72.0,
+            "venue": "OKX",
+            "inst_id": "OKX:BTC-USDT-SWAP",
+            "direction": "short_perp_long_spot",
+            "trade_type": "perp_funding_basis",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+            "promotion_eligible": False,
+            "paper_okx_basis_context_signal_stats": {
+                "signal_key": "OKX|perp_funding_basis|short_perp_long_spot|standard",
+                "closed_count": 274,
+                "avg_pnl_bps": 20.742,
+                "score_adjustment": 7.391,
+                "win_rate": 0.511,
+            },
+        }
+
+        detail = sr.apply_paper_context_priors(candidate, {"mode": "paper", "allow_live_trading": False})
+
+        self.assertEqual("okx_standard_short_perp_long_spot_preserved", candidate["paper_context_gate_reason"])
+        self.assertTrue(candidate["promotion_eligible"])
+        self.assertTrue(candidate["paper_context_top_rank_eligible"])
+        self.assertEqual("ranked_not_blocked", candidate["paper_context_prior_status"])
+        self.assertEqual("preserve_standard_cash_carry", detail["okx_basis_context_gate"]["action"])
+
 
 if __name__ == "__main__":
     unittest.main()

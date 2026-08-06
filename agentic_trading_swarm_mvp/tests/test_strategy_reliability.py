@@ -522,6 +522,41 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["quality_action"], "shadow_filtered")
         self.assertEqual(rows[0]["score"], 0.0)
 
+    def test_okx_conditional_reverse_basis_is_capped_without_decay_quarantine(self) -> None:
+        candidate = base_candidate(
+            venue="OKX",
+            inst_id="OKX:BTC-USDT-SWAP",
+            trade_type="perp_funding_basis",
+            direction="long_perp_short_spot",
+            funding_bps=6.0,
+            basis_bps=40.0,
+            liquidity_score=0.8,
+            quality_score=None,
+            execution_feasibility={"status": "conditional", "route_status": "conditional"},
+            paper_okx_basis_context_signal_stats={
+                "signal_key": "OKX|perp_funding_basis|long_perp_short_spot|conditional",
+                "closed_count": 218,
+                "avg_pnl_bps": -36.215,
+                "score_adjustment": -14.051,
+                "win_rate": 0.385,
+            },
+        )
+
+        rows, report = strategy_reliability.apply_strategy_reliability([candidate], {"mode": "paper"})
+
+        row = rows[0]
+        self.assertFalse(row.get("paper_entry_blocked", False))
+        self.assertNotIn("paper_okx_basis_decay_quarantine", row)
+        self.assertEqual("reverse_basis_conditional_route_cap", row["strategy_reliability_action"])
+        self.assertEqual("okx_reverse_basis_conditional_route_cap", row["paper_context_gate_reason"])
+        self.assertEqual(35.0, row["score"])
+        self.assertEqual(0.25, row["paper_allocation_multiplier"])
+        self.assertFalse(row["promotion_eligible"])
+        self.assertEqual(
+            1,
+            report["summary"]["okx_basis_context_reason_counts"]["okx_reverse_basis_conditional_route_cap"],
+        )
+
     def test_yahoo_proxy_direction_family_is_quarantined_on_both_sides(self) -> None:
         short = base_candidate(
             venue="YAHOO_PROXY",

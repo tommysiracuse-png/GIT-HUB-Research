@@ -90,6 +90,13 @@ PAPER_CONTEXT_PRIOR_DEFAULTS = {
         "MEXC|long|standard": -12.0,
         "MEXC|long|conditional": -15.0,
     },
+    "okx_basis_context_overlays": {
+        "enabled": True,
+        "conditional_long_perp_short_spot_score_cap": 35.0,
+        "conditional_long_perp_short_spot_allocation_cap": 0.25,
+        "funding_capture_min_closed_trades_for_promotion": 50,
+        "funding_capture_score_cap": 75.0,
+    },
 }
 PAPER_CONTEXT_RANK_GATE_TRADE_TYPES = {
     "frontier_crypto_venue_map",
@@ -3503,6 +3510,9 @@ def _paper_context_prior_policy(config: Mapping[str, Any] | None) -> dict[str, A
     policy["venue_direction_feasibility_priors"] = dict(
         PAPER_CONTEXT_PRIOR_DEFAULTS["venue_direction_feasibility_priors"]
     )
+    policy["okx_basis_context_overlays"] = dict(
+        PAPER_CONTEXT_PRIOR_DEFAULTS["okx_basis_context_overlays"]
+    )
     if not isinstance(config, Mapping):
         return policy
     configured_blocks: list[Mapping[str, Any]] = []
@@ -3518,7 +3528,7 @@ def _paper_context_prior_policy(config: Mapping[str, Any] | None) -> dict[str, A
             configured_blocks.append(nested)
     for block in configured_blocks:
         for key, value in block.items():
-            if key == "venue_direction_feasibility_priors" and isinstance(value, Mapping):
+            if key in {"venue_direction_feasibility_priors", "okx_basis_context_overlays"} and isinstance(value, Mapping):
                 policy[key].update(value)
             elif key == "venue_direction_priors" and isinstance(value, Mapping):
                 for slice_key, prior in value.items():
@@ -3573,6 +3583,10 @@ def _paper_context_direction(candidate: Mapping[str, Any]) -> str:
     if explicit in {"long", "short"}:
         return explicit
     direction = str(candidate.get("direction") or "").strip().lower().replace("-", "_")
+    if direction in {"long_perp_short_spot", "funding_capture_long_perp", "basis_mean_reversion_long_perp"}:
+        return "long"
+    if direction in {"short_perp_long_spot", "funding_capture_short_perp", "basis_mean_reversion_short_perp"}:
+        return "short"
     tokens = set(direction.split("_"))
     if "long" in tokens and "short" not in tokens:
         return "long"
@@ -3762,6 +3776,198 @@ def _paper_context_realized_prior(
     return round(prior, 3), detail
 
 
+def _okx_basis_context_signal_key(
+    candidate: Mapping[str, Any],
+    *,
+    feasibility_status: str | None = None,
+) -> str | None:
+    venue = str(candidate.get("venue") or "").strip().upper()
+    trade_type = str(candidate.get("trade_type") or "").strip().lower()
+    direction = str(candidate.get("direction") or "").strip().lower().replace("-", "_")
+    status = str(feasibility_status or _paper_context_feasibility_status(candidate) or "").strip().lower()
+    if venue != "OKX" or trade_type != "perp_funding_basis" or not direction or not status:
+        return None
+    return f"OKX|perp_funding_basis|{direction}|{status}"
+
+
+def _normalize_okx_basis_context_signal_stats(
+    value: Mapping[str, Any] | None,
+    *,
+    expected_signal_key: str,
+) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    signal_key_value = str(
+        value.get("signal_key")
+        or value.get("source_signal_key")
+        or value.get("target_signal_key")
+        or expected_signal_key
+    ).strip()
+    if signal_key_value != expected_signal_key:
+        return None
+    closed_count = _as_int(
+        value.get("closed_count", value.get("closed_trades", value.get("sample_size"))),
+        0,
+    )
+    avg_pnl_bps = _maybe_float(value.get("avg_pnl_bps"))
+    win_rate = _maybe_float(value.get("win_rate"))
+    score_adjustment = _maybe_float(value.get("score_adjustment"))
+    return {
+        "signal_key": signal_key_value,
+        "closed_count": closed_count,
+        "avg_pnl_bps": round(avg_pnl_bps, 3) if avg_pnl_bps is not None else None,
+        "win_rate": round(win_rate, 6) if win_rate is not None else None,
+        "score_adjustment": round(score_adjustment, 3) if score_adjustment is not None else None,
+        "updated_at": value.get("updated_at"),
+    }
+
+
+def _okx_basis_context_signal_stats(
+    candidate: Mapping[str, Any],
+    *,
+    expected_signal_key: str,
+) -> dict[str, Any] | None:
+    for field in (
+        "paper_okx_basis_context_signal_stats",
+        "okx_basis_context_signal_stats",
+        "paper_okx_basis_decay_signal_stats",
+        "okx_basis_decay_signal_stats",
+        "signal_stats",
+    ):
+        normalized = _normalize_okx_basis_context_signal_stats(
+            candidate.get(field),
+            expected_signal_key=expected_signal_key,
+        )
+        if normalized is not None:
+            return normalized
+    existing_gate = candidate.get("paper_okx_basis_context_gate")
+    if isinstance(existing_gate, Mapping):
+        normalized = _normalize_okx_basis_context_signal_stats(
+            existing_gate.get("signal_stats"),
+            expected_signal_key=expected_signal_key,
+        )
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _okx_basis_context_overlay_record(
+    candidate: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    *,
+    feasibility_status: str,
+    pre_overlay_score: float,
+    reference_score: float,
+) -> dict[str, Any] | None:
+    overlay_policy = policy.get("okx_basis_context_overlays")
+    if not isinstance(overlay_policy, Mapping) or not _as_bool(overlay_policy.get("enabled"), True):
+        return None
+
+    signal_key = _okx_basis_context_signal_key(candidate, feasibility_status=feasibility_status)
+    if not signal_key:
+        return None
+
+    direction = str(candidate.get("direction") or "").strip().lower().replace("-", "_")
+    signal_stats = _okx_basis_context_signal_stats(candidate, expected_signal_key=signal_key)
+    closed_count = _as_int((signal_stats or {}).get("closed_count"), 0)
+    avg_pnl_bps = _maybe_float((signal_stats or {}).get("avg_pnl_bps"))
+    win_rate = _maybe_float((signal_stats or {}).get("win_rate"))
+    score_adjustment = _maybe_float((signal_stats or {}).get("score_adjustment"))
+    current_promotion_eligible = bool(candidate.get("promotion_eligible", True))
+    current_fill_allowed = bool(candidate.get("paper_fill_allowed", True))
+    final_score = round(pre_overlay_score, 3)
+    score_cap = None
+    allocation_multiplier_cap = None
+    promotion_eligible = current_promotion_eligible
+    paper_fill_allowed = current_fill_allowed
+    reason = None
+    action = None
+
+    if direction.startswith("basis_mean_reversion"):
+        reason = "decayed_basis_mean_reversion_quarantine"
+        action = "quarantine_mean_reversion"
+        score_cap = 0.0
+        final_score = min(final_score, 0.0)
+        promotion_eligible = False
+        paper_fill_allowed = False
+    elif direction == "long_perp_short_spot" and feasibility_status == "conditional":
+        reason = "okx_reverse_basis_conditional_route_cap"
+        action = "cap_conditional_reverse_basis"
+        score_cap = round(
+            _as_float(overlay_policy.get("conditional_long_perp_short_spot_score_cap"), 35.0),
+            3,
+        )
+        allocation_multiplier_cap = round(
+            min(
+                1.0,
+                max(
+                    0.0,
+                    _as_float(
+                        overlay_policy.get("conditional_long_perp_short_spot_allocation_cap"),
+                        0.25,
+                    ),
+                ),
+            ),
+            3,
+        )
+        final_score = min(round(reference_score, 3), score_cap)
+        promotion_eligible = False
+        paper_fill_allowed = True
+    elif direction == "short_perp_long_spot" and feasibility_status == "standard":
+        reason = "okx_standard_short_perp_long_spot_preserved"
+        action = "preserve_standard_cash_carry"
+        if closed_count > 0 and avg_pnl_bps is not None and avg_pnl_bps > 0.0:
+            final_score = round(reference_score, 3)
+            promotion_eligible = True
+            paper_fill_allowed = True
+    elif direction in {"funding_capture_long_perp", "funding_capture_short_perp"}:
+        min_closed = max(
+            1,
+            _as_int(overlay_policy.get("funding_capture_min_closed_trades_for_promotion"), 50),
+        )
+        if closed_count < min_closed:
+            reason = "okx_funding_capture_observe_until_50_closed"
+            action = "observe_funding_capture_until_sample_confirmed"
+            score_cap = round(
+                _as_float(overlay_policy.get("funding_capture_score_cap"), 75.0),
+                3,
+            )
+            final_score = min(final_score, score_cap)
+            promotion_eligible = False
+            paper_fill_allowed = True
+
+    if reason is None:
+        return None
+
+    applied = (
+        round(final_score, 3) != round(pre_overlay_score, 3)
+        or promotion_eligible != current_promotion_eligible
+        or paper_fill_allowed != current_fill_allowed
+        or allocation_multiplier_cap is not None
+    )
+    return {
+        "paper_only": True,
+        "applied": applied,
+        "signal_key": signal_key,
+        "direction": direction,
+        "feasibility_status": feasibility_status,
+        "reason": reason,
+        "action": action,
+        "closed_count": closed_count,
+        "avg_pnl_bps": round(avg_pnl_bps, 3) if avg_pnl_bps is not None else None,
+        "win_rate": round(win_rate, 6) if win_rate is not None else None,
+        "score_adjustment": round(score_adjustment, 3) if score_adjustment is not None else None,
+        "pre_overlay_score": round(pre_overlay_score, 3),
+        "reference_score": round(reference_score, 3),
+        "score_cap": score_cap,
+        "final_score": round(final_score, 3),
+        "allocation_multiplier_cap": allocation_multiplier_cap,
+        "promotion_eligible": promotion_eligible,
+        "paper_fill_allowed": paper_fill_allowed,
+        "signal_stats": dict(signal_stats or {}),
+    }
+
+
 def _paper_context_rank_gate_applies(
     candidate: Mapping[str, Any],
     *,
@@ -3943,6 +4149,46 @@ def apply_paper_context_priors(
         detail["rank_gate"] = None
         detail["top_rank_eligible"] = True
         detail["promotion_eligible"] = bool(candidate.get("promotion_eligible", True))
+    okx_basis_context_gate = _okx_basis_context_overlay_record(
+        candidate,
+        policy,
+        feasibility_status=feasibility_status,
+        pre_overlay_score=final_score,
+        reference_score=_as_float(rank_gate.get("pre_gate_score"), final_score),
+    )
+    if okx_basis_context_gate is not None:
+        final_score = _as_float(okx_basis_context_gate.get("final_score"), final_score)
+        detail["final_paper_score"] = round(final_score, 3)
+        detail["okx_basis_context_gate"] = okx_basis_context_gate
+        detail["top_rank_eligible"] = bool(okx_basis_context_gate["promotion_eligible"])
+        detail["promotion_eligible"] = bool(okx_basis_context_gate["promotion_eligible"])
+        candidate["paper_okx_basis_context_gate"] = dict(okx_basis_context_gate)
+        candidate["paper_context_gate_reason"] = okx_basis_context_gate["reason"]
+        candidate["paper_context_gate_action"] = okx_basis_context_gate["action"]
+        candidate["paper_context_gate_promotion_eligible"] = bool(
+            okx_basis_context_gate["promotion_eligible"]
+        )
+        candidate["paper_context_gate_paper_fill_allowed"] = bool(
+            okx_basis_context_gate["paper_fill_allowed"]
+        )
+        candidate["paper_context_top_rank_eligible"] = bool(
+            okx_basis_context_gate["promotion_eligible"]
+        )
+        if okx_basis_context_gate.get("allocation_multiplier_cap") is not None:
+            current_allocation = _as_float(candidate.get("paper_allocation_multiplier"), 1.0)
+            candidate["paper_allocation_multiplier"] = round(
+                min(
+                    current_allocation,
+                    _as_float(okx_basis_context_gate["allocation_multiplier_cap"], 1.0),
+                ),
+                3,
+            )
+        candidate["promotion_eligible"] = bool(okx_basis_context_gate["promotion_eligible"])
+        if not okx_basis_context_gate["paper_fill_allowed"]:
+            candidate["paper_fill_allowed"] = False
+        _append_note(candidate, f"paper_context_gate:{okx_basis_context_gate['reason']}")
+    else:
+        detail["okx_basis_context_gate"] = None
     candidate["score"] = final_score
     candidate["final_paper_score"] = final_score
     if rank_gate["enabled"]:
@@ -3950,8 +4196,20 @@ def apply_paper_context_priors(
         candidate["paper_context_top_rank_eligible"] = bool(rank_gate["top_rank_eligible"])
         if not rank_gate["promotion_eligible"]:
             candidate["promotion_eligible"] = False
+    if okx_basis_context_gate is not None:
+        candidate["paper_context_top_rank_eligible"] = bool(
+            okx_basis_context_gate["promotion_eligible"]
+        )
+        candidate["promotion_eligible"] = bool(okx_basis_context_gate["promotion_eligible"])
     candidate["paper_context_prior"] = detail
-    if rank_gate["hard_gate"] or rank_gate["applied"]:
+    if okx_basis_context_gate is not None:
+        if not okx_basis_context_gate["paper_fill_allowed"]:
+            candidate["paper_context_prior_status"] = "ranked_hard_gated"
+        elif not okx_basis_context_gate["promotion_eligible"]:
+            candidate["paper_context_prior_status"] = "ranked_promotion_gated"
+        else:
+            candidate["paper_context_prior_status"] = "ranked_not_blocked"
+    elif rank_gate["hard_gate"] or rank_gate["applied"]:
         candidate["paper_context_prior_status"] = "ranked_hard_gated"
     elif rank_gate["enabled"] and not rank_gate["promotion_eligible"]:
         candidate["paper_context_prior_status"] = "ranked_promotion_gated"
@@ -4646,6 +4904,16 @@ def _repair_okx_candidate(candidate: dict) -> dict | None:
                     "paper_proxy_quality_and_outcomes_are_counterfactual_not_live_route_evidence",
                 ],
                 score_delta=0.0,
+                allocation_multiplier=0.25,
+            )
+        if route_status == "conditional":
+            diagnostic_reasons = reasons or ["reverse_basis_conditional_route_measured"]
+            return _annotate(
+                candidate,
+                profile="okx_reverse_basis",
+                action="reverse_basis_conditional_route_cap",
+                reasons=diagnostic_reasons,
+                score_delta=-6.0,
                 allocation_multiplier=0.25,
             )
         if reasons:
@@ -5475,6 +5743,7 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
     by_direction = collections.Counter(item["direction"] for item in items)
     by_venue = collections.Counter(item["venue"] for item in items if item.get("venue"))
     route_feasibility_reason_counts: collections.Counter[str] = collections.Counter()
+    okx_basis_context_reason_counts: collections.Counter[str] = collections.Counter()
     blocked = sum(1 for item in items if item["action"].startswith("shadow") or "shadow" in item["action"])
     protected = sum(1 for item in items if item.get("protect_working_slice"))
     quarantined = sum(1 for item in items if item.get("profile") == "yahoo_proxy_family_quarantine")
@@ -5530,6 +5799,11 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         reason = str(candidate.get("route_feasibility_reason") or "").strip()
         if reason:
             route_feasibility_reason_counts[reason] += 1
+        context_gate = candidate.get("paper_okx_basis_context_gate")
+        if isinstance(context_gate, Mapping):
+            context_reason = str(context_gate.get("reason") or "").strip()
+            if context_reason:
+                okx_basis_context_reason_counts[context_reason] += 1
         if _as_bool(candidate.get("paper_route_feasibility_shadow_label"), False):
             route_feasibility_shadow_count += 1
         if _as_bool(candidate.get("paper_active_scoring_eligible"), True) and reason in {
@@ -5552,6 +5826,8 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         "okx_basis_decay_quarantined_signals": okx_basis_decay_signals[:10],
         "by_quality_failure": dict(by_quality_failure),
         "route_feasibility_reason_counts": dict(route_feasibility_reason_counts),
+        "okx_basis_context_reason_counts": dict(okx_basis_context_reason_counts),
+        "okx_basis_context_gate_count": sum(okx_basis_context_reason_counts.values()),
         "route_feasibility_shadow_count": route_feasibility_shadow_count,
         "route_feasibility_verified_exception_count": route_feasibility_verified_exception_count,
         "protected_working_slice_count": protected,
@@ -5635,6 +5911,7 @@ def _report_markdown(report: dict) -> str:
     yahoo_proxy_transfer = report.get("yahoo_proxy_transfer_friction_diagnostic", {})
     native_surface = yahoo_proxy_transfer.get("native_surface", {})
     transferred_routes = yahoo_proxy_transfer.get("transferred_routes", {})
+    okx_basis_context_overlays = report.get("okx_basis_context_overlays") or []
     lines = [
         "# Strategy Reliability Report",
         "",
@@ -5648,6 +5925,7 @@ def _report_markdown(report: dict) -> str:
         f"- Lineage source-health guards: `{summary.get('lineage_source_health_guard_count', 0)}`",
         f"- Cross-family portability quarantines: `{summary.get('portability_quarantine_count', 0)}`",
         f"- Protected working slices: `{summary.get('protected_working_slice_count', 0)}`",
+        f"- OKX basis context overlays: `{summary.get('okx_basis_context_gate_count', 0)}`",
         f"- Actions: `{summary.get('by_action', {})}`",
         f"- Profiles: `{summary.get('by_profile', {})}`",
         f"- Proxy-short quality failures: `{summary.get('by_quality_failure', {})}`",
@@ -5668,6 +5946,21 @@ def _report_markdown(report: dict) -> str:
             f"action=`{item.get('action')}` allocation=`{item.get('allocation_multiplier')}` "
             f"score_delta=`{item.get('score_delta')}` reasons={item.get('reasons')}"
         )
+    if okx_basis_context_overlays:
+        lines.extend(
+            [
+                "",
+                "## OKX Basis Context Overlays",
+                "",
+                "| Signal | Reason | Closed | Avg bps | Fill allowed | Promotion eligible |",
+                "|---|---|---:|---:|---:|---:|",
+            ]
+        )
+        for item in okx_basis_context_overlays[:15]:
+            lines.append(
+                f"| {item.get('signal_key')} | {item.get('reason')} | {item.get('closed_count', 0)} | "
+                f"{item.get('avg_pnl_bps')} | {item.get('paper_fill_allowed')} | {item.get('promotion_eligible')} |"
+            )
     lines.extend(
         [
             "",
@@ -5925,6 +6218,59 @@ def _segment_yahoo_proxy_transfer_rows(
         }
         for key, items in sorted(grouped.items())
     }
+
+
+def hydrate_okx_basis_context_signal_stats(
+    candidates: list[dict[str, Any]],
+    conn: Any | None,
+) -> None:
+    requested_signal_stats: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for candidate in candidates:
+        signal_key_value = _okx_basis_context_signal_key(candidate)
+        if not signal_key_value:
+            continue
+        existing = _okx_basis_context_signal_stats(candidate, expected_signal_key=signal_key_value)
+        if existing is not None:
+            candidate["paper_okx_basis_context_signal_stats"] = dict(existing)
+            continue
+        requested_signal_stats[signal_key_value].append(candidate)
+
+    if conn is None or not requested_signal_stats:
+        return
+
+    placeholders = ",".join("?" for _ in requested_signal_stats)
+    try:
+        rows = conn.execute(
+            f"""
+            select signal_key, closed_count, avg_pnl_bps, win_rate, score_adjustment, updated_at
+            from signal_stats
+            where signal_key in ({placeholders})
+            """,
+            tuple(requested_signal_stats),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - optional read-only runtime evidence
+        rows = []
+    for raw in rows:
+        try:
+            stats = dict(raw)
+        except (TypeError, ValueError):
+            stats = {
+                "signal_key": raw[0],
+                "closed_count": raw[1],
+                "avg_pnl_bps": raw[2],
+                "win_rate": raw[3],
+                "score_adjustment": raw[4],
+                "updated_at": raw[5],
+            }
+        signal_key_value = str(stats.get("signal_key") or "")
+        normalized = _normalize_okx_basis_context_signal_stats(
+            stats,
+            expected_signal_key=signal_key_value,
+        )
+        if normalized is None:
+            continue
+        for candidate in requested_signal_stats.get(signal_key_value, []):
+            candidate["paper_okx_basis_context_signal_stats"] = dict(normalized)
 
 
 def _hydrate_yahoo_proxy_transfer_diagnostics(
@@ -6199,6 +6545,7 @@ def apply_strategy_reliability(
     _hydrate_portability_paper_evidence(candidates, conn)
     hydrate_paper_context_loss_statistics(candidates, conn, settings)
     hydrate_paper_context_prior_statistics(candidates, conn, settings)
+    hydrate_okx_basis_context_signal_stats(candidates, conn)
     hydrate_paper_family_decay_statistics(candidates, conn, settings)
     hydrate_paper_family_decay_diagnostics(candidates, settings)
     _hydrate_yahoo_proxy_transfer_diagnostics(candidates, conn)
@@ -6260,6 +6607,11 @@ def apply_strategy_reliability(
         "generated_at": _utc_now(),
         "summary": _summarize(adjusted, candidates),
         "top_adjustments": top_adjustments,
+        "okx_basis_context_overlays": [
+            dict(candidate.get("paper_okx_basis_context_gate") or {})
+            for candidate in candidates
+            if isinstance(candidate.get("paper_okx_basis_context_gate"), Mapping)
+        ][:50],
         "paper_context_prior_adjustments": sorted(
             context_prior_adjustments,
             key=lambda row: abs(_as_float(row.get("total_prior"))),

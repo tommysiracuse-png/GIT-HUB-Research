@@ -1950,6 +1950,7 @@ def _compact_strategy_reliability(report: dict) -> dict:
     return {
         "generated_at": report.get("generated_at"),
         "summary": report.get("summary", {}),
+        "okx_basis_context_overlays": report.get("okx_basis_context_overlays", [])[:15],
         "top_adjustments": report.get("top_adjustments", [])[:15],
         "covered_improvement_task_ids": report.get("covered_improvement_task_ids", []),
         "covered_growth_experiment_ids": report.get("covered_growth_experiment_ids", []),

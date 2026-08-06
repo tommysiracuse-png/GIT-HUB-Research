@@ -73,6 +73,31 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
         self.assertEqual(["simulated_slippage_exceeds_edge"], ticket["anomaly_flags"])
         self.assertEqual(0.0, ticket["net_edge_bps_estimate"])
 
+    def test_order_ticket_carries_okx_basis_context_gate_reason(self) -> None:
+        candidate = {
+            "venue": "OKX",
+            "inst_id": "OKX:BTC-USDT-SWAP",
+            "direction": "long_perp_short_spot",
+            "trade_type": "perp_funding_basis",
+            "last": 100.0,
+            "paper_context_gate_reason": "okx_reverse_basis_conditional_route_cap",
+            "paper_context_gate_action": "cap_conditional_reverse_basis",
+            "paper_context_gate_promotion_eligible": False,
+            "paper_context_gate_paper_fill_allowed": True,
+        }
+        review = {
+            "paper_allocation_multiplier": 1.0,
+            "feasibility_status": "conditional",
+            "route_status": "conditional",
+        }
+
+        ticket = build_order_ticket(candidate, review, DEFAULT_SETTINGS)
+
+        self.assertEqual("okx_reverse_basis_conditional_route_cap", ticket["paper_context_gate_reason"])
+        self.assertEqual("cap_conditional_reverse_basis", ticket["paper_context_gate_action"])
+        self.assertFalse(ticket["paper_context_gate_promotion_eligible"])
+        self.assertTrue(ticket["paper_context_gate_paper_fill_allowed"])
+
     def test_unconfirmed_frontier_spot_borrow_is_shadow_observed_without_an_order(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

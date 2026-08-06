@@ -163,7 +163,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         self.assertEqual("decayed_basis_mean_reversion_quarantine", guarded["candidate_reject_reason"])
         self.assertEqual("shadow_filtered", guarded["quality_action"])
 
-    def test_exact_target_directions_are_quarantined(self) -> None:
+    def test_exact_target_directions_quarantine_only_mean_reversion_variants(self) -> None:
         conditional = self.candidate(
             direction="basis_mean_reversion_long_perp",
             execution_feasibility={"status": "conditional", "route_status": "conditional"},
@@ -182,7 +182,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         )
 
         self.assertTrue(quarantine_record(conditional, self.settings)["active"])
-        self.assertTrue(quarantine_record(reverse_basis_conditional, self.settings)["active"])
+        self.assertIsNone(quarantine_record(reverse_basis_conditional, self.settings))
         self.assertIsNone(quarantine_record(reverse_basis_standard, self.settings))
         self.assertIsNone(quarantine_record(protected, self.settings))
 
@@ -444,6 +444,47 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             self.assertEqual(
                 0,
                 paper_report["summary"]["okx_basis_decay_quarantine_current_cycle_would_have_filled_count"],
+            )
+            conn.close()
+
+    def test_paper_report_distinguishes_preserved_and_quarantined_okx_basis_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            quarantined = apply_strategy_reliability([self.candidate()], self.settings, conn=conn)[0][0]
+            preserved_candidate = self.candidate(
+                direction="short_perp_long_spot",
+                signal_key="OKX|perp_funding_basis|short_perp_long_spot|standard",
+                execution_feasibility={"status": "standard", "route_status": "standard"},
+                paper_okx_basis_context_signal_stats={
+                    "signal_key": "OKX|perp_funding_basis|short_perp_long_spot|standard",
+                    "closed_count": 274,
+                    "avg_pnl_bps": 20.742,
+                    "score_adjustment": 7.391,
+                    "win_rate": 0.511,
+                },
+            )
+            preserved = apply_strategy_reliability([preserved_candidate], self.settings, conn=conn)[0][0]
+
+            paper_report = build_paper_exploration_report(
+                conn,
+                self.settings,
+                reviewed=[
+                    {"candidate": quarantined, "review": {"decision": "approve_paper_trade"}},
+                    {"candidate": preserved, "review": {"decision": "approve_paper_trade"}},
+                ],
+            )
+
+            self.assertEqual(
+                1,
+                paper_report["okx_basis_context_overlays"]["current_cycle_reason_counts"][
+                    "decayed_basis_mean_reversion_quarantine"
+                ],
+            )
+            self.assertEqual(
+                1,
+                paper_report["okx_basis_context_overlays"]["current_cycle_reason_counts"][
+                    "okx_standard_short_perp_long_spot_preserved"
+                ],
             )
             conn.close()
 

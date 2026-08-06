@@ -24,6 +24,7 @@ _EXEMPT_DIRECTIONS = frozenset(
     {
         "funding_capture_long_perp",
         "funding_capture_short_perp",
+        "long_perp_short_spot",
         "short_perp_long_spot",
     }
 )
@@ -33,7 +34,7 @@ _TARGET_DIRECTIONS = frozenset(
         "basis_mean_reversion_short_perp",
     }
 )
-_CONDITIONAL_TARGET_DIRECTIONS = frozenset({"long_perp_short_spot"})
+_CONDITIONAL_TARGET_DIRECTIONS = frozenset()
 _QUARANTINE_ACTION = "quarantined_basis_mr"
 _EXACT_SIGNAL_ID_FIELDS = (
     "signal_key",
