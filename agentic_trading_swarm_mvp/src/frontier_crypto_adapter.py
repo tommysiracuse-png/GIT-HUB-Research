@@ -2801,37 +2801,13 @@ def _paper_only_valr_pick_first(payload, *keys):
 
 
 def _paper_only_valr_order_book_top(levels, *, reverse=False):
-    if not isinstance(levels, (list, tuple)):
-        return (None, None)
-
-    normalized = []
-    for level in levels:
-        if isinstance(level, dict):
-            price = _paper_only_valr_float_or_none(
-                level.get("price") or level.get("rate") or level.get("bidPrice") or level.get("askPrice")
-            )
-            quantity = _paper_only_valr_float_or_none(
-                level.get("quantity") or level.get("qty") or level.get("volume") or level.get("size")
-            )
-        elif isinstance(level, (list, tuple)) and len(level) >= 2:
-            price = _paper_only_valr_float_or_none(level[0])
-            quantity = _paper_only_valr_float_or_none(level[1])
-        else:
-            continue
-        if price is None or quantity is None or price <= 0.0 or quantity <= 0.0:
-            continue
-        normalized.append((price, quantity))
-
+    normalized = _paper_only_valr_normalize_order_book_side(levels, reverse=reverse)
     if not normalized:
         return (None, None)
-
-    normalized.sort(key=lambda item: item[0], reverse=bool(reverse))
-    return normalized[0]
+    return tuple(normalized[0])
 
 
-def _paper_only_valr_shallow_order_book(levels, *, reverse=False, max_levels=5):
-    """Normalize a bounded public VALR book without retaining full depth."""
-
+def _paper_only_valr_normalize_order_book_side(levels, *, reverse=False, max_levels=None):
     if not isinstance(levels, (list, tuple)):
         return []
     normalized = []
@@ -2848,10 +2824,53 @@ def _paper_only_valr_shallow_order_book(levels, *, reverse=False, max_levels=5):
             quantity = _paper_only_valr_float_or_none(level[1])
         else:
             continue
-        if price is not None and quantity is not None and price > 0.0 and quantity > 0.0:
-            normalized.append([price, quantity])
+        if price is None or quantity is None or price <= 0.0 or quantity <= 0.0:
+            continue
+        normalized.append([price, quantity])
     normalized.sort(key=lambda item: item[0], reverse=bool(reverse))
+    if max_levels is None:
+        return normalized
     return normalized[: max(1, int(max_levels))]
+
+
+def _paper_only_valr_shallow_order_book(levels, *, reverse=False, max_levels=5):
+    """Normalize a bounded public VALR book without retaining full depth."""
+
+    return _paper_only_valr_normalize_order_book_side(levels, reverse=reverse, max_levels=max_levels)
+
+
+def _paper_only_valr_normalize_public_order_book(orderbook_payload, *, max_levels=5):
+    orderbook = orderbook_payload if isinstance(orderbook_payload, dict) else {}
+    bids = _paper_only_valr_normalize_order_book_side(
+        orderbook.get("bids") or orderbook.get("Bids"),
+        reverse=True,
+    )
+    asks = _paper_only_valr_normalize_order_book_side(
+        orderbook.get("asks") or orderbook.get("Asks"),
+        reverse=False,
+    )
+    best_bid = bids[0][0] if bids else None
+    best_ask = asks[0][0] if asks else None
+    bid_size = bids[0][1] if bids else None
+    ask_size = asks[0][1] if asks else None
+    mid_price = None
+    spread_bps = None
+    if best_bid is not None and best_ask is not None and best_bid > 0.0 and best_ask > 0.0:
+        mid_price = (best_bid + best_ask) / 2.0
+        if mid_price > 0.0 and best_ask >= best_bid:
+            spread_bps = ((best_ask - best_bid) / mid_price) * 10_000.0
+    anomaly_flags = ["parser_error"] if not bids and not asks else []
+    return {
+        "bids": bids[: max(1, int(max_levels))],
+        "asks": asks[: max(1, int(max_levels))],
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "bid_size": bid_size,
+        "ask_size": ask_size,
+        "mid_price": mid_price,
+        "spread_bps": spread_bps,
+        "anomaly_flags": anomaly_flags,
+    }
 
 
 def paper_only_valr_normalize_symbol(symbol):
@@ -3233,11 +3252,14 @@ def paper_only_valr_observation_from_public_payloads(
         _paper_only_valr_pick_first(ticker, "askPrice", "bestAskPrice", "ask", "ask_price")
     )
 
-    bid_book, bid_size = _paper_only_valr_order_book_top(orderbook.get("bids") or orderbook.get("Bids"), reverse=True)
-    ask_book, ask_size = _paper_only_valr_order_book_top(orderbook.get("asks") or orderbook.get("Asks"), reverse=False)
+    normalized_order_book = _paper_only_valr_normalize_public_order_book(orderbook, max_levels=5)
+    bid_book = normalized_order_book["best_bid"]
+    bid_size = normalized_order_book["bid_size"]
+    ask_book = normalized_order_book["best_ask"]
+    ask_size = normalized_order_book["ask_size"]
     shallow_order_book = {
-        "bids": _paper_only_valr_shallow_order_book(orderbook.get("bids") or orderbook.get("Bids"), reverse=True),
-        "asks": _paper_only_valr_shallow_order_book(orderbook.get("asks") or orderbook.get("Asks"), reverse=False),
+        "bids": normalized_order_book["bids"],
+        "asks": normalized_order_book["asks"],
     }
 
     if best_bid is None:
@@ -3351,6 +3373,8 @@ def paper_only_valr_observation_from_public_payloads(
         ).isoformat() if (ticker_trade_timestamp or recent_trade_timestamp) is not None else None,
         "observed_at": observed_at.isoformat() if observed_at is not None else None,
         "shallow_order_book": shallow_order_book,
+        "anomaly_flags": list(normalized_order_book["anomaly_flags"]),
+        "critical_anomaly_flags": [],
         "route_quality": route_quality,
         "paper_ineligible": paper_ineligible,
         "paper_ineligible_reason": paper_ineligible_reason,

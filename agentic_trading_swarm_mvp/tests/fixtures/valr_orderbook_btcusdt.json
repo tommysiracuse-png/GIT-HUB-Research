@@ -1,0 +1,64 @@
+{
+  "Asks": [
+    {
+      "side": "sell",
+      "quantity": "0.19407903",
+      "price": "64438",
+      "currencyPair": "BTCUSDT",
+      "orderCount": 1
+    },
+    {
+      "side": "sell",
+      "quantity": "0.025",
+      "price": "64426",
+      "currencyPair": "BTCUSDT",
+      "orderCount": 1
+    },
+    {
+      "side": "sell",
+      "quantity": "0",
+      "price": "64424",
+      "currencyPair": "BTCUSDT",
+      "orderCount": 1
+    },
+    {
+      "side": "sell",
+      "quantity": "0.01552144",
+      "price": "64427",
+      "currencyPair": "BTCUSDT",
+      "orderCount": 1
+    }
+  ],
+  "Bids": [
+    {
+      "side": "buy",
+      "quantity": "0.01554049",
+      "price": "64348",
+      "currencyPair": "BTCUSDT",
+      "orderCount": 1
+    },
+    {
+      "side": "buy",
+      "quantity": "0.025",
+      "price": "64375",
+      "currencyPair": "BTCUSDT",
+      "orderCount": 1
+    },
+    {
+      "side": "buy",
+      "quantity": "-1",
+      "price": "64390",
+      "currencyPair": "BTCUSDT",
+      "orderCount": 1
+    },
+    {
+      "side": "buy",
+      "quantity": "0.19408554",
+      "price": "64374",
+      "currencyPair": "BTCUSDT",
+      "orderCount": 1
+    }
+  ],
+  "LastChange": "2026-08-06T18:50:38.975Z",
+  "SequenceNumber": 14723244110
+}

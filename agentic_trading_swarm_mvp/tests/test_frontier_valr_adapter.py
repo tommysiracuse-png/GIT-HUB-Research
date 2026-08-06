@@ -1,11 +1,21 @@
+import json
+import pathlib
 import unittest
 
 from src.frontier_crypto_adapter import (
+    _paper_only_valr_normalize_public_order_book,
     paper_only_valr_market_catalog,
     paper_only_valr_normalize_symbol,
     paper_only_valr_observation_from_public_payloads,
 )
 from src.frontier_data_quality import paper_only_valr_public_request_plan
+
+
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+
+
+def _load_fixture(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
 class ValrPaperAdapterTests(unittest.TestCase):
@@ -70,6 +80,22 @@ class ValrPaperAdapterTests(unittest.TestCase):
         self.assertEqual(observation["instrument_metadata"]["venue_constraints"]["constraint_source"], "observed_public_payload")
         self.assertEqual(observation["shallow_order_book"]["bids"], [[1234400.0, 0.75]])
         self.assertEqual(observation["market_data_origin"], "native_public_spot")
+
+    def test_public_order_book_normalization_accepts_actual_uppercase_shape(self):
+        cases = (
+            ("valr_orderbook_btcusdt.json", 64375.0, 64426.0),
+            ("valr_orderbook_solusdc.json", 72.79, 72.89),
+        )
+
+        for fixture_name, expected_bid, expected_ask in cases:
+            with self.subTest(fixture=fixture_name):
+                normalized = _paper_only_valr_normalize_public_order_book(_load_fixture(fixture_name), max_levels=3)
+                self.assertEqual(expected_bid, normalized["best_bid"])
+                self.assertEqual(expected_ask, normalized["best_ask"])
+                self.assertEqual(expected_bid, normalized["bids"][0][0])
+                self.assertEqual(expected_ask, normalized["asks"][0][0])
+                self.assertGreater(normalized["spread_bps"], 0.0)
+                self.assertEqual([], normalized["anomaly_flags"])
 
 
 class ValrPaperDataQualityTests(unittest.TestCase):

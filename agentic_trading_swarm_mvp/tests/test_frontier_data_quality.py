@@ -21,6 +21,8 @@ import frontier_data_quality as quality
 import storage
 from settings import DEFAULT_SETTINGS
 
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+
 
 def settings() -> dict:
     return copy.deepcopy(DEFAULT_SETTINGS)
@@ -65,6 +67,10 @@ def healthy_book() -> dict:
         "book_timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
         "freshness_basis": "exchange_timestamp",
     }
+
+
+def load_fixture(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
 class DepthParserTests(unittest.TestCase):
@@ -214,6 +220,46 @@ class QualityMathTests(unittest.TestCase):
         self.assertAlmostEqual(100.0 / 1900.0, result["quote_to_usd_multiplier"], places=9)
         self.assertLess(result["depth_usd"]["bid"]["25"], 250.0)
         self.assertGreater(result["depth_usd"]["bid"]["25"], 190.0)
+
+    def test_valr_fixture_books_keep_valid_best_prices_and_nonempty_levels(self) -> None:
+        cases = (
+            ("valr_orderbook_btcusdt.json", "BTCUSDT", "USDT", 64432.0, 64375.0, 64426.0),
+            ("valr_orderbook_solusdc.json", "SOLUSDC", "USDC", 72.87, 72.79, 72.89),
+        )
+        received_at = "2026-08-06T18:50:40+00:00"
+
+        for fixture_name, symbol, quote, last_price, expected_bid, expected_ask in cases:
+            with self.subTest(fixture=fixture_name):
+                row = observation()
+                row.update(
+                    {
+                        "venue": "VALR",
+                        "symbol": symbol,
+                        "instrument_id": f"VALR:{symbol}",
+                        "route_id": "valr_spot_public",
+                        "quote": quote,
+                        "last": last_price,
+                        "bid": expected_bid,
+                        "ask": expected_ask,
+                        "usd_normalized_last": last_price,
+                    }
+                )
+                extracted = quality._extract_depth("valr_orderbook", load_fixture(fixture_name), received_at)
+                result = quality.analyze_book(
+                    row,
+                    extracted,
+                    latency_ms=100.0,
+                    received_at=received_at,
+                    fresh_seconds=30.0,
+                )
+
+                self.assertTrue(extracted["bids"])
+                self.assertTrue(extracted["asks"])
+                self.assertEqual(expected_bid, result["book_levels"]["bids"][0][0])
+                self.assertEqual(expected_ask, result["book_levels"]["asks"][0][0])
+                self.assertNotIn("empty_book", result["anomaly_flags"])
+                self.assertNotIn("invalid_best_prices", result["anomaly_flags"])
+                self.assertGreater(result["book_mid"], 0.0)
 
     def test_regional_depth_without_fx_is_unknown_not_fake_usd(self) -> None:
         row = observation()
