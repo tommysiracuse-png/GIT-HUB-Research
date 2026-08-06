@@ -102,6 +102,28 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["strategy_reliability_action"], "probation_short_expansion")
         self.assertEqual(rows[0]["strategy_reliability_allocation_multiplier"], 0.25)
 
+    def test_runtime_applies_context_prior_before_candidate_sorting(self) -> None:
+        candidate = {
+            "seen_at": "2026-06-24T00:00:00+00:00",
+            "venue": "BYBIT_SPOT",
+            "inst_id": "BYBIT_SPOT:BTC_USDT",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "score": 60.0,
+            "last": 100.0,
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+        }
+
+        rows, report = strategy_reliability.apply_strategy_reliability(
+            [candidate], {"mode": "paper", "allow_live_trading": False}
+        )
+
+        self.assertEqual(rows[0]["score"], 84.0)
+        self.assertEqual(rows[0]["final_paper_score"], 84.0)
+        self.assertEqual(rows[0]["paper_context_prior"]["venue_direction_prior"], 6.0)
+        self.assertEqual(report["paper_context_prior_adjustments"][0]["final_paper_score"], 84.0)
+
     def test_bybit_long_quality_slice_gets_probation_not_blanket_expand(self) -> None:
         candidate = base_candidate(
             venue="BYBIT_SPOT",

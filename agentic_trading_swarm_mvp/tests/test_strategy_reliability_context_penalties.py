@@ -12,6 +12,81 @@ import strategy_reliability as sr
 
 
 class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
+    def test_context_priors_promote_standard_liquid_carry_route(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "asset_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard"},
+        }
+
+        detail = sr.apply_paper_context_priors(candidate, {"mode": "paper", "allow_live_trading": False})
+
+        self.assertEqual(detail["base_signal_score"], 60.0)
+        self.assertEqual(detail["feasibility_prior"], 6.0)
+        self.assertEqual(detail["venue_direction_prior"], 8.0)
+        self.assertEqual(detail["liquidity_prior"], 4.0)
+        self.assertEqual(detail["strategy_family_prior"], 8.0)
+        self.assertEqual(candidate["final_paper_score"], 86.0)
+        self.assertEqual(candidate["score"], 86.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_not_blocked")
+        self.assertNotIn("paper_entry_blocked", candidate)
+
+    def test_context_priors_rank_down_weak_conditional_convergence_without_blocking(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "MEXC",
+            "direction": "long_frontier_spot",
+            "trade_type": "basis_mean_reversion",
+            "liquidity_score": 0.3,
+            "execution_feasibility": {"status": "conditional"},
+        }
+
+        detail = sr.apply_paper_context_priors(candidate, {"mode": "paper", "allow_live_trading": False})
+
+        self.assertEqual(detail["raw_total_prior"], -38.0)
+        self.assertEqual(candidate["score"], 22.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_not_blocked")
+        self.assertNotIn("paper_entry_blocked", candidate)
+        self.assertNotIn("paper_fill_allowed", candidate)
+
+    def test_exceptional_signal_keeps_negative_context_as_diagnostic(self) -> None:
+        candidate = {
+            "score": 90.0,
+            "venue": "MEXC",
+            "direction": "long_frontier_spot",
+            "trade_type": "basis_mean_reversion",
+            "liquidity_score": 0.3,
+            "execution_feasibility": {"status": "conditional"},
+        }
+
+        detail = sr.apply_paper_context_priors(candidate, {"mode": "paper", "allow_live_trading": False})
+
+        self.assertTrue(detail["exceptional_signal_override"])
+        self.assertEqual(detail["raw_total_prior"], -38.0)
+        self.assertEqual(detail["total_prior"], 0.0)
+        self.assertEqual(candidate["score"], 90.0)
+
+    def test_context_priors_are_inert_for_live_configuration(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "asset_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard"},
+        }
+
+        detail = sr.apply_paper_context_priors(candidate, {"mode": "live", "allow_live_trading": False})
+
+        self.assertIsNone(detail)
+        self.assertEqual(candidate["score"], 60.0)
+        self.assertNotIn("paper_context_prior", candidate)
+
     def test_context_penalties_disabled_by_default(self) -> None:
         candidate = {
             "score": 50.0,

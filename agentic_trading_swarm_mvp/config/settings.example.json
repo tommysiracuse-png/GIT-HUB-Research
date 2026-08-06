@@ -47,6 +47,27 @@
     "delay_decay_bps_per_second": 0.02,
     "max_delay_decay_bps": 8.0
   },
+  "paper_context_priors": {
+    "enabled": true,
+    "paper_only": true,
+    "exceptional_base_signal_score": 85.0,
+    "feasibility_standard_prior": 6.0,
+    "feasibility_conditional_prior": -8.0,
+    "strong_liquidity_score": 0.7,
+    "strong_liquidity_prior": 4.0,
+    "weak_liquidity_score": 0.45,
+    "weak_liquidity_prior": -8.0,
+    "carry_strategy_prior": 8.0,
+    "convergence_strategy_prior": -10.0,
+    "venue_direction_priors": {
+      "OKX_SPOT|long": 8.0,
+      "BYBIT_SPOT|long": 6.0,
+      "GATE|short": 3.0,
+      "GATE|long": -7.0,
+      "KRAKEN|long": -4.0,
+      "MEXC|long": -12.0
+    }
+  },
   "paper_route_feasibility_gate": {
     "enabled": true,
     "min_score": 0.65

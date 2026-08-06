@@ -42,6 +42,27 @@ CONTEXT_PENALTY_SCOPES = (
     "paper_policy",
     "strategy_reliability",
 )
+PAPER_CONTEXT_PRIOR_DEFAULTS = {
+    "enabled": True,
+    "paper_only": True,
+    "exceptional_base_signal_score": 85.0,
+    "feasibility_standard_prior": 6.0,
+    "feasibility_conditional_prior": -8.0,
+    "strong_liquidity_score": 0.70,
+    "strong_liquidity_prior": 4.0,
+    "weak_liquidity_score": 0.45,
+    "weak_liquidity_prior": -8.0,
+    "carry_strategy_prior": 8.0,
+    "convergence_strategy_prior": -10.0,
+    "venue_direction_priors": {
+        "OKX_SPOT|long": 8.0,
+        "BYBIT_SPOT|long": 6.0,
+        "GATE|short": 3.0,
+        "GATE|long": -7.0,
+        "KRAKEN|long": -4.0,
+        "MEXC|long": -12.0,
+    },
+}
 CRITICAL_ANOMALY_TERMS = {"crossed_book", "locked_book", "one_sided_book", "empty_book", "stale_book", "critical"}
 
 PAPER_FAMILY_QUARANTINE_FLAG_KEYS = (
@@ -2888,6 +2909,188 @@ def _set_score(candidate: dict, delta: float) -> None:
     candidate["score"] = round(max(0.0, min(100.0, original + delta)), 3)
 
 
+def _paper_context_prior_policy(config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return the paper-only context-prior policy without enabling live use."""
+    policy = dict(PAPER_CONTEXT_PRIOR_DEFAULTS)
+    policy["venue_direction_priors"] = dict(PAPER_CONTEXT_PRIOR_DEFAULTS["venue_direction_priors"])
+    if not isinstance(config, Mapping):
+        return policy
+    configured = config.get("paper_context_priors")
+    if isinstance(configured, Mapping):
+        for key, value in configured.items():
+            if key == "venue_direction_priors" and isinstance(value, Mapping):
+                policy[key].update(value)
+            else:
+                policy[key] = value
+    return policy
+
+
+def _paper_context_prior_active(candidate: Mapping[str, Any], config: Mapping[str, Any] | None) -> bool:
+    """True only for the paper/research scoring path.
+
+    Context evidence is deliberately a ranking input.  It must never leak into
+    a live route, even if this helper is called by a reused candidate pipeline.
+    """
+    policy = _paper_context_prior_policy(config)
+    if not _as_bool(policy.get("enabled"), True):
+        return False
+    if not _as_bool(policy.get("paper_only"), True):
+        return False
+    combined: list[Mapping[str, Any]] = [candidate]
+    if isinstance(config, Mapping):
+        combined.insert(0, config)
+    paper_mode_confirmed = False
+    for scope in combined:
+        if _as_bool(scope.get("allow_live_trading"), False):
+            return False
+        mode = str(
+            scope.get("mode")
+            or scope.get("runtime_mode")
+            or scope.get("execution_mode")
+            or scope.get("trading_mode")
+            or ""
+        ).strip().lower()
+        if mode in LIVE_MODE_VALUES:
+            return False
+        if mode in PAPER_MODE_VALUES:
+            paper_mode_confirmed = True
+    return paper_mode_confirmed
+
+
+def _paper_context_direction(candidate: Mapping[str, Any]) -> str:
+    explicit = str(candidate.get("position_side") or candidate.get("side") or "").strip().lower()
+    if explicit in {"long", "short"}:
+        return explicit
+    direction = str(candidate.get("direction") or "").strip().lower().replace("-", "_")
+    tokens = set(direction.split("_"))
+    if "long" in tokens and "short" not in tokens:
+        return "long"
+    if "short" in tokens and "long" not in tokens:
+        return "short"
+    return "unknown"
+
+
+def _paper_context_venue(candidate: Mapping[str, Any]) -> str:
+    venue = _venue(dict(candidate))
+    surface = str(candidate.get("asset_surface") or candidate.get("market_type") or "").strip().lower()
+    trade_type = str(candidate.get("trade_type") or "").strip().lower()
+    direction = str(candidate.get("direction") or "").strip().lower()
+    if venue == "OKX" and (surface == "spot" or ("perp" not in trade_type and "spot" in direction)):
+        return "OKX_SPOT"
+    if venue == "BYBIT" and (surface == "spot" or ("perp" not in trade_type and "spot" in direction)):
+        return "BYBIT_SPOT"
+    return venue
+
+
+def _paper_context_strategy_prior(candidate: Mapping[str, Any], policy: Mapping[str, Any]) -> tuple[float, str | None]:
+    family = " ".join(
+        str(candidate.get(field) or "").lower()
+        for field in ("strategy_family", "signal_family", "trade_type", "direction", "signal_key")
+    )
+    if any(token in family for token in ("mean_reversion", "convergence", "long_perp_short_spot")):
+        return _as_float(policy.get("convergence_strategy_prior"), -10.0), "convergence_or_mean_reversion"
+    if any(token in family for token in ("funding_capture", "short_perp_long_spot", "carry")):
+        return _as_float(policy.get("carry_strategy_prior"), 8.0), "carry_or_funding_capture"
+    return 0.0, None
+
+
+def apply_paper_context_priors(
+    candidate: dict[str, Any],
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Apply measured route, venue, liquidity, and family priors to paper rank.
+
+    This is intentionally additive and non-blocking: every priceable candidate
+    remains available to the exploration layer.  Exceptional base signals keep
+    their negative context terms as diagnostics but do not receive a negative
+    context adjustment.
+    """
+    existing = candidate.get("paper_context_prior")
+    if isinstance(existing, Mapping) and existing.get("applied"):
+        return dict(existing)
+    if not _paper_context_prior_active(candidate, config):
+        return None
+
+    policy = _paper_context_prior_policy(config)
+    base_score = round(_as_float(candidate.get("score"), 0.0), 3)
+    feasibility = candidate.get("execution_feasibility") or {}
+    route = candidate.get("execution_route") or {}
+    feasibility_status = str(
+        feasibility.get("route_status")
+        or feasibility.get("status")
+        or route.get("route_status")
+        or candidate.get("route_status")
+        or "unknown"
+    ).strip().lower()
+    feasibility_prior = (
+        _as_float(policy.get("feasibility_standard_prior"), 6.0)
+        if feasibility_status == "standard"
+        else _as_float(policy.get("feasibility_conditional_prior"), -8.0)
+        if feasibility_status == "conditional"
+        else 0.0
+    )
+    venue = _paper_context_venue(candidate)
+    direction = _paper_context_direction(candidate)
+    venue_direction_key = f"{venue}|{direction}"
+    venue_direction_prior = _as_float(
+        (policy.get("venue_direction_priors") or {}).get(venue_direction_key), 0.0
+    )
+    liquidity_raw = _maybe_float(candidate.get("liquidity_score"))
+    liquidity_score = _normalize_fraction(liquidity_raw) if liquidity_raw is not None else None
+    liquidity_prior = 0.0
+    liquidity_bucket = "unknown"
+    if liquidity_score is not None:
+        if liquidity_score >= _normalize_fraction(_as_float(policy.get("strong_liquidity_score"), 0.70)):
+            liquidity_prior = _as_float(policy.get("strong_liquidity_prior"), 4.0)
+            liquidity_bucket = "strong"
+        elif liquidity_score < _normalize_fraction(_as_float(policy.get("weak_liquidity_score"), 0.45)):
+            liquidity_prior = _as_float(policy.get("weak_liquidity_prior"), -8.0)
+            liquidity_bucket = "weak"
+        else:
+            liquidity_bucket = "normal"
+    strategy_family_prior, strategy_family = _paper_context_strategy_prior(candidate, policy)
+    terms = {
+        "feasibility_prior": round(feasibility_prior, 3),
+        "venue_direction_prior": round(venue_direction_prior, 3),
+        "liquidity_prior": round(liquidity_prior, 3),
+        "strategy_family_prior": round(strategy_family_prior, 3),
+    }
+    raw_total_prior = round(sum(terms.values()), 3)
+    exceptional = base_score >= _as_float(policy.get("exceptional_base_signal_score"), 85.0)
+    existing_safety_state = bool(candidate.get("paper_entry_blocked")) or candidate.get("paper_score_eligible") is False
+    # A context prior can reorder priceable exploration candidates, but must
+    # not revive a score that an earlier immutable/safety guard intentionally
+    # set aside.
+    total_prior = 0.0 if existing_safety_state else max(0.0, raw_total_prior) if exceptional else raw_total_prior
+    final_score = round(max(0.0, min(100.0, base_score + total_prior)), 3)
+    detail = {
+        "paper_only": True,
+        "applied": True,
+        "base_signal_score": base_score,
+        "final_paper_score": final_score,
+        **terms,
+        "raw_total_prior": raw_total_prior,
+        "total_prior": round(total_prior, 3),
+        "exceptional_signal_override": exceptional and raw_total_prior < 0.0,
+        "existing_safety_state_preserved": existing_safety_state,
+        "feasibility_status": feasibility_status,
+        "venue_direction_key": venue_direction_key,
+        "liquidity_score": round(liquidity_score, 6) if liquidity_score is not None else None,
+        "liquidity_bucket": liquidity_bucket,
+        "strategy_family": strategy_family,
+    }
+    candidate["score"] = final_score
+    candidate["final_paper_score"] = final_score
+    candidate["paper_context_prior"] = detail
+    candidate["paper_context_prior_status"] = "ranked_not_blocked"
+    if raw_total_prior:
+        _append_note(candidate, "paper_context_prior:exceptional_signal_override" if detail["exceptional_signal_override"] else "paper_context_prior:applied")
+    reliability = candidate.get("strategy_reliability")
+    if isinstance(reliability, dict):
+        reliability["paper_context_prior"] = detail
+    return detail
+
+
 def _remove_invalid_proxy_confirmation(candidate: dict) -> dict[str, Any] | None:
     """Remove invalid Yahoo proxy influence while retaining the candidate."""
 
@@ -4474,10 +4677,14 @@ def apply_strategy_reliability(
         }
 
     adjusted = []
+    context_prior_adjustments = []
     for candidate in candidates:
         reliability = _apply_one(candidate, config=settings, conn=conn)
         if reliability:
             adjusted.append(reliability)
+        context_prior = apply_paper_context_priors(candidate, settings)
+        if context_prior is not None:
+            context_prior_adjustments.append(context_prior)
     candidates.sort(key=lambda row: row.get("score", 0), reverse=True)
 
     top_adjustments = sorted(
@@ -4490,6 +4697,11 @@ def apply_strategy_reliability(
         "generated_at": _utc_now(),
         "summary": _summarize(adjusted, candidates),
         "top_adjustments": top_adjustments,
+        "paper_context_prior_adjustments": sorted(
+            context_prior_adjustments,
+            key=lambda row: abs(_as_float(row.get("total_prior"))),
+            reverse=True,
+        )[:50],
         "covered_improvement_task_ids": COVERED_IMPROVEMENT_TASK_IDS,
         "covered_growth_experiment_ids": COVERED_GROWTH_EXPERIMENT_IDS,
         "task_cleanup": _cleanup_manual_tasks(conn),
