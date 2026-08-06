@@ -128,6 +128,31 @@ class RegionalFxReferenceTests(unittest.TestCase):
         self.assertEqual(set(refs), {"AUD", "EUR", "GBP"})
         self.assertTrue({"AUD", "EUR", "GBP"}.issubset(set(fallback_refs)))
 
+    def test_fetch_without_db_connection_uses_internal_memory_cache(self) -> None:
+        old_fetch = fx.fetch_json
+        old_memory_cache = fx._MEMORY_CACHE_CONN
+        calls = []
+
+        def fake_fetch(url: str, timeout: int = 10):
+            calls.append(url)
+            return {"rates": {"ZAR": 18.0}, "time_last_update_unix": 1_700_000_000}
+
+        fx._MEMORY_CACHE_CONN = None
+        fx.fetch_json = fake_fetch
+        try:
+            first = fx.get_regional_fx_references(None, settings(), quotes={"ZAR"}, force_refresh=True)
+            second = fx.get_regional_fx_references(None, settings(), quotes={"ZAR"})
+        finally:
+            fx.fetch_json = old_fetch
+            if fx._MEMORY_CACHE_CONN is not None and fx._MEMORY_CACHE_CONN is not old_memory_cache:
+                fx._MEMORY_CACHE_CONN.close()
+            fx._MEMORY_CACHE_CONN = old_memory_cache
+
+        self.assertEqual({"ZAR"}, set(first))
+        self.assertEqual({"ZAR"}, set(second))
+        self.assertEqual(1, len(calls))
+        self.assertEqual("ExchangeRate-API Open", second["ZAR"]["provider"])
+
     def test_yahoo_fallback_backfills_missing_frontier_quote_after_partial_primary_coverage(self) -> None:
         old_fetch = fx.fetch_json
         calls = []

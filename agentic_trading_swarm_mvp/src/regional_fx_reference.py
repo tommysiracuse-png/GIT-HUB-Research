@@ -40,6 +40,7 @@ EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/USD"
 FRANKFURTER_URL = "https://api.frankfurter.dev/v2/rates"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 YAHOO_FX_PROVIDER = "Yahoo Finance FX"
+_MEMORY_CACHE_CONN: sqlite3.Connection | None = None
 
 
 def _utc_now() -> str:
@@ -245,6 +246,38 @@ def _yahoo_fx_url(quote: str) -> str:
     return YAHOO_CHART_URL.format(symbol=urllib.parse.quote(_yahoo_fx_symbol(quote))) + "?" + params
 
 
+def _in_memory_cache_conn() -> sqlite3.Connection:
+    global _MEMORY_CACHE_CONN
+    if _MEMORY_CACHE_CONN is None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            create table if not exists regional_fx_snapshots (
+                id integer primary key autoincrement,
+                fetched_at text not null,
+                provider text not null,
+                base text not null,
+                quote text not null,
+                rate real,
+                provider_updated_at text,
+                next_update_at text,
+                status text not null,
+                source_url text not null,
+                payload_json text not null,
+                unique(provider, base, quote, fetched_at)
+            )
+            """
+        )
+        conn.execute(
+            "create index if not exists idx_regional_fx_quote_time "
+            "on regional_fx_snapshots(base, quote, fetched_at)"
+        )
+        conn.commit()
+        _MEMORY_CACHE_CONN = conn
+    return _MEMORY_CACHE_CONN
+
+
 def _latest_cached(
     conn: sqlite3.Connection,
     quotes: set[str],
@@ -325,8 +358,9 @@ def get_regional_fx_references(
     force_refresh: bool = False,
 ) -> dict[str, dict]:
     cfg = (settings or {}).get("frontier_regional_fx", {})
-    if not cfg.get("enabled", True) or conn is None:
+    if not cfg.get("enabled", True):
         return {}
+    conn = conn or _in_memory_cache_conn()
     wanted = _configured_quotes(settings, quotes)
     if not wanted:
         return {}
