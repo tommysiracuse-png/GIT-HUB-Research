@@ -251,6 +251,123 @@ class PaperExplorationTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_frontier_short_diagnostics_split_stale_illiquid_high_basis_subsets_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            try:
+                observed_at = dt.datetime.now(dt.timezone.utc).isoformat()
+
+                def record_trade(index: int, *, frontier_short: bool, premium_bps: float, pnl_bps: float) -> None:
+                    if frontier_short:
+                        candidate = {
+                            "venue": f"FRONTIER_{index}",
+                            "inst_id": f"FRONTIER_{index}:BTC-ZAR",
+                            "trade_type": "frontier_crypto_venue_map",
+                            "direction": "short_frontier_spot",
+                            "last": 100.0,
+                            "score": 65.0,
+                            "thesis": "frontier short diagnostic",
+                            "signal_stats_scope": "synthetic_research",
+                            "synthetic_research_paper": True,
+                            "region": "Africa",
+                            "quote": "ZAR",
+                            "quote_normalization_status": "external_fx_reference",
+                            "premium_vs_reference_bps": premium_bps,
+                            "basis_bps": 32.0,
+                            "liquidity_score": 0.2,
+                            "spread_bps": 12.0,
+                            "freshness_age_seconds": 240.0,
+                            "edge_bps_estimate": 18.0,
+                        }
+                    else:
+                        candidate = {
+                            "venue": f"CONTROL_{index}",
+                            "inst_id": f"CONTROL_{index}:BTC-USDT",
+                            "trade_type": "frontier_crypto_venue_map",
+                            "direction": "long_frontier_spot",
+                            "last": 100.0,
+                            "score": 67.0,
+                            "thesis": "nearby control diagnostic",
+                            "signal_stats_scope": "paper_proxy" if index % 2 else "direct",
+                            "paper_proxy_activated": bool(index % 2),
+                            "region": "Global",
+                            "quote": "USDT",
+                            "premium_vs_reference_bps": premium_bps,
+                            "basis_bps": 3.0,
+                            "liquidity_score": 0.9,
+                            "spread_bps": 2.0,
+                            "freshness_age_seconds": 12.0,
+                            "edge_bps_estimate": 20.0,
+                        }
+                    review = {
+                        "decision": "approve_paper_trade",
+                        "learned_score": candidate["score"],
+                        "net_edge_bps_estimate": candidate["edge_bps_estimate"],
+                    }
+                    trade_id = open_paper_trade(conn, candidate, review, settings=self.settings)
+                    conn.execute(
+                        """
+                        insert into paper_trade_outcomes (
+                            trade_id, horizon_minutes, measured_at, price, pnl_bps, context_json,
+                            target_at, observed_at, delay_seconds, measurement_status, price_source
+                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            trade_id,
+                            60,
+                            observed_at,
+                            100.0,
+                            pnl_bps,
+                            "{}",
+                            observed_at,
+                            observed_at,
+                            0.0,
+                            "valid",
+                            "unit_test",
+                        ),
+                    )
+
+                for index, premium in enumerate(range(10, 110, 10), start=1):
+                    record_trade(index, frontier_short=True, premium_bps=float(premium), pnl_bps=-15.0 - index)
+                    record_trade(index, frontier_short=False, premium_bps=float(premium), pnl_bps=8.0 + index)
+                conn.commit()
+
+                report = build_paper_exploration_report(conn, self.settings)
+                diagnostics = report["frontier_short_diagnostics"]
+                compact = compact_paper_exploration_report(report)
+
+                self.assertTrue(diagnostics["paper_only"])
+                self.assertFalse(diagnostics["entry_blocked"])
+                self.assertEqual(10, diagnostics["frontier_short_valid_outcome_count"])
+                self.assertEqual(10, diagnostics["control_valid_outcome_count"])
+                self.assertEqual(10, len(diagnostics["premium_decile_outcomes"]))
+                self.assertEqual(
+                    True,
+                    diagnostics["concentration_flags"]["stale_subset_underperforming"],
+                )
+                self.assertEqual(
+                    True,
+                    diagnostics["concentration_flags"]["illiquid_subset_underperforming"],
+                )
+                self.assertEqual(
+                    True,
+                    diagnostics["concentration_flags"]["high_basis_subset_underperforming"],
+                )
+                self.assertTrue(diagnostics["market_structure_misclassification_likely"])
+                self.assertEqual(
+                    10,
+                    diagnostics["stricter_stale_print_filter"]["frontier_short_excluded_count"],
+                )
+                self.assertEqual(
+                    5,
+                    len(compact["frontier_short_diagnostics"]["premium_decile_outcomes"]),
+                )
+                self.assertTrue(
+                    compact["frontier_short_diagnostics"]["market_structure_misclassification_likely"]
+                )
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
