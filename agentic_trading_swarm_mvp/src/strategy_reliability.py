@@ -4201,15 +4201,24 @@ def _apply_okx_basis_decay_quarantine(
             "guard": record.get("guard"),
             "record": dict(record),
         }
+        candidate["candidate_status"] = "shadow_quarantined"
         candidate["paper_quarantine_status"] = "shadow_quarantined"
         candidate["paper_fill_allowed"] = True
         candidate["promotion_eligible"] = False
         candidate["_hunter_bucket"] = "diagnose"
+        if not candidate.get("paper_exploration_immutable_rejections") and not candidate.get(
+            "paper_experiment_capacity_deferred"
+        ):
+            candidate["shadow_filtered"] = False
+            candidate["paper_entry_blocked"] = False
+            candidate.pop("candidate_reject_reason", None)
+            candidate.pop("candidate_reject_detail", None)
         reliability["paper_okx_basis_decay_quarantine"] = dict(record)
         reliability["okx_basis_decay_quarantine_score_policy"] = dict(score_policy)
         _append_note(candidate, "paper_guard_would_block:okx_basis_decay_quarantine")
         return reliability
     score_policy = apply_okx_basis_decay_score_policy(candidate, config, zero_score=True)
+    candidate["candidate_status"] = "shadow_quarantined"
     candidate["paper_fill_allowed"] = False
     candidate["paper_action"] = "shadow_trial"
     candidate["paper_execution_mode"] = "observe_only"

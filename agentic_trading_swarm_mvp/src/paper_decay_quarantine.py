@@ -419,6 +419,7 @@ def apply_quarantine(
             "guard": POLICY_KEY,
             "record": dict(record),
         }
+        guarded["candidate_status"] = "shadow_quarantined"
         guarded["paper_quarantine_status"] = "shadow_quarantined"
         guarded["promotion_eligible"] = False
         guarded["_hunter_bucket"] = "diagnose"
@@ -440,6 +441,7 @@ def apply_quarantine(
             "paper_execution_mode": "observe_only",
             "paper_observation_only": True,
             "paper_observation_reason": REASON,
+            "candidate_status": "shadow_quarantined",
             "paper_quarantine_status": "shadow_quarantined",
             "promotion_eligible": False,
             "candidate_reject_reason": REASON,

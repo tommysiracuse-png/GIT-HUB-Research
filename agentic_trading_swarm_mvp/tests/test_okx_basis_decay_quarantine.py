@@ -66,11 +66,30 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
                 blocked["okx_basis_decay_quarantine_score_policy"]["mode"],
             )
             self.assertEqual(65.0, blocked["okx_basis_decay_quarantine_score_policy"]["post_quarantine_score"])
+            self.assertEqual("shadow_quarantined", blocked["candidate_status"])
+            self.assertFalse(blocked.get("paper_entry_blocked", False))
             self.assertTrue(blocked.get("paper_fill_allowed", True))
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["funding_capture_long_perp"])
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["short_perp_long_spot"])
             self.assertEqual(1, report["summary"]["okx_basis_decay_quarantine_count"])
             conn.close()
+
+    def test_diagnostic_quarantine_clears_stale_block_state(self) -> None:
+        candidate = self.candidate(
+            paper_entry_blocked=True,
+            shadow_filtered=True,
+            candidate_reject_reason="legacy_guard",
+            candidate_reject_detail={"reason": "legacy_guard"},
+        )
+
+        rows, _ = apply_strategy_reliability([candidate], self.settings)
+        guarded = rows[0]
+
+        self.assertEqual("shadow_quarantined", guarded["candidate_status"])
+        self.assertFalse(guarded.get("paper_entry_blocked", False))
+        self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertNotIn("candidate_reject_reason", guarded)
+        self.assertNotIn("candidate_reject_detail", guarded)
 
     def test_only_exact_basis_mean_reversion_directions_are_quarantined(self) -> None:
         conditional = self.candidate(

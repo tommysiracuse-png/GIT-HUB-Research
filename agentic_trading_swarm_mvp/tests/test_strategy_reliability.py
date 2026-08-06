@@ -231,6 +231,7 @@ class StrategyReliabilityTests(unittest.TestCase):
 
         self.assertFalse(rows[0].get("paper_entry_blocked", False))
         self.assertEqual(rows[0]["strategy_reliability_action"], "decay_quarantine_shadow_trial")
+        self.assertEqual(rows[0]["candidate_status"], "shadow_quarantined")
         self.assertEqual(rows[0]["candidate_reject_reason"], "decayed_basis_mean_reversion_quarantine")
         self.assertEqual(rows[0]["score"], 0.0)
 
