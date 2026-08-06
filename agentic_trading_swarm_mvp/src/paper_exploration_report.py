@@ -13,6 +13,7 @@ from paper_decay_quarantine import (
     REASON as OKX_BASIS_DECAY_QUARANTINE_REASON,
     matches_reason as okx_basis_decay_matches_reason,
     runtime_report as okx_basis_decay_quarantine_runtime_report,
+    target_signal as okx_basis_decay_target_signal,
 )
 
 
@@ -74,7 +75,12 @@ def build_paper_exploration_report(
         candidate = (item or {}).get("candidate") or {}
         review = (item or {}).get("review") or {}
         record = candidate.get("paper_okx_basis_decay_quarantine")
-        if not isinstance(record, dict) or not record.get("active") or not okx_basis_decay_matches_reason(record.get("reason")):
+        if (
+            not isinstance(record, dict)
+            or not record.get("active")
+            or not okx_basis_decay_matches_reason(record.get("reason"))
+            or okx_basis_decay_target_signal(candidate) is None
+        ):
             continue
         cycle_quarantined_count += 1
         if str(review.get("decision") or "").strip() in {"approve_paper_trade", "approve_conditional_paper_trade"}:

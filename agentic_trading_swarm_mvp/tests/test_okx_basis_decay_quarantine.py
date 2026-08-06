@@ -282,6 +282,38 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             )
             conn.close()
 
+    def test_runtime_report_cycle_counters_ignore_positive_control_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            decayed_rows, _ = apply_strategy_reliability([self.candidate()], self.settings, conn=conn)
+            decayed = decayed_rows[0]
+            protected = self.candidate(
+                direction="funding_capture_long_perp",
+                signal_key="OKX|perp_funding_basis|funding_capture_long_perp|conditional",
+            )
+            protected["paper_okx_basis_decay_quarantine"] = dict(decayed["paper_okx_basis_decay_quarantine"])
+
+            paper_report = build_paper_exploration_report(
+                conn,
+                self.settings,
+                reviewed=[
+                    {"candidate": decayed, "review": {"decision": "approve_paper_trade"}},
+                    {"candidate": protected, "review": {"decision": "approve_paper_trade"}},
+                ],
+            )
+
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["current_cycle_quarantined_count"])
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["current_cycle_would_have_filled_count"])
+            self.assertEqual(
+                1,
+                paper_report["summary"]["okx_basis_decay_quarantine_current_cycle_quarantined_count"],
+            )
+            self.assertEqual(
+                1,
+                paper_report["summary"]["okx_basis_decay_quarantine_current_cycle_would_have_filled_count"],
+            )
+            conn.close()
+
     def test_runtime_report_releases_after_the_fourteen_day_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
