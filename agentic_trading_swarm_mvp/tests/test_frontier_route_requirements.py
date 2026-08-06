@@ -134,6 +134,42 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
             "explicit_borrow_ok",
         )
 
+    def test_verified_standard_short_route_remains_active_without_explicit_borrow_flag(self):
+        gate = paper_only_conditional_short_route_feasibility_gate(
+            venue="GATE",
+            direction="short_frontier_spot",
+            context_stats={
+                "execution_feasibility": {"status": "conditional", "route_status": "conditional"},
+                "trade_type": "frontier_crypto_venue_map",
+                "paper_route_registry": {"support_status": "supported"},
+                "margin_eligible": True,
+                "fees_modeled": True,
+                "symbol_supported": True,
+                "supports_conditional_orders": True,
+                "paper_route_requirement_report": {
+                    "route_requirements": {
+                        "route_requirement_checklist": {
+                            "shortable_inventory_declared": True,
+                            "borrow_cost_model_present": True,
+                            "venue_supports_margin_or_equivalent": True,
+                            "fees_modeled": True,
+                        }
+                    }
+                },
+            },
+        )
+
+        self.assertTrue(gate["applied"])
+        self.assertTrue(gate["active_scoring_eligible"])
+        self.assertFalse(gate["shadow_label"])
+        self.assertFalse(gate["paper_ineligible"])
+        self.assertFalse(gate["explicit_borrow_ok"])
+        self.assertTrue(gate["verified_standard_route"])
+        self.assertEqual(
+            gate["route_feasibility_reason"],
+            "verified_standard_short_route",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6130,12 +6130,43 @@ def paper_only_cross_market_risk_gate(
 ) -> dict:
     """Paper-only gate for cross-market divergence observation and exit logic."""
 
-    divergence = float(divergence_bps or 0.0)
-    trigger = float(trigger_bps or 0.0)
-    freshness_limit = float(freshness_limit_ms or DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY["freshness_limit_ms"])
-    mean_reversion = float(mean_reversion_bps or DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY["mean_reversion_bps"])
-    freshness_a = float(source_a_freshness_ms or 0.0)
-    freshness_b = float(source_b_freshness_ms or 0.0)
+    freshness_limit = float(
+        freshness_limit_ms
+        or DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY["freshness_limit_ms"]
+    )
+    mean_reversion = float(
+        mean_reversion_bps
+        or DEFAULT_PAPER_ONLY_CROSS_MARKET_RISK_GATE_POLICY["mean_reversion_bps"]
+    )
+    has_required_inputs = all(
+        value is not None
+        for value in (
+            divergence_bps,
+            trigger_bps,
+            source_a_freshness_ms,
+            source_b_freshness_ms,
+        )
+    )
+    if not enabled or not has_required_inputs:
+        return {
+            "enabled": bool(enabled),
+            "applicable": bool(enabled and has_required_inputs),
+            "allow_record": False,
+            "close_position": False,
+            "fresh": None,
+            "exceeds_trigger": None,
+            "mean_reverted": None,
+            "score_multiplier": 1.0,
+            "divergence_bps": None if divergence_bps is None else float(divergence_bps),
+            "trigger_bps": None if trigger_bps is None else float(trigger_bps),
+            "freshness_limit_ms": freshness_limit,
+            "reason": "disabled" if not enabled else "insufficient_inputs",
+        }
+
+    divergence = float(divergence_bps)
+    trigger = float(trigger_bps)
+    freshness_a = float(source_a_freshness_ms)
+    freshness_b = float(source_b_freshness_ms)
     fresh = freshness_a <= freshness_limit and freshness_b <= freshness_limit
     exceeds_trigger = divergence > trigger
     mean_reverted = abs(divergence) <= mean_reversion
@@ -6146,6 +6177,7 @@ def paper_only_cross_market_risk_gate(
         score_multiplier = 0.0
     return {
         "enabled": bool(enabled),
+        "applicable": True,
         "allow_record": allow_record,
         "close_position": close_position,
         "fresh": fresh,
@@ -6155,6 +6187,7 @@ def paper_only_cross_market_risk_gate(
         "divergence_bps": divergence,
         "trigger_bps": trigger,
         "freshness_limit_ms": freshness_limit,
+        "reason": "allow_record" if allow_record else "close_position" if close_position else "observe_only",
     }
 
 
