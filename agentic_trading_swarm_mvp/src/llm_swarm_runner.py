@@ -1601,6 +1601,8 @@ def _strict_contract_failure(agent: dict, raw_response: str) -> tuple[str, str] 
         priority = parsed.get("priority")
         if isinstance(priority, bool) or not isinstance(priority, int):
             return "invalid_schema", "priority_must_be_integer"
+        if not 1 <= priority <= 100:
+            return "invalid_schema", "priority_out_of_range"
         return "invalid_schema", "recommendation_schema_invalid"
 
 

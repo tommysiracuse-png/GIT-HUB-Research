@@ -135,6 +135,15 @@ class RecommendationFinalizerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     finalize_red_team_response(response)
 
+    def test_red_team_schema_rejects_out_of_range_priority(self):
+        invalid_priority = _payload(priority=0)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "red-team recommendation priority must be an integer between 1 and 100",
+        ):
+            finalize_red_team_response(json.dumps(invalid_priority))
+
 
 class CrossMarketResearcherRetryTests(unittest.TestCase):
     def setUp(self):
@@ -346,6 +355,43 @@ class RedTeamStrictRetryTests(unittest.TestCase):
         self.assertIn("exactly one complete JSON object", rec["evidence"]["schema_violation"])
         self.assertEqual(rec["evidence"]["raw_generation_metadata"]["retry"]["response_text"], wrapped)
         self.assertEqual(rec["retry_count"], 1)
+
+    def test_out_of_range_priority_retries_once_and_accepts_valid_retry(self):
+        invalid_priority = json.dumps(
+            {
+                "action": "propose_diagnostic_hypothesis",
+                "priority": 0,
+                "title": "Priority is invalid",
+                "rationale": "This should be retried instead of being accepted.",
+                "market_key": "paper.red_team",
+                "evidence": {"issue": "schema"},
+                "proposed_change": {"summary": "Repair the response."},
+            }
+        )
+        valid_retry = json.dumps(
+            {
+                "action": "propose_diagnostic_hypothesis",
+                "priority": 50,
+                "title": "Retry repaired the priority",
+                "rationale": "The follow-up response satisfied the strict contract.",
+                "market_key": "paper.red_team.okx",
+                "evidence": {"issue": "priority range"},
+                "proposed_change": {"summary": "Measure the failure before changing code."},
+            }
+        )
+
+        with mock.patch.object(
+            llm_swarm_runner,
+            "complete",
+            side_effect=[_model_result(invalid_priority), _model_result(valid_retry)],
+        ) as complete:
+            rec = llm_swarm_runner.run_agent(self.agent, self.packet, [])
+
+        self.assertEqual(complete.call_count, 2)
+        self.assertEqual(complete.call_args.kwargs["operation"], "llm_swarm_schema_retry")
+        self.assertEqual(rec["title"], "Retry repaired the priority")
+        self.assertEqual(rec["retry_count"], 1)
+        self.assertEqual(rec["initial_parse_status"], "invalid_schema")
 
 
 class CrossMarketSchemaRetryPromptTests(unittest.TestCase):

@@ -269,7 +269,9 @@ def validate_red_team_object(payload: Any) -> None:
     if payload["action"] not in RED_TEAM_ALLOWED_ACTIONS:
         raise ValueError("red-team recommendation action is not allowed")
     if isinstance(payload["priority"], bool) or not isinstance(payload["priority"], int):
-        raise ValueError("red-team recommendation priority must be an integer")
+        raise ValueError("red-team recommendation priority must be an integer between 1 and 100")
+    if not 1 <= payload["priority"] <= 100:
+        raise ValueError("red-team recommendation priority must be an integer between 1 and 100")
     if not isinstance(payload["evidence"], dict):
         raise ValueError("red-team recommendation evidence must be a JSON object")
     if not isinstance(payload["proposed_change"], dict):
