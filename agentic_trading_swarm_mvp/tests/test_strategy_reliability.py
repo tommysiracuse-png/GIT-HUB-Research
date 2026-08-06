@@ -120,11 +120,14 @@ class StrategyReliabilityTests(unittest.TestCase):
             [candidate], {"mode": "paper", "allow_live_trading": False}
         )
 
-        self.assertEqual(rows[0]["score"], 76.0)
-        self.assertEqual(rows[0]["final_paper_score"], 76.0)
+        self.assertEqual(rows[0]["score"], 75.0)
+        self.assertEqual(rows[0]["final_paper_score"], 75.0)
         self.assertEqual(rows[0]["paper_context_prior"]["context_slice_key"], "BYBIT_SPOT|long|standard")
         self.assertEqual(rows[0]["paper_context_prior"]["context_slice_prior"], 6.0)
-        self.assertEqual(report["paper_context_prior_adjustments"][0]["final_paper_score"], 76.0)
+        self.assertFalse(rows[0]["promotion_eligible"])
+        self.assertFalse(rows[0]["paper_context_top_rank_eligible"])
+        self.assertEqual(rows[0]["paper_context_prior_status"], "ranked_hard_gated")
+        self.assertEqual(report["paper_context_prior_adjustments"][0]["final_paper_score"], 75.0)
 
     def test_runtime_hydrates_realized_context_by_venue_direction_and_feasibility(self) -> None:
         standard = {

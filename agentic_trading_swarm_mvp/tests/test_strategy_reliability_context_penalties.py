@@ -31,9 +31,11 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(detail["context_slice_key"], "OKX_SPOT|long|standard")
         self.assertEqual(detail["liquidity_prior"], 4.0)
         self.assertEqual(detail["strategy_family"], "carry_or_funding_capture")
-        self.assertEqual(candidate["final_paper_score"], 78.0)
-        self.assertEqual(candidate["score"], 78.0)
-        self.assertEqual(candidate["paper_context_prior_status"], "ranked_not_blocked")
+        self.assertEqual(candidate["final_paper_score"], 75.0)
+        self.assertEqual(candidate["score"], 75.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
+        self.assertFalse(candidate["promotion_eligible"])
+        self.assertFalse(candidate["paper_context_top_rank_eligible"])
         self.assertNotIn("paper_entry_blocked", candidate)
 
     def test_context_priors_use_positive_realized_slice_evidence(self) -> None:
@@ -68,8 +70,44 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(detail["realized_context_closed_count"], 10)
         self.assertEqual(detail["realized_context_avg_pnl_bps"], 20.0)
         self.assertEqual(detail["realized_context_prior"], 4.0)
+        self.assertEqual(candidate["final_paper_score"], 75.0)
+        self.assertEqual(candidate["score"], 75.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
+        self.assertFalse(candidate["paper_context_top_rank_eligible"])
+
+    def test_context_priors_allow_proven_positive_standard_slice_to_clear_top_rank_cap(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "asset_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard"},
+        }
+
+        detail = sr.apply_paper_context_priors(
+            candidate,
+            {
+                "mode": "paper",
+                "allow_live_trading": False,
+                "paper_context_priors": {
+                    "realized_context_stats": {
+                        "OKX_SPOT|long|standard": {
+                            "closed_count": 30,
+                            "avg_pnl_bps": 20.0,
+                            "win_rate": 0.7,
+                        }
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(detail["realized_context_closed_count"], 30)
         self.assertEqual(candidate["final_paper_score"], 82.0)
         self.assertEqual(candidate["score"], 82.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_not_blocked")
+        self.assertTrue(candidate["paper_context_top_rank_eligible"])
 
     def test_context_priors_differentiate_standard_and_conditional_slices(self) -> None:
         standard = {
@@ -111,7 +149,8 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
 
         self.assertEqual(detail["raw_total_prior"], -33.0)
         self.assertEqual(candidate["score"], 27.0)
-        self.assertEqual(candidate["paper_context_prior_status"], "ranked_not_blocked")
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_promotion_gated")
+        self.assertFalse(candidate["promotion_eligible"])
         self.assertNotIn("paper_entry_blocked", candidate)
         self.assertNotIn("paper_fill_allowed", candidate)
 
@@ -147,7 +186,8 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(detail["realized_context_prior"], -15.75)
         self.assertEqual(detail["raw_total_prior"], -48.75)
         self.assertEqual(candidate["score"], 11.25)
-        self.assertEqual(candidate["paper_context_prior_status"], "ranked_not_blocked")
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_promotion_gated")
+        self.assertFalse(candidate["promotion_eligible"])
         self.assertNotIn("paper_entry_blocked", candidate)
 
     def test_exceptional_signal_keeps_negative_context_as_diagnostic(self) -> None:
@@ -165,7 +205,9 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertTrue(detail["exceptional_signal_override"])
         self.assertEqual(detail["raw_total_prior"], -33.0)
         self.assertEqual(detail["total_prior"], 0.0)
-        self.assertEqual(candidate["score"], 90.0)
+        self.assertTrue(detail["exceptional_signal_override"])
+        self.assertEqual(candidate["score"], 35.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
 
     def test_context_priors_are_inert_for_live_configuration(self) -> None:
         candidate = {

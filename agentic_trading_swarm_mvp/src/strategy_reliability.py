@@ -51,6 +51,10 @@ PAPER_CONTEXT_PRIOR_DEFAULTS = {
     "exceptional_base_signal_score": 85.0,
     "feasibility_standard_prior": 6.0,
     "feasibility_conditional_prior": -10.0,
+    "top_rank_min_closed_trades": 25,
+    "top_rank_min_avg_pnl_bps": 0.0,
+    "top_rank_score_cap": 75.0,
+    "conditional_rank_score_cap": 35.0,
     "realized_context_window_closed_trades": 30,
     "realized_context_min_closed_trades": 6,
     "realized_context_positive_scale": 0.2,
@@ -78,6 +82,16 @@ PAPER_CONTEXT_PRIOR_DEFAULTS = {
         "MEXC|long|standard": -12.0,
         "MEXC|long|conditional": -15.0,
     },
+}
+PAPER_CONTEXT_RANK_GATE_TRADE_TYPES = {
+    "frontier_crypto_venue_map",
+    "perp_funding_basis",
+    "spot_carry",
+    "basis_mean_reversion",
+}
+PAPER_CONTEXT_RANK_GATE_FAMILIES = {
+    "carry_or_funding_capture",
+    "convergence_or_mean_reversion",
 }
 CRITICAL_ANOMALY_TERMS = {"crossed_book", "locked_book", "one_sided_book", "empty_book", "stale_book", "critical"}
 
@@ -3439,6 +3453,78 @@ def _paper_context_realized_prior(
     return round(prior, 3), detail
 
 
+def _paper_context_rank_gate_applies(
+    candidate: Mapping[str, Any],
+    *,
+    strategy_family: str | None,
+) -> bool:
+    trade_type = str(candidate.get("trade_type") or "").strip().lower()
+    if trade_type in PAPER_CONTEXT_RANK_GATE_TRADE_TYPES:
+        return True
+    return strategy_family in PAPER_CONTEXT_RANK_GATE_FAMILIES
+
+
+def _paper_context_rank_gate(
+    candidate: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    *,
+    feasibility_status: str,
+    strategy_family: str | None,
+    realized_context: Mapping[str, Any],
+    pre_gate_score: float,
+) -> dict[str, Any]:
+    applies = _paper_context_rank_gate_applies(candidate, strategy_family=strategy_family)
+    min_closed_trades = max(1, _as_int(policy.get("top_rank_min_closed_trades"), 25))
+    min_avg_pnl_bps = _as_float(policy.get("top_rank_min_avg_pnl_bps"), 0.0)
+    top_rank_score_cap = round(_as_float(policy.get("top_rank_score_cap"), 75.0), 3)
+    conditional_rank_score_cap = round(
+        min(
+            top_rank_score_cap,
+            _as_float(policy.get("conditional_rank_score_cap"), 35.0),
+        ),
+        3,
+    )
+    realized_closed_count = _as_int(realized_context.get("closed_count"), 0)
+    realized_avg_pnl_bps = _maybe_float(realized_context.get("avg_pnl_bps"))
+    sufficient_sample = realized_closed_count >= min_closed_trades
+    positive_expectancy = realized_avg_pnl_bps is not None and realized_avg_pnl_bps > min_avg_pnl_bps
+    top_rank_eligible = bool(
+        applies and feasibility_status == "standard" and sufficient_sample and positive_expectancy
+    )
+    reason = "not_applicable"
+    score_cap = None
+    if applies and feasibility_status == "conditional":
+        reason = "conditional_context_rank_gated"
+        score_cap = conditional_rank_score_cap
+    elif applies and not top_rank_eligible:
+        if not sufficient_sample:
+            reason = "insufficient_venue_direction_closed_trades"
+        elif not positive_expectancy:
+            reason = "non_positive_venue_direction_expectancy"
+        else:
+            reason = "top_rank_evidence_not_confirmed"
+        score_cap = top_rank_score_cap
+
+    gated_score = round(min(pre_gate_score, score_cap), 3) if score_cap is not None else round(pre_gate_score, 3)
+    return {
+        "enabled": applies,
+        "applied": applies and score_cap is not None and gated_score < round(pre_gate_score, 3),
+        "reason": reason,
+        "feasibility_status": feasibility_status,
+        "min_closed_trades": min_closed_trades,
+        "min_avg_pnl_bps": round(min_avg_pnl_bps, 3),
+        "realized_closed_count": realized_closed_count,
+        "realized_avg_pnl_bps": round(realized_avg_pnl_bps, 3) if realized_avg_pnl_bps is not None else None,
+        "sufficient_sample": sufficient_sample,
+        "positive_expectancy": positive_expectancy,
+        "top_rank_eligible": top_rank_eligible,
+        "score_cap": score_cap,
+        "pre_gate_score": round(pre_gate_score, 3),
+        "final_score": gated_score,
+        "promotion_eligible": top_rank_eligible,
+    }
+
+
 def apply_paper_context_priors(
     candidate: dict[str, Any],
     config: Mapping[str, Any] | None = None,
@@ -3527,12 +3613,45 @@ def apply_paper_context_priors(
         "liquidity_bucket": liquidity_bucket,
         "strategy_family": strategy_family,
     }
+    rank_gate = _paper_context_rank_gate(
+        candidate,
+        policy,
+        feasibility_status=feasibility_status,
+        strategy_family=strategy_family,
+        realized_context=realized_context,
+        pre_gate_score=final_score,
+    )
+    if rank_gate["enabled"]:
+        detail["rank_gate"] = rank_gate
+        detail["top_rank_eligible"] = bool(rank_gate["top_rank_eligible"])
+        detail["promotion_eligible"] = bool(rank_gate["promotion_eligible"])
+        if rank_gate["applied"]:
+            final_score = _as_float(rank_gate["final_score"], final_score)
+            detail["final_paper_score"] = round(final_score, 3)
+    else:
+        detail["rank_gate"] = None
+        detail["top_rank_eligible"] = True
+        detail["promotion_eligible"] = bool(candidate.get("promotion_eligible", True))
     candidate["score"] = final_score
     candidate["final_paper_score"] = final_score
+    if rank_gate["enabled"]:
+        candidate["paper_context_rank_gate"] = dict(rank_gate)
+        candidate["paper_context_top_rank_eligible"] = bool(rank_gate["top_rank_eligible"])
+        if not rank_gate["promotion_eligible"]:
+            candidate["promotion_eligible"] = False
     candidate["paper_context_prior"] = detail
-    candidate["paper_context_prior_status"] = "ranked_not_blocked"
+    if rank_gate["applied"]:
+        candidate["paper_context_prior_status"] = "ranked_hard_gated"
+    elif rank_gate["enabled"] and not rank_gate["promotion_eligible"]:
+        candidate["paper_context_prior_status"] = "ranked_promotion_gated"
+    else:
+        candidate["paper_context_prior_status"] = "ranked_not_blocked"
     if raw_total_prior:
         _append_note(candidate, "paper_context_prior:exceptional_signal_override" if detail["exceptional_signal_override"] else "paper_context_prior:applied")
+    if rank_gate["applied"]:
+        _append_note(candidate, f"paper_context_rank_gate:{rank_gate['reason']}")
+    elif rank_gate["enabled"] and not rank_gate["promotion_eligible"]:
+        _append_note(candidate, f"paper_context_promotion_gate:{rank_gate['reason']}")
     reliability = candidate.get("strategy_reliability")
     if isinstance(reliability, dict):
         reliability["paper_context_prior"] = detail
