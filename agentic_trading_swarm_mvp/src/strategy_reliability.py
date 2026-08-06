@@ -3305,6 +3305,7 @@ def _paper_context_feasibility_status(candidate: Mapping[str, Any]) -> str:
     return str(
         feasibility.get("route_status")
         or feasibility.get("status")
+        or candidate.get("feasibility_status")
         or route.get("route_status")
         or candidate.get("route_status")
         or "unknown"
@@ -4497,7 +4498,7 @@ def hydrate_paper_context_prior_statistics(
     try:
         rows = conn.execute(
             """
-            select venue, direction, trade_type, pnl_bps, candidate_json
+            select venue, direction, trade_type, pnl_bps, candidate_json, review_json, context_json
             from paper_trades
             where status = 'closed' and pnl_bps is not null
             order by closed_at desc, id desc
@@ -4516,14 +4517,37 @@ def hydrate_paper_context_prior_statistics(
             trade_candidate = {}
         if not isinstance(trade_candidate, Mapping):
             trade_candidate = {}
+        try:
+            review = json.loads(raw.get("review_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            review = {}
+        if not isinstance(review, Mapping):
+            review = {}
+        try:
+            context = json.loads(raw.get("context_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            context = {}
+        if not isinstance(context, Mapping):
+            context = {}
         if str(trade_candidate.get("signal_stats_scope") or "").lower() == "synthetic_research":
             continue
+        review_feasibility_status = review.get("feasibility_status") or context.get("feasibility_status")
+        review_route_status = review.get("route_status") or context.get("route_status")
         context_candidate = {
             **trade_candidate,
             "venue": trade_candidate.get("venue") or raw.get("venue"),
             "direction": trade_candidate.get("direction") or raw.get("direction"),
             "trade_type": trade_candidate.get("trade_type") or raw.get("trade_type"),
+            "feasibility_status": trade_candidate.get("feasibility_status") or review_feasibility_status,
+            "route_status": trade_candidate.get("route_status") or review_route_status,
         }
+        if not isinstance(context_candidate.get("execution_feasibility"), Mapping):
+            fallback_status = review_feasibility_status or review_route_status
+            if fallback_status:
+                context_candidate["execution_feasibility"] = {
+                    "status": fallback_status,
+                    "route_status": review_route_status or fallback_status,
+                }
         key = _paper_context_realized_key(
             context_candidate,
             feasibility_status=_paper_context_feasibility_status(context_candidate),
