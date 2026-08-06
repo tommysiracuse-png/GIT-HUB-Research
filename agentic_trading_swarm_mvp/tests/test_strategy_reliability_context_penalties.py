@@ -135,6 +135,24 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(conditional_detail["context_slice_prior"], -3.0)
         self.assertGreater(standard["score"], conditional["score"])
 
+    def test_context_priors_normalize_sparse_okx_spot_surface_fields(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "market_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard"},
+        }
+
+        detail = sr.apply_paper_context_priors(candidate, {"mode": "paper", "allow_live_trading": False})
+
+        self.assertEqual(detail["context_slice_key"], "OKX_SPOT|long|standard")
+        self.assertEqual(detail["context_slice_prior"], 8.0)
+        self.assertEqual(candidate["final_paper_score"], 75.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
+
     def test_context_priors_rank_down_weak_conditional_convergence_without_blocking(self) -> None:
         candidate = {
             "score": 60.0,

@@ -339,6 +339,69 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(detail["realized_context_closed_count"], 8)
         self.assertEqual(detail["realized_context_prior"], -15.75)
 
+    def test_runtime_hydrates_realized_context_from_sparse_okx_surface_metadata(self) -> None:
+        candidate = {
+            "seen_at": "2026-08-06T00:00:00+00:00",
+            "venue": "OKX",
+            "inst_id": "BTC-USDT",
+            "market_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "score": 60.0,
+            "last": 100.0,
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+        }
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        try:
+            for index in range(8):
+                payload = {
+                    "venue": "OKX",
+                    "inst_id": "BTC-USDT",
+                    "market_surface": "spot",
+                    "direction": "long_frontier_spot",
+                    "trade_type": "spot_carry",
+                }
+                review = {
+                    "feasibility_status": "standard",
+                    "route_status": "standard",
+                }
+                conn.execute(
+                    """
+                    insert into paper_trades (
+                        opened_at, closed_at, venue, inst_id, direction, trade_type,
+                        signal_key, base_score, learned_score, entry, exit, pnl_bps,
+                        status, thesis, candidate_json, review_json, context_json
+                    ) values (?, ?, 'OKX', 'BTC-USDT', 'long_frontier_spot',
+                              'spot_carry', ?, 80, 80, 100, 101, ?, 'closed', 'test', ?, ?, ?)
+                    """,
+                    (
+                        f"2026-08-05T00:{index:02d}:00+00:00",
+                        f"2026-08-05T01:{index:02d}:00+00:00",
+                        f"OKX:BTC-USDT|standard|{index}",
+                        20.0,
+                        json.dumps(payload),
+                        json.dumps(review),
+                        json.dumps({"feasibility_status": "standard", "route_status": "standard"}),
+                    ),
+                )
+            conn.commit()
+            rows, _ = strategy_reliability.apply_strategy_reliability(
+                [candidate],
+                {"mode": "paper", "allow_live_trading": False},
+                conn=conn,
+            )
+        finally:
+            conn.close()
+
+        detail = rows[0]["paper_context_prior"]
+        self.assertEqual(detail["context_slice_key"], "OKX_SPOT|long|standard")
+        self.assertEqual(detail["realized_context_key"], "OKX_SPOT|long|standard")
+        self.assertEqual(detail["realized_context_closed_count"], 8)
+        self.assertEqual(detail["realized_context_prior"], 4.0)
+
     def test_bybit_long_quality_slice_gets_probation_not_blanket_expand(self) -> None:
         candidate = base_candidate(
             venue="BYBIT_SPOT",

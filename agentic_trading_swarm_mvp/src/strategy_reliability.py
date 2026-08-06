@@ -3393,9 +3393,34 @@ def _paper_context_direction(candidate: Mapping[str, Any]) -> str:
     return "unknown"
 
 
+def _paper_context_surface_kind(candidate: Mapping[str, Any]) -> str | None:
+    for field in (
+        "asset_surface",
+        "market_type",
+        "market_surface",
+        "target_surface",
+        "execution_surface",
+        "paper_target_surface",
+    ):
+        token = str(candidate.get(field) or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if not token:
+            continue
+        if "spot" in token:
+            return "spot"
+        if any(marker in token for marker in ("perp", "swap", "future", "futures", "perpetual")):
+            return "perp"
+    inst_id = str(candidate.get("inst_id") or candidate.get("instrument_id") or "").strip().upper()
+    if inst_id:
+        if any(marker in inst_id for marker in ("SWAP", "PERP")):
+            return "perp"
+        if any(marker in inst_id for marker in ("SPOT", "_USDT", "_USD", "-USDT", "-USD", "/USDT", "/USD")):
+            return "spot"
+    return None
+
+
 def _paper_context_venue(candidate: Mapping[str, Any]) -> str:
     venue = _venue(dict(candidate))
-    surface = str(candidate.get("asset_surface") or candidate.get("market_type") or "").strip().lower()
+    surface = _paper_context_surface_kind(candidate)
     trade_type = str(candidate.get("trade_type") or "").strip().lower()
     direction = str(candidate.get("direction") or "").strip().lower()
     if venue == "OKX" and (surface == "spot" or ("perp" not in trade_type and "spot" in direction)):
