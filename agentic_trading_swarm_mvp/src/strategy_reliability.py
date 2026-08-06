@@ -3179,6 +3179,82 @@ def frontier_route_feasibility_record(candidate: dict) -> dict[str, Any]:
     return record
 
 
+def _frontier_route_feasibility_enabled(config: Mapping[str, Any] | bool | None = None) -> bool:
+    if isinstance(config, bool):
+        return config
+    if not isinstance(config, Mapping):
+        return True
+    for container in (
+        config,
+        config.get("paper"),
+        config.get("paper_policy"),
+        config.get("strategy_reliability"),
+    ):
+        if not isinstance(container, Mapping):
+            continue
+        if _as_bool(container.get("allow_live_trading"), False):
+            return False
+        for key in PAPER_MODE_CONFIG_KEYS:
+            mode = str(container.get(key) or "").strip().lower()
+            if mode in LIVE_MODE_VALUES:
+                return False
+    return True
+
+
+def _hydrate_frontier_short_route_feasibility(
+    candidate: dict[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+    if candidate.get("trade_type") != "frontier_crypto_venue_map":
+        return None
+    if str(candidate.get("direction") or "").strip().lower() != "short_frontier_spot":
+        return None
+
+    enabled = _frontier_route_feasibility_enabled(config)
+    try:
+        from frontier_crypto_adapter import paper_only_conditional_short_route_feasibility_gate
+    except ImportError:  # pragma: no cover - package import fallback
+        from src.frontier_crypto_adapter import paper_only_conditional_short_route_feasibility_gate
+
+    gate = paper_only_conditional_short_route_feasibility_gate(
+        venue=_paper_context_venue(candidate),
+        direction=str(candidate.get("direction") or ""),
+        context_stats=candidate,
+        enabled=enabled,
+    )
+    candidate["frontier_route_feasibility"] = dict(gate)
+    candidate["route_feasibility_gate"] = dict(gate)
+
+    reason = str(gate.get("route_feasibility_reason") or gate.get("reason") or "unknown")
+    active_scoring_eligible = _as_bool(gate.get("active_scoring_eligible"), True)
+    shadow_label = _as_bool(gate.get("shadow_label"), False)
+    candidate["route_feasibility_reason"] = reason
+    candidate["paper_active_scoring_eligible"] = active_scoring_eligible
+    candidate["paper_route_feasibility_shadow_label"] = shadow_label
+    candidate["paper_ineligible"] = _as_bool(gate.get("paper_ineligible"), False)
+    candidate["paper_ineligible_reason"] = gate.get("paper_ineligible_reason")
+    if shadow_label:
+        candidate["paper_route_feasibility_shadow_reason"] = reason
+
+    if (
+        enabled
+        and gate.get("applied")
+        and not _as_bool(candidate.get("frontier_route_feasibility_score_applied"), False)
+    ):
+        pre_score = _as_float(candidate.get("score"), 0.0)
+        multiplier = max(0.0, min(1.0, _as_float(gate.get("score_multiplier"), 1.0)))
+        candidate["pre_frontier_route_feasibility_score"] = pre_score
+        candidate["frontier_route_feasibility_score_multiplier"] = multiplier
+        candidate["score"] = round(max(0.0, pre_score * multiplier), 3)
+        candidate["frontier_route_feasibility_score_applied"] = True
+        if not active_scoring_eligible:
+            candidate["paper_normal_scoring_eligible"] = False
+            candidate["_hunter_bucket"] = candidate.get("_hunter_bucket") or "diagnose"
+    return gate
+
+
 def _route_status(candidate: dict) -> str:
     route_record = frontier_route_feasibility_record(candidate)
     normalized_status = str(route_record.get("paper_route_status") or "").strip()
@@ -5138,6 +5214,7 @@ def _apply_one(
     conn: Any | None = None,
 ) -> dict | None:
     _record_proxy_short_quality(candidate, config)
+    _hydrate_frontier_short_route_feasibility(candidate, config=config)
     yahoo_proxy_freshness_gate = paper_yahoo_proxy_freshness_shadow_record(candidate, config=config)
     skip_family_quarantine = False
     if yahoo_proxy_freshness_gate is not None:
@@ -5182,6 +5259,7 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
     by_signal = collections.Counter(item["signal_key"] for item in items)
     by_direction = collections.Counter(item["direction"] for item in items)
     by_venue = collections.Counter(item["venue"] for item in items if item.get("venue"))
+    route_feasibility_reason_counts: collections.Counter[str] = collections.Counter()
     blocked = sum(1 for item in items if item["action"].startswith("shadow") or "shadow" in item["action"])
     protected = sum(1 for item in items if item.get("protect_working_slice"))
     quarantined = sum(1 for item in items if item.get("profile") == "yahoo_proxy_family_quarantine")
@@ -5205,6 +5283,19 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         for candidate in candidates
         for reason in candidate.get("proxy_short_quality_failure_reasons") or []
     )
+    route_feasibility_shadow_count = 0
+    route_feasibility_verified_exception_count = 0
+    for candidate in candidates:
+        reason = str(candidate.get("route_feasibility_reason") or "").strip()
+        if reason:
+            route_feasibility_reason_counts[reason] += 1
+        if _as_bool(candidate.get("paper_route_feasibility_shadow_label"), False):
+            route_feasibility_shadow_count += 1
+        if _as_bool(candidate.get("paper_active_scoring_eligible"), True) and reason in {
+            "verified_standard_short_route",
+            "explicit_borrow_ok",
+        }:
+            route_feasibility_verified_exception_count += 1
     return {
         "candidate_count": len(candidates),
         "annotated_count": len(items),
@@ -5215,6 +5306,9 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         "context_loss_quarantine_count": context_loss_quarantined,
         "okx_basis_decay_quarantine_count": okx_basis_decay_quarantined,
         "by_quality_failure": dict(by_quality_failure),
+        "route_feasibility_reason_counts": dict(route_feasibility_reason_counts),
+        "route_feasibility_shadow_count": route_feasibility_shadow_count,
+        "route_feasibility_verified_exception_count": route_feasibility_verified_exception_count,
         "protected_working_slice_count": protected,
         "by_action": dict(by_action),
         "by_profile": dict(by_profile),
@@ -5311,6 +5405,9 @@ def _report_markdown(report: dict) -> str:
         f"- Actions: `{summary.get('by_action', {})}`",
         f"- Profiles: `{summary.get('by_profile', {})}`",
         f"- Proxy-short quality failures: `{summary.get('by_quality_failure', {})}`",
+        f"- Route feasibility reasons: `{summary.get('route_feasibility_reason_counts', {})}`",
+        f"- Route-feasibility shadow labels: `{summary.get('route_feasibility_shadow_count', 0)}`",
+        f"- Verified route exceptions kept active: `{summary.get('route_feasibility_verified_exception_count', 0)}`",
         f"- Manual repair focus: `{summary.get('manual_repair_focus', {})}`",
         "",
         "## Top Adjustments",

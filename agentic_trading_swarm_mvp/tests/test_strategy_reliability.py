@@ -103,6 +103,81 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["strategy_reliability_action"], "probation_short_expansion")
         self.assertEqual(rows[0]["strategy_reliability_allocation_multiplier"], 0.25)
 
+    def test_frontier_short_route_feasibility_penalizes_unverified_conditional_and_preserves_verified_exception(self) -> None:
+        route_checklist = {
+            "route_requirement_checklist": {
+                "shortable_inventory_declared": True,
+                "borrow_cost_model_present": True,
+                "venue_supports_margin_or_equivalent": True,
+                "fees_modeled": True,
+            }
+        }
+        unverified = base_candidate(
+            venue="GATE",
+            inst_id="GATE:UNVERIFIED_USDT",
+            execution_feasibility={"status": "conditional", "route_status": "conditional"},
+            margin_eligible=True,
+            fees_modeled=True,
+            symbol_supported=True,
+            supports_conditional_orders=True,
+            paper_route_requirement_report={"route_requirements": route_checklist},
+        )
+        verified = base_candidate(
+            venue="GATE",
+            inst_id="GATE:VERIFIED_USDT",
+            execution_feasibility={"status": "conditional", "route_status": "conditional"},
+            paper_route_registry={"support_status": "supported"},
+            margin_eligible=True,
+            fees_modeled=True,
+            symbol_supported=True,
+            supports_conditional_orders=True,
+            paper_route_requirement_report={"route_requirements": route_checklist},
+        )
+
+        rows, report = strategy_reliability.apply_strategy_reliability(
+            [unverified, verified],
+            {"mode": "paper", "allow_live_trading": False},
+        )
+
+        by_inst = {row["inst_id"]: row for row in rows}
+        unverified_row = by_inst["GATE:UNVERIFIED_USDT"]
+        verified_row = by_inst["GATE:VERIFIED_USDT"]
+
+        self.assertEqual(
+            "conditional_short_unverified_route",
+            unverified_row["route_feasibility_reason"],
+        )
+        self.assertFalse(unverified_row["paper_active_scoring_eligible"])
+        self.assertTrue(unverified_row["paper_route_feasibility_shadow_label"])
+        self.assertLess(
+            unverified_row["frontier_route_feasibility_score_multiplier"],
+            0.2,
+        )
+        self.assertLess(unverified_row["score"], verified_row["score"])
+
+        self.assertEqual(
+            "verified_standard_short_route",
+            verified_row["route_feasibility_reason"],
+        )
+        self.assertTrue(verified_row["paper_active_scoring_eligible"])
+        self.assertFalse(verified_row["paper_route_feasibility_shadow_label"])
+        self.assertGreater(
+            verified_row["frontier_route_feasibility_score_multiplier"],
+            unverified_row["frontier_route_feasibility_score_multiplier"],
+        )
+
+        summary = report["summary"]
+        self.assertEqual(
+            1,
+            summary["route_feasibility_reason_counts"]["conditional_short_unverified_route"],
+        )
+        self.assertEqual(
+            1,
+            summary["route_feasibility_reason_counts"]["verified_standard_short_route"],
+        )
+        self.assertEqual(1, summary["route_feasibility_shadow_count"])
+        self.assertEqual(1, summary["route_feasibility_verified_exception_count"])
+
     def test_runtime_applies_context_prior_before_candidate_sorting(self) -> None:
         candidate = {
             "seen_at": "2026-06-24T00:00:00+00:00",
