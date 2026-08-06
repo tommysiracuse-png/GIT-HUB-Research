@@ -48,12 +48,80 @@ class CodexWorkerPoolTests(unittest.TestCase):
         return storage.connect(self.radar_path)
 
     def test_worker_settings_defer_only_full_regression(self) -> None:
-        configured = codex_worker_pool._worker_settings(self.settings, "strategy-codex")
+        peer_context = {"active_peer_work": [{"work_scope": "adapter:one"}]}
+        configured = codex_worker_pool._worker_settings(
+            self.settings, "strategy-codex", peer_context
+        )
         self.assertTrue(configured["_codex_worker_execute"])
         self.assertEqual("strategy-codex", configured["_codex_worker_id"])
         self.assertFalse(configured["code_evolution"]["run_full_regression"])
         self.assertTrue(configured["codex_repo_agent"]["parallel_sessions_enabled"])
+        self.assertEqual(peer_context, configured["codex_repo_agent"]["coordination_context"])
         self.assertTrue(self.settings["code_evolution"]["run_full_regression"])
+
+    def test_semantic_work_identity_collapses_action_word_variants(self) -> None:
+        base = {
+            "category": "paper_scoring_logic",
+            "payload": {"market_key": "frontier_crypto_venue_map"},
+        }
+        fingerprints = {
+            codex_worker_pool._proposal_work_identity(
+                {**base, "title": title}
+            )[0]
+            for title in (
+                "Gate cost-swallowed frontier paper fills",
+                "Stop cost-swallowed frontier paper fills",
+                "Shadow cost-negative frontier fills",
+            )
+        }
+        self.assertEqual(1, len(fingerprints))
+
+    def test_adapter_specs_keep_distinct_work_identities(self) -> None:
+        first = codex_worker_pool._proposal_work_identity({
+            "category": "public_data_adapter",
+            "title": "Implement venue A",
+            "payload": {"adapter_spec_id": 101},
+        })
+        second = codex_worker_pool._proposal_work_identity({
+            "category": "public_data_adapter",
+            "title": "Implement venue B",
+            "payload": {"adapter_spec_id": 102},
+        })
+        self.assertNotEqual(first[0], second[0])
+
+    def test_sync_supersedes_duplicate_code_proposals_before_claim(self) -> None:
+        with closing(self._radar_connect()) as radar:
+            for proposal_id, title in (
+                ("proposal-cost-a", "Gate cost-swallowed frontier paper fills"),
+                ("proposal-cost-b", "Shadow cost-negative frontier fills"),
+            ):
+                storage.add_code_evolution_proposal(
+                    radar, proposal_id, None, "red_team", "openai/test", "standard", None,
+                    title, "paper_scoring_logic", 94,
+                    {"title": title, "market_key": "frontier_crypto_venue_map"}, {},
+                    status="proposed",
+                )
+            with closing(codex_coordination.connect(self.coord_path)) as coord:
+                result = codex_worker_pool.sync_available_work(radar, coord, self.settings)
+                claim = codex_coordination.claim_task(
+                    coord, "system-codex", preferred_lane="general"
+                )
+                second_claim = codex_coordination.claim_task(
+                    coord, "market-codex", preferred_lane="general"
+                )
+                statuses = dict(coord.execute(
+                    "select source_id,status from codex_tasks where source_id like 'proposal-cost-%'"
+                ).fetchall())
+            proposal_statuses = {
+                proposal_id: storage.get_code_evolution_proposal(radar, proposal_id)["status"]
+                for proposal_id in ("proposal-cost-a", "proposal-cost-b")
+            }
+
+        self.assertEqual(1, result["duplicates_suppressed"])
+        self.assertIsNotNone(claim)
+        self.assertIsNone(second_claim)
+        self.assertEqual(1, list(statuses.values()).count("superseded_duplicate"))
+        self.assertEqual(1, list(proposal_statuses.values()).count("superseded_duplicate"))
 
     def test_sync_migrates_paused_proposal_to_preferred_lane(self) -> None:
         with closing(self._radar_connect()) as radar:

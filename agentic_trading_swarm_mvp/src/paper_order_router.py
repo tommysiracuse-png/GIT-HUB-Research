@@ -510,7 +510,13 @@ def frontier_paper_net_edge_guard_reason(
 
     checks: list[dict[str, Any]] = []
     quality_action = _normalize_route_status(candidate.get("quality_action"))
-    if quality_action and quality_action != "normal":
+    scanner_scoped = _as_bool(candidate.get(FRONTIER_PAPER_ADMISSION_MARKER), False)
+    if not scanner_scoped and quality_action == "shadow_only":
+        # The established quality guard owns this case and preserves its
+        # detailed anomaly diagnostics and shadow_filtered semantics.
+        return None
+    allowed_quality_actions = {"normal"} if scanner_scoped else {"normal", "verified", "candidate"}
+    if quality_action and quality_action not in allowed_quality_actions:
         checks.append(
             {
                 "code": "quality_action_not_normal",
@@ -567,7 +573,11 @@ def frontier_paper_net_edge_guard_reason(
         )
 
     route_blockers = _route_blockers(candidate)
-    if _is_short_frontier_spot(candidate) and "spot_borrow" in route_blockers:
+    if (
+        _is_short_frontier_spot(candidate)
+        and "spot_borrow" in route_blockers
+        and not _is_direct_borrow_confirmed(candidate)
+    ):
         checks.append(
             {
                 "code": "short_frontier_spot_spot_borrow_blocked",
@@ -933,6 +943,28 @@ def _is_confirmed_borrow(candidate: Mapping[str, Any]) -> bool:
         ):
             return True
     return False
+
+
+def _is_direct_borrow_confirmed(candidate: Mapping[str, Any]) -> bool:
+    """Return true only for an explicitly executable direct borrow route."""
+
+    for field in ("borrow_confirmed", "spot_borrow_confirmed"):
+        if _as_bool(candidate.get(field), False):
+            return True
+    for field in ("borrow_status", "borrow_availability", "spot_borrow_status"):
+        if str(candidate.get(field) or "").strip().lower() in {
+            "confirmed", "configured", "available",
+        }:
+            return True
+    route = candidate.get("execution_route")
+    return bool(
+        isinstance(route, Mapping)
+        and str(route.get("borrow_status") or "").strip().lower()
+        in {"confirmed", "configured", "available"}
+        and _normalize_route_status(route.get("route_status") or route.get("status"))
+        in _ROUTE_EXECUTABLE_STATUSES
+        and not _coerce_flags(route.get("missing_permissions"))
+    )
 
 
 def _is_short_frontier_spot(candidate: Mapping[str, Any]) -> bool:
@@ -1381,7 +1413,7 @@ def frontier_shadow_filter_reason(
 
 
     if not checks:
-        return None
+        return frontier_paper_net_edge_guard_reason(candidate, config)
 
     return {
         "reason": FRONTIER_SHADOW_REASON,

@@ -52,7 +52,7 @@ class CodexRepoAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = codex_repo_agent.codex_repo_agent_config({}, pathlib.Path(tmp))
 
-        self.assertEqual("gpt-5.6-terra", cfg["model"])
+        self.assertEqual("gpt-5.4", cfg["model"])
         self.assertEqual("high", cfg["reasoning_effort"])
         self.assertEqual(pathlib.Path.home() / ".codex", pathlib.Path(cfg["codex_home"]))
         self.assertTrue(cfg["chatgpt_account_fallback_enabled"])

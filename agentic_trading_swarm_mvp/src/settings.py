@@ -820,7 +820,7 @@ DEFAULT_SETTINGS = {
     },
     "codex_repo_agent": {
         "enabled": True,
-        "model": "gpt-5.6-terra",
+        "model": "gpt-5.4",
         "reasoning_effort": "high",
         "parallel_sessions_enabled": True,
         "session_lock_dir": "runs/codex_session_locks",
@@ -848,7 +848,7 @@ DEFAULT_SETTINGS = {
         "auto_merge_paper_only": True,
         "max_auto_merges_per_loop": 12,
         "require_frontier_model": False,
-        "required_model": "openai/gpt-5.6-terra",
+        "required_model": "openai/gpt-5.4",
         "min_priority": 50,
         "run_full_regression": True,
         "full_regression_timeout_seconds": 300,

@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
+import re
 import sqlite3
 import subprocess
 import sys
@@ -40,10 +42,13 @@ from codex_coordination import (
     enqueue_verification_job,
     finish_verification_job,
     heartbeat_worker,
+    peer_work_context,
     record_migration,
+    reconcile_duplicate_tasks,
     release_resource_lease,
     renew_task_lease,
     requeue_task,
+    set_task_work_identity,
 )
 from evolution.contracts import CandidateRelease
 from evolution.worktree import cleanup_worktree, current_commit, repo_root, run_git, update_champion_latest
@@ -159,6 +164,9 @@ def _enqueue_owner_turn(
     source_id: str,
     lane: str,
     priority: int,
+    payload: dict[str, Any] | None = None,
+    work_fingerprint: str | None = None,
+    work_scope: str | None = None,
 ) -> dict[str, Any] | None:
     if _coordination_has_open_kind(coord, source_kind):
         return None
@@ -168,8 +176,10 @@ def _enqueue_owner_turn(
         source_id,
         lane=lane,
         priority=priority,
-        payload={"lane": lane, "source_id": source_id},
+        payload={"lane": lane, "source_id": source_id, **(payload or {})},
         reactivate_terminal=True,
+        work_fingerprint=work_fingerprint,
+        work_scope=work_scope,
     )
 
 
@@ -184,6 +194,139 @@ def _proposal_lane(row: dict[str, Any]) -> str:
     if "activation" in source or category == "runtime_pipeline_integration":
         return "activation"
     return "general"
+
+
+_WORK_STOPWORDS = {
+    "a", "add", "an", "and", "as", "at", "candidate", "candidates", "change",
+    "for", "from", "in", "into", "of", "on", "only", "paper", "spot", "spots",
+    "the", "through", "to", "with", "fill", "fills", "trade", "trades",
+}
+
+
+def _nested(payload: dict[str, Any], key: str) -> Any:
+    if key in payload and payload.get(key) not in (None, ""):
+        return payload.get(key)
+    code_change = payload.get("code_change")
+    if isinstance(code_change, dict) and code_change.get(key) not in (None, ""):
+        return code_change.get(key)
+    return None
+
+
+def _flatten_work_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return " ".join(_flatten_work_text(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_flatten_work_text(item) for item in value)
+    return str(value or "")
+
+
+def _normalize_work_tokens(value: Any) -> list[str]:
+    text = _flatten_work_text(value).lower()
+    replacements = (
+        (r"\b(?:cost[-_\s]*(?:swallowed|negative)|non[-_\s]*positive[-_\s]*net[-_\s]*edge|net[-_\s]*edge[-_\s]*(?:after[-_\s]*)?costs?)\b", " net_edge_cost "),
+        (r"\bmean[-_\s]*reversion\b", " mean_reversion "),
+        (r"\b(?:gate|gated|guard|guardrail|shadow|stop|quarantine|exclude|block|filter|cap|tighten)(?:d|ing|s)?\b", " admission_policy "),
+        (r"\b(?:decayed|decaying|decay)\b", " decay "),
+        (r"\b(?:paper[-_\s]*)?(?:filled|fills?|candidates?)\b", " "),
+    )
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    tokens = re.findall(r"[a-z0-9]+(?:_[a-z0-9]+)*", text)
+    normalized = {token for token in tokens if token not in _WORK_STOPWORDS and len(token) > 1}
+    if "okx" in normalized and "basis" in normalized and "decay" in normalized:
+        normalized.difference_update({"basis", "decay", "mean_reversion", "regime"})
+        normalized.add("okx_basis_decay")
+    if "frontier" in normalized and (
+        "net_edge_cost" in normalized or {"cost", "edge"}.issubset(normalized)
+    ):
+        normalized.difference_update({"cost", "edge", "negative", "swallowed", "nonpositive"})
+        normalized.add("frontier_net_edge_cost")
+    return sorted(normalized)
+
+
+def _proposal_work_identity(
+    row: dict[str, Any], radar: sqlite3.Connection | None = None
+) -> tuple[str, str]:
+    """Return a stable, readable identity for semantically equivalent code work."""
+
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    code_change = payload.get("code_change") if isinstance(payload.get("code_change"), dict) else {}
+    proposal_id = str(row.get("proposal_id") or "")
+
+    activation = code_change.get("activation_contract")
+    if isinstance(activation, dict):
+        adapter_id = str(activation.get("adapter_id") or "unknown").lower()
+        surface = str(activation.get("market_surface") or payload.get("market_key") or "unknown").lower()
+        scope = f"market_activation:{adapter_id}:{surface}"
+        return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24], scope
+
+    if radar is not None and proposal_id and _table_exists(radar, "strategy_owner_tasks"):
+        owner = radar.execute(
+            "select task_id from strategy_owner_tasks where code_proposal_id=? limit 1",
+            (proposal_id,),
+        ).fetchone()
+        if owner:
+            scope = f"strategy_owner:{str(owner['task_id']).lower()}"
+            return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24], scope
+
+    adapter_spec_id = _nested(payload, "adapter_spec_id")
+    if adapter_spec_id not in (None, ""):
+        scope = f"adapter_spec:{adapter_spec_id}"
+        return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24], scope
+
+    market_key = str(payload.get("market_key") or payload.get("signal_key") or "").lower()
+    target_tokens = _normalize_work_tokens(market_key)
+    target = "_".join(target_tokens[:10]) or str(row.get("category") or "general").lower()
+    title_tokens = _normalize_work_tokens(row.get("title") or payload.get("title"))
+    if len(title_tokens) < 2:
+        title_tokens = _normalize_work_tokens(payload.get("proposed_change") or payload.get("rationale"))[:12]
+    scope = f"semantic:{target}:{'_'.join(title_tokens[:14]) or 'unspecified'}"
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24], scope
+
+
+def _owner_work_identity(source_kind: str, row: sqlite3.Row) -> tuple[str, str]:
+    if source_kind == "adapter_owner_turn":
+        scope = f"adapter_spec:{row['id']}"
+    elif source_kind == "strategy_owner_turn":
+        scope = f"strategy_owner:{str(row['task_id']).lower()}"
+    elif source_kind == "activation_owner_turn":
+        scope = (
+            f"market_activation:{str(row['adapter_id'] or 'unknown').lower()}:"
+            f"{str(row['market_surface'] or 'unknown').lower()}"
+        )
+    else:
+        scope = f"{source_kind}:{str(row[0]).lower()}"
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24], scope
+
+
+def _backfill_work_identities(
+    radar: sqlite3.Connection, coord: sqlite3.Connection, *, limit: int = 1000
+) -> int:
+    rows = coord.execute(
+        """
+        select task_id,source_id from codex_tasks
+        where source_kind='code_evolution_proposal'
+          and status<>'superseded_duplicate'
+          and (work_fingerprint is null or work_fingerprint='')
+        order by updated_at desc limit ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    updated = 0
+    for task in rows:
+        proposal = get_code_evolution_proposal(radar, str(task["source_id"]))
+        if not proposal:
+            continue
+        fingerprint, scope = _proposal_work_identity(proposal, radar)
+        updated += int(
+            set_task_work_identity(
+                coord,
+                str(task["task_id"]),
+                work_fingerprint=fingerprint,
+                work_scope=scope,
+            )
+        )
+    return updated
 
 
 def _reconcile_promoted_commits(
@@ -231,6 +374,7 @@ def _reconcile_promoted_commits(
             evaluation=evaluation,
             promotion_reason="Reconciled exact autonomous commit after interrupted database status write.",
         )
+        work_fingerprint, work_scope = _proposal_work_identity(row, radar)
         task = enqueue_task(
             coord,
             "code_evolution_proposal",
@@ -239,19 +383,22 @@ def _reconcile_promoted_commits(
             priority=int(row.get("priority") or 0),
             payload={"proposal_id": proposal_id, "category": row.get("category"), "title": row.get("title")},
             reactivate_terminal=True,
+            work_fingerprint=work_fingerprint,
+            work_scope=work_scope,
         )
-        complete_task(
-            coord,
-            str(task["task_id"]),
-            status="promoted_pending_verification",
-            result={"reconciled_commit": promoted_commit},
-        )
-        enqueue_verification_job(
-            coord,
-            str(task["task_id"]),
-            priority=int(row.get("priority") or 0),
-            payload={"proposal_id": proposal_id, "promoted_commit": promoted_commit},
-        )
+        if str(task.get("status") or "") != "superseded_duplicate":
+            complete_task(
+                coord,
+                str(task["task_id"]),
+                status="promoted_pending_verification",
+                result={"reconciled_commit": promoted_commit},
+            )
+            enqueue_verification_job(
+                coord,
+                str(task["task_id"]),
+                priority=int(row.get("priority") or 0),
+                payload={"proposal_id": proposal_id, "promoted_commit": promoted_commit},
+            )
         source_id = str(row.get("source_recommendation_id") or "")
         if source_id.startswith("strategy-owner:") and source_id.endswith(":code"):
             owner_task_id = source_id[len("strategy-owner:") : -len(":code")]
@@ -275,27 +422,53 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
 
     cfg = _cfg(settings)
     reconciliation = _reconcile_promoted_commits(radar, coord, settings)
+    identities_backfilled = _backfill_work_identities(radar, coord)
     queued: list[dict[str, Any]] = []
+    duplicate_proposals: list[dict[str, Any]] = []
     for row in code_evolution_by_status(radar, PROPOSAL_QUEUE_STATUSES, limit=int(cfg["queue_batch_size"])):
         payload = row.get("payload") or {}
         category = str(row.get("category") or "unknown")
         lane = _proposal_lane(row)
-        queued.append(
-            enqueue_task(
-                coord,
-                "code_evolution_proposal",
-                str(row["proposal_id"]),
-                lane=lane,
-                priority=int(row.get("priority") or 0),
-                payload={"proposal_id": row["proposal_id"], "category": category, "title": row.get("title")},
-                reactivate_terminal=True,
-            )
+        work_fingerprint, work_scope = _proposal_work_identity(row, radar)
+        item = enqueue_task(
+            coord,
+            "code_evolution_proposal",
+            str(row["proposal_id"]),
+            lane=lane,
+            priority=int(row.get("priority") or 0),
+            payload={
+                "proposal_id": row["proposal_id"],
+                "category": category,
+                "title": row.get("title"),
+                "work_scope": work_scope,
+            },
+            reactivate_terminal=True,
+            work_fingerprint=work_fingerprint,
+            work_scope=work_scope,
         )
+        if str(item.get("status") or "") == "superseded_duplicate":
+            duplicate = {
+                "proposal_id": str(row["proposal_id"]),
+                "canonical_task_id": item.get("canonical_task_id"),
+                "work_fingerprint": work_fingerprint,
+                "work_scope": work_scope,
+            }
+            evaluation = dict(row.get("evaluation") or {})
+            evaluation["coordination_deduplication"] = {"at": _utc_now(), **duplicate}
+            update_code_evolution_proposal(
+                radar,
+                str(row["proposal_id"]),
+                status="superseded_duplicate",
+                evaluation=evaluation,
+            )
+            duplicate_proposals.append(duplicate)
+        else:
+            queued.append(item)
 
     if _table_exists(radar, "strategy_owner_tasks"):
         row = radar.execute(
             """
-            select task_id,priority from strategy_owner_tasks
+            select task_id,priority,code_proposal_id from strategy_owner_tasks
             where status in ('queued','analyzing','coding','implementation_paused','waiting_quota',
                              'waiting_network','promote_candidate')
               and (next_retry_at is null or next_retry_at<=?)
@@ -304,9 +477,12 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
             (_utc_now(),),
         ).fetchone()
         if row:
+            work_fingerprint, work_scope = _owner_work_identity("strategy_owner_turn", row)
             item = _enqueue_owner_turn(
                 coord, source_kind="strategy_owner_turn", source_id=str(row["task_id"]),
                 lane="strategy", priority=int(row["priority"] or 90),
+                payload={"title": f"Strategy owner {row['task_id']}", "work_scope": work_scope},
+                work_fingerprint=work_fingerprint, work_scope=work_scope,
             )
             if item:
                 queued.append(item)
@@ -314,15 +490,18 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
     if _table_exists(radar, "adapter_specs"):
         row = radar.execute(
             """
-            select id,priority from adapter_specs
+            select id,priority,title,market_key from adapter_specs
             where status in ('open','planned','proposed','implementation_queued','implementation_queued_retry')
             order by priority desc,created_at asc limit 1
             """
         ).fetchone()
         if row:
+            work_fingerprint, work_scope = _owner_work_identity("adapter_owner_turn", row)
             item = _enqueue_owner_turn(
                 coord, source_kind="adapter_owner_turn", source_id=str(row["id"]),
                 lane="adapter", priority=int(row["priority"] or 80),
+                payload={"title": row["title"], "market_key": row["market_key"], "work_scope": work_scope},
+                work_fingerprint=work_fingerprint, work_scope=work_scope,
             )
             if item:
                 queued.append(item)
@@ -330,7 +509,7 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
     if _table_exists(radar, "market_activation_tasks"):
         row = radar.execute(
             """
-            select task_id,priority from market_activation_tasks
+            select task_id,priority,adapter_id,market_surface,venue from market_activation_tasks
             where status in ('queued','waiting_source','needs_data_repair','needs_runtime_repair','implementation_paused')
               and (next_retry_at is null or next_retry_at<=?)
             order by priority desc,updated_at asc limit 1
@@ -338,9 +517,16 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
             (_utc_now(),),
         ).fetchone()
         if row:
+            work_fingerprint, work_scope = _owner_work_identity("activation_owner_turn", row)
             item = _enqueue_owner_turn(
                 coord, source_kind="activation_owner_turn", source_id=str(row["task_id"]),
                 lane="activation", priority=int(row["priority"] or 85),
+                payload={
+                    "title": f"Activate {row['adapter_id']} for {row['market_surface']}",
+                    "venue": row["venue"],
+                    "work_scope": work_scope,
+                },
+                work_fingerprint=work_fingerprint, work_scope=work_scope,
             )
             if item:
                 queued.append(item)
@@ -361,19 +547,60 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
             if item:
                 queued.append(item)
 
+    reconciled_duplicates = reconcile_duplicate_tasks(coord)
+    for duplicate in reconciled_duplicates:
+        if duplicate.get("source_kind") != "code_evolution_proposal":
+            continue
+        proposal_id = str(duplicate.get("source_id") or "")
+        proposal = get_code_evolution_proposal(radar, proposal_id)
+        if not proposal or str(proposal.get("status") or "") not in PROPOSAL_QUEUE_STATUSES:
+            continue
+        evaluation = dict(proposal.get("evaluation") or {})
+        evaluation["coordination_deduplication"] = {
+            "at": _utc_now(),
+            "canonical_task_id": duplicate.get("canonical_task_id"),
+            "canonical_source_id": duplicate.get("canonical_source_id"),
+            "work_fingerprint": duplicate.get("work_fingerprint"),
+            "work_scope": duplicate.get("work_scope"),
+        }
+        update_code_evolution_proposal(
+            radar,
+            proposal_id,
+            status="superseded_duplicate",
+            evaluation=evaluation,
+        )
+        duplicate_proposals.append({"proposal_id": proposal_id, **duplicate})
+
     record_migration(
         coord,
         "radar_backlog_sync",
-        {"checked_at": _utc_now(), "queued_or_refreshed": len(queued)},
+        {
+            "checked_at": _utc_now(),
+            "queued_or_refreshed": len(queued),
+            "identities_backfilled": identities_backfilled,
+            "duplicates_suppressed": len(duplicate_proposals),
+        },
     )
-    return {"queued_or_refreshed": len(queued), "tasks": queued, "promotion_reconciliation": reconciliation}
+    return {
+        "queued_or_refreshed": len(queued),
+        "tasks": queued,
+        "identities_backfilled": identities_backfilled,
+        "duplicates_suppressed": len(duplicate_proposals),
+        "duplicate_tasks": duplicate_proposals[:50],
+        "promotion_reconciliation": reconciliation,
+    }
 
 
-def _worker_settings(settings: dict, worker_id: str) -> dict:
+def _worker_settings(
+    settings: dict,
+    worker_id: str,
+    coordination_context: dict[str, Any] | None = None,
+) -> dict:
     output = copy.deepcopy(settings)
     output["_codex_worker_execute"] = True
     output["_codex_worker_id"] = worker_id
     output.setdefault("codex_repo_agent", {})["parallel_sessions_enabled"] = True
+    output["codex_repo_agent"]["coordination_context"] = coordination_context or {}
     if _cfg(settings).get("defer_full_regression", True):
         output.setdefault("code_evolution", {})["run_full_regression"] = False
     output.setdefault("self_improvement", {})["process_code_changes_in_radar_loop"] = True
@@ -408,11 +635,15 @@ def _run_code_proposal(radar: sqlite3.Connection, task: dict, settings: dict) ->
     row = get_code_evolution_proposal(radar, proposal_id)
     if not row:
         return {"status": "missing_code_evolution_proposal", "proposal_id": proposal_id}
+    proposal_payload = dict(row.get("payload") or {})
+    coordination_context = (settings.get("codex_repo_agent") or {}).get("coordination_context")
+    if coordination_context:
+        proposal_payload["coordination_context"] = coordination_context
     rec = {
         "recommendation_id": row.get("source_recommendation_id") or f"coordination:{proposal_id}",
         "title": row.get("title"),
         "priority": row.get("priority"),
-        "payload": row.get("payload") or {},
+        "payload": proposal_payload,
     }
     return process_code_change_recommendation(radar, rec, settings)
 
@@ -498,6 +729,10 @@ def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
             coord, worker_id, preferred_lane=preferred, pid=os.getpid(),
             lease_seconds=int(cfg.get("task_lease_seconds", 2700)),
         )
+        if task:
+            task["coordination_context"] = peer_work_context(
+                coord, task_id=str(task.get("task_id") or ""), limit=16
+            )
     if not task:
         with closing(connect_coordination(db_path)) as coord:
             heartbeat_worker(coord, worker_id, preferred_lane=preferred, pid=os.getpid(), state="idle")
@@ -510,7 +745,10 @@ def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
     heartbeat.start()
     started = time.monotonic()
     try:
-        result = _dispatch(task, _worker_settings(settings, worker_id))
+        result = _dispatch(
+            task,
+            _worker_settings(settings, worker_id, task.get("coordination_context")),
+        )
         status, proposal_id = _proposal_result(result)
         elapsed = round(time.monotonic() - started, 3)
         model_usage = _proposal_model_usage(proposal_id)

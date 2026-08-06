@@ -22,7 +22,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
 DEFAULT_DB_PATH = RUNS_DIR / "codex_coordination.sqlite"
 SQLITE_BUSY_TIMEOUT_MS = 15_000
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 CLAIMABLE_TASK_STATUSES = frozenset({"queued", "requeued"})
 ACTIVE_TASK_STATUSES = frozenset(
@@ -37,6 +37,11 @@ ACTIVE_TASK_STATUSES = frozenset(
     }
 )
 CLAIMABLE_VERIFICATION_STATUSES = frozenset({"queued", "requeued"})
+DEDUPLICATION_BLOCKING_STATUSES = frozenset(
+    set(CLAIMABLE_TASK_STATUSES)
+    | set(ACTIVE_TASK_STATUSES)
+    | {"promoted", "verified", "repairing_post_promotion"}
+)
 
 
 def utc_now() -> str:
@@ -120,6 +125,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             status text not null,
             priority integer not null default 0,
             payload_json text not null default '{}',
+            work_fingerprint text,
+            work_scope text,
+            canonical_task_id text,
             created_at text not null,
             updated_at text not null,
             retry_at text,
@@ -201,6 +209,21 @@ def init_db(conn: sqlite3.Connection) -> None:
             on codex_coordination_events(entity_kind, entity_id, occurred_at);
         """
     )
+    task_columns = {
+        str(row["name"])
+        for row in conn.execute("pragma table_info(codex_tasks)").fetchall()
+    }
+    for name, sql_type in (
+        ("work_fingerprint", "text"),
+        ("work_scope", "text"),
+        ("canonical_task_id", "text"),
+    ):
+        if name not in task_columns:
+            conn.execute(f"alter table codex_tasks add column {name} {sql_type}")
+    conn.execute(
+        "create index if not exists idx_codex_tasks_work "
+        "on codex_tasks(work_fingerprint,status,priority desc,created_at)"
+    )
     now = utc_now()
     conn.execute(
         """
@@ -278,10 +301,14 @@ def enqueue_task(
     payload: Mapping[str, Any] | None = None,
     status: str = "queued",
     reactivate_terminal: bool = False,
+    work_fingerprint: str | None = None,
+    work_scope: str | None = None,
 ) -> dict[str, Any]:
-    """Idempotently enqueue a durable task keyed by source kind and source id."""
+    """Idempotently enqueue a task and collapse equivalent work across sources."""
 
     source_id_text = str(source_id)
+    fingerprint = str(work_fingerprint or "").strip() or None
+    scope = str(work_scope or "").strip() or None
     now = utc_now()
     _begin(conn)
     try:
@@ -289,6 +316,74 @@ def enqueue_task(
             "select * from codex_tasks where source_kind=? and source_id=?",
             (source_kind, source_id_text),
         ).fetchone()
+        canonical = None
+        if fingerprint:
+            statuses = tuple(sorted(DEDUPLICATION_BLOCKING_STATUSES))
+            canonical = conn.execute(
+                """
+                select * from codex_tasks
+                where work_fingerprint=? and status in (%s)
+                  and not (source_kind=? and source_id=?)
+                order by case
+                    when status in ('verified','promoted') then 0
+                    when status in ('promoted_pending_verification','verifying','candidate_committed') then 1
+                    when status in ('claimed','coding','focused_tests','repairing','repairing_post_promotion') then 2
+                    else 3 end,
+                    priority desc, created_at asc, task_id asc
+                limit 1
+                """ % ",".join("?" for _ in statuses),
+                (fingerprint, *statuses, source_kind, source_id_text),
+            ).fetchone()
+        if canonical is not None and not (
+            existing is not None and str(existing["status"]) in ACTIVE_TASK_STATUSES
+        ):
+            result_payload = {
+                "reason": "equivalent_work_already_owned",
+                "canonical_task_id": str(canonical["task_id"]),
+                "canonical_source_kind": str(canonical["source_kind"]),
+                "canonical_source_id": str(canonical["source_id"]),
+                "work_scope": scope or str(canonical["work_scope"] or ""),
+            }
+            if existing is None:
+                task_id = uuid.uuid4().hex
+                conn.execute(
+                    """
+                    insert into codex_tasks(
+                        task_id,source_kind,source_id,lane,status,priority,payload_json,
+                        work_fingerprint,work_scope,canonical_task_id,created_at,updated_at,
+                        completed_at,result_json
+                    ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        task_id, source_kind, source_id_text, lane, "superseded_duplicate",
+                        int(priority), _json(dict(payload or {})), fingerprint, scope,
+                        canonical["task_id"], now, now, now, _json(result_payload),
+                    ),
+                )
+                duplicate_id = task_id
+            else:
+                duplicate_id = str(existing["task_id"])
+                conn.execute(
+                    """
+                    update codex_tasks
+                    set lane=?, priority=max(priority,?), payload_json=?, status='superseded_duplicate',
+                        work_fingerprint=?, work_scope=?, canonical_task_id=?, completed_at=?,
+                        result_json=?, retry_at=null, claimed_by=null, claim_pid=null,
+                        claim_token=null, claimed_at=null, lease_expires_at=null, updated_at=?
+                    where task_id=?
+                    """,
+                    (
+                        lane, int(priority), _json(dict(payload or _decode_json(existing["payload_json"]))),
+                        fingerprint, scope, canonical["task_id"], now, _json(result_payload), now,
+                        duplicate_id,
+                    ),
+                )
+            _event(conn, "task", duplicate_id, "superseded_duplicate", result_payload)
+            result = conn.execute(
+                "select * from codex_tasks where task_id=?", (duplicate_id,)
+            ).fetchone()
+            conn.commit()
+            return _row_dict(result) or {}
         if existing is not None:
             # New evidence may improve the priority/payload but cannot steal a live claim.
             next_status = str(existing["status"])
@@ -299,12 +394,16 @@ def enqueue_task(
                 "priority": max(int(existing["priority"]), int(priority)),
                 "payload_json": _json(dict(payload or _decode_json(existing["payload_json"]))),
                 "status": next_status,
+                "work_fingerprint": fingerprint or existing["work_fingerprint"],
+                "work_scope": scope or existing["work_scope"],
                 "updated_at": now,
             }
             conn.execute(
                 """
                 update codex_tasks
                 set lane=:lane, priority=:priority, payload_json=:payload_json, status=:status,
+                    work_fingerprint=:work_fingerprint, work_scope=:work_scope,
+                    canonical_task_id=case when :status in ('queued','requeued') then null else canonical_task_id end,
                     completed_at=case when :status in ('queued','requeued') then null else completed_at end,
                     retry_at=case when :status in ('queued','requeued') then null else retry_at end,
                     updated_at=:updated_at
@@ -321,10 +420,14 @@ def enqueue_task(
             conn.execute(
                 """
                 insert into codex_tasks(
-                    task_id,source_kind,source_id,lane,status,priority,payload_json,created_at,updated_at
-                ) values(?,?,?,?,?,?,?,?,?)
+                    task_id,source_kind,source_id,lane,status,priority,payload_json,
+                    work_fingerprint,work_scope,created_at,updated_at
+                ) values(?,?,?,?,?,?,?,?,?,?,?)
                 """,
-                (task_id, source_kind, source_id_text, lane, status, int(priority), _json(dict(payload or {})), now, now),
+                (
+                    task_id, source_kind, source_id_text, lane, status, int(priority),
+                    _json(dict(payload or {})), fingerprint, scope, now, now,
+                ),
             )
             result = conn.execute("select * from codex_tasks where task_id=?", (task_id,)).fetchone()
             _event(conn, "task", task_id, "enqueued", {"source_kind": source_kind, "lane": lane})
@@ -359,6 +462,152 @@ def heartbeat_worker(
     )
     conn.commit()
     return _row_dict(conn.execute("select * from codex_workers where worker_id=?", (worker_id,)).fetchone()) or {}
+
+
+def set_task_work_identity(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    work_fingerprint: str,
+    work_scope: str,
+) -> bool:
+    """Backfill a canonical identity for work queued before schema version 2."""
+
+    updated = conn.execute(
+        """
+        update codex_tasks set work_fingerprint=?,work_scope=?,updated_at=?
+        where task_id=?
+        """,
+        (work_fingerprint, work_scope, utc_now(), task_id),
+    ).rowcount
+    conn.commit()
+    return updated == 1
+
+
+def reconcile_duplicate_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Collapse claimable tasks that share work already owned by a peer."""
+
+    blocking = tuple(sorted(DEDUPLICATION_BLOCKING_STATUSES))
+    claimable = tuple(sorted(CLAIMABLE_TASK_STATUSES))
+    fingerprints = conn.execute(
+        """
+        select work_fingerprint from codex_tasks
+        where work_fingerprint is not null and work_fingerprint<>'' and status in (%s)
+        group by work_fingerprint having count(*)>1
+        """ % ",".join("?" for _ in blocking),
+        blocking,
+    ).fetchall()
+    superseded: list[dict[str, Any]] = []
+    _begin(conn)
+    try:
+        now = utc_now()
+        for fingerprint_row in fingerprints:
+            fingerprint = str(fingerprint_row["work_fingerprint"])
+            rows = conn.execute(
+                """
+                select * from codex_tasks where work_fingerprint=? and status in (%s)
+                order by case
+                    when status in ('verified','promoted') then 0
+                    when status in ('promoted_pending_verification','verifying','candidate_committed') then 1
+                    when status in ('claimed','coding','focused_tests','repairing','repairing_post_promotion') then 2
+                    else 3 end,
+                    priority desc,created_at asc,task_id asc
+                """ % ",".join("?" for _ in blocking),
+                (fingerprint, *blocking),
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+            canonical = rows[0]
+            for duplicate in rows[1:]:
+                if str(duplicate["status"]) not in CLAIMABLE_TASK_STATUSES:
+                    continue
+                result = {
+                    "reason": "equivalent_work_reconciled",
+                    "canonical_task_id": str(canonical["task_id"]),
+                    "canonical_source_kind": str(canonical["source_kind"]),
+                    "canonical_source_id": str(canonical["source_id"]),
+                    "work_scope": str(canonical["work_scope"] or ""),
+                }
+                updated = conn.execute(
+                    """
+                    update codex_tasks set status='superseded_duplicate',canonical_task_id=?,
+                        completed_at=?,updated_at=?,retry_at=null,result_json=?,last_error=null
+                    where task_id=? and status in (%s)
+                    """ % ",".join("?" for _ in claimable),
+                    (
+                        canonical["task_id"], now, now, _json(result), duplicate["task_id"],
+                        *claimable,
+                    ),
+                ).rowcount
+                if not updated:
+                    continue
+                _event(conn, "task", str(duplicate["task_id"]), "superseded_duplicate", result)
+                superseded.append(
+                    {
+                        "task_id": str(duplicate["task_id"]),
+                        "source_kind": str(duplicate["source_kind"]),
+                        "source_id": str(duplicate["source_id"]),
+                        "canonical_task_id": str(canonical["task_id"]),
+                        "canonical_source_id": str(canonical["source_id"]),
+                        "work_fingerprint": fingerprint,
+                        "work_scope": str(canonical["work_scope"] or ""),
+                    }
+                )
+        conn.commit()
+        return superseded
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def peer_work_context(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str | None = None,
+    limit: int = 16,
+) -> dict[str, Any]:
+    """Return compact shared work memory for a coding session."""
+
+    active = conn.execute(
+        """
+        select task_id,source_kind,source_id,lane,status,claimed_by,
+               work_fingerprint,work_scope,payload_json
+        from codex_tasks
+        where task_id<>coalesce(?, '') and status in (%s)
+        order by updated_at desc limit ?
+        """ % ",".join("?" for _ in ACTIVE_TASK_STATUSES),
+        (task_id, *sorted(ACTIVE_TASK_STATUSES), int(limit)),
+    ).fetchall()
+    recent = conn.execute(
+        """
+        select task_id,source_kind,source_id,lane,status,null as claimed_by,
+               work_fingerprint,work_scope,payload_json
+        from codex_tasks
+        where task_id<>coalesce(?, '')
+          and status in ('promoted','verified','promoted_pending_verification')
+        order by updated_at desc limit ?
+        """,
+        (task_id, int(limit)),
+    ).fetchall()
+
+    def compact(row: sqlite3.Row) -> dict[str, Any]:
+        payload = _decode_json(row["payload_json"])
+        return {
+            "task_id": str(row["task_id"]),
+            "source_kind": str(row["source_kind"]),
+            "source_id": str(row["source_id"]),
+            "lane": str(row["lane"]),
+            "status": str(row["status"]),
+            "worker": str(row["claimed_by"] or ""),
+            "work_fingerprint": str(row["work_fingerprint"] or ""),
+            "work_scope": str(row["work_scope"] or ""),
+            "title": str(payload.get("title") or ""),
+        }
+
+    return {
+        "active_peer_work": [compact(row) for row in active],
+        "recent_completed_work": [compact(row) for row in recent],
+    }
 
 
 def _default_pid_alive(pid: int | None) -> bool:
@@ -446,15 +695,29 @@ def claim_task(
     _begin(conn)
     try:
         statuses = tuple(sorted(CLAIMABLE_TASK_STATUSES))
+        active_peer_statuses = tuple(
+            sorted(DEDUPLICATION_BLOCKING_STATUSES - CLAIMABLE_TASK_STATUSES)
+        )
         row = conn.execute(
             """
-            select * from codex_tasks
-            where status in (%s) and (retry_at is null or retry_at <= ?)
-            order by case when lane=? then 0 else 1 end,
-                     priority desc, created_at asc, task_id asc
+            select t.* from codex_tasks t
+            where t.status in (%s) and (t.retry_at is null or t.retry_at <= ?)
+              and (
+                t.work_fingerprint is null or t.work_fingerprint='' or not exists (
+                    select 1 from codex_tasks peer
+                    where peer.task_id<>t.task_id
+                      and peer.work_fingerprint=t.work_fingerprint
+                      and peer.status in (%s)
+                )
+              )
+            order by case when t.lane=? then 0 else 1 end,
+                     t.priority desc, t.created_at asc, t.task_id asc
             limit 1
-            """ % ",".join("?" for _ in statuses),
-            (*statuses, now, preferred_lane),
+            """ % (
+                ",".join("?" for _ in statuses),
+                ",".join("?" for _ in active_peer_statuses),
+            ),
+            (*statuses, now, *active_peer_statuses, preferred_lane),
         ).fetchone()
         if row is None:
             conn.commit()
@@ -471,6 +734,36 @@ def claim_task(
         if updated != 1:
             conn.rollback()
             return None
+        if row["work_fingerprint"]:
+            duplicate_rows = conn.execute(
+                """
+                select task_id,source_kind,source_id from codex_tasks
+                where task_id<>? and work_fingerprint=? and status in (%s)
+                """ % ",".join("?" for _ in statuses),
+                (row["task_id"], row["work_fingerprint"], *statuses),
+            ).fetchall()
+            for duplicate in duplicate_rows:
+                duplicate_result = {
+                    "reason": "equivalent_work_claimed_by_peer",
+                    "canonical_task_id": str(row["task_id"]),
+                    "canonical_source_kind": str(row["source_kind"]),
+                    "canonical_source_id": str(row["source_id"]),
+                }
+                conn.execute(
+                    """
+                    update codex_tasks set status='superseded_duplicate', canonical_task_id=?,
+                        completed_at=?, updated_at=?, retry_at=null, result_json=?, last_error=null
+                    where task_id=?
+                    """,
+                    (row["task_id"], now, now, _json(duplicate_result), duplicate["task_id"]),
+                )
+                _event(
+                    conn,
+                    "task",
+                    str(duplicate["task_id"]),
+                    "superseded_duplicate",
+                    duplicate_result,
+                )
         result = conn.execute("select * from codex_tasks where task_id=?", (row["task_id"],)).fetchone()
         _event(
             conn,
@@ -853,6 +1146,10 @@ def coordination_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         "select count(*) from codex_tasks where status in ('queued','requeued') and (retry_at is null or retry_at<=?)",
         (utc_now(),),
     ).fetchone()[0]
+    duplicate_count = conn.execute(
+        "select count(*) from codex_tasks where status='superseded_duplicate'"
+    ).fetchone()[0]
+    shared_work = peer_work_context(conn, limit=12)
     return {
         "generated_at": utc_now(),
         "schema_version": SCHEMA_VERSION,
@@ -875,6 +1172,8 @@ def coordination_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         "verification_statuses": {str(row["status"]): int(row["count"]) for row in verification_rows},
         "promotions": int(promotion_count),
         "repairs": int(repair_count),
+        "deduplicated_tasks": int(duplicate_count),
+        "shared_work": shared_work,
         "workers": [_row_dict(row) for row in worker_rows],
         "migrations": migration_metadata(conn),
     }

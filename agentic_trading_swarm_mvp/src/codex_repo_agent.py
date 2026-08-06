@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterator
 
 PINNED_CODEX_PACKAGE = "openai-codex==0.144.4"
 PINNED_CODEX_NPM_FALLBACK = "@openai/codex@0.146.0"
-DEFAULT_MODEL = "gpt-5.6-terra"
+DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_CODEX_HOME = pathlib.Path.home() / ".codex"
 SECRET_ENV_NAMES = (
     "CODEX_API_KEY",
@@ -427,6 +427,7 @@ def build_implementation_prompt(
         "rollback_criteria": payload.get("rollback_criteria")
         or code_change.get("rollback_criteria"),
         "supplied_patch_hint": str(supplied_patch)[:24000],
+        "shared_coder_context": payload.get("coordination_context") or {},
     }
     hints = {
         "possible_files": (preflight_hints or {}).get("target_files") or [],
@@ -438,6 +439,7 @@ def build_implementation_prompt(
         "Search the repository and read the exact current files before editing. Implement the goal end to end, edit incrementally, run focused tests, inspect failures, and repair your work. Do not merely describe a patch.",
         "The host independently runs focused tests and the full regression suite, commits, and promotes. Do not commit or change branches yourself.",
         "Supplied paths, tests, and patch text are non-authoritative hints. Correct them by searching the repository and choose any tracked files needed for a complete implementation.",
+        "The shared coder context lists work active or recently completed by peer coders. Do not recreate that work; build on the current repository state and keep this task's scope distinct.",
         "Never inspect, print, persist, transmit, or modify credentials or secret-bearing environment variables. Do not edit .git, runs, runtime databases, or local secret configuration.",
         "Keep live trading disabled. Do not make broker/order writes or nonzero real-money execution reachable from paper mode.",
         "Paper exploration is the active runtime policy. Do not turn weak performance, route limits, low quality, spread, liquidity, or cost evidence into a new hard candidate suppression, quarantine, or paper-entry block. Preserve priceable candidate emission and express that evidence as diagnostics, ranking, sizing, synthetic-paper routing, or counterfactual guard-value measurement. Only invalid or dangerously stale prices, critically malformed data, undefined PnL, missing required leg prices without a proxy, duplicate exposure, or capacity deferral may prevent a paper experiment.",
@@ -620,7 +622,10 @@ def run_codex_repo_agent(
     pathlib.Path(str(cfg["codex_home"])).expanduser().mkdir(parents=True, exist_ok=True)
     log_path = pathlib.Path(str(cfg["session_log_dir"])) / f"{proposal_id.replace(':', '_')}.jsonl"
     command_for_session = lambda resume_id: _command(runtime, cfg, worktree_root.resolve(), resume_id)
-    prompt = build_implementation_prompt(payload, preflight_hints, failure_context)
+    effective_payload = dict(payload)
+    if cfg.get("coordination_context") and not effective_payload.get("coordination_context"):
+        effective_payload["coordination_context"] = cfg["coordination_context"]
+    prompt = build_implementation_prompt(effective_payload, preflight_hints, failure_context)
     started_at = _utc_now()
     runtime_meta = {name: value for name, value in runtime.items() if name != "command_prefix"}
     try:

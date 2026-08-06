@@ -46,6 +46,91 @@ class CodexCoordinationTests(unittest.TestCase):
         self.assertEqual({"version": 2}, second["payload"])
         self.assertEqual(claimed["claim_token"], second["claim_token"])
 
+    def test_equivalent_sources_share_one_canonical_task(self) -> None:
+        first = coordination.enqueue_task(
+            self.conn,
+            "proposal",
+            "one",
+            lane="general",
+            priority=90,
+            payload={"title": "Gate cost-swallowed frontier fills"},
+            work_fingerprint="same-work",
+            work_scope="frontier:net-edge",
+        )
+        duplicate = coordination.enqueue_task(
+            self.conn,
+            "proposal",
+            "two",
+            lane="general",
+            priority=95,
+            payload={"title": "Shadow cost-negative frontier fills"},
+            work_fingerprint="same-work",
+            work_scope="frontier:net-edge",
+        )
+
+        self.assertEqual("queued", first["status"])
+        self.assertEqual("superseded_duplicate", duplicate["status"])
+        self.assertEqual(first["task_id"], duplicate["canonical_task_id"])
+        claim = coordination.claim_task(self.conn, "worker-a", preferred_lane="general")
+        self.assertEqual(first["task_id"], claim["task_id"])
+        self.assertIsNone(coordination.claim_task(self.conn, "worker-b", preferred_lane="general"))
+
+    def test_verified_work_suppresses_a_future_equivalent_task(self) -> None:
+        first = coordination.enqueue_task(
+            self.conn,
+            "proposal",
+            "done",
+            work_fingerprint="completed-work",
+            work_scope="adapter:123",
+        )
+        coordination.complete_task(self.conn, first["task_id"], status="verified")
+        duplicate = coordination.enqueue_task(
+            self.conn,
+            "proposal",
+            "new-source",
+            work_fingerprint="completed-work",
+            work_scope="adapter:123",
+        )
+        self.assertEqual("superseded_duplicate", duplicate["status"])
+        self.assertEqual(first["task_id"], duplicate["canonical_task_id"])
+
+    def test_different_work_fingerprints_remain_independently_claimable(self) -> None:
+        first = coordination.enqueue_task(
+            self.conn, "proposal", "venue-a", work_fingerprint="adapter-a", work_scope="adapter:a"
+        )
+        second = coordination.enqueue_task(
+            self.conn, "proposal", "venue-b", work_fingerprint="adapter-b", work_scope="adapter:b"
+        )
+        claimed = {
+            coordination.claim_task(self.conn, "worker-a", preferred_lane="general")["task_id"],
+            coordination.claim_task(self.conn, "worker-b", preferred_lane="general")["task_id"],
+        }
+        self.assertEqual({first["task_id"], second["task_id"]}, claimed)
+
+    def test_peer_context_reports_active_and_recent_work(self) -> None:
+        active = coordination.enqueue_task(
+            self.conn,
+            "proposal",
+            "active",
+            payload={"title": "Active adapter"},
+            work_fingerprint="active-fingerprint",
+            work_scope="adapter:active",
+        )
+        coordination.claim_task(self.conn, "worker-a", preferred_lane="general")
+        done = coordination.enqueue_task(
+            self.conn,
+            "proposal",
+            "done",
+            payload={"title": "Completed strategy"},
+            work_fingerprint="done-fingerprint",
+            work_scope="strategy:done",
+        )
+        coordination.complete_task(self.conn, done["task_id"], status="verified")
+
+        context = coordination.peer_work_context(self.conn)
+        self.assertEqual(active["task_id"], context["active_peer_work"][0]["task_id"])
+        self.assertEqual(done["task_id"], context["recent_completed_work"][0]["task_id"])
+
     def test_preferred_lane_then_work_stealing(self) -> None:
         general = coordination.enqueue_task(self.conn, "proposal", "general", lane="general", priority=99)
         strategy = coordination.enqueue_task(self.conn, "proposal", "strategy", lane="strategy", priority=1)
@@ -199,6 +284,8 @@ class CodexCoordinationTests(unittest.TestCase):
         self.assertEqual(1, summary["repairs"])
         self.assertEqual({"tasks": 2}, summary["migrations"]["initial_import"]["details"])
         self.assertEqual("general-1", summary["workers"][0]["worker_id"])
+        self.assertIn("deduplicated_tasks", summary)
+        self.assertIn("shared_work", summary)
 
 
 if __name__ == "__main__":
