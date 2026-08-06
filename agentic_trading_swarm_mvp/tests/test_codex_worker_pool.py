@@ -180,6 +180,43 @@ class CodexWorkerPoolTests(unittest.TestCase):
         self.assertEqual(2, result["tasks_processed_this_turn"])
         self.assertEqual(1, result["quick_handoffs"])
 
+    def test_exact_main_commit_repairs_interrupted_proposal_status_and_queues_verification(self) -> None:
+        proposal_id = "code_evolution:interrupted"
+        with closing(self._radar_connect()) as radar:
+            storage.add_code_evolution_proposal(
+                radar, proposal_id, None, "strategy_implementation_owner", "openai/test", "frontier", None,
+                "Recovered strategy code", "strategy_lab_promotion", 95,
+                {"agent_name": "strategy_implementation_owner"}, {}, status="proposed",
+            )
+            with (
+                closing(codex_coordination.connect(self.coord_path)) as coord,
+                mock.patch.object(codex_worker_pool, "repo_root", return_value=self.root),
+                mock.patch.object(codex_worker_pool, "run_git") as run_git,
+            ):
+                run_git.side_effect = [
+                    {
+                        "returncode": 0,
+                        "stdout": f"verified-sha\tAutonomous candidate {proposal_id}\n",
+                        "stderr": "",
+                    },
+                    {"returncode": 0, "stdout": "parent-sha\n", "stderr": ""},
+                ]
+                result = codex_worker_pool._reconcile_promoted_commits(radar, coord, self.settings)
+                task = coord.execute(
+                    "select task_id,status from codex_tasks where source_kind='code_evolution_proposal' and source_id=?",
+                    (proposal_id,),
+                ).fetchone()
+                verification = coord.execute(
+                    "select status from codex_verification_jobs where task_id=?", (task["task_id"],)
+                ).fetchone()
+            proposal = storage.get_code_evolution_proposal(radar, proposal_id)
+
+        self.assertEqual(1, result["reconciled"])
+        self.assertEqual("promoted_pending_verification", proposal["status"])
+        self.assertEqual("verified-sha", proposal["candidate_commit"])
+        self.assertEqual("promoted_pending_verification", task["status"])
+        self.assertEqual("queued", verification["status"])
+
 
 if __name__ == "__main__":
     unittest.main()

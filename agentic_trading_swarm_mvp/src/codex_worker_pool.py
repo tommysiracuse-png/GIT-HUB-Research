@@ -173,21 +173,113 @@ def _enqueue_owner_turn(
     )
 
 
+def _proposal_lane(row: dict[str, Any]) -> str:
+    payload = row.get("payload") or {}
+    category = str(row.get("category") or "unknown")
+    source = str(payload.get("agent_name") or row.get("source_agent") or "").lower()
+    if "strategy" in source or category == "strategy_lab_promotion":
+        return "strategy"
+    if "adapter" in source or category in {"public_data_adapter", "parser_improvement", "scanner_expansion"}:
+        return "adapter"
+    if "activation" in source or category == "runtime_pipeline_integration":
+        return "activation"
+    return "general"
+
+
+def _reconcile_promoted_commits(
+    radar: sqlite3.Connection, coord: sqlite3.Connection, settings: dict
+) -> dict[str, Any]:
+    """Recover metadata when Git promotion won the race with a locked radar DB."""
+
+    root = repo_root(ROOT)
+    if root is None:
+        return {"reconciled": 0, "reason": "ambiguous_repo_root"}
+    history = run_git(
+        ["log", "--format=%H%x09%s", f"-{int(_cfg(settings).get('promotion_reconcile_log_limit', 500))}"],
+        root,
+        timeout=30,
+    )
+    if history["returncode"] != 0:
+        return {"reconciled": 0, "reason": "git_history_unavailable"}
+    promoted_by_subject: dict[str, str] = {}
+    for line in str(history.get("stdout") or "").splitlines():
+        commit, separator, subject = line.partition("\t")
+        if separator and subject.startswith("Autonomous candidate "):
+            promoted_by_subject[subject.removeprefix("Autonomous candidate ").strip()] = commit.strip()
+
+    rows = code_evolution_by_status(radar, PROPOSAL_QUEUE_STATUSES, limit=1000)
+    reconciled: list[dict[str, Any]] = []
+    for row in rows:
+        proposal_id = str(row.get("proposal_id") or "")
+        promoted_commit = promoted_by_subject.get(proposal_id)
+        if not promoted_commit:
+            continue
+        parent = run_git(["rev-parse", f"{promoted_commit}^"], root, timeout=30)
+        parent_commit = str(parent.get("stdout") or "").strip() if parent["returncode"] == 0 else None
+        evaluation = dict(row.get("evaluation") or {})
+        evaluation["promotion_reconciliation"] = {
+            "at": _utc_now(),
+            "reason": "main_commit_found_after_interrupted_status_write",
+            "promoted_commit": promoted_commit,
+        }
+        update_code_evolution_proposal(
+            radar,
+            proposal_id,
+            status="promoted_pending_verification",
+            parent_commit=parent_commit,
+            candidate_commit=promoted_commit,
+            evaluation=evaluation,
+            promotion_reason="Reconciled exact autonomous commit after interrupted database status write.",
+        )
+        task = enqueue_task(
+            coord,
+            "code_evolution_proposal",
+            proposal_id,
+            lane=_proposal_lane(row),
+            priority=int(row.get("priority") or 0),
+            payload={"proposal_id": proposal_id, "category": row.get("category"), "title": row.get("title")},
+            reactivate_terminal=True,
+        )
+        complete_task(
+            coord,
+            str(task["task_id"]),
+            status="promoted_pending_verification",
+            result={"reconciled_commit": promoted_commit},
+        )
+        enqueue_verification_job(
+            coord,
+            str(task["task_id"]),
+            priority=int(row.get("priority") or 0),
+            payload={"proposal_id": proposal_id, "promoted_commit": promoted_commit},
+        )
+        source_id = str(row.get("source_recommendation_id") or "")
+        if source_id.startswith("strategy-owner:") and source_id.endswith(":code"):
+            owner_task_id = source_id[len("strategy-owner:") : -len(":code")]
+            if _table_exists(radar, "strategy_owner_tasks"):
+                radar.execute(
+                    """
+                    update strategy_owner_tasks
+                    set code_proposal_id=?, status='promoted_to_runtime', claimed_by=null, claimed_pid=null,
+                        lease_expires_at=null, next_retry_at=null, updated_at=?
+                    where task_id=? and status not in ('completed','promoted_to_code','retired_bad_evidence')
+                    """,
+                    (proposal_id, _utc_now(), owner_task_id),
+                )
+                radar.commit()
+        reconciled.append({"proposal_id": proposal_id, "promoted_commit": promoted_commit})
+    return {"reconciled": len(reconciled), "items": reconciled}
+
+
 def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, settings: dict) -> dict[str, Any]:
     """Copy durable executable work into the low-contention coordination queue."""
 
     cfg = _cfg(settings)
+    reconciliation = _reconcile_promoted_commits(radar, coord, settings)
     queued: list[dict[str, Any]] = []
     for row in code_evolution_by_status(radar, PROPOSAL_QUEUE_STATUSES, limit=int(cfg["queue_batch_size"])):
         payload = row.get("payload") or {}
         category = str(row.get("category") or "unknown")
-        source = str(payload.get("agent_name") or row.get("source_agent") or "").lower()
-        lane = (
-            "strategy" if "strategy" in source or category == "strategy_lab_promotion"
-            else "adapter" if "adapter" in source or category in {"public_data_adapter", "parser_improvement", "scanner_expansion"}
-            else "activation" if "activation" in source or category == "runtime_pipeline_integration"
-            else "general"
-        )
+        lane = _proposal_lane(row)
         queued.append(
             enqueue_task(
                 coord,
@@ -274,7 +366,7 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
         "radar_backlog_sync",
         {"checked_at": _utc_now(), "queued_or_refreshed": len(queued)},
     )
-    return {"queued_or_refreshed": len(queued), "tasks": queued}
+    return {"queued_or_refreshed": len(queued), "tasks": queued, "promotion_reconciliation": reconciliation}
 
 
 def _worker_settings(settings: dict, worker_id: str) -> dict:

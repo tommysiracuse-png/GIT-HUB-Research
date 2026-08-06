@@ -713,6 +713,7 @@ DEFAULT_SETTINGS = {
         "queue_batch_size": 100,
         "max_quick_task_hops": 8,
         "quick_task_seconds": 5,
+        "promotion_reconcile_log_limit": 500,
         "defer_full_regression": True,
         "keep_repairing_after_verification_failure": True,
         "revert_only_on_catastrophic_health_failure": True,
