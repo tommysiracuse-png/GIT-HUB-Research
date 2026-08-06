@@ -5398,6 +5398,30 @@ def _finite_preliminary_spread_bps(row: dict) -> float | None:
     return spread_bps
 
 
+def _regional_shadow_depth_probe_policy(cfg: dict) -> dict:
+    allowed_statuses = {
+        str(status).strip()
+        for status in cfg.get(
+            "regional_shadow_depth_probe_allowed_quote_normalization_statuses",
+            ["usd_like", "same_venue_stablecoin_reference"],
+        )
+        if str(status).strip()
+    }
+    if not allowed_statuses:
+        allowed_statuses = {"usd_like", "same_venue_stablecoin_reference"}
+    max_spread_bps = float(cfg.get("regional_shadow_depth_probe_max_spread_bps", 75.0) or 0.0)
+    if not math.isfinite(max_spread_bps) or max_spread_bps <= 0.0:
+        max_spread_bps = 75.0
+    return {
+        "enabled": bool(cfg.get("regional_shadow_depth_probe_enabled", False)),
+        "max_per_cycle": max(0, int(cfg.get("regional_shadow_depth_probe_max_per_cycle", 15) or 0)),
+        "max_per_region": max(0, int(cfg.get("regional_shadow_depth_probe_max_per_region", 5) or 0)),
+        "max_per_venue": max(0, int(cfg.get("regional_shadow_depth_probe_max_per_venue", 3) or 0)),
+        "max_spread_bps": max_spread_bps,
+        "allowed_quote_normalization_statuses": sorted(allowed_statuses),
+    }
+
+
 def _data_gap_quality_coverage(
     observations: list[dict],
     snapshot_state: dict[str, dict],
@@ -5682,6 +5706,7 @@ def select_enrichment_observations(
     settings: dict,
 ) -> list[dict]:
     cfg = settings.get("frontier_data_quality", {})
+    regional_shadow_depth_probe = _regional_shadow_depth_probe_policy(cfg)
     base_max_total = int(cfg.get("max_symbols_per_cycle", 60))
     base_max_per_venue = int(cfg.get("max_symbols_per_venue", 12))
     unknown_reserve = int(cfg.get("unknown_quality_reserve_per_cycle", 30))
@@ -6131,6 +6156,96 @@ def select_enrichment_observations(
         data_gap_known_quality_rate_threshold,
         data_gap_quota_fraction,
     )
+    normal_selected_count = len(selected)
+    shadow_probe_selected: list[dict] = []
+    shadow_probe_selected_by_region: collections.Counter[str] = collections.Counter()
+    shadow_probe_selected_by_venue: collections.Counter[str] = collections.Counter()
+    shadow_probe_policy_enabled = bool(regional_shadow_depth_probe.get("enabled"))
+    shadow_probe_allowed_statuses = set(
+        regional_shadow_depth_probe.get("allowed_quote_normalization_statuses", [])
+    )
+    shadow_probe_max_spread_bps = float(regional_shadow_depth_probe.get("max_spread_bps", 75.0))
+
+    def shadow_probe_sort_key(row: dict) -> tuple:
+        spread_bps = _finite_preliminary_spread_bps(row)
+        quote_volume_24h = _finite_quote_volume_24h(row)
+        if adaptive:
+            return (
+                *_starved_sort_key(row, snapshot_state, starved_venues, cfg),
+                spread_bps if spread_bps is not None else float("inf"),
+                -(quote_volume_24h or 0.0),
+                str(row.get("instrument_id") or ""),
+            )
+        return (
+            0 if str(row.get("venue") or "").upper() in starved_venues else 1,
+            spread_bps if spread_bps is not None else float("inf"),
+            -(quote_volume_24h or 0.0),
+            str(row.get("instrument_id") or ""),
+        )
+
+    shadow_probe_eligible = sorted(
+        [
+            row
+            for row in observations
+            if row.get("instrument_id")
+            and str(row.get("instrument_id")) not in selected_ids
+            and row.get("data_status") == "reachable"
+            and row.get("market_type") == "spot"
+            and row.get("region")
+            and str(row.get("quote_normalization_status") or "") in shadow_probe_allowed_statuses
+            and str(row.get("suppression_reason") or "") != "unsupported_quote"
+            and str(row.get("quote_normalization_status") or "") != "unsupported_quote"
+            and _finite_quote_volume_24h(row) is not None
+            and _has_sane_preliminary_spread(row, shadow_probe_max_spread_bps)
+        ],
+        key=shadow_probe_sort_key,
+    )
+    if shadow_probe_policy_enabled:
+        for row in shadow_probe_eligible:
+            if len(shadow_probe_selected) >= int(regional_shadow_depth_probe["max_per_cycle"]):
+                break
+            inst_id = str(row.get("instrument_id") or "")
+            if not inst_id or inst_id in selected_ids:
+                continue
+            venue = str(row.get("venue") or "unknown").upper()
+            region = str(row.get("region") or "unknown")
+            if shadow_probe_selected_by_region[region] >= int(regional_shadow_depth_probe["max_per_region"]):
+                continue
+            if shadow_probe_selected_by_venue[venue] >= int(regional_shadow_depth_probe["max_per_venue"]):
+                continue
+            output = dict(row)
+            output["depth_selection_bucket"] = "regional_shadow_depth_probe"
+            output["depth_selection_reason"] = "regional_shadow_depth_probe"
+            output["starved_venue"] = venue in starved_venues
+            output["depth_selection_escalation"] = escalation
+            output["shadow_depth_probe"] = True
+            output["shadow_depth_probe_region"] = region
+            selected.append(output)
+            selected_ids.add(inst_id)
+            venue_counts[venue] += 1
+            shadow_probe_selected.append(output)
+            shadow_probe_selected_by_region[region] += 1
+            shadow_probe_selected_by_venue[venue] += 1
+    regional_shadow_depth_probe_report = {
+        "enabled": shadow_probe_policy_enabled,
+        "eligible_count": len(shadow_probe_eligible),
+        "selected_count": len(shadow_probe_selected),
+        "normal_selected_count": normal_selected_count,
+        "max_per_cycle": int(regional_shadow_depth_probe["max_per_cycle"]),
+        "max_per_region": int(regional_shadow_depth_probe["max_per_region"]),
+        "max_per_venue": int(regional_shadow_depth_probe["max_per_venue"]),
+        "max_spread_bps": round(shadow_probe_max_spread_bps, 3),
+        "allowed_quote_normalization_statuses": list(
+            regional_shadow_depth_probe["allowed_quote_normalization_statuses"]
+        ),
+        "selected_instruments": [
+            str(row.get("instrument_id"))
+            for row in shadow_probe_selected
+            if row.get("instrument_id")
+        ],
+        "selected_by_region": dict(shadow_probe_selected_by_region),
+        "selected_by_venue": dict(shadow_probe_selected_by_venue),
+    }
     selected_gap_instruments = [
         str(row.get("instrument_id"))
         for row in selected
@@ -6162,13 +6277,20 @@ def select_enrichment_observations(
         "data_gap_depth_quota_min_observation_count": data_gap_quota_min_observations,
         "data_gap_known_quality_rate_threshold": round(data_gap_known_quality_rate_threshold, 4),
         "data_gap_depth_quota_reserved_slots": data_gap_quota_reserved_slots,
+        "regional_shadow_depth_probe_enabled": shadow_probe_policy_enabled,
+        "regional_shadow_depth_probe_max_per_cycle": int(regional_shadow_depth_probe["max_per_cycle"]),
+        "regional_shadow_depth_probe_max_per_region": int(regional_shadow_depth_probe["max_per_region"]),
+        "regional_shadow_depth_probe_max_per_venue": int(regional_shadow_depth_probe["max_per_venue"]),
+        "regional_shadow_depth_probe_max_spread_bps": round(shadow_probe_max_spread_bps, 3),
     }
     for row in selected:
+        row.setdefault("shadow_depth_probe", False)
         row["depth_selection_venue_quota_report"] = quota_report
         row["depth_selection_limits"] = selection_limits
         row["depth_selection_zero_quality_venue_probe_report"] = zero_quality_probe_report
         row["depth_selection_data_gap_quota_report"] = data_gap_quota_report
         row["depth_selection_blind_under_sampled_quota_report"] = data_gap_quota_report
+        row["depth_selection_regional_shadow_depth_probe_report"] = regional_shadow_depth_probe_report
         row["depth_selection_selected_gap_instruments"] = list(selected_gap_instruments)
     return selected
 
@@ -6268,9 +6390,17 @@ def enrich_observations(
     data_gap_quota_report = dict(
         selected[0].get("depth_selection_data_gap_quota_report", {}) if selected else {}
     )
+    regional_shadow_depth_probe_report = dict(
+        selected[0].get("depth_selection_regional_shadow_depth_probe_report", {}) if selected else {}
+    )
     selected_gap_instruments = list(
         selected[0].get("depth_selection_selected_gap_instruments", []) if selected else []
     )
+    shadow_probe_selected_ids = {
+        str(row.get("instrument_id"))
+        for row in selected
+        if row.get("shadow_depth_probe") and row.get("instrument_id")
+    }
     starved_venues = {
         str(venue).upper()
         for venue in cfg.get("starved_venues", [])
@@ -6279,6 +6409,7 @@ def enrich_observations(
         output = dict(row)
         inst_id = str(row.get("instrument_id"))
         quality = results.get(str(row.get("instrument_id")))
+        output["shadow_depth_probe"] = inst_id in shadow_probe_selected_ids
         if quality:
             output.update(quality)
         elif inst_id in selected_ids:
@@ -6313,9 +6444,25 @@ def enrich_observations(
     for venue, item in zero_quality_probe_report.items():
         item["selected_quality_status_counts"] = dict(probe_quality_by_venue.get(str(venue).upper(), {}))
         item["depth_endpoint_configured"] = str(venue).upper() in target_venues
+    regional_shadow_depth_probe_report["selected_enriched_count"] = sum(
+        1
+        for inst_id in shadow_probe_selected_ids
+        if (results.get(inst_id) or {}).get("quality_status") in {"verified", "degraded"}
+    )
+    regional_shadow_depth_probe_report["selected_unknown_count"] = sum(
+        1
+        for inst_id in shadow_probe_selected_ids
+        if (results.get(inst_id) or {}).get("quality_status") == "unknown"
+    )
+    regional_shadow_depth_probe_report["selected_blocked_count"] = sum(
+        1
+        for inst_id in shadow_probe_selected_ids
+        if (results.get(inst_id) or {}).get("quality_status") == "blocked"
+    )
     return enriched, {
         "enabled": True,
         "selected_count": len(selected),
+        "normal_selected_count": int(regional_shadow_depth_probe_report.get("normal_selected_count", len(selected))),
         "enriched_count": sum(1 for item in results.values() if item.get("quality_status") in {"verified", "degraded"}),
         "unknown_count": sum(1 for item in results.values() if item.get("quality_status") == "unknown"),
         "blocked_count": sum(1 for item in results.values() if item.get("quality_status") == "blocked"),
@@ -6329,6 +6476,8 @@ def enrich_observations(
         "venue_quota_report": selection_quota_report,
         "selection_bucket_counts": dict(bucket_counts),
         "zero_quality_venue_probe": zero_quality_probe_report,
+        "regional_shadow_depth_probe": regional_shadow_depth_probe_report,
+        "shadow_depth_probe_selected_count": len(shadow_probe_selected_ids),
         "data_gap_depth_quota": data_gap_quota_report,
         "blind_under_sampled_coverage_quota": data_gap_quota_report,
         "selected_by_venue": dict(selected_by_venue),

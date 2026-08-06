@@ -13074,6 +13074,7 @@ def _candidate_from_observation(
         "suppression_reason": observation.get("suppression_reason"),
         "product_metadata_validated": bool(observation.get("product_metadata_validated")),
         "conversion_path_validated": bool(observation.get("conversion_path_validated")),
+        "shadow_depth_probe": bool(observation.get("shadow_depth_probe")),
         "paper_only_quote_normalization": bool(observation.get("paper_only_quote_normalization")),
         "paper_derived_quote_normalization": paper_derived_quote_normalization,
         "quote_ranking_eligible": bool(observation.get("quote_ranking_eligible", True)),
@@ -13484,7 +13485,11 @@ def summarize(
     depth_summary = quality_summary or {}
     venue_quote_context = _venue_quote_context(candidates)
     depth_selected = int(depth_summary.get("selected_count", 0) or 0)
+    normal_depth_selected = int(depth_summary.get("normal_selected_count", depth_selected) or 0)
     depth_enriched = int(depth_summary.get("enriched_count", 0) or 0)
+    shadow_depth_probe_selected = int(depth_summary.get("shadow_depth_probe_selected_count", 0) or 0)
+    shadow_depth_probe_observation_count = sum(1 for row in observations if row.get("shadow_depth_probe"))
+    shadow_depth_probe_candidate_count = sum(1 for row in candidates if row.get("shadow_depth_probe"))
     observation_count = len(observations)
     starved_coverage = _starved_venue_coverage(observations, depth_summary)
     known_quality_rate = round(quality_known_count / observation_count, 4) if observation_count else 0.0
@@ -13497,9 +13502,13 @@ def summarize(
         "symbol_count": len({row.get("comparison_key") for row in observations if row.get("comparison_key")}),
         "regional_observation_count": sum(1 for row in observations if row.get("quote") in REGIONAL_FIAT_QUOTES),
         "depth_selected_count": depth_selected,
+        "normal_depth_selected_count": normal_depth_selected,
         "depth_enriched_count": depth_enriched,
         "depth_selected_rate": round(depth_selected / observation_count, 4) if observation_count else 0.0,
         "depth_enriched_rate": round(depth_enriched / observation_count, 4) if observation_count else 0.0,
+        "shadow_depth_probe_selected_count": shadow_depth_probe_selected,
+        "shadow_depth_probe_observation_count": shadow_depth_probe_observation_count,
+        "shadow_depth_probe_candidate_count": shadow_depth_probe_candidate_count,
         "known_quality_count": quality_known_count,
         "unknown_quality_count": quality_statuses.get("unknown", 0),
         "known_quality_rate": known_quality_rate,
@@ -13512,6 +13521,7 @@ def summarize(
         "quality_target_escalation": depth_summary.get("selection_escalation", {}),
         "depth_selection_buckets": depth_summary.get("selection_bucket_counts", {}),
         "zero_quality_venue_probe": depth_summary.get("zero_quality_venue_probe", {}),
+        "regional_shadow_depth_probe": depth_summary.get("regional_shadow_depth_probe", {}),
         "blind_under_sampled_coverage_quota": depth_summary.get("blind_under_sampled_coverage_quota", {}),
         "market_testing_progress": depth_summary.get("market_testing_progress", {}),
         "selected_by_venue": depth_summary.get("selected_by_venue", {}),
@@ -13746,6 +13756,7 @@ def summarize(
             "paper_fill_gate_reason": row.get("paper_fill_gate_reason"),
             "paper_fill_gate_trigger_codes": row.get("paper_fill_gate_trigger_codes", []),
             "paper_venue_diagnostics": row.get("paper_venue_diagnostics"),
+            "shadow_depth_probe": row.get("shadow_depth_probe"),
         }
         for row in candidates[:20]
     ]
@@ -13765,6 +13776,7 @@ def summarize(
         "by_quote_normalization": dict(by_quote_normalization),
         "by_quote_suppression": dict(by_quote_suppression),
         "regional_observation_count": sum(1 for row in observations if row.get("quote") in REGIONAL_FIAT_QUOTES),
+        "shadow_depth_probe_observation_count": shadow_depth_probe_observation_count,
         "local_quote_normalization": {
             "paper_only": True,
             "supported_venues": sorted(LOCAL_FIAT_CEX_VENUES),
@@ -13778,6 +13790,7 @@ def summarize(
             ),
         },
         "regional_candidate_count": sum(1 for row in candidates if row.get("quote") in REGIONAL_FIAT_QUOTES),
+        "shadow_depth_probe_candidate_count": shadow_depth_probe_candidate_count,
         "active_paper_review_candidate_count": active_candidate_count,
         "shadow_or_observe_only_candidate_count": shadow_only_candidate_count,
         "candidate_activity": candidate_activity,
@@ -13803,6 +13816,9 @@ def summarize(
         "blocked_venues": sorted({row["venue"] for row in observations if row.get("data_status") == "blocked"}),
         "degraded_venues": sorted({row["venue"] for row in observations if row.get("data_status") == "degraded"}),
         "depth_enrichment": quality_summary or {},
+        "normal_depth_selected_count": normal_depth_selected,
+        "shadow_depth_probe_selected_count": shadow_depth_probe_selected,
+        "regional_shadow_depth_probe": depth_summary.get("regional_shadow_depth_probe", {}),
         "data_gap_depth_quota_applied": bool(depth_summary.get("data_gap_depth_quota_applied")),
         "data_gap_selected_count": int(depth_summary.get("data_gap_selected_count", 0) or 0),
         "selected_gap_instruments": list(depth_summary.get("selected_gap_instruments", []) or []),
@@ -13906,6 +13922,8 @@ def _markdown(report: dict) -> str:
         f"- Symbols: `{summary.get('symbol_count', 0)}`",
         f"- Regional observations: `{summary.get('regional_observation_count', 0)}`",
         f"- Regional candidates: `{summary.get('regional_candidate_count', 0)}`",
+        f"- Shadow depth-probe observations: `{summary.get('shadow_depth_probe_observation_count', 0)}`",
+        f"- Shadow depth-probe candidates: `{summary.get('shadow_depth_probe_candidate_count', 0)}`",
         f"- Reachable venues: `{', '.join(summary.get('reachable_venues', [])) or 'none'}`",
         f"- Blocked venues: `{', '.join(summary.get('blocked_venues', [])) or 'none'}`",
         f"- Degraded venues: `{', '.join(summary.get('degraded_venues', [])) or 'none'}`",
@@ -13954,6 +13972,9 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Unknown quality count: `{expansion.get('unknown_quality_count')}`")
     lines.append(f"- Depth selected rate: `{expansion.get('depth_selected_rate')}`")
     lines.append(f"- Depth enriched rate: `{expansion.get('depth_enriched_rate')}`")
+    lines.append(f"- Normal depth-selected count: `{expansion.get('normal_depth_selected_count')}`")
+    lines.append(f"- Shadow depth-probe selected count: `{expansion.get('shadow_depth_probe_selected_count')}`")
+    lines.append(f"- Regional shadow depth probe: `{expansion.get('regional_shadow_depth_probe', {})}`")
     lines.append(f"- Data-gap quota applied: `{expansion.get('data_gap_depth_quota_applied')}`")
     lines.append(f"- Data-gap selected count: `{expansion.get('data_gap_selected_count')}`")
     lines.append(f"- Data-gap instruments: `{expansion.get('selected_gap_instruments', [])}`")

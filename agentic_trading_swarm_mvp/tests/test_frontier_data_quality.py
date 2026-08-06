@@ -788,6 +788,127 @@ class EnrichmentSelectionTests(unittest.TestCase):
         self.assertIn("MXN", gap_report["eligible_quotes"])
         self.assertEqual(["BITSO:GAPMXN"], selected[0]["depth_selection_selected_gap_instruments"])
 
+    def test_regional_shadow_depth_probe_adds_extra_bounded_tranche(self) -> None:
+        conn = memory_conn()
+        cfg = settings()
+        cfg["frontier_data_quality"].update(
+            {
+                "adaptive_selection": False,
+                "max_symbols_per_cycle": 1,
+                "max_symbols_per_venue": 1,
+                "quality_target_escalation_enabled": False,
+                "unknown_quality_reserve_per_cycle": 0,
+                "regional_reserve_per_cycle": 0,
+                "exploit_variant_reserve_per_cycle": 0,
+                "zero_quality_venue_probe_reserve_per_cycle": 0,
+                "data_gap_depth_quota_fraction": 0.0,
+                "regional_shadow_depth_probe_enabled": True,
+                "regional_shadow_depth_probe_max_per_cycle": 15,
+                "regional_shadow_depth_probe_max_per_region": 5,
+                "regional_shadow_depth_probe_max_per_venue": 3,
+                "regional_shadow_depth_probe_max_spread_bps": 75.0,
+            }
+        )
+        open_obs = observation()
+        open_obs.update(
+            {
+                "venue": "KRAKEN",
+                "instrument_id": "KRAKEN:OPENUSD",
+                "symbol": "OPENUSD",
+                "quote": "USD",
+                "quote_normalization_status": "usd_like",
+                "quote_volume_24h": 500_000.0,
+            }
+        )
+        storage.open_paper_trade(
+            conn,
+            {
+                "inst_id": "KRAKEN:OPENUSD",
+                "trade_type": "frontier_crypto_venue_map",
+                "direction": "long_frontier_spot",
+                "venue": "KRAKEN",
+                "last": 100.0,
+                "score": 50.0,
+                "execution_feasibility": {"status": "standard"},
+            },
+            {"learned_score": 50.0},
+        )
+        observations = [open_obs]
+        regional_layout = {
+            "Africa": [("LUNO", 6, 1_000_000.0), ("VALR", 4, 700_000.0)],
+            "LATAM": [("BITSO", 5, 900_000.0), ("BUDA", 4, 650_000.0)],
+            "Southeast Asia": [("BITKUB", 5, 800_000.0), ("INDODAX", 4, 600_000.0)],
+        }
+        for region, venue_specs in regional_layout.items():
+            for venue, count, base_volume in venue_specs:
+                for index in range(count):
+                    row = observation()
+                    row.update(
+                        {
+                            "venue": venue,
+                            "instrument_id": f"{venue}:REG{index}",
+                            "symbol": f"REG{index}",
+                            "quote": "USDT" if index % 2 == 0 else "ZAR",
+                            "region": region,
+                            "quote_volume_24h": base_volume - index,
+                            "quote_normalization_status": (
+                                "usd_like" if index % 2 == 0 else "same_venue_stablecoin_reference"
+                            ),
+                            "spread_bps": 10.0 + index,
+                        }
+                    )
+                    observations.append(row)
+        unsupported = observation()
+        unsupported.update(
+            {
+                "venue": "LUNO",
+                "instrument_id": "LUNO:BADUNSUPPORTED",
+                "symbol": "BADUNSUPPORTED",
+                "quote": "KES",
+                "region": "Africa",
+                "quote_volume_24h": 2_000_000.0,
+                "quote_normalization_status": "unsupported_quote",
+                "suppression_reason": "unsupported_quote",
+                "spread_bps": 5.0,
+            }
+        )
+        wide = observation()
+        wide.update(
+            {
+                "venue": "BITSO",
+                "instrument_id": "BITSO:BADSPREAD",
+                "symbol": "BADSPREAD",
+                "quote": "MXN",
+                "region": "LATAM",
+                "quote_volume_24h": 2_000_000.0,
+                "quote_normalization_status": "same_venue_stablecoin_reference",
+                "spread_bps": 90.0,
+            }
+        )
+        observations.extend([unsupported, wide])
+
+        selected = quality.select_enrichment_observations(conn, observations, [], {}, cfg)
+
+        probes = [row for row in selected if row.get("shadow_depth_probe")]
+        region_counts = collections.Counter(str(row.get("region")) for row in probes)
+        venue_counts = collections.Counter(str(row.get("venue")) for row in probes)
+        probe_ids = {str(row.get("instrument_id")) for row in probes}
+        self.assertEqual(16, len(selected))
+        self.assertEqual(15, len(probes))
+        self.assertEqual({"Africa": 5, "LATAM": 5, "Southeast Asia": 5}, dict(region_counts))
+        self.assertEqual(
+            {"LUNO": 3, "VALR": 2, "BITSO": 3, "BUDA": 2, "BITKUB": 3, "INDODAX": 2},
+            dict(venue_counts),
+        )
+        self.assertNotIn("LUNO:BADUNSUPPORTED", probe_ids)
+        self.assertNotIn("BITSO:BADSPREAD", probe_ids)
+        self.assertTrue(all(row["depth_selection_bucket"] == "regional_shadow_depth_probe" for row in probes))
+        report = selected[0]["depth_selection_regional_shadow_depth_probe_report"]
+        self.assertTrue(report["enabled"])
+        self.assertEqual(1, report["normal_selected_count"])
+        self.assertEqual(15, report["selected_count"])
+        self.assertEqual({"Africa": 5, "LATAM": 5, "Southeast Asia": 5}, report["selected_by_region"])
+
     def test_starved_venue_minimums_reserve_per_venue_depth_samples(self) -> None:
         conn = memory_conn()
         cfg = settings()

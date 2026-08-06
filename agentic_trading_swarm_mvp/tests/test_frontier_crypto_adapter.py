@@ -880,6 +880,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             self._obs("B", "ABC-USDT", "ABC", "USDT", 98, 100000),
             self._obs("C", "ABC-USDT", "ABC", "USDT", 102, 100000),
         ]
+        observations[1]["shadow_depth_probe"] = True
         refs = frontier._reference_prices(observations, cfg)
         candidates = [
             frontier._candidate_from_observation(row, cfg, refs["ABC"], 3)
@@ -898,8 +899,18 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                     candidates,
                     cfg,
                     quality_summary={
-                        "selected_count": 3,
-                        "enriched_count": 2,
+                        "selected_count": 5,
+                        "normal_selected_count": 3,
+                        "enriched_count": 4,
+                        "shadow_depth_probe_selected_count": 2,
+                        "regional_shadow_depth_probe": {
+                            "enabled": True,
+                            "normal_selected_count": 3,
+                            "selected_count": 2,
+                            "selected_enriched_count": 2,
+                            "selected_by_region": {"LATAM": 2},
+                            "selected_by_venue": {"B": 1, "C": 1},
+                        },
                         "data_gap_depth_quota_applied": True,
                         "data_gap_selected_count": 2,
                         "selected_gap_instruments": ["B:ABC-USDT", "C:ABC-USDT"],
@@ -957,9 +968,15 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertIn("short_cost_decomposition", summary)
         self.assertIn("dislocation_quality_score", summary["top_dislocations"][0])
         self.assertIn("short_cost_decomposition", summary["top_dislocations"][0])
+        self.assertEqual(1, summary["shadow_depth_probe_observation_count"])
+        self.assertEqual(1, summary["shadow_depth_probe_candidate_count"])
+        self.assertEqual(2, summary["shadow_depth_probe_selected_count"])
+        self.assertEqual(3, summary["normal_depth_selected_count"])
+        self.assertTrue(summary["regional_shadow_depth_probe"]["enabled"])
         self.assertEqual(summary["expansion_map"]["worker_count"], 16)
         self.assertEqual(summary["expansion_map"]["selection_limits"]["max_symbols_per_cycle"], 300)
         self.assertEqual(summary["expansion_map"]["venue_quota_report"]["A"]["status"], "partial")
+        self.assertEqual(2, summary["expansion_map"]["regional_shadow_depth_probe"]["selected_count"])
         self.assertTrue(summary["data_gap_depth_quota_applied"])
         self.assertEqual(2, summary["data_gap_selected_count"])
         self.assertEqual(["B:ABC-USDT", "C:ABC-USDT"], summary["selected_gap_instruments"])
@@ -969,6 +986,8 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             0,
         )
         self.assertIn("Data-gap quota applied", report_md)
+        self.assertIn("Shadow depth-probe observations", report_md)
+        self.assertIn("Regional shadow depth probe", report_md)
 
     def test_dislocation_quality_ranks_broad_stable_references_without_blocking_fragile_paper(self) -> None:
         cfg = settings()
