@@ -113,11 +113,31 @@ def validate_cross_market_researcher_object(payload: Any) -> None:
         raise ValueError(
             "cross-market recommendation missing required fields: " + ", ".join(missing)
         )
+    unexpected = [key for key in payload if key not in REQUIRED_RECOMMENDATION_KEYS]
+    if unexpected:
+        raise ValueError(
+            "cross-market recommendation contains unexpected fields: "
+            + ", ".join(sorted(unexpected))
+        )
     if payload["action"] not in CROSS_MARKET_RESEARCHER_ALLOWED_ACTIONS:
         raise ValueError("cross-market recommendation action is not allowed")
+    for field in ("title", "rationale", "market_key"):
+        value = payload[field]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"cross-market recommendation {field} must be a non-empty string"
+            )
     # bool is an int subclass, but it is not a meaningful recommendation priority.
     if isinstance(payload["priority"], bool) or not isinstance(payload["priority"], int):
         raise ValueError("cross-market recommendation priority must be an integer")
+    if not isinstance(payload["evidence"], dict):
+        raise ValueError("cross-market recommendation evidence must be a JSON object")
+    if not payload["evidence"]:
+        raise ValueError("cross-market recommendation evidence must not be empty")
+    if not isinstance(payload["proposed_change"], dict):
+        raise ValueError("cross-market recommendation proposed_change must be a JSON object")
+    if not payload["proposed_change"]:
+        raise ValueError("cross-market recommendation proposed_change must not be empty")
 
 
 def validate_red_team_object(payload: Any) -> None:
@@ -170,17 +190,20 @@ def cross_market_researcher_schema_fallback(
         "priority": 100,
         "title": "Cross-market researcher response schema violation",
         "rationale": (
-            "The generated cross-market recommendation was not schema-valid; retain the "
-            "failure as a paper-only diagnostic rather than using it for execution."
+            "The generated cross-market recommendation was not schema-valid or lacked "
+            "enough evidence for a supported thesis; retain the failure as a paper-only "
+            "diagnostic rather than using it for execution."
         ),
         "market_key": "paper.cross_market_researcher.schema_fallback",
         "evidence": {
             "schema_violation": validation_error,
             "raw_generation_metadata": raw_generation_metadata,
+            "insufficient_market_evidence_defaults_to_diagnostic": True,
             "paper_only": True,
         },
         "proposed_change": {
             "summary": "Repair the cross-market response schema and rerun the paper-only analysis.",
+            "fallback_mode": "paper_only_diagnostic_hypothesis",
             "paper_only": True,
             "live_trading": "disabled",
         },

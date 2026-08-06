@@ -1376,6 +1376,24 @@ def _schema_retry_prompt(agent: dict, original_text: str) -> str:
             "No markdown, no commentary, no extra keys, no arrays at the top level. Keep it paper-only.\n\n"
             f"Previous response preview:\n{(original_text or '')[:1200]}"
         )
+    if agent.get("name") == "cross_market_researcher":
+        return (
+            "The previous cross_market_researcher response was not a complete valid JSON recommendation. "
+            "Return exactly one JSON object and no prose. Use exactly these top-level keys: "
+            "action, priority, title, rationale, market_key, evidence, proposed_change. "
+            "action must be either \"no_action\" or \"propose_diagnostic_hypothesis\". "
+            "priority must be an integer 1-100. title, rationale, and market_key must be non-empty strings. "
+            "evidence and proposed_change must be non-empty JSON objects. "
+            "If the available market evidence is insufficient for a reliable thesis, "
+            "default to action=\"propose_diagnostic_hypothesis\" with a paper-only diagnostic hypothesis instead of partial content. "
+            "Use this exact schema-locked template shape:\n"
+            "{\"action\":\"propose_diagnostic_hypothesis\",\"priority\":100,\"title\":\"...\"," 
+            "\"rationale\":\"...\",\"market_key\":\"paper.cross_market_researcher.<scope>\","
+            "\"evidence\":{\"schema_violation\":\"...\",\"paper_only\":true},"
+            "\"proposed_change\":{\"summary\":\"...\",\"paper_only\":true}}\n"
+            "No markdown, no commentary, no extra keys, no arrays at the top level. Keep it paper-only.\n\n"
+            f"Previous response preview:\n{(original_text or '')[:1200]}"
+        )
     return (
         f"The previous {agent['name']} response was not a complete valid JSON recommendation. "
         "Return exactly one complete JSON object with: action, priority, title, rationale, "

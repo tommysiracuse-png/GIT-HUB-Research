@@ -90,8 +90,19 @@ class RecommendationFinalizerTests(unittest.TestCase):
         missing_field.pop("evidence")
         invalid_action = _payload(action="propose_code_change")
         invalid_priority = _payload(priority="high")
+        extra_field = _payload(extra="not allowed")
+        empty_evidence = _payload(evidence={})
+        string_proposed_change = _payload(proposed_change="partial")
 
-        for response in (top_level_array, missing_field, invalid_action, invalid_priority):
+        for response in (
+            top_level_array,
+            missing_field,
+            invalid_action,
+            invalid_priority,
+            extra_field,
+            empty_evidence,
+            string_proposed_change,
+        ):
             with self.subTest(response=response):
                 with self.assertRaises(ValueError):
                     finalize_cross_market_researcher_response(json.dumps(response))
@@ -161,6 +172,11 @@ class CrossMarketResearcherRetryTests(unittest.TestCase):
         self.assertIn("exactly one complete JSON object", rec["evidence"]["schema_violation"])
         self.assertEqual(rec["evidence"]["raw_generation_metadata"]["retry"]["response_text"], wrapped)
         self.assertEqual(rec["retry_count"], 1)
+        self.assertTrue(rec["evidence"]["insufficient_market_evidence_defaults_to_diagnostic"])
+        self.assertEqual(
+            rec["proposed_change"]["fallback_mode"],
+            "paper_only_diagnostic_hypothesis",
+        )
 
     def test_invalid_action_becomes_schema_diagnostic_after_retry(self):
         invalid_action = json.dumps(_payload(action="propose_code_change"))
@@ -292,6 +308,22 @@ class RedTeamStrictRetryTests(unittest.TestCase):
         self.assertIn("exactly one complete JSON object", rec["evidence"]["schema_violation"])
         self.assertEqual(rec["evidence"]["raw_generation_metadata"]["retry"]["response_text"], wrapped)
         self.assertEqual(rec["retry_count"], 1)
+
+
+class CrossMarketSchemaRetryPromptTests(unittest.TestCase):
+    def test_cross_market_retry_prompt_requires_diagnostic_fallback_on_insufficient_evidence(self):
+        agent = next(
+            agent
+            for agent in llm_swarm_runner.AGENTS
+            if agent["name"] == "cross_market_researcher"
+        )
+
+        prompt = llm_swarm_runner._schema_retry_prompt(agent, '{"action":"partial"}')
+
+        self.assertIn("Use exactly these top-level keys", prompt)
+        self.assertIn("paper-only diagnostic hypothesis", prompt)
+        self.assertIn("no extra keys", prompt)
+        self.assertIn("evidence and proposed_change must be non-empty JSON objects", prompt)
 
 
 if __name__ == "__main__":
