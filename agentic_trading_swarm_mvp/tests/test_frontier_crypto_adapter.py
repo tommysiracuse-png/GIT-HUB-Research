@@ -594,6 +594,68 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertGreater(candidate["local_quote_score_penalty"], 0.0)
         self.assertFalse(candidate["paper_entry_blocked"])
 
+    def test_yahoo_fx_fallback_keeps_frontier_quote_rankable_with_paper_haircut(self) -> None:
+        cfg = settings()
+        local = self._obs("QUIDAX", "BTCUGX", "BTC", "UGX", 232_360_000.0, 23_236_000_000.0, region="africa")
+        peer = self._obs("COINBASE", "BTC-USD", "BTC", "USD", 64_000.0, 10_000_000.0)
+
+        normalized = frontier._normalize_regional_quotes(
+            [local, peer],
+            fx_references={
+                "UGX": {
+                    "rate": 3700.0,
+                    "provider": frontier.YAHOO_FX_REFERENCE_PROVIDER,
+                    "age_seconds": 15.0,
+                    "source_url": "https://example.test/yahoo",
+                }
+            },
+        )
+        quidax = next(row for row in normalized if row["venue"] == "QUIDAX")
+        quidax.update(
+            {
+                "quality_status": "verified",
+                "quality_score": 90.0,
+                "venue_health_score": 90.0,
+                "venue_health": {"venue_quality_score": 90.0},
+                "verified_depth_snapshot_count": 3,
+                "simulated_fills": {
+                    "buy": {"1000": {"filled": True, "slippage_bps": 1.0}},
+                    "sell": {"1000": {"filled": True, "slippage_bps": 1.0}},
+                },
+                "anomaly_flags": [],
+                "critical_anomaly_flags": [],
+            }
+        )
+
+        candidate = frontier._candidate_from_observation(
+            quidax,
+            cfg,
+            64_000.0,
+            2,
+            reference_observations=normalized,
+        )
+        ranked = frontier.rank_frontier_paper_candidates([candidate], cfg)
+
+        self.assertEqual(frontier.YAHOO_FX_FALLBACK_NORMALIZATION_STATUS, quidax["quote_normalization_status"])
+        self.assertTrue(quidax["paper_derived_quote_normalization"])
+        self.assertTrue(quidax["quote_normalization_is_fallback"])
+        self.assertIn("paper_derived_yahoo_fx_fallback", quidax["notes"])
+        self.assertLess(quidax["quote_normalization_confidence_multiplier"], 1.0)
+        self.assertTrue(candidate["paper_derived_quote_normalization"])
+        self.assertIn("yahoo_fx_fallback_reference", candidate["local_quote_diagnostics"])
+        self.assertIn("quote_normalization_confidence_haircut", candidate["local_quote_diagnostics"])
+        self.assertGreater(candidate["score_before_quote_normalization_haircut"], candidate["score"])
+        self.assertGreater(candidate["quote_normalization_confidence_haircut"], 0.0)
+        self.assertGreater(ranked[0]["paper_ranking_score"], 0.0)
+        self.assertLess(
+            ranked[0]["effective_edge_model"]["quote_normalization_confidence_multiplier"],
+            1.0,
+        )
+        self.assertIn(
+            "frontier fiat FX conversion uses a read-only Yahoo spot fallback for paper ranking only",
+            ranked[0]["risk_notes"],
+        )
+
     def test_stale_external_fx_stays_priceable_but_is_excluded_from_active_ranking(self) -> None:
         cfg = settings()
         local = self._obs("LUNO", "XBTZAR", "BTC", "ZAR", 1_782_000.0, 180_000_000, region="Africa")
@@ -653,6 +715,62 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertFalse(ranked[0]["paper_active_scoring_eligible"])
         self.assertEqual("stale_fx_reference", ranked[0]["paper_fx_ranking_reason"])
         self.assertEqual("stale_fx_reference_shadow_only", ranked[0]["paper_quality_filter_status"])
+        self.assertEqual(0.0, ranked[0]["paper_ranking_score"])
+
+    def test_stale_yahoo_fx_fallback_stays_excluded_from_active_ranking(self) -> None:
+        cfg = settings()
+        local = self._obs("QUIDAX", "BTCUGX", "BTC", "UGX", 232_360_000.0, 23_236_000_000.0, region="Africa")
+        peer = self._obs("COINBASE", "BTC-USD", "BTC", "USD", 64_000.0, 10_000_000.0)
+
+        normalized = frontier._normalize_regional_quotes(
+            [local, peer],
+            fx_references={
+                "UGX": {
+                    "rate": 3700.0,
+                    "provider": frontier.YAHOO_FX_REFERENCE_PROVIDER,
+                    "age_seconds": 301.0,
+                    "source_url": "https://example.test/yahoo",
+                }
+            },
+            policy={
+                "regional_fx_normalization_enabled": True,
+                "regional_fx_require_fresh_reference": True,
+                "regional_fx_max_age_seconds": 300.0,
+                "regional_fx_yahoo_fallback_confidence_multiplier": 0.75,
+            },
+        )
+        quidax = next(row for row in normalized if row["venue"] == "QUIDAX")
+        quidax.update(
+            {
+                "quality_status": "verified",
+                "quality_score": 90.0,
+                "venue_health_score": 90.0,
+                "venue_health": {"venue_quality_score": 90.0},
+                "verified_depth_snapshot_count": 3,
+                "simulated_fills": {
+                    "buy": {"1000": {"filled": True, "slippage_bps": 1.0}},
+                    "sell": {"1000": {"filled": True, "slippage_bps": 1.0}},
+                },
+                "anomaly_flags": [],
+                "critical_anomaly_flags": [],
+            }
+        )
+
+        candidate = frontier._candidate_from_observation(
+            quidax,
+            cfg,
+            64_000.0,
+            2,
+            reference_observations=normalized,
+        )
+        ranked = frontier.rank_frontier_paper_candidates([candidate], cfg)
+
+        self.assertEqual("stale_fx_reference", quidax["quote_normalization_status"])
+        self.assertTrue(quidax["paper_derived_quote_normalization"])
+        self.assertTrue(quidax["quote_normalization_is_fallback"])
+        self.assertFalse(candidate["quote_ranking_eligible"])
+        self.assertFalse(ranked[0]["paper_active_scoring_eligible"])
+        self.assertEqual("stale_fx_reference", ranked[0]["paper_fx_ranking_reason"])
         self.assertEqual(0.0, ranked[0]["paper_ranking_score"])
 
     def test_unmatched_quote_and_invalid_product_metadata_fail_closed(self) -> None:

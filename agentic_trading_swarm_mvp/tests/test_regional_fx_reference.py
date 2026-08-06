@@ -45,6 +45,8 @@ class RegionalFxReferenceTests(unittest.TestCase):
         self.assertIn("TZS", configured)
         self.assertIn("UGX", configured)
         self.assertEqual(5, DEFAULT_SETTINGS["frontier_regional_fx"]["cache_ttl_minutes"])
+        self.assertTrue(DEFAULT_SETTINGS["frontier_regional_fx"]["yahoo_fallback_enabled"])
+        self.assertEqual(2, DEFAULT_SETTINGS["frontier_regional_fx"]["yahoo_cache_ttl_minutes"])
 
     def test_parse_exchange_rate_api_open_response(self) -> None:
         rows = fx.parse_exchange_rate_api(
@@ -125,6 +127,41 @@ class RegionalFxReferenceTests(unittest.TestCase):
 
         self.assertEqual(set(refs), {"AUD", "EUR", "GBP"})
         self.assertTrue({"AUD", "EUR", "GBP"}.issubset(set(fallback_refs)))
+
+    def test_yahoo_fallback_backfills_missing_frontier_quote_after_partial_primary_coverage(self) -> None:
+        old_fetch = fx.fetch_json
+        calls = []
+
+        def fake_fetch(url: str, timeout: int = 10):
+            calls.append(url)
+            if "open.er-api.com" in url:
+                return {"rates": {"ZAR": 18.1}, "time_last_update_unix": 1_700_000_000}
+            if "frankfurter" in url:
+                return {"base": "USD", "date": "2026-06-29", "rates": {}}
+            return {
+                "chart": {
+                    "result": [
+                        {
+                            "meta": {"regularMarketPrice": 3720.7, "regularMarketTime": 1_700_000_030},
+                            "timestamp": [1_700_000_030],
+                            "indicators": {"quote": [{"close": [3720.7]}]},
+                        }
+                    ],
+                    "error": None,
+                }
+            }
+
+        conn = memory_conn()
+        fx.fetch_json = fake_fetch
+        try:
+            refs = fx.get_regional_fx_references(conn, settings(), quotes={"ZAR", "UGX"}, force_refresh=True)
+        finally:
+            fx.fetch_json = old_fetch
+
+        self.assertEqual({"ZAR", "UGX"}, set(refs))
+        self.assertEqual("ExchangeRate-API Open", refs["ZAR"]["provider"])
+        self.assertEqual(fx.YAHOO_FX_PROVIDER, refs["UGX"]["provider"])
+        self.assertTrue(any("USDUGX%3DX" in url or "USDUGX=X" in url for url in calls))
 
 
 if __name__ == "__main__":

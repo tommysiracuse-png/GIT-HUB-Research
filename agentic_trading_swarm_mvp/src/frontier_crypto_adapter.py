@@ -7851,6 +7851,8 @@ CUSTOM_REGISTRY_PATH = CONFIG_DIR / "frontier_crypto_venues.json"
 EXAMPLE_REGISTRY_PATH = CONFIG_DIR / "frontier_crypto_venues.example.json"
 
 USD_LIKE_QUOTES = {"USD", "USDT", "USDC"}
+YAHOO_FX_REFERENCE_PROVIDER = "Yahoo Finance FX"
+YAHOO_FX_FALLBACK_NORMALIZATION_STATUS = "yahoo_fx_fallback_reference"
 REGIONAL_FIAT_QUOTES = {
     "AUD",
     "EUR",
@@ -8072,6 +8074,7 @@ DEFAULT_REGISTRY = {
         "regional_fx_require_fresh_reference": True,
         "regional_fx_max_age_seconds": 300,
         "regional_fx_stale_confidence_haircut": 0.35,
+        "regional_fx_yahoo_fallback_confidence_multiplier": 0.75,
     },
     "paper_trade_policy": DEFAULT_PAPER_TRADE_POLICY,
     "route_feasibility": DEFAULT_ROUTE_FEASIBILITY_POLICY,
@@ -10175,6 +10178,10 @@ def _normalize_regional_quotes(
     normalization_enabled = bool(policy.get("regional_fx_normalization_enabled", True))
     require_fresh_reference = bool(policy.get("regional_fx_require_fresh_reference", True))
     max_fx_age_seconds = float(policy.get("regional_fx_max_age_seconds", 21_600))
+    yahoo_fallback_confidence_multiplier = max(
+        0.0,
+        min(1.0, float(policy.get("regional_fx_yahoo_fallback_confidence_multiplier", 0.75))),
+    )
     by_venue_quote: dict[tuple[str, str], dict] = {}
     for row in observations:
         if row.get("data_status") != "reachable":
@@ -10206,6 +10213,10 @@ def _normalize_regional_quotes(
                 "conversion_path_validated": False,
                 "quote_ranking_eligible": True,
                 "quote_ranking_reason": None,
+                "quote_normalization_reference_currency": "USD",
+                "quote_normalization_confidence_multiplier": 1.0,
+                "quote_normalization_is_fallback": False,
+                "paper_derived_quote_normalization": False,
                 "product_metadata_validated": bool(
                     base
                     and quote
@@ -10261,13 +10272,20 @@ def _normalize_regional_quotes(
                 ref = fx_references[quote]
                 fx_price = float(ref["rate"])
                 fx_age = as_float(ref.get("age_seconds"), None)
+                provider = str(ref.get("provider") or "")
+                yahoo_fallback = provider == YAHOO_FX_REFERENCE_PROVIDER
                 output["quote_normalization_source"] = f"{ref.get('provider')}:USD/{quote}"
                 output["fx_source"] = output["quote_normalization_source"]
                 output["fx_age_seconds"] = round(float(fx_age), 3) if fx_age is not None else None
                 output["fx_reference_rate"] = fx_price
-                output["fx_reference_provider"] = ref.get("provider")
+                output["fx_reference_provider"] = provider
                 output["fx_reference_age_seconds"] = output["fx_age_seconds"]
                 output["fx_reference_source_url"] = ref.get("source_url")
+                output["quote_normalization_confidence_multiplier"] = (
+                    yahoo_fallback_confidence_multiplier if yahoo_fallback else 1.0
+                )
+                output["quote_normalization_is_fallback"] = yahoo_fallback
+                output["paper_derived_quote_normalization"] = yahoo_fallback
                 output["usd_normalized_last"] = round(last / fx_price, 12)
                 output["canonical_normalized_price"] = output["usd_normalized_last"]
                 output["canonical_quote_currency"] = "USD"
@@ -10284,7 +10302,13 @@ def _normalize_regional_quotes(
                 ):
                     _set_stale_fx_ranking_state(output)
                 else:
-                    output["quote_normalization_status"] = "external_fx_reference"
+                    output["quote_normalization_status"] = (
+                        YAHOO_FX_FALLBACK_NORMALIZATION_STATUS
+                        if yahoo_fallback
+                        else "external_fx_reference"
+                    )
+                    if yahoo_fallback:
+                        _append_note(output, "paper_derived_yahoo_fx_fallback")
             else:
                 output["quote_normalization_source"] = None
                 _set_quote_suppression(
@@ -11647,6 +11671,10 @@ def _frontier_paper_score_review(
             "paper_only": True,
             "applicable": False,
             "hard_gate_applied": False,
+            "quote_normalization_confidence_multiplier": round(
+                max(0.0, min(1.0, as_float(candidate.get("quote_normalization_confidence_multiplier"), 1.0) or 1.0)),
+                6,
+            ),
             "score": round(max(0.0, ranking_edge if ranking_edge is not None else base_score), 3),
         }
 
@@ -11725,8 +11753,12 @@ def _frontier_paper_score_review(
         hard_gate_reasons.append("liquidity_below_minimum")
     if spread_bps_value is not None and spread_bps_value > max_spread_bps:
         hard_gate_reasons.append("spread_above_maximum")
+    quote_normalization_confidence_multiplier = max(
+        0.0,
+        min(1.0, as_float(candidate.get("quote_normalization_confidence_multiplier"), 1.0) or 1.0),
+    )
     # Context is already folded into the bounded execution-quality term.
-    score = expected_edge_value * execution_quality_term * freshness_term
+    score = expected_edge_value * execution_quality_term * freshness_term * quote_normalization_confidence_multiplier
     if hard_gate_reasons:
         score = 0.0
     return {
@@ -11746,6 +11778,8 @@ def _frontier_paper_score_review(
         "observed_spread_bps": round(spread_bps_value, 6) if spread_bps_value is not None else None,
         "minimum_liquidity_score": round(min_liquidity, 6),
         "maximum_spread_bps": round(max_spread_bps, 6),
+        "quote_normalization_confidence_multiplier": round(quote_normalization_confidence_multiplier, 6),
+        "paper_derived_quote_normalization": bool(candidate.get("paper_derived_quote_normalization")),
         "hard_gate_applied": bool(hard_gate_reasons),
         "hard_gate_reasons": hard_gate_reasons,
         "gating_mode": "ranking_only",
@@ -12099,7 +12133,10 @@ def frontier_effective_edge_review(observation: dict, candidate: dict, settings:
     )
     quote_status = str(observation.get("quote_normalization_status") or "").lower()
     quote_conversion_cost = max(0.0, as_float(observation.get("quote_conversion_cost_bps"), None) or 0.0)
-    if quote_conversion_cost == 0.0 and quote_status == "external_fx_reference":
+    if quote_conversion_cost == 0.0 and quote_status in {
+        "external_fx_reference",
+        YAHOO_FX_FALLBACK_NORMALIZATION_STATUS,
+    }:
         quote_conversion_cost = max(0.0, float(policy["external_quote_conversion_cost_bps"]))
     route_text = " ".join(
         str(value or "")
@@ -12152,7 +12189,27 @@ def frontier_effective_edge_review(observation: dict, candidate: dict, settings:
         1.0 if reliability is not None and reliability >= min_reliability
         else (reliability / min_reliability if reliability is not None and min_reliability else 0.0)
     )
-    confidence_score = max(0.0, min(1.0, freshness_confidence * liquidity_confidence * reliability_confidence))
+    quote_normalization_confidence_multiplier = max(
+        0.0,
+        min(
+            1.0,
+            as_float(
+                candidate.get("quote_normalization_confidence_multiplier"),
+                as_float(observation.get("quote_normalization_confidence_multiplier"), 1.0),
+            )
+            or 1.0,
+        ),
+    )
+    confidence_score = max(
+        0.0,
+        min(
+            1.0,
+            freshness_confidence
+            * liquidity_confidence
+            * reliability_confidence
+            * quote_normalization_confidence_multiplier,
+        ),
+    )
     reasons = []
     if effective_edge <= float(policy["minimum_effective_edge_bps"]):
         reasons.append("effective_edge_not_positive")
@@ -12193,6 +12250,10 @@ def frontier_effective_edge_review(observation: dict, candidate: dict, settings:
         "venue_reliability_score": round(reliability, 6) if reliability is not None else None,
         "venue_reliability_source": reliability_source,
         "synthetic_or_proxy_route": synthetic_route,
+        "quote_normalization_confidence_multiplier": round(quote_normalization_confidence_multiplier, 6),
+        "paper_derived_quote_normalization": bool(
+            candidate.get("paper_derived_quote_normalization") or observation.get("paper_derived_quote_normalization")
+        ),
         "primary_allocation_multiplier": round(primary_allocation, 6),
         "allocation_cap": round(allocation_cap, 6),
         "counterfactual_allocation_multiplier": round(
@@ -12826,7 +12887,16 @@ def _candidate_from_observation(
     regional_candidate_gate_status = "not_applicable"
     regional_candidate_diagnostics = []
     regional_quote = observation.get("quote") in REGIONAL_FIAT_QUOTES
-    if regional_quote and observation.get("quote_normalization_status") == "external_fx_reference":
+    quote_normalization_status = str(observation.get("quote_normalization_status") or "")
+    paper_derived_quote_normalization = bool(observation.get("paper_derived_quote_normalization"))
+    quote_normalization_confidence_multiplier = max(
+        0.0,
+        min(1.0, as_float(observation.get("quote_normalization_confidence_multiplier"), 1.0) or 1.0),
+    )
+    if regional_quote and quote_normalization_status in {
+        "external_fx_reference",
+        YAHOO_FX_FALLBACK_NORMALIZATION_STATUS,
+    }:
         required_snapshots = int(quality_cfg.get("min_verified_snapshots_for_regional_candidate", 3))
         min_regional_quality = float(quality_cfg.get("min_regional_quality_score", 70.0))
         verified_count = int(observation.get("verified_depth_snapshot_count") or 0)
@@ -12841,6 +12911,10 @@ def _candidate_from_observation(
         if regional_candidate_gate_status != "passed":
             anomaly_flags = sorted(set([*anomaly_flags, regional_candidate_gate_status]))
             regional_candidate_diagnostics.append(regional_candidate_gate_status)
+    if paper_derived_quote_normalization:
+        regional_candidate_diagnostics.append("paper_derived_quote_normalization")
+        if quote_normalization_status == YAHOO_FX_FALLBACK_NORMALIZATION_STATUS:
+            regional_candidate_diagnostics.append("yahoo_fx_fallback_reference")
     local_premium_bps = as_float(observation.get("premium_vs_reference_bps"), None)
     fx_age_minutes = as_float(observation.get("fx_age_minutes"), None)
     local_quote_score_penalty = 0.0
@@ -12859,6 +12933,8 @@ def _candidate_from_observation(
     local_quote_score_penalty = round(local_quote_score_penalty, 3)
     actionable = direction != "watch_only" and observation.get("data_status") == "reachable" and not reject_reason
     score = 0.0
+    score_before_quote_normalization_haircut = 0.0
+    quote_normalization_confidence_haircut = 0.0
     if actionable:
         score = min(100.0, 24.0 + edge * 1.25 + liq * 18.0 - min(spread * 1.2, 20.0) + min(source_venue_count, 8))
         if quality_score is not None:
@@ -12867,8 +12943,14 @@ def _candidate_from_observation(
         # not turn an otherwise priceable observation into a watch-only row.
         score -= local_quote_score_penalty
         score = max(0.0, min(100.0, score))
+        score_before_quote_normalization_haircut = score
+        if quote_normalization_confidence_multiplier < 1.0:
+            score *= quote_normalization_confidence_multiplier
+            quote_normalization_confidence_haircut = score_before_quote_normalization_haircut - score
+            regional_candidate_diagnostics.append("quote_normalization_confidence_haircut")
     elif observation.get("data_status") == "reachable":
         score = min(25.0, 8.0 + abs(deviation) * 0.3 + liq * 10.0)
+        score_before_quote_normalization_haircut = score
     feasibility = _preliminary_feasibility(direction, observation["market_type"], observation["data_status"], settings)
     funding_bps = (float(observation.get("funding_rate") or 0.0) * 10_000.0) if observation.get("funding_rate") is not None else 0.0
     change_24h_pct = float(as_float(observation.get("change_24h_pct"), 0.0) or 0.0)
@@ -12909,6 +12991,11 @@ def _candidate_from_observation(
         "reference_price": round(float(reference_price or 0.0), 8),
         "quote_normalization_status": observation.get("quote_normalization_status"),
         "quote_normalization_source": observation.get("quote_normalization_source"),
+        "quote_normalization_reference_currency": observation.get("quote_normalization_reference_currency"),
+        "quote_normalization_confidence_multiplier": quote_normalization_confidence_multiplier,
+        "quote_normalization_confidence_haircut": round(quote_normalization_confidence_haircut, 6),
+        "score_before_quote_normalization_haircut": round(score_before_quote_normalization_haircut, 6),
+        "quote_normalization_is_fallback": bool(observation.get("quote_normalization_is_fallback")),
         "fx_source": observation.get("fx_source"),
         "fx_age_seconds": observation.get("fx_age_seconds"),
         "fx_to_usd": observation.get("fx_to_usd"),
@@ -12919,11 +13006,12 @@ def _candidate_from_observation(
         "premium_vs_reference_bps": observation.get("premium_vs_reference_bps"),
         "local_quote_flag": bool(observation.get("local_quote_flag")),
         "local_quote_score_penalty": local_quote_score_penalty,
-        "local_quote_diagnostics": regional_candidate_diagnostics,
+        "local_quote_diagnostics": list(dict.fromkeys(regional_candidate_diagnostics)),
         "suppression_reason": observation.get("suppression_reason"),
         "product_metadata_validated": bool(observation.get("product_metadata_validated")),
         "conversion_path_validated": bool(observation.get("conversion_path_validated")),
         "paper_only_quote_normalization": bool(observation.get("paper_only_quote_normalization")),
+        "paper_derived_quote_normalization": paper_derived_quote_normalization,
         "quote_ranking_eligible": bool(observation.get("quote_ranking_eligible", True)),
         "quote_ranking_reason": observation.get("quote_ranking_reason"),
         "fx_reference_rate": observation.get("fx_reference_rate"),
@@ -13001,6 +13089,10 @@ def _candidate_from_observation(
             "notes": observation.get("notes", []),
         },
     }
+    if paper_derived_quote_normalization:
+        candidate["risk_notes"].append(
+            "frontier fiat FX conversion uses a read-only Yahoo spot fallback for paper ranking only"
+        )
     if observation.get("market_type") == "spot":
         candidate.update(native_spot_surface_fields(observation))
     # Route facts must be present before either context-cost sizing or the

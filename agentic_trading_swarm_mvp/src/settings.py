@@ -475,6 +475,8 @@ DEFAULT_SETTINGS = {
     "frontier_regional_fx": {
         "enabled": True,
         "cache_ttl_minutes": 5,
+        "yahoo_fallback_enabled": True,
+        "yahoo_cache_ttl_minutes": 2,
         "max_reference_age_hours": 30,
         "timeout_seconds": 10,
         "quotes": ["ARS", "AUD", "BRL", "CLP", "COP", "EUR", "GBP", "GHS", "IDR", "KES", "MXN", "MYR", "NGN", "PEN", "PHP", "SGD", "THB", "TZS", "UGX", "ZAR"],
