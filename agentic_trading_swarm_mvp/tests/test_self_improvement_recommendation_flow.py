@@ -27,6 +27,36 @@ def fixture(name):
 
 
 class SelfImprovementRecommendationFlowTest(unittest.TestCase):
+    def test_paper_only_canary_reaches_full_parse_success_with_single_retry(self):
+        ingestor = RecommendationIngestor(retry_timeout_seconds=1)
+        sample = [
+            fixture("native_valid.json"),
+            fixture("embedded_valid.json"),
+            fixture("truncated.json"),
+        ]
+        retry_calls = []
+
+        def retry(_prompt):
+            retry_calls.append("retry")
+            repaired = json.loads(json.dumps(fixture("native_valid.json")))
+            repaired["output_parsed"]["title"] = "Recovered truncated recommendation"
+            repaired["output_parsed"]["rationale"] = (
+                "The retry returned one schema-complete paper-only recommendation object."
+            )
+            return repaired
+
+        results = [ingestor.ingest(item, retry=retry) for item in sample]
+
+        self.assertEqual(3, len(results))
+        self.assertTrue(all(result["accepted"] for result in results))
+        self.assertEqual(1, len(retry_calls))
+        self.assertEqual(
+            1.0,
+            sum(1 for result in results if result["accepted"]) / len(results),
+        )
+        self.assertEqual("truncated_json", results[2]["initial_parse_status"])
+        self.assertEqual(1, ingestor.audit()["retried"])
+
     def test_offline_replay_routes_valid_code_change_exactly_once(self):
         dispatches = []
         swarm = {

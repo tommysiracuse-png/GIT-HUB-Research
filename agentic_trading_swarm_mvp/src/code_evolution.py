@@ -358,15 +358,25 @@ def validate_strict_recommendation_json_text(text: str) -> tuple[bool, dict[str,
     stripped = text.strip()
     if stripped.startswith("```") or stripped.startswith("["):
         return False, None, "markdown_or_array_not_allowed"
-    if stripped.count("{") < 1 or stripped.count("}") < 1:
+    if "{" not in stripped:
         return False, None, "missing_json_object"
+    decoder = json.JSONDecoder()
     try:
-        payload = json.loads(stripped)
+        payload, end = decoder.raw_decode(stripped)
     except json.JSONDecodeError:
+        if stripped.startswith("{") and (
+            not stripped.endswith("}") or stripped.count("{") > stripped.count("}")
+        ):
+            return False, None, "truncated_json"
         return False, None, "invalid_json"
+    if not isinstance(payload, dict):
+        return False, None, "payload_not_object"
+    if stripped[end:].strip():
+        return False, None, "extraneous_text"
     ok, reason = validate_paper_only_recommendation_payload(payload)
     if not ok:
         return False, None, reason
+    return True, payload, "ok"
 
 
 def validate_paper_only_recommendation_payload(payload: Any) -> tuple[bool, str]:
@@ -377,6 +387,20 @@ def validate_paper_only_recommendation_payload(payload: Any) -> tuple[bool, str]
     missing = [field for field in STRICT_REQUIRED_RECOMMENDATION_FIELDS if field not in payload]
     if missing:
         return False, "missing_required_fields"
+    action = str(payload.get("action") or "").strip()
+    allowed_actions = STRICT_RECOMMENDATION_FALLBACK_ACTIONS | SUPPRESSION_ACTIONS
+    if action not in allowed_actions:
+        return False, "invalid_action"
+    if not isinstance(payload.get("evidence"), dict):
+        return False, "invalid_evidence"
+    if not STRICT_RECOMMENDATION_REQUIRED_EVIDENCE_FIELDS_SET.issubset(payload["evidence"]):
+        return False, "missing_required_evidence_fields"
+    if not isinstance(payload.get("proposed_change"), dict):
+        return False, "invalid_proposed_change"
+    if not STRICT_RECOMMENDATION_REQUIRED_PROPOSED_CHANGE_FIELDS_SET.issubset(
+        payload["proposed_change"]
+    ):
+        return False, "missing_required_proposed_change_fields"
     market_key = payload.get("market_key")
     if not isinstance(market_key, str) or not market_key.strip():
         return False, "invalid_market_key"
