@@ -326,6 +326,84 @@ def boc_auction_reference_logic() -> dict:
     }
 
 
+def carb_allowance_auction_observation(
+    price: float,
+    event_date: dt.date,
+    *,
+    auction_number: int,
+    allowance_category: str,
+    allowances_offered: float,
+    allowances_sold: float | None = None,
+    **overrides: object,
+) -> dict:
+    sold = allowances_offered if allowances_sold is None else allowances_sold
+    observed_at = dt.datetime.combine(
+        event_date,
+        dt.time(hour=12, tzinfo=dt.timezone.utc),
+    ).isoformat()
+    row = {
+        "inst_id": (
+            f"CARB:CA_QC_AUCTION:{auction_number}:{allowance_category.upper()}:{event_date.isoformat()}"
+        ),
+        "venue": "CARB_CA_QC",
+        "trade_type": "official_market_reference",
+        "market_type": "joint_allowance_auction_result",
+        "market_surface": "california_quebec_cap_and_invest_joint_allowance_auctions",
+        "asset_class": "greenhouse_gas_emission_allowance",
+        "quote": "USD_PER_ALLOWANCE",
+        "base": "CA_QC_GHG_ALLOWANCE",
+        "last": price,
+        "price_available": True,
+        "auction_settlement_price_usd": price,
+        "allowances_offered": allowances_offered,
+        "allowances_sold": sold,
+        "allowance_category": allowance_category,
+        "auction_number": auction_number,
+        "event_date": event_date.isoformat(),
+        "quality_status": "official_auction_result",
+        "freshness_state": "fresh",
+        "candidate_reject_reason": "official_allowance_auction_reference_not_order_routable",
+        "session_status": "closed",
+        "reserve_sale": allowance_category == "reserve",
+        "observed_at": observed_at,
+        "price_source": "California Air Resources Board public Cap-and-Invest record",
+    }
+    row.update(overrides)
+    return row
+
+
+def carb_allowance_auction_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["CARB_CA_QC"],
+            "asset_classes": ["greenhouse_gas_emission_allowance"],
+            "market_types": ["joint_allowance_auction_result"],
+            "market_surfaces": ["california_quebec_cap_and_invest_joint_allowance_auctions"],
+        },
+        "calculated_features": {
+            "paired_sellthrough_total": "current_sellthrough + advance_sellthrough",
+            "tight_discount_edge_bps": "max(0, 25 - term_discount_bps)",
+        },
+        "entry_expression": (
+            "market_surface == 'california_quebec_cap_and_invest_joint_allowance_auctions' "
+            "and quality_status == 'official_auction_result' "
+            "and candidate_reject_reason == 'official_allowance_auction_reference_not_order_routable' "
+            "and allowance_category == 'current' and paired_current_advance_observed >= 1 "
+            "and current_sellthrough >= 1 and advance_sellthrough >= 1 "
+            "and price_available == True and reserve_sale == False"
+        ),
+        "invalidation_expression": (
+            "freshness_state != 'fresh' or paired_current_advance_observed < 1 "
+            "or reserve_sale == True or price_available == False"
+        ),
+        "direction": "long",
+        "edge_expression": "tight_discount_edge_bps + 10 * max(paired_sellthrough_total - 2, 0)",
+        "score_expression": "clip(50 + tight_discount_edge_bps + 5 * paired_current_advance_observed, 0, 100)",
+        "route_surface": "auction_reference",
+    }
+
+
 def eex_reported_spot_observation(price: float, observed_at: str, **overrides: object) -> dict:
     row = {
         "inst_id": "EEX:EUAA:SPOT:691200",
@@ -1109,6 +1187,139 @@ class StrategyProgramTests(unittest.TestCase):
         candidates, diagnostic = generate_program_candidates(experiment, [invalid], cfg)
         self.assertEqual([], candidates, diagnostic)
         self.assertEqual(1, diagnostic["reject_reasons"]["entry_expression_false"])
+
+    def test_carb_allowance_auction_reference_uses_paired_features_and_next_current_settlement(self) -> None:
+        cfg = settings()
+        cfg["paper_exploration"]["enabled"] = True
+        cfg["learning"]["horizon_minutes"] = [0]
+        recommendation = lab_recommendation(
+            "carb_allowance_reference_v1",
+            carb_allowance_auction_logic(),
+        )
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["hypothesis"] = (
+            "Tight current-versus-advance CARB discounts with full sell-through support firmer next current settlements."
+        )
+        experiment["source_surface"] = "california_quebec_cap_and_invest_joint_allowance_auctions"
+        experiment["permitted_target_surface"] = [
+            "california_quebec_cap_and_invest_joint_allowance_auctions"
+        ]
+
+        prior_date = dt.date(2026, 5, 20)
+        entry_date = dt.date(2026, 8, 19)
+        next_date = dt.date(2026, 11, 18)
+        prior_current = carb_allowance_auction_observation(
+            28.95,
+            prior_date,
+            auction_number=47,
+            allowance_category="current",
+            allowances_offered=49_647_415.0,
+        )
+        prior_advance = carb_allowance_auction_observation(
+            28.70,
+            prior_date,
+            auction_number=47,
+            allowance_category="advance",
+            allowances_offered=6_481_750.0,
+        )
+        entry_current = carb_allowance_auction_observation(
+            28.81,
+            entry_date,
+            auction_number=48,
+            allowance_category="current",
+            allowances_offered=51_177_593.0,
+        )
+        entry_advance = carb_allowance_auction_observation(
+            28.76,
+            entry_date,
+            auction_number=48,
+            allowance_category="advance",
+            allowances_offered=6_400_000.0,
+        )
+        next_current = carb_allowance_auction_observation(
+            29.10,
+            next_date,
+            auction_number=49,
+            allowance_category="current",
+            allowances_offered=50_000_000.0,
+        )
+        next_advance = carb_allowance_auction_observation(
+            28.90,
+            next_date,
+            auction_number=49,
+            allowance_category="advance",
+            allowances_offered=6_300_000.0,
+        )
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            record_feature_snapshots(conn, [prior_current, prior_advance], cfg)
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [entry_current, entry_advance],
+            )
+
+            self.assertEqual(1, len(generated), report)
+            candidate = generated[0]
+            self.assertEqual(
+                "california_quebec_cap_and_invest_joint_allowance_auctions",
+                candidate["target_surface"],
+            )
+            self.assertTrue(candidate["paper_auction_reference"])
+            self.assertTrue(candidate["paper_auction_reference_provenance_valid"])
+            self.assertTrue(candidate["synthetic_research_paper"])
+            self.assertEqual("official_allowance_auction_reference_not_order_routable", candidate["candidate_reject_reason"])
+            self.assertEqual(1.0, candidate["strategy_lab_program_features"]["paired_current_advance_observed"])
+            self.assertEqual(1.0, candidate["strategy_lab_program_features"]["current_sellthrough"])
+            self.assertEqual(1.0, candidate["strategy_lab_program_features"]["advance_sellthrough"])
+            self.assertGreater(candidate["strategy_lab_program_features"]["term_discount_bps"], 0)
+            self.assertEqual(28.81, candidate["strategy_lab_program_features"]["current_price_usd_by_auction"])
+            self.assertEqual(28.76, candidate["strategy_lab_program_features"]["advance_price_usd_by_auction"])
+
+            execution = execute_order(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"], "paper_allocation_multiplier": 1.0},
+                cfg,
+            )
+            self.assertTrue(execution["paper_filled"])
+            self.assertIsNone(execution["order_id"])
+            self.assertEqual("synthetic_auction_reference_paper", execution["order"]["route_id"])
+            self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
+
+            trade_id = open_paper_trade(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"]},
+                execution=execution,
+                settings=cfg,
+            )
+            self.assertEqual([], record_due_horizon_outcomes(conn, {entry_current["inst_id"]: entry_current}, cfg))
+
+            recorded = record_due_horizon_outcomes(
+                conn,
+                {
+                    next_current["inst_id"]: next_current,
+                    next_advance["inst_id"]: next_advance,
+                },
+                cfg,
+            )
+            self.assertEqual(1, len(recorded))
+            self.assertEqual("valid_auction_event", recorded[0]["measurement_status"])
+            self.assertGreater(recorded[0]["pnl_bps"], 0)
+
+            outcome = conn.execute(
+                "select price, pnl_bps, measurement_status, context_json from paper_trade_outcomes where trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+            self.assertEqual(29.10, outcome["price"])
+            self.assertEqual("valid_auction_event", outcome["measurement_status"])
+            context = json.loads(outcome["context_json"])["paper_auction_reference_outcome"]
+            self.assertEqual(next_current["inst_id"], context["outcome_inst_id"])
+            self.assertEqual(next_date.isoformat(), context["outcome_event_date"])
+            self.assertEqual(49, context["outcome_auction_number"])
 
     def test_exploration_tests_non_positive_model_edge_without_promoting_it(self) -> None:
         cfg = settings()

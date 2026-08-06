@@ -33,6 +33,7 @@ NAV_REFERENCE_REJECT_REASON = "factsheet_nav_not_entry_quality_quote"
 AUCTION_REFERENCE_ROUTE_SURFACE = "auction_reference"
 AUCTION_REFERENCE_QUALITY_STATUS = "official_auction_result"
 AUCTION_REFERENCE_REJECT_REASON = "official_auction_result_not_executable_quote"
+ALLOWANCE_AUCTION_REFERENCE_REJECT_REASON = "official_allowance_auction_reference_not_order_routable"
 SHOCK_REVERSAL_CALCULATED_FEATURES = {
     "shock_magnitude_bps": "abs(return_60m_bps)",
     "shock_sigma": "abs(return_60m_bps) / max(volatility_60m_bps, 10)",
@@ -100,6 +101,17 @@ BASE_FEATURES = {
     "auction_average_yield_pct",
     "auction_stop_out_yield_pct",
     "auction_result_published",
+    "auction_settlement_price_usd",
+    "allowances_offered",
+    "allowances_sold",
+    "allowance_sellthrough_ratio",
+    "paired_current_advance_observed",
+    "current_price_usd_by_auction",
+    "advance_price_usd_by_auction",
+    "current_sellthrough",
+    "advance_sellthrough",
+    "term_discount_bps",
+    "term_discount_zscore",
     # EEX publishes completed secondary spot trades rather than executable
     # quotes. Keep the disclosed values distinct from the generic `last`
     # feature so contracts can require the exact reported-trade provenance.
@@ -162,6 +174,14 @@ PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS = {
     "source_record_type",
     "trade_id",
     "traded_volume",
+    "allowance_category",
+    "auction_number",
+    "event_date",
+    "reserve_sale",
+    "price_available",
+    "auction_settlement_price_usd",
+    "allowances_offered",
+    "allowances_sold",
     "reported_trade_price",
     "reported_trade_volume",
     "reported_trade_valid",
@@ -183,6 +203,11 @@ METADATA_NAMES = {
     "freshness_state",
     "candidate_reject_reason",
     "price_source",
+    "allowance_category",
+    "auction_number",
+    "event_date",
+    "reserve_sale",
+    "price_available",
 }
 ALLOWED_AST_NODES = (
     ast.Expression,
@@ -333,6 +358,136 @@ def _stored_feature(item: dict, name: str) -> Any:
     return features.get(name) if isinstance(features, dict) else None
 
 
+def _ratio(numerator: Any, denominator: Any) -> float:
+    numerator_value = _float(numerator)
+    denominator_value = _float(denominator)
+    if denominator_value <= 0:
+        return 0.0
+    return numerator_value / denominator_value
+
+
+def _series_zscore(current: float, history: list[float]) -> float:
+    values = [float(item) for item in history if math.isfinite(float(item))]
+    if len(values) < 3:
+        return 0.0
+    deviation = statistics.pstdev(values)
+    return (current - statistics.fmean(values)) / deviation if deviation > 0 else 0.0
+
+
+def _allowance_auction_group_key(frame: dict) -> tuple[str, str, str]:
+    auction_number = str(frame.get("auction_number") or "").strip()
+    event_date = str(frame.get("event_date") or "").strip()
+    fallback = event_date or str(frame.get("inst_id") or "").strip()
+    return (
+        str(frame.get("venue") or ""),
+        str(frame.get("market_surface") or ""),
+        auction_number or fallback,
+    )
+
+
+def _load_allowance_auction_discount_history(
+    conn: sqlite3.Connection,
+    frames: list[dict],
+    cutoff: str,
+    max_points: int,
+) -> dict[tuple[str, str], list[float]]:
+    pairs = {
+        (str(frame.get("venue") or ""), str(frame.get("market_surface") or ""))
+        for frame in frames
+        if str(frame.get("allowance_category") or "").strip()
+    }
+    history: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for venue, surface in sorted(pairs):
+        if not venue or not surface:
+            continue
+        rows = conn.execute(
+            """
+            select features_json
+            from strategy_feature_snapshots
+            where bucket_at >= ? and venue = ?
+            order by bucket_at
+            """,
+            (cutoff, venue),
+        ).fetchall()
+        values: list[float] = []
+        for raw in rows:
+            features = _json(raw["features_json"], {})
+            if str(features.get("market_surface") or "") != surface:
+                continue
+            if str(features.get("allowance_category") or "") != "current":
+                continue
+            if _float(features.get("paired_current_advance_observed")) < 1.0:
+                continue
+            value = _float(features.get("term_discount_bps"))
+            if math.isfinite(value):
+                values.append(value)
+        history[(venue, surface)] = values[-max_points:] if max_points > 0 else values
+    return history
+
+
+def _annotate_allowance_auction_frames(
+    frames: list[dict],
+    discount_history: dict[tuple[str, str], list[float]],
+) -> None:
+    groups: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    for frame in frames:
+        if not str(frame.get("allowance_category") or "").strip():
+            continue
+        groups[_allowance_auction_group_key(frame)].append(frame)
+    for group in groups.values():
+        by_category = {
+            str(item.get("allowance_category") or "").strip().lower(): item
+            for item in group
+        }
+        current = by_category.get("current")
+        advance = by_category.get("advance")
+        current_price = _float(
+            (current or {}).get("auction_settlement_price_usd", (current or {}).get("last"))
+        )
+        advance_price = _float(
+            (advance or {}).get("auction_settlement_price_usd", (advance or {}).get("last"))
+        )
+        current_sellthrough = _ratio(
+            (current or {}).get("allowances_sold"),
+            (current or {}).get("allowances_offered"),
+        )
+        advance_sellthrough = _ratio(
+            (advance or {}).get("allowances_sold"),
+            (advance or {}).get("allowances_offered"),
+        )
+        pair_present = current is not None and advance is not None and current_price > 0 and advance_price > 0
+        term_discount_bps = (
+            ((current_price - advance_price) / current_price) * 10_000.0
+            if pair_present
+            else 0.0
+        )
+        history_key = (
+            str((current or group[0]).get("venue") or ""),
+            str((current or group[0]).get("market_surface") or ""),
+        )
+        term_discount_zscore = _series_zscore(
+            term_discount_bps,
+            discount_history.get(history_key, []),
+        ) if pair_present else 0.0
+        for frame in group:
+            frame["auction_settlement_price_usd"] = _float(
+                frame.get("auction_settlement_price_usd", frame.get("last"))
+            )
+            frame["allowances_offered"] = max(0.0, _float(frame.get("allowances_offered")))
+            frame["allowances_sold"] = max(0.0, _float(frame.get("allowances_sold")))
+            frame["allowance_sellthrough_ratio"] = _ratio(
+                frame.get("allowances_sold"),
+                frame.get("allowances_offered"),
+            )
+            frame["paired_current_advance_observed"] = 1.0 if pair_present else 0.0
+            frame["current_price_usd_by_auction"] = current_price if pair_present else 0.0
+            frame["advance_price_usd_by_auction"] = advance_price if pair_present else 0.0
+            frame["current_sellthrough"] = current_sellthrough if pair_present else 0.0
+            frame["advance_sellthrough"] = advance_sellthrough if pair_present else 0.0
+            frame["term_discount_bps"] = term_discount_bps if pair_present else 0.0
+            frame["term_discount_zscore"] = term_discount_zscore if pair_present else 0.0
+
+
 def _base_symbol(row: dict) -> str:
     base = str(row.get("base") or "").upper()
     if base:
@@ -435,6 +590,20 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
         "auction_result_published": (
             1.0 if str(row.get("quality_status") or "") == AUCTION_REFERENCE_QUALITY_STATUS else 0.0
         ),
+        "auction_settlement_price_usd": _float(
+            row.get("auction_settlement_price_usd"),
+            _float(row.get("last")),
+        ),
+        "allowances_offered": max(0.0, _float(row.get("allowances_offered"))),
+        "allowances_sold": max(0.0, _float(row.get("allowances_sold"))),
+        "allowance_sellthrough_ratio": _ratio(row.get("allowances_sold"), row.get("allowances_offered")),
+        "paired_current_advance_observed": max(0.0, _float(row.get("paired_current_advance_observed"))),
+        "current_price_usd_by_auction": max(0.0, _float(row.get("current_price_usd_by_auction"))),
+        "advance_price_usd_by_auction": max(0.0, _float(row.get("advance_price_usd_by_auction"))),
+        "current_sellthrough": max(0.0, _float(row.get("current_sellthrough"))),
+        "advance_sellthrough": max(0.0, _float(row.get("advance_sellthrough"))),
+        "term_discount_bps": _float(row.get("term_discount_bps")),
+        "term_discount_zscore": _float(row.get("term_discount_zscore")),
         "reported_trade_price": _float(row.get("reported_trade_price", last)),
         "reported_trade_volume": max(
             0.0,
@@ -477,6 +646,13 @@ def build_feature_frames(
         )
         for row in rows
     ]
+    allowance_discount_history = _load_allowance_auction_discount_history(
+        conn,
+        frames,
+        cutoff,
+        int(cfg.get("feature_history_max_points", 4032)),
+    )
+    _annotate_allowance_auction_frames(frames, allowance_discount_history)
     by_inst = {str(frame["inst_id"]): frame for frame in frames}
     for frame in frames:
         benchmark_id = str(frame.get("benchmark_inst_id") or "")
@@ -931,12 +1107,26 @@ def _auction_reference_provenance(frame: dict) -> tuple[bool, list[str]]:
         missing.append("market_surface")
     if str(frame.get("quality_status") or "") != AUCTION_REFERENCE_QUALITY_STATUS:
         missing.append("quality_status")
-    if str(frame.get("candidate_reject_reason") or "") != AUCTION_REFERENCE_REJECT_REASON:
+    reject_reason = str(frame.get("candidate_reject_reason") or "")
+    if reject_reason not in {
+        AUCTION_REFERENCE_REJECT_REASON,
+        ALLOWANCE_AUCTION_REFERENCE_REJECT_REASON,
+    }:
         missing.append("candidate_reject_reason")
     if str(frame.get("freshness_state") or "") != "fresh":
         missing.append("freshness_state")
     if not str(frame.get("price_source") or "").strip():
         missing.append("price_source")
+    if reject_reason == ALLOWANCE_AUCTION_REFERENCE_REJECT_REASON:
+        if str(frame.get("allowance_category") or "").strip().lower() != "current":
+            missing.append("allowance_category")
+        if not bool(frame.get("price_available")):
+            missing.append("price_available")
+        if _float(frame.get("auction_settlement_price_usd", frame.get("last"))) <= 0:
+            missing.append("auction_settlement_price_usd")
+        if not str(frame.get("event_date") or "").strip():
+            missing.append("event_date")
+        return not missing, missing
     if _float(frame.get("auction_term_days")) <= 0:
         missing.append("auction_term_days")
     if _float(frame.get("auction_average_yield_pct")) <= 0:
@@ -981,13 +1171,26 @@ def generate_program_candidates(
     for frame in frames:
         if len(generated) >= limit:
             break
+        route_surface = _route_surface(frame, program)
+        closed_session_allowed = (
+            str(frame.get("session_status") or "").lower() == "closed"
+            and
+            route_surface == AUCTION_REFERENCE_ROUTE_SURFACE
+            and str(frame.get("quality_status") or "") == AUCTION_REFERENCE_QUALITY_STATUS
+            and str(frame.get("candidate_reject_reason") or "") in {
+                AUCTION_REFERENCE_REJECT_REASON,
+                ALLOWANCE_AUCTION_REFERENCE_REJECT_REASON,
+            }
+        )
         if not _universe_matches(frame, universe):
             rejects["universe_mismatch"] += 1
             continue
-        if str(frame.get("session_status") or "").lower() in {"closed", "stale", "unavailable"}:
+        if (
+            str(frame.get("session_status") or "").lower() in {"closed", "stale", "unavailable"}
+            and not closed_session_allowed
+        ):
             rejects["session_not_open"] += 1
             continue
-        route_surface = _route_surface(frame, program)
         is_nav_reference = route_surface == NAV_REFERENCE_ROUTE_SURFACE
         is_auction_reference = route_surface == AUCTION_REFERENCE_ROUTE_SURFACE
         # EEX's public DataSource secondary-spot feed reports completed
@@ -1127,6 +1330,14 @@ def generate_program_candidates(
                 "auction_term_days": _float(frame.get("auction_term_days")),
                 "auction_average_yield_pct": _float(frame.get("auction_average_yield_pct")),
                 "auction_stop_out_yield_pct": _float(frame.get("auction_stop_out_yield_pct")),
+                "allowance_category": str(frame.get("allowance_category") or ""),
+                "auction_number": str(frame.get("auction_number") or ""),
+                "event_date": str(frame.get("event_date") or ""),
+                "price_available": bool(frame.get("price_available")),
+                "reserve_sale": bool(frame.get("reserve_sale")),
+                "auction_settlement_price_usd": _float(
+                    frame.get("auction_settlement_price_usd", frame.get("last"))
+                ),
             }
             if is_auction_reference
             else {},

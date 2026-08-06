@@ -2226,6 +2226,71 @@ def _auction_reference_outcome(
         return None
     venue = str(candidate.get("venue") or "")
     surface = str(provenance.get("market_surface") or "")
+    reject_reason = str(provenance.get("candidate_reject_reason") or "")
+    if reject_reason == "official_allowance_auction_reference_not_order_routable":
+        try:
+            entry_price = float(provenance.get("auction_settlement_price_usd") or 0)
+            entry_event_date = dt.date.fromisoformat(str(provenance.get("event_date") or ""))
+            entry_auction_number = int(float(provenance.get("auction_number") or 0))
+        except (TypeError, ValueError):
+            return None
+        if (
+            not venue
+            or not surface
+            or entry_price <= 0
+            or str(provenance.get("allowance_category") or "").lower() != "current"
+        ):
+            return None
+        earliest: tuple[dt.date, int, dict] | None = None
+        for raw in observations.values():
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("venue") or "") != venue:
+                continue
+            if str(raw.get("market_surface") or "") != surface:
+                continue
+            if str(raw.get("quality_status") or "") != "official_auction_result":
+                continue
+            if str(raw.get("candidate_reject_reason") or "") != reject_reason:
+                continue
+            if str(raw.get("freshness_state") or "") != "fresh":
+                continue
+            if str(raw.get("allowance_category") or "").lower() != "current":
+                continue
+            if bool(raw.get("reserve_sale")) or not bool(raw.get("price_available")):
+                continue
+            try:
+                outcome_price = float(raw.get("auction_settlement_price_usd") or raw.get("last") or 0)
+                outcome_event_date = dt.date.fromisoformat(str(raw.get("event_date") or ""))
+                outcome_auction_number = int(float(raw.get("auction_number") or 0))
+            except (TypeError, ValueError):
+                continue
+            if outcome_price <= 0:
+                continue
+            if outcome_event_date < entry_event_date:
+                continue
+            if outcome_event_date == entry_event_date and outcome_auction_number <= entry_auction_number:
+                continue
+            if earliest is None or (outcome_event_date, outcome_auction_number) < (earliest[0], earliest[1]):
+                earliest = (outcome_event_date, outcome_auction_number, raw)
+        if earliest is None:
+            return None
+        outcome_event_date, outcome_auction_number, row = earliest
+        outcome_at = dt.datetime.combine(
+            outcome_event_date,
+            dt.time.min,
+            tzinfo=dt.timezone.utc,
+        )
+        return {
+            "kind": "allowance_price",
+            "auction_at": outcome_at,
+            "entry_price": entry_price,
+            "outcome_price": float(row.get("auction_settlement_price_usd") or row.get("last") or 0),
+            "event_date": outcome_event_date.isoformat(),
+            "auction_number": outcome_auction_number,
+            "price_source": str(row.get("price_source") or row.get("venue") or "official_auction"),
+            "inst_id": str(row.get("inst_id") or row.get("instrument_id") or ""),
+        }
     try:
         term_days = int(float(provenance.get("auction_term_days") or 0))
         entry_yield = float(provenance.get("auction_average_yield_pct") or 0)
@@ -2263,6 +2328,7 @@ def _auction_reference_outcome(
         return None
     auction_at, row = earliest
     return {
+        "kind": "yield",
         "auction_at": auction_at,
         "entry_yield_pct": entry_yield,
         "outcome_yield_pct": float(row["average_yield_pct"]),
@@ -2453,12 +2519,20 @@ def record_due_horizon_outcomes(
                 observed_at = auction_outcome["auction_at"]
                 delay_seconds = 0.0
                 measurement_status = "valid_auction_event"
-                price = auction_outcome["outcome_yield_pct"]
-                pnl_bps = (
-                    (auction_outcome["entry_yield_pct"] / price - 1.0)
-                    * 10_000.0
-                    * sign
-                )
+                if auction_outcome.get("kind") == "allowance_price":
+                    price = auction_outcome["outcome_price"]
+                    pnl_bps = (
+                        (price / auction_outcome["entry_price"] - 1.0)
+                        * 10_000.0
+                        * sign
+                    )
+                else:
+                    price = auction_outcome["outcome_yield_pct"]
+                    pnl_bps = (
+                        (auction_outcome["entry_yield_pct"] / price - 1.0)
+                        * 10_000.0
+                        * sign
+                    )
                 price_source = auction_outcome["price_source"]
             elif latest:
                 raw_observed = latest.get("observed_at") or latest.get("seen_at") or latest.get("last_checked_at")
@@ -2537,12 +2611,22 @@ def record_due_horizon_outcomes(
             except (TypeError, ValueError):
                 outcome_context = {}
             if auction_outcome is not None:
-                outcome_context["paper_auction_reference_outcome"] = {
-                    "entry_yield_pct": auction_outcome["entry_yield_pct"],
-                    "outcome_yield_pct": auction_outcome["outcome_yield_pct"],
-                    "outcome_auction_at": auction_outcome["auction_at"].isoformat(),
-                    "outcome_inst_id": auction_outcome["inst_id"],
-                }
+                if auction_outcome.get("kind") == "allowance_price":
+                    outcome_context["paper_auction_reference_outcome"] = {
+                        "entry_price": auction_outcome["entry_price"],
+                        "outcome_price": auction_outcome["outcome_price"],
+                        "outcome_event_date": auction_outcome["event_date"],
+                        "outcome_auction_number": auction_outcome["auction_number"],
+                        "outcome_auction_at": auction_outcome["auction_at"].isoformat(),
+                        "outcome_inst_id": auction_outcome["inst_id"],
+                    }
+                else:
+                    outcome_context["paper_auction_reference_outcome"] = {
+                        "entry_yield_pct": auction_outcome["entry_yield_pct"],
+                        "outcome_yield_pct": auction_outcome["outcome_yield_pct"],
+                        "outcome_auction_at": auction_outcome["auction_at"].isoformat(),
+                        "outcome_inst_id": auction_outcome["inst_id"],
+                    }
             if pnl_bps is not None and cost_audit is not None:
                 outcome_context["paper_realized_cost_audit"] = cost_audit
             conn.execute(
