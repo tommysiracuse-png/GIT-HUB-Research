@@ -51,9 +51,17 @@ class RouteUnblockerTests(unittest.TestCase):
 
         review = agent_review.review_candidate(enriched, cfg, {})
 
-        self.assertEqual(review["decision"], "approve_conditional_paper_trade")
+        self.assertEqual(review["decision"], "conditional_review")
         self.assertFalse(review["route_alternative_used"])
         self.assertEqual(review["effective_route_id"], "synthetic_research_paper")
+        self.assertEqual(review["paper_review_state"], "observe_only")
+        self.assertFalse(review["emit_recommendation"])
+        self.assertFalse(review["emit_route"])
+        self.assertFalse(review["paper_short_route_gate"]["paper_trade_allowed"])
+        self.assertEqual(
+            "negative",
+            review["paper_short_route_gate"]["capability_confirmation_status"],
+        )
         self.assertTrue(
             any("direct route unavailable" in block for block in review["would_block_reasons"])
         )
@@ -87,6 +95,44 @@ class RouteUnblockerTests(unittest.TestCase):
         self.assertEqual({}, review["route_alternative"])
         self.assertEqual(review["paper_allocation_multiplier"], 0.25)
         self.assertIn("jurisdiction_eligibility", review["direct_missing_requirements"])
+
+    def test_stale_borrow_capability_confirmation_downgrades_conditional_route_to_observe_only(self) -> None:
+        cfg = settings()
+        candidate = base_candidate(
+            execution_feasibility={
+                "status": "conditional",
+                "route_status": "conditional",
+                "missing_requirements": ["spot_borrow"],
+            },
+            execution_route={
+                "route_id": "conditional_crypto_route_paper",
+                "route_status": "conditional",
+                "missing_permissions": ["spot_borrow"],
+                "requirements": [
+                    {
+                        "requirement_id": "spot_borrow",
+                        "status": "unknown",
+                        "blocking_level": "hard",
+                    }
+                ],
+            },
+            route_feasibility_reason="stale_confirmation",
+        )
+
+        review = agent_review.review_candidate(candidate, cfg, {})
+
+        self.assertEqual("conditional_review", review["decision"])
+        self.assertEqual("observe_only", review["paper_review_state"])
+        self.assertFalse(review["emit_recommendation"])
+        self.assertFalse(review["emit_route"])
+        self.assertEqual(
+            "stale",
+            review["paper_short_route_gate"]["capability_confirmation_status"],
+        )
+        self.assertEqual(
+            "stale_confirmation",
+            review["paper_short_route_gate"]["suppression_reason"],
+        )
 
 
 if __name__ == "__main__":

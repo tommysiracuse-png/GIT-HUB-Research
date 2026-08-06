@@ -23,6 +23,11 @@ try:  # pragma: no cover - import fallback for package/script execution
 except ImportError:  # pragma: no cover
     from src.paper_order_router import frontier_paper_fill_hard_fail_review
 
+try:  # pragma: no cover - import fallback for package/script execution
+    from route_resolver import assess_paper_short_route_gate
+except ImportError:  # pragma: no cover
+    from src.route_resolver import assess_paper_short_route_gate
+
 
 def _matching_policies(key: str, policies: list[dict] | None, context_features: dict | None = None) -> list[dict]:
     if not policies:
@@ -90,6 +95,7 @@ def review_candidate(
     adjustments: dict[str, float],
     policies: list[dict] | None = None,
 ) -> dict:
+    direct_route_gate = assess_paper_short_route_gate(candidate)
     candidate = prepare_candidate_for_exploration(candidate, settings)
     risk = settings["risk"]
     key = signal_key(candidate)
@@ -106,9 +112,14 @@ def review_candidate(
     missing_requirements = feasibility.get("missing_requirements") or route.get("missing_permissions") or []
     route_alternative = _best_route_alternative(feasibility, route)
     paper_route_eligibility = candidate.get("paper_route_eligibility") or {}
+    actionable_route_suppressed = bool(
+        direct_route_gate.get("applies")
+        and not direct_route_gate.get("paper_trade_allowed", True)
+    )
     route_alternative_usable = (
         _route_alternative_covers_missing(missing_requirements, route_alternative)
         and not paper_route_eligibility.get("suppressed", False)
+        and not actionable_route_suppressed
     )
     proxy_not_live_equivalent = bool(
         candidate.get("paper_proxy_activated")
@@ -234,6 +245,17 @@ def review_candidate(
         warnings.append(
             "proxy quality is a counterfactual paper measurement and does not validate the direct borrow route"
         )
+    if actionable_route_suppressed:
+        suppression_reason = str(
+            direct_route_gate.get("suppression_reason")
+            or direct_route_gate.get("route_feasibility_reason")
+            or "spot_short_route_requirements_unconfirmed"
+        )
+        warnings.append(
+            "conditional borrow-dependent route downgraded to observe-only: "
+            f"{suppression_reason}"
+        )
+        allocation_multiplier = 0.0
     if cross_context_diagnostic:
         warnings.append(
             "cross-context paper diagnostic "
@@ -343,12 +365,27 @@ def review_candidate(
             decision = "conditional_review" if feasibility_status == "conditional" else "reject"
     else:
         decision = "approve_paper_trade"
+    if actionable_route_suppressed:
+        decision = "conditional_review"
     if decision == "approve_paper_trade" and candidate.get("quality_action") == "conditional":
         decision = "approve_conditional_paper_trade"
     if decision == "approve_paper_trade" and route_alternative_usable:
         decision = "approve_conditional_paper_trade"
     if not hard_blocks and candidate.get("synthetic_research_paper"):
         decision = "approve_conditional_paper_trade"
+    if actionable_route_suppressed:
+        decision = "conditional_review"
+
+    emit_recommendation = decision in {"approve_paper_trade", "approve_conditional_paper_trade"}
+    if actionable_route_suppressed:
+        emit_recommendation = False
+    paper_review_state = (
+        "observe_only"
+        if actionable_route_suppressed or candidate.get("paper_observation_only")
+        else "review_ok"
+        if emit_recommendation
+        else "review_required"
+    )
 
     confidence = 0.5
     confidence += min(abs(candidate["funding_bps"]) / 40.0, 0.15)
@@ -413,6 +450,10 @@ def review_candidate(
         ),
         "route_alternative": route_alternative if route_alternative_usable else {},
         "route_alternative_used": bool(route_alternative_usable),
+        "paper_short_route_gate": direct_route_gate,
+        "paper_review_state": paper_review_state,
+        "emit_recommendation": emit_recommendation,
+        "emit_route": emit_recommendation,
         "paper_proxy_activated": bool(candidate.get("paper_proxy_activated")),
         "execution_semantics": (
             "proxy_not_live_equivalent"
