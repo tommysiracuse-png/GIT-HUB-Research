@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from collections import Counter
@@ -128,6 +129,69 @@ def _runtime_report() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _slug_token(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower())
+    return text.strip("_") or "unknown"
+
+
+def _bounded_preview(parts: list[str], *, max_length: int = 400) -> str:
+    output = " | ".join(part for part in parts if part).strip()
+    return output[:max_length]
+
+
+def _strict_snapshot(value: Any, *, max_items: int = 8, max_length: int = 400) -> Any:
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, nested in value.items():
+            converted = _strict_snapshot(
+                nested,
+                max_items=max_items,
+                max_length=max_length,
+            )
+            if converted in (None, "", {}):
+                continue
+            output[str(key)] = converted
+        return output
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        rendered: list[str] = []
+        for item in items[:max_items]:
+            converted = _strict_snapshot(
+                item,
+                max_items=max_items,
+                max_length=max(120, max_length // 2),
+            )
+            if converted in (None, "", {}):
+                continue
+            if isinstance(converted, dict):
+                rendered.append(
+                    json.dumps(converted, sort_keys=True, default=str, ensure_ascii=False)
+                )
+            else:
+                rendered.append(str(converted))
+        snapshot: dict[str, Any] = {"item_count": len(items)}
+        preview = _bounded_preview(rendered, max_length=max_length)
+        if preview:
+            snapshot["items_preview"] = preview
+        if len(items) > max_items:
+            snapshot["truncated"] = True
+        return snapshot
+    if isinstance(value, str):
+        return value.strip()[:max_length]
+    return value
+
+
+def _paper_market_key(task: dict[str, Any]) -> str:
+    return ".".join(
+        (
+            "paper",
+            "market_activation",
+            _slug_token(task.get("venue")),
+            _slug_token(task.get("market_surface")),
+        )
+    )
 
 
 def _surface_rows(adapter: dict[str, Any]) -> list[tuple[str, int]]:
@@ -498,20 +562,25 @@ def _paper_diagnostic_pass(
         "decision_thresholds": {
             "minimum_price_observations": int(cfg.get("minimum_price_observations", 1)),
             "runtime_verification_scans": int(cfg.get("runtime_verification_scans", 3)),
-            "required_chain": list((task.get("acceptance") or {}).get("required_chain") or []),
+            "required_chain": _bounded_preview(
+                [str(item) for item in ((task.get("acceptance") or {}).get("required_chain") or [])],
+                max_length=500,
+            ),
         },
         "simulated_positions": {
             "paper_trade_count": paper_trade_count,
             "open_paper_trade_count": int(metrics.get("open_paper_trade_count") or 0),
             "closed_paper_trade_count": sum(str(item.get("status") or "") == "closed" for item in matched_trades),
             "reliable_outcome_count": reliable_outcome_count,
-            "strategy_lab_ids": list(metrics.get("strategy_lab_ids") or []),
-            "recent_trade_ids": [int(item["id"]) for item in matched_trades[:10] if item.get("id") is not None],
+            "strategy_lab_ids": _strict_snapshot(metrics.get("strategy_lab_ids") or []),
+            "recent_trade_ids": _strict_snapshot(
+                [int(item["id"]) for item in matched_trades[:10] if item.get("id") is not None]
+            ),
         },
         "json_schema_validation": {
             "valid": schema_valid,
             "reason": schema_reason,
-            "quality_scorecard": (
+            "quality_scorecard": _strict_snapshot(
                 (preflight.get("quality_scorecard") or {})
                 if isinstance(preflight, dict)
                 else {}
@@ -768,6 +837,71 @@ def _select_code_task(conn: sqlite3.Connection) -> dict[str, Any] | None:
     return None
 
 
+def _activation_contract_payload(acceptance: dict[str, Any]) -> dict[str, Any]:
+    contract = _strict_snapshot(acceptance)
+    if isinstance(contract, dict):
+        contract["required_chain"] = _bounded_preview(
+            [str(item) for item in acceptance.get("required_chain") or []],
+            max_length=500,
+        )
+    return contract if isinstance(contract, dict) else {}
+
+
+def _stored_recommendation_repair(
+    stored: dict[str, Any] | None,
+    fresh: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if not isinstance(stored, dict):
+        return fresh, None
+    payload = stored.get("payload")
+    if not isinstance(payload, dict):
+        repaired = dict(fresh)
+        repaired_payload = dict(repaired["payload"])
+        repaired_payload["evidence"] = {
+            **dict(repaired_payload.get("evidence") or {}),
+            "resume_repair": {
+                "status": "repaired_invalid_paused_recommendation",
+                "reason": "stored_payload_not_object",
+                "source_agent": "market_activation_owner",
+            },
+        }
+        repaired["payload"] = repaired_payload
+        return repaired, repaired_payload["evidence"]["resume_repair"]
+
+    valid, reason = validate_strict_recommendation_schema(payload)
+    if valid:
+        repaired = dict(fresh)
+        repaired["recommendation_id"] = str(
+            stored.get("recommendation_id") or fresh.get("recommendation_id")
+        )
+        repaired["title"] = str(stored.get("title") or fresh.get("title") or "")
+        repaired["priority"] = int(stored.get("priority") or fresh.get("priority") or 0)
+        repaired_payload = dict(payload)
+        repaired_code_change = dict(
+            repaired_payload.get("code_change")
+            if isinstance(repaired_payload.get("code_change"), dict)
+            else {}
+        )
+        fresh_code_change = dict(fresh["payload"].get("code_change") or {})
+        fresh_code_change.update(repaired_code_change)
+        repaired_payload["code_change"] = fresh_code_change
+        repaired["payload"] = repaired_payload
+        return repaired, None
+
+    repaired = dict(fresh)
+    repaired_payload = dict(repaired["payload"])
+    repaired_payload["evidence"] = {
+        **dict(repaired_payload.get("evidence") or {}),
+        "resume_repair": {
+            "status": "repaired_invalid_paused_recommendation",
+            "reason": reason,
+            "source_agent": "market_activation_owner",
+        },
+    }
+    repaired["payload"] = repaired_payload
+    return repaired, repaired_payload["evidence"]["resume_repair"]
+
+
 def _code_recommendation(
     task: dict[str, Any],
     metrics: dict[str, Any],
@@ -789,14 +923,14 @@ def _code_recommendation(
         "diagnostic pass that records data freshness, signal values, decision thresholds, simulated positions, and JSON-schema "
         "validation results before changing the paper strategy. Add focused tests and leave unrelated strategies unchanged."
     )
+    frontier_reason = (
+        "A public adapter already exists but has not produced paper evidence; "
+        "repository-aware implementation is required."
+    )
     code_change = {
         "change_category": "runtime_pipeline_integration",
         "implementation_mode": "runtime_active",
-        "expected_files": [],
-        "tests_to_run": [
-            "python -m unittest tests.test_public_market_adapters",
-            "python -m unittest tests.test_strategy_lab",
-        ],
+        "tests_to_run": "python -m unittest tests.test_public_market_adapters tests.test_strategy_lab",
         "paper_testable_surface": f"paper:{task['venue']}:{task['market_surface']}:{task['adapter_id']}",
         "behavioral_gate": (
             "A normal radar cycle must advance this exact surface toward Strategy Lab candidates and paper evidence, "
@@ -805,23 +939,29 @@ def _code_recommendation(
         "rollback_criteria": (
             "Revert if public-adapter discovery, Strategy Lab propagation, paper-only safety, or the full regression fails."
         ),
-        "activation_contract": acceptance,
+        "activation_contract": _activation_contract_payload(acceptance),
+        "frontier_escalation_reason": frontier_reason,
     }
     payload = {
         "action": "propose_code_change",
-        "agent_name": "market_activation_owner",
         "title": f"Activate {task['adapter_id']} through paper testing"[:180],
         "priority": int(task["priority"]),
-        "market_key": f"paper|{task['venue']}|{task['market_surface']}",
+        "market_key": _paper_market_key(task),
         "rationale": proposed,
-        "proposed_change": proposed,
+        "proposed_change": {
+            "goal": proposed,
+            "constraints": (
+                "Keep live trading disabled, preserve priceable paper exploration, and "
+                "record a paper-only diagnostic pass before any strategy change."
+            ),
+        },
         "evidence": {
             "source": "market_activation_owner",
             "market_activation_task_id": task["task_id"],
             "adapter_id": task["adapter_id"],
-            "adapter_runtime": adapter,
-            "admission": metrics["admission"],
-            "strategy": metrics["strategy"],
+            "adapter_runtime_snapshot": _strict_snapshot(adapter),
+            "admission_snapshot": _strict_snapshot(metrics["admission"]),
+            "strategy_snapshot": _strict_snapshot(metrics["strategy"]),
             "route_evidence": {
                 "paper_mode": True,
                 "synthetic_research_available": True,
@@ -829,19 +969,11 @@ def _code_recommendation(
             },
             "quality_evidence": {
                 "price_observation_count": adapter.get("price_observation_count", 0),
-                "available_fields": adapter.get("available_fields") or [],
+                "available_fields": _strict_snapshot(adapter.get("available_fields") or []),
                 "source_status": adapter.get("source_status"),
                 "capability_gap": adapter.get("capability_gap"),
             },
         },
-        "paper_testable_surface": code_change["paper_testable_surface"],
-        "behavioral_gate": code_change["behavioral_gate"],
-        "rollback_criteria": code_change["rollback_criteria"],
-        "frontier_escalation_reason": (
-            "A public adapter already exists but has not produced paper evidence; repository-aware implementation is required."
-        ),
-        "change_category": code_change["change_category"],
-        "implementation_mode": code_change["implementation_mode"],
         "code_change": code_change,
     }
     payload["evidence"]["paper_diagnostic_pass"] = _paper_diagnostic_pass(
@@ -851,6 +983,13 @@ def _code_recommendation(
         recent_trades,
         recommendation_payload=payload,
     )
+    valid, reason = validate_strict_recommendation_schema(payload)
+    if not valid:
+        payload["evidence"]["resume_repair"] = {
+            "status": "schema_fallback_required",
+            "reason": reason,
+            "source_agent": "market_activation_owner",
+        }
     return {
         "recommendation_id": rec_id,
         "title": payload["title"],
@@ -871,24 +1010,30 @@ def _run_code_turn(
     last_result = dict(task.get("last_result") or {})
     stored_rec = last_result.get("active_code_recommendation")
     if task["status"] == "implementation_paused" and isinstance(stored_rec, dict):
-        recommendation = stored_rec
         attempt = int(task.get("attempt_count") or 1)
-        payload = recommendation.get("payload") if isinstance(recommendation.get("payload"), dict) else {}
-        if payload:
-            payload = dict(payload)
-            payload.setdefault("evidence", {})
-            if isinstance(payload["evidence"], dict):
-                payload["evidence"]["paper_diagnostic_pass"] = _paper_diagnostic_pass(
-                    task,
-                    metrics,
-                    settings,
-                    recent_trades,
-                    recommendation_payload=payload,
-                )
-            recommendation = {**recommendation, "payload": payload}
+        recommendation, repair_note = _stored_recommendation_repair(
+            stored_rec,
+            _code_recommendation(task, metrics, settings, recent_trades, attempt),
+        )
     else:
         attempt = int(task.get("attempt_count") or 0) + 1
         recommendation = _code_recommendation(task, metrics, settings, recent_trades, attempt)
+        repair_note = None
+    payload = recommendation.get("payload") if isinstance(recommendation.get("payload"), dict) else {}
+    if payload:
+        payload = dict(payload)
+        payload.setdefault("evidence", {})
+        if isinstance(payload["evidence"], dict):
+            payload["evidence"]["paper_diagnostic_pass"] = _paper_diagnostic_pass(
+                task,
+                metrics,
+                settings,
+                recent_trades,
+                recommendation_payload=payload,
+            )
+            if isinstance(repair_note, dict):
+                payload["evidence"]["resume_repair"] = repair_note
+        recommendation = {**recommendation, "payload": payload}
     diagnostic = (
         (((recommendation.get("payload") or {}).get("evidence") or {}).get("paper_diagnostic_pass"))
         if isinstance(recommendation, dict)

@@ -183,12 +183,14 @@ class MarketActivationOwnerTests(unittest.TestCase):
         task = self._task()
         self.assertEqual("deployed_waiting_runtime", task["status"])
         self.assertTrue(report["consumed_writer"])
-        self.assertEqual("runtime_pipeline_integration", captured["change_category"])
+        valid, reason = owner.validate_strict_recommendation_schema(captured)
+        self.assertTrue(valid, reason)
+        self.assertEqual("runtime_pipeline_integration", captured["code_change"]["change_category"])
         contract = captured["code_change"]["activation_contract"]
         self.assertIn("strategy_lab_handoff_or_surface_candidate", contract["required_chain"])
         self.assertIn("paper_trade", contract["required_chain"])
         self.assertIn("reliable_outcome", contract["required_chain"])
-        self.assertIn("never fabricate a price", captured["proposed_change"])
+        self.assertIn("never fabricate a price", captured["proposed_change"]["goal"])
         preflight = preflight_proposal(captured, self.settings)
         self.assertFalse(preflight["quality_scorecard"]["reject_before_model_call"])
 
@@ -222,6 +224,67 @@ class MarketActivationOwnerTests(unittest.TestCase):
         self.assertEqual(
             diagnostic,
             last_result["active_code_recommendation"]["payload"]["evidence"]["paper_diagnostic_pass"],
+        )
+        valid, reason = owner.validate_strict_recommendation_schema(
+            last_result["active_code_recommendation"]["payload"]
+        )
+        self.assertTrue(valid, reason)
+
+    def test_paused_code_turn_repairs_malformed_stored_recommendation(self) -> None:
+        self._write_adapter_report(price_observations=4, candidates=0)
+        with self._patch_paths():
+            owner.run_once(self.conn, self.settings, execute_turn=False, cycle_id="cycle-seed")
+        self.conn.execute(
+            """
+            update market_activation_tasks
+            set status='implementation_paused',
+                attempt_count=1,
+                next_retry_at=null,
+                last_result_json=?
+            """,
+            (
+                json.dumps(
+                    {
+                        "active_code_recommendation": {
+                            "recommendation_id": "paused-rec",
+                            "payload": {
+                                "action": "propose_code_change",
+                                "priority": 95,
+                                "title": "Malformed paused recommendation",
+                                "rationale": "Stored payload leaked invalid top-level fields.",
+                                "market_key": "paper|broken|surface",
+                                "evidence": "not-an-object",
+                                "proposed_change": "not-an-object",
+                                "change_category": "runtime_pipeline_integration",
+                            },
+                        }
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        self.conn.commit()
+
+        captured = {}
+
+        def fake_process(conn, recommendation, settings):
+            captured.update(recommendation["payload"])
+            return [{"proposal_id": "activation-proposal", "status": "implementation_paused"}]
+
+        with self._patch_paths(), mock.patch.object(owner, "process_code_change_recommendation", side_effect=fake_process):
+            owner.run_once(self.conn, self.settings, execute_turn=True, cycle_id="cycle-resume")
+
+        self.assertEqual("implementation_paused", self._task()["status"])
+        valid, reason = owner.validate_strict_recommendation_schema(captured)
+        self.assertTrue(valid, reason)
+        self.assertEqual("propose_code_change", captured["action"])
+        self.assertEqual(
+            "repaired_invalid_paused_recommendation",
+            captured["evidence"]["resume_repair"]["status"],
+        )
+        self.assertIn(
+            "unexpected top-level keys",
+            captured["evidence"]["resume_repair"]["reason"],
         )
 
     def test_task_completes_only_after_matching_paper_trade_has_reliable_outcome(self) -> None:
