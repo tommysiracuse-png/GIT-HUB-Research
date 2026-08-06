@@ -5648,6 +5648,7 @@ DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_POLICY = {
     "unsupported_behavior": "suppress",
     "unknown_behavior": "penalize",
     "unknown_multiplier": 0.75,
+    "unverified_route_multiplier": 0.15,
     "exact_unsupported_multiplier": 0.15,
     "generic_unsupported_multiplier": 0.15,
     "metadata_missing_behavior": "suppress",
@@ -6841,23 +6842,25 @@ def _paper_only_frontier_short_route_feasibility_reason(
     verified_standard_route = bool(
         route_status in {"standard", "executable", "feasible", "supported"}
         or registry_status == "supported"
-        or (
-            registry_status in {"", "unknown", "unspecified"}
-            and generic_status == "supported"
-        )
+    )
+    generic_supported_without_verified_route = bool(
+        not explicit_borrow_ok
+        and not verified_standard_route
+        and registry_status in {"", "unknown", "unspecified"}
+        and generic_status == "supported"
     )
     if explicit_borrow_ok:
         reason = "explicit_borrow_ok"
         shadow_label = False
         active_scoring_eligible = True
     elif verified_standard_route:
-        reason = (
-            "supported_venue_short_route_exception"
-            if registry_status in {"", "unknown", "unspecified"} and generic_status == "supported"
-            else "verified_standard_short_route"
-        )
+        reason = "verified_standard_short_route"
         shadow_label = False
         active_scoring_eligible = True
+    elif generic_supported_without_verified_route:
+        reason = "conditional_short_unverified_route"
+        shadow_label = True
+        active_scoring_eligible = False
     elif registry_status == "unsupported":
         reason = "conditional_short_exact_route_unsupported"
         shadow_label = True
@@ -6948,6 +6951,11 @@ def paper_only_conditional_short_route_feasibility_gate(
         route_reason = str(route_review.get("route_feasibility_reason") or "").strip().lower()
         if route_reason == "conditional_short_support_unknown":
             score_multiplier *= max(0.0, min(1.0, float(merged_policy.get("unknown_multiplier", 0.75) or 0.75)))
+        elif route_reason == "conditional_short_unverified_route":
+            score_multiplier *= max(
+                0.0,
+                min(1.0, float(merged_policy.get("unverified_route_multiplier", 0.15) or 0.15)),
+            )
         elif str(route_review.get("route_registry_status") or "").strip().lower() == "unsupported":
             score_multiplier *= max(
                 0.0,

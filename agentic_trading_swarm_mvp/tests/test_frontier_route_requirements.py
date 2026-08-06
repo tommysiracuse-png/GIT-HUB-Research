@@ -170,6 +170,45 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
             "verified_standard_short_route",
         )
 
+    def test_generic_supported_route_without_verified_standard_path_is_shadow_only(self):
+        gate = paper_only_conditional_short_route_feasibility_gate(
+            venue="GATE",
+            direction="short_frontier_spot",
+            context_stats={
+                "execution_feasibility": {"status": "conditional", "route_status": "conditional"},
+                "trade_type": "frontier_crypto_venue_map",
+                "margin_eligible": True,
+                "fees_modeled": True,
+                "symbol_supported": True,
+                "supports_conditional_orders": True,
+                "paper_route_requirement_report": {
+                    "route_requirements": {
+                        "route_requirement_checklist": {
+                            "shortable_inventory_declared": True,
+                            "borrow_cost_model_present": True,
+                            "venue_supports_margin_or_equivalent": True,
+                            "fees_modeled": True,
+                        }
+                    }
+                },
+            },
+        )
+
+        self.assertTrue(gate["applied"])
+        self.assertTrue(gate["allow"])
+        self.assertFalse(gate["suppressed"])
+        self.assertGreater(gate["score_multiplier"], 0.0)
+        self.assertLess(gate["score_multiplier"], 0.15)
+        self.assertFalse(gate["active_scoring_eligible"])
+        self.assertTrue(gate["shadow_label"])
+        self.assertFalse(gate["paper_ineligible"])
+        self.assertFalse(gate["explicit_borrow_ok"])
+        self.assertFalse(gate["verified_standard_route"])
+        self.assertEqual(
+            gate["route_feasibility_reason"],
+            "conditional_short_unverified_route",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

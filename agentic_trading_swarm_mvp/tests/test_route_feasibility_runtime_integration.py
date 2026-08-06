@@ -216,6 +216,42 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
             guarded["frontier_route_feasibility"]["paper_active_scoring_eligible"]
         )
 
+    def test_generic_supported_conditional_short_without_verified_route_stays_shadow_only(self):
+        candidate = _candidate(
+            venue="GATE",
+            trade_type="frontier_crypto_venue_map",
+            quality_action="verified",
+            execution_feasibility={"status": "conditional", "route_status": "conditional"},
+            margin_eligible=True,
+            fees_modeled=True,
+            symbol_supported=True,
+            supports_conditional_orders=True,
+            paper_route_requirement_report={
+                "route_requirements": {
+                    "route_requirement_checklist": {
+                        "shortable_inventory_declared": True,
+                        "borrow_cost_model_present": True,
+                        "venue_supports_margin_or_equivalent": True,
+                        "fees_modeled": True,
+                    }
+                }
+            },
+        )
+
+        guarded = apply_frontier_paper_guard(candidate)
+
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("conditional_short_unverified_route", guarded["candidate_reject_reason"])
+        self.assertEqual("conditional_short_unverified_route", guarded["route_feasibility_reason"])
+        self.assertFalse(guarded["paper_active_scoring_eligible"])
+        self.assertTrue(guarded["paper_route_feasibility_shadow_label"])
+        self.assertFalse(guarded["paper_ineligible"])
+        self.assertEqual(
+            "conditional_short_unverified_route",
+            guarded["frontier_route_feasibility"]["route_feasibility_reason"],
+        )
+        self.assertFalse(guarded["frontier_route_feasibility"]["paper_active_scoring_eligible"])
+
 
 if __name__ == "__main__":
     unittest.main()
