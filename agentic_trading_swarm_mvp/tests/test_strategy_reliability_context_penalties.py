@@ -148,8 +148,9 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         detail = sr.apply_paper_context_priors(candidate, {"mode": "paper", "allow_live_trading": False})
 
         self.assertEqual(detail["raw_total_prior"], -33.0)
-        self.assertEqual(candidate["score"], 27.0)
-        self.assertEqual(candidate["paper_context_prior_status"], "ranked_promotion_gated")
+        self.assertTrue(detail["rank_gate"]["hard_gate"])
+        self.assertEqual(candidate["score"], 20.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
         self.assertFalse(candidate["promotion_eligible"])
         self.assertNotIn("paper_entry_blocked", candidate)
         self.assertNotIn("paper_fill_allowed", candidate)
@@ -186,7 +187,8 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(detail["realized_context_prior"], -15.75)
         self.assertEqual(detail["raw_total_prior"], -48.75)
         self.assertEqual(candidate["score"], 11.25)
-        self.assertEqual(candidate["paper_context_prior_status"], "ranked_promotion_gated")
+        self.assertTrue(detail["rank_gate"]["hard_gate"])
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
         self.assertFalse(candidate["promotion_eligible"])
         self.assertNotIn("paper_entry_blocked", candidate)
 
@@ -206,7 +208,8 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(detail["raw_total_prior"], -33.0)
         self.assertEqual(detail["total_prior"], 0.0)
         self.assertTrue(detail["exceptional_signal_override"])
-        self.assertEqual(candidate["score"], 35.0)
+        self.assertTrue(detail["rank_gate"]["hard_gate"])
+        self.assertEqual(candidate["score"], 20.0)
         self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
 
     def test_context_priors_are_inert_for_live_configuration(self) -> None:
@@ -265,8 +268,96 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertTrue(detail["realized_context_persistent_negative"])
         self.assertEqual(detail["realized_context_prior"], -7.875)
         self.assertEqual(detail["raw_total_prior"], -22.875)
-        self.assertEqual(candidate["score"], 35.0)
+        self.assertTrue(detail["rank_gate"]["hard_gate"])
+        self.assertEqual(candidate["score"], 20.0)
         self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
+
+    def test_positive_conditional_frontier_slice_stays_hard_gated_in_paper_ranking(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "asset_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "conditional"},
+        }
+
+        detail = sr.apply_paper_context_priors(
+            candidate,
+            {
+                "mode": "paper",
+                "allow_live_trading": False,
+                "paper_context_priors": {
+                    "realized_context_stats": {
+                        "OKX_SPOT|long|conditional": {
+                            "closed_count": 40,
+                            "avg_pnl_bps": 25.0,
+                            "win_rate": 0.7,
+                        }
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(detail["realized_context_key"], "OKX_SPOT|long|conditional")
+        self.assertTrue(detail["rank_gate"]["hard_gate"])
+        self.assertFalse(detail["top_rank_eligible"])
+        self.assertEqual(candidate["score"], 20.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
+        self.assertFalse(candidate["promotion_eligible"])
+
+    def test_realized_context_scoring_keeps_venue_direction_edges_separate(self) -> None:
+        long_candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "asset_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard"},
+        }
+        short_candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "asset_surface": "spot",
+            "direction": "short_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard"},
+        }
+
+        config = {
+            "mode": "paper",
+            "allow_live_trading": False,
+            "paper_context_priors": {
+                "venue_direction_feasibility_priors": {
+                    "OKX_SPOT|long|standard": 8.0,
+                    "OKX_SPOT|short|standard": -8.0,
+                },
+                "realized_context_stats": {
+                    "OKX_SPOT|long|standard": {
+                        "closed_count": 30,
+                        "avg_pnl_bps": 20.0,
+                        "win_rate": 0.7,
+                    },
+                    "OKX_SPOT|short|standard": {
+                        "closed_count": 30,
+                        "avg_pnl_bps": -20.0,
+                        "win_rate": 0.3,
+                    },
+                },
+            },
+        }
+
+        long_detail = sr.apply_paper_context_priors(long_candidate, config)
+        short_detail = sr.apply_paper_context_priors(short_candidate, config)
+
+        self.assertEqual(long_detail["realized_context_key"], "OKX_SPOT|long|standard")
+        self.assertEqual(short_detail["realized_context_key"], "OKX_SPOT|short|standard")
+        self.assertEqual(long_candidate["score"], 82.0)
+        self.assertEqual(short_candidate["score"], 53.0)
+        self.assertGreater(long_candidate["score"], short_candidate["score"])
 
     def test_context_priors_are_inert_for_nested_live_scope(self) -> None:
         candidate = {

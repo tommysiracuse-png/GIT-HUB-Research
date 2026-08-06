@@ -60,7 +60,7 @@ PAPER_CONTEXT_PRIOR_DEFAULTS = {
     "top_rank_min_closed_trades": 25,
     "top_rank_min_avg_pnl_bps": 0.0,
     "top_rank_score_cap": 75.0,
-    "conditional_rank_score_cap": 35.0,
+    "conditional_rank_score_cap": 20.0,
     "realized_context_window_closed_trades": 30,
     "realized_context_min_closed_trades": 6,
     "realized_context_positive_scale": 0.2,
@@ -3513,7 +3513,8 @@ def _paper_context_rank_gate(
     )
     reason = "not_applicable"
     score_cap = None
-    if applies and feasibility_status == "conditional":
+    hard_gate = bool(applies and feasibility_status == "conditional")
+    if hard_gate:
         reason = "conditional_context_rank_gated"
         score_cap = conditional_rank_score_cap
     elif applies and not top_rank_eligible:
@@ -3528,6 +3529,7 @@ def _paper_context_rank_gate(
     gated_score = round(min(pre_gate_score, score_cap), 3) if score_cap is not None else round(pre_gate_score, 3)
     return {
         "enabled": applies,
+        "hard_gate": hard_gate,
         "applied": applies and score_cap is not None and gated_score < round(pre_gate_score, 3),
         "reason": reason,
         "feasibility_status": feasibility_status,
@@ -3660,7 +3662,7 @@ def apply_paper_context_priors(
         if not rank_gate["promotion_eligible"]:
             candidate["promotion_eligible"] = False
     candidate["paper_context_prior"] = detail
-    if rank_gate["applied"]:
+    if rank_gate["hard_gate"] or rank_gate["applied"]:
         candidate["paper_context_prior_status"] = "ranked_hard_gated"
     elif rank_gate["enabled"] and not rank_gate["promotion_eligible"]:
         candidate["paper_context_prior_status"] = "ranked_promotion_gated"
@@ -3668,7 +3670,7 @@ def apply_paper_context_priors(
         candidate["paper_context_prior_status"] = "ranked_not_blocked"
     if raw_total_prior:
         _append_note(candidate, "paper_context_prior:exceptional_signal_override" if detail["exceptional_signal_override"] else "paper_context_prior:applied")
-    if rank_gate["applied"]:
+    if rank_gate["hard_gate"] or rank_gate["applied"]:
         _append_note(candidate, f"paper_context_rank_gate:{rank_gate['reason']}")
     elif rank_gate["enabled"] and not rank_gate["promotion_eligible"]:
         _append_note(candidate, f"paper_context_promotion_gate:{rank_gate['reason']}")

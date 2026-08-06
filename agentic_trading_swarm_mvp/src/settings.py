@@ -70,6 +70,7 @@ DEFAULT_SETTINGS = {
         "exceptional_base_signal_score": 85.0,
         "feasibility_standard_prior": 6.0,
         "feasibility_conditional_prior": -10.0,
+        "conditional_rank_score_cap": 20.0,
         "realized_context_window_closed_trades": 30,
         "realized_context_min_closed_trades": 6,
         "realized_context_positive_scale": 0.2,
