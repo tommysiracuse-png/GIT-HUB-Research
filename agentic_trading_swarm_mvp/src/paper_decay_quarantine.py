@@ -457,6 +457,7 @@ def apply_quarantine(
         ):
             guarded["shadow_filtered"] = False
             guarded["paper_fill_allowed"] = True
+            guarded["paper_eligible"] = True
             guarded["paper_entry_blocked"] = False
             guarded.pop("candidate_reject_reason", None)
             guarded.pop("candidate_reject_detail", None)
@@ -466,6 +467,7 @@ def apply_quarantine(
         {
             "shadow_filtered": True,
             "paper_fill_allowed": False,
+            "paper_eligible": False,
             "paper_action": "shadow_trial",
             "paper_execution_mode": "observe_only",
             "paper_observation_only": True,

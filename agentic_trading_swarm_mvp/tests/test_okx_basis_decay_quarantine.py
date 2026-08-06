@@ -88,6 +88,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         self.assertEqual("shadow_quarantined", guarded["candidate_status"])
         self.assertFalse(guarded.get("paper_entry_blocked", False))
         self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertTrue(guarded.get("paper_eligible", True))
         self.assertNotIn("candidate_reject_reason", guarded)
         self.assertNotIn("candidate_reject_detail", guarded)
 
@@ -167,6 +168,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
 
         self.assertTrue(guarded["shadow_filtered"])
         self.assertFalse(guarded["paper_filled"])
+        self.assertFalse(guarded["paper_eligible"])
         self.assertEqual("shadow_trial", guarded["paper_action"])
 
     def test_proxy_lineage_is_not_reclassified_as_the_direct_decayed_family(self) -> None:

@@ -1599,6 +1599,7 @@ def _annotate_shadow_filtered_candidate(
     paper_net_edge_guard = reason.get("reason") == PAPER_NET_EDGE_GUARD_REASON
     guarded["shadow_filtered"] = True
     guarded["paper_fill_allowed"] = False
+    guarded["paper_eligible"] = False
     shadow_status = "shadow_only" if paper_net_edge_guard else "shadow_filtered"
     guarded["paper_action"] = shadow_status
     guarded["paper_status"] = shadow_status

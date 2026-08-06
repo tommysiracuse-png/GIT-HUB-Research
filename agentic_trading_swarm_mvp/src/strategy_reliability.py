@@ -4781,6 +4781,7 @@ def _apply_okx_basis_decay_quarantine(
         candidate["candidate_status"] = "shadow_quarantined"
         candidate["paper_quarantine_status"] = "shadow_quarantined"
         candidate["paper_fill_allowed"] = True
+        candidate["paper_eligible"] = True
         candidate["promotion_eligible"] = False
         candidate["_hunter_bucket"] = "diagnose"
         if not candidate.get("paper_exploration_immutable_rejections") and not candidate.get(
@@ -4797,6 +4798,7 @@ def _apply_okx_basis_decay_quarantine(
     score_policy = apply_okx_basis_decay_score_policy(candidate, config, zero_score=True)
     candidate["candidate_status"] = "shadow_quarantined"
     candidate["paper_fill_allowed"] = False
+    candidate["paper_eligible"] = False
     candidate["paper_action"] = "shadow_trial"
     candidate["paper_execution_mode"] = "observe_only"
     candidate["paper_observation_only"] = True
