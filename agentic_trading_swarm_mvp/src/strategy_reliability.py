@@ -51,6 +51,15 @@ PAPER_CONTEXT_PRIOR_DEFAULTS = {
     "exceptional_base_signal_score": 85.0,
     "feasibility_standard_prior": 6.0,
     "feasibility_conditional_prior": -8.0,
+    "realized_context_window_closed_trades": 30,
+    "realized_context_min_closed_trades": 6,
+    "realized_context_positive_scale": 0.2,
+    "realized_context_negative_scale": 0.3,
+    "realized_context_max_positive_prior": 12.0,
+    "realized_context_max_negative_prior": -18.0,
+    "realized_context_persistent_negative_closed_trades": 8,
+    "realized_context_conditional_penalty_multiplier": 1.5,
+    "realized_context_persistent_negative_multiplier": 1.25,
     "strong_liquidity_score": 0.70,
     "strong_liquidity_prior": 4.0,
     "weak_liquidity_score": 0.45,
@@ -2997,6 +3006,123 @@ def _paper_context_strategy_prior(candidate: Mapping[str, Any], policy: Mapping[
     return 0.0, None
 
 
+def _paper_context_feasibility_status(candidate: Mapping[str, Any]) -> str:
+    feasibility = candidate.get("execution_feasibility") or {}
+    route = candidate.get("execution_route") or {}
+    return str(
+        feasibility.get("route_status")
+        or feasibility.get("status")
+        or route.get("route_status")
+        or candidate.get("route_status")
+        or "unknown"
+    ).strip().lower()
+
+
+def _paper_context_realized_key(
+    candidate: Mapping[str, Any],
+    *,
+    feasibility_status: str | None = None,
+) -> str:
+    status = str(feasibility_status or _paper_context_feasibility_status(candidate) or "unknown").strip().lower()
+    return f"{_paper_context_venue(candidate)}|{_paper_context_direction(candidate)}|{status or 'unknown'}"
+
+
+def _paper_context_realized_stats(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | None,
+    *,
+    feasibility_status: str,
+) -> dict[str, Any] | None:
+    key = _paper_context_realized_key(candidate, feasibility_status=feasibility_status)
+    for field in (
+        "paper_context_realized_stats",
+        "paper_context_prior_realized_stats",
+        "paper_context_loss_stats",
+        "paper_context_loss_statistics",
+    ):
+        value = candidate.get(field)
+        if not isinstance(value, Mapping):
+            continue
+        if any(name in value for name in ("closed_count", "closed_trades", "sample_size")):
+            return dict(value)
+        scoped = value.get(key)
+        if isinstance(scoped, Mapping):
+            return dict(scoped)
+    policy_stats = _paper_context_prior_policy(config).get("realized_context_stats")
+    if isinstance(policy_stats, Mapping):
+        scoped = policy_stats.get(key)
+        if isinstance(scoped, Mapping):
+            return dict(scoped)
+    return None
+
+
+def _paper_context_realized_prior(
+    candidate: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    config: Mapping[str, Any] | None,
+    *,
+    feasibility_status: str,
+) -> tuple[float, dict[str, Any]]:
+    key = _paper_context_realized_key(candidate, feasibility_status=feasibility_status)
+    stats = _paper_context_realized_stats(candidate, config, feasibility_status=feasibility_status)
+    detail = {
+        "key": key,
+        "closed_count": 0,
+        "avg_pnl_bps": None,
+        "win_rate": None,
+        "tail_average_bps": None,
+        "prior": 0.0,
+        "applied": False,
+        "persistent_negative": False,
+    }
+    if not isinstance(stats, Mapping):
+        return 0.0, detail
+
+    closed_count = _as_int(stats.get("closed_count", stats.get("closed_trades", stats.get("sample_size"))), 0)
+    avg_pnl_bps = _paper_context_loss_metric(stats, "avg_pnl_bps", "expectancy_bps", "recent_expectancy_bps")
+    win_rate = _paper_context_loss_metric(stats, "win_rate", "recent_win_rate")
+    tail_average_bps = _paper_context_loss_metric(stats, "tail_average_bps", "tail_avg_bps", "average_tail_loss_bps")
+    persistent_negative = bool(
+        _as_bool(stats.get("persistent_negative"), False)
+        or (
+            closed_count >= max(1, _as_int(policy.get("realized_context_persistent_negative_closed_trades"), 8))
+            and avg_pnl_bps is not None
+            and avg_pnl_bps < 0.0
+        )
+    )
+    detail.update(
+        {
+            "closed_count": closed_count,
+            "avg_pnl_bps": round(avg_pnl_bps, 3) if avg_pnl_bps is not None else None,
+            "win_rate": round(win_rate, 6) if win_rate is not None else None,
+            "tail_average_bps": round(tail_average_bps, 3) if tail_average_bps is not None else None,
+            "persistent_negative": persistent_negative,
+        }
+    )
+    if closed_count < max(1, _as_int(policy.get("realized_context_min_closed_trades"), 6)) or avg_pnl_bps is None:
+        return 0.0, detail
+
+    prior = 0.0
+    if avg_pnl_bps > 0.0:
+        prior = min(
+            _as_float(policy.get("realized_context_max_positive_prior"), 12.0),
+            avg_pnl_bps * _as_float(policy.get("realized_context_positive_scale"), 0.2),
+        )
+    elif avg_pnl_bps < 0.0:
+        multiplier = 1.0
+        if feasibility_status == "conditional":
+            multiplier *= _as_float(policy.get("realized_context_conditional_penalty_multiplier"), 1.5)
+        if persistent_negative:
+            multiplier *= _as_float(policy.get("realized_context_persistent_negative_multiplier"), 1.25)
+        prior = max(
+            _as_float(policy.get("realized_context_max_negative_prior"), -18.0),
+            avg_pnl_bps * _as_float(policy.get("realized_context_negative_scale"), 0.3) * multiplier,
+        )
+    detail["prior"] = round(prior, 3)
+    detail["applied"] = bool(prior)
+    return round(prior, 3), detail
+
+
 def apply_paper_context_priors(
     candidate: dict[str, Any],
     config: Mapping[str, Any] | None = None,
@@ -3016,15 +3142,7 @@ def apply_paper_context_priors(
 
     policy = _paper_context_prior_policy(config)
     base_score = round(_as_float(candidate.get("score"), 0.0), 3)
-    feasibility = candidate.get("execution_feasibility") or {}
-    route = candidate.get("execution_route") or {}
-    feasibility_status = str(
-        feasibility.get("route_status")
-        or feasibility.get("status")
-        or route.get("route_status")
-        or candidate.get("route_status")
-        or "unknown"
-    ).strip().lower()
+    feasibility_status = _paper_context_feasibility_status(candidate)
     feasibility_prior = (
         _as_float(policy.get("feasibility_standard_prior"), 6.0)
         if feasibility_status == "standard"
@@ -3052,9 +3170,16 @@ def apply_paper_context_priors(
         else:
             liquidity_bucket = "normal"
     strategy_family_prior, strategy_family = _paper_context_strategy_prior(candidate, policy)
+    realized_context_prior, realized_context = _paper_context_realized_prior(
+        candidate,
+        policy,
+        config,
+        feasibility_status=feasibility_status,
+    )
     terms = {
         "feasibility_prior": round(feasibility_prior, 3),
         "venue_direction_prior": round(venue_direction_prior, 3),
+        "realized_context_prior": round(realized_context_prior, 3),
         "liquidity_prior": round(liquidity_prior, 3),
         "strategy_family_prior": round(strategy_family_prior, 3),
     }
@@ -3078,6 +3203,12 @@ def apply_paper_context_priors(
         "existing_safety_state_preserved": existing_safety_state,
         "feasibility_status": feasibility_status,
         "venue_direction_key": venue_direction_key,
+        "realized_context_key": realized_context["key"],
+        "realized_context_closed_count": realized_context["closed_count"],
+        "realized_context_avg_pnl_bps": realized_context["avg_pnl_bps"],
+        "realized_context_win_rate": realized_context["win_rate"],
+        "realized_context_tail_average_bps": realized_context["tail_average_bps"],
+        "realized_context_persistent_negative": realized_context["persistent_negative"],
         "liquidity_score": round(liquidity_score, 6) if liquidity_score is not None else None,
         "liquidity_bucket": liquidity_bucket,
         "strategy_family": strategy_family,
@@ -4039,6 +4170,87 @@ def hydrate_paper_context_loss_statistics(
             candidate["paper_context_loss_quarantine_state"] = states[key]
 
 
+def hydrate_paper_context_prior_statistics(
+    candidates: list[dict],
+    conn: Any | None,
+    config: Mapping[str, Any] | None = None,
+) -> None:
+    """Attach venue/direction/feasibility realized paper stats for ranking only."""
+    if conn is None:
+        return
+    eligible = [candidate for candidate in candidates if _paper_context_prior_active(candidate, config)]
+    if not eligible:
+        return
+    policy = _paper_context_prior_policy(config)
+    keys = {
+        _paper_context_realized_key(candidate, feasibility_status=_paper_context_feasibility_status(candidate))
+        for candidate in eligible
+    }
+    if not keys:
+        return
+    grouped: dict[str, list[float]] = collections.defaultdict(list)
+    try:
+        rows = conn.execute(
+            """
+            select venue, direction, trade_type, pnl_bps, candidate_json
+            from paper_trades
+            where status = 'closed' and pnl_bps is not null
+            order by closed_at desc, id desc
+            """
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - optional paper evidence is read-only
+        return
+    for row in rows:
+        try:
+            raw = dict(row)
+        except (TypeError, ValueError):
+            continue
+        try:
+            trade_candidate = json.loads(raw.get("candidate_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            trade_candidate = {}
+        if not isinstance(trade_candidate, Mapping):
+            trade_candidate = {}
+        if str(trade_candidate.get("signal_stats_scope") or "").lower() == "synthetic_research":
+            continue
+        context_candidate = {
+            **trade_candidate,
+            "venue": trade_candidate.get("venue") or raw.get("venue"),
+            "direction": trade_candidate.get("direction") or raw.get("direction"),
+            "trade_type": trade_candidate.get("trade_type") or raw.get("trade_type"),
+        }
+        key = _paper_context_realized_key(
+            context_candidate,
+            feasibility_status=_paper_context_feasibility_status(context_candidate),
+        )
+        if key in keys:
+            grouped[key].append(_as_float(raw.get("pnl_bps")))
+
+    window = max(1, _as_int(policy.get("realized_context_window_closed_trades"), 30))
+    min_persistent_count = max(1, _as_int(policy.get("realized_context_persistent_negative_closed_trades"), 8))
+    stats_by_key: dict[str, dict[str, Any]] = {}
+    for key, values in grouped.items():
+        values = values[:window]
+        if not values:
+            continue
+        tail_count = max(1, math.ceil(len(values) * 0.25))
+        worst_values = sorted(values)[:tail_count]
+        avg_pnl_bps = sum(values) / len(values)
+        stats_by_key[key] = {
+            "closed_count": len(values),
+            "win_rate": round(sum(value > 0.0 for value in values) / len(values), 6),
+            "avg_pnl_bps": round(avg_pnl_bps, 6),
+            "expectancy_bps": round(avg_pnl_bps, 6),
+            "tail_average_bps": round(sum(worst_values) / len(worst_values), 6),
+            "persistent_negative": bool(len(values) >= min_persistent_count and avg_pnl_bps < 0.0),
+            "rolling_window_closed_trades": window,
+        }
+    for candidate in eligible:
+        key = _paper_context_realized_key(candidate, feasibility_status=_paper_context_feasibility_status(candidate))
+        if key in stats_by_key and not isinstance(candidate.get("paper_context_realized_stats"), Mapping):
+            candidate["paper_context_realized_stats"] = stats_by_key[key]
+
+
 def _persist_paper_context_loss_quarantine(
     conn: Any | None,
     record: Mapping[str, Any] | None,
@@ -4672,6 +4884,7 @@ def apply_strategy_reliability(
     hydrate_paper_lineage_source_health(candidates, conn)
     _hydrate_portability_paper_evidence(candidates, conn)
     hydrate_paper_context_loss_statistics(candidates, conn, settings)
+    hydrate_paper_context_prior_statistics(candidates, conn, settings)
     for candidate in candidates:
         _remove_invalid_proxy_confirmation(candidate)
         _record_proxy_short_quality(candidate, settings)

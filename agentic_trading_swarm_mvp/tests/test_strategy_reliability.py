@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import sqlite3
 import sys
@@ -123,6 +124,79 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["final_paper_score"], 84.0)
         self.assertEqual(rows[0]["paper_context_prior"]["venue_direction_prior"], 6.0)
         self.assertEqual(report["paper_context_prior_adjustments"][0]["final_paper_score"], 84.0)
+
+    def test_runtime_hydrates_realized_context_by_venue_direction_and_feasibility(self) -> None:
+        standard = {
+            "seen_at": "2026-08-06T00:00:00+00:00",
+            "venue": "BYBIT_SPOT",
+            "inst_id": "BYBIT_SPOT:BTC_USDT",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "score": 60.0,
+            "last": 100.0,
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+        }
+        conditional = {
+            **standard,
+            "inst_id": "BYBIT_SPOT:ETH_USDT",
+            "execution_feasibility": {"status": "conditional", "route_status": "conditional"},
+        }
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        try:
+            for index in range(8):
+                for inst_id, status, pnl in (
+                    ("BYBIT_SPOT:BTC_USDT", "standard", 20.0),
+                    ("BYBIT_SPOT:ETH_USDT", "conditional", -20.0),
+                ):
+                    payload = {
+                        "venue": "BYBIT_SPOT",
+                        "inst_id": inst_id,
+                        "direction": "long_frontier_spot",
+                        "trade_type": "spot_carry",
+                        "execution_feasibility": {"status": status, "route_status": status},
+                    }
+                    conn.execute(
+                        """
+                        insert into paper_trades (
+                            opened_at, closed_at, venue, inst_id, direction, trade_type,
+                            signal_key, base_score, learned_score, entry, exit, pnl_bps,
+                            status, thesis, candidate_json, review_json
+                        ) values (?, ?, 'BYBIT_SPOT', ?, 'long_frontier_spot',
+                                  'spot_carry', ?, 80, 80, 100, 101, ?, 'closed', 'test', ?, '{}')
+                        """,
+                        (
+                            f"2026-08-05T00:{index:02d}:00+00:00",
+                            f"2026-08-05T01:{index:02d}:00+00:00",
+                            inst_id,
+                            f"{inst_id}|{status}",
+                            pnl,
+                            json.dumps(payload),
+                        ),
+                    )
+            conn.commit()
+            rows, report = strategy_reliability.apply_strategy_reliability(
+                [standard, conditional],
+                {"mode": "paper", "allow_live_trading": False},
+                conn=conn,
+            )
+        finally:
+            conn.close()
+
+        by_inst = {row["inst_id"]: row for row in rows}
+        standard_row = by_inst["BYBIT_SPOT:BTC_USDT"]
+        conditional_row = by_inst["BYBIT_SPOT:ETH_USDT"]
+
+        self.assertEqual(standard_row["paper_context_prior"]["realized_context_key"], "BYBIT_SPOT|long|standard")
+        self.assertEqual(conditional_row["paper_context_prior"]["realized_context_key"], "BYBIT_SPOT|long|conditional")
+        self.assertEqual(standard_row["paper_context_prior"]["realized_context_prior"], 4.0)
+        self.assertEqual(conditional_row["paper_context_prior"]["realized_context_prior"], -11.25)
+        self.assertGreater(standard_row["score"], conditional_row["score"])
+        report_keys = {item["realized_context_key"] for item in report["paper_context_prior_adjustments"]}
+        self.assertIn("BYBIT_SPOT|long|standard", report_keys)
+        self.assertIn("BYBIT_SPOT|long|conditional", report_keys)
 
     def test_bybit_long_quality_slice_gets_probation_not_blanket_expand(self) -> None:
         candidate = base_candidate(

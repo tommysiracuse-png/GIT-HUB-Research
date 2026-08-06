@@ -35,6 +35,41 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(candidate["paper_context_prior_status"], "ranked_not_blocked")
         self.assertNotIn("paper_entry_blocked", candidate)
 
+    def test_context_priors_use_positive_realized_slice_evidence(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "asset_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard"},
+        }
+
+        detail = sr.apply_paper_context_priors(
+            candidate,
+            {
+                "mode": "paper",
+                "allow_live_trading": False,
+                "paper_context_priors": {
+                    "realized_context_stats": {
+                        "OKX_SPOT|long|standard": {
+                            "closed_count": 10,
+                            "avg_pnl_bps": 20.0,
+                            "win_rate": 0.7,
+                        }
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(detail["realized_context_key"], "OKX_SPOT|long|standard")
+        self.assertEqual(detail["realized_context_closed_count"], 10)
+        self.assertEqual(detail["realized_context_avg_pnl_bps"], 20.0)
+        self.assertEqual(detail["realized_context_prior"], 4.0)
+        self.assertEqual(candidate["final_paper_score"], 90.0)
+        self.assertEqual(candidate["score"], 90.0)
+
     def test_context_priors_rank_down_weak_conditional_convergence_without_blocking(self) -> None:
         candidate = {
             "score": 60.0,
@@ -52,6 +87,41 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(candidate["paper_context_prior_status"], "ranked_not_blocked")
         self.assertNotIn("paper_entry_blocked", candidate)
         self.assertNotIn("paper_fill_allowed", candidate)
+
+    def test_context_priors_penalize_negative_conditional_slice_more_strongly(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "MEXC",
+            "direction": "long_frontier_spot",
+            "trade_type": "basis_mean_reversion",
+            "liquidity_score": 0.3,
+            "execution_feasibility": {"status": "conditional"},
+        }
+
+        detail = sr.apply_paper_context_priors(
+            candidate,
+            {
+                "mode": "paper",
+                "allow_live_trading": False,
+                "paper_context_priors": {
+                    "realized_context_stats": {
+                        "MEXC|long|conditional": {
+                            "closed_count": 12,
+                            "avg_pnl_bps": -20.0,
+                            "win_rate": 0.33,
+                        }
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(detail["realized_context_key"], "MEXC|long|conditional")
+        self.assertTrue(detail["realized_context_persistent_negative"])
+        self.assertEqual(detail["realized_context_prior"], -11.25)
+        self.assertEqual(detail["raw_total_prior"], -49.25)
+        self.assertEqual(candidate["score"], 10.75)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_not_blocked")
+        self.assertNotIn("paper_entry_blocked", candidate)
 
     def test_exceptional_signal_keeps_negative_context_as_diagnostic(self) -> None:
         candidate = {
