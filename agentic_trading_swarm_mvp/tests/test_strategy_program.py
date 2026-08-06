@@ -610,6 +610,87 @@ def eex_reported_spot_logic() -> dict:
     }
 
 
+def icdx_cpotr_price_card_observation(
+    price: float,
+    observed_at: str,
+    *,
+    price_type: str,
+    contract_month: str = "AUG26",
+    **overrides: object,
+) -> dict:
+    normalized_type = str(price_type)
+    code = "SOBO" if normalized_type == "suggested_opening" else "YDSP"
+    row = {
+        "inst_id": f"ICDX:CPOTR:{contract_month}:{code}",
+        "venue": "ICDX",
+        "trade_type": "official_price_card_reference",
+        "market_type": "commodity_futures_reference_price",
+        "market_surface": "icdx_cpotr",
+        "asset_class": "crude_palm_oil_futures",
+        "base": "CRUDE_PALM_OIL",
+        "quote": "IDR_PER_TONNE",
+        "last": price,
+        "contract_month": contract_month,
+        "price_type": normalized_type,
+        "price_basis": (
+            "suggested_opening_idr_per_tonne"
+            if normalized_type == "suggested_opening"
+            else "previous_settlement_idr_per_tonne"
+        ),
+        "quality_status": "official_price_card",
+        "candidate_reject_reason": "public_price_card_not_execution_route",
+        "freshness_state": "fresh",
+        "session_status": (
+            "pre_open_indicative"
+            if normalized_type == "suggested_opening"
+            else "previous_settlement_reference"
+        ),
+        "data_status": "reachable",
+        "observed_at": observed_at,
+        "price_source": "ICDX homepage official price card",
+        "source_url": "https://www.icdx.co.id/",
+        "source_record_type": "homepage_price_card",
+        "source_adapter_id": "indonesia_commodity_derivatives_exchange_icdx",
+    }
+    row.update(overrides)
+    return row
+
+
+def icdx_cpotr_price_card_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["ICDX"],
+            "trade_types": ["official_price_card_reference"],
+            "market_surfaces": ["icdx_cpotr"],
+        },
+        "calculated_features": {
+            "cpotr_opening_gap_abs_bps": "abs(cpotr_opening_gap_bps)",
+        },
+        "entry_expression": (
+            "market_surface == 'icdx_cpotr' "
+            "and quality_status == 'official_price_card' "
+            "and candidate_reject_reason == 'public_price_card_not_execution_route' "
+            "and freshness_state == 'fresh' "
+            "and cpotr_price_card_pair_observed >= 1 "
+            "and price_type == 'previous_settlement' "
+            "and previous_settlement_price > 0 and suggested_opening_price > 0"
+        ),
+        "invalidation_expression": (
+            "freshness_state != 'fresh' or cpotr_price_card_pair_observed < 1 "
+            "or previous_settlement_price <= 0 or suggested_opening_price <= 0"
+        ),
+        "long_expression": "cpotr_opening_gap_bps > 0",
+        "short_expression": "cpotr_opening_gap_bps < 0",
+        "edge_expression": "cpotr_opening_gap_abs_bps",
+        "score_expression": (
+            "clip(45 + min(cpotr_opening_gap_abs_bps, 80) / 2 "
+            "+ 5 * cpotr_price_card_pair_observed, 0, 100)"
+        ),
+        "route_surface": "proxy",
+    }
+
+
 class StrategyProgramTests(unittest.TestCase):
     def test_safe_expression_rejects_code_and_attribute_access(self) -> None:
         with self.assertRaises(ProgramValidationError):
@@ -1196,6 +1277,70 @@ class StrategyProgramTests(unittest.TestCase):
                 "https://api1.datasource.eex-group.com/getSpot/2026-08-04",
                 candidate["source_url"],
             )
+
+            synthetic = prepare_candidate_for_exploration(candidate, cfg)
+            self.assertTrue(synthetic["synthetic_research_paper"])
+            self.assertFalse(synthetic["promotion_eligible"])
+            self.assertEqual("synthetic_research_not_live_equivalent", synthetic["paper_execution_semantics"])
+
+            execution = execute_order(
+                conn,
+                synthetic,
+                {"learned_score": synthetic["score"], "paper_allocation_multiplier": 1.0},
+                cfg,
+            )
+            self.assertTrue(execution["paper_filled"])
+            self.assertEqual("synthetic_research_paper", execution["order"]["route_id"])
+            self.assertEqual("paper", execution["order"]["mode"])
+
+    def test_icdx_price_card_program_uses_paired_features_and_synthetic_paper_route(self) -> None:
+        cfg = settings()
+        cfg["paper_exploration"]["enabled"] = True
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        recommendation = lab_recommendation(
+            "icdx_cpotr_price_card_reference_v1",
+            icdx_cpotr_price_card_logic(),
+        )
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["hypothesis"] = (
+            "A paired ICDX CPOTR suggested opening and previous settlement supports "
+            "same-surface synthetic continuation measurement."
+        )
+        experiment["source_surface"] = "icdx_cpotr"
+        experiment["permitted_target_surface"] = ["icdx_cpotr"]
+
+        suggested = icdx_cpotr_price_card_observation(
+            16875.0,
+            now.isoformat(),
+            price_type="suggested_opening",
+        )
+        settlement = icdx_cpotr_price_card_observation(
+            16280.0,
+            now.isoformat(),
+            price_type="previous_settlement",
+        )
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [suggested, settlement],
+            )
+
+            self.assertEqual(1, len(generated), report)
+            candidate = generated[0]
+            self.assertEqual("icdx_cpotr", candidate["target_surface"])
+            self.assertEqual("long_proxy", candidate["direction"])
+            self.assertTrue(candidate["paper_cpotr_price_card_reference"])
+            self.assertTrue(candidate["paper_cpotr_price_card_provenance_valid"])
+            self.assertEqual("synthetic_research_paper", candidate["synthetic_route_id"])
+            self.assertEqual(16875.0, candidate["strategy_lab_program_features"]["suggested_opening_price"])
+            self.assertEqual(16280.0, candidate["strategy_lab_program_features"]["previous_settlement_price"])
+            self.assertEqual(1.0, candidate["strategy_lab_program_features"]["cpotr_price_card_pair_observed"])
+            self.assertGreater(candidate["strategy_lab_program_features"]["cpotr_opening_gap_bps"], 0.0)
 
             synthetic = prepare_candidate_for_exploration(candidate, cfg)
             self.assertTrue(synthetic["synthetic_research_paper"])

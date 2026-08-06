@@ -27,6 +27,8 @@ EEX_SECONDARY_SPOT_SURFACE = "eex_eu_ets_secondary_spot_trades"
 EEX_SECONDARY_SPOT_LAB_ID = "eex_eu_ets_secondary_spot_reported_trade_v1"
 ADX_DERIVATIVES_SURFACE = "adx_equity_and_index_futures_contract_catalog"
 ADX_DERIVATIVES_LAB_ID = "adx_derivatives_companion_quote_v1"
+ICDX_CPOTR_SURFACE = "icdx_cpotr"
+ICDX_CPOTR_LAB_ID = "icdx_cpotr_price_card_reference_v1"
 
 
 def _strategy_lab_id(state: dict[str, Any]) -> str:
@@ -387,6 +389,121 @@ def _create_adx_derivatives_companion_program(
     }
 
 
+def _create_icdx_cpotr_price_card_program(
+    conn: sqlite3.Connection,
+    settings: dict,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the canonical ICDX CPOTR synthetic paper program.
+
+    ICDX publishes paired suggested-opening and previous-settlement values for
+    CPOTR on its homepage price card. Those are defensible public prices, but
+    they are still reference data rather than an executable order route. The
+    program measures same-surface paper continuation through the existing
+    synthetic research path.
+    """
+
+    claim = _claim(conn, state, "activate_icdx_cpotr_price_card_paper_research", 90)
+    if claim.duplicate and claim.canonical_row_id:
+        return {
+            "action": "strategy_lab_icdx_cpotr_program",
+            "status": "deduplicated",
+            "topic_key": claim.topic_key,
+        }
+    evidence = _evidence(state)
+    details = state.get("details") if isinstance(state.get("details"), dict) else {}
+    rec = {
+        "recommendation_id": f"market_admission:{state['admission_key']}:icdx_cpotr_program",
+        "source_agent": "market_admission_bridge",
+        "payload": {
+            "agent_name": "market_admission_bridge",
+            "title": "Paper-test ICDX CPOTR official price-card continuation",
+            "rationale": (
+                "ICDX's paired CPOTR suggested-opening and previous-settlement price-card values "
+                "provide public same-surface price evidence. They remain synthetic paper research "
+                "only and do not imply an executable ICDX route."
+            ),
+            "strategy_lab_experiment": {
+                "strategy_lab_id": ICDX_CPOTR_LAB_ID,
+                "experiment_type": "market_strategy",
+                "hypothesis": (
+                    "When ICDX publishes a paired CPOTR suggested opening and previous settlement, "
+                    "the opening-gap direction supports a same-surface synthetic paper continuation test."
+                ),
+                "source_surface": ICDX_CPOTR_SURFACE,
+                "permitted_target_surface": [ICDX_CPOTR_SURFACE],
+                "strategy_logic": {
+                    "type": "observation_program",
+                    "universe": {
+                        "venues": ["ICDX"],
+                        "trade_types": ["official_price_card_reference"],
+                        "market_surfaces": [ICDX_CPOTR_SURFACE],
+                    },
+                    "calculated_features": {
+                        "cpotr_opening_gap_abs_bps": "abs(cpotr_opening_gap_bps)",
+                    },
+                    "entry_expression": (
+                        "market_surface == 'icdx_cpotr' "
+                        "and quality_status == 'official_price_card' "
+                        "and candidate_reject_reason == 'public_price_card_not_execution_route' "
+                        "and freshness_state == 'fresh' "
+                        "and cpotr_price_card_pair_observed >= 1 "
+                        "and price_type == 'previous_settlement' "
+                        "and previous_settlement_price > 0 "
+                        "and suggested_opening_price > 0"
+                    ),
+                    "invalidation_expression": (
+                        "freshness_state != 'fresh' or cpotr_price_card_pair_observed < 1 "
+                        "or previous_settlement_price <= 0 or suggested_opening_price <= 0"
+                    ),
+                    "long_expression": "cpotr_opening_gap_bps > 0",
+                    "short_expression": "cpotr_opening_gap_bps < 0",
+                    "edge_expression": "cpotr_opening_gap_abs_bps",
+                    "score_expression": (
+                        "clip(45 + min(cpotr_opening_gap_abs_bps, 80) / 2 "
+                        "+ 5 * cpotr_price_card_pair_observed, 0, 100)"
+                    ),
+                    "route_surface": "proxy",
+                },
+                "data_requirements": {
+                    "admission_key": state.get("admission_key"),
+                    "adapter_id": details.get("adapter_id"),
+                    "market_surface": ICDX_CPOTR_SURFACE,
+                    "required_fields": [
+                        "last",
+                        "contract_month",
+                        "price_type",
+                        "price_basis",
+                        "price_source",
+                        "source_url",
+                        "cpotr_price_card_pair_observed",
+                        "suggested_opening_price",
+                        "previous_settlement_price",
+                        "cpotr_opening_gap_bps",
+                    ],
+                    "requires_independent_signal_logic": True,
+                    "paper_only_reference": True,
+                },
+                "risk_gates": {
+                    "require_route_feasible": False,
+                    "paper_allocation_multiplier": 0.25,
+                    "synthetic_research_only": True,
+                },
+            },
+            "evidence": evidence,
+        },
+    }
+    result = ingest_strategy_lab_recommendation(conn, rec, settings)[0]
+    if result.get("strategy_lab_id"):
+        bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
+    return {
+        "action": "strategy_lab_icdx_cpotr_program",
+        "status": "created" if result.get("created") else "updated",
+        "strategy_lab_id": result.get("strategy_lab_id"),
+        "topic_key": claim.topic_key,
+    }
+
+
 def _create_strategy_discovery(
     conn: sqlite3.Connection,
     settings: dict,
@@ -506,6 +623,11 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
                 and str(state.get("market_surface") or "") == EEX_SECONDARY_SPOT_SURFACE
             ):
                 actions.append(_create_eex_secondary_spot_program(conn, settings, state))
+            elif (
+                str(state.get("venue") or "").upper() == "ICDX"
+                and str(state.get("market_surface") or "") == ICDX_CPOTR_SURFACE
+            ):
+                actions.append(_create_icdx_cpotr_price_card_program(conn, settings, state))
             else:
                 actions.append(_create_enrichment(conn, state))
         elif stage == "quality_verified" and str(state.get("strategy_lineage") or "") == "adapter_observation":

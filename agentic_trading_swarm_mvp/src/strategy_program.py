@@ -124,6 +124,10 @@ BASE_FEATURES = {
     "reported_trade_price",
     "reported_trade_volume",
     "reported_trade_valid",
+    "cpotr_price_card_pair_observed",
+    "suggested_opening_price",
+    "previous_settlement_price",
+    "cpotr_opening_gap_bps",
 }
 PERP_FUNDING_CAPTURE_REQUIRED_FEATURES = {
     "funding_bps",
@@ -175,6 +179,9 @@ PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS = {
     "freshness_state",
     "candidate_reject_reason",
     "price_basis",
+    "price_type",
+    "contract_month",
+    "price_reference_role",
     "price_source",
     "source_adapter_id",
     "source_url",
@@ -214,6 +221,9 @@ METADATA_NAMES = {
     "freshness_state",
     "candidate_reject_reason",
     "price_basis",
+    "price_type",
+    "contract_month",
+    "price_reference_role",
     "price_source",
     "allowance_category",
     "auction_number",
@@ -500,6 +510,50 @@ def _annotate_allowance_auction_frames(
             frame["term_discount_zscore"] = term_discount_zscore if pair_present else 0.0
 
 
+def _icdx_cpotr_price_card_group_key(frame: dict) -> tuple[str, str, str]:
+    contract_month = str(frame.get("contract_month") or "").strip()
+    fallback = contract_month or str(frame.get("inst_id") or "").strip()
+    return (
+        str(frame.get("venue") or ""),
+        str(frame.get("market_surface") or ""),
+        fallback,
+    )
+
+
+def _annotate_icdx_cpotr_price_card_frames(frames: list[dict]) -> None:
+    groups: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    for frame in frames:
+        if str(frame.get("venue") or "").upper() != "ICDX":
+            continue
+        if str(frame.get("market_surface") or "") != "icdx_cpotr":
+            continue
+        if str(frame.get("trade_type") or "") != "official_price_card_reference":
+            continue
+        groups[_icdx_cpotr_price_card_group_key(frame)].append(frame)
+    for group in groups.values():
+        suggested = next(
+            (frame for frame in group if str(frame.get("price_type") or "") == "suggested_opening"),
+            None,
+        )
+        settlement = next(
+            (frame for frame in group if str(frame.get("price_type") or "") == "previous_settlement"),
+            None,
+        )
+        suggested_price = max(0.0, _float((suggested or {}).get("last")))
+        settlement_price = max(0.0, _float((settlement or {}).get("last")))
+        pair_present = bool(suggested and settlement and suggested_price > 0 and settlement_price > 0)
+        opening_gap_bps = (
+            ((suggested_price - settlement_price) / settlement_price) * 10_000.0
+            if pair_present
+            else 0.0
+        )
+        for frame in group:
+            frame["suggested_opening_price"] = suggested_price
+            frame["previous_settlement_price"] = settlement_price
+            frame["cpotr_price_card_pair_observed"] = 1.0 if pair_present else 0.0
+            frame["cpotr_opening_gap_bps"] = opening_gap_bps if pair_present else 0.0
+
+
 def _base_symbol(row: dict) -> str:
     base = str(row.get("base") or "").upper()
     if base:
@@ -697,6 +751,7 @@ def build_feature_frames(
         int(cfg.get("feature_history_max_points", 4032)),
     )
     _annotate_allowance_auction_frames(frames, allowance_discount_history)
+    _annotate_icdx_cpotr_price_card_frames(frames)
     by_inst = {str(frame["inst_id"]): frame for frame in frames}
     for frame in frames:
         benchmark_id = str(frame.get("benchmark_inst_id") or "")
@@ -1248,6 +1303,24 @@ def generate_program_candidates(
             and str(frame.get("candidate_reject_reason") or "")
             == "reported_spot_trade_not_executable_quote"
         )
+        is_icdx_cpotr_price_card_reference = (
+            str(frame.get("venue") or "").upper() == "ICDX"
+            and str(frame.get("market_surface") or "") == "icdx_cpotr"
+            and str(frame.get("trade_type") or "") == "official_price_card_reference"
+            and str(frame.get("quality_status") or "") == "official_price_card"
+            and str(frame.get("candidate_reject_reason") or "")
+            == "public_price_card_not_execution_route"
+        )
+        icdx_cpotr_provenance_valid = bool(
+            is_icdx_cpotr_price_card_reference
+            and str(frame.get("freshness_state") or "") == "fresh"
+            and _float(frame.get("cpotr_price_card_pair_observed")) >= 1.0
+            and _float(frame.get("suggested_opening_price")) > 0
+            and _float(frame.get("previous_settlement_price")) > 0
+            and str(frame.get("price_type") or "") in {"suggested_opening", "previous_settlement"}
+            and str(frame.get("contract_month") or "").strip()
+            and str(frame.get("price_source") or "").strip()
+        )
         provenance_valid = True
         provenance_missing: list[str] = []
         if is_nav_reference:
@@ -1339,17 +1412,28 @@ def generate_program_candidates(
             "base": frame.get("base"),
             "quote": frame.get("quote"),
             "paper_only": True,
-            "synthetic_research_paper": is_auction_reference or is_reported_spot_reference,
+            "synthetic_research_paper": (
+                is_auction_reference or is_reported_spot_reference or is_icdx_cpotr_price_card_reference
+            ),
             "paper_reported_spot_reference": is_reported_spot_reference,
-            "synthetic_route_id": synthetic_route_id if is_reported_spot_reference else None,
-            "synthetic_not_live_equivalent": is_auction_reference or is_reported_spot_reference,
+            "paper_cpotr_price_card_reference": is_icdx_cpotr_price_card_reference,
+            "synthetic_route_id": (
+                synthetic_route_id
+                if (is_reported_spot_reference or is_icdx_cpotr_price_card_reference)
+                else None
+            ),
+            "synthetic_not_live_equivalent": (
+                is_auction_reference or is_reported_spot_reference or is_icdx_cpotr_price_card_reference
+            ),
             "paper_execution_semantics": (
                 "synthetic_research_not_live_equivalent"
-                if is_reported_spot_reference
+                if (is_reported_spot_reference or is_icdx_cpotr_price_card_reference)
                 else None
             ),
             "signal_stats_scope": (
-                "synthetic_research" if is_auction_reference or is_reported_spot_reference else None
+                "synthetic_research"
+                if (is_auction_reference or is_reported_spot_reference or is_icdx_cpotr_price_card_reference)
+                else None
             ),
             "paper_nav_reference": is_nav_reference,
             "paper_nav_reference_provenance_valid": provenance_valid,
@@ -1385,6 +1469,22 @@ def generate_program_candidates(
             }
             if is_auction_reference
             else {},
+            "paper_cpotr_price_card_provenance_valid": icdx_cpotr_provenance_valid,
+            "paper_cpotr_price_card_provenance": {
+                "market_surface": str(frame.get("market_surface") or ""),
+                "quality_status": str(frame.get("quality_status") or ""),
+                "candidate_reject_reason": str(frame.get("candidate_reject_reason") or ""),
+                "freshness_state": str(frame.get("freshness_state") or ""),
+                "price_source": str(frame.get("price_source") or ""),
+                "contract_month": str(frame.get("contract_month") or ""),
+                "price_type": str(frame.get("price_type") or ""),
+                "price_basis": str(frame.get("price_basis") or ""),
+                "suggested_opening_price": _float(frame.get("suggested_opening_price")),
+                "previous_settlement_price": _float(frame.get("previous_settlement_price")),
+                "cpotr_opening_gap_bps": _float(frame.get("cpotr_opening_gap_bps")),
+            }
+            if is_icdx_cpotr_price_card_reference
+            else {},
             "strategy_lab_id": str(experiment.get("strategy_lab_id")),
             "strategy_lab_version": int(experiment.get("version") or 1),
             "strategy_lab_experiment_type": "market_strategy",
@@ -1417,6 +1517,7 @@ def generate_program_candidates(
                 or non_positive_edge_at_entry
                 or is_auction_reference
                 or is_reported_spot_reference
+                or is_icdx_cpotr_price_card_reference
             ),
             "strategy_reliability_allocation_multiplier": experimental_allocation,
             "strategy_lab_relaxation": risk_gates.get("adaptive_relaxation") or {},

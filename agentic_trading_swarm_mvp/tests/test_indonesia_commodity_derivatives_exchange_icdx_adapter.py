@@ -122,9 +122,14 @@ class IndonesiaCommodityDerivativesExchangeIcdxAdapterTests(unittest.TestCase):
         suggested, settlement = price_rows
         self.assertEqual("ICDX:CPOTR:AUG26:SOBO", suggested["inst_id"])
         self.assertEqual(16875.0, suggested["last"])
+        self.assertEqual("icdx_cpotr", suggested["market_surface"])
+        self.assertEqual("official_price_card_reference", suggested["trade_type"])
+        self.assertEqual("homepage_price_card", suggested["source_record_type"])
         self.assertEqual("pre_open_indicative", suggested["session_status"])
         self.assertEqual("ICDX:CPOTR:AUG26:YDSP", settlement["inst_id"])
         self.assertEqual(16280.0, settlement["last"])
+        self.assertEqual("icdx_cpotr", settlement["market_surface"])
+        self.assertEqual("official_price_card_reference", settlement["trade_type"])
         self.assertEqual("previous_settlement_reference", settlement["session_status"])
         self.assertTrue(all(row["source_url"] == HOME_URL for row in price_rows))
 

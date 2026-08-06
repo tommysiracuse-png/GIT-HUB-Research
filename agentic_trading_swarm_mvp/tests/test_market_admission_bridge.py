@@ -130,6 +130,40 @@ class MarketAdmissionBridgeTests(unittest.TestCase):
         self.assertIn("source_contract_url", requirements["required_fields"])
         self.assertFalse(json.loads(row["risk_gates_json"])["require_route_feasible"])
 
+    def test_icdx_priceable_price_card_creates_canonical_synthetic_research_program(self) -> None:
+        icdx_state = state(
+            "priceable",
+            venue="ICDX",
+            inst_id="ICDX:CPOTR:AUG26:YDSP",
+            market_surface="icdx_cpotr",
+            session_status="previous_settlement_reference",
+            blocker_code="quality_unverified",
+            details={
+                "adapter_id": "indonesia_commodity_derivatives_exchange_icdx",
+                "quality_status": "official_price_card",
+                "route_status": "unknown",
+            },
+        )
+        result = market_admission_bridge.run_market_admission_bridge(
+            self.conn, self.settings, {"states": [icdx_state]}
+        )
+        row = self.conn.execute(
+            "select strategy_lab_id, strategy_logic_json, data_requirements_json, risk_gates_json from strategy_lab_experiments"
+        ).fetchone()
+
+        self.assertEqual(1, result["summary"]["actions_created"])
+        self.assertEqual("strategy_lab_icdx_cpotr_program", result["actions"][0]["action"])
+        self.assertEqual("icdx_cpotr_price_card_reference_v1", row["strategy_lab_id"])
+        logic = json.loads(row["strategy_logic_json"])
+        self.assertEqual("observation_program", logic["type"])
+        self.assertEqual("proxy", logic["route_surface"])
+        self.assertEqual("abs(cpotr_opening_gap_bps)", logic["calculated_features"]["cpotr_opening_gap_abs_bps"])
+        self.assertIn("price_type == 'previous_settlement'", logic["entry_expression"])
+        requirements = json.loads(row["data_requirements_json"])
+        self.assertEqual("indonesia_commodity_derivatives_exchange_icdx", requirements["adapter_id"])
+        self.assertIn("cpotr_opening_gap_bps", requirements["required_fields"])
+        self.assertTrue(json.loads(row["risk_gates_json"])["synthetic_research_only"])
+
     def test_spot_borrow_user_constraint_suppresses_route_task(self) -> None:
         item = state(
             "strategy_candidate",
