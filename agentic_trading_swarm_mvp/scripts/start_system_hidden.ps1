@@ -1,6 +1,7 @@
 param(
     [int]$RadarStaleMinutes = 30,
-    [int]$EvolutionStaleMinutes = 45
+    [int]$EvolutionStaleMinutes = 45,
+    [int]$CodexWorkerPoolStaleMinutes = 15
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,7 +53,8 @@ function Test-Supervisor {
     catch { return $false }
     $heartbeat = Read-JsonFile $HeartbeatPath
     if (-not $heartbeat -or [int]$heartbeat.supervisor_pid -ne $pidValue -or [string]$heartbeat.project_root -ne $ProjectRoot) { return $false }
-    $stamp = $heartbeat.last_iteration_finished_at_utc
+    $stamp = $heartbeat.last_updated_at_utc
+    if (-not $stamp) { $stamp = $heartbeat.last_iteration_finished_at_utc }
     if (-not $stamp) { $stamp = $heartbeat.started_at_utc }
     try {
         if (((Get-Date).ToUniversalTime() - [DateTimeOffset]::Parse([string]$stamp).UtcDateTime).TotalMinutes -gt $StaleMinutes) {
@@ -90,6 +92,14 @@ $definitions = @(
         Meta = Join-Path $RunsDir "evolution_worker_forever.pid.json"
         Heartbeat = Join-Path $RunsDir "evolution_worker_heartbeat.json"
         Stale = $EvolutionStaleMinutes
+    },
+    @{
+        Name = "codex_worker_pool"
+        Script = "run_codex_worker_pool_forever.ps1"
+        Pid = Join-Path $RunsDir "codex_worker_pool_forever.pid"
+        Meta = Join-Path $RunsDir "codex_worker_pool_forever.pid.json"
+        Heartbeat = Join-Path $RunsDir "codex_worker_pool_heartbeat.json"
+        Stale = $CodexWorkerPoolStaleMinutes
     }
 )
 
