@@ -11,9 +11,16 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import settings
+import strategy_reliability
 
 
 class SettingsLocalOverrideTest(unittest.TestCase):
+    def test_default_paper_context_priors_match_strategy_reliability_policy(self) -> None:
+        self.assertEqual(
+            settings.DEFAULT_SETTINGS["paper_context_priors"],
+            strategy_reliability.PAPER_CONTEXT_PRIOR_DEFAULTS,
+        )
+
     def test_default_load_merges_ignored_local_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
