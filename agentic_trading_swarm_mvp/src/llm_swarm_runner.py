@@ -22,7 +22,7 @@ import sys
 import time
 from typing import Annotated, Any, TypedDict
 
-from cost_router import complete
+from cost_router import complete, load_llm_config
 from evolution.builder_context import resolve_repo_targets
 from llm_bridge import INBOX, STATE_JSON
 from memory_graph import (
@@ -511,6 +511,109 @@ def _attach_execution_route_requirement_summary(rec: dict, summary: dict) -> dic
     return decorated
 
 
+_STRATEGY_LAB_MARKET_SNAPSHOT_FIELDS = (
+    "market_key",
+    "signal_key",
+    "venue",
+    "inst_id",
+    "symbol",
+    "trade_type",
+    "direction",
+    "score",
+    "confidence",
+    "quality_score",
+    "net_edge_bps",
+    "route_status",
+    "freshness_age_seconds",
+    "data_status",
+    "seen_at",
+)
+
+
+def _input_value_present(value: Any) -> bool:
+    if value in (None, "", [], {}, ()):
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _strategy_market_snapshot(packet: dict) -> dict[str, Any]:
+    rows = packet.get("top_reviewed") if isinstance(packet.get("top_reviewed"), list) else []
+    signal_set: list[dict[str, Any]] = []
+    observed_market_key = False
+    observed_signal_payload = False
+    observed_confidence_metadata = False
+    observed_snapshot_freshness = False
+
+    for item in rows[:12]:
+        if not isinstance(item, dict):
+            continue
+        market_key = str(item.get("market_key") or "").strip()
+        has_market_key = bool(market_key)
+        has_signal_payload = any(
+            _input_value_present(item.get(field))
+            for field in ("signal_key", "trade_type", "direction", "inst_id", "symbol", "venue")
+        )
+        has_confidence_metadata = any(
+            _input_value_present(item.get(field))
+            for field in ("score", "confidence", "quality_score", "net_edge_bps")
+        )
+        has_snapshot_freshness = any(
+            _input_value_present(item.get(field))
+            for field in ("freshness_age_seconds", "data_status", "seen_at")
+        )
+        observed_market_key = observed_market_key or has_market_key
+        observed_signal_payload = observed_signal_payload or has_signal_payload
+        observed_confidence_metadata = observed_confidence_metadata or has_confidence_metadata
+        observed_snapshot_freshness = observed_snapshot_freshness or has_snapshot_freshness
+
+        snapshot = {
+            field: item.get(field)
+            for field in _STRATEGY_LAB_MARKET_SNAPSHOT_FIELDS
+            if field in item and _input_value_present(item.get(field))
+        }
+        if has_market_key:
+            snapshot["market_key"] = market_key
+        snapshot["hydration_flags"] = {
+            "has_market_key": has_market_key,
+            "has_signal_payload": has_signal_payload,
+            "has_confidence_metadata": has_confidence_metadata,
+            "has_snapshot_freshness": has_snapshot_freshness,
+        }
+        if has_market_key and has_signal_payload and has_confidence_metadata and has_snapshot_freshness:
+            signal_set.append(snapshot)
+
+    validation_errors: list[str] = []
+    if not rows:
+        validation_errors.append("missing_market_snapshot")
+    if not observed_market_key:
+        validation_errors.append("missing_market_key")
+    if not observed_signal_payload:
+        validation_errors.append("missing_signal_payload")
+    if not observed_confidence_metadata:
+        validation_errors.append("missing_confidence_metadata")
+    if not observed_snapshot_freshness:
+        validation_errors.append("missing_snapshot_freshness")
+
+    market_key = next(
+        (
+            str(item.get("market_key") or "").strip()
+            for item in signal_set
+            if str(item.get("market_key") or "").strip()
+        ),
+        "",
+    )
+    return {
+        "hydrated": not validation_errors and bool(signal_set),
+        "market_key": market_key or None,
+        "signal_set": signal_set[:8],
+        "signal_count": len(signal_set),
+        "observed_top_reviewed_count": len([item for item in rows if isinstance(item, dict)]),
+        "validation_errors": validation_errors,
+    }
+
+
 def _strategy_invention_context(packet: dict, memory: list[dict]) -> dict:
     lab = packet.get("strategy_lab") if isinstance(packet.get("strategy_lab"), dict) else {}
     recent_experiments = []
@@ -614,6 +717,7 @@ def _strategy_invention_context(packet: dict, memory: list[dict]) -> dict:
     ]
     return {
         "paper_summary": packet.get("summary"),
+        "market_snapshot": _strategy_market_snapshot(packet),
         "strategy_lab_counts": {
             key: lab.get(key)
             for key in ("status_counts", "compile_status_counts", "novelty_status_counts")
@@ -627,6 +731,198 @@ def _strategy_invention_context(packet: dict, memory: list[dict]) -> dict:
         "current_cycle_critiques": current_critiques,
         "relevant_memory": relevant_memory,
     }
+
+
+def _requested_model_controls(
+    agent: dict,
+    *,
+    tier: str,
+    operation: str,
+    reasoning_override: str | None,
+    structured_json: bool,
+) -> dict[str, Any]:
+    try:
+        cfg = load_llm_config()
+    except Exception:  # pragma: no cover - config failure should not block fallback behavior
+        cfg = {}
+    tier_cfg = ((cfg.get("tiers") or {}).get(tier) or {}) if isinstance(cfg, dict) else {}
+    agent_cfg = (
+        ((cfg.get("agents") or {}).get(str(agent.get("name") or "")) or {})
+        if isinstance(cfg, dict)
+        else {}
+    )
+    return {
+        "operation": operation,
+        "tier_override": tier,
+        "structured_json": structured_json,
+        "configured_model": tier_cfg.get("model"),
+        "configured_api": tier_cfg.get("api"),
+        "reasoning_effort": reasoning_override or tier_cfg.get("reasoning_effort"),
+        "reasoning_mode": tier_cfg.get("reasoning_mode"),
+        "verbosity": tier_cfg.get("verbosity"),
+        "max_output_tokens": tier_cfg.get(
+            "max_output_tokens",
+            tier_cfg.get("estimated_completion_tokens", 4000),
+        ),
+        "daily_budget_usd": agent_cfg.get(
+            "daily_budget_usd",
+            cfg.get("daily_budget_usd") if isinstance(cfg, dict) else None,
+        ),
+    }
+
+
+def _recommendation_input_audit(
+    agent: dict,
+    packet: dict,
+    memory: list[dict],
+    *,
+    prompt: str,
+    operation: str,
+    tier: str,
+    reasoning_override: str | None,
+    structured_json: bool,
+) -> dict[str, Any]:
+    strategy_context = _strategy_invention_context(packet, memory)
+    market_snapshot = strategy_context.get("market_snapshot") if isinstance(strategy_context, dict) else {}
+    controls = _requested_model_controls(
+        agent,
+        tier=tier,
+        operation=operation,
+        reasoning_override=reasoning_override,
+        structured_json=structured_json,
+    )
+    return {
+        "agent_name": str(agent.get("name") or ""),
+        "allowed_actions": list(agent.get("allowed_actions") or [agent.get("default_action")]),
+        "prompt_characters": len(prompt),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "requested_model_controls": controls,
+        "token_budget_controls": {
+            "max_output_tokens": controls.get("max_output_tokens"),
+            "daily_budget_usd": controls.get("daily_budget_usd"),
+        },
+        "structured_input": {
+            "market_key": market_snapshot.get("market_key") if isinstance(market_snapshot, dict) else None,
+            "signal_set": list((market_snapshot.get("signal_set") or [])[:8])
+            if isinstance(market_snapshot, dict)
+            else [],
+            "strategy_invention_context": strategy_context,
+        },
+    }
+
+
+def _requires_strategy_lab_market_context(agent: dict) -> bool:
+    allowed_actions = {str(action) for action in (agent.get("allowed_actions") or []) if action}
+    return str(agent.get("name") or "") == "strategy_lab" or "propose_strategy_lab_experiment" in allowed_actions
+
+
+def _recommendation_preflight(agent: dict, input_audit: dict[str, Any]) -> dict[str, Any]:
+    if not _requires_strategy_lab_market_context(agent):
+        return {"status": "not_required"}
+    structured_input = input_audit.get("structured_input")
+    market_snapshot = (
+        structured_input.get("strategy_invention_context", {}).get("market_snapshot")
+        if isinstance(structured_input, dict)
+        and isinstance(structured_input.get("strategy_invention_context"), dict)
+        else {}
+    )
+    if not isinstance(market_snapshot, dict):
+        return {
+            "status": "failed",
+            "reason": "market_snapshot_not_hydrated",
+            "validation_errors": ["missing_market_snapshot"],
+        }
+    if market_snapshot.get("hydrated"):
+        return {
+            "status": "ok",
+            "reason": "market_snapshot_hydrated",
+            "market_key": market_snapshot.get("market_key"),
+            "signal_count": market_snapshot.get("signal_count"),
+        }
+    return {
+        "status": "failed",
+        "reason": "market_snapshot_not_hydrated",
+        "market_key": market_snapshot.get("market_key"),
+        "signal_count": market_snapshot.get("signal_count"),
+        "validation_errors": list(
+            market_snapshot.get("validation_errors") or ["missing_market_snapshot"]
+        ),
+    }
+
+
+def _preflight_no_action_recommendation(
+    agent: dict,
+    input_audit: dict[str, Any],
+    preflight: dict[str, Any],
+) -> dict[str, Any]:
+    fallback = paper_only_no_action_fallback(
+        market_key=f"paper.{agent.get('name') or 'agent'}.input_guard",
+        title=f"{agent.get('name') or 'agent'} input guard: no action",
+        rationale=(
+            "The recommendation agent did not receive a hydrated market snapshot with "
+            "instrument-level signal payload and confidence metadata."
+        ),
+    )
+    fallback["evidence"] = {
+        **fallback["evidence"],
+        "issue_type": "missing_market_context",
+        "validation_errors": list(preflight.get("validation_errors") or []),
+        "market_snapshot": (
+            ((input_audit.get("structured_input") or {}).get("strategy_invention_context") or {}).get(
+                "market_snapshot"
+            )
+        ),
+        "structured_input_logged": True,
+        "paper_only": True,
+    }
+    fallback["proposed_change"] = {
+        "summary": (
+            "Refresh the state packet so recommendation generation receives a hydrated "
+            "market snapshot, signal set, and confidence metadata before another "
+            "strategy proposal is attempted."
+        ),
+        "required_inputs": {
+            "market_key": "non-empty paper-scoped or venue-scoped market identifier",
+            "signal_set": "at least one instrument-level signal payload",
+            "confidence_metadata": "score, confidence, quality_score, or net_edge_bps",
+            "snapshot_freshness": "freshness_age_seconds, data_status, or seen_at",
+        },
+        "fallback_mode": "pre_generation_no_action",
+        "paper_only": True,
+        "live_trading": "disabled",
+    }
+    fallback.update(
+        {
+            "_rejected": True,
+            "accepted": False,
+            "agent_name": agent.get("name"),
+            "parse_status": "input_precondition_failed",
+            "terminal_failure_reason": str(
+                preflight.get("reason") or "market_snapshot_not_hydrated"
+            ),
+            "provenance": {
+                "state_packet": str(STATE_JSON),
+                "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+            "model_output_audit": {
+                "input": input_audit,
+                "preflight": preflight,
+            },
+            "model": {
+                "name": input_audit.get("requested_model_controls", {}).get("configured_model"),
+                "tier": input_audit.get("requested_model_controls", {}).get("tier_override"),
+                "status": "preflight_input_validation_failed",
+                "estimated_cost_usd": 0.0,
+                "api": input_audit.get("requested_model_controls", {}).get("configured_api"),
+                "reasoning_effort": input_audit.get("requested_model_controls", {}).get("reasoning_effort"),
+                "reasoning_mode": input_audit.get("requested_model_controls", {}).get("reasoning_mode"),
+                "verbosity": input_audit.get("requested_model_controls", {}).get("verbosity"),
+                "structured_json": input_audit.get("requested_model_controls", {}).get("structured_json"),
+                "frontier_escalation_reason": None,
+            },
+        }
+    )
+    return fallback
 
 
 def _strategy_lab_agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
@@ -1185,6 +1481,19 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
     system = "You are a bounded AI research agent for a paper-trading market radar. Output JSON only."
     prompt = agent_prompt(agent, packet, memory)
     tier, escalation_reason, reasoning_override = select_model_policy(agent, packet)
+    input_audit = _recommendation_input_audit(
+        agent,
+        packet,
+        memory,
+        prompt=prompt,
+        operation="llm_swarm_recommendation",
+        tier=tier,
+        reasoning_override=reasoning_override,
+        structured_json=True,
+    )
+    preflight = _recommendation_preflight(agent, input_audit)
+    if preflight.get("status") == "failed":
+        return _preflight_no_action_recommendation(agent, input_audit, preflight)
     result = complete(
         agent["name"],
         prompt,
@@ -1195,7 +1504,11 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
         reasoning_effort_override=reasoning_override,
         structured_json=True,
     )
-    generation_attempts = {"initial": _generation_metadata(result)}
+    generation_attempts = {
+        "input": input_audit,
+        "preflight": preflight,
+        "initial": _generation_metadata(result),
+    }
     rec = parse_recommendation(result.text, agent, packet)
     strict_failure = _strict_contract_failure(agent, result.text)
     if strict_failure is not None:

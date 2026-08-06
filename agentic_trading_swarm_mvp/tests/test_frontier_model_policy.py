@@ -257,7 +257,7 @@ class FrontierModelPolicyTests(unittest.TestCase):
             structured_json=True,
         )
         second = ModelResult(
-            text='{"action":"propose_hunter_directive","priority":88,"title":"Retry ok","rationale":"fixed","market_key":"OKX","evidence":{},"proposed_change":"Probe"}',
+            text='{"action":"propose_hunter_directive","priority":88,"title":"Retry ok","rationale":"fixed","market_key":"OKX","evidence":{"source":"retry"},"proposed_change":{"summary":"Probe"}}',
             model_name="openai/gpt-5.4",
             model_tier="standard",
             prompt_tokens=10,
@@ -322,6 +322,106 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertIn("propose_strategy_lab_experiment", prompt)
         self.assertIn("permitted_target_surface", prompt)
         self.assertIn("Do not use refine", prompt)
+
+    def test_strategy_lab_run_agent_blocks_unhydrated_market_context_before_model_call(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": ["propose_strategy_lab_experiment", "no_action"],
+            "summary": {"closed": 3, "avg_pnl_bps": -2.5},
+            "strategy_lab": {"recent": []},
+        }
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "strategy_lab")
+
+        with mock.patch.object(llm_swarm_runner, "complete") as complete_call:
+            rec = llm_swarm_runner.run_agent(agent, packet, [])
+
+        complete_call.assert_not_called()
+        self.assertEqual(rec["action"], "no_action")
+        self.assertEqual(rec["parse_status"], "input_precondition_failed")
+        self.assertEqual(rec["terminal_failure_reason"], "market_snapshot_not_hydrated")
+        self.assertIn("missing_market_snapshot", rec["evidence"]["validation_errors"])
+        self.assertTrue(rec["evidence"]["structured_input_logged"])
+        self.assertEqual(rec["model_output_audit"]["input"]["structured_input"]["market_key"], None)
+        self.assertEqual(rec["model_output_audit"]["preflight"]["status"], "failed")
+        self.assertIsNotNone(
+            rec["model_output_audit"]["input"]["token_budget_controls"]["max_output_tokens"]
+        )
+
+    def test_strategy_lab_run_agent_records_structured_input_audit(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": ["propose_strategy_lab_experiment", "no_action"],
+            "summary": {"closed": 40, "avg_pnl_bps": 6.5},
+            "strategy_lab": {"recent": []},
+            "top_reviewed": [
+                {
+                    "market_key": "OKX|perp_funding_basis|funding_capture_long_perp",
+                    "signal_key": "okx_funding_capture",
+                    "venue": "OKX",
+                    "inst_id": "BTC-USDT-SWAP",
+                    "trade_type": "perp_funding_basis",
+                    "direction": "funding_capture_long_perp",
+                    "score": 0.74,
+                    "freshness_age_seconds": 45,
+                    "data_status": "fresh",
+                }
+            ],
+        }
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "strategy_lab")
+        result = ModelResult(
+            text=json.dumps(
+                {
+                    "action": "propose_strategy_lab_experiment",
+                    "priority": 92,
+                    "title": "OKX carry observation",
+                    "rationale": "Fresh OKX carry observations justify a paper-only experiment.",
+                    "market_key": "paper.okx.funding_capture",
+                    "evidence": {"signal_count": 1, "source": "top_reviewed"},
+                    "proposed_change": {"summary": "Create a paper-only OKX carry experiment."},
+                    "strategy_lab_experiment": {
+                        "strategy_lab_id": "okx_carry_obs_v1",
+                        "version": 1,
+                        "experiment_type": "market_strategy",
+                        "hypothesis": "Carry persists briefly after positive funding dislocations.",
+                        "source_surface": "perp_funding_basis",
+                        "permitted_target_surface": ["perp_funding_basis"],
+                        "strategy_logic": {"type": "observation_program"},
+                        "data_requirements": {"paper_only": True},
+                        "risk_gates": {},
+                        "promotion_rules": {},
+                    },
+                }
+            ),
+            model_name="openai/gpt-5.4",
+            model_tier="standard",
+            prompt_tokens=120,
+            completion_tokens=90,
+            estimated_cost_usd=0.02,
+            status="model_call:responses",
+            api="responses",
+            reasoning_effort="medium",
+            reasoning_mode="standard",
+            verbosity="medium",
+            structured_json=True,
+            max_output_tokens=4000,
+        )
+
+        with mock.patch.object(llm_swarm_runner, "complete", return_value=result) as complete_call:
+            rec = llm_swarm_runner.run_agent(agent, packet, [])
+
+        complete_call.assert_called_once()
+        self.assertEqual(rec["action"], "propose_strategy_lab_experiment")
+        self.assertEqual(
+            rec["model_output_audit"]["input"]["structured_input"]["market_key"],
+            "OKX|perp_funding_basis|funding_capture_long_perp",
+        )
+        self.assertEqual(
+            len(rec["model_output_audit"]["input"]["structured_input"]["signal_set"]),
+            1,
+        )
+        self.assertEqual(rec["model_output_audit"]["preflight"]["status"], "ok")
+        self.assertIsNotNone(
+            rec["model_output_audit"]["input"]["token_budget_controls"]["max_output_tokens"]
+        )
+        self.assertTrue(rec["model_output_audit"]["initial"]["post_processor_schema_valid"])
 
     def test_build_planner_unstructured_output_is_not_fake_code_change(self) -> None:
         packet = {
@@ -568,8 +668,11 @@ class FrontierModelPolicyTests(unittest.TestCase):
                     "priority": 80,
                     "title": "No trade change until schema recovers",
                     "rationale": "Re-run the researcher before changing paper behavior.",
-                    "market_key": "system",
-                    "evidence": {"parse_failure": True},
+                    "market_key": "paper.system",
+                    "evidence": {
+                        "market_recommendation_blocked": True,
+                        "validation_error": "schema recovering",
+                    },
                     "proposed_change": {"decision": "no portfolio change"},
                 }
             ),
