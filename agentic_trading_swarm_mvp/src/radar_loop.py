@@ -36,7 +36,12 @@ from global_market_discovery_scanner import build_scan_batch as build_global_mar
 from global_proxy_scanner import build_scan_batch as build_global_proxy_scan_batch
 from hunter_allocation import allocate_candidate_review, write_hunter_allocation_report
 from learning import load_adjustments, stats_snapshot, update_signal_stats
-from llm_bridge import cross_context_reliability, ingest_llm_recommendations, write_llm_state_packet
+from llm_bridge import (
+    cross_context_reliability,
+    ingest_llm_recommendations,
+    route_requirement_candidate_inputs,
+    write_llm_state_packet,
+)
 from market_admission import run_market_admission_monitor
 from market_admission_bridge import run_market_admission_bridge
 from llm_swarm_runner import run_once as run_llm_swarm_once
@@ -781,6 +786,11 @@ def run_once(settings: dict) -> dict:
             "summary": summary,
             "execution_summary": execution_summary(conn),
             "maintenance": maintenance,
+            # The bridge projects these existing paper candidates into a
+            # compact read-only route-feasibility packet.  The raw candidates
+            # are not persisted in the LLM packet and no routing decision is
+            # made from this hand-off.
+            "route_requirement_candidates": route_requirement_candidate_inputs(candidates),
             "top_reviewed": [
                 {
                     "inst_id": item["candidate"]["inst_id"],

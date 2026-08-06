@@ -39,12 +39,240 @@ from market_activation_owner import summary as market_activation_owner_summary
 from strategy_implementation_owner import summary as strategy_owner_summary
 
 try:
-    from route_intelligence import build_short_frontier_spot_route_outcome_diagnostics
+    from route_intelligence import (
+        build_route_requirements_matrix,
+        build_short_frontier_spot_route_outcome_diagnostics,
+    )
 except ModuleNotFoundError:  # pragma: no cover - package import fallback
-    from .route_intelligence import build_short_frontier_spot_route_outcome_diagnostics
+    from .route_intelligence import (
+        build_route_requirements_matrix,
+        build_short_frontier_spot_route_outcome_diagnostics,
+    )
 
 
 _strategy_lab_summary_original = strategy_lab_summary
+
+
+ROUTE_REQUIREMENT_SUMMARY_VERSION = "paper_candidate_route_feasibility_v1"
+ROUTE_REQUIREMENT_CANDIDATE_FIELDS = (
+    "venue", "exchange", "inst_id", "direction", "trade_type", "signal_family",
+    "market_key", "signal_key", "score", "route_status", "route_blockers",
+    "required_permissions", "requirements", "borrow_required", "borrow_status",
+    "borrow_availability_status", "borrow_available", "borrowable", "borrow_fee_bps",
+    "borrow_fee_bps_estimate", "margin_required", "margin_mode", "margin_account_mode",
+    "leverage_mode", "fee_tier", "fee_model", "fee_model_status", "fee_bps_per_side",
+    "maker_fee_bps", "taker_fee_bps", "estimated_round_trip_cost_bps",
+    "route_cost_bps_paper", "api_access_status", "api_permission_status",
+    "venue_api_status", "endpoint_status", "required_order_types", "required_order_type",
+    "supported_order_types", "order_types_supported", "minimum_size", "min_size",
+    "size_increment", "spread_bps", "depth_usd", "liquidity_usd", "quote_volume_24h",
+    "withdrawal_transfer_dependency", "transfer_dependency", "freshness_state",
+    "data_freshness_state", "freshness_age_seconds", "data_age_seconds", "stale_minutes",
+    "paper_testable_proxy", "paper_proxy_route", "proxy_supported", "instrument_type",
+)
+
+
+def route_requirement_candidate_inputs(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only public route facts before they enter the LLM-packet path."""
+
+    inputs: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        item = {
+            field: candidate[field]
+            for field in ROUTE_REQUIREMENT_CANDIDATE_FIELDS
+            if field in candidate
+        }
+        execution_route = candidate.get("execution_route")
+        execution_feasibility = candidate.get("execution_feasibility")
+        for route_metadata in (execution_route, execution_feasibility):
+            if not isinstance(route_metadata, dict):
+                continue
+            for field in ROUTE_REQUIREMENT_CANDIDATE_FIELDS:
+                if field not in item and field in route_metadata:
+                    item[field] = route_metadata[field]
+        inputs.append(item)
+    return inputs
+
+
+def _route_value_known(value: Any) -> bool:
+    """Return whether a public route fact is observed rather than a placeholder."""
+
+    if value in (None, "", [], {}, "unknown", "unconfirmed", "not_checked"):
+        return False
+    return str(value).strip().lower() not in {
+        "unknown",
+        "unconfirmed",
+        "not_checked",
+        "not_applicable",
+        "missing",
+        "unavailable",
+        "unsupported",
+    }
+
+
+def _route_component(value: Any, *, required: bool, source: str) -> dict[str, Any]:
+    """Normalize a route fact into an explicitly non-blocking score component."""
+
+    if not required:
+        return {
+            "status": "not_applicable",
+            "score": None,
+            "missing": False,
+            "evidence_source": source,
+        }
+    text = str(value or "unknown").strip().lower()
+    unavailable = text in {"missing", "unavailable", "unsupported", "blocked", "false"}
+    known = _route_value_known(value)
+    return {
+        "status": "confirmed" if known else "unavailable" if unavailable else "unknown",
+        "score": 100.0 if known else 20.0 if unavailable else 50.0,
+        "missing": not known,
+        "evidence_source": source,
+    }
+
+
+def _is_route_summary_candidate(candidate: dict[str, Any]) -> bool:
+    """Limit this packet projection to the requested paper research surfaces."""
+
+    trade_type = str(candidate.get("trade_type") or candidate.get("signal_family") or "").lower()
+    direction = str(candidate.get("direction") or "").lower()
+    return (
+        trade_type == "frontier_crypto_venue_map" and direction == "short_frontier_spot"
+    ) or trade_type == "perp_funding_basis"
+
+
+def build_paper_route_requirement_summaries(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build compact route-feasibility annotations for paper research packets.
+
+    This projection is intentionally separate from candidate ranking and order
+    routing.  It exposes common, comparable route facts for frontier spot
+    shorts and spot-perp basis research while leaving the raw alpha score and
+    paper candidate emission unchanged.
+    """
+
+    scoped = [
+        candidate
+        for candidate in route_requirement_candidate_inputs(candidates)
+        if _is_route_summary_candidate(candidate)
+    ]
+    rows = build_route_requirements_matrix(scoped) if scoped else []
+    rows_by_candidate: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (
+            str(row.get("venue") or "unknown").upper(),
+            str(row.get("inst_id") or "unknown"),
+            str(row.get("direction") or "unknown").lower(),
+        )
+        rows_by_candidate.setdefault(key, []).append(row)
+    summaries: list[dict[str, Any]] = []
+    for candidate in scoped:
+        key = (
+            str(candidate.get("venue") or "unknown").upper(),
+            str(candidate.get("inst_id") or "unknown"),
+            str(candidate.get("direction") or "unknown").lower(),
+        )
+        matching_rows = rows_by_candidate.get(key) or []
+        row = matching_rows.pop(0) if matching_rows else {}
+        route_summary = row.get("route_requirement_summary") or {}
+        friction = row.get("route_friction_summary") or {}
+        borrow = route_summary.get("short_borrow_availability") or {}
+        margin = route_summary.get("margin_mode") or {}
+        fees = route_summary.get("fee_estimate") or {}
+        api = route_summary.get("api_entitlement") or {}
+        direction = str(candidate.get("direction") or row.get("direction") or "unknown")
+        short_spot_required = bool(borrow.get("short_required")) or direction in {
+            "short_frontier_spot",
+            "long_perp_short_spot",
+            "funding_capture_long_perp",
+            "basis_mean_reversion_long_perp",
+        }
+        components = {
+            "short_borrow_or_proxy": _route_component(
+                borrow.get("availability_status"),
+                required=short_spot_required,
+                source="short_borrow_availability.availability_status",
+            ),
+            "margin_mode": _route_component(
+                margin.get("mode") if margin.get("required") is not False else "not_applicable",
+                required=margin.get("required") is not False,
+                source="margin_mode.mode",
+            ),
+            "fees_and_carry": _route_component(
+                fees.get("route_cost_bps_paper") or fees.get("estimated_round_trip_taker_bps"),
+                required=True,
+                source="fee_estimate.route_cost_bps_paper",
+            ),
+            "api_product_availability": _route_component(
+                api.get("path_readiness") or api.get("entitlement_status"),
+                required=True,
+                source="api_entitlement.path_readiness",
+            ),
+            "minimum_size_and_precision": _route_component(
+                candidate.get("minimum_size") or candidate.get("min_size") or candidate.get("size_increment"),
+                required=True,
+                source="candidate.minimum_size_or_precision",
+            ),
+            "top_of_book_spread": _route_component(
+                candidate.get("spread_bps"),
+                required=True,
+                source="candidate.spread_bps",
+            ),
+            "depth_or_liquidity": _route_component(
+                candidate.get("depth_usd") or candidate.get("liquidity_usd") or row.get("minimum_liquidity_usd_or_unknown"),
+                required=True,
+                source="candidate.depth_or_liquidity",
+            ),
+            "transfer_dependency": _route_component(
+                candidate.get("withdrawal_transfer_dependency") or candidate.get("transfer_dependency"),
+                required=direction in {"long_perp_short_spot", "short_perp_long_spot"},
+                source="candidate.withdrawal_transfer_dependency",
+            ),
+        }
+        scored = [component["score"] for component in components.values() if component["score"] is not None]
+        missing_flags = [name for name, component in components.items() if component["missing"]]
+        summaries.append(
+            {
+                "summary_version": ROUTE_REQUIREMENT_SUMMARY_VERSION,
+                "paper_only": True,
+                "read_only": True,
+                "candidate": {
+                    "venue": route_summary.get("candidate", {}).get("venue", candidate.get("venue") or "unknown"),
+                    "inst_id": route_summary.get("candidate", {}).get("inst_id", candidate.get("inst_id") or "unknown"),
+                    "trade_type": candidate.get("trade_type") or "unknown",
+                    "direction": direction,
+                },
+                "normalized_feasibility_score": round(sum(scored) / len(scored), 4) if scored else 0.0,
+                "feasibility_components": components,
+                "missing_data_flags": missing_flags,
+                "route_friction": {
+                    "score": friction.get("friction_score", 0.0),
+                    "reasons": list(friction.get("friction_reasons") or []),
+                },
+                "ranking_annotation": {
+                    "mode": "paper_ordering_only",
+                    "action": "display_route_feasibility_separately_from_raw_alpha",
+                    "raw_alpha_score": candidate.get("score"),
+                    "score_adjustment": 0.0,
+                    "candidate_emission": "retained_for_paper_exploration",
+                },
+                "hard_blocking": False,
+                "entry_blocked": False,
+                "routing_decision_changed": False,
+            }
+        )
+    return {
+        "summary_version": ROUTE_REQUIREMENT_SUMMARY_VERSION,
+        "paper_only": True,
+        "read_only": True,
+        "candidate_count": len(summaries),
+        "ranking_policy": "diagnostic_only_no_eligibility_or_quarantine_change",
+        "candidates": summaries,
+        "hard_blocking": False,
+        "entry_blocked": False,
+        "routing_decision_changed": False,
+    }
 
 
 def strategy_lab_summary(*args: Any, **kwargs: Any) -> Any:
@@ -1241,6 +1469,9 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
     buckets = _bucketize(stats, directives)
     global_market_discovery = _compact_global_market_discovery(payload.get("research_worker"))
     hunter_allocation = payload.get("hunter_allocation", {})
+    route_requirement_summaries = build_paper_route_requirement_summaries(
+        list(payload.get("route_requirement_candidates") or [])
+    )
     allowed_actions = list(dict.fromkeys([*settings.get("llm_bridge", {}).get("allowed_actions", []), "no_action"]))
     crypto_venue_health = payload.get("crypto_venue_health", [])
     packet = {
@@ -1255,6 +1486,10 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         # gate: the route hunter and planner receive it as diagnostic/ranking
         # evidence only.
         "short_frontier_spot_route_outcomes": short_frontier_spot_route_outcomes,
+        # A per-candidate, normalized route view for both frontier spot shorts
+        # and spot-perp basis research.  This is deliberately separate from
+        # alpha ranking and cannot alter candidate eligibility or routing.
+        "paper_route_requirement_summaries": route_requirement_summaries,
         "expansion_map": payload.get("expansion_map", {}),
         "public_market_adapters": (payload.get("public_market_adapters") or {}).get("summary", {}),
         "adapter_capabilities": {

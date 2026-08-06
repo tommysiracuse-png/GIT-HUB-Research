@@ -440,6 +440,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "route_intelligence": (packet.get("expansion_map", {}) or {}).get("route_intelligence", {}),
         "short_frontier_spot_route_outcomes": packet.get("short_frontier_spot_route_outcomes", {}),
         "execution_route_requirement_summary": packet.get("execution_route_requirement_summary", {}),
+        "paper_route_requirement_summaries": packet.get("paper_route_requirement_summaries", {}),
         "prediction_markets": (packet.get("expansion_map", {}) or {}).get("prediction_markets", {}),
         "hunter_directives": packet.get("hunter_directives", [])[:10],
         "growth_experiments": packet.get("growth_experiments", [])[:10],
@@ -493,7 +494,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
     route_hunter_instruction = ""
     if agent["name"] == "execution_route_hunter":
         route_hunter_instruction = (
-            "Use execution_route_requirement_summary, prepared before recommendation ranking, to emit read-only "
+            "Use execution_route_requirement_summary and paper_route_requirement_summaries, prepared before recommendation ranking, to emit read-only "
             "route diagnostics for borrow availability, fee pressure, margin needs, API/borrow feasibility, "
             "permissions, spread/liquidity, and carry. "
             "Weak observed paper PnL is route-specific diagnostic and paper-ordering evidence only: retain "
