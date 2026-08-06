@@ -10,14 +10,15 @@ from typing import Any
 POLICY_KEY = "okx_perp_funding_basis_decay_quarantine"
 REASON = "decayed_basis_mean_reversion_quarantine"
 REASON_ALIASES = frozenset({REASON, "decay_quarantine"})
-DEFAULT_CLOSED_LABEL_LIMIT = 100
+DEFAULT_CLOSED_LABEL_LIMIT = 30
 DEFAULT_DURATION_DAYS = 14
 DEFAULT_MAX_LEARNED_PENALTY = 15.0
-DEFAULT_PAPER_SCORE_CAP = 20.0
+DEFAULT_PAPER_SCORE_CAP = 0.0
 DEFAULT_MIN_CLOSED_COUNT = 20
 DEFAULT_MAX_AVG_PNL_BPS = -25.0
 DEFAULT_MAX_SCORE_ADJUSTMENT = -10.0
-DEFAULT_RELEASE_MIN_AVG_PNL_BPS = 10.0
+DEFAULT_RELEASE_MIN_AVG_PNL_BPS = 5.0
+DEFAULT_RELEASE_MIN_WIN_RATE = 0.50
 _LIVE_MODES = {"live", "production", "prod", "real", "broker"}
 _EXEMPT_DIRECTIONS = frozenset(
     {
@@ -26,6 +27,14 @@ _EXEMPT_DIRECTIONS = frozenset(
         "short_perp_long_spot",
     }
 )
+_TARGET_DIRECTIONS = frozenset(
+    {
+        "basis_mean_reversion_long_perp",
+        "basis_mean_reversion_short_perp",
+    }
+)
+_CONDITIONAL_TARGET_DIRECTIONS = frozenset({"long_perp_short_spot"})
+_QUARANTINE_ACTION = "quarantined_basis_mr"
 _EXACT_SIGNAL_ID_FIELDS = (
     "signal_key",
     "market_key",
@@ -60,6 +69,7 @@ def _policy(settings: Mapping[str, Any] | bool | None) -> dict[str, Any]:
         "max_avg_pnl_bps": DEFAULT_MAX_AVG_PNL_BPS,
         "max_score_adjustment": DEFAULT_MAX_SCORE_ADJUSTMENT,
         "release_min_avg_pnl_bps": DEFAULT_RELEASE_MIN_AVG_PNL_BPS,
+        "release_min_win_rate": DEFAULT_RELEASE_MIN_WIN_RATE,
     }
     if isinstance(settings, bool):
         policy["enabled"] = settings
@@ -108,6 +118,13 @@ def _policy(settings: Mapping[str, Any] | bool | None) -> dict[str, Any]:
     policy["release_min_avg_pnl_bps"] = round(
         _as_float(policy.get("release_min_avg_pnl_bps"), DEFAULT_RELEASE_MIN_AVG_PNL_BPS),
         3,
+    )
+    policy["release_min_win_rate"] = round(
+        min(
+            1.0,
+            max(0.0, _as_float(policy.get("release_min_win_rate"), DEFAULT_RELEASE_MIN_WIN_RATE)),
+        ),
+        6,
     )
     return policy
 
@@ -244,22 +261,38 @@ def clear_quarantine_state(
         candidate.pop("paper_action", None)
     if candidate.get("paper_action") == "shadow_only":
         candidate.pop("paper_action", None)
+    if candidate.get("paper_action") == "shadow_filtered":
+        candidate.pop("paper_action", None)
     if candidate.get("paper_quarantine_status") == "shadow_quarantined":
         candidate.pop("paper_quarantine_status", None)
     if candidate.get("paper_quarantine_status") == "shadow_only":
+        candidate.pop("paper_quarantine_status", None)
+    if candidate.get("paper_quarantine_status") == _QUARANTINE_ACTION:
         candidate.pop("paper_quarantine_status", None)
     if candidate.get("candidate_status") == "shadow_quarantined":
         candidate.pop("candidate_status", None)
     if candidate.get("candidate_status") == "shadow_only":
         candidate.pop("candidate_status", None)
+    if candidate.get("candidate_status") == _QUARANTINE_ACTION:
+        candidate.pop("candidate_status", None)
     if candidate.get("paper_status") == "shadow_only":
+        candidate.pop("paper_status", None)
+    if candidate.get("paper_status") == "shadow_filtered":
         candidate.pop("paper_status", None)
     if candidate.get("paper_fill_status") == "shadow_only":
         candidate.pop("paper_fill_status", None)
+    if candidate.get("paper_fill_status") == "shadow_filtered":
+        candidate.pop("paper_fill_status", None)
     if candidate.get("paper_order_status") == "shadow_only":
+        candidate.pop("paper_order_status", None)
+    if candidate.get("paper_order_status") == "shadow_filtered":
         candidate.pop("paper_order_status", None)
     if candidate.get("quality_action") == "shadow_only":
         candidate.pop("quality_action", None)
+    if candidate.get("quality_action") == "shadow_filtered":
+        candidate.pop("quality_action", None)
+    if candidate.get("router_action") == _QUARANTINE_ACTION:
+        candidate.pop("router_action", None)
 
     candidate.pop("shadow_filtered", None)
     candidate["paper_fill_allowed"] = True
@@ -278,6 +311,18 @@ def _feasibility_status(candidate: Mapping[str, Any]) -> str:
     if isinstance(feasibility, Mapping) and feasibility.get("status") is not None:
         return str(feasibility["status"]).strip().lower()
     return str(candidate.get("feasibility_status") or "unknown").strip().lower()
+
+
+def _route_status(candidate: Mapping[str, Any]) -> str:
+    if candidate.get("route_status") is not None:
+        return str(candidate["route_status"]).strip().lower()
+    feasibility = candidate.get("execution_feasibility")
+    if isinstance(feasibility, Mapping) and feasibility.get("route_status") is not None:
+        return str(feasibility["route_status"]).strip().lower()
+    execution_route = candidate.get("execution_route")
+    if isinstance(execution_route, Mapping) and execution_route.get("route_status") is not None:
+        return str(execution_route["route_status"]).strip().lower()
+    return _feasibility_status(candidate)
 
 
 def _separate_proxy_lineage(candidate: Mapping[str, Any]) -> bool:
@@ -310,7 +355,7 @@ def _parse_exact_target_signal(raw_value: object) -> dict[str, str] | None:
     status = parts[3].strip().lower() or "unknown"
     if venue != "OKX" or trade_type != "perp_funding_basis":
         return None
-    if not direction or direction in _EXEMPT_DIRECTIONS:
+    if not _is_target_direction(direction, status):
         return None
     return {
         "venue": venue,
@@ -333,6 +378,16 @@ def _explicit_target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | No
     return None
 
 
+def _is_target_direction(direction: str, status: str) -> bool:
+    normalized_direction = str(direction or "").strip()
+    normalized_status = str(status or "").strip().lower()
+    if normalized_direction in _TARGET_DIRECTIONS:
+        return True
+    if normalized_direction in _CONDITIONAL_TARGET_DIRECTIONS:
+        return normalized_status == "conditional"
+    return False
+
+
 def target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
     """Return the exact decayed signal family identity, without prose matching."""
     if _separate_proxy_lineage(candidate):
@@ -348,11 +403,14 @@ def target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
     trade_type = str(candidate.get("trade_type") or (parts[1] if len(parts) >= 2 else "")).strip()
     direction = str(candidate.get("direction_mode") or candidate.get("direction") or (parts[2] if len(parts) >= 3 else "")).strip()
     status = _feasibility_status(candidate)
+    route_status = _route_status(candidate)
+    if direction in _CONDITIONAL_TARGET_DIRECTIONS and route_status != "unknown":
+        status = route_status
     if status == "unknown" and len(parts) >= 4:
         status = parts[3].strip().lower()
     if venue != "OKX" or trade_type != "perp_funding_basis":
         return None
-    if not direction or direction in _EXEMPT_DIRECTIONS:
+    if not _is_target_direction(direction, status):
         return None
     return {
         "venue": venue,
@@ -381,6 +439,10 @@ def _thresholds(policy: Mapping[str, Any]) -> dict[str, Any]:
         "release_min_avg_pnl_bps": round(
             _as_float(policy.get("release_min_avg_pnl_bps"), DEFAULT_RELEASE_MIN_AVG_PNL_BPS),
             3,
+        ),
+        "release_min_win_rate": round(
+            _as_float(policy.get("release_min_win_rate"), DEFAULT_RELEASE_MIN_WIN_RATE),
+            6,
         ),
     }
 
@@ -465,18 +527,6 @@ def _matching_signal_stats(
     stats = _candidate_signal_stats(candidate, expected_signal_key=expected_signal_key)
     if stats is None:
         stats = _load_signal_stats(conn, expected_signal_key=expected_signal_key)
-    if stats is None:
-        return None
-    thresholds = _thresholds(policy)
-    if (
-        int(stats.get("closed_count") or 0) < int(thresholds["min_closed_count"])
-        or _as_float(stats.get("avg_pnl_bps"), 0.0) > _as_float(thresholds["max_avg_pnl_bps"], DEFAULT_MAX_AVG_PNL_BPS)
-        or _as_float(stats.get("score_adjustment"), 0.0) > _as_float(
-            thresholds["max_score_adjustment"],
-            DEFAULT_MAX_SCORE_ADJUSTMENT,
-        )
-    ):
-        return None
     return stats
 
 
@@ -510,9 +560,20 @@ def _load_state(conn: Any | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
-def _closed_label_statistics(conn: Any | None, started_at: str) -> dict[str, Any]:
+def _closed_label_statistics(
+    conn: Any | None,
+    started_at: str,
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
     if conn is None:
-        return {"closed_label_count": 0, "avg_pnl_bps": None, "win_rate": None}
+        return {
+            "closed_label_count": 0,
+            "avg_pnl_bps": None,
+            "win_rate": None,
+            "rolling_window_closed_label_count": 0,
+            "rolling_avg_pnl_bps": None,
+            "rolling_win_rate": None,
+        }
     try:
         rows = conn.execute(
             """
@@ -520,11 +581,19 @@ def _closed_label_statistics(conn: Any | None, started_at: str) -> dict[str, Any
             from paper_trades
             where status = 'closed' and pnl_bps is not null and closed_at >= ?
               and venue = 'OKX' and trade_type = 'perp_funding_basis'
+            order by closed_at desc, id desc
             """,
             (started_at,),
         ).fetchall()
     except Exception:  # noqa: BLE001 - unavailable evidence must not release the paper guard
-        return {"closed_label_count": 0, "avg_pnl_bps": None, "win_rate": None}
+        return {
+            "closed_label_count": 0,
+            "avg_pnl_bps": None,
+            "win_rate": None,
+            "rolling_window_closed_label_count": 0,
+            "rolling_avg_pnl_bps": None,
+            "rolling_win_rate": None,
+        }
     pnls: list[float] = []
     for row in rows:
         try:
@@ -539,16 +608,63 @@ def _closed_label_statistics(conn: Any | None, started_at: str) -> dict[str, Any
             "trade_type": candidate.get("trade_type") or "perp_funding_basis",
             "direction": candidate.get("direction") or row["direction"],
         }
-        if target_signal(candidate) is not None:
+        if target_signal(candidate) is not None and candidate_quarantine_record(candidate) is not None:
             try:
                 pnls.append(float(row["pnl_bps"]))
             except (TypeError, ValueError):
                 continue
+    rolling_window = max(1, int(policy.get("closed_label_limit", DEFAULT_CLOSED_LABEL_LIMIT)))
+    rolling_pnls = pnls[:rolling_window]
     return {
         "closed_label_count": len(pnls),
         "avg_pnl_bps": round(sum(pnls) / len(pnls), 3) if pnls else None,
         "win_rate": round(sum(value > 0.0 for value in pnls) / len(pnls), 6) if pnls else None,
+        "rolling_window_closed_label_count": len(rolling_pnls),
+        "rolling_avg_pnl_bps": round(sum(rolling_pnls) / len(rolling_pnls), 3) if rolling_pnls else None,
+        "rolling_win_rate": (
+            round(sum(value > 0.0 for value in rolling_pnls) / len(rolling_pnls), 6)
+            if rolling_pnls
+            else None
+        ),
     }
+
+
+def _shadow_signal_stats(target: Mapping[str, Any], signal_stats: Mapping[str, Any] | None) -> dict[str, Any]:
+    if isinstance(signal_stats, Mapping):
+        return dict(signal_stats)
+    return {
+        "signal_key": str(target.get("signal_key") or ""),
+        "closed_count": 0,
+        "avg_pnl_bps": None,
+        "score_adjustment": None,
+        "win_rate": None,
+        "updated_at": None,
+    }
+
+
+def _release_reason_from_shadow_statistics(
+    label_statistics: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> str | None:
+    if int(label_statistics.get("rolling_window_closed_label_count") or 0) < int(
+        policy.get("closed_label_limit", DEFAULT_CLOSED_LABEL_LIMIT)
+    ):
+        return None
+    avg_pnl_bps = label_statistics.get("rolling_avg_pnl_bps")
+    win_rate = label_statistics.get("rolling_win_rate")
+    if avg_pnl_bps is None or win_rate is None:
+        return None
+    if _as_float(avg_pnl_bps, 0.0) <= _as_float(
+        policy.get("release_min_avg_pnl_bps"),
+        DEFAULT_RELEASE_MIN_AVG_PNL_BPS,
+    ):
+        return None
+    if _as_float(win_rate, 0.0) <= _as_float(
+        policy.get("release_min_win_rate"),
+        DEFAULT_RELEASE_MIN_WIN_RATE,
+    ):
+        return None
+    return "rolling_shadow_recovery_confirmed"
 
 
 def _persist_state(conn: Any | None, state: Mapping[str, Any]) -> None:
@@ -597,8 +713,7 @@ def quarantine_record(
         conn,
         expected_signal_key=target["signal_key"],
     )
-    if signal_stats is None:
-        return None
+    signal_stats = _shadow_signal_stats(target, signal_stats)
     existing = candidate.get("paper_okx_basis_decay_quarantine")
     if conn is None and isinstance(existing, Mapping):
         if not existing.get("active"):
@@ -609,8 +724,9 @@ def quarantine_record(
                 "diagnostic_only": True,
                 "would_block": True,
                 "paper_fill_allowed": False,
+                "shadow_filtered": True,
                 "shadow_only": True,
-                "quarantine_action": "shadow_only_counterfactual",
+                "quarantine_action": _QUARANTINE_ACTION,
                 "signal_stats_scope": "synthetic_research",
                 "paper_execution_mode": "observe_only",
                 "paper_execution_semantics": "counterfactual_okx_basis_decay_guard",
@@ -639,23 +755,11 @@ def quarantine_record(
         state.setdefault("closed_label_limit", policy["closed_label_limit"])
 
     started_at = str(state["started_at"])
-    label_statistics = _closed_label_statistics(conn, started_at)
+    label_statistics = _closed_label_statistics(conn, started_at, policy)
     state["closed_label_count"] = label_statistics["closed_label_count"]
-    expires_at = _parse_time(state.get("expires_at"))
     release_reason = None
     if state.get("status") == "active":
-        if (
-            int(signal_stats.get("closed_count") or 0) >= int(policy["min_closed_count"])
-            and _as_float(signal_stats.get("avg_pnl_bps"), 0.0) > _as_float(
-                policy.get("release_min_avg_pnl_bps"),
-                DEFAULT_RELEASE_MIN_AVG_PNL_BPS,
-            )
-        ):
-            release_reason = "reliable_signal_stats_recovered"
-        elif state["closed_label_count"] >= int(state["closed_label_limit"]):
-            release_reason = "closed_label_limit_reached"
-        elif expires_at is not None and now >= expires_at:
-            release_reason = "duration_elapsed"
+        release_reason = _release_reason_from_shadow_statistics(label_statistics, policy)
     if release_reason:
         state["status"] = "released"
         state["release_reason"] = release_reason
@@ -671,9 +775,10 @@ def quarantine_record(
         "diagnostic_only": diagnostic_only,
         "would_block": active,
         "paper_fill_allowed": not active,
+        "shadow_filtered": active,
         "shadow_only": active,
         "quarantine_action": (
-            "shadow_only_counterfactual"
+            _QUARANTINE_ACTION
             if active
             else "released"
         ),
@@ -685,6 +790,9 @@ def quarantine_record(
         "closed_label_remaining": max(0, int(state["closed_label_limit"]) - int(state["closed_label_count"])),
         "avg_pnl_bps": label_statistics["avg_pnl_bps"],
         "win_rate": label_statistics["win_rate"],
+        "rolling_window_closed_label_count": int(label_statistics["rolling_window_closed_label_count"]),
+        "rolling_avg_pnl_bps": label_statistics["rolling_avg_pnl_bps"],
+        "rolling_win_rate": label_statistics["rolling_win_rate"],
         "max_learned_penalty": round(maximum_learned_penalty(settings), 3),
         "paper_score_cap": round(_as_float(policy.get("paper_score_cap"), DEFAULT_PAPER_SCORE_CAP), 3),
         "signal_stats": signal_stats,
@@ -702,7 +810,7 @@ def apply_quarantine(
     settings: Mapping[str, Any] | bool | None = None,
     conn: Any | None = None,
 ) -> dict[str, Any]:
-    """Convert decayed OKX basis variants into shadow-only paper diagnostics."""
+    """Convert decayed OKX basis variants into shadow-filtered paper diagnostics."""
     guarded = dict(candidate)
     record = quarantine_record(guarded, settings, conn=conn)
     if record is None:
@@ -712,7 +820,8 @@ def apply_quarantine(
         clear_quarantine_state(guarded)
         return guarded
     clear_quarantine_state(guarded)
-    score_policy = apply_score_policy(guarded, settings, zero_score=False)
+    score_policy = apply_score_policy(guarded, settings, zero_score=True)
+    quarantine_action = str(record.get("quarantine_action") or _QUARANTINE_ACTION)
     reasons = list(guarded.get("paper_exploration_would_block_reasons") or [])
     reasons.append(REASON)
     guarded["paper_exploration_would_block_reasons"] = list(dict.fromkeys(reasons))
@@ -726,10 +835,11 @@ def apply_quarantine(
             "shadow_filtered": True,
             "paper_fill_allowed": False,
             "paper_eligible": False,
-            "paper_action": "shadow_only",
-            "paper_status": "shadow_only",
-            "paper_fill_status": "shadow_only",
-            "paper_order_status": "shadow_only",
+            "paper_action": "shadow_filtered",
+            "paper_status": "shadow_filtered",
+            "paper_fill_status": "shadow_filtered",
+            "paper_order_status": "shadow_filtered",
+            "router_action": quarantine_action,
             "paper_execution_mode": "observe_only",
             "paper_observation_only": True,
             "paper_observation_reason": REASON,
@@ -737,14 +847,14 @@ def apply_quarantine(
                 record.get("paper_execution_semantics") or "counterfactual_okx_basis_decay_guard"
             ),
             "signal_stats_scope": str(record.get("signal_stats_scope") or "synthetic_research"),
-            "candidate_status": "shadow_only",
-            "paper_quarantine_status": "shadow_only",
+            "candidate_status": quarantine_action,
+            "paper_quarantine_status": quarantine_action,
             "promotion_eligible": False,
             "paper_entry_blocked": True,
             "paper_score_eligible": False,
             "paper_rank_eligible": True,
             "paper_allocation_multiplier": 0.0,
-            "quality_action": "shadow_only",
+            "quality_action": "shadow_filtered",
             "candidate_reject_reason": REASON,
             "candidate_reject_detail": record,
             "shadow_reason": REASON,
@@ -878,16 +988,14 @@ def runtime_report(conn: Any | None, settings: Mapping[str, Any] | bool | None =
             **execution_metrics,
         }
     state = dict(state)
-    label_statistics = _closed_label_statistics(conn, str(state["started_at"]))
+    label_statistics = _closed_label_statistics(conn, str(state["started_at"]), policy)
     state["closed_label_count"] = label_statistics["closed_label_count"]
     now = dt.datetime.now(dt.timezone.utc)
-    expires_at = _parse_time(state.get("expires_at"))
-    if state.get("status") == "active" and state["closed_label_count"] >= int(state["closed_label_limit"]):
-        state["status"] = "released"
-        state["release_reason"] = "closed_label_limit_reached"
-    elif state.get("status") == "active" and expires_at is not None and now >= expires_at:
-        state["status"] = "released"
-        state["release_reason"] = "duration_elapsed"
+    if state.get("status") == "active":
+        release_reason = _release_reason_from_shadow_statistics(label_statistics, policy)
+        if release_reason:
+            state["status"] = "released"
+            state["release_reason"] = release_reason
     state["updated_at"] = now.isoformat()
     _persist_state(conn, state)
     return {
@@ -901,6 +1009,17 @@ def runtime_report(conn: Any | None, settings: Mapping[str, Any] | bool | None =
         "closed_label_remaining": max(0, int(state.get("closed_label_limit") or policy["closed_label_limit"]) - int(state.get("closed_label_count") or 0)),
         "avg_pnl_bps": label_statistics["avg_pnl_bps"],
         "win_rate": label_statistics["win_rate"],
+        "rolling_window_closed_label_count": int(label_statistics.get("rolling_window_closed_label_count") or 0),
+        "rolling_avg_pnl_bps": label_statistics.get("rolling_avg_pnl_bps"),
+        "rolling_win_rate": label_statistics.get("rolling_win_rate"),
+        "release_min_avg_pnl_bps": round(
+            _as_float(policy.get("release_min_avg_pnl_bps"), DEFAULT_RELEASE_MIN_AVG_PNL_BPS),
+            3,
+        ),
+        "release_min_win_rate": round(
+            _as_float(policy.get("release_min_win_rate"), DEFAULT_RELEASE_MIN_WIN_RATE),
+            6,
+        ),
         "release_reason": state.get("release_reason"),
         **execution_metrics,
     }

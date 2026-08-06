@@ -1836,11 +1836,12 @@ def _annotate_shadow_filtered_candidate(
             FRONTIER_COST_SWALLOWED_SCORE_CAP,
         )
     if reason.get("guard") == OKX_BASIS_DECAY_QUARANTINE_POLICY_KEY:
-        guarded["paper_action"] = "shadow_only"
-        guarded["paper_status"] = "shadow_only"
-        guarded["paper_fill_status"] = "shadow_only"
-        guarded["paper_order_status"] = "shadow_only"
-        guarded["router_action"] = "observe_only"
+        quarantine_action = str(reason.get("quarantine_action") or "quarantined_basis_mr")
+        guarded["paper_action"] = "shadow_filtered"
+        guarded["paper_status"] = "shadow_filtered"
+        guarded["paper_fill_status"] = "shadow_filtered"
+        guarded["paper_order_status"] = "shadow_filtered"
+        guarded["router_action"] = quarantine_action
         guarded["paper_execution_mode"] = "observe_only"
         guarded["paper_observation_only"] = True
         guarded["paper_observation_reason"] = reason.get("reason") or OKX_BASIS_DECAY_QUARANTINE_REASON
@@ -1848,8 +1849,9 @@ def _annotate_shadow_filtered_candidate(
             reason.get("paper_execution_semantics") or "counterfactual_okx_basis_decay_guard"
         )
         guarded["signal_stats_scope"] = str(reason.get("signal_stats_scope") or "synthetic_research")
-        guarded["candidate_status"] = "shadow_only"
-        guarded["paper_quarantine_status"] = "shadow_only"
+        guarded["candidate_status"] = quarantine_action
+        guarded["paper_quarantine_status"] = quarantine_action
+        guarded["quality_action"] = "shadow_filtered"
         guarded["paper_entry_blocked"] = True
         guarded["promotion_eligible"] = False
     if reason.get("guard") == "paper_yahoo_proxy_freshness_shadow_gate":

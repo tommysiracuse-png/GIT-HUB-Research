@@ -70,7 +70,52 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         )
         return candidate
 
-    def test_only_named_okx_families_are_diagnostic_in_exploration(self) -> None:
+    def add_closed_shadow_labels(
+        self,
+        conn,
+        *,
+        candidate: dict | None = None,
+        settings: dict | None = None,
+        count: int = 30,
+        pnl_bps: float = 6.0,
+    ) -> None:
+        runtime_settings = settings or self.settings
+        guarded = apply_quarantine(candidate or self.candidate(), runtime_settings, conn=conn)
+        closed_base = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1)
+        signal_key = guarded["paper_okx_basis_decay_quarantine"]["target"]["signal_key"]
+        for index in range(count):
+            shadow_candidate = copy.deepcopy(guarded)
+            shadow_candidate["inst_id"] = f"BTC-{index}-USDT-SWAP"
+            closed_at = (closed_base + dt.timedelta(seconds=index)).isoformat()
+            conn.execute(
+                """
+                insert into paper_trades (
+                    opened_at, closed_at, venue, inst_id, direction, trade_type,
+                    signal_key, base_score, learned_score, entry, exit, pnl_bps,
+                    status, thesis, candidate_json, review_json
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?, ?, ?)
+                """,
+                (
+                    closed_at,
+                    closed_at,
+                    shadow_candidate["venue"],
+                    shadow_candidate["inst_id"],
+                    shadow_candidate["direction"],
+                    shadow_candidate["trade_type"],
+                    signal_key,
+                    80.0,
+                    80.0,
+                    100.0,
+                    101.0,
+                    pnl_bps,
+                    "shadow label",
+                    json.dumps(shadow_candidate),
+                    "{}",
+                ),
+            )
+        conn.commit()
+
+    def test_only_named_okx_families_are_shadow_filtered_in_exploration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
             decayed = self.candidate()
@@ -85,16 +130,16 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             blocked = by_direction["basis_mean_reversion_short_perp"]
             self.assertTrue(blocked["paper_okx_basis_decay_quarantine"]["diagnostic_only"])
             self.assertIn("decayed_basis_mean_reversion_quarantine", blocked["paper_exploration_would_block_reasons"])
-            self.assertEqual("shadow_only", blocked.get("paper_action"))
+            self.assertEqual("shadow_filtered", blocked.get("paper_action"))
             self.assertEqual(
-                "paper_score_cap",
+                "zero_cap",
                 blocked["okx_basis_decay_quarantine_score_policy"]["mode"],
             )
-            self.assertEqual(20.0, blocked["okx_basis_decay_quarantine_score_policy"]["post_quarantine_score"])
-            self.assertEqual("shadow_only", blocked["candidate_status"])
+            self.assertEqual(0.0, blocked["okx_basis_decay_quarantine_score_policy"]["post_quarantine_score"])
+            self.assertEqual("quarantined_basis_mr", blocked["candidate_status"])
             self.assertTrue(blocked.get("paper_entry_blocked", False))
             self.assertFalse(blocked.get("paper_fill_allowed", True))
-            self.assertEqual("shadow_only", blocked.get("quality_action"))
+            self.assertEqual("shadow_filtered", blocked.get("quality_action"))
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["funding_capture_long_perp"])
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["short_perp_long_spot"])
             self.assertEqual(1, report["summary"]["okx_basis_decay_quarantine_count"])
@@ -111,21 +156,25 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         rows, _ = apply_strategy_reliability([candidate], self.settings)
         guarded = rows[0]
 
-        self.assertEqual("shadow_only", guarded["candidate_status"])
+        self.assertEqual("quarantined_basis_mr", guarded["candidate_status"])
         self.assertTrue(guarded.get("paper_entry_blocked", False))
         self.assertTrue(guarded.get("shadow_filtered", False))
         self.assertFalse(guarded.get("paper_eligible", True))
         self.assertEqual("decayed_basis_mean_reversion_quarantine", guarded["candidate_reject_reason"])
-        self.assertEqual("shadow_only", guarded["quality_action"])
+        self.assertEqual("shadow_filtered", guarded["quality_action"])
 
-    def test_exact_decayed_non_exempt_directions_are_quarantined(self) -> None:
+    def test_exact_target_directions_are_quarantined(self) -> None:
         conditional = self.candidate(
             direction="basis_mean_reversion_long_perp",
             execution_feasibility={"status": "conditional", "route_status": "conditional"},
         )
-        reverse_basis = self.candidate(
+        reverse_basis_conditional = self.candidate(
             direction="long_perp_short_spot",
             execution_feasibility={"status": "conditional", "route_status": "conditional"},
+        )
+        reverse_basis_standard = self.candidate(
+            direction="long_perp_short_spot",
+            execution_feasibility={"status": "standard", "route_status": "standard"},
         )
         protected = self.candidate(
             direction="short_perp_long_spot",
@@ -133,7 +182,8 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         )
 
         self.assertTrue(quarantine_record(conditional, self.settings)["active"])
-        self.assertTrue(quarantine_record(reverse_basis, self.settings)["active"])
+        self.assertTrue(quarantine_record(reverse_basis_conditional, self.settings)["active"])
+        self.assertIsNone(quarantine_record(reverse_basis_standard, self.settings))
         self.assertIsNone(quarantine_record(protected, self.settings))
 
     def test_explicit_feasibility_status_is_reflected_in_target_signal_key(self) -> None:
@@ -194,7 +244,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
 
         self.assertIsNone(quarantine_record(translated, self.settings))
 
-    def test_exploration_emits_a_shadow_only_observation_with_quarantine_diagnostics(self) -> None:
+    def test_exploration_emits_a_shadow_filtered_observation_with_quarantine_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
             review = {"paper_allocation_multiplier": 1.0, "decision": "approve_paper_trade"}
@@ -203,7 +253,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
 
             self.assertFalse(execution["paper_filled"])
             self.assertTrue(execution["paper_observation_ready"])
-            self.assertEqual("shadow_only", execution["order"]["status"])
+            self.assertEqual("shadow_filtered", execution["order"]["status"])
             self.assertEqual("synthetic_research", execution["order"]["signal_stats_scope"])
             self.assertTrue(execution["candidate"]["paper_okx_basis_decay_quarantine"]["diagnostic_only"])
             self.assertIn(
@@ -212,17 +262,17 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             )
             conn.close()
 
-    def test_router_marks_target_shadow_only_in_exploration(self) -> None:
+    def test_router_marks_target_shadow_filtered_in_exploration(self) -> None:
         guarded = apply_frontier_paper_guard(
             self.candidate(paper_filled=True, status="paper_filled"), self.settings
         )
 
         self.assertTrue(guarded.get("shadow_filtered", False))
-        self.assertEqual("shadow_only", guarded["paper_action"])
-        self.assertEqual("shadow_only", guarded["candidate_status"])
+        self.assertEqual("shadow_filtered", guarded["paper_action"])
+        self.assertEqual("quarantined_basis_mr", guarded["candidate_status"])
         self.assertFalse(guarded["paper_filled"])
 
-    def test_non_exploration_mode_still_uses_shadow_only_quarantine(self) -> None:
+    def test_non_exploration_mode_still_uses_shadow_filtered_quarantine(self) -> None:
         settings = copy.deepcopy(self.settings)
         settings["paper_exploration"]["enabled"] = False
         guarded = apply_frontier_paper_guard(
@@ -232,43 +282,39 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         self.assertTrue(guarded["shadow_filtered"])
         self.assertFalse(guarded["paper_filled"])
         self.assertFalse(guarded["paper_eligible"])
-        self.assertEqual("shadow_only", guarded["paper_action"])
+        self.assertEqual("shadow_filtered", guarded["paper_action"])
 
-    def test_reused_quarantine_candidate_keeps_score_cap_policy(self) -> None:
+    def test_reused_quarantine_candidate_keeps_zero_cap_policy(self) -> None:
         settings = copy.deepcopy(self.settings)
         settings["paper_exploration"]["enabled"] = False
         candidate = apply_quarantine(self.candidate(), settings)
 
-        self.assertEqual(20.0, candidate["score"])
+        self.assertEqual(0.0, candidate["score"])
         self.assertEqual(
-            "paper_score_cap",
+            "zero_cap",
             candidate["okx_basis_decay_quarantine_score_policy"]["mode"],
         )
 
         recovered = apply_quarantine(candidate, self.settings)
 
-        self.assertEqual(20.0, recovered["score"])
+        self.assertEqual(0.0, recovered["score"])
         self.assertEqual(
-            "paper_score_cap",
+            "zero_cap",
             recovered["okx_basis_decay_quarantine_score_policy"]["mode"],
         )
         self.assertTrue(recovered.get("shadow_filtered", False))
         self.assertTrue(recovered.get("paper_entry_blocked", False))
         self.assertFalse(recovered.get("paper_fill_allowed", True))
 
-    def test_released_reused_candidate_restores_pre_quarantine_score(self) -> None:
+    def test_released_reused_candidate_restores_pre_quarantine_score_after_shadow_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
             settings = copy.deepcopy(self.settings)
             settings["paper_exploration"]["enabled"] = False
             candidate = apply_quarantine(self.candidate(), settings, conn=conn)
 
-            self.assertEqual(20.0, candidate["score"])
-            conn.execute(
-                "update paper_decay_quarantines set expires_at = ?",
-                ((dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)).isoformat(),),
-            )
-            conn.commit()
+            self.assertEqual(0.0, candidate["score"])
+            self.add_closed_shadow_labels(conn, candidate=self.candidate(), settings=settings, count=30, pnl_bps=6.0)
 
             released = apply_quarantine(candidate, settings, conn=conn)
 
@@ -293,55 +339,27 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         self.assertIsNone(target_signal(proxy))
         self.assertIsNone(quarantine_record(proxy, self.settings))
 
-    def test_runtime_report_releases_after_one_hundred_closed_target_labels(self) -> None:
+    def test_runtime_report_releases_after_thirty_profitable_shadow_labels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
             candidate = self.candidate()
             first = quarantine_record(candidate, self.settings, conn=conn)
             self.assertTrue(first["active"])
-            closed_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1)).isoformat()
-            for index in range(100):
-                conn.execute(
-                    """
-                    insert into paper_trades (
-                        opened_at, closed_at, venue, inst_id, direction, trade_type,
-                        signal_key, base_score, learned_score, entry, exit, pnl_bps,
-                        status, thesis, candidate_json, review_json
-                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?, ?, ?)
-                    """,
-                    (
-                        closed_at,
-                        closed_at,
-                        "OKX",
-                        f"BTC-{index}-USDT-SWAP",
-                        candidate["direction"],
-                        candidate["trade_type"],
-                        "OKX|perp_funding_basis|basis_mean_reversion_short_perp|standard",
-                        80.0,
-                        80.0,
-                        100.0,
-                        101.0,
-                        10.0,
-                        "shadow label",
-                        json.dumps(candidate),
-                        "{}",
-                    ),
-                )
-            conn.commit()
+            self.add_closed_shadow_labels(conn, candidate=candidate, count=30, pnl_bps=6.0)
 
             report = runtime_report(conn, self.settings)
             paper_report = build_paper_exploration_report(conn, self.settings)
 
             self.assertEqual("released", report["status"])
-            self.assertEqual("closed_label_limit_reached", report["release_reason"])
-            self.assertEqual(100, report["closed_label_count"])
-            self.assertEqual(10.0, report["avg_pnl_bps"])
+            self.assertEqual("rolling_shadow_recovery_confirmed", report["release_reason"])
+            self.assertEqual(30, report["closed_label_count"])
+            self.assertEqual(6.0, report["avg_pnl_bps"])
             self.assertEqual(1.0, report["win_rate"])
             self.assertEqual(
                 "decayed_basis_mean_reversion_quarantine",
                 paper_report["okx_basis_decay_quarantine"]["reason"],
             )
-            self.assertEqual(100, paper_report["summary"]["okx_basis_decay_quarantine_closed_labels"])
+            self.assertEqual(30, paper_report["summary"]["okx_basis_decay_quarantine_closed_labels"])
             conn.close()
 
     def test_runtime_report_exposes_quarantine_counts_and_shadow_pnl(self) -> None:
@@ -571,7 +589,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             self.assertEqual(12.5, report["shadow_pnl_bps"])
             conn.close()
 
-    def test_runtime_report_releases_after_the_fourteen_day_deadline(self) -> None:
+    def test_runtime_report_does_not_release_on_deadline_without_shadow_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
             quarantine_record(self.candidate(), self.settings, conn=conn)
@@ -583,8 +601,8 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
 
             report = runtime_report(conn, self.settings)
 
-            self.assertEqual("released", report["status"])
-            self.assertEqual("duration_elapsed", report["release_reason"])
+            self.assertEqual("active", report["status"])
+            self.assertIsNone(report["release_reason"])
             conn.close()
 
     def test_released_quarantine_allows_a_new_paper_fill(self) -> None:
@@ -594,11 +612,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             settings["paper_exploration"]["enabled"] = False
             settings["paper_context_cost_floor"]["enabled"] = False
             quarantine_record(self.candidate(), self.settings, conn=conn)
-            conn.execute(
-                "update paper_decay_quarantines set expires_at = ?",
-                ((dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)).isoformat(),),
-            )
-            conn.commit()
+            self.add_closed_shadow_labels(conn, settings=settings, count=30, pnl_bps=6.0)
 
             try:
                 execution = execute_order(

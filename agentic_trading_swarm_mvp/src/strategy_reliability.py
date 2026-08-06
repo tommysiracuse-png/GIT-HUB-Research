@@ -5244,13 +5244,14 @@ def _apply_okx_basis_decay_quarantine(
     reliability = _annotate(
         candidate,
         profile="okx_basis_decay_quarantine",
-        action="decay_quarantine_shadow_only",
+        action="decay_quarantine_shadow_filtered",
         reasons=[record["reason"]],
         allocation_multiplier=0.0,
         shadow_only=False,
     )
     score_policy = dict(candidate.get("okx_basis_decay_quarantine_score_policy") or {})
-    candidate["candidate_status"] = "shadow_only"
+    candidate["candidate_status"] = str(record.get("quarantine_action") or "quarantined_basis_mr")
+    candidate["paper_quarantine_status"] = str(record.get("quarantine_action") or "quarantined_basis_mr")
     reliability["paper_okx_basis_decay_quarantine"] = dict(record)
     reliability["okx_basis_decay_quarantine_score_policy"] = dict(score_policy)
     return reliability

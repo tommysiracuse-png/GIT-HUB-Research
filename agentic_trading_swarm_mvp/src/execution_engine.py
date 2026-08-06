@@ -401,11 +401,14 @@ def _restore_okx_basis_decay_shadow(candidate: dict) -> dict:
         record.get("paper_execution_semantics") or "counterfactual_okx_basis_decay_guard"
     )
     restored["signal_stats_scope"] = str(record.get("signal_stats_scope") or "synthetic_research")
-    restored["candidate_status"] = "shadow_only"
-    restored["paper_action"] = "shadow_only"
-    restored["paper_status"] = "shadow_only"
-    restored["paper_fill_status"] = "shadow_only"
-    restored["paper_order_status"] = "shadow_only"
+    quarantine_action = str(record.get("quarantine_action") or "quarantined_basis_mr")
+    restored["candidate_status"] = quarantine_action
+    restored["paper_quarantine_status"] = quarantine_action
+    restored["paper_action"] = "shadow_filtered"
+    restored["paper_status"] = "shadow_filtered"
+    restored["paper_fill_status"] = "shadow_filtered"
+    restored["paper_order_status"] = "shadow_filtered"
+    restored["router_action"] = quarantine_action
     restored["shadow_reason"] = str(record.get("reason") or "decayed_basis_mean_reversion_quarantine")
     restored["candidate_reject_reason"] = restored["shadow_reason"]
     restored["candidate_reject_detail"] = dict(record)
@@ -556,7 +559,12 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             and not candidate["paper_okx_basis_decay_quarantine"].get("paper_fill_allowed", True)
         )
         if okx_basis_decay_shadow:
-            order["status"] = "shadow_only"
+            order["status"] = "shadow_filtered"
+            order["router_action"] = (
+                candidate.get("router_action")
+                or (candidate.get("paper_okx_basis_decay_quarantine") or {}).get("quarantine_action")
+                or "quarantined_basis_mr"
+            )
             order["shadow_filter"] = candidate.get("candidate_reject_detail")
             order["shadow_reason"] = candidate.get("shadow_reason") or candidate.get("candidate_reject_reason")
             order["signal_stats_scope"] = candidate.get("signal_stats_scope", "synthetic_research")

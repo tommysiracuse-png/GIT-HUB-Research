@@ -516,11 +516,11 @@ class StrategyReliabilityTests(unittest.TestCase):
         rows, _ = strategy_reliability.apply_strategy_reliability([candidate])
 
         self.assertTrue(rows[0].get("paper_entry_blocked", False))
-        self.assertEqual(rows[0]["strategy_reliability_action"], "decay_quarantine_shadow_only")
-        self.assertEqual(rows[0]["candidate_status"], "shadow_only")
+        self.assertEqual(rows[0]["strategy_reliability_action"], "decay_quarantine_shadow_filtered")
+        self.assertEqual(rows[0]["candidate_status"], "quarantined_basis_mr")
         self.assertEqual(rows[0]["candidate_reject_reason"], "decayed_basis_mean_reversion_quarantine")
-        self.assertEqual(rows[0]["quality_action"], "shadow_only")
-        self.assertEqual(rows[0]["score"], 20.0)
+        self.assertEqual(rows[0]["quality_action"], "shadow_filtered")
+        self.assertEqual(rows[0]["score"], 0.0)
 
     def test_yahoo_proxy_direction_family_is_quarantined_on_both_sides(self) -> None:
         short = base_candidate(
