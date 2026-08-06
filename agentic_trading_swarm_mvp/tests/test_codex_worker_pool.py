@@ -89,6 +89,41 @@ class CodexWorkerPoolTests(unittest.TestCase):
         })
         self.assertNotEqual(first[0], second[0])
 
+    def test_legacy_adapter_owner_task_receives_canonical_work_identity(self) -> None:
+        with closing(self._radar_connect()) as radar:
+            storage.add_adapter_spec(
+                radar,
+                "recommendation-legacy-adapter",
+                "new_global_market",
+                91,
+                "Implement a new global market adapter",
+                {"venue": "TEST_VENUE"},
+                {"source": "public_docs"},
+            )
+            adapter_id = radar.execute(
+                "select id from adapter_specs where source_recommendation_id=?",
+                ("recommendation-legacy-adapter",),
+            ).fetchone()[0]
+            with closing(codex_coordination.connect(self.coord_path)) as coord:
+                legacy = codex_coordination.enqueue_task(
+                    coord,
+                    "adapter_owner_turn",
+                    str(adapter_id),
+                    lane="adapter",
+                    priority=91,
+                    payload={"title": "Implement a new global market adapter"},
+                )
+
+                updated = codex_worker_pool._backfill_work_identities(radar, coord)
+                migrated = coord.execute(
+                    "select work_fingerprint,work_scope from codex_tasks where task_id=?",
+                    (legacy["task_id"],),
+                ).fetchone()
+
+        self.assertEqual(1, updated)
+        self.assertEqual(f"adapter_spec:{adapter_id}", migrated["work_scope"])
+        self.assertTrue(migrated["work_fingerprint"])
+
     def test_sync_supersedes_duplicate_code_proposals_before_claim(self) -> None:
         with closing(self._radar_connect()) as radar:
             for proposal_id, title in (

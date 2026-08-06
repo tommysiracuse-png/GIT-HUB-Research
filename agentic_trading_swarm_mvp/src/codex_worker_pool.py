@@ -326,6 +326,51 @@ def _backfill_work_identities(
                 work_scope=scope,
             )
         )
+    owner_rows = coord.execute(
+        """
+        select task_id,source_kind,source_id from codex_tasks
+        where source_kind in ('strategy_owner_turn','adapter_owner_turn','activation_owner_turn','general_owner_turn')
+          and status<>'superseded_duplicate'
+          and (work_fingerprint is null or work_fingerprint='')
+        order by updated_at desc limit ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    for task in owner_rows:
+        source_kind = str(task["source_kind"])
+        source_id = str(task["source_id"])
+        owner_row = None
+        if source_kind == "strategy_owner_turn" and _table_exists(radar, "strategy_owner_tasks"):
+            owner_row = radar.execute(
+                "select task_id,priority,code_proposal_id from strategy_owner_tasks where task_id=?",
+                (source_id,),
+            ).fetchone()
+        elif source_kind == "adapter_owner_turn" and _table_exists(radar, "adapter_specs"):
+            owner_row = radar.execute(
+                "select id,priority,title,market_key from adapter_specs where id=?",
+                (source_id,),
+            ).fetchone()
+        elif source_kind == "activation_owner_turn" and _table_exists(radar, "market_activation_tasks"):
+            owner_row = radar.execute(
+                """
+                select task_id,priority,adapter_id,market_surface,venue
+                from market_activation_tasks where task_id=?
+                """,
+                (source_id,),
+            ).fetchone()
+        if owner_row is not None:
+            fingerprint, scope = _owner_work_identity(source_kind, owner_row)
+        else:
+            scope = f"{source_kind}:{source_id.lower()}"
+            fingerprint = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
+        updated += int(
+            set_task_work_identity(
+                coord,
+                str(task["task_id"]),
+                work_fingerprint=fingerprint,
+                work_scope=scope,
+            )
+        )
     return updated
 
 
