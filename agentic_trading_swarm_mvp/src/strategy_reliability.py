@@ -16,7 +16,10 @@ import math
 from typing import Any
 
 from paper_context_cost import realized_paper_cost_audit
-from paper_decay_quarantine import quarantine_record as okx_basis_decay_quarantine_record
+from paper_decay_quarantine import (
+    apply_score_policy as apply_okx_basis_decay_score_policy,
+    quarantine_record as okx_basis_decay_quarantine_record,
+)
 from proxy_signal_quality import PROXY_TRADE_TYPES, proxy_short_quality_review
 from storage import RUNS_DIR, signal_key
 from frontier_data_quality import (
@@ -4178,7 +4181,18 @@ def _apply_okx_basis_decay_quarantine(
     candidate["paper_okx_basis_decay_quarantine"] = dict(record)
     if not record["active"]:
         return None
+    reliability = _annotate(
+        candidate,
+        profile="okx_basis_decay_quarantine",
+        action="decay_quarantine_shadow_trial",
+        reasons=[record["reason"]],
+        allocation_multiplier=0.0 if not record.get("diagnostic_only") else 1.0,
+        # Keep exploration-mode candidates priceable while still surfacing the
+        # exact-family quarantine and score penalty in the ranking pipeline.
+        shadow_only=False,
+    )
     if record.get("diagnostic_only"):
+        score_policy = apply_okx_basis_decay_score_policy(candidate, config, zero_score=False)
         reasons = list(candidate.get("paper_exploration_would_block_reasons") or [])
         reasons.append(record["reason"])
         candidate["paper_exploration_would_block_reasons"] = list(dict.fromkeys(reasons))
@@ -4187,32 +4201,29 @@ def _apply_okx_basis_decay_quarantine(
             "guard": record.get("guard"),
             "record": dict(record),
         }
+        candidate["paper_quarantine_status"] = "shadow_quarantined"
+        candidate["paper_fill_allowed"] = True
         candidate["promotion_eligible"] = False
         candidate["_hunter_bucket"] = "diagnose"
+        reliability["paper_okx_basis_decay_quarantine"] = dict(record)
+        reliability["okx_basis_decay_quarantine_score_policy"] = dict(score_policy)
         _append_note(candidate, "paper_guard_would_block:okx_basis_decay_quarantine")
-        return None
-    pre_quarantine_score = _as_float(candidate.get("score"), 0.0)
-    reliability = _annotate(
-        candidate,
-        profile="okx_basis_decay_quarantine",
-        action="decay_quarantine_shadow_trial",
-        reasons=[record["reason"]],
-        allocation_multiplier=0.0,
-        # Keep the priceable candidate in the paper-review cohort.  The
-        # execution boundary below turns it into an observe-only shadow trial;
-        # weak-family evidence must not erase the candidate before that point.
-        shadow_only=False,
-    )
-    candidate["pre_okx_basis_decay_quarantine_score"] = pre_quarantine_score
+        return reliability
+    score_policy = apply_okx_basis_decay_score_policy(candidate, config, zero_score=True)
     candidate["paper_fill_allowed"] = False
     candidate["paper_action"] = "shadow_trial"
     candidate["paper_execution_mode"] = "observe_only"
     candidate["paper_observation_only"] = True
     candidate["paper_observation_reason"] = record["reason"]
+    candidate["paper_quarantine_status"] = "shadow_quarantined"
+    candidate["paper_score_multiplier"] = 0.0
+    candidate["paper_score_eligible"] = False
+    candidate["paper_rank_eligible"] = False
     candidate["promotion_eligible"] = False
     candidate["candidate_reject_reason"] = record["reason"]
     candidate["candidate_reject_detail"] = dict(record)
     reliability["paper_okx_basis_decay_quarantine"] = dict(record)
+    reliability["okx_basis_decay_quarantine_score_policy"] = dict(score_policy)
     return reliability
 
 

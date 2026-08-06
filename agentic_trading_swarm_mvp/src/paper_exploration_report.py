@@ -9,10 +9,18 @@ import sqlite3
 from collections import Counter, defaultdict
 
 from storage import RUNS_DIR
-from paper_decay_quarantine import runtime_report as okx_basis_decay_quarantine_runtime_report
+from paper_decay_quarantine import (
+    REASON as OKX_BASIS_DECAY_QUARANTINE_REASON,
+    matches_reason as okx_basis_decay_matches_reason,
+    runtime_report as okx_basis_decay_quarantine_runtime_report,
+)
 
 
 _GUARD_REASON_PATTERNS = (
+    (
+        re.compile(r"^(decay_quarantine|decayed_basis_mean_reversion_quarantine)$", re.I),
+        OKX_BASIS_DECAY_QUARANTINE_REASON,
+    ),
     (re.compile(r"^learned score below threshold", re.I), "learned score below threshold"),
     (re.compile(r"^estimated net edge too small after costs", re.I), "estimated net edge too small after costs"),
     (re.compile(r"^liquidity score below minimum", re.I), "liquidity score below minimum"),
@@ -60,6 +68,22 @@ def build_paper_exploration_report(
 ) -> dict:
     cfg = settings.get("paper_exploration", {})
     decay_quarantine = okx_basis_decay_quarantine_runtime_report(conn, settings)
+    cycle_quarantined_count = 0
+    cycle_would_have_filled_count = 0
+    for item in reviewed or []:
+        candidate = (item or {}).get("candidate") or {}
+        review = (item or {}).get("review") or {}
+        record = candidate.get("paper_okx_basis_decay_quarantine")
+        if not isinstance(record, dict) or not record.get("active") or not okx_basis_decay_matches_reason(record.get("reason")):
+            continue
+        cycle_quarantined_count += 1
+        if str(review.get("decision") or "").strip() in {"approve_paper_trade", "approve_conditional_paper_trade"}:
+            cycle_would_have_filled_count += 1
+    decay_quarantine = {
+        **decay_quarantine,
+        "current_cycle_quarantined_count": cycle_quarantined_count,
+        "current_cycle_would_have_filled_count": cycle_would_have_filled_count,
+    }
     horizon = int(cfg.get("guard_value_horizon_minutes", 60))
     rows = conn.execute(
         """
@@ -175,6 +199,16 @@ def build_paper_exploration_report(
             "would_block_guard_count": len(guard_value),
             "okx_basis_decay_quarantine_active": int(decay_quarantine.get("status") == "active"),
             "okx_basis_decay_quarantine_closed_labels": int(decay_quarantine.get("closed_label_count") or 0),
+            "okx_basis_decay_quarantine_quarantined_count": int(decay_quarantine.get("quarantined_count") or 0),
+            "okx_basis_decay_quarantine_would_have_filled_count": int(decay_quarantine.get("would_have_filled_count") or 0),
+            "okx_basis_decay_quarantine_shadow_valid_outcome_count": int(decay_quarantine.get("shadow_valid_outcome_count") or 0),
+            "okx_basis_decay_quarantine_shadow_pnl_bps": decay_quarantine.get("shadow_pnl_bps"),
+            "okx_basis_decay_quarantine_current_cycle_quarantined_count": int(
+                decay_quarantine.get("current_cycle_quarantined_count") or 0
+            ),
+            "okx_basis_decay_quarantine_current_cycle_would_have_filled_count": int(
+                decay_quarantine.get("current_cycle_would_have_filled_count") or 0
+            ),
         },
         "decisions_24h": dict(decisions),
         "true_rejection_reasons_24h": dict(true_rejections.most_common()),
@@ -231,8 +265,12 @@ def write_paper_exploration_report(
             "",
             "## OKX Basis Decay Quarantine",
             "",
-            f"- Reason: `{decay_quarantine.get('reason', 'decay_quarantine')}`",
+            f"- Reason: `{decay_quarantine.get('reason', OKX_BASIS_DECAY_QUARANTINE_REASON)}`",
             f"- Status: `{decay_quarantine.get('status', 'not_started')}`",
+            f"- Quarantined count: `{decay_quarantine.get('quarantined_count', 0)}`",
+            f"- Would-have-filled count: `{decay_quarantine.get('would_have_filled_count', 0)}`",
+            f"- Current-cycle quarantined / would-have-filled: `{decay_quarantine.get('current_cycle_quarantined_count', 0)}` / `{decay_quarantine.get('current_cycle_would_have_filled_count', 0)}`",
+            f"- Subsequent shadow PnL: `{decay_quarantine.get('shadow_pnl_bps')}` bps across `{decay_quarantine.get('shadow_valid_outcome_count', 0)}` valid outcomes",
             f"- Closed labels: `{decay_quarantine.get('closed_label_count', 0)}` / `{decay_quarantine.get('closed_label_limit', 100)}`",
             f"- Labels remaining: `{decay_quarantine.get('closed_label_remaining', 100)}`",
             f"- Label avg PnL / win rate: `{decay_quarantine.get('avg_pnl_bps')}` bps / `{decay_quarantine.get('win_rate')}`",

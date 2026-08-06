@@ -11,10 +11,18 @@ from paper_exploration import exploration_enabled
 
 
 POLICY_KEY = "okx_perp_funding_basis_decay_quarantine"
-REASON = "decay_quarantine"
+REASON = "decayed_basis_mean_reversion_quarantine"
+REASON_ALIASES = frozenset({REASON, "decay_quarantine"})
 DEFAULT_CLOSED_LABEL_LIMIT = 100
 DEFAULT_DURATION_DAYS = 14
+DEFAULT_MAX_LEARNED_PENALTY = 15.0
 _LIVE_MODES = {"live", "production", "prod", "real", "broker"}
+_TARGET_DIRECTIONS = frozenset(
+    {
+        "basis_mean_reversion_long_perp",
+        "basis_mean_reversion_short_perp",
+    }
+)
 
 
 def _as_bool(value: Any, default: bool = True) -> bool:
@@ -23,6 +31,13 @@ def _as_bool(value: Any, default: bool = True) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _policy(settings: Mapping[str, Any] | bool | None) -> dict[str, Any]:
@@ -76,6 +91,63 @@ def _paper_context(settings: Mapping[str, Any] | bool | None) -> bool:
     return not any(mode in _LIVE_MODES for mode in modes)
 
 
+def matches_reason(value: object) -> bool:
+    return str(value or "").strip() in REASON_ALIASES
+
+
+def maximum_learned_penalty(settings: Mapping[str, Any] | bool | None = None) -> float:
+    if isinstance(settings, Mapping):
+        learning = settings.get("learning")
+        if isinstance(learning, Mapping):
+            return max(
+                0.0,
+                _as_float(learning.get("max_adjustment_bps"), DEFAULT_MAX_LEARNED_PENALTY),
+            )
+    return DEFAULT_MAX_LEARNED_PENALTY
+
+
+def apply_score_policy(
+    candidate: dict[str, Any],
+    settings: Mapping[str, Any] | bool | None = None,
+    *,
+    zero_score: bool,
+) -> dict[str, Any]:
+    existing = candidate.get("okx_basis_decay_quarantine_score_policy")
+    if isinstance(existing, Mapping):
+        candidate.setdefault(
+            "pre_okx_basis_decay_quarantine_score",
+            _as_float(existing.get("pre_quarantine_score"), _as_float(candidate.get("score"), 0.0)),
+        )
+        return dict(existing)
+
+    pre_score = max(0.0, _as_float(candidate.get("score"), 0.0))
+    if zero_score:
+        post_score = 0.0
+        policy = {
+            "reason": REASON,
+            "mode": "zero_cap",
+            "pre_quarantine_score": round(pre_score, 3),
+            "post_quarantine_score": 0.0,
+            "score_delta": round(-pre_score, 3),
+            "max_learned_penalty": maximum_learned_penalty(settings),
+        }
+    else:
+        penalty = maximum_learned_penalty(settings)
+        post_score = max(0.0, pre_score - penalty)
+        policy = {
+            "reason": REASON,
+            "mode": "max_learned_penalty",
+            "pre_quarantine_score": round(pre_score, 3),
+            "post_quarantine_score": round(post_score, 3),
+            "score_delta": round(post_score - pre_score, 3),
+            "max_learned_penalty": round(penalty, 3),
+        }
+    candidate["pre_okx_basis_decay_quarantine_score"] = round(pre_score, 3)
+    candidate["score"] = round(post_score, 3)
+    candidate["okx_basis_decay_quarantine_score_policy"] = policy
+    return policy
+
+
 def _feasibility_status(candidate: Mapping[str, Any]) -> str:
     # The normalized candidate field is the explicit signal-family status.
     # Prefer it over an older nested route snapshot when both are present.
@@ -118,11 +190,7 @@ def target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
         status = parts[3].strip().lower()
     if venue != "OKX" or trade_type != "perp_funding_basis":
         return None
-    if direction.startswith("basis_mean_reversion_"):
-        pass
-    elif direction == "long_perp_short_spot" and status == "conditional":
-        pass
-    else:
+    if direction not in _TARGET_DIRECTIONS:
         return None
     return {
         "venue": venue,
@@ -139,6 +207,14 @@ def _parse_time(value: object) -> dt.datetime | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def _load_candidate_json(value: object) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
 
 
 def _load_state(conn: Any | None) -> dict[str, Any] | None:
@@ -314,6 +390,7 @@ def quarantine_record(
         "closed_label_remaining": max(0, int(state["closed_label_limit"]) - int(state["closed_label_count"])),
         "avg_pnl_bps": label_statistics["avg_pnl_bps"],
         "win_rate": label_statistics["win_rate"],
+        "max_learned_penalty": round(maximum_learned_penalty(settings), 3),
         "status": state["status"],
         "release_reason": state.get("release_reason"),
     }
@@ -333,6 +410,7 @@ def apply_quarantine(
     if not record["active"]:
         return guarded
     if record.get("diagnostic_only"):
+        apply_score_policy(guarded, settings, zero_score=False)
         reasons = list(guarded.get("paper_exploration_would_block_reasons") or [])
         reasons.append(REASON)
         guarded["paper_exploration_would_block_reasons"] = list(dict.fromkeys(reasons))
@@ -341,6 +419,7 @@ def apply_quarantine(
             "guard": POLICY_KEY,
             "record": dict(record),
         }
+        guarded["paper_quarantine_status"] = "shadow_quarantined"
         guarded["promotion_eligible"] = False
         guarded["_hunter_bucket"] = "diagnose"
         if not guarded.get("paper_exploration_immutable_rejections") and not guarded.get(
@@ -352,6 +431,7 @@ def apply_quarantine(
             guarded.pop("candidate_reject_reason", None)
             guarded.pop("candidate_reject_detail", None)
         return guarded
+    apply_score_policy(guarded, settings, zero_score=True)
     guarded.update(
         {
             "shadow_filtered": True,
@@ -360,6 +440,7 @@ def apply_quarantine(
             "paper_execution_mode": "observe_only",
             "paper_observation_only": True,
             "paper_observation_reason": REASON,
+            "paper_quarantine_status": "shadow_quarantined",
             "promotion_eligible": False,
             "candidate_reject_reason": REASON,
             "candidate_reject_detail": record,
@@ -368,10 +449,74 @@ def apply_quarantine(
     return guarded
 
 
+def _execution_metrics(conn: Any | None) -> dict[str, Any]:
+    metrics = {
+        "quarantined_count": 0,
+        "would_have_filled_count": 0,
+        "shadow_valid_outcome_count": 0,
+        "shadow_avg_pnl_bps": None,
+        "shadow_pnl_bps": None,
+    }
+    if conn is None:
+        return metrics
+    try:
+        order_rows = conn.execute(
+            "select status, candidate_json from execution_orders"
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - reporting must tolerate partial schemas
+        order_rows = []
+    for row in order_rows:
+        candidate = _load_candidate_json(row["candidate_json"])
+        record = candidate.get("paper_okx_basis_decay_quarantine")
+        if (
+            not isinstance(record, Mapping)
+            or not bool(record.get("active"))
+            or not matches_reason(record.get("reason"))
+            or target_signal(candidate) is None
+        ):
+            continue
+        metrics["quarantined_count"] += 1
+        if str(row["status"] or "").strip().lower() == "paper_filled":
+            metrics["would_have_filled_count"] += 1
+    try:
+        outcome_rows = conn.execute(
+            """
+            select o.measurement_status, o.pnl_bps, t.candidate_json
+            from paper_trade_outcomes o
+            join paper_trades t on t.id = o.trade_id
+            """
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - reporting must tolerate partial schemas
+        outcome_rows = []
+    pnls: list[float] = []
+    for row in outcome_rows:
+        candidate = _load_candidate_json(row["candidate_json"])
+        record = candidate.get("paper_okx_basis_decay_quarantine")
+        if (
+            not isinstance(record, Mapping)
+            or not bool(record.get("active"))
+            or not bool(record.get("diagnostic_only"))
+            or not matches_reason(record.get("reason"))
+            or target_signal(candidate) is None
+            or str(row["measurement_status"] or "").strip().lower() != "valid"
+            or row["pnl_bps"] is None
+        ):
+            continue
+        try:
+            pnls.append(float(row["pnl_bps"]))
+        except (TypeError, ValueError):
+            continue
+    metrics["shadow_valid_outcome_count"] = len(pnls)
+    metrics["shadow_avg_pnl_bps"] = round(sum(pnls) / len(pnls), 3) if pnls else None
+    metrics["shadow_pnl_bps"] = round(sum(pnls), 3) if pnls else None
+    return metrics
+
+
 def runtime_report(conn: Any | None, settings: Mapping[str, Any] | bool | None = None) -> dict[str, Any]:
     """Expose persisted closed-label progress without activating a new quarantine."""
     policy = _policy(settings)
     state = _load_state(conn)
+    execution_metrics = _execution_metrics(conn)
     if state is None:
         return {
             "enabled": bool(policy["enabled"] and _paper_context(settings)),
@@ -382,6 +527,7 @@ def runtime_report(conn: Any | None, settings: Mapping[str, Any] | bool | None =
             "closed_label_remaining": int(policy["closed_label_limit"]),
             "expires_at": None,
             "release_reason": None,
+            **execution_metrics,
         }
     state = dict(state)
     label_statistics = _closed_label_statistics(conn, str(state["started_at"]))
@@ -408,4 +554,5 @@ def runtime_report(conn: Any | None, settings: Mapping[str, Any] | bool | None =
         "avg_pnl_bps": label_statistics["avg_pnl_bps"],
         "win_rate": label_statistics["win_rate"],
         "release_reason": state.get("release_reason"),
+        **execution_metrics,
     }

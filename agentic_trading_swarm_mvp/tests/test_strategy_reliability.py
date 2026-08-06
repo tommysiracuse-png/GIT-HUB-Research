@@ -231,7 +231,8 @@ class StrategyReliabilityTests(unittest.TestCase):
 
         self.assertFalse(rows[0].get("paper_entry_blocked", False))
         self.assertEqual(rows[0]["strategy_reliability_action"], "decay_quarantine_shadow_trial")
-        self.assertEqual(rows[0]["candidate_reject_reason"], "decay_quarantine")
+        self.assertEqual(rows[0]["candidate_reject_reason"], "decayed_basis_mean_reversion_quarantine")
+        self.assertEqual(rows[0]["score"], 0.0)
 
     def test_yahoo_proxy_direction_family_is_quarantined_on_both_sides(self) -> None:
         short = base_candidate(

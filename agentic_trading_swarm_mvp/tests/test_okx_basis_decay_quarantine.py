@@ -19,7 +19,7 @@ from paper_order_router import apply_frontier_paper_guard
 from paper_decay_quarantine import quarantine_record, runtime_report, target_signal
 from paper_exploration_report import build_paper_exploration_report
 from settings import DEFAULT_SETTINGS
-from storage import connect
+from storage import connect, open_paper_trade
 from strategy_reliability import apply_strategy_reliability
 
 
@@ -59,32 +59,46 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             by_direction = {row["direction"]: row for row in rows}
             blocked = by_direction["basis_mean_reversion_short_perp"]
             self.assertTrue(blocked["paper_okx_basis_decay_quarantine"]["diagnostic_only"])
-            self.assertIn("decay_quarantine", blocked["paper_exploration_would_block_reasons"])
+            self.assertIn("decayed_basis_mean_reversion_quarantine", blocked["paper_exploration_would_block_reasons"])
             self.assertNotEqual("shadow_trial", blocked.get("paper_action"))
+            self.assertEqual(
+                "max_learned_penalty",
+                blocked["okx_basis_decay_quarantine_score_policy"]["mode"],
+            )
+            self.assertEqual(65.0, blocked["okx_basis_decay_quarantine_score_policy"]["post_quarantine_score"])
             self.assertTrue(blocked.get("paper_fill_allowed", True))
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["funding_capture_long_perp"])
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["short_perp_long_spot"])
             self.assertEqual(1, report["summary"]["okx_basis_decay_quarantine_count"])
             conn.close()
 
-    def test_conditional_reverse_basis_is_quarantined_but_standard_is_not(self) -> None:
+    def test_only_exact_basis_mean_reversion_directions_are_quarantined(self) -> None:
         conditional = self.candidate(
+            direction="basis_mean_reversion_long_perp",
+            execution_feasibility={"status": "conditional", "route_status": "conditional"},
+        )
+        reverse_basis = self.candidate(
             direction="long_perp_short_spot",
             execution_feasibility={"status": "conditional", "route_status": "conditional"},
         )
-        standard = self.candidate(direction="long_perp_short_spot")
 
         self.assertTrue(quarantine_record(conditional, self.settings)["active"])
-        self.assertIsNone(quarantine_record(standard, self.settings))
+        self.assertIsNone(quarantine_record(reverse_basis, self.settings))
 
-    def test_explicit_feasibility_status_overrides_stale_nested_route_status(self) -> None:
+    def test_explicit_feasibility_status_is_reflected_in_target_signal_key(self) -> None:
         conditional = self.candidate(
-            direction="long_perp_short_spot",
+            direction="basis_mean_reversion_long_perp",
             feasibility_status="conditional",
             execution_feasibility={"status": "standard", "route_status": "standard"},
         )
 
-        self.assertTrue(quarantine_record(conditional, self.settings)["active"])
+        record = quarantine_record(conditional, self.settings)
+
+        self.assertTrue(record["active"])
+        self.assertEqual(
+            "OKX|perp_funding_basis|basis_mean_reversion_long_perp|conditional",
+            record["target"]["signal_key"],
+        )
 
     def test_exploration_emits_a_paper_fill_with_quarantine_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -96,7 +110,10 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             self.assertTrue(execution["paper_filled"])
             self.assertEqual("paper_filled", execution["order"]["status"])
             self.assertTrue(execution["candidate"]["paper_okx_basis_decay_quarantine"]["diagnostic_only"])
-            self.assertIn("decay_quarantine", execution["candidate"]["paper_exploration_would_block_reasons"])
+            self.assertIn(
+                "decayed_basis_mean_reversion_quarantine",
+                execution["candidate"]["paper_exploration_would_block_reasons"],
+            )
             conn.close()
 
     def test_router_keeps_target_admissible_in_exploration(self) -> None:
@@ -175,8 +192,60 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             self.assertEqual(100, report["closed_label_count"])
             self.assertEqual(10.0, report["avg_pnl_bps"])
             self.assertEqual(1.0, report["win_rate"])
-            self.assertEqual("decay_quarantine", paper_report["okx_basis_decay_quarantine"]["reason"])
+            self.assertEqual(
+                "decayed_basis_mean_reversion_quarantine",
+                paper_report["okx_basis_decay_quarantine"]["reason"],
+            )
             self.assertEqual(100, paper_report["summary"]["okx_basis_decay_quarantine_closed_labels"])
+            conn.close()
+
+    def test_runtime_report_exposes_quarantine_counts_and_shadow_pnl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            candidate = self.candidate()
+            rows, _ = apply_strategy_reliability([candidate], self.settings, conn=conn)
+            candidate = rows[0]
+            review = {
+                "decision": "approve_paper_trade",
+                "learned_score": candidate["score"],
+                "paper_allocation_multiplier": 1.0,
+            }
+            execution = execute_order(conn, candidate, review, self.settings)
+            trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=self.settings)
+            observed_at = dt.datetime.now(dt.timezone.utc).isoformat()
+            conn.execute(
+                """
+                insert into paper_trade_outcomes (
+                    trade_id, horizon_minutes, measured_at, price, pnl_bps, context_json,
+                    target_at, observed_at, delay_seconds, measurement_status, price_source
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_id,
+                    60,
+                    observed_at,
+                    101.0,
+                    12.5,
+                    "{}",
+                    observed_at,
+                    observed_at,
+                    0.0,
+                    "valid",
+                    "unit_test",
+                ),
+            )
+            conn.commit()
+
+            paper_report = build_paper_exploration_report(conn, self.settings)
+
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["quarantined_count"])
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["would_have_filled_count"])
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["shadow_valid_outcome_count"])
+            self.assertEqual(12.5, paper_report["okx_basis_decay_quarantine"]["shadow_pnl_bps"])
+            self.assertEqual(
+                1,
+                paper_report["summary"]["okx_basis_decay_quarantine_would_have_filled_count"],
+            )
             conn.close()
 
     def test_runtime_report_releases_after_the_fourteen_day_deadline(self) -> None:
