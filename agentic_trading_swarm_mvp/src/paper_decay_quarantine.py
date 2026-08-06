@@ -120,14 +120,29 @@ def apply_score_policy(
     zero_score: bool,
 ) -> dict[str, Any]:
     existing = candidate.get("okx_basis_decay_quarantine_score_policy")
-    if isinstance(existing, Mapping):
+    desired_mode = "zero_cap" if zero_score else "max_learned_penalty"
+    if (
+        isinstance(existing, Mapping)
+        and matches_reason(existing.get("reason"))
+        and str(existing.get("mode") or "").strip() == desired_mode
+    ):
         candidate.setdefault(
             "pre_okx_basis_decay_quarantine_score",
             _as_float(existing.get("pre_quarantine_score"), _as_float(candidate.get("score"), 0.0)),
         )
+        candidate["score"] = round(
+            _as_float(existing.get("post_quarantine_score"), _as_float(candidate.get("score"), 0.0)),
+            3,
+        )
         return dict(existing)
 
-    pre_score = max(0.0, _as_float(candidate.get("score"), 0.0))
+    pre_score = max(
+        0.0,
+        _as_float(
+            candidate.get("pre_okx_basis_decay_quarantine_score"),
+            _as_float(existing.get("pre_quarantine_score") if isinstance(existing, Mapping) else None, _as_float(candidate.get("score"), 0.0)),
+        ),
+    )
     if zero_score:
         post_score = 0.0
         policy = {
@@ -153,6 +168,62 @@ def apply_score_policy(
     candidate["score"] = round(post_score, 3)
     candidate["okx_basis_decay_quarantine_score_policy"] = policy
     return policy
+
+
+def clear_quarantine_state(
+    candidate: dict[str, Any],
+    *,
+    restore_score: bool = True,
+) -> dict[str, Any]:
+    """Remove stale decay-quarantine score and block state from a reused candidate."""
+    if restore_score:
+        restored_score = _as_float(
+            candidate.get("pre_okx_basis_decay_quarantine_score"),
+            _as_float(
+                (candidate.get("okx_basis_decay_quarantine_score_policy") or {}).get("pre_quarantine_score"),
+                _as_float(candidate.get("score"), 0.0),
+            ),
+        )
+        candidate["score"] = round(max(0.0, restored_score), 3)
+    candidate.pop("pre_okx_basis_decay_quarantine_score", None)
+    candidate.pop("okx_basis_decay_quarantine_score_policy", None)
+
+    guard_would_block = candidate.get("paper_guard_would_block")
+    if isinstance(guard_would_block, Mapping) and str(guard_would_block.get("guard") or "").strip() == POLICY_KEY:
+        candidate.pop("paper_guard_would_block", None)
+
+    reasons = [
+        item
+        for item in list(candidate.get("paper_exploration_would_block_reasons") or [])
+        if not matches_reason(item)
+    ]
+    if reasons:
+        candidate["paper_exploration_would_block_reasons"] = reasons
+    else:
+        candidate.pop("paper_exploration_would_block_reasons", None)
+
+    if matches_reason(candidate.get("candidate_reject_reason")):
+        candidate.pop("candidate_reject_reason", None)
+        candidate.pop("candidate_reject_detail", None)
+
+    if candidate.get("paper_observation_reason") == REASON:
+        candidate.pop("paper_observation_reason", None)
+        candidate.pop("paper_observation_only", None)
+        if candidate.get("paper_execution_mode") == "observe_only":
+            candidate.pop("paper_execution_mode", None)
+
+    if candidate.get("paper_action") == "shadow_trial":
+        candidate.pop("paper_action", None)
+    if candidate.get("paper_quarantine_status") == "shadow_quarantined":
+        candidate.pop("paper_quarantine_status", None)
+    if candidate.get("candidate_status") == "shadow_quarantined":
+        candidate.pop("candidate_status", None)
+
+    candidate.pop("shadow_filtered", None)
+    candidate["paper_fill_allowed"] = True
+    candidate["paper_eligible"] = True
+    candidate["paper_entry_blocked"] = False
+    return candidate
 
 
 def _feasibility_status(candidate: Mapping[str, Any]) -> str:
@@ -456,8 +527,10 @@ def apply_quarantine(
         return guarded
     guarded["paper_okx_basis_decay_quarantine"] = record
     if not record["active"]:
+        clear_quarantine_state(guarded)
         return guarded
     if record.get("diagnostic_only"):
+        clear_quarantine_state(guarded)
         apply_score_policy(guarded, settings, zero_score=False)
         reasons = list(guarded.get("paper_exploration_would_block_reasons") or [])
         reasons.append(REASON)

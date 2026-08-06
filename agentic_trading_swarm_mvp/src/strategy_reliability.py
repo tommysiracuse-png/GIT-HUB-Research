@@ -18,6 +18,7 @@ from typing import Any
 from paper_context_cost import realized_paper_cost_audit
 from paper_decay_quarantine import (
     apply_score_policy as apply_okx_basis_decay_score_policy,
+    clear_quarantine_state as clear_okx_basis_decay_quarantine_state,
     quarantine_record as okx_basis_decay_quarantine_record,
 )
 from proxy_signal_quality import PROXY_TRADE_TYPES, proxy_short_quality_review
@@ -5170,6 +5171,7 @@ def _apply_okx_basis_decay_quarantine(
         return None
     candidate["paper_okx_basis_decay_quarantine"] = dict(record)
     if not record["active"]:
+        clear_okx_basis_decay_quarantine_state(candidate)
         return None
     reliability = _annotate(
         candidate,
@@ -5182,6 +5184,7 @@ def _apply_okx_basis_decay_quarantine(
         shadow_only=False,
     )
     if record.get("diagnostic_only"):
+        clear_okx_basis_decay_quarantine_state(candidate)
         score_policy = apply_okx_basis_decay_score_policy(candidate, config, zero_score=False)
         reasons = list(candidate.get("paper_exploration_would_block_reasons") or [])
         reasons.append(record["reason"])

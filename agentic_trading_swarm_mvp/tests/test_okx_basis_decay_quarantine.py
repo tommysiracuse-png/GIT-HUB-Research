@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
 
 from execution_engine import execute_order
 from paper_order_router import apply_frontier_paper_guard
-from paper_decay_quarantine import quarantine_record, runtime_report, target_signal
+from paper_decay_quarantine import apply_quarantine, quarantine_record, runtime_report, target_signal
 from paper_exploration_report import build_paper_exploration_report
 from settings import DEFAULT_SETTINGS
 from storage import connect, open_paper_trade
@@ -198,6 +198,52 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         self.assertFalse(guarded["paper_filled"])
         self.assertFalse(guarded["paper_eligible"])
         self.assertEqual("shadow_trial", guarded["paper_action"])
+
+    def test_reused_hard_quarantine_candidate_recomputes_diagnostic_score_policy(self) -> None:
+        settings = copy.deepcopy(self.settings)
+        settings["paper_exploration"]["enabled"] = False
+        candidate = apply_quarantine(self.candidate(), settings)
+
+        self.assertEqual(0.0, candidate["score"])
+        self.assertEqual(
+            "zero_cap",
+            candidate["okx_basis_decay_quarantine_score_policy"]["mode"],
+        )
+
+        recovered = apply_quarantine(candidate, self.settings)
+
+        self.assertEqual(65.0, recovered["score"])
+        self.assertEqual(
+            "max_learned_penalty",
+            recovered["okx_basis_decay_quarantine_score_policy"]["mode"],
+        )
+        self.assertFalse(recovered.get("shadow_filtered", False))
+        self.assertFalse(recovered.get("paper_entry_blocked", False))
+        self.assertTrue(recovered.get("paper_fill_allowed", True))
+
+    def test_released_reused_candidate_restores_pre_quarantine_score(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            settings = copy.deepcopy(self.settings)
+            settings["paper_exploration"]["enabled"] = False
+            candidate = apply_quarantine(self.candidate(), settings, conn=conn)
+
+            self.assertEqual(0.0, candidate["score"])
+            conn.execute(
+                "update paper_decay_quarantines set expires_at = ?",
+                ((dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)).isoformat(),),
+            )
+            conn.commit()
+
+            released = apply_quarantine(candidate, settings, conn=conn)
+
+            self.assertEqual("released", released["paper_okx_basis_decay_quarantine"]["status"])
+            self.assertEqual(80.0, released["score"])
+            self.assertNotIn("okx_basis_decay_quarantine_score_policy", released)
+            self.assertFalse(released.get("shadow_filtered", False))
+            self.assertFalse(released.get("paper_entry_blocked", False))
+            self.assertTrue(released.get("paper_fill_allowed", True))
+            conn.close()
 
     def test_proxy_lineage_is_not_reclassified_as_the_direct_decayed_family(self) -> None:
         proxy = self.candidate(
