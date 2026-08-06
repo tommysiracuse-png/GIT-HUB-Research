@@ -10259,7 +10259,7 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             if isinstance(context_review, dict) and context_review.get("applicable")
             else None
         )
-        candidate["paper_ranking_score"] = round(
+        paper_ranking_score = round(
             effective_edge_score
             + quality_weight * quality_score
             + context_weight * ((context_score - 100.0) if context_score is not None else 0.0)
@@ -10275,6 +10275,10 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             ),
             3,
         )
+        cost_diagnostic = candidate.get("paper_cost_diagnostic") or {}
+        if isinstance(cost_diagnostic, dict) and cost_diagnostic.get("emission_action") == "counterfactual_guard_value":
+            paper_ranking_score = min(paper_ranking_score, as_float(cost_diagnostic.get("score_cap"), 59.999) or 59.999)
+        candidate["paper_ranking_score"] = paper_ranking_score
         candidate["paper_ranking_edge_bps"] = round(ranking_edge, 6) if ranking_edge is not None else None
         candidate["paper_ranking_edge_source"] = ranking_edge_source
         candidate["paper_quality_cohort"] = (
@@ -11768,6 +11772,8 @@ def summarize(
     short_market_context_diagnostics: collections.Counter[str] = collections.Counter()
     short_market_context_scores = []
     short_market_context_counterfactual_count = 0
+    cost_swallowed_diagnostic_count = 0
+    cost_swallowed_check_counts: collections.Counter[str] = collections.Counter()
     short_net_edges = []
     short_cost_components: collections.Counter[str] = collections.Counter()
     for row in candidates:
@@ -11784,6 +11790,10 @@ def summarize(
             short_market_context_diagnostics.update(market_context.get("diagnostics") or [])
             if market_context.get("emission_action") == "counterfactual_guard_value":
                 short_market_context_counterfactual_count += 1
+        cost_diagnostic = row.get("paper_cost_diagnostic") or {}
+        if isinstance(cost_diagnostic, dict) and cost_diagnostic.get("reason") == "cost_swallowed_after_slippage":
+            cost_swallowed_diagnostic_count += 1
+            cost_swallowed_check_counts.update(str(check.get("code")) for check in (cost_diagnostic.get("checks") or []) if isinstance(check, dict) and check.get("code"))
         short_cost = row.get("short_cost_decomposition") or {}
         if isinstance(short_cost, dict) and short_cost.get("applicable"):
             net_edge = as_float(short_cost.get("net_edge_bps"), None)
@@ -11858,6 +11868,7 @@ def summarize(
             "quality_status": row.get("quality_status"),
             "quality_action": row.get("quality_action"),
             "anomaly_flags": row.get("anomaly_flags", []),
+            "paper_cost_diagnostic": row.get("paper_cost_diagnostic"),
             "route_status": (row.get("execution_feasibility") or {}).get("status"),
             "route_blockers": (row.get("execution_feasibility") or {}).get("route_blockers", []),
             "spread_bps": row.get("spread_bps"),
@@ -11969,6 +11980,7 @@ def summarize(
             "score": _distribution(short_market_context_scores),
             "diagnostics": dict(short_market_context_diagnostics),
         },
+        "paper_cost_swallowed_diagnostics": {"paper_only": True, "candidate_count": cost_swallowed_diagnostic_count, "check_counts": dict(cost_swallowed_check_counts), "emission_action": "counterfactual_guard_value"},
         "anomaly_counts": dict(anomaly_counts.most_common()),
         "freshness_age_seconds": _distribution(freshness_values),
         "depth_latency_ms": _distribution(depth_latency_values),
@@ -12069,6 +12081,7 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Paper cohort outcomes: `{summary.get('dislocation_quality_cohort_outcomes', {})}`")
     lines.append(f"- Paper-only short cost decomposition: `{summary.get('short_cost_decomposition', {})}`")
     lines.append(f"- Frontier-short market context: `{summary.get('frontier_short_market_context', {})}`")
+    lines.append(f"- Cost-swallowed paper diagnostics: `{summary.get('paper_cost_swallowed_diagnostics', {})}`")
     lines.append(f"- Venue quote context: `{summary.get('venue_quote_context', {})}`")
     expansion = summary.get("expansion_map", {})
     lines.extend(["", "## Expansion Map", ""])
@@ -12125,6 +12138,7 @@ def _markdown(report: dict) -> str:
             f"venue_score=`{row.get('venue_score')}` stale_reason=`{row.get('staleness_reason')}` "
             f"quote_penalty=`{row.get('quote_context_ranking_penalty')}` "
             f"quality=`{row.get('quality_score')}` action=`{row.get('quality_action')}` "
+            f"cost_diag=`{row.get('paper_cost_diagnostic')}` "
             f"quote_norm=`{row.get('quote_normalization_status')}` "
             f"native_quote=`{row.get('native_quote_currency')}` canonical_price=`{row.get('canonical_normalized_price')}` "
             f"fx_source=`{row.get('fx_source')}` fx_age=`{row.get('fx_age_seconds')}` suppress=`{row.get('suppression_reason')}` "

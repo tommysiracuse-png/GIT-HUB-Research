@@ -104,9 +104,10 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         )
         if exploration_enabled(settings):
             registry_multiplier = max(registry_multiplier, review_multiplier)
+        candidate_multiplier = max(0.0, min(1.0, float(candidate.get("paper_allocation_multiplier", 1.0))))
         # Route-requirement evidence is a paper-only sizing input.  It never
         # changes admission or makes a live route reachable.
-        notional *= min(review_multiplier, registry_multiplier, report_multiplier)
+        notional *= min(review_multiplier, registry_multiplier, report_multiplier, candidate_multiplier)
     if mode == "live":
         notional = min(notional, float(risk.get("max_live_notional_usd", 0.0)))
 

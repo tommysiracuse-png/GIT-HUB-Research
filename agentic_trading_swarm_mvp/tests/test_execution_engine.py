@@ -41,7 +41,7 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
         self.assertEqual(600.0, ticket["notional_usd"])
         self.assertEqual("ready_for_paper_execution", ticket["status"])
 
-    def test_unconfirmed_frontier_spot_borrow_is_shadow_observed_without_an_order(self) -> None:
+    def test_unconfirmed_frontier_spot_borrow_uses_synthetic_paper_execution(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         init_db(conn)
@@ -78,35 +78,14 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
 
         result = execute_order(conn, candidate, review, DEFAULT_SETTINGS)
 
-        self.assertFalse(result["paper_filled"])
-        self.assertIsNone(result["order_id"])
-        self.assertEqual(result["order"]["status"], "shadow_observed")
-        self.assertEqual([], result["fills"])
-        self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
-        row = conn.execute(
-            "select reject_reason, candidate_json from frontier_paper_shadow_observations"
-        ).fetchone()
-        self.assertEqual("cost_swallowed_or_route_blocked", row["reject_reason"])
-        saved_candidate = json.loads(row["candidate_json"])
-        self.assertFalse(saved_candidate["paper_score_eligible"])
-        self.assertIn("spot_borrow", saved_candidate["execution_route"]["route_blockers"])
+        self.assertTrue(result["paper_filled"])
+        self.assertEqual(result["order"]["status"], "paper_filled")
+        self.assertEqual("synthetic_research_paper", result["order"]["route_id"])
+        self.assertEqual(1, len(result["fills"]))
+        self.assertEqual(1, conn.execute("select count(*) from execution_orders").fetchone()[0])
         counters = execution_summary(conn)["frontier_paper_candidates"]
-        self.assertEqual(0, counters["accepted"])
-        self.assertEqual(1, counters["shadowed"])
-
-        observed_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=61)
-        conn.execute(
-            "update frontier_paper_shadow_observations set observed_at = ?",
-            (observed_at.isoformat(),),
-        )
-        outcomes = record_due_horizon_outcomes(
-            conn,
-            {"GATE:ARC_USDT": {"last": 1.01, "observed_at": dt.datetime.now(dt.timezone.utc).isoformat()}},
-            {"learning": {"horizon_minutes": [60], "max_outcome_delay_seconds": 300}},
-        )
-        self.assertEqual(1, len(outcomes))
-        self.assertIn("shadow_observation_id", outcomes[0])
-        self.assertEqual(1, conn.execute("select count(*) from frontier_paper_shadow_outcomes").fetchone()[0])
+        self.assertEqual(1, counters["accepted"])
+        self.assertEqual(0, counters["shadowed"])
 
     def test_execution_summary_counts_accepted_frontier_fill(self) -> None:
         conn = sqlite3.connect(":memory:")

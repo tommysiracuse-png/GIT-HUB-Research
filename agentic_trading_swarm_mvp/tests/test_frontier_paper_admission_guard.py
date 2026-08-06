@@ -15,7 +15,6 @@ if str(SRC) not in sys.path:
 from execution_engine import execute_order  # noqa: E402
 from frontier_crypto_adapter import rank_frontier_paper_candidates  # noqa: E402
 from paper_order_router import (  # noqa: E402
-    FRONTIER_SHADOW_REASON,
     apply_frontier_paper_admission_guard,
 )
 from settings import DEFAULT_SETTINGS  # noqa: E402
@@ -69,16 +68,15 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
             )
         )
 
-        codes = {check["code"] for check in guarded["candidate_reject_detail"]["checks"]}
-        self.assertTrue(guarded["shadow_filtered"])
-        self.assertFalse(guarded["paper_fill_allowed"])
-        self.assertEqual(FRONTIER_SHADOW_REASON, guarded["candidate_reject_reason"])
+        diagnostic = guarded["paper_cost_diagnostic"]
+        codes = {check["code"] for check in diagnostic["checks"]}
+        self.assertFalse(diagnostic["blocks_paper_fill"])
+        self.assertNotIn("shadow_filtered", guarded)
         self.assertTrue(
             {
-                "edge_bps_estimate_not_positive",
-                "net_edge_below_5bps_after_costs",
+                "non_positive_net_edge",
+                "gross_edge_not_at_least_5bps_above_round_trip_cost",
                 "simulated_slippage_exceeds_edge",
-                "quality_action_shadow_only",
             }.issubset(codes)
         )
 
@@ -88,8 +86,8 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         ranked = rank_frontier_paper_candidates([weak], copy.deepcopy(DEFAULT_SETTINGS))
 
         self.assertEqual([weak], ranked)
-        self.assertTrue(weak["shadow_filtered"])
-        self.assertEqual(FRONTIER_SHADOW_REASON, weak["candidate_reject_reason"])
+        self.assertNotIn("shadow_filtered", weak)
+        self.assertEqual("cost_swallowed_after_slippage", weak["paper_cost_diagnostic_reason"])
 
     def test_exploration_boundary_does_not_fill_a_rejected_frontier_candidate(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -106,15 +104,10 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
 
         result = execute_order(conn, candidate(edge_bps_estimate=0.0), review, copy.deepcopy(DEFAULT_SETTINGS))
 
-        self.assertFalse(result["paper_filled"])
-        self.assertEqual("shadow_observed", result["order"]["status"])
-        self.assertIsNone(result["order_id"])
-        self.assertEqual(FRONTIER_SHADOW_REASON, result["candidate"]["candidate_reject_reason"])
-        self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
-        observation = conn.execute(
-            "select reject_reason from frontier_paper_shadow_observations"
-        ).fetchone()
-        self.assertEqual(FRONTIER_SHADOW_REASON, observation[0])
+        self.assertTrue(result["paper_filled"])
+        self.assertEqual("paper_filled", result["order"]["status"])
+        self.assertEqual(250.0, result["order"]["notional_usd"])
+        self.assertEqual("cost_swallowed_after_slippage", result["candidate"]["paper_cost_diagnostic_reason"])
 
 
 if __name__ == "__main__":
