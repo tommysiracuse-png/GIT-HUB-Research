@@ -162,6 +162,24 @@ class CodexWorkerPoolTests(unittest.TestCase):
         )
         self.assertEqual("verified-candidate", result["verified_commit"])
 
+    def test_quick_owner_task_does_not_idle_worker_behind_longest_session(self) -> None:
+        quick = {"worker_id": "market-codex", "status": "not_due", "elapsed_seconds": 0.02}
+        coding = {
+            "worker_id": "market-codex", "status": "promoted_pending_verification",
+            "elapsed_seconds": 12.0, "proposal_id": "adapter-proposal",
+        }
+        with mock.patch.object(
+            codex_worker_pool, "_run_one_worker_task", side_effect=[quick, coding]
+        ) as run_task:
+            result = codex_worker_pool.run_worker_once(
+                {"worker_id": "market-codex", "preferred_lanes": ["adapter"]}, self.settings
+            )
+
+        self.assertEqual(2, run_task.call_count)
+        self.assertEqual("adapter-proposal", result["proposal_id"])
+        self.assertEqual(2, result["tasks_processed_this_turn"])
+        self.assertEqual(1, result["quick_handoffs"])
+
 
 if __name__ == "__main__":
     unittest.main()

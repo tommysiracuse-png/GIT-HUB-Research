@@ -118,7 +118,9 @@ def _cfg(settings: dict) -> dict[str, Any]:
         "worker_heartbeat_seconds": 30,
         "promotion_lease_seconds": 180,
         "verification_timeout_seconds": 900,
-        "queue_batch_size": 100,
+    "queue_batch_size": 100,
+    "max_quick_task_hops": 8,
+    "quick_task_seconds": 5,
         "defer_full_regression": True,
         "keep_repairing_after_verification_failure": True,
         "worker_roles": [
@@ -388,7 +390,7 @@ def _lease_heartbeat(stop: threading.Event, db_path: pathlib.Path, task: dict, w
             continue
 
 
-def run_worker_once(worker: dict, settings: dict) -> dict[str, Any]:
+def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
     cfg = _cfg(settings)
     worker_id = str(worker.get("worker_id") or f"codex-{uuid.uuid4().hex[:8]}")
     preferences = list(worker.get("preferred_lanes") or ["general"])
@@ -484,6 +486,39 @@ def run_worker_once(worker: dict, settings: dict) -> dict[str, Any]:
     finally:
         stop.set()
         heartbeat.join(timeout=2)
+
+
+def run_worker_once(worker: dict, settings: dict) -> dict[str, Any]:
+    """Keep a lane productive when owner bookkeeping finishes almost immediately."""
+
+    cfg = _cfg(settings)
+    max_hops = max(1, int(cfg.get("max_quick_task_hops", 8)))
+    quick_seconds = max(0.1, float(cfg.get("quick_task_seconds", 5)))
+    completed: list[dict[str, Any]] = []
+    for _index in range(max_hops):
+        result = _run_one_worker_task(worker, settings)
+        if result.get("status") == "idle":
+            if not completed:
+                return result
+            final = dict(completed[-1])
+            final["tasks_processed_this_turn"] = len(completed)
+            final["quick_handoffs"] = len(completed)
+            final["drained_to_idle"] = True
+            return final
+        completed.append(result)
+        status = str(result.get("status") or "")
+        elapsed = float(result.get("elapsed_seconds") or 0.0)
+        if (
+            elapsed > quick_seconds
+            or status in PENDING_VERIFICATION_STATUSES
+            or status in RETRYABLE_STATUSES
+            or status in {"requeued_after_exception", "worker_exception"}
+        ):
+            break
+    final = dict(completed[-1]) if completed else {"status": "idle"}
+    final["tasks_processed_this_turn"] = len(completed)
+    final["quick_handoffs"] = max(0, len(completed) - 1)
+    return final
 
 
 def _release_from_row(row: dict) -> CandidateRelease | None:
