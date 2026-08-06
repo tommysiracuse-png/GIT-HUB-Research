@@ -82,6 +82,44 @@ EXECUTION_ROUTE_REQUIREMENT_LABELS = (
     "margin_needs",
     "api_borrow_feasibility",
 )
+_EXECUTION_ROUTE_HUNTER_SAFE_ROUTE_STATUSES = {
+    "actionable",
+    "executable",
+    "executable_proxy",
+    "executable_standard",
+    "feasible_for_paper",
+    "feasible_with_simulation_assumptions",
+    "paper_observation",
+    "paper_testable_proxy",
+    "paper_testable_via_proxy",
+    "proxy_only",
+    "route_supported",
+    "supported",
+    "standard",
+}
+_EXECUTION_ROUTE_HUNTER_ROUTE_CONTAINER_KEYS = (
+    "paper_safe_route",
+    "selected_paper_route",
+    "paper_route",
+    "paper_route_review",
+    "execution_route",
+    "route",
+)
+_EXECUTION_ROUTE_HUNTER_ROUTE_STATUS_KEYS = (
+    "route_status",
+    "paper_route_status",
+    "status",
+    "route_decision",
+    "route_recommendation_status",
+    "route_actionability",
+    "feasibility_status",
+)
+_EXECUTION_ROUTE_HUNTER_INCOMPLETE_ROUTE_LABELS = {
+    "requires_api_and_borrow_confirmation",
+    "requires_borrow_confirmation",
+    "fee_pressure_unmeasured",
+    "margin_needs_confirmation",
+}
 
 
 class SwarmState(TypedDict, total=False):
@@ -179,6 +217,185 @@ def _route_label(value: Any, fallback: str) -> str:
     if value in (None, "", [], {}, ()):
         return fallback
     return str(value)
+
+
+def _missing_recommendation_fields(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return list(REQUIRED_RECOMMENDATION_KEYS)
+    missing: list[str] = []
+    for field in REQUIRED_RECOMMENDATION_KEYS:
+        item = value.get(field)
+        if item is None:
+            missing.append(field)
+        elif isinstance(item, str) and not item.strip():
+            missing.append(field)
+        elif field in {"evidence", "proposed_change"} and item == {}:
+            missing.append(field)
+    return missing
+
+
+def _execution_route_hunter_route_status(value: Any) -> bool:
+    return str(value or "").strip().lower() in _EXECUTION_ROUTE_HUNTER_SAFE_ROUTE_STATUSES
+
+
+def _mapping_has_explicit_paper_safe_route(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for key in _EXECUTION_ROUTE_HUNTER_ROUTE_STATUS_KEYS:
+        if _execution_route_hunter_route_status(value.get(key)):
+            return True
+    if value.get("route_feasible_paper") is True:
+        return True
+    if value.get("direct_route_actionable") is True or value.get("route_eligible") is True:
+        return True
+    route_id = value.get("route_id") or value.get("paper_proxy_id") or value.get("selected_proxy_id")
+    return bool(route_id) and any(
+        _execution_route_hunter_route_status(value.get(key))
+        for key in _EXECUTION_ROUTE_HUNTER_ROUTE_STATUS_KEYS
+    )
+
+
+def _recommendation_has_explicit_paper_safe_route(rec: dict) -> bool:
+    for container in (rec, rec.get("evidence"), rec.get("proposed_change")):
+        if _mapping_has_explicit_paper_safe_route(container):
+            return True
+        if not isinstance(container, dict):
+            continue
+        for key in _EXECUTION_ROUTE_HUNTER_ROUTE_CONTAINER_KEYS:
+            if _mapping_has_explicit_paper_safe_route(container.get(key)):
+                return True
+    return False
+
+
+def _route_summary_has_explicit_paper_safe_route(summary: Any) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    routes = summary.get("routes")
+    if not isinstance(routes, list):
+        return False
+    for row in routes:
+        if not isinstance(row, dict):
+            continue
+        labels = row.get("labels")
+        if not isinstance(labels, dict):
+            continue
+        values = [
+            str(labels.get(label) or "").strip().lower()
+            for label in EXECUTION_ROUTE_REQUIREMENT_LABELS
+        ]
+        if values and all(value and value not in _EXECUTION_ROUTE_HUNTER_INCOMPLETE_ROUTE_LABELS for value in values):
+            return True
+    return False
+
+
+def _paper_route_requirement_summaries_have_explicit_route(summary: Any) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    candidates = summary.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        missing_flags = candidate.get("missing_data_flags")
+        if isinstance(missing_flags, list) and not missing_flags:
+            return True
+    return False
+
+
+def _packet_has_route_context(packet: dict) -> bool:
+    return bool(
+        packet.get("execution_route_requirement_summary")
+        or packet.get("paper_route_requirement_summaries")
+        or packet.get("route_resolver")
+    )
+
+
+def _packet_has_explicit_paper_safe_route(packet: dict) -> bool:
+    if _route_summary_has_explicit_paper_safe_route(packet.get("execution_route_requirement_summary")):
+        return True
+    if _paper_route_requirement_summaries_have_explicit_route(packet.get("paper_route_requirement_summaries")):
+        return True
+    route_resolver = packet.get("route_resolver")
+    if isinstance(route_resolver, dict):
+        by_status = route_resolver.get("by_route_status")
+        if isinstance(by_status, dict) and any(
+            str(key).strip().lower() in _EXECUTION_ROUTE_HUNTER_SAFE_ROUTE_STATUSES and bool(value)
+            for key, value in by_status.items()
+        ):
+            return True
+        route_intelligence = route_resolver.get("route_intelligence")
+        if isinstance(route_intelligence, dict):
+            if any(
+                int(route_intelligence.get(key) or 0) > 0
+                for key in ("paper_proxy_available_count", "paper_research_available_count")
+            ):
+                return True
+            for key in ("paper_proxy_available", "paper_research_available"):
+                items = route_intelligence.get(key)
+                if isinstance(items, list) and items:
+                    return True
+    return False
+
+
+def _execution_route_hunter_fallback(
+    rec: dict,
+    packet: dict,
+    reason: str,
+) -> dict:
+    fallback = paper_only_no_action_fallback(
+        market_key="paper.execution_route_hunter",
+        rationale=(
+            "The execution_route_hunter recommendation was incomplete or lacked an "
+            "explicit paper-safe route, so it was converted into a paper-only "
+            "no_action record."
+        ),
+    )
+    fallback["evidence"] = {
+        **fallback["evidence"],
+        "paper_only": True,
+        "explicit_paper_safe_route_required": True,
+        "schema_violation": reason,
+        "original_action": str(rec.get("action") or ""),
+    }
+    route_summary = packet.get("execution_route_requirement_summary")
+    if isinstance(route_summary, dict) and route_summary:
+        fallback["evidence"]["execution_route_requirement_summary"] = route_summary
+    paper_summaries = packet.get("paper_route_requirement_summaries")
+    if isinstance(paper_summaries, dict) and paper_summaries:
+        fallback["evidence"]["paper_route_requirement_summaries"] = paper_summaries
+    fallback["parse_status"] = "invalid_schema"
+    fallback["terminal_failure_reason"] = reason
+    fallback["_rejected"] = True
+    fallback["accepted"] = False
+    return fallback
+
+
+def _guard_execution_route_hunter_recommendation(
+    agent: dict,
+    rec: dict,
+    packet: dict,
+) -> dict:
+    if agent.get("name") != "execution_route_hunter" or rec.get("action") == "no_action":
+        return rec
+    missing = _missing_recommendation_fields(rec)
+    if missing:
+        return _execution_route_hunter_fallback(
+            rec,
+            packet,
+            f"missing_required_fields:{','.join(missing)}",
+        )
+    if _recommendation_has_explicit_paper_safe_route(rec):
+        return rec
+    if not _packet_has_route_context(packet):
+        return rec
+    if not _packet_has_explicit_paper_safe_route(packet):
+        return _execution_route_hunter_fallback(
+            rec,
+            packet,
+            "missing_explicit_paper_safe_route",
+        )
+    return rec
 
 
 def build_execution_route_requirement_summary(packet: dict) -> dict:
@@ -515,7 +732,10 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
             "route diagnostics for borrow availability, fee pressure, margin needs, API/borrow feasibility, "
             "permissions, spread/liquidity, and carry. "
             "Weak observed paper PnL is route-specific diagnostic and paper-ordering evidence only: retain "
-            "candidate emission and do not recommend suppression, quarantine, or a paper-entry block.\n"
+            "candidate emission and do not recommend suppression, quarantine, or a paper-entry block. "
+            "If you return an actionable route recommendation, include evidence.paper_safe_route as a JSON object "
+            "with explicit validated paper-only route facts such as route_status, route_decision, route_id, or "
+            "route_actionability. If no explicit paper-safe route is available, return action='no_action'.\n"
         )
     dynamic_instruction = ""
     if agent.get("dynamic_agent_id"):
@@ -693,6 +913,10 @@ def parse_recommendation(text: str, agent: dict, packet: dict) -> dict:
                 parse_status,
                 "ungrounded_code_change",
             )
+    if agent["name"] == "execution_route_hunter":
+        guarded = _guard_execution_route_hunter_recommendation(agent, rec, packet)
+        if guarded is not rec:
+            return guarded
     rec["priority"] = _coerce_priority(rec.get("priority"), default=50)
     rec.setdefault("title", f"{agent['name']} recommendation")
     rec.setdefault("rationale", "Generated by LLM swarm.")
@@ -1408,6 +1632,18 @@ def _schema_retry_prompt(agent: dict, original_text: str) -> str:
             "\"rationale\":\"...\",\"market_key\":\"paper.cross_market_researcher.<scope>\","
             "\"evidence\":{\"schema_violation\":\"...\",\"paper_only\":true},"
             "\"proposed_change\":{\"summary\":\"...\",\"paper_only\":true}}\n"
+            "No markdown, no commentary, no extra keys, no arrays at the top level. Keep it paper-only.\n\n"
+            f"Previous response preview:\n{(original_text or '')[:1200]}"
+        )
+    if agent.get("name") == "execution_route_hunter":
+        return (
+            "The previous execution_route_hunter response was not a complete valid paper-only route recommendation. "
+            "Return exactly one JSON object and no prose. Use exactly these top-level keys: "
+            "action, priority, title, rationale, market_key, evidence, proposed_change. "
+            "action must be one of the allowed actions or \"no_action\". priority must be an integer 1-100. "
+            "If action is not \"no_action\", evidence must include paper_safe_route as a JSON object with explicit "
+            "validated paper-only route facts such as route_status, route_decision, route_id, or route_actionability. "
+            "If no explicit paper-safe route is available, return action=\"no_action\" with the failure captured in evidence. "
             "No markdown, no commentary, no extra keys, no arrays at the top level. Keep it paper-only.\n\n"
             f"Previous response preview:\n{(original_text or '')[:1200]}"
         )

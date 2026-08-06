@@ -580,6 +580,131 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertTrue(rec["_rejected"])
         self.assertEqual(rec["terminal_failure_reason"], "non_actionable_hold_or_rerun")
 
+    def test_execution_route_hunter_missing_required_fields_becomes_no_action_fallback(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": ["propose_hunter_directive", "no_action"],
+            "execution_route_requirement_summary": {
+                "routes": [
+                    {
+                        "labels": {
+                            "borrow_availability": "available",
+                            "fee_pressure": "14.5",
+                            "margin_needs": "available",
+                            "api_borrow_feasibility": "observed",
+                        }
+                    }
+                ]
+            },
+        }
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "execution_route_hunter")
+
+        rec = llm_swarm_runner.parse_recommendation(
+            json.dumps(
+                {
+                    "action": "propose_hunter_directive",
+                    "priority": 88,
+                    "title": "Missing rationale",
+                    "market_key": "paper.execution_route_hunter",
+                    "evidence": {"paper_safe_route": {"route_status": "paper_testable_proxy"}},
+                    "proposed_change": {"summary": "adjust route"},
+                }
+            ),
+            agent,
+            packet,
+        )
+
+        self.assertTrue(rec["_rejected"])
+        self.assertEqual("no_action", rec["action"])
+        self.assertEqual(
+            "missing_required_fields:rationale",
+            rec["terminal_failure_reason"],
+        )
+
+    def test_execution_route_hunter_requires_explicit_paper_safe_route_with_route_context(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": ["propose_hunter_directive", "no_action"],
+            "execution_route_requirement_summary": {
+                "routes": [
+                    {
+                        "labels": {
+                            "borrow_availability": "requires_borrow_confirmation",
+                            "fee_pressure": "fee_pressure_unmeasured",
+                            "margin_needs": "margin_needs_confirmation",
+                            "api_borrow_feasibility": "requires_api_and_borrow_confirmation",
+                        }
+                    }
+                ]
+            },
+        }
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "execution_route_hunter")
+
+        rec = llm_swarm_runner.parse_recommendation(
+            json.dumps(
+                {
+                    "action": "propose_hunter_directive",
+                    "priority": 88,
+                    "title": "Route review",
+                    "rationale": "Change the route after validation.",
+                    "market_key": "paper.execution_route_hunter",
+                    "evidence": {"issue": "route costs changed"},
+                    "proposed_change": {"summary": "adjust route"},
+                }
+            ),
+            agent,
+            packet,
+        )
+
+        self.assertTrue(rec["_rejected"])
+        self.assertEqual("no_action", rec["action"])
+        self.assertEqual(
+            "missing_explicit_paper_safe_route",
+            rec["terminal_failure_reason"],
+        )
+        self.assertTrue(rec["evidence"]["explicit_paper_safe_route_required"])
+
+    def test_execution_route_hunter_accepts_explicit_paper_safe_route(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": ["propose_hunter_directive", "no_action"],
+            "execution_route_requirement_summary": {
+                "routes": [
+                    {
+                        "labels": {
+                            "borrow_availability": "available",
+                            "fee_pressure": "14.5",
+                            "margin_needs": "available",
+                            "api_borrow_feasibility": "observed",
+                        }
+                    }
+                ]
+            },
+        }
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "execution_route_hunter")
+
+        rec = llm_swarm_runner.parse_recommendation(
+            json.dumps(
+                {
+                    "action": "propose_hunter_directive",
+                    "priority": 88,
+                    "title": "Use validated paper proxy route",
+                    "rationale": "A maintained paper proxy route is already validated.",
+                    "market_key": "paper.execution_route_hunter",
+                    "evidence": {
+                        "paper_safe_route": {
+                            "route_id": "okx_derivatives_paper",
+                            "route_status": "paper_testable_proxy",
+                            "paper_only": True,
+                        }
+                    },
+                    "proposed_change": {"summary": "review the validated proxy route"},
+                }
+            ),
+            agent,
+            packet,
+        )
+
+        self.assertFalse(rec.get("_rejected", False))
+        self.assertEqual("propose_hunter_directive", rec["action"])
+
     def test_sequential_swarm_passes_prior_outputs_to_later_agents(self) -> None:
         seen_counts: list[int] = []
 

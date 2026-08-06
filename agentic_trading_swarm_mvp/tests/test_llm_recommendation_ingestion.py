@@ -147,6 +147,76 @@ class RecommendationIngestionTest(unittest.TestCase):
         self.assertEqual("safety_rejected", result["parse_status"])
         self.assertEqual("invalid_target_files", result["terminal_failure_reason"])
 
+    def test_execution_route_hunter_partial_payload_fails_closed_to_no_action_fallback(self):
+        result = normalize_recommendation(
+            {
+                "parsed": {
+                    "market_key": "paper.execution_route_hunter",
+                    "action": "route_review",
+                    "evidence": {"issue": "route object was incomplete"},
+                    "proposed_change": {"summary": "adjust route"},
+                    "agent_role": "route_resolver",
+                }
+            }
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual("native_valid", result["parse_status"])
+        self.assertEqual("no_action", result["action"])
+        self.assertEqual("no_action", result["downstream_task_type"])
+        self.assertEqual("paper.execution_route_hunter", result["market_key"])
+        self.assertIn("missing_required_fields", result["evidence"]["schema_violation"])
+        self.assertTrue(result["evidence"]["explicit_paper_safe_route_required"])
+
+    def test_execution_route_hunter_actionable_payload_requires_explicit_paper_safe_route(self):
+        result = normalize_recommendation(
+            {
+                "parsed": {
+                    "market_key": "paper.execution_route_hunter",
+                    "action": "route_review",
+                    "priority": 88,
+                    "title": "Route review",
+                    "rationale": "Change the route after validation.",
+                    "evidence": {"issue": "route costs changed"},
+                    "proposed_change": {"summary": "adjust route"},
+                    "agent_role": "route_resolver",
+                }
+            }
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual("no_action", result["action"])
+        self.assertEqual(
+            "missing_explicit_paper_safe_route",
+            result["evidence"]["schema_violation"],
+        )
+
+    def test_execution_route_hunter_accepts_actionable_payload_with_explicit_paper_safe_route(self):
+        result = normalize_recommendation(
+            {
+                "parsed": {
+                    "market_key": "paper.execution_route_hunter",
+                    "action": "route_review",
+                    "priority": 88,
+                    "title": "Use validated paper proxy route",
+                    "rationale": "A maintained paper proxy route is already validated.",
+                    "evidence": {
+                        "paper_safe_route": {
+                            "route_id": "okx_derivatives_paper",
+                            "route_status": "paper_testable_proxy",
+                            "paper_only": True,
+                        }
+                    },
+                    "proposed_change": {"summary": "review the validated proxy route"},
+                    "agent_role": "route_resolver",
+                }
+            }
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual("route_review", result["action"])
+        self.assertEqual("route_review", result["downstream_task_type"])
+
 
 if __name__ == "__main__":
     unittest.main()

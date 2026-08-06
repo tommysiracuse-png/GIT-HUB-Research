@@ -147,6 +147,48 @@ _TEST_COMMAND_PREFIXES = (
     "pytest",
 )
 
+_ROUTE_PROOF_CONTAINER_KEYS = (
+    "paper_safe_route",
+    "selected_paper_route",
+    "paper_route",
+    "paper_route_review",
+    "execution_route",
+    "route",
+)
+_ROUTE_PROOF_STATUS_KEYS = (
+    "route_status",
+    "paper_route_status",
+    "status",
+    "route_decision",
+    "route_recommendation_status",
+    "route_actionability",
+    "feasibility_status",
+)
+_PAPER_SAFE_ROUTE_STATUSES = {
+    "actionable",
+    "executable",
+    "executable_proxy",
+    "executable_standard",
+    "feasible_for_paper",
+    "feasible_with_simulation_assumptions",
+    "paper_observation",
+    "paper_testable_proxy",
+    "paper_testable_via_proxy",
+    "proxy_only",
+    "route_supported",
+    "supported",
+    "standard",
+}
+_EXECUTION_ROUTE_HUNTER_REQUIRED_FIELDS = (
+    "action",
+    "priority",
+    "title",
+    "rationale",
+    "market_key",
+    "evidence",
+    "proposed_change",
+)
+
 
 def _json_default(value: Any) -> str:
     return repr(value)
@@ -221,6 +263,83 @@ def _nonempty(value: Any) -> bool:
     return value is not None and value != [] and value != {}
 
 
+def _is_explicit_paper_safe_route_status(value: Any) -> bool:
+    return str(value or "").strip().lower() in _PAPER_SAFE_ROUTE_STATUSES
+
+
+def _mapping_has_explicit_paper_safe_route(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    for key in _ROUTE_PROOF_STATUS_KEYS:
+        if _is_explicit_paper_safe_route_status(value.get(key)):
+            return True
+    if value.get("route_feasible_paper") is True:
+        return True
+    if value.get("direct_route_actionable") is True or value.get("route_eligible") is True:
+        return True
+    route_id = _first(value, ("route_id", "paper_proxy_id", "selected_proxy_id"))
+    return bool(route_id) and any(
+        _is_explicit_paper_safe_route_status(value.get(key))
+        for key in _ROUTE_PROOF_STATUS_KEYS
+    )
+
+
+def _has_explicit_paper_safe_route(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    for container in (value, value.get("evidence"), value.get("proposed_change")):
+        if _mapping_has_explicit_paper_safe_route(container):
+            return True
+        if not isinstance(container, Mapping):
+            continue
+        for key in _ROUTE_PROOF_CONTAINER_KEYS:
+            if _mapping_has_explicit_paper_safe_route(container.get(key)):
+                return True
+    return False
+
+
+def _execution_route_hunter_fallback(
+    reason: str,
+    value: Mapping[str, Any],
+) -> Dict[str, Any]:
+    current_evidence = value.get("evidence")
+    paper_safe_route = None
+    if isinstance(current_evidence, Mapping):
+        candidate_route = current_evidence.get("paper_safe_route")
+        if isinstance(candidate_route, Mapping):
+            paper_safe_route = dict(candidate_route)
+    fallback: Dict[str, Any] = {
+        "action": "no_action",
+        "priority": 90,
+        "title": "No action without a validated paper-safe route",
+        "rationale": (
+            "execution_route_hunter output must include every required field and an "
+            "explicit validated paper-safe route before it can produce an actionable "
+            "paper-only route recommendation."
+        ),
+        "market_key": "paper.execution_route_hunter",
+        "evidence": {
+            "issue": "route_validation_failed",
+            "schema_violation": reason,
+            "paper_only": True,
+            "explicit_paper_safe_route_required": True,
+            "original_action": _clean_action(_first(value, ("action", "proposed_action"), "")),
+        },
+        "proposed_change": {
+            "summary": "Keep the recommendation non-actionable until a validated paper-safe route is provided in a complete JSON object.",
+            "required_fields": ", ".join(_EXECUTION_ROUTE_HUNTER_REQUIRED_FIELDS),
+            "paper_only": True,
+            "paper_trade_instruction": "No action. Simulation and reporting only; no execution.",
+        },
+    }
+    fallback["agent_role"] = _clean_role(
+        _first(value, ("agent_role", "role"), "route_resolver")
+    ) or "route_resolver"
+    if paper_safe_route is not None:
+        fallback["evidence"]["paper_safe_route"] = paper_safe_route
+    return fallback
+
+
 def _repair_execution_route_hunter_payload(value: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(value, Mapping):
         return None
@@ -234,9 +353,9 @@ def _repair_execution_route_hunter_payload(value: Any) -> Optional[Dict[str, Any
         return None
 
     repaired: Dict[str, Any] = dict(value)
-    action = _clean_action(_first(repaired, ("action", "proposed_action"), "code_change"))
+    action = _clean_action(_first(repaired, ("action", "proposed_action"), "no_action"))
     if action not in ALLOWED_ACTIONS:
-        action = "code_change"
+        return _execution_route_hunter_fallback("invalid_action", repaired)
     repaired["action"] = action
 
     try:
@@ -245,23 +364,21 @@ def _repair_execution_route_hunter_payload(value: Any) -> Optional[Dict[str, Any
         priority = 90
     repaired["priority"] = max(1, min(100, priority))
 
-    if not _nonempty(repaired.get("title")):
-        repaired["title"] = "Harden execution_route_hunter paper recommendation output"
-    if not _nonempty(repaired.get("rationale")):
-        repaired["rationale"] = (
-            "Preserve parser compatibility by requiring execution_route_hunter "
-            "to emit one complete paper-only recommendation object."
+    missing = [
+        field
+        for field in _EXECUTION_ROUTE_HUNTER_REQUIRED_FIELDS
+        if not _nonempty(repaired.get(field))
+    ]
+    if missing:
+        return _execution_route_hunter_fallback(
+            f"missing_required_fields:{','.join(missing)}",
+            repaired,
         )
-    if not _nonempty(repaired.get("proposed_change")):
-        repaired["proposed_change"] = (
-            "Require a single schema-complete paper-only JSON recommendation object "
-            "for execution_route_hunter responses."
+    if action != "no_action" and not _has_explicit_paper_safe_route(repaired):
+        return _execution_route_hunter_fallback(
+            "missing_explicit_paper_safe_route",
+            repaired,
         )
-    if not _nonempty(repaired.get("evidence")):
-        repaired["evidence"] = {
-            "issue": "Incomplete execution_route_hunter recommendation object threatened parser compatibility.",
-            "impact": "Recommendation ingestion could fail before any paper-routing review.",
-        }
     return repaired
 
 

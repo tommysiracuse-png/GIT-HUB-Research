@@ -464,23 +464,24 @@ MARKET_SCOUT_FALLBACK_RECOMMENDATION = {
 
 EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION = default_paper_recommendation(
     {
-        "action": "refine",
-        "priority": 85,
-        "title": "Refine paper execution route recommendation",
+        "action": "no_action",
+        "priority": 1,
+        "title": "No action without an explicit paper-safe route",
         "rationale": (
             "Auto-generated because the primary execution-route response failed strict "
             "single-object validation, omitted required fields, or did not provide "
-            "enough paper-only evidence to support routing analysis."
+            "an explicit validated paper-safe route for routing analysis."
         ),
         "market_key": "paper.execution_route_hunter",
         "evidence": {
             "issue": "route_validation_failed",
             "validation_error": "schema_validation_failed",
             "paper_only": True,
+            "explicit_paper_safe_route_required": True,
         },
         "proposed_change": {
-            "summary": "Return one schema-complete paper-only route recommendation or a conservative hold/refine decision.",
-            "fallback_behavior": "refine_or_hold_with_validation_evidence",
+            "summary": "Return one schema-complete paper-only route recommendation only when an explicit paper-safe route is validated; otherwise emit no_action.",
+            "fallback_behavior": "no_action_with_validation_evidence",
             "required_fields": ", ".join(REQUIRED_RECOMMENDATION_FIELDS),
             "safety_mode": "paper_only",
             "suppress_live_execution_wording": True,
@@ -1328,9 +1329,10 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
         "priority": "integer 1-100",
         "fallback_behavior": (
             "If any required field is unavailable, route construction fails validation, "
-            "or the response would otherwise be partial, emit action='no_action' instead of "
-            "inventing a hold/refine/build recommendation. The no-action response must still "
-            "be returned as exactly one JSON object with the failure captured in evidence."
+            "an explicit paper-safe route is unavailable, or the response would otherwise "
+            "be partial, emit action='no_action' instead of inventing a route-change, "
+            "hold, refine, or build recommendation. The no-action response must still be "
+            "returned as exactly one JSON object with the failure captured in evidence."
         ),
         "validation_policy": {
             "publish_only_single_json_object": True,
@@ -1342,7 +1344,8 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "required_fields": required_fields,
             "required_fields_csv": required_fields_csv,
             "require_explicit_paper_only_scope": True,
-            "paper_execution_route_hunter_fallback": "refine_or_hold_with_validation_evidence",
+            "require_explicit_paper_safe_route": True,
+            "paper_execution_route_hunter_fallback": "no_action_with_validation_evidence",
             "require_non_empty_market_key": True,
             "require_non_empty_rationale": True,
             "require_no_extra_text_outside_object": True,
@@ -1442,9 +1445,10 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
                 "Always emit exactly one schema-complete top-level JSON object with "
                 "action, priority, title, rationale, market_key, evidence, and "
                 "proposed_change. No markdown, commentary, wrapper arrays, or live "
-                "execution wording. If route construction fails validation or context "
-                "is incomplete, emit the provided paper-only refine/hold fallback "
-                "recommendation object with the validation failure captured in evidence."
+                "execution wording. If route construction fails validation, any required "
+                "field is missing, or no explicit paper-safe route is available, emit the "
+                "provided paper-only no_action fallback recommendation object with the "
+                "validation failure captured in evidence."
             ),
             "paper_system.integrity.market_scout": "Always emit exactly one schema-complete top-level JSON object with action, priority, title, rationale, market_key, evidence, and proposed_change. If generation or validation fails, emit the provided fallback paper-only hold recommendation object instead of partial output.",
         },
@@ -1452,6 +1456,7 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
             "paper.execution_route_hunter": {
                 "mode": "paper_only",
                 "forbid_live_execution_wording": True,
+                "require_explicit_paper_safe_route": True,
                 "required_fields": required_fields,
             },
         },
