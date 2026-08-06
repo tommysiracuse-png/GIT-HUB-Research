@@ -8,6 +8,7 @@ uses credentials, private/account APIs, or order endpoints.
 
 from __future__ import annotations
 import datetime as dt
+import re
 from typing import Any
 
 try:
@@ -10738,6 +10739,335 @@ def _annotate_frontier_short_paper_diagnostics(
     return candidate
 
 
+def _paper_venue_diagnostics_lookup(candidate: dict, observation: dict, *keys: str):
+    containers = [candidate, observation]
+    nested_names = (
+        "route_quality",
+        "venue_health",
+        "instrument_metadata",
+        "venue_constraints",
+        "frontier_short_paper_diagnostics",
+    )
+    for container in (candidate, observation):
+        if not isinstance(container, dict):
+            continue
+        for nested_name in nested_names:
+            nested = container.get(nested_name)
+            if isinstance(nested, dict):
+                containers.append(nested)
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, "", [], {}, (), set(), frozenset()):
+                return value
+    return None
+
+
+def _paper_venue_diagnostics_timestamp(candidate: dict, observation: dict) -> str | None:
+    for key in (
+        "quote_timestamp",
+        "freshness_timestamp",
+        "last_trade_timestamp",
+        "book_observed_at",
+        "observed_at",
+        "seen_at",
+        "last_checked_at",
+    ):
+        parsed = _paper_only_parse_timestamp(_paper_venue_diagnostics_lookup(candidate, observation, key))
+        if parsed is not None:
+            return parsed.isoformat()
+    return None
+
+
+def _paper_venue_diagnostics_venue_symbol(candidate: dict, observation: dict):
+    for container in (candidate, observation):
+        if not isinstance(container, dict):
+            continue
+        metadata = container.get("instrument_metadata")
+        if isinstance(metadata, dict):
+            value = metadata.get("venue_symbol")
+            if value not in (None, "", [], {}, (), set(), frozenset()):
+                return value
+        value = container.get("venue_symbol")
+        if value not in (None, "", [], {}, (), set(), frozenset()):
+            return value
+    return None
+
+
+def _paper_venue_diagnostics_confidence(candidate: dict, observation: dict) -> tuple[float | None, str | None]:
+    direct = as_float(
+        _paper_venue_diagnostics_lookup(
+            candidate,
+            observation,
+            "route_mapping_confidence",
+            "mapping_confidence",
+            "symbol_mapping_confidence",
+        ),
+        None,
+    )
+    if direct is not None:
+        return max(0.0, min(1.0, direct)), "observed_mapping_confidence"
+    venue_symbol = _paper_venue_diagnostics_venue_symbol(candidate, observation)
+    symbol = _paper_venue_diagnostics_lookup(candidate, observation, "symbol")
+    if venue_symbol and symbol:
+        return 1.0, "parser_symbol_normalization"
+    return None, None
+
+
+def _paper_venue_diagnostics_access_status(candidate: dict, observation: dict, prefix: str) -> tuple[str, bool]:
+    keys = (
+        f"{prefix}_status",
+        f"{prefix}_enabled",
+        f"{prefix}_available",
+        f"{prefix}_open",
+        f"{prefix}s_enabled",
+        f"{prefix}s_available",
+    )
+    raw_value = _paper_venue_diagnostics_lookup(candidate, observation, *keys)
+    if raw_value is None:
+        return "unknown", False
+    if isinstance(raw_value, bool):
+        return ("available" if raw_value else "unavailable"), True
+    text = str(raw_value).strip().lower()
+    if text in {"true", "1", "yes", "open", "enabled", "available", "supported"}:
+        return "available", True
+    if text in {"false", "0", "no", "closed", "disabled", "unavailable", "unsupported", "halted"}:
+        return "unavailable", True
+    return text or "unknown", True
+
+
+def _normalize_paper_network_identifiers(candidate: dict, observation: dict) -> list[str]:
+    raw_values = []
+    for key in ("network", "networks", "chain", "chains", "chain_id", "chain_ids"):
+        value = _paper_venue_diagnostics_lookup(candidate, observation, key)
+        if value not in (None, "", [], {}, (), set(), frozenset()):
+            raw_values.append(value)
+    identifiers = []
+    seen = set()
+
+    def _append(value):
+        token = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "").strip().upper()).strip("_")
+        if token and token not in seen:
+            seen.add(token)
+            identifiers.append(token)
+
+    for value in raw_values:
+        if isinstance(value, dict):
+            for nested_key in ("network", "chain", "chain_id", "id", "name"):
+                nested_value = value.get(nested_key)
+                if nested_value not in (None, "", [], {}, (), set(), frozenset()):
+                    _append(nested_value)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                if isinstance(item, dict):
+                    for nested_key in ("network", "chain", "chain_id", "id", "name"):
+                        nested_value = item.get(nested_key)
+                        if nested_value not in (None, "", [], {}, (), set(), frozenset()):
+                            _append(nested_value)
+                else:
+                    _append(item)
+        else:
+            _append(value)
+    return identifiers
+
+
+def _build_paper_venue_diagnostics(candidate: dict, observation: dict) -> dict:
+    quote_timestamp = _paper_venue_diagnostics_timestamp(candidate, observation)
+    quote_age_ms = as_float(
+        _paper_venue_diagnostics_lookup(candidate, observation, "quote_age_ms", "market_data_freshness_ms"),
+        None,
+    )
+    if quote_age_ms is None:
+        freshness_age_seconds = as_float(
+            _paper_venue_diagnostics_lookup(candidate, observation, "freshness_age_seconds"),
+            None,
+        )
+        if freshness_age_seconds is not None:
+            quote_age_ms = freshness_age_seconds * 1000.0
+    quote_age_seconds = round(quote_age_ms / 1000.0, 6) if quote_age_ms is not None else None
+    best_bid = as_float(_paper_venue_diagnostics_lookup(candidate, observation, "best_bid", "bid"), None)
+    best_ask = as_float(_paper_venue_diagnostics_lookup(candidate, observation, "best_ask", "ask"), None)
+    spread_bps = as_float(
+        _paper_venue_diagnostics_lookup(
+            candidate,
+            observation,
+            "best_bid_ask_spread_bps",
+            "spread_bps",
+            "effective_spread_bps",
+        ),
+        None,
+    )
+    route_quality = candidate.get("route_quality")
+    if not isinstance(route_quality, dict):
+        route_quality = observation.get("route_quality")
+    route_quality = route_quality if isinstance(route_quality, dict) else {}
+    baseline_spread_bps = as_float(route_quality.get("venue_spread_baseline_bps"), None)
+    spread_ratio = as_float(route_quality.get("spread_to_baseline_ratio"), None)
+    spread_volatility_proxy_bps = (
+        round(abs(spread_bps - baseline_spread_bps), 6)
+        if spread_bps is not None and baseline_spread_bps is not None
+        else None
+    )
+    spread_volatility_proxy_ratio = (
+        round(abs(spread_ratio - 1.0), 6)
+        if spread_ratio is not None
+        else None
+    )
+
+    bid_notional_usd, bid_depth_basis = _top_of_book_notional_usd(observation, "bid")
+    ask_notional_usd, ask_depth_basis = _top_of_book_notional_usd(observation, "ask")
+    depth_candidates = [value for value in (bid_notional_usd, ask_notional_usd) if value is not None]
+    top_depth_usd = min(depth_candidates) if depth_candidates else as_float(
+        _paper_venue_diagnostics_lookup(candidate, observation, "top_of_book_depth_usd", "top_of_book_depth_notional"),
+        None,
+    )
+    depth_basis = (
+        "two_sided_top_level"
+        if bid_notional_usd is not None and ask_notional_usd is not None
+        else bid_depth_basis if bid_notional_usd is not None else ask_depth_basis
+    )
+    slippage_proxy_bps = max(
+        (
+            value
+            for value in (
+                as_float(_paper_venue_diagnostics_lookup(candidate, observation, "estimated_slippage_bps"), None),
+                as_float(_paper_venue_diagnostics_lookup(candidate, observation, "entry_slippage_bps_estimate"), None),
+                as_float(_paper_venue_diagnostics_lookup(candidate, observation, "exit_slippage_bps_estimate"), None),
+            )
+            if value is not None
+        ),
+        default=None,
+    )
+    venue_health_score = as_float(_paper_venue_diagnostics_lookup(candidate, observation, "venue_health_score"), None)
+    venue_confidence_score = as_float(
+        _paper_venue_diagnostics_lookup(candidate, observation, "venue_confidence_score"),
+        None,
+    )
+    if venue_confidence_score is None:
+        venue_score = as_float(_paper_venue_diagnostics_lookup(candidate, observation, "venue_score"), None)
+        if venue_score is not None:
+            venue_confidence_score = max(0.0, min(1.0, venue_score / 100.0))
+        elif venue_health_score is not None:
+            venue_confidence_score = max(0.0, min(1.0, venue_health_score / 100.0))
+    mapping_confidence, mapping_source = _paper_venue_diagnostics_confidence(candidate, observation)
+    deposit_status, deposit_public = _paper_venue_diagnostics_access_status(candidate, observation, "deposit")
+    withdrawal_status, withdrawal_public = _paper_venue_diagnostics_access_status(candidate, observation, "withdrawal")
+    network_identifiers = _normalize_paper_network_identifiers(candidate, observation)
+    venue_symbol = _paper_venue_diagnostics_venue_symbol(candidate, observation)
+    freshness_state = _paper_venue_diagnostics_lookup(candidate, observation, "freshness_state")
+    freshness_basis = _paper_venue_diagnostics_lookup(candidate, observation, "freshness_basis")
+    latency_ms = as_float(_paper_venue_diagnostics_lookup(candidate, observation, "latency_ms"), None)
+    depth_latency_ms = as_float(_paper_venue_diagnostics_lookup(candidate, observation, "depth_latency_ms"), None)
+
+    missing_data_flags = []
+    if best_bid is None or best_ask is None:
+        missing_data_flags.append("top_of_book_missing")
+    if quote_timestamp is None:
+        missing_data_flags.append("quote_timestamp_missing")
+    if quote_age_seconds is None:
+        missing_data_flags.append("quote_age_missing")
+    if baseline_spread_bps is None:
+        missing_data_flags.append("spread_baseline_missing")
+    if top_depth_usd is None:
+        missing_data_flags.append("displayed_depth_missing")
+    if slippage_proxy_bps is None:
+        missing_data_flags.append("slippage_proxy_missing")
+    if freshness_state in (None, ""):
+        missing_data_flags.append("freshness_state_missing")
+    if venue_health_score is None:
+        missing_data_flags.append("venue_health_missing")
+    if not deposit_public:
+        missing_data_flags.append("deposit_status_unknown")
+    if not withdrawal_public:
+        missing_data_flags.append("withdrawal_status_unknown")
+    if not network_identifiers:
+        missing_data_flags.append("network_identifiers_missing")
+    if venue_symbol in (None, ""):
+        missing_data_flags.append("venue_symbol_missing")
+    if mapping_confidence is None:
+        missing_data_flags.append("symbol_mapping_confidence_missing")
+
+    return {
+        "paper_only": True,
+        "diagnostic_version": "frontier_paper_venue_diagnostics_v1",
+        "emission_action": "diagnostics_ranking_sizing_only",
+        "venue": str(candidate.get("venue") or observation.get("venue") or ""),
+        "inst_id": str(candidate.get("inst_id") or observation.get("instrument_id") or ""),
+        "symbol": str(candidate.get("symbol") or observation.get("symbol") or ""),
+        "top_of_book": {
+            "best_bid": round(best_bid, 12) if best_bid is not None else None,
+            "best_ask": round(best_ask, 12) if best_ask is not None else None,
+            "quote_timestamp": quote_timestamp,
+            "quote_age_ms": round(quote_age_ms, 6) if quote_age_ms is not None else None,
+            "quote_age_seconds": quote_age_seconds,
+        },
+        "spread_statistics": {
+            "current_spread_bps": round(spread_bps, 6) if spread_bps is not None else None,
+            "venue_spread_baseline_bps": round(baseline_spread_bps, 6) if baseline_spread_bps is not None else None,
+            "spread_to_baseline_ratio": round(spread_ratio, 6) if spread_ratio is not None else None,
+            "spread_volatility_proxy_bps": spread_volatility_proxy_bps,
+            "spread_volatility_proxy_ratio": spread_volatility_proxy_ratio,
+            "spread_volatility_method": (
+                "baseline_deviation_proxy"
+                if spread_volatility_proxy_bps is not None or spread_volatility_proxy_ratio is not None
+                else "unavailable"
+            ),
+        },
+        "displayed_depth": {
+            "bid_notional_usd": round(bid_notional_usd, 6) if bid_notional_usd is not None else None,
+            "ask_notional_usd": round(ask_notional_usd, 6) if ask_notional_usd is not None else None,
+            "top_of_book_depth_usd": round(top_depth_usd, 6) if top_depth_usd is not None else None,
+            "depth_basis": depth_basis,
+            "slippage_proxy_bps": round(slippage_proxy_bps, 6) if slippage_proxy_bps is not None else None,
+            "depth_to_size_ratio": (
+                round(as_float(route_quality.get("depth_to_size_ratio"), None), 6)
+                if as_float(route_quality.get("depth_to_size_ratio"), None) is not None
+                else None
+            ),
+        },
+        "venue_health": {
+            "source_status": str(observation.get("data_status") or candidate.get("data_status") or "unknown"),
+            "http_status": observation.get("http_status") or candidate.get("http_status"),
+            "latency_ms": round(latency_ms, 6) if latency_ms is not None else None,
+            "depth_latency_ms": round(depth_latency_ms, 6) if depth_latency_ms is not None else None,
+            "freshness_state": freshness_state,
+            "freshness_basis": freshness_basis,
+            "freshness_age_seconds": as_float(
+                _paper_venue_diagnostics_lookup(candidate, observation, "freshness_age_seconds"),
+                None,
+            ),
+            "venue_health_score": round(venue_health_score, 6) if venue_health_score is not None else None,
+            "uptime_status": _paper_venue_diagnostics_lookup(
+                candidate,
+                observation,
+                "uptime_status",
+                "availability_status",
+                "health_status",
+            ),
+        },
+        "access_status": {
+            "deposit_status": deposit_status,
+            "withdrawal_status": withdrawal_status,
+            "publicly_reported": bool(deposit_public or withdrawal_public),
+        },
+        "network_normalization": {
+            "identifiers": network_identifiers,
+            "source": "public_observation" if network_identifiers else None,
+        },
+        "symbol_mapping": {
+            "venue_symbol": venue_symbol,
+            "base": candidate.get("base") or observation.get("base"),
+            "quote": candidate.get("quote") or observation.get("quote"),
+            "mapping_confidence": round(mapping_confidence, 6) if mapping_confidence is not None else None,
+            "mapping_source": mapping_source,
+        },
+        "venue_confidence_score": round(venue_confidence_score, 6) if venue_confidence_score is not None else None,
+        "missing_data_flags": missing_data_flags,
+    }
+
+
 def _frontier_reference_peer_rows(
     observation: dict,
     reference_observations: list[dict] | None,
@@ -12311,7 +12641,9 @@ def _candidate_from_observation(
     )
     _annotate_frontier_quote_context(candidate, observation, settings)
     candidate = _apply_frontier_marketability_gate(candidate, observation, settings, reference_observations)
-    return _annotate_frontier_short_paper_diagnostics(candidate, observation, settings)
+    candidate = _annotate_frontier_short_paper_diagnostics(candidate, observation, settings)
+    candidate["paper_venue_diagnostics"] = _build_paper_venue_diagnostics(candidate, observation)
+    return candidate
 
 
 def _strategy_lab_observation(row: dict) -> dict:
@@ -12842,6 +13174,7 @@ def summarize(
             "paper_route_feasibility_shadow_label": row.get(
                 "paper_route_feasibility_shadow_label"
             ),
+            "paper_venue_diagnostics": row.get("paper_venue_diagnostics"),
         }
         for row in candidates[:20]
     ]

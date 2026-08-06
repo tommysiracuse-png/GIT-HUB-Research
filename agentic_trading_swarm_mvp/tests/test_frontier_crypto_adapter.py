@@ -1385,6 +1385,91 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             places=3,
         )
 
+    def test_paper_venue_diagnostics_normalize_public_route_observability(self) -> None:
+        cfg = settings()
+        peer = self._quality_obs("REFERENCE", "BTC-USDT", "BTC", "USDT", 100.0, 1_000_000, quality_score=90)
+        local = self._quality_obs("VALR", "BTC-ZAR", "BTC", "ZAR", 101.0, 100_000, quality_score=88, region="Africa")
+        local.update(
+            {
+                "last_trade_timestamp": "2026-08-05T17:00:00+00:00",
+                "deposit_enabled": True,
+                "withdrawal_enabled": False,
+                "instrument_metadata": {
+                    "venue_symbol": "BTCZAR",
+                    "networks": ["erc20", {"chain_id": "tron"}],
+                },
+                "route_quality": {
+                    "venue_spread_baseline_bps": 10.0,
+                    "spread_to_baseline_ratio": 2.0,
+                    "depth_to_size_ratio": 2.5,
+                },
+            }
+        )
+
+        candidate = frontier._candidate_from_observation(
+            local,
+            cfg,
+            100.0,
+            2,
+            reference_observations=[local, peer],
+        )
+
+        diagnostics = candidate["paper_venue_diagnostics"]
+        self.assertTrue(diagnostics["paper_only"])
+        self.assertEqual("frontier_paper_venue_diagnostics_v1", diagnostics["diagnostic_version"])
+        self.assertEqual("diagnostics_ranking_sizing_only", diagnostics["emission_action"])
+        self.assertEqual(100.9899, diagnostics["top_of_book"]["best_bid"])
+        self.assertEqual(101.0101, diagnostics["top_of_book"]["best_ask"])
+        self.assertEqual("2026-08-05T17:00:00+00:00", diagnostics["top_of_book"]["quote_timestamp"])
+        self.assertEqual(5.0, diagnostics["top_of_book"]["quote_age_seconds"])
+        self.assertAlmostEqual(candidate["spread_bps"], diagnostics["spread_statistics"]["current_spread_bps"], places=6)
+        self.assertEqual(10.0, diagnostics["spread_statistics"]["venue_spread_baseline_bps"])
+        self.assertEqual(2.0, diagnostics["spread_statistics"]["spread_to_baseline_ratio"])
+        self.assertEqual("baseline_deviation_proxy", diagnostics["spread_statistics"]["spread_volatility_method"])
+        self.assertEqual(2000.0, diagnostics["displayed_depth"]["top_of_book_depth_usd"])
+        self.assertEqual(2.0, diagnostics["displayed_depth"]["slippage_proxy_bps"])
+        self.assertEqual(2.5, diagnostics["displayed_depth"]["depth_to_size_ratio"])
+        self.assertEqual("reachable", diagnostics["venue_health"]["source_status"])
+        self.assertEqual(88.0, diagnostics["venue_health"]["venue_health_score"])
+        self.assertEqual("available", diagnostics["access_status"]["deposit_status"])
+        self.assertEqual("unavailable", diagnostics["access_status"]["withdrawal_status"])
+        self.assertTrue(diagnostics["access_status"]["publicly_reported"])
+        self.assertEqual(["ERC20", "TRON"], diagnostics["network_normalization"]["identifiers"])
+        self.assertEqual("BTC-ZAR", diagnostics["symbol_mapping"]["venue_symbol"])
+        self.assertEqual(0.8, diagnostics["symbol_mapping"]["mapping_confidence"])
+        self.assertEqual("observed_mapping_confidence", diagnostics["symbol_mapping"]["mapping_source"])
+        self.assertGreater(diagnostics["venue_confidence_score"], 0.0)
+        self.assertNotIn("network_identifiers_missing", diagnostics["missing_data_flags"])
+        self.assertNotIn("deposit_status_unknown", diagnostics["missing_data_flags"])
+
+    def test_paper_venue_diagnostics_preserve_missing_public_fields_as_flags(self) -> None:
+        cfg = settings()
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
+        local = self._quality_obs("MEXC", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+        local.pop("route_mapping_confidence", None)
+        local.pop("venue_health_score", None)
+        local.pop("venue_health", None)
+        local.pop("instrument_metadata", None)
+        local.pop("route_quality", None)
+
+        candidate = frontier._candidate_from_observation(
+            local,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[local, peer],
+        )
+
+        diagnostics = candidate["paper_venue_diagnostics"]
+        self.assertIn("venue_health_missing", diagnostics["missing_data_flags"])
+        self.assertIn("deposit_status_unknown", diagnostics["missing_data_flags"])
+        self.assertIn("withdrawal_status_unknown", diagnostics["missing_data_flags"])
+        self.assertIn("network_identifiers_missing", diagnostics["missing_data_flags"])
+        self.assertEqual("ABC-USDT", diagnostics["symbol_mapping"]["venue_symbol"])
+        self.assertEqual(1.0, diagnostics["symbol_mapping"]["mapping_confidence"])
+        self.assertEqual("parser_symbol_normalization", diagnostics["symbol_mapping"]["mapping_source"])
+        self.assertFalse(candidate["paper_entry_blocked"])
+
     def test_marketability_diagnostics_preserve_exploration_when_venue_telemetry_is_missing(self) -> None:
         cfg = settings()
         peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
