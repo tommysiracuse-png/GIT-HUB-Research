@@ -117,6 +117,7 @@ class IndonesiaCommodityDerivativesExchangeIcdxAdapterTests(unittest.TestCase):
         self.assertEqual(2018, milestone_rows[0]["gofx_launch_year"])
         self.assertEqual(["COFR", "COFU10", "COFU100"], milestone_rows[0]["crude_oil_contract_codes"])
         self.assertEqual(ABOUT_URL, milestone_rows[0]["source_url"])
+        self.assertGreater(milestone_rows[0]["exchange_age_years"], 0.0)
 
         self.assertEqual(2, len(price_rows))
         suggested, settlement = price_rows
@@ -132,6 +133,30 @@ class IndonesiaCommodityDerivativesExchangeIcdxAdapterTests(unittest.TestCase):
         self.assertEqual("official_price_card_reference", settlement["trade_type"])
         self.assertEqual("previous_settlement_reference", settlement["session_status"])
         self.assertTrue(all(row["source_url"] == HOME_URL for row in price_rows))
+
+    def test_scan_enriches_milestone_surface_with_public_cpotr_companion_price(self) -> None:
+        with mock.patch(
+            "adapters.venues.indonesia_commodity_derivatives_exchange_icdx.fetch_text",
+            side_effect=[
+                fetch_result(HOME_PAGE),
+                fetch_result(EXCHANGE_PAGE),
+                fetch_result(CPO_PAGE),
+                fetch_result(ABOUT_PAGE),
+            ],
+        ):
+            batch = IndonesiaCommodityDerivativesExchangeIcdxAdapter().scan({})
+
+        milestone = next(row for row in batch.observations if row["inst_id"] == "ICDX:MARKET_MILESTONES")
+        self.assertEqual("icdx_exchange_milestones", milestone["market_surface"])
+        self.assertEqual(16280.0, milestone["last"])
+        self.assertEqual("verified_proxy", milestone["quality_status"])
+        self.assertEqual("public_companion_cpotr_previous_settlement", milestone["price_basis"])
+        self.assertEqual("public_companion_price_requires_strategy_logic", milestone["candidate_reject_reason"])
+        self.assertEqual("ICDX:CPOTR:AUG26:YDSP", milestone["companion_inst_id"])
+        self.assertEqual(HOME_URL, milestone["source_url"])
+        self.assertEqual(ABOUT_URL, milestone["source_timeline_url"])
+        self.assertEqual(1.0, milestone["cpotr_price_card_pair_observed"])
+        self.assertGreater(milestone["cpotr_opening_gap_bps"], 0.0)
 
     def test_adapter_preserves_fetch_and_parser_failure_evidence(self) -> None:
         blocked = {

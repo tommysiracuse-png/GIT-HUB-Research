@@ -164,6 +164,44 @@ class MarketAdmissionBridgeTests(unittest.TestCase):
         self.assertIn("cpotr_opening_gap_bps", requirements["required_fields"])
         self.assertTrue(json.loads(row["risk_gates_json"])["synthetic_research_only"])
 
+    def test_icdx_quality_verified_milestones_create_canonical_companion_program(self) -> None:
+        milestone_state = state(
+            "quality_verified",
+            venue="ICDX",
+            inst_id="ICDX:MARKET_MILESTONES",
+            market_surface="icdx_exchange_milestones",
+            session_status="previous_settlement_reference",
+            details={
+                "adapter_id": "indonesia_commodity_derivatives_exchange_icdx",
+                "quality_status": "verified_proxy",
+                "candidate_reject_reason": "public_companion_price_requires_strategy_logic",
+                "route_status": "unknown",
+            },
+        )
+        result = market_admission_bridge.run_market_admission_bridge(
+            self.conn, self.settings, {"states": [milestone_state]}
+        )
+        row = self.conn.execute(
+            "select strategy_lab_id, strategy_logic_json, data_requirements_json, risk_gates_json from strategy_lab_experiments"
+        ).fetchone()
+
+        self.assertEqual(1, result["summary"]["actions_created"])
+        self.assertEqual("strategy_lab_icdx_milestones_program", result["actions"][0]["action"])
+        self.assertEqual("icdx_exchange_milestones_companion_v1", row["strategy_lab_id"])
+        logic = json.loads(row["strategy_logic_json"])
+        self.assertEqual("observation_program", logic["type"])
+        self.assertEqual("proxy", logic["route_surface"])
+        self.assertIn("cpotr_opening_gap_bps > 0", logic["long_expression"])
+        self.assertIn(
+            "years_since_cpotr_launch + years_since_gofx_launch",
+            logic["calculated_features"]["milestone_reference_depth_years"],
+        )
+        requirements = json.loads(row["data_requirements_json"])
+        self.assertEqual("indonesia_commodity_derivatives_exchange_icdx", requirements["adapter_id"])
+        self.assertIn("source_timeline_url", requirements["required_fields"])
+        self.assertIn("years_since_gofx_launch", requirements["required_fields"])
+        self.assertTrue(json.loads(row["risk_gates_json"])["synthetic_research_only"])
+
     def test_carb_closed_priceable_allowance_results_create_canonical_auction_reference_program(self) -> None:
         carb_state = state(
             "priceable",

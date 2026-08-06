@@ -29,6 +29,8 @@ ADX_DERIVATIVES_SURFACE = "adx_equity_and_index_futures_contract_catalog"
 ADX_DERIVATIVES_LAB_ID = "adx_derivatives_companion_quote_v1"
 ICDX_CPOTR_SURFACE = "icdx_cpotr"
 ICDX_CPOTR_LAB_ID = "icdx_cpotr_price_card_reference_v1"
+ICDX_MILESTONES_SURFACE = "icdx_exchange_milestones"
+ICDX_MILESTONES_LAB_ID = "icdx_exchange_milestones_companion_v1"
 CARB_ALLOWANCE_SURFACE = "california_quebec_cap_and_invest_joint_allowance_auctions"
 CARB_ALLOWANCE_LAB_ID = "carb_joint_allowance_discount_tightness_v1"
 
@@ -521,6 +523,130 @@ def _create_icdx_cpotr_price_card_program(
     }
 
 
+def _create_icdx_milestones_companion_program(
+    conn: sqlite3.Connection,
+    settings: dict,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the canonical ICDX milestone companion program.
+
+    The ICDX milestone page is reference-only, but the repaired adapter now
+    preserves those launch-year facts on the same surface while attaching a
+    defensible public CPOTR homepage companion price. The program turns that
+    exact-surface context into synthetic paper research without claiming an
+    executable ICDX order route.
+    """
+
+    claim = _claim(conn, state, "activate_icdx_exchange_milestones_companion_program", 90)
+    if claim.duplicate and claim.canonical_row_id:
+        return {
+            "action": "strategy_lab_icdx_milestones_program",
+            "status": "deduplicated",
+            "topic_key": claim.topic_key,
+        }
+    evidence = _evidence(state)
+    details = state.get("details") if isinstance(state.get("details"), dict) else {}
+    rec = {
+        "recommendation_id": f"market_admission:{state['admission_key']}:icdx_milestones_program",
+        "source_agent": "market_admission_bridge",
+        "payload": {
+            "agent_name": "market_admission_bridge",
+            "title": "Paper-test ICDX exchange milestones via CPOTR companion pricing",
+            "rationale": (
+                "ICDX's milestone timeline is reference-only, but the repaired adapter now keeps those launch "
+                "facts on the same surface while attaching a public CPOTR price-card companion. That preserves "
+                "exact provenance and enables same-surface synthetic paper research without implying an executable "
+                "ICDX route."
+            ),
+            "strategy_lab_experiment": {
+                "strategy_lab_id": ICDX_MILESTONES_LAB_ID,
+                "experiment_type": "market_strategy",
+                "hypothesis": (
+                    "When ICDX's milestone surface carries a fresh CPOTR price-card companion, the signed CPOTR "
+                    "opening gap can drive same-surface synthetic paper tests while the launch-year timeline "
+                    "anchors the structural market context."
+                ),
+                "source_surface": ICDX_MILESTONES_SURFACE,
+                "permitted_target_surface": [ICDX_MILESTONES_SURFACE],
+                "strategy_logic": {
+                    "type": "observation_program",
+                    "universe": {
+                        "venues": ["ICDX"],
+                        "trade_types": ["official_market_milestone_reference"],
+                        "market_surfaces": [ICDX_MILESTONES_SURFACE],
+                    },
+                    "calculated_features": {
+                        "milestone_reference_depth_years": (
+                            "years_since_cpotr_launch + years_since_gofx_launch + "
+                            "years_since_crude_oil_contract_launch"
+                        ),
+                        "milestone_proxy_gap_abs_bps": "abs(cpotr_opening_gap_bps)",
+                        "milestone_structural_signal": "min(milestone_reference_depth_years, 40)",
+                    },
+                    "entry_expression": (
+                        "market_surface == 'icdx_exchange_milestones' "
+                        "and price_basis == 'public_companion_cpotr_previous_settlement' "
+                        "and quality_status == 'verified_proxy' "
+                        "and candidate_reject_reason == 'public_companion_price_requires_strategy_logic' "
+                        "and freshness_state == 'fresh' "
+                        "and cpotr_price_card_pair_observed >= 1 "
+                        "and last > 0"
+                    ),
+                    "invalidation_expression": (
+                        "freshness_state != 'fresh' or cpotr_price_card_pair_observed < 1 or last <= 0"
+                    ),
+                    "long_expression": "cpotr_opening_gap_bps > 0",
+                    "short_expression": "cpotr_opening_gap_bps < 0",
+                    "edge_expression": "milestone_proxy_gap_abs_bps + milestone_structural_signal",
+                    "score_expression": (
+                        "clip(45 + min(milestone_proxy_gap_abs_bps, 80) / 2 + milestone_structural_signal / 4, 0, 100)"
+                    ),
+                    "route_surface": "proxy",
+                },
+                "data_requirements": {
+                    "admission_key": state.get("admission_key"),
+                    "adapter_id": details.get("adapter_id"),
+                    "market_surface": ICDX_MILESTONES_SURFACE,
+                    "required_fields": [
+                        "last",
+                        "price_basis",
+                        "price_source",
+                        "source_url",
+                        "source_timeline_url",
+                        "cpotr_price_card_pair_observed",
+                        "suggested_opening_price",
+                        "previous_settlement_price",
+                        "cpotr_opening_gap_bps",
+                        "exchange_established_year",
+                        "cpotr_launch_year",
+                        "gofx_launch_year",
+                        "years_since_cpotr_launch",
+                        "years_since_gofx_launch",
+                        "years_since_crude_oil_contract_launch",
+                    ],
+                    "requires_independent_signal_logic": True,
+                    "paper_only_reference": True,
+                },
+                "risk_gates": {
+                    "require_route_feasible": False,
+                    "paper_allocation_multiplier": 0.25,
+                    "synthetic_research_only": True,
+                },
+            },
+            "evidence": evidence,
+        },
+    }
+    result = ingest_strategy_lab_recommendation(conn, rec, settings)[0]
+    if result.get("strategy_lab_id"):
+        bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
+    return {
+        "action": "strategy_lab_icdx_milestones_program",
+        "status": "created" if result.get("created") else "updated",
+        "strategy_lab_id": result.get("strategy_lab_id"),
+        "topic_key": claim.topic_key,
+    }
+
+
 def _create_carb_allowance_paper_program(
     conn: sqlite3.Connection,
     settings: dict,
@@ -842,6 +968,11 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
                 and str(state.get("market_surface") or "") == ADX_DERIVATIVES_SURFACE
             ):
                 actions.append(_create_adx_derivatives_companion_program(conn, settings, state))
+            elif (
+                str(state.get("venue") or "").upper() == "ICDX"
+                and str(state.get("market_surface") or "") == ICDX_MILESTONES_SURFACE
+            ):
+                actions.append(_create_icdx_milestones_companion_program(conn, settings, state))
             else:
                 actions.append(_create_strategy_discovery(conn, settings, state))
         elif stage == "strategy_candidate":

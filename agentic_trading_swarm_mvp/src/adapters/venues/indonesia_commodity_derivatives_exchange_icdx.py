@@ -88,6 +88,20 @@ def _number(value: str) -> float | None:
         return None
 
 
+def _years_since(reference_year: int | None, observed_at: dt.datetime) -> float:
+    if reference_year is None:
+        return 0.0
+    try:
+        normalized_year = int(reference_year)
+    except (TypeError, ValueError):
+        return 0.0
+    if normalized_year <= 0:
+        return 0.0
+    year_fraction = ((observed_at.timetuple().tm_yday - 1) / 365.25) if observed_at.timetuple().tm_yday > 0 else 0.0
+    observed_year = observed_at.year + year_fraction
+    return round(max(0.0, observed_year - normalized_year), 6)
+
+
 def _reference_row(
     *,
     inst_id: str,
@@ -272,6 +286,11 @@ def parse_icdx_about_milestones(
     if missing:
         raise IcdxParseError("ICDX about-us page is missing marker(s): " + "; ".join(missing))
     fetched_at = _received_at(received_at)
+    exchange_established_year = 2009
+    cpotr_launch_year = 2010
+    gofx_launch_year = 2018
+    gofx_micro_launch_year = 2019
+    crude_oil_contract_launch_year = 2020
     return [
         _reference_row(
             inst_id=f"{VENUE}:MARKET_MILESTONES",
@@ -289,15 +308,100 @@ def parse_icdx_about_milestones(
                 "ICDX milestone page dates CPOTR launch to 2010, GOFX launch to 2018, GOFX Micro to 2019, and COFR/COFU10/COFU100 launches to 2020."
             ],
             extra={
-                "exchange_established_year": 2009,
-                "cpotr_launch_year": 2010,
-                "gofx_launch_year": 2018,
-                "gofx_micro_launch_year": 2019,
-                "crude_oil_contract_launch_year": 2020,
+                "exchange_established_year": exchange_established_year,
+                "cpotr_launch_year": cpotr_launch_year,
+                "gofx_launch_year": gofx_launch_year,
+                "gofx_micro_launch_year": gofx_micro_launch_year,
+                "crude_oil_contract_launch_year": crude_oil_contract_launch_year,
                 "crude_oil_contract_codes": ["COFR", "COFU10", "COFU100"],
+                "exchange_age_years": _years_since(exchange_established_year, fetched_at),
+                "years_since_cpotr_launch": _years_since(cpotr_launch_year, fetched_at),
+                "years_since_gofx_launch": _years_since(gofx_launch_year, fetched_at),
+                "years_since_gofx_micro_launch": _years_since(gofx_micro_launch_year, fetched_at),
+                "years_since_crude_oil_contract_launch": _years_since(crude_oil_contract_launch_year, fetched_at),
+                "source_record_type": "about_us_milestone_timeline",
+                "source_timeline_url": source_url,
             },
         )
     ]
+
+
+def _apply_homepage_price_card_companion_to_milestones(
+    milestone_rows: list[dict[str, Any]],
+    homepage_price_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not milestone_rows or not homepage_price_rows:
+        return milestone_rows
+    suggested = next(
+        (
+            row
+            for row in homepage_price_rows
+            if str(row.get("price_type") or "") == "suggested_opening" and float(row.get("last") or 0.0) > 0.0
+        ),
+        None,
+    )
+    settlement = next(
+        (
+            row
+            for row in homepage_price_rows
+            if str(row.get("price_type") or "") == "previous_settlement" and float(row.get("last") or 0.0) > 0.0
+        ),
+        None,
+    )
+    chosen = settlement or suggested
+    if chosen is None:
+        return milestone_rows
+    suggested_price = float((suggested or {}).get("last") or 0.0)
+    settlement_price = float((settlement or {}).get("last") or 0.0)
+    pair_present = bool(suggested_price > 0.0 and settlement_price > 0.0)
+    opening_gap_bps = (
+        ((suggested_price - settlement_price) / settlement_price) * 10_000.0
+        if pair_present and settlement_price > 0.0
+        else 0.0
+    )
+    chosen_price_type = str(chosen.get("price_type") or "")
+    price_basis = (
+        "public_companion_cpotr_previous_settlement"
+        if chosen_price_type == "previous_settlement"
+        else "public_companion_cpotr_suggested_opening"
+    )
+    output: list[dict[str, Any]] = []
+    for row in milestone_rows:
+        enriched = dict(row)
+        enriched["last"] = float(chosen["last"])
+        enriched["quote"] = "IDR_PER_TONNE"
+        enriched["price_available"] = True
+        enriched["price_basis"] = price_basis
+        enriched["price_type"] = chosen_price_type
+        enriched["contract_month"] = str(chosen.get("contract_month") or "")
+        enriched["quality_status"] = "verified_proxy"
+        enriched["proxy_quality_status"] = "verified_proxy"
+        enriched["proxy_symbol"] = str(chosen.get("inst_id") or chosen.get("instrument_id") or "")
+        enriched["companion_inst_id"] = str(chosen.get("inst_id") or chosen.get("instrument_id") or "")
+        enriched["companion_price_type"] = chosen_price_type
+        enriched["companion_price_source"] = str(chosen.get("price_source") or "")
+        enriched["companion_source_url"] = str(chosen.get("source_url") or "")
+        enriched["source_timeline_url"] = str(row.get("source_timeline_url") or row.get("source_url") or ABOUT_URL)
+        enriched["source_url"] = str(chosen.get("source_url") or HOME_URL)
+        enriched["source_record_type"] = "milestone_timeline_with_homepage_price_card_companion"
+        enriched["price_source"] = str(chosen.get("price_source") or "ICDX homepage official price card")
+        enriched["freshness_state"] = str(chosen.get("freshness_state") or "fresh")
+        enriched["freshness_basis"] = "homepage_price_card_companion_fetch_time"
+        enriched["freshness_age_seconds"] = float(chosen.get("freshness_age_seconds") or 0.0)
+        enriched["session_status"] = str(chosen.get("session_status") or "unknown")
+        enriched["observed_at"] = str(chosen.get("observed_at") or row.get("observed_at") or "")
+        enriched["fetched_at"] = str(chosen.get("fetched_at") or row.get("fetched_at") or "")
+        enriched["price_reference_role"] = "milestone_surface_companion_price"
+        enriched["candidate_reject_reason"] = "public_companion_price_requires_strategy_logic"
+        enriched["cpotr_price_card_pair_observed"] = 1.0 if pair_present else 0.0
+        enriched["suggested_opening_price"] = suggested_price
+        enriched["previous_settlement_price"] = settlement_price
+        enriched["cpotr_opening_gap_bps"] = opening_gap_bps if pair_present else 0.0
+        enriched["notes"] = list(row.get("notes") or []) + [
+            "ICDX milestone surface carries the homepage CPOTR price-card companion so paper research can use a defensible public price without implying an executable order route."
+        ]
+        output.append(enriched)
+    return output
 
 
 def parse_icdx_homepage_price_cards(
@@ -473,6 +577,7 @@ class IndonesiaCommodityDerivativesExchangeIcdxAdapter:
         fetch_status = {key: _fetch_evidence(result, url) for key, (url, result) in results.items()}
         observations: list[dict[str, Any]] = []
         parser_failures: list[dict[str, str]] = []
+        homepage_price_rows: list[dict[str, Any]] = []
         parsers = {
             "homepage": parse_icdx_homepage_price_cards,
             "exchange": parse_icdx_exchange_surface,
@@ -485,13 +590,16 @@ class IndonesiaCommodityDerivativesExchangeIcdxAdapter:
                 observations.append(_failure_observation(source_key, source_url, result))
                 continue
             try:
-                observations.extend(
-                    parser(
-                        str(result.get("text") or ""),
-                        source_url=source_url,
-                        received_at=result.get("received_at"),
-                    )
+                parsed_rows = parser(
+                    str(result.get("text") or ""),
+                    source_url=source_url,
+                    received_at=result.get("received_at"),
                 )
+                if source_key == "homepage":
+                    homepage_price_rows = [dict(row) for row in parsed_rows]
+                if source_key == "about_us" and homepage_price_rows:
+                    parsed_rows = _apply_homepage_price_card_companion_to_milestones(parsed_rows, homepage_price_rows)
+                observations.extend(parsed_rows)
             except (IcdxParseError, TypeError, ValueError) as exc:
                 message = f"ICDX {source_key.replace('_', ' ')} parser failed: {exc}"[:300]
                 parser_failures.append({"source": source_key, "source_url": source_url, "error": message})
