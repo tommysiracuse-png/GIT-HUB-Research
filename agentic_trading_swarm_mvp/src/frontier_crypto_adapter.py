@@ -13033,6 +13033,9 @@ def summarize(
     cost_swallowed_check_counts: collections.Counter[str] = collections.Counter()
     short_net_edges = []
     short_cost_components: collections.Counter[str] = collections.Counter()
+    route_feasibility_reason_counts: collections.Counter[str] = collections.Counter()
+    route_feasibility_status_counts: collections.Counter[str] = collections.Counter()
+    route_feasibility_verified_exception_count = 0
     for row in candidates:
         marketability_failures.update((row.get("marketability_gate") or {}).get("failed_checks") or [])
         dislocation_quality_diagnostics.update(row.get("dislocation_quality_diagnostics") or [])
@@ -13066,6 +13069,17 @@ def summarize(
                 value = as_float(short_cost.get(key), None)
                 if value is not None:
                     short_cost_components[key] += value
+        route_feasibility_reason = str(row.get("route_feasibility_reason") or "").strip()
+        if route_feasibility_reason:
+            route_feasibility_reason_counts[route_feasibility_reason] += 1
+        if route_feasibility_reason and bool(row.get("paper_active_scoring_eligible", True)):
+            if route_feasibility_reason in {"verified_standard_short_route", "explicit_borrow_ok"}:
+                route_feasibility_status_counts["allowed_verified_exception"] += 1
+                route_feasibility_verified_exception_count += 1
+            else:
+                route_feasibility_status_counts["allowed_other_route_reason"] += 1
+        elif bool(row.get("paper_route_feasibility_shadow_label")):
+            route_feasibility_status_counts["shadow_only_route_feasibility"] += 1
     active_candidate_count = sum(
         1
         for row in candidates
@@ -13090,6 +13104,9 @@ def summarize(
         "active_paper_review_candidates": active_candidate_count,
         "shadow_or_observe_only_candidates": shadow_only_candidate_count,
         "route_feasibility_shadow_candidates": route_feasibility_shadow_count,
+        "route_feasibility_verified_exception_candidates": route_feasibility_verified_exception_count,
+        "route_feasibility_reason_counts": dict(route_feasibility_reason_counts),
+        "route_feasibility_status_counts": dict(route_feasibility_status_counts),
         "regional_admitted_candidates": regional_candidate_blockers.get("passed", 0),
         "regional_blocked_candidates": sum(
             count
@@ -13210,6 +13227,14 @@ def summarize(
         "active_paper_review_candidate_count": active_candidate_count,
         "shadow_or_observe_only_candidate_count": shadow_only_candidate_count,
         "candidate_activity": candidate_activity,
+        "paper_short_route_gate": {
+            "enabled": bool(route_feasibility_reason_counts or route_feasibility_shadow_count),
+            "candidate_count": sum(route_feasibility_reason_counts.values()),
+            "shadow_candidate_count": route_feasibility_shadow_count,
+            "verified_exception_count": route_feasibility_verified_exception_count,
+            "status_counts": dict(route_feasibility_status_counts),
+            "route_feasibility_reason_counts": dict(route_feasibility_reason_counts),
+        },
         "by_preliminary_route_status": dict(route_status),
         "by_route_blocker": dict(route_blockers),
         "venue_quote_context": venue_quote_context,

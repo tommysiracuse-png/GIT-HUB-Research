@@ -1048,7 +1048,6 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             reference_observations=[local, peer],
         )
         frontier.rank_frontier_paper_candidates([candidate], cfg)
-
         costs = candidate["short_cost_decomposition"]
         expected_net = (
             costs["gross_edge_bps"]
@@ -1065,6 +1064,52 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual("unconfirmed_borrow_proxy", costs["borrow_proxy_source"])
         self.assertEqual("short_cost_decomposition.net_edge_bps", candidate["paper_ranking_edge_source"])
         self.assertFalse(candidate["paper_entry_blocked"])
+
+    def test_summary_breaks_out_route_feasibility_reasons_and_verified_exceptions(self) -> None:
+        gated = {
+            "inst_id": "BITSO:EDGE-USDT",
+            "venue": "BITSO",
+            "direction": "short_frontier_spot",
+            "paper_active_scoring_eligible": False,
+            "paper_route_feasibility_shadow_label": True,
+            "route_feasibility_reason": "conditional_short_paper_metadata_missing",
+            "candidate_reject_reason": "conditional_short_paper_metadata_missing",
+        }
+        verified = {
+            "inst_id": "GATE:EDGE-USDT",
+            "venue": "GATE",
+            "direction": "short_frontier_spot",
+            "paper_active_scoring_eligible": True,
+            "paper_route_feasibility_shadow_label": False,
+            "route_feasibility_reason": "verified_standard_short_route",
+        }
+
+        summary = frontier.summarize([], [gated, verified])
+
+        self.assertEqual(
+            1,
+            summary["candidate_activity"]["route_feasibility_reason_counts"][
+                "conditional_short_paper_metadata_missing"
+            ],
+        )
+        self.assertEqual(
+            1,
+            summary["candidate_activity"]["route_feasibility_reason_counts"][
+                "verified_standard_short_route"
+            ],
+        )
+        self.assertEqual(
+            1,
+            summary["candidate_activity"]["route_feasibility_verified_exception_candidates"],
+        )
+        self.assertEqual(
+            1,
+            summary["paper_short_route_gate"]["status_counts"]["allowed_verified_exception"],
+        )
+        self.assertEqual(
+            1,
+            summary["paper_short_route_gate"]["status_counts"]["shadow_only_route_feasibility"],
+        )
 
     def test_short_cost_decomposition_reorders_synthetic_route_by_net_edge(self) -> None:
         cfg = settings()
