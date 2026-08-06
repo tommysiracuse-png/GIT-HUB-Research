@@ -202,6 +202,86 @@ class SelfImprovementOpenPackTests(unittest.TestCase):
         self.assertIn("regional_time_zone_cohort_mismatch", analysis["localization_summary"]["likely_decay_sources"])
         self.assertIn("directional_asymmetry", analysis["localization_summary"]["likely_decay_sources"])
 
+    def test_yahoo_proxy_decay_analysis_exposes_horizon_and_cost_buckets(self) -> None:
+        conn = make_conn()
+        for index in range(10):
+            candidate = {
+                "route_surface": "proxy",
+                "provider_age_seconds": 120.0,
+                "spread_bps": 4.0,
+                "region": "emea",
+                "timezone": "Europe/London",
+                "seen_at": "2026-08-01T12:03:00+00:00",
+                "source_quote_timestamp": "2026-08-01T12:00:00+00:00",
+            }
+            cur = conn.execute(
+                """
+                insert into paper_trades (
+                    opened_at, venue, inst_id, direction, trade_type, signal_key,
+                    base_score, learned_score, entry, status, thesis,
+                    candidate_json, review_json, context_json, entry_fee_bps, entry_slippage_bps
+                ) values (?, 'YAHOO_PROXY', ?, 'long_proxy', 'global_proxy_momentum',
+                          'YAHOO_PROXY|global_proxy_momentum|long_proxy|standard',
+                          70, 70, 100, 'closed', 'test', ?, '{}', '{}', 3, 2)
+                """,
+                ("2026-08-01T12:03:00+00:00", f"COST{index}", json.dumps(candidate)),
+            )
+            trade_id = cur.lastrowid
+            for horizon, price, pnl, context in (
+                (15, 99.75, -25.0, "{}"),
+                (
+                    60,
+                    100.05,
+                    -7.0,
+                    json.dumps(
+                        {
+                            "paper_realized_cost_audit": {
+                                "paper_only": True,
+                                "charged_cost_bps": 5.0,
+                                "realized_cost_backfill_bps": 7.0,
+                            }
+                        }
+                    ),
+                ),
+                (240, 100.14, 14.0, "{}"),
+            ):
+                conn.execute(
+                    """
+                    insert into paper_trade_outcomes (
+                        trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                        context_json, measurement_status, delay_seconds
+                    ) values (?, ?, ?, ?, ?, ?, 'valid', 5)
+                    """,
+                    (trade_id, horizon, utc_now(), price, pnl, context),
+                )
+        conn.commit()
+
+        report = pack.build_open_pack_report(conn, DEFAULT_SETTINGS)
+        analysis = report["signal_repair_diagnostics"]["yahoo_proxy_decay_analysis"]
+        by_hypothesis = {
+            item["hypothesis"]: item
+            for item in analysis["counterfactual_hypothesis_tests"]
+        }
+
+        self.assertEqual(30, analysis["reliable_label_count"])
+        self.assertEqual(10, analysis["unique_trade_count"])
+        self.assertEqual(60, analysis["primary_horizon_minutes"])
+        self.assertEqual(-25.0, analysis["forward_return_horizons"]["15"]["avg_net_pnl_bps"])
+        self.assertEqual(-7.0, analysis["forward_return_horizons"]["60"]["avg_net_pnl_bps"])
+        self.assertEqual(14.0, analysis["forward_return_horizons"]["240"]["avg_net_pnl_bps"])
+        self.assertEqual("cost_drag", analysis["leading_counterfactual_hypothesis"])
+        self.assertEqual("confirmed", by_hypothesis["cost_drag"]["status"])
+        self.assertEqual("confirmed", by_hypothesis["horizon_or_sign_mismatch"]["status"])
+        self.assertEqual(12.0, analysis["counterfactual_cost_summary"]["avg_total_realized_cost_bps"])
+        self.assertEqual(
+            "moderate_8_to_16bps",
+            analysis["realized_cost_bucket_outcomes"][0]["realized_total_cost_bucket"],
+        )
+        self.assertEqual(
+            "cost_drag_flipped_negative",
+            analysis["cost_drag_bucket_outcomes"][0]["cost_drag_bucket"],
+        )
+
     def test_duplicate_text_matches_open_pack_scope(self) -> None:
         self.assertTrue(pack.is_duplicate_open_pack_text("Add Kalshi read-only public event market coverage"))
         self.assertTrue(pack.is_duplicate_open_pack_text("Resolve spot borrow route data for frontier shorts"))

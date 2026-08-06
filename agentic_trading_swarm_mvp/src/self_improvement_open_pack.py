@@ -16,6 +16,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from storage import RUNS_DIR
+import yahoo_counterfactual
 
 
 IMPLEMENTED_STATUS = "implemented_self_improvement_open_pack_2026_06_29"
@@ -469,10 +470,17 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
             "unique_trade_count": 0,
             "primary_horizon_minutes": None,
             "direction_horizon_curves": {},
+            "forward_return_horizons": {},
+            "holding_horizon_bucket_outcomes": [],
             "route_surface_outcomes": [],
             "proxy_cohort_outcomes": [],
             "signal_age_outcomes": [],
             "spread_bucket_outcomes": [],
+            "realized_cost_bucket_outcomes": [],
+            "cost_drag_bucket_outcomes": [],
+            "counterfactual_cost_summary": {},
+            "counterfactual_hypothesis_tests": [],
+            "leading_counterfactual_hypothesis": None,
             "regional_timezone_outcomes": [],
             "localization_summary": {
                 "localized_decay_detected": False,
@@ -519,6 +527,8 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
 
     primary_horizon = 60 if by_horizon_count.get(60) else min(by_horizon_count)
     primary_rows = [row for row in all_primary_candidates if row["horizon_minutes"] == primary_horizon]
+    counterfactual_report = yahoo_counterfactual.build_report(conn)
+    counterfactual_attribution = counterfactual_report.get("diagnostic_attribution") or {}
 
     route_values: dict[str, list[float]] = collections.defaultdict(list)
     cohort_values: dict[str, list[float]] = collections.defaultdict(list)
@@ -591,10 +601,17 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
         "unique_trade_count": len({int(row["id"]) for row in rows}),
         "primary_horizon_minutes": primary_horizon,
         "direction_horizon_curves": direction_curves,
+        "forward_return_horizons": counterfactual_attribution.get("forward_return_horizons", {}),
+        "holding_horizon_bucket_outcomes": counterfactual_attribution.get("holding_horizon_bucket_outcomes", []),
         "route_surface_outcomes": route_rows,
         "proxy_cohort_outcomes": cohort_rows,
         "signal_age_outcomes": age_rows,
         "spread_bucket_outcomes": spread_rows,
+        "realized_cost_bucket_outcomes": counterfactual_attribution.get("realized_cost_bucket_outcomes", []),
+        "cost_drag_bucket_outcomes": counterfactual_attribution.get("cost_drag_bucket_outcomes", []),
+        "counterfactual_cost_summary": counterfactual_attribution.get("cost_summary", {}),
+        "counterfactual_hypothesis_tests": counterfactual_attribution.get("hypothesis_tests", []),
+        "leading_counterfactual_hypothesis": counterfactual_attribution.get("leading_hypothesis"),
         "regional_timezone_outcomes": regional_timezone_rows,
         "localization_summary": {
             "localized_decay_detected": localized,
@@ -821,6 +838,16 @@ def render_open_pack_markdown(report: Mapping[str, Any]) -> str:
             f"- Yahoo decay localization: localized=`{summary.get('localized_decay_detected')}` "
             f"primary_horizon=`{yahoo_decay.get('primary_horizon_minutes')}` "
             f"sources=`{summary.get('likely_decay_sources', [])}`"
+        )
+        lines.append(
+            f"- Yahoo counterfactual hypothesis: `{yahoo_decay.get('leading_counterfactual_hypothesis')}` "
+            f"cost_summary=`{yahoo_decay.get('counterfactual_cost_summary', {})}`"
+        )
+        lines.append(
+            f"- Yahoo forward return horizons: `{yahoo_decay.get('forward_return_horizons', {})}`"
+        )
+        lines.append(
+            f"- Yahoo realized cost buckets: `{yahoo_decay.get('realized_cost_bucket_outcomes', [])}`"
         )
     for row in (diagnostics.get("frontier_weak_signal_diagnostics") or [])[:10]:
         lines.append(

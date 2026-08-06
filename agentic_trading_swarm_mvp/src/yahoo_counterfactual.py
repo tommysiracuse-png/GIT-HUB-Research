@@ -155,6 +155,36 @@ def _holding_horizon_bucket(horizon_minutes: int) -> str:
     return "position_gt_240m"
 
 
+def _realized_cost_bucket(total_cost_bps: float | None) -> str:
+    if total_cost_bps is None:
+        return "unknown"
+    if total_cost_bps <= 2.0:
+        return "friction_le_2bps"
+    if total_cost_bps <= 8.0:
+        return "light_2_to_8bps"
+    if total_cost_bps <= 16.0:
+        return "moderate_8_to_16bps"
+    return "heavy_gt_16bps"
+
+
+def _cost_drag_bucket(
+    net_pnl_bps: float | None,
+    gross_return_bps: float | None,
+    realized_total_cost_bps: float | None,
+) -> str:
+    if net_pnl_bps is None or gross_return_bps is None:
+        return "unpriced_or_missing_cost"
+    if gross_return_bps >= 0.0 and net_pnl_bps < 0.0:
+        return "cost_drag_flipped_negative"
+    if gross_return_bps < 0.0:
+        return "negative_before_cost"
+    if net_pnl_bps >= 0.0 and (realized_total_cost_bps or 0.0) <= 2.0:
+        return "positive_with_minimal_cost"
+    if net_pnl_bps >= 0.0:
+        return "positive_after_cost"
+    return "negative_after_cost_without_gross_reversal"
+
+
 def _spread_bps(candidate: dict, outcome_context: dict) -> float | None:
     value = _lookup_nested(
         (candidate, outcome_context),
@@ -390,12 +420,14 @@ def build_report(conn: sqlite3.Connection) -> dict:
                 "net_pnl_bps": pnl,
                 "gross_return_bps": round(gross, 3) if gross is not None else None,
                 "realized_total_cost_bps": round(realized_total_cost, 3) if realized_total_cost is not None else None,
+                "realized_total_cost_bucket": _realized_cost_bucket(realized_total_cost),
                 "charged_cost_bps": round(charged_cost, 3) if charged_cost is not None else None,
                 "modeled_context_cost_bps": round(modeled_backfill, 3) if modeled_backfill is not None else None,
                 "spread_bps": _spread_bps(candidate, outcome_context),
                 "slippage_bps": _slippage_bps(candidate, outcome_context, row),
                 "quote_age_seconds": round(quote_age_seconds, 3) if quote_age_seconds is not None else None,
                 "quote_age_bucket": _quote_age_bucket(quote_age_seconds),
+                "cost_drag_bucket": _cost_drag_bucket(pnl, gross, realized_total_cost),
             }
         )
         if horizon != 60:
@@ -426,6 +458,8 @@ def build_report(conn: sqlite3.Connection) -> dict:
     direction_outcomes = _aggregate_labeled(primary_rows, "direction")
     holding_horizon_bucket_outcomes = _aggregate_labeled(attribution_rows, "holding_horizon_bucket")
     quote_age_outcomes = _aggregate_labeled(primary_rows, "quote_age_bucket")
+    realized_cost_bucket_outcomes = _aggregate_labeled(primary_rows, "realized_total_cost_bucket")
+    cost_drag_bucket_outcomes = _aggregate_labeled(primary_rows, "cost_drag_bucket")
     primary_cost_summary = _aggregate_records(primary_rows)
     family_leg_primary_map = {row["family_leg"]: row for row in family_leg_outcomes}
     mature_family_legs = {
@@ -562,6 +596,8 @@ def build_report(conn: sqlite3.Connection) -> dict:
             "direction_outcomes": direction_outcomes,
             "holding_horizon_bucket_outcomes": holding_horizon_bucket_outcomes,
             "quote_age_outcomes": quote_age_outcomes,
+            "realized_cost_bucket_outcomes": realized_cost_bucket_outcomes,
+            "cost_drag_bucket_outcomes": cost_drag_bucket_outcomes,
             "hypothesis_tests": hypothesis_tests,
             "leading_hypothesis": leading_hypothesis,
         },
@@ -602,6 +638,8 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Direction outcomes: `{attribution.get('direction_outcomes', [])}`")
     lines.append(f"- Holding horizon buckets: `{attribution.get('holding_horizon_bucket_outcomes', [])}`")
     lines.append(f"- Quote age buckets: `{attribution.get('quote_age_outcomes', [])}`")
+    lines.append(f"- Realized cost buckets: `{attribution.get('realized_cost_bucket_outcomes', [])}`")
+    lines.append(f"- Cost drag buckets: `{attribution.get('cost_drag_bucket_outcomes', [])}`")
     for test in attribution.get("hypothesis_tests", []):
         lines.append(
             f"- Hypothesis `{test.get('hypothesis')}` status=`{test.get('status')}` details=`{test}`"

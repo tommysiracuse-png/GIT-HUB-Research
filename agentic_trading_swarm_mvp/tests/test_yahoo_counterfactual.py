@@ -74,11 +74,15 @@ class YahooCounterfactualTests(unittest.TestCase):
         attribution = report["diagnostic_attribution"]
         self.assertEqual(60, attribution["primary_horizon_minutes"])
         self.assertEqual("horizon_or_sign_mismatch", attribution["leading_hypothesis"])
+        self.assertEqual(-32.0, attribution["forward_return_horizons"]["15"]["avg_net_pnl_bps"])
+        self.assertEqual(18.0, attribution["forward_return_horizons"]["240"]["avg_net_pnl_bps"])
         self.assertEqual(-102.0, attribution["cost_summary"]["avg_net_pnl_bps"])
         self.assertEqual(-100.0, attribution["cost_summary"]["avg_gross_return_bps"])
         self.assertEqual(2.0, attribution["cost_summary"]["avg_total_realized_cost_bps"])
         self.assertEqual("long_proxy_standard", attribution["family_leg_outcomes"][0]["family_leg"])
         self.assertEqual("aging_15m_to_60m", attribution["quote_age_outcomes"][0]["quote_age_bucket"])
+        self.assertEqual("friction_le_2bps", attribution["realized_cost_bucket_outcomes"][0]["realized_total_cost_bucket"])
+        self.assertEqual("negative_before_cost", attribution["cost_drag_bucket_outcomes"][0]["cost_drag_bucket"])
 
     def test_cost_drag_hypothesis_is_confirmed_when_gross_turns_positive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,6 +139,14 @@ class YahooCounterfactualTests(unittest.TestCase):
         self.assertEqual(12.0, attribution["cost_summary"]["avg_total_realized_cost_bps"])
         self.assertEqual(4.0, attribution["cost_summary"]["avg_estimated_spread_bps"])
         self.assertEqual(6.0, attribution["cost_summary"]["avg_estimated_slippage_bps"])
+        self.assertEqual(
+            "moderate_8_to_16bps",
+            attribution["realized_cost_bucket_outcomes"][0]["realized_total_cost_bucket"],
+        )
+        self.assertEqual(
+            "cost_drag_flipped_negative",
+            attribution["cost_drag_bucket_outcomes"][0]["cost_drag_bucket"],
+        )
 
     def test_stale_proxy_hypothesis_is_confirmed_before_direction_flip_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
