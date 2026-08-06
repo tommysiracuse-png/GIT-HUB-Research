@@ -167,6 +167,51 @@ class CrossMarketResearcherRetryTests(unittest.TestCase):
         self.assertEqual(rec["evidence"]["raw_generation_metadata"]["initial"]["response_text"], invalid_action)
         self.assertIn("action is not allowed", rec["evidence"]["schema_violation"])
 
+    def test_final_guard_replaces_invalid_post_processor_output_with_no_action(self):
+        agent = next(
+            item for item in llm_swarm_runner.AGENTS if item["name"] == "market_scout"
+        )
+        raw = json.dumps(
+            {
+                "action": "propose_hunter_directive",
+                "priority": 60,
+                "title": "Raw response is complete",
+                "rationale": "Use this only to verify audit separation.",
+                "market_key": "paper.okx",
+                "evidence": {},
+                "proposed_change": "Record the parser result.",
+            }
+        )
+        packet = {"allowed_recommendation_actions": ["propose_hunter_directive"]}
+
+        with mock.patch.object(llm_swarm_runner, "complete", return_value=_model_result(raw)), mock.patch.object(
+            llm_swarm_runner, "parse_recommendation", return_value={}
+        ):
+            rec = llm_swarm_runner.run_agent(agent, packet, [])
+
+        self.assertTrue(rec["_rejected"])
+        self.assertEqual(rec["action"], "no_action")
+        self.assertEqual(rec["parse_status"], "schema_fallback")
+        audit = rec["model_output_audit"]
+        self.assertEqual(audit["initial"]["raw_model_output"], raw)
+        self.assertEqual(audit["initial"]["post_processor_output"], "{}")
+        self.assertTrue(audit["initial"]["transport_integrity"]["raw_schema_valid"])
+        self.assertEqual(
+            audit["initial"]["transport_integrity"]["cutoff_assessment"],
+            "not_detected_complete_schema_object_below_token_limit",
+        )
+
+    def test_transport_audit_flags_truncated_output_at_configured_token_limit(self):
+        result = _model_result('{"action":"propose_hunter_directive"')
+        result.completion_tokens = 800
+        result.max_output_tokens = 800
+
+        integrity = llm_swarm_runner._transport_integrity(result.text, result)
+
+        self.assertTrue(integrity["truncation_suspected"])
+        self.assertTrue(integrity["token_limit_reached"])
+        self.assertEqual(integrity["cutoff_assessment"], "token_limit_cutoff_suspected")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,7 @@ class ModelResult:
     prompt_cache_key: str | None = None
     frontier_escalation_reason: str | None = None
     structured_json: bool = False
+    max_output_tokens: int | None = None
 
 
 def load_llm_config(path: pathlib.Path = CONFIG_PATH) -> dict:
@@ -356,6 +357,10 @@ def complete(
     if provider == "openai" and _provider_model_name(model_name).startswith("gpt-5.") and prompt_cache_retention == "in_memory":
         prompt_cache_retention = "24h"
     structured_json_enabled = bool(tier_cfg.get("structured_json", False) if structured_json is None else structured_json)
+    max_output_tokens = int(
+        max_output_tokens_override
+        or tier_cfg.get("max_output_tokens", tier_cfg.get("estimated_completion_tokens", 4000))
+    )
     operation = operation or "llm_completion"
 
     use_litellm = os.environ.get("RADAR_USE_LITELLM") == "1"
@@ -379,6 +384,7 @@ def complete(
             prompt_cache_key=prompt_cache_key,
             frontier_escalation_reason=frontier_escalation_reason,
             structured_json=structured_json_enabled,
+            max_output_tokens=max_output_tokens,
         )
         _log(agent_name, result)
         return result
@@ -404,6 +410,7 @@ def complete(
             prompt_cache_key=prompt_cache_key,
             frontier_escalation_reason=frontier_escalation_reason,
             structured_json=structured_json_enabled,
+            max_output_tokens=max_output_tokens,
         )
         _log(agent_name, result)
         return result
@@ -429,6 +436,7 @@ def complete(
             prompt_cache_key=prompt_cache_key,
             frontier_escalation_reason=frontier_escalation_reason,
             structured_json=structured_json_enabled,
+            max_output_tokens=max_output_tokens,
         )
         _log(agent_name, result)
         return result
@@ -454,6 +462,7 @@ def complete(
             prompt_cache_key=prompt_cache_key,
             frontier_escalation_reason=frontier_escalation_reason,
             structured_json=structured_json_enabled,
+            max_output_tokens=max_output_tokens,
         )
         _log(agent_name, result)
         return result
@@ -468,10 +477,7 @@ def complete(
                 reasoning_mode=reasoning_mode,
                 verbosity=verbosity,
                 structured_json=structured_json_enabled,
-                max_output_tokens=int(
-                    max_output_tokens_override
-                    or tier_cfg.get("max_output_tokens", tier_cfg.get("estimated_completion_tokens", 4000))
-                ),
+                max_output_tokens=max_output_tokens,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
                 timeout_seconds=timeout_seconds,
@@ -507,6 +513,7 @@ def complete(
             prompt_cache_key=prompt_cache_key,
             frontier_escalation_reason=frontier_escalation_reason,
             structured_json=structured_json_enabled,
+            max_output_tokens=max_output_tokens,
         )
         _log(agent_name, result)
         return result
@@ -531,6 +538,7 @@ def complete(
             prompt_cache_key=prompt_cache_key,
             frontier_escalation_reason=frontier_escalation_reason,
             structured_json=structured_json_enabled,
+            max_output_tokens=max_output_tokens,
         )
         _log(agent_name, result)
         return result

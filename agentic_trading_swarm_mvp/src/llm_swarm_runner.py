@@ -37,6 +37,9 @@ from recommendation_schema import (
     REQUIRED_RECOMMENDATION_KEYS,
     cross_market_researcher_schema_fallback,
     finalize_cross_market_researcher_response,
+    finalize_recommendation_response,
+    paper_only_no_action_fallback,
+    validate_recommendation_object,
 )
 from settings import load_settings
 from storage import RUNS_DIR, connect
@@ -883,6 +886,7 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
     )
     generation_attempts = {"initial": _generation_metadata(result)}
     rec = parse_recommendation(result.text, agent, packet)
+    _record_post_processor_output(generation_attempts["initial"], rec)
     if _should_retry_schema(
         rec,
         {
@@ -901,15 +905,21 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
             structured_json=True,
         )
         retry_rec = parse_recommendation(retry.text, agent, packet)
+        generation_attempts["retry"] = _generation_metadata(retry)
+        _record_post_processor_output(generation_attempts["retry"], retry_rec)
         retry_rec["retry_count"] = 1
         retry_rec["initial_parse_status"] = rec.get("parse_status")
         result = retry
         rec = retry_rec
-        generation_attempts["retry"] = _generation_metadata(result)
     rec = _finalize_cross_market_recommendation(
         agent,
         rec,
         result.text,
+        generation_attempts,
+    )
+    rec = _finalize_agent_recommendation(
+        agent,
+        rec,
         generation_attempts,
     )
     if result.model_tier == "frontier" and not rec.get("frontier_escalation_reason"):
@@ -931,17 +941,167 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
 
 def _generation_metadata(result: Any) -> dict[str, Any]:
     """Keep model output context with a fallback without exposing configuration secrets."""
+    response_text = str(getattr(result, "text", "") or "")
     return {
-        "response_text": str(getattr(result, "text", "") or ""),
+        # ``response_text`` remains for existing report readers.  The explicit
+        # raw/post-processor fields make it possible to distinguish provider
+        # truncation from a transformation in the recommendation parser.
+        "response_text": response_text,
+        "raw_model_output": response_text,
         "model_name": getattr(result, "model_name", None),
         "model_tier": getattr(result, "model_tier", None),
         "status": getattr(result, "status", None),
         "api": getattr(result, "api", None),
+        "completion_tokens": getattr(result, "completion_tokens", None),
         "reasoning_effort": getattr(result, "reasoning_effort", None),
         "reasoning_mode": getattr(result, "reasoning_mode", None),
         "verbosity": getattr(result, "verbosity", None),
         "structured_json": getattr(result, "structured_json", None),
+        "transport_integrity": _transport_integrity(response_text, result),
     }
+
+
+def _transport_integrity(raw_response: str, result: Any) -> dict[str, Any]:
+    """Record observable transport integrity without guessing provider limits.
+
+    A complete raw JSON object proves that the application received a complete
+    recommendation.  A partial object is marked as a suspected cutoff, but we
+    do not claim whether the provider token limit or an upstream transport was
+    responsible because that metadata is not available on every provider.
+    """
+    raw_schema_valid = False
+    raw_schema_error: str | None = None
+    try:
+        finalize_recommendation_response(raw_response)
+        raw_schema_valid = True
+    except ValueError as exc:
+        raw_schema_error = str(exc)
+    truncated = _appears_truncated_json(raw_response)
+    completion_tokens = getattr(result, "completion_tokens", None)
+    max_output_tokens = getattr(result, "max_output_tokens", None)
+    token_limit_reached = (
+        isinstance(completion_tokens, int)
+        and not isinstance(completion_tokens, bool)
+        and isinstance(max_output_tokens, int)
+        and not isinstance(max_output_tokens, bool)
+        and completion_tokens >= max_output_tokens
+    )
+    if raw_schema_valid and not token_limit_reached:
+        cutoff_assessment = "not_detected_complete_schema_object_below_token_limit"
+    elif truncated and token_limit_reached:
+        cutoff_assessment = "token_limit_cutoff_suspected"
+    elif truncated:
+        cutoff_assessment = "suspected_incomplete_payload"
+    elif token_limit_reached:
+        cutoff_assessment = "token_limit_reached_complete_schema_object"
+    else:
+        cutoff_assessment = "not_confirmed_schema_invalid"
+    return {
+        "raw_characters": len(raw_response),
+        "completion_tokens": completion_tokens,
+        "max_output_tokens": max_output_tokens,
+        "token_limit_reached": token_limit_reached,
+        "raw_schema_valid": raw_schema_valid,
+        "raw_schema_error": raw_schema_error,
+        "truncation_suspected": truncated,
+        "application_buffer_limit": None,
+        "buffer_limit_detected": False,
+        "cutoff_assessment": cutoff_assessment,
+    }
+
+
+def _record_post_processor_output(attempt: dict[str, Any], recommendation: Any) -> None:
+    """Persist the parser output separately from the provider's raw output."""
+    try:
+        attempt["post_processor_output"] = json.dumps(
+            recommendation,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        attempt["post_processor_schema_valid"] = _has_complete_recommendation_schema(
+            recommendation
+        )
+    except (TypeError, ValueError):
+        attempt["post_processor_output"] = None
+        attempt["post_processor_schema_valid"] = False
+
+
+def _has_complete_recommendation_schema(candidate: Any) -> bool:
+    """Check the final object shape, including meaningful required values."""
+    if not validate_recommendation_object(candidate):
+        return False
+    if not isinstance(candidate, dict):
+        return False
+    try:
+        serialized = json.dumps(candidate, ensure_ascii=False, allow_nan=False)
+        decoded = json.loads(serialized)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(decoded, dict):
+        return False
+    if any(
+        decoded.get(field) is None
+        or (isinstance(decoded.get(field), str) and not decoded[field].strip())
+        for field in REQUIRED_RECOMMENDATION_KEYS
+    ):
+        return False
+    if not isinstance(decoded.get("action"), str):
+        return False
+    if isinstance(decoded.get("priority"), bool) or not isinstance(
+        decoded.get("priority"), int
+    ):
+        return False
+    if not isinstance(decoded.get("market_key"), str):
+        return False
+    return isinstance(decoded.get("evidence"), dict) and isinstance(
+        decoded.get("proposed_change"), (dict, str)
+    )
+
+
+def _finalize_agent_recommendation(
+    agent: dict,
+    recommendation: Any,
+    generation_attempts: dict[str, dict[str, Any]],
+) -> dict:
+    """Final schema guard for every recommendation emitted by the swarm.
+
+    Parsing can enrich an otherwise valid object with provenance.  This final
+    gate validates that post-processor object immediately before it is returned
+    to the graph and replaces an invalid result with a minimal paper-only
+    ``no_action`` object.  Both sides of the transformation remain in the
+    report audit trail.
+    """
+    _record_post_processor_output(
+        generation_attempts.setdefault("final", {}), recommendation
+    )
+    if not _has_complete_recommendation_schema(recommendation):
+        fallback = paper_only_no_action_fallback(
+            market_key=f"paper.{agent.get('name') or 'agent'}.schema_guard",
+            rationale=(
+                "The post-processor did not return one complete recommendation "
+                "object with every required field."
+            ),
+        )
+        fallback.update(
+            {
+                "_rejected": True,
+                "accepted": False,
+                "agent_name": agent.get("name"),
+                "parse_status": "schema_fallback",
+                "terminal_failure_reason": "post_processor_schema_violation",
+                "provenance": {
+                    "state_packet": str(STATE_JSON),
+                    "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+            }
+        )
+        _record_post_processor_output(generation_attempts["final"], fallback)
+        recommendation = fallback
+    else:
+        recommendation = dict(recommendation)
+    recommendation["model_output_audit"] = generation_attempts
+    return recommendation
 
 
 def _finalize_cross_market_recommendation(

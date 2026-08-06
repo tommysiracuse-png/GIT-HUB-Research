@@ -78,12 +78,14 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(result.reasoning_effort, "xhigh")
         self.assertEqual(result.prompt_tokens, 10)
         self.assertEqual(result.completion_tokens, 20)
+        self.assertEqual(result.max_output_tokens, 8000)
         self.assertGreater(result.estimated_cost_usd, 0)
         kwargs = call.call_args.kwargs
         self.assertEqual(kwargs["model_name"], "gpt-5.6-sol")
         self.assertEqual(kwargs["reasoning_effort"], "xhigh")
         self.assertEqual(kwargs["reasoning_mode"], "pro")
         self.assertTrue(kwargs["structured_json"])
+        self.assertEqual(kwargs["max_output_tokens"], result.max_output_tokens)
         self.assertEqual(captured[0].api, "responses")
 
     def test_quota_failure_opens_shared_circuit_before_more_paid_calls(self) -> None:

@@ -68,6 +68,35 @@ def paper_only_fallback_recommendation(
     }
 
 
+def paper_only_no_action_fallback(
+    *,
+    market_key: str = "paper.market_radar.schema_guard",
+    title: str = "Paper-only schema guard: no action",
+    rationale: str = "The generated recommendation was incomplete or invalid after processing.",
+) -> dict[str, Any]:
+    """Return the minimal schema-valid paper-only terminal recommendation.
+
+    This object deliberately uses ``no_action`` rather than attempting to
+    infer a strategy, trade, or implementation change from malformed model
+    output.  Consumers may log it, but it is not actionable.
+    """
+    return {
+        "action": "no_action",
+        "priority": 1,
+        "title": title,
+        "rationale": rationale,
+        "market_key": market_key,
+        "evidence": {
+            "issue_type": "schema_validation_failure",
+            "paper_only_status": "no live trading",
+        },
+        "proposed_change": {
+            "summary": "Do not act on invalid model output; retain the failure for paper-only diagnostics.",
+            "paper_trade_instruction": "No action. Simulation and reporting only; no execution.",
+        },
+    }
+
+
 def validate_recommendation_object(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
