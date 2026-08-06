@@ -39,7 +39,28 @@ class FrontierExecutionQualityPacketTests(unittest.TestCase):
             llm_bridge.STATE_JSON = pathlib.Path(tmp) / "state.json"
             llm_bridge.STATE_MD = pathlib.Path(tmp) / "state.md"
             try:
-                packet = llm_bridge.write_llm_state_packet(conn, {}, DEFAULT_SETTINGS)
+                packet = llm_bridge.write_llm_state_packet(
+                    conn,
+                    {
+                        "route_requirement_candidates": [
+                            {
+                                "venue": "MEXC",
+                                "inst_id": "MEXC:BTC-USDT",
+                                "trade_type": "frontier_crypto_venue_map",
+                                "direction": "short_frontier_spot",
+                                "score": 64.0,
+                            },
+                            {
+                                "venue": "OKX",
+                                "inst_id": "OKX:BTC-USDT-SWAP",
+                                "trade_type": "perp_funding_basis",
+                                "direction": "short_perp_long_spot",
+                                "score": 58.0,
+                            },
+                        ]
+                    },
+                    DEFAULT_SETTINGS,
+                )
             finally:
                 llm_bridge.STATE_JSON, llm_bridge.STATE_MD = old_json, old_md
 
@@ -51,6 +72,10 @@ class FrontierExecutionQualityPacketTests(unittest.TestCase):
         self.assertEqual("weak_paper_outcome", route["outcome_status"])
         self.assertEqual("diagnose_and_down_rank_only", route["ranking_input"]["ranking_action"])
         self.assertFalse(route["entry_blocked"])
+        route_summaries = packet["paper_route_requirement_summaries"]
+        self.assertTrue(route_summaries["read_only"])
+        self.assertEqual(2, route_summaries["candidate_count"])
+        self.assertEqual(0.0, route_summaries["candidates"][0]["ranking_annotation"]["score_adjustment"])
 
     def test_compact_frontier_execution_quality_counts_route_and_quote_failures(self):
         research_worker = {
