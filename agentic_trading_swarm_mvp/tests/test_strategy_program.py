@@ -17,7 +17,7 @@ if str(SRC) not in sys.path:
 from settings import DEFAULT_SETTINGS  # noqa: E402
 from execution_engine import execute_order  # noqa: E402
 from radar_loop import _select_runtime_strategy_lab_candidates  # noqa: E402
-from storage import init_db, open_paper_trade  # noqa: E402
+from storage import init_db, open_paper_trade, record_due_horizon_outcomes  # noqa: E402
 from strategy_lab import (  # noqa: E402
     _observation_program_inputs,
     _paper_route_eligible_candidates,
@@ -256,6 +256,72 @@ def adx_nav_reference_logic() -> dict:
         "edge_expression": "nav_update_edge_bps",
         "score_expression": "clip(50 + nav_update_edge_bps / 4, 0, 100)",
         "route_surface": "nav_reference",
+    }
+
+
+def boc_auction_observation(
+    price: float,
+    auction_at: dt.datetime,
+    *,
+    term_days: int = 91,
+    average_yield_pct: float = 2.5,
+    coverage_ratio: float = 2.2,
+    tail_bps: float = 1.0,
+    **overrides: object,
+) -> dict:
+    row = {
+        "inst_id": f"BANK_OF_CANADA:TEST:AUCTION:{auction_at.date().isoformat()}:{term_days}",
+        "venue": "BANK_OF_CANADA",
+        "trade_type": "official_primary_auction_result",
+        "market_type": "treasury_bill_auction_reference",
+        "asset_class": "sovereign_treasury_bill",
+        "quote": "CAD_PER_100_FACE",
+        "base": f"CANADA_TBILL_{term_days}",
+        "last": price,
+        "coverage_ratio": coverage_ratio,
+        "tail_bps": tail_bps,
+        "term_days": term_days,
+        "average_yield_pct": average_yield_pct,
+        "stop_out_yield_pct": average_yield_pct + 0.01,
+        "quality_status": "official_auction_result",
+        "market_surface": "canada_regular_treasury_bill_auctions",
+        "freshness_state": "fresh",
+        "candidate_reject_reason": "official_auction_result_not_executable_quote",
+        "session_status": "results_published",
+        "auction_at": auction_at.isoformat(),
+        "observed_at": auction_at.isoformat(),
+        "price_source": "Bank of Canada Valet AUC_TBILL",
+    }
+    row.update(overrides)
+    return row
+
+
+def boc_auction_reference_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["BANK_OF_CANADA"],
+            "asset_classes": ["sovereign_treasury_bill"],
+            "market_types": ["treasury_bill_auction_reference"],
+        },
+        "calculated_features": {
+            "auction_demand_pressure": "auction_coverage_ratio - abs(auction_tail_bps) / 10",
+        },
+        "entry_expression": (
+            "market_surface == 'canada_regular_treasury_bill_auctions' "
+            "and quality_status == 'official_auction_result' "
+            "and candidate_reject_reason == 'official_auction_result_not_executable_quote' "
+            "and freshness_state == 'fresh' and auction_coverage_ratio >= 2 "
+            "and abs(auction_tail_bps) <= 2 and auction_result_published >= 1"
+        ),
+        "invalidation_expression": (
+            "freshness_state != 'fresh' or auction_coverage_ratio < 2 "
+            "or abs(auction_tail_bps) > 2"
+        ),
+        "direction": "long",
+        "edge_expression": "auction_demand_pressure",
+        "score_expression": "clip(50 + 10 * auction_demand_pressure, 0, 100)",
+        "route_surface": "auction_reference",
     }
 
 
@@ -744,6 +810,126 @@ class StrategyProgramTests(unittest.TestCase):
                 cfg,
             )
             self.assertEqual([], candidates, diagnostic)
+
+    def test_boc_auction_reference_uses_feature_snapshots_and_next_same_tenor_label(self) -> None:
+        cfg = settings()
+        cfg["paper_exploration"]["enabled"] = True
+        cfg["learning"]["horizon_minutes"] = [0]
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        entry_auction_at = now - dt.timedelta(days=6)
+        next_auction_at = now - dt.timedelta(days=1)
+        recommendation = lab_recommendation("boc_auction_reference_v1", boc_auction_reference_logic())
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["hypothesis"] = "Strong, low-tail official bill auctions predict lower next same-tenor yields."
+        experiment["source_surface"] = "canada_regular_treasury_bill_auctions"
+        experiment["permitted_target_surface"] = ["canada_regular_treasury_bill_auctions"]
+        entry = boc_auction_observation(
+            99.40,
+            entry_auction_at,
+            average_yield_pct=2.50,
+            coverage_ratio=2.25,
+            tail_bps=1.0,
+        )
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            generated, report = generate_strategy_lab_candidates(conn, cfg, [], [entry])
+
+            self.assertEqual(1, len(generated), report)
+            candidate = generated[0]
+            self.assertEqual("canada_regular_treasury_bill_auctions", candidate["target_surface"])
+            self.assertTrue(candidate["paper_auction_reference"])
+            self.assertTrue(candidate["paper_auction_reference_provenance_valid"])
+            self.assertTrue(candidate["synthetic_research_paper"])
+            self.assertEqual(2.25, candidate["strategy_lab_program_features"]["auction_coverage_ratio"])
+
+            execution = execute_order(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"], "paper_allocation_multiplier": 1.0},
+                cfg,
+            )
+            self.assertTrue(execution["paper_filled"])
+            self.assertIsNone(execution["order_id"])
+            self.assertEqual("synthetic_auction_reference_paper", execution["order"]["route_id"])
+            self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
+
+            live_cfg = copy.deepcopy(cfg)
+            live_cfg["mode"] = "live"
+            live_execution = execute_order(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"], "paper_allocation_multiplier": 1.0},
+                live_cfg,
+            )
+            self.assertFalse(live_execution["paper_filled"])
+            self.assertEqual("paper_reference_rejected", live_execution["order"]["status"])
+            self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
+
+            trade_id = open_paper_trade(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"]},
+                execution=execution,
+                settings=cfg,
+            )
+            self.assertEqual([], record_due_horizon_outcomes(conn, {entry["inst_id"]: entry}, cfg))
+
+            same_auction = {**entry, "average_yield_pct": 1.50}
+            wrong_tenor = boc_auction_observation(
+                99.45,
+                next_auction_at,
+                term_days=28,
+                average_yield_pct=1.0,
+            )
+            stale_same_tenor = boc_auction_observation(
+                99.45,
+                entry_auction_at + dt.timedelta(days=2),
+                average_yield_pct=1.0,
+                freshness_state="stale",
+            )
+            next_same_tenor = boc_auction_observation(
+                99.50,
+                next_auction_at,
+                average_yield_pct=2.40,
+            )
+            recorded = record_due_horizon_outcomes(
+                conn,
+                {
+                    same_auction["inst_id"]: same_auction,
+                    wrong_tenor["inst_id"]: wrong_tenor,
+                    stale_same_tenor["inst_id"]: stale_same_tenor,
+                    next_same_tenor["inst_id"]: next_same_tenor,
+                },
+                cfg,
+            )
+            self.assertEqual(1, len(recorded))
+            self.assertEqual("valid_auction_event", recorded[0]["measurement_status"])
+            self.assertGreater(recorded[0]["pnl_bps"], 0)
+
+            outcome = conn.execute(
+                "select price, pnl_bps, measurement_status, context_json from paper_trade_outcomes where trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+            self.assertEqual(2.40, outcome["price"])
+            self.assertEqual("valid_auction_event", outcome["measurement_status"])
+            context = json.loads(outcome["context_json"])["paper_auction_reference_outcome"]
+            self.assertEqual(next_same_tenor["inst_id"], context["outcome_inst_id"])
+            self.assertEqual(next_auction_at.isoformat(), context["outcome_auction_at"])
+
+        invalid = {
+            **entry,
+            "coverage_ratio": 1.99,
+            "auction_coverage_ratio": 1.99,
+            "auction_tail_bps": 1.0,
+            "auction_term_days": 91.0,
+            "auction_average_yield_pct": 2.5,
+            "auction_stop_out_yield_pct": 2.51,
+            "auction_result_published": 1.0,
+        }
+        candidates, diagnostic = generate_program_candidates(experiment, [invalid], cfg)
+        self.assertEqual([], candidates, diagnostic)
+        self.assertEqual(1, diagnostic["reject_reasons"]["entry_expression_false"])
 
     def test_exploration_tests_non_positive_model_edge_without_promoting_it(self) -> None:
         cfg = settings()

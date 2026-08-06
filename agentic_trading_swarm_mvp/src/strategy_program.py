@@ -30,6 +30,9 @@ OUTPUT_TRADE_TYPE_TARGET_SURFACES = {
 NAV_REFERENCE_ROUTE_SURFACE = "nav_reference"
 NAV_REFERENCE_QUALITY_STATUS = "official_month_end_nav"
 NAV_REFERENCE_REJECT_REASON = "factsheet_nav_not_entry_quality_quote"
+AUCTION_REFERENCE_ROUTE_SURFACE = "auction_reference"
+AUCTION_REFERENCE_QUALITY_STATUS = "official_auction_result"
+AUCTION_REFERENCE_REJECT_REASON = "official_auction_result_not_executable_quote"
 SHOCK_REVERSAL_CALCULATED_FEATURES = {
     "shock_magnitude_bps": "abs(return_60m_bps)",
     "shock_sigma": "abs(return_60m_bps) / max(volatility_60m_bps, 10)",
@@ -89,6 +92,14 @@ BASE_FEATURES = {
     "quote_volume_1m",
     "relative_volume_1m_60m",
     "microstructure_history_ready",
+    # Auction fields are normalized, paper-only observation features.  They
+    # deliberately describe the public result rather than an executable quote.
+    "auction_coverage_ratio",
+    "auction_tail_bps",
+    "auction_term_days",
+    "auction_average_yield_pct",
+    "auction_stop_out_yield_pct",
+    "auction_result_published",
 }
 PERP_FUNDING_CAPTURE_REQUIRED_FEATURES = {
     "funding_bps",
@@ -403,6 +414,14 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
         "quote_volume_1m": max(0.0, _float(row.get("quote_volume_1m"))),
         "relative_volume_1m_60m": max(0.0, _float(row.get("relative_volume_1m_60m"))),
         "microstructure_history_ready": 1.0 if _float(row.get("microstructure_history_ready")) >= 1.0 else 0.0,
+        "auction_coverage_ratio": max(0.0, _float(row.get("coverage_ratio"))),
+        "auction_tail_bps": _float(row.get("tail_bps")),
+        "auction_term_days": max(0.0, _float(row.get("term_days"))),
+        "auction_average_yield_pct": max(0.0, _float(row.get("average_yield_pct"))),
+        "auction_stop_out_yield_pct": max(0.0, _float(row.get("stop_out_yield_pct"))),
+        "auction_result_published": (
+            1.0 if str(row.get("quality_status") or "") == AUCTION_REFERENCE_QUALITY_STATUS else 0.0
+        ),
     }
 
 
@@ -739,6 +758,7 @@ def compile_observation_program(logic: dict) -> tuple[dict | None, dict]:
             "proxy",
             "prediction",
             NAV_REFERENCE_ROUTE_SURFACE,
+            AUCTION_REFERENCE_ROUTE_SURFACE,
         }:
             raise ProgramValidationError("unsupported_route_surface")
         program["output_trade_type"] = str(program.get("output_trade_type") or "").lower()
@@ -815,6 +835,9 @@ def _route_mapping(frame: dict, program: dict, side: str) -> tuple[str, str]:
         # A reference NAV can support a directional paper measurement, but it
         # is never evidence of an executable order route.
         return "global_market_discovery_proxy", f"{side}_proxy"
+    if surface == AUCTION_REFERENCE_ROUTE_SURFACE:
+        # Auction results are paper research references, never order routes.
+        return "global_market_discovery_proxy", f"{side}_proxy"
     if surface == "spot":
         return "frontier_crypto_venue_map", f"{side}_frontier_spot"
     if surface == "perp":
@@ -830,7 +853,10 @@ def _route_mapping(frame: dict, program: dict, side: str) -> tuple[str, str]:
 
 def _target_surface(frame: dict, program: dict) -> str:
     output_trade_type = str(program.get("output_trade_type") or "")
-    if _route_surface(frame, program) == NAV_REFERENCE_ROUTE_SURFACE:
+    if _route_surface(frame, program) in {
+        NAV_REFERENCE_ROUTE_SURFACE,
+        AUCTION_REFERENCE_ROUTE_SURFACE,
+    }:
         return str(frame.get("market_surface") or "").strip().lower()
     return OUTPUT_TRADE_TYPE_TARGET_SURFACES.get(
         output_trade_type,
@@ -856,6 +882,28 @@ def _nav_reference_provenance(frame: dict) -> tuple[bool, list[str]]:
         missing.append("freshness_state")
     if not str(frame.get("price_source") or "").strip():
         missing.append("price_source")
+    return not missing, missing
+
+
+def _auction_reference_provenance(frame: dict) -> tuple[bool, list[str]]:
+    """Validate an official auction result before emitting a synthetic label."""
+    missing: list[str] = []
+    if not str(frame.get("market_surface") or "").strip():
+        missing.append("market_surface")
+    if str(frame.get("quality_status") or "") != AUCTION_REFERENCE_QUALITY_STATUS:
+        missing.append("quality_status")
+    if str(frame.get("candidate_reject_reason") or "") != AUCTION_REFERENCE_REJECT_REASON:
+        missing.append("candidate_reject_reason")
+    if str(frame.get("freshness_state") or "") != "fresh":
+        missing.append("freshness_state")
+    if not str(frame.get("price_source") or "").strip():
+        missing.append("price_source")
+    if _float(frame.get("auction_term_days")) <= 0:
+        missing.append("auction_term_days")
+    if _float(frame.get("auction_average_yield_pct")) <= 0:
+        missing.append("auction_average_yield_pct")
+    if not str(frame.get("auction_at") or "").strip():
+        missing.append("auction_at")
     return not missing, missing
 
 
@@ -896,7 +944,9 @@ def generate_program_candidates(
         if str(frame.get("session_status") or "").lower() in {"closed", "stale", "unavailable"}:
             rejects["session_not_open"] += 1
             continue
-        is_nav_reference = _route_surface(frame, program) == NAV_REFERENCE_ROUTE_SURFACE
+        route_surface = _route_surface(frame, program)
+        is_nav_reference = route_surface == NAV_REFERENCE_ROUTE_SURFACE
+        is_auction_reference = route_surface == AUCTION_REFERENCE_ROUTE_SURFACE
         provenance_valid = True
         provenance_missing: list[str] = []
         if is_nav_reference:
@@ -905,6 +955,13 @@ def generate_program_candidates(
                 rejects["nav_reference_provenance_invalid"] += 1
                 for field in provenance_missing:
                     rejects[f"nav_reference_missing:{field}"] += 1
+                continue
+        if is_auction_reference:
+            provenance_valid, provenance_missing = _auction_reference_provenance(frame)
+            if not provenance_valid:
+                rejects["auction_reference_provenance_invalid"] += 1
+                for field in provenance_missing:
+                    rejects[f"auction_reference_missing:{field}"] += 1
                 continue
         try:
             values = _program_values(frame, program)
@@ -981,6 +1038,7 @@ def generate_program_candidates(
             "base": frame.get("base"),
             "quote": frame.get("quote"),
             "paper_only": True,
+            "synthetic_research_paper": is_auction_reference,
             "paper_nav_reference": is_nav_reference,
             "paper_nav_reference_provenance_valid": provenance_valid,
             "paper_nav_reference_provenance": {
@@ -991,6 +1049,21 @@ def generate_program_candidates(
                 "price_source": str(frame.get("price_source") or ""),
             }
             if is_nav_reference
+            else {},
+            "paper_auction_reference": is_auction_reference,
+            "paper_auction_reference_provenance_valid": provenance_valid,
+            "paper_auction_reference_provenance": {
+                "market_surface": str(frame.get("market_surface") or ""),
+                "quality_status": str(frame.get("quality_status") or ""),
+                "candidate_reject_reason": str(frame.get("candidate_reject_reason") or ""),
+                "freshness_state": str(frame.get("freshness_state") or ""),
+                "price_source": str(frame.get("price_source") or ""),
+                "auction_at": str(frame.get("auction_at") or ""),
+                "auction_term_days": _float(frame.get("auction_term_days")),
+                "auction_average_yield_pct": _float(frame.get("auction_average_yield_pct")),
+                "auction_stop_out_yield_pct": _float(frame.get("auction_stop_out_yield_pct")),
+            }
+            if is_auction_reference
             else {},
             "strategy_lab_id": str(experiment.get("strategy_lab_id")),
             "strategy_lab_version": int(experiment.get("version") or 1),

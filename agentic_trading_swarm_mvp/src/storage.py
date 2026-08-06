@@ -2152,6 +2152,68 @@ def close_due_trades(
     return closed
 
 
+def _auction_reference_outcome(
+    candidate: dict,
+    observations: dict[str, dict],
+) -> dict | None:
+    """Find the next strictly later official auction result for a paper label.
+
+    This deliberately keys time on the auction event, not the scanner fetch.
+    A later row from the same scan is usable only when it is the earliest
+    official result after the entry auction for the same venue, surface, and
+    tenor.  Scheduled calls-for-tender and stale/non-official rows never label
+    the experiment.
+    """
+    provenance = candidate.get("paper_auction_reference_provenance")
+    if not isinstance(provenance, dict):
+        return None
+    venue = str(candidate.get("venue") or "")
+    surface = str(provenance.get("market_surface") or "")
+    try:
+        term_days = int(float(provenance.get("auction_term_days") or 0))
+        entry_yield = float(provenance.get("auction_average_yield_pct") or 0)
+        entry_auction_at = _parse_storage_iso(str(provenance.get("auction_at") or ""))
+    except (TypeError, ValueError):
+        return None
+    if not venue or not surface or term_days <= 0 or entry_yield <= 0:
+        return None
+
+    earliest: tuple[dt.datetime, dict] | None = None
+    for raw in observations.values():
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("venue") or "") != venue:
+            continue
+        if str(raw.get("market_surface") or "") != surface:
+            continue
+        if str(raw.get("quality_status") or "") != "official_auction_result":
+            continue
+        if str(raw.get("candidate_reject_reason") or "") != "official_auction_result_not_executable_quote":
+            continue
+        if str(raw.get("freshness_state") or "") != "fresh":
+            continue
+        try:
+            candidate_term_days = int(float(raw.get("term_days") or 0))
+            outcome_yield = float(raw.get("average_yield_pct") or 0)
+            auction_at = _parse_storage_iso(str(raw.get("auction_at") or ""))
+        except (TypeError, ValueError):
+            continue
+        if candidate_term_days != term_days or outcome_yield <= 0 or auction_at <= entry_auction_at:
+            continue
+        if earliest is None or auction_at < earliest[0]:
+            earliest = (auction_at, raw)
+    if earliest is None:
+        return None
+    auction_at, row = earliest
+    return {
+        "auction_at": auction_at,
+        "entry_yield_pct": entry_yield,
+        "outcome_yield_pct": float(row["average_yield_pct"]),
+        "price_source": str(row.get("price_source") or row.get("venue") or "official_auction"),
+        "inst_id": str(row.get("inst_id") or row.get("instrument_id") or ""),
+    }
+
+
 def record_due_horizon_outcomes(
     conn: sqlite3.Connection,
     latest_by_inst: dict[str, dict],
@@ -2213,26 +2275,51 @@ def record_due_horizon_outcomes(
             ).fetchone()
             if exists:
                 continue
+            try:
+                candidate = json.loads(row["candidate_json"] or "{}")
+            except (TypeError, ValueError):
+                candidate = {}
+            auction_outcome = (
+                _auction_reference_outcome(candidate, latest_by_inst)
+                if candidate.get("paper_auction_reference")
+                else None
+            )
+            if candidate.get("paper_auction_reference") and auction_outcome is None:
+                # Await the next official same-tenor result rather than
+                # converting unavailable research evidence into a bad label.
+                continue
             latest = latest_by_inst.get(row["inst_id"])
             observed_at = None
             cost_audit = None
-            if latest:
+            if auction_outcome is not None:
+                observed_at = auction_outcome["auction_at"]
+                delay_seconds = 0.0
+                measurement_status = "valid_auction_event"
+                price = auction_outcome["outcome_yield_pct"]
+                pnl_bps = (
+                    (auction_outcome["entry_yield_pct"] / price - 1.0)
+                    * 10_000.0
+                    * sign
+                )
+                price_source = auction_outcome["price_source"]
+            elif latest:
                 raw_observed = latest.get("observed_at") or latest.get("seen_at") or latest.get("last_checked_at")
                 try:
                     observed_at = _parse_storage_iso(raw_observed) if raw_observed else now
                 except (TypeError, ValueError):
                     observed_at = now
-            if observed_at and observed_at < target:
+            if auction_outcome is None and observed_at and observed_at < target:
                 latest = None
                 observed_at = None
 
-            if latest and latest.get("last") not in (None, ""):
+            if auction_outcome is not None:
+                pass
+            elif latest and latest.get("last") not in (None, ""):
                 delay_seconds = max(0.0, (observed_at - target).total_seconds()) if observed_at else 0.0
                 measurement_status = "valid" if delay_seconds <= max_delay_seconds else "late"
                 price = float(latest["last"])
                 pnl_bps = (price / float(row["entry"]) - 1.0) * 10_000.0 * sign
                 risk = settings.get("risk", {})
-                candidate = json.loads(row["candidate_json"] or "{}")
                 charged_cost_bps = float(row["entry_fee_bps"] or 0) + float(
                     row["entry_slippage_bps"] or 0
                 )
@@ -2291,6 +2378,13 @@ def record_due_horizon_outcomes(
                 outcome_context = json.loads(row["context_json"] or "{}")
             except (TypeError, ValueError):
                 outcome_context = {}
+            if auction_outcome is not None:
+                outcome_context["paper_auction_reference_outcome"] = {
+                    "entry_yield_pct": auction_outcome["entry_yield_pct"],
+                    "outcome_yield_pct": auction_outcome["outcome_yield_pct"],
+                    "outcome_auction_at": auction_outcome["auction_at"].isoformat(),
+                    "outcome_inst_id": auction_outcome["inst_id"],
+                }
             if pnl_bps is not None and cost_audit is not None:
                 outcome_context["paper_realized_cost_audit"] = cost_audit
             conn.execute(

@@ -18,6 +18,7 @@ from storage import save_execution_fill, save_execution_order
 
 
 NAV_REFERENCE_PAPER_ROUTE_ID = "synthetic_nav_reference_paper"
+AUCTION_REFERENCE_PAPER_ROUTE_ID = "synthetic_auction_reference_paper"
 
 
 def _side_for_direction(direction: str) -> str:
@@ -262,6 +263,49 @@ def _nav_reference_execution(candidate: dict, settings: dict) -> dict:
     }
 
 
+def _auction_reference_execution(candidate: dict, settings: dict) -> dict:
+    """Record an official auction research label without creating an order.
+
+    Auction results are public event data, not a tradable Treasury-bill quote.
+    The candidate is therefore eligible only for isolated synthetic-paper
+    measurement and can never reach an order ticket in either paper or live
+    mode.
+    """
+    valid = bool(candidate.get("paper_auction_reference_provenance_valid")) and not bool(
+        candidate.get("shadow_filtered")
+    )
+    paper_mode = (
+        settings.get("mode", "paper") == "paper"
+        and not settings.get("allow_live_trading")
+    )
+    status = "paper_reference_labeled" if valid and paper_mode else "paper_reference_rejected"
+    order = {
+        "mode": "paper",
+        "route_id": AUCTION_REFERENCE_PAPER_ROUTE_ID,
+        "status": status,
+        "notional_usd": 0.0,
+        "direction": candidate.get("direction"),
+        "trade_type": candidate.get("trade_type", "unknown"),
+        "execution_semantics": "synthetic_auction_reference_not_live_equivalent",
+        "signal_stats_scope": "synthetic_research",
+        "proxy_not_live_equivalent": False,
+        "paper_proxy_not_live_equivalent": False,
+        "legs": [],
+        "notes": [
+            "Paper auction-reference label recorded without an execution order or fill.",
+            "Official auction results are not executable quotes and are never broker routes.",
+        ],
+    }
+    return {
+        "order_id": None,
+        "order": order,
+        "fills": [],
+        "fill_ids": [],
+        "paper_filled": status == "paper_reference_labeled",
+        "candidate": candidate,
+    }
+
+
 def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
     context_loss_quarantine = candidate.get("paper_context_loss_quarantine") or {}
     context_loss_quarantined = bool(
@@ -311,6 +355,8 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             candidate["gating_reason"] = "bounded_paper_recovery_probe_below_cost_floor"
     if candidate.get("paper_nav_reference"):
         return _nav_reference_execution(candidate, settings)
+    if candidate.get("paper_auction_reference"):
+        return _auction_reference_execution(candidate, settings)
     order = build_order_ticket(candidate, review, settings)
     if candidate.get("shadow_filtered"):
         order["status"] = "shadow_filtered"

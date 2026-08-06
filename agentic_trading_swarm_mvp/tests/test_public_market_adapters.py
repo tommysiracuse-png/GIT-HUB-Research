@@ -984,6 +984,14 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual(16400.0, result["awarded_amount_millions_cad"])
         self.assertEqual(164.0, result["bank_of_canada_purchase_millions_cad"])
         self.assertEqual(1.667, result["coverage_ratio"])
+        self.assertEqual(0.790, result["tail_bps"])
+        self.assertEqual(98, result["term_days"])
+        self.assertEqual(2.290, result["average_yield_pct"])
+        self.assertEqual("official_auction_result", result["quality_status"])
+        self.assertEqual(
+            "official_auction_result_not_executable_quote",
+            result["candidate_reject_reason"],
+        )
         self.assertEqual("fresh", result["freshness_state"])
         self.assertEqual(BANK_OF_CANADA_TBILL_API_URL, result["source_url"])
         self.assertEqual("watch_only", result["direction"])
