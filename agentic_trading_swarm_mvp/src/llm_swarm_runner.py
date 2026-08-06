@@ -60,6 +60,20 @@ COLLABORATION_MODE = "langgraph_typed_action_package"
 FALLBACK_COLLABORATION_MODE = "sequential_typed_action_package"
 LAST_SWARM_STATE: dict[str, Any] = {}
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+PUBLISH_OPTIONAL_RECOMMENDATION_FIELDS = (
+    "signal_key",
+    "directive",
+    "variant_config",
+    "strategy_lab_experiment",
+    "code_change",
+    "agent_spec",
+)
+PUBLISH_REQUIRED_ACTION_PAYLOADS = {
+    "spawn_agent": "agent_spec",
+    "propose_strategy_lab_experiment": "strategy_lab_experiment",
+    "propose_code_change": "code_change",
+    "propose_signal_variant": "variant_config",
+}
 
 
 EXECUTION_ROUTE_REQUIREMENT_LABELS = (
@@ -1985,6 +1999,124 @@ def _is_fallback_recommendation(rec: dict) -> bool:
     )
 
 
+def _json_safe_clone(value: Any) -> Any:
+    return json.loads(json.dumps(value, sort_keys=True, default=str))
+
+
+def _paper_scoped_market_key(value: Any, *, agent_name: str | None = None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = f"{agent_name or 'agent'}.recommendation"
+    text = re.sub(r"[^A-Za-z0-9._:-]+", "_", text).strip("._:-")
+    if not text.lower().startswith("paper"):
+        text = f"paper.{text or agent_name or 'agent'}"
+    return text
+
+
+def _publish_evidence(value: Any, recommendation: dict) -> dict[str, Any]:
+    if isinstance(value, dict) and value:
+        evidence = _json_safe_clone(value)
+    else:
+        evidence = {}
+    if not evidence:
+        parse_status = str(recommendation.get("parse_status") or "").strip()
+        failure_reason = str(recommendation.get("terminal_failure_reason") or "").strip()
+        if parse_status:
+            evidence["parse_status"] = parse_status
+        if failure_reason:
+            evidence["terminal_failure_reason"] = failure_reason
+    if not evidence:
+        evidence["issue"] = "missing_publish_evidence"
+    return evidence
+
+
+def _publish_proposed_change(value: Any, recommendation: dict) -> dict[str, Any]:
+    if isinstance(value, dict) and value:
+        proposed_change = _json_safe_clone(value)
+    else:
+        text = str(value or "").strip() or str(recommendation.get("rationale") or "").strip()
+        proposed_change = {"summary": text or "Keep the recommendation paper-only and auditable."}
+    return proposed_change
+
+
+def _publish_fallback_recommendation(recommendation: dict, reason: str) -> dict[str, Any]:
+    fallback = paper_only_no_action_fallback(
+        market_key=_paper_scoped_market_key(
+            recommendation.get("market_key"),
+            agent_name=str(recommendation.get("agent_name") or "agent"),
+        ),
+        rationale=(
+            "The recommendation could not be normalized into one complete JSON object "
+            "for downstream consumers."
+        ),
+    )
+    fallback["evidence"] = {
+        **fallback["evidence"],
+        "mode": "fallback",
+        "schema_violation": reason,
+        "original_action": str(recommendation.get("action") or ""),
+    }
+    fallback["proposed_change"] = {
+        "summary": "Suppress the malformed recommendation and keep the paper-only audit trail.",
+        "paper_trade_instruction": "No action. Simulation and reporting only; no execution.",
+    }
+    return fallback
+
+
+def _publishable_recommendation_payload(recommendation: dict) -> dict[str, Any]:
+    action = str(recommendation.get("action") or "").strip()
+    payload = {
+        "action": action or "no_action",
+        "priority": _coerce_priority(recommendation.get("priority"), default=1),
+        "title": str(recommendation.get("title") or "Paper-only schema guard").strip(),
+        "rationale": str(
+            recommendation.get("rationale")
+            or "The recommendation was normalized for downstream paper-only consumers."
+        ).strip(),
+        "market_key": _paper_scoped_market_key(
+            recommendation.get("market_key"),
+            agent_name=str(recommendation.get("agent_name") or "agent"),
+        ),
+        "evidence": _publish_evidence(recommendation.get("evidence"), recommendation),
+        "proposed_change": _publish_proposed_change(
+            recommendation.get("proposed_change"),
+            recommendation,
+        ),
+    }
+    signal_key = str(recommendation.get("signal_key") or "").strip()
+    if signal_key:
+        payload["signal_key"] = signal_key
+    directive = str(recommendation.get("directive") or "").strip()
+    if directive:
+        payload["directive"] = directive
+    for field in ("variant_config", "strategy_lab_experiment", "code_change", "agent_spec"):
+        value = recommendation.get(field)
+        if isinstance(value, dict) and value:
+            payload[field] = _json_safe_clone(value)
+
+    required_payload = PUBLISH_REQUIRED_ACTION_PAYLOADS.get(payload["action"])
+    if required_payload and required_payload not in payload:
+        return _publish_fallback_recommendation(
+            recommendation,
+            f"missing_required_action_payload:{required_payload}",
+        )
+
+    try:
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        finalized = finalize_recommendation_response(serialized)
+    except ValueError as exc:
+        return _publish_fallback_recommendation(recommendation, str(exc))
+    if any(
+        field in finalized and not isinstance(finalized[field], dict)
+        for field in ("evidence", "proposed_change", "variant_config", "strategy_lab_experiment", "code_change", "agent_spec")
+    ):
+        return _publish_fallback_recommendation(
+            recommendation,
+            "non_object_nested_payload",
+        )
+    return finalized
+
+
 def _latest_failure_cooldown_active(settings: dict) -> bool:
     cfg = settings.get("llm_swarm", {})
     if not cfg.get("cooldown_on_model_unavailable", True):
@@ -2028,16 +2160,17 @@ def write_recommendations(
     write_fallback = bool(cfg.get("write_fallback_recommendations_to_inbox", False))
     state = swarm_state or LAST_SWARM_STATE or {}
     state_rejected = list(state.get("rejected_actions") or [])
-    actionable = [
-        rec
-        for rec in recommendations
-        if not _is_rejected(rec) and (write_fallback or not _is_fallback_recommendation(rec))
-    ]
-    suppressed = [
-        rec
-        for rec in recommendations
-        if _is_rejected(rec) or (not write_fallback and _is_fallback_recommendation(rec))
-    ]
+    actionable: list[dict[str, Any]] = []
+    suppressed: list[dict[str, Any]] = []
+    for rec in recommendations:
+        published = _publishable_recommendation_payload(rec)
+        publish_is_fallback = _is_fallback_recommendation(published) or published.get("action") == "no_action"
+        if _is_rejected(rec) or (publish_is_fallback and not write_fallback) or (
+            not write_fallback and _is_fallback_recommendation(rec)
+        ):
+            suppressed.append(published)
+            continue
+        actionable.append(published)
     selected = actionable[:max_items]
     action_package = {
         "ranked_actions": selected,

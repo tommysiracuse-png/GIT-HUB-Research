@@ -802,6 +802,112 @@ class FrontierModelPolicyTests(unittest.TestCase):
                 llm_swarm_runner.INBOX = old_inbox
                 llm_swarm_runner.RUNS_DIR = old_runs
 
+    def test_write_recommendations_publishes_strict_schema_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_inbox = llm_swarm_runner.INBOX
+            old_runs = llm_swarm_runner.RUNS_DIR
+            try:
+                llm_swarm_runner.RUNS_DIR = pathlib.Path(tmp)
+                llm_swarm_runner.INBOX = pathlib.Path(tmp) / "llm_recommendations_inbox.jsonl"
+                llm_swarm_runner.write_recommendations(
+                    [
+                        {
+                            "action": "spawn_agent",
+                            "priority": 84,
+                            "title": "Create recurring strategy lab specialist",
+                            "rationale": "Recurring strategy-lab work should become a persistent paper-only specialist.",
+                            "market_key": "strategy_lab_recommendation",
+                            "evidence": {"dynamic_agent_objective": "Own recurring strategy_lab recommendation work."},
+                            "proposed_change": "Register the specialist for the next cycle.",
+                            "agent_spec": {
+                                "name": "strategy_lab_specialist",
+                                "objective": "Own recurring strategy-lab work and turn it into paper-testable artifacts.",
+                                "parent_agent_id": "strategy_lab",
+                                "triggers": {"any_packet_paths": ["strategy_lab"], "cooldown_minutes": 60},
+                                "evidence_inputs": ["strategy_lab", "horizon_outcomes"],
+                                "memory_policy": {
+                                    "namespaces": ["strategies", "outcomes", "recommendations"],
+                                    "keywords": ["strategy lab", "recommendation"],
+                                    "retrieval_limit": 24,
+                                },
+                                "model_tier": "standard",
+                                "allowed_actions": ["propose_strategy_lab_experiment", "propose_code_change", "spawn_agent"],
+                                "success_measure": {"primary": "paper_candidates_generated"},
+                            },
+                            "agent_name": "novel_strategy_discovery_specialist",
+                            "dynamic_agent_id": "agent_123",
+                            "parse_status": "native_valid",
+                            "provenance": {"state_packet": "runs/llm_state_packet.json"},
+                            "model": {"status": "model_call:test"},
+                        }
+                    ],
+                    10,
+                    settings={"llm_swarm": {"write_fallback_recommendations_to_inbox": False}},
+                )
+
+                published = json.loads(llm_swarm_runner.INBOX.read_text(encoding="utf-8").strip())
+                self.assertEqual(
+                    set(published),
+                    {
+                        "action",
+                        "priority",
+                        "title",
+                        "rationale",
+                        "market_key",
+                        "evidence",
+                        "proposed_change",
+                        "agent_spec",
+                    },
+                )
+                self.assertEqual("spawn_agent", published["action"])
+                self.assertTrue(published["market_key"].startswith("paper."))
+                self.assertEqual(
+                    published["proposed_change"],
+                    {"summary": "Register the specialist for the next cycle."},
+                )
+                self.assertNotIn("agent_name", published)
+                self.assertNotIn("model", published)
+                self.assertNotIn("dynamic_agent_id", published)
+            finally:
+                llm_swarm_runner.INBOX = old_inbox
+                llm_swarm_runner.RUNS_DIR = old_runs
+
+    def test_write_recommendations_suppresses_missing_action_payload_with_schema_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_inbox = llm_swarm_runner.INBOX
+            old_runs = llm_swarm_runner.RUNS_DIR
+            try:
+                llm_swarm_runner.RUNS_DIR = pathlib.Path(tmp)
+                llm_swarm_runner.INBOX = pathlib.Path(tmp) / "llm_recommendations_inbox.jsonl"
+                llm_swarm_runner.write_recommendations(
+                    [
+                        {
+                            "action": "propose_strategy_lab_experiment",
+                            "priority": 79,
+                            "title": "Recurring strategy lab idea",
+                            "rationale": "A strict publish contract should not release a strategy-lab action without its experiment payload.",
+                            "market_key": "strategy_lab_recommendation",
+                            "evidence": {"dynamic_agent_objective": "Own recurring strategy_lab recommendation work."},
+                            "proposed_change": {"summary": "Try again with a complete experiment object."},
+                            "agent_name": "novel_strategy_discovery_specialist",
+                        }
+                    ],
+                    10,
+                    settings={"llm_swarm": {"write_fallback_recommendations_to_inbox": False}},
+                )
+
+                self.assertEqual("", llm_swarm_runner.INBOX.read_text(encoding="utf-8"))
+                latest = json.loads((pathlib.Path(tmp) / "llm_swarm_latest.json").read_text(encoding="utf-8"))
+                self.assertEqual([], latest["recommendations"])
+                self.assertEqual("no_action", latest["suppressed_recommendations"][0]["action"])
+                self.assertEqual(
+                    "missing_required_action_payload:strategy_lab_experiment",
+                    latest["suppressed_recommendations"][0]["evidence"]["schema_violation"],
+                )
+            finally:
+                llm_swarm_runner.INBOX = old_inbox
+                llm_swarm_runner.RUNS_DIR = old_runs
+
     def test_post_model_database_lock_preserves_generated_recommendations(self) -> None:
         llm_swarm_runner.LAST_SWARM_STATE = {"ranked_actions": [{"title": "paid result"}]}
         with mock.patch.object(

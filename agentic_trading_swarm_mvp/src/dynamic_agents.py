@@ -935,9 +935,12 @@ def architect_recommendation(dynamic_cycle: dict) -> dict | None:
             f"The unresolved {candidate['objective_cluster']} cluster persisted across "
             f"{len(evidence.get('observed_cycle_ids') or [])} cycles and is not covered by an equivalent agent."
         ),
-        "market_key": candidate["objective_cluster"],
+        "market_key": f"paper.dynamic_agents.{_safe_name(candidate['objective_cluster'])}",
         "evidence": evidence,
-        "proposed_change": "Register the persistent specialist for the next evolution cycle.",
+        "proposed_change": {
+            "summary": "Register the persistent specialist for the next evolution cycle.",
+            "paper_only": True,
+        },
         "agent_spec": candidate["proposed_spec"],
         "agent_name": "agent_architect",
         "parse_status": "deterministic_valid",

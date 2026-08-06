@@ -214,6 +214,31 @@ class DynamicAgentPersistenceTests(unittest.TestCase):
         self.assertEqual(1, self.conn.execute("select count(*) from agent_specs").fetchone()[0])
         self.assertEqual("spawned", self.conn.execute("select status from agent_spawn_candidates").fetchone()[0])
 
+    def test_architect_recommendation_is_publish_ready(self):
+        recommendation = dynamic_agents.architect_recommendation(
+            {
+                "agent_architect": {
+                    "spawn_candidate": {
+                        "candidate_id": "spawn-rec-1",
+                        "objective_cluster": "strategy_lab_recommendation",
+                        "proposed_spec": agent_spec(parent_agent_id="strategy_lab"),
+                        "evidence": {"priority": 88, "observed_cycle_ids": ["cycle-a", "cycle-b"]},
+                    }
+                }
+            }
+        )
+
+        self.assertIsNotNone(recommendation)
+        self.assertEqual("spawn_agent", recommendation["action"])
+        self.assertTrue(recommendation["market_key"].startswith("paper.dynamic_agents."))
+        self.assertEqual(
+            recommendation["proposed_change"],
+            {
+                "summary": "Register the persistent specialist for the next evolution cycle.",
+                "paper_only": True,
+            },
+        )
+
     def test_role_specific_memory_policy_is_forwarded(self):
         created = dynamic_agents.register_agent_spec(self.conn, agent_spec(triggers={"always": True}))
         cycle = dynamic_agents.prepare_dynamic_agent_cycle(
