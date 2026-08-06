@@ -3149,12 +3149,16 @@ def paper_family_quarantine_record(
         "reason": "quarantined_family_decay",
         "guard": "paper_strategy_family_quarantine",
         "paper_only": True,
-        "eligible": False,
-        "paper_score_eligible": False,
-        "paper_rank_eligible": False,
+        "diagnostic_only": True,
+        "eligible": True,
+        "paper_score_eligible": True,
+        "paper_rank_eligible": True,
         "paper_fill_allowed": False,
-        "paper_score_multiplier": 0.0,
+        "paper_score_multiplier": 1.0,
         "paper_allocation_multiplier": 0.0,
+        "paper_execution_mode": "synthetic_paper",
+        "paper_execution_semantics": "counterfactual_family_decay_guard",
+        "signal_stats_scope": "synthetic_research",
         "quarantine_action": "shadow_monitor_only",
         "family_key": QUARANTINED_PAPER_FAMILY_KEY,
         "quarantine_family": QUARANTINED_PAPER_FAMILY_KEY,
@@ -4972,20 +4976,51 @@ def _apply_family_quarantine(
         action="family_quarantine_shadow_only",
         reasons=reasons,
         allocation_multiplier=0.0,
-        shadow_only=True,
+        shadow_only=False,
     )
     reliability["paper_strategy_quarantine"] = dict(quarantine)
     reliability["pre_quarantine_score"] = pre_quarantine_score
-    reliability["paper_score_multiplier"] = 0.0
-    reliability["paper_rank_eligible"] = False
+    reliability["paper_score_multiplier"] = 1.0
+    reliability["paper_rank_eligible"] = True
+    reliability["paper_guard_would_block"] = {
+        "reason": quarantine.get("reason"),
+        "guard": quarantine.get("guard"),
+        "record": dict(quarantine),
+    }
     candidate["pre_quarantine_score"] = pre_quarantine_score
-    candidate["score"] = 0.0
-    candidate["paper_score_multiplier"] = 0.0
-    candidate["paper_score_eligible"] = False
-    candidate["paper_rank_eligible"] = False
+    candidate["paper_score_multiplier"] = 1.0
+    candidate["paper_score_eligible"] = True
+    candidate["paper_rank_eligible"] = True
     candidate["paper_fill_allowed"] = False
+    candidate["paper_eligible"] = True
+    candidate["paper_entry_blocked"] = False
+    candidate["paper_observation_only"] = True
+    candidate["paper_observation_reason"] = str(
+        quarantine.get("reason") or "quarantined_family_decay"
+    )
+    candidate["paper_execution_mode"] = str(
+        quarantine.get("paper_execution_mode") or "synthetic_paper"
+    )
+    candidate["paper_execution_semantics"] = str(
+        quarantine.get("paper_execution_semantics") or "counterfactual_family_decay_guard"
+    )
+    candidate["signal_stats_scope"] = str(
+        quarantine.get("signal_stats_scope") or "synthetic_research"
+    )
+    candidate["paper_action"] = "shadow_only"
+    candidate["paper_status"] = "shadow_only"
+    candidate["paper_fill_status"] = "shadow_only"
+    candidate["paper_order_status"] = "shadow_only"
+    candidate["candidate_status"] = "shadow_quarantined"
+    candidate["paper_quarantine_status"] = "shadow_quarantined"
+    candidate["promotion_eligible"] = False
+    candidate["_hunter_bucket"] = "diagnose"
+    candidate["paper_guard_would_block"] = dict(reliability["paper_guard_would_block"])
+    candidate["shadow_filtered"] = False
     candidate["paper_strategy_quarantine"] = dict(quarantine)
     candidate["strategy_reliability"] = reliability
+    candidate.pop("candidate_reject_reason", None)
+    candidate.pop("candidate_reject_detail", None)
     _append_note(candidate, "paper_strategy_family_quarantine:yahoo_proxy_family_decay")
     return reliability
 

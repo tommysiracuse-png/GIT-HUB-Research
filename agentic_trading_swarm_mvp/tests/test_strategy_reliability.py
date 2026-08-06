@@ -538,9 +538,12 @@ class StrategyReliabilityTests(unittest.TestCase):
 
         for direction in ("short_proxy", "long_proxy"):
             candidate = by_direction[direction]
-            self.assertTrue(candidate["paper_entry_blocked"])
-            self.assertFalse(candidate["paper_score_eligible"])
-            self.assertEqual(candidate["score"], 0.0)
+            self.assertFalse(candidate["paper_entry_blocked"])
+            self.assertTrue(candidate["paper_score_eligible"])
+            self.assertGreater(candidate["score"], 0.0)
+            self.assertFalse(candidate["paper_fill_allowed"])
+            self.assertTrue(candidate["paper_observation_only"])
+            self.assertEqual(candidate["paper_execution_mode"], "synthetic_paper")
             self.assertEqual(candidate["strategy_reliability_action"], "family_quarantine_shadow_only")
 
     def test_proxy_short_quality_failure_is_preserved_through_family_quarantine(self) -> None:
@@ -561,7 +564,9 @@ class StrategyReliabilityTests(unittest.TestCase):
 
         rows, report = strategy_reliability.apply_strategy_reliability([candidate])
 
-        self.assertTrue(rows[0]["paper_entry_blocked"])
+        self.assertFalse(rows[0]["paper_entry_blocked"])
+        self.assertFalse(rows[0]["paper_fill_allowed"])
+        self.assertTrue(rows[0]["paper_observation_only"])
         self.assertEqual("proxy_short_quality_missing_freshness", rows[0]["quality_failure_reason"])
         self.assertIn(
             "proxy_short_quality_missing_freshness",

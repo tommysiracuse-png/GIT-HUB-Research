@@ -56,8 +56,9 @@ class PaperFamilyQuarantineTests(unittest.TestCase):
 
         self.assertEqual(record["family_key"], "YAHOO_PROXY|global_proxy_momentum")
         self.assertEqual(record["matched_on"]["type"], "family_metadata")
-        self.assertFalse(record["paper_score_eligible"])
-        self.assertEqual(record["paper_score_multiplier"], 0.0)
+        self.assertTrue(record["diagnostic_only"])
+        self.assertTrue(record["paper_score_eligible"])
+        self.assertEqual(record["paper_score_multiplier"], 1.0)
 
     def test_matches_direction_descendant_by_family_key_prefix(self) -> None:
         candidate = self._candidate(
@@ -69,7 +70,7 @@ class PaperFamilyQuarantineTests(unittest.TestCase):
         record = paper_family_quarantine_record(candidate)
 
         self.assertEqual(record["matched_on"]["type"], "family_key_prefix")
-        self.assertFalse(record["paper_rank_eligible"])
+        self.assertTrue(record["paper_rank_eligible"])
 
     def test_matches_current_cycle_strategy_lab_descendant_name_prefix(self) -> None:
         candidate = self._candidate(
@@ -145,7 +146,7 @@ class PaperFamilyQuarantineTests(unittest.TestCase):
         self.assertIsNone(paper_family_quarantine_record(candidate, config={"mode": "live"}))
         self.assertIsNone(paper_family_quarantine_record(candidate, config=False))
 
-    def test_scoring_gate_clamps_score_and_preserves_observability(self) -> None:
+    def test_scoring_gate_preserves_score_and_marks_synthetic_observation(self) -> None:
         quarantined = self._candidate(score=99.0)
         healthy = self._candidate(
             venue="DIRECT_JSE",
@@ -158,13 +159,18 @@ class PaperFamilyQuarantineTests(unittest.TestCase):
         by_inst = {row["inst_id"]: row for row in rows}
         blocked = by_inst["YAHOO_PROXY:EWZ"]
 
-        self.assertEqual(rows[0]["inst_id"], "DIRECT_JSE:NPN")
+        self.assertEqual(rows[0]["inst_id"], "YAHOO_PROXY:EWZ")
         self.assertEqual(blocked["pre_quarantine_score"], 99.0)
-        self.assertEqual(blocked["score"], 0.0)
-        self.assertFalse(blocked["paper_score_eligible"])
+        self.assertGreaterEqual(blocked["score"], blocked["pre_quarantine_score"])
+        self.assertTrue(blocked["paper_score_eligible"])
+        self.assertFalse(blocked["paper_fill_allowed"])
+        self.assertFalse(blocked["paper_entry_blocked"])
+        self.assertTrue(blocked["paper_observation_only"])
+        self.assertEqual(blocked["paper_execution_mode"], "synthetic_paper")
         self.assertFalse(blocked["promotion_eligible"])
         self.assertEqual(blocked["strategy_reliability_allocation_multiplier"], 0.0)
         self.assertIn("paper_strategy_quarantine", blocked)
+        self.assertIn("paper_guard_would_block", blocked)
         self.assertEqual(report["summary"]["family_quarantine_count"], 1)
 
     def test_hard_gate_survives_general_reliability_feature_disable(self) -> None:
@@ -177,10 +183,12 @@ class PaperFamilyQuarantineTests(unittest.TestCase):
 
         self.assertFalse(report["enabled"])
         self.assertTrue(report["paper_family_quarantine_enabled"])
-        self.assertEqual(rows[0]["score"], 0.0)
-        self.assertFalse(rows[0]["paper_rank_eligible"])
+        self.assertEqual(rows[0]["score"], 88.0)
+        self.assertTrue(rows[0]["paper_rank_eligible"])
+        self.assertFalse(rows[0]["paper_fill_allowed"])
+        self.assertEqual(rows[0]["paper_execution_mode"], "synthetic_paper")
 
-    def test_router_shadow_filters_quarantined_candidate(self) -> None:
+    def test_router_retains_quarantined_candidate_as_synthetic_diagnostic(self) -> None:
         candidate = self._candidate(paper_filled=True, status="paper_filled")
 
         reason = frontier_shadow_filter_reason(candidate, config={"mode": "paper"})
@@ -188,9 +196,11 @@ class PaperFamilyQuarantineTests(unittest.TestCase):
 
         self.assertEqual(reason["guard"], "paper_strategy_family_quarantine")
         self.assertFalse(reason["paper_fill_allowed"])
-        self.assertTrue(guarded["shadow_filtered"])
+        self.assertFalse(guarded["shadow_filtered"])
         self.assertFalse(guarded["paper_filled"])
-        self.assertEqual(guarded["status"], "shadow_filtered")
+        self.assertEqual(guarded["status"], "shadow_only")
+        self.assertTrue(guarded["paper_observation_only"])
+        self.assertEqual(guarded["paper_execution_mode"], "synthetic_paper")
 
     def test_router_prefers_freshness_gate_over_family_quarantine_when_yahoo_telemetry_is_present(self) -> None:
         candidate = self._candidate(

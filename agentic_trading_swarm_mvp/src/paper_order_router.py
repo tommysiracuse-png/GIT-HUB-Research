@@ -1963,6 +1963,61 @@ def _retain_research_only_route_candidate(
     return guarded
 
 
+def _retain_diagnostic_only_family_quarantine_candidate(
+    guarded: dict[str, Any],
+    reason: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Keep family-decay guard outcomes visible as synthetic-paper diagnostics."""
+    if reason.get("guard") != "paper_strategy_family_quarantine" or not _as_bool(
+        reason.get("diagnostic_only"),
+        False,
+    ):
+        return None
+
+    guarded["paper_strategy_quarantine"] = dict(reason)
+    guarded["paper_guard_would_block"] = {
+        "reason": reason.get("reason"),
+        "guard": reason.get("guard"),
+        "record": dict(reason),
+    }
+    guarded["shadow_filtered"] = False
+    guarded["paper_fill_allowed"] = False
+    guarded["paper_eligible"] = True
+    guarded["paper_entry_blocked"] = False
+    guarded["paper_score_eligible"] = True
+    guarded["paper_rank_eligible"] = True
+    guarded["paper_score_multiplier"] = 1.0
+    guarded["paper_action"] = "shadow_only"
+    guarded["paper_status"] = "shadow_only"
+    guarded["paper_fill_status"] = "shadow_only"
+    guarded["paper_order_status"] = "shadow_only"
+    guarded["router_action"] = "observe_only"
+    guarded["paper_observation_only"] = True
+    guarded["paper_observation_reason"] = str(
+        reason.get("reason") or "quarantined_family_decay"
+    )
+    guarded["paper_execution_mode"] = str(
+        reason.get("paper_execution_mode") or "synthetic_paper"
+    )
+    guarded["paper_execution_semantics"] = str(
+        reason.get("paper_execution_semantics") or "counterfactual_family_decay_guard"
+    )
+    guarded["signal_stats_scope"] = str(reason.get("signal_stats_scope") or "synthetic_research")
+    guarded["candidate_status"] = "family_decay_diagnostic"
+    guarded["paper_quarantine_status"] = "family_decay_diagnostic"
+    guarded["promotion_eligible"] = False
+    guarded["_hunter_bucket"] = "diagnose"
+    for boolean_field in ("paper_filled", "filled"):
+        if guarded.get(boolean_field) is True:
+            guarded[boolean_field] = False
+    for status_field in ("status", "order_status", "fill_status"):
+        if str(guarded.get(status_field) or "").lower() == "paper_filled":
+            guarded[status_field] = "shadow_only"
+    guarded.pop("candidate_reject_reason", None)
+    guarded.pop("candidate_reject_detail", None)
+    return guarded
+
+
 def apply_frontier_paper_guard(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -2053,6 +2108,9 @@ def apply_frontier_paper_guard(
     reason = frontier_shadow_filter_reason(guarded, config)
     if reason is not None:
         retained = _retain_research_only_route_candidate(guarded, reason)
+        if retained is not None:
+            return retained
+        retained = _retain_diagnostic_only_family_quarantine_candidate(guarded, reason)
         if retained is not None:
             return retained
         return _annotate_shadow_filtered_candidate(guarded, reason, "frontier_paper_guard")
