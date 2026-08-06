@@ -22,7 +22,7 @@ class CrossMarketResearcherRecommendationIngestionTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(payload)
-        self.assertEqual(payload["action"], "code_change")
+        self.assertEqual(payload["action"], "diagnostic")
         self.assertEqual(payload["priority"], 90)
         self.assertEqual(payload["market_key"], "paper_global_macro")
         self.assertEqual(payload["title"], "Return a single complete paper-trading recommendation object")
@@ -48,10 +48,28 @@ class CrossMarketResearcherRecommendationIngestionTests(unittest.TestCase):
         )
 
         self.assertEqual(len(parsed), 1)
-        self.assertEqual(parsed[0]["action"], "code_change")
+        self.assertEqual(parsed[0]["action"], "diagnostic")
         self.assertEqual(parsed[0]["priority"], 90)
         self.assertEqual(parsed[0]["evidence"]["impact"], "parser failure")
         self.assertIn("required_fields", parsed[0]["proposed_change"])
+
+    def test_native_payload_preserves_no_action_cross_market_schema_guard(self) -> None:
+        payload = _native_payload(
+            {
+                "parsed": {
+                    "source_agent": "cross_market_researcher",
+                    "market_key": "paper_global_macro",
+                    "action": "no_action",
+                    "rationale": "Keep the malformed output diagnostic-only.",
+                    "evidence": {"issue": "schema guard"},
+                    "proposed_change": {"goal": "rerun the paper-only analysis"},
+                }
+            }
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["action"], "no_action")
+        self.assertEqual(payload["priority"], 90)
 
     def test_json_objects_rejects_top_level_array_wrapper(self) -> None:
         parsed = list(

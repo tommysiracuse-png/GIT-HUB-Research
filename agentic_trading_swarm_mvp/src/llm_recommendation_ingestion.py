@@ -279,9 +279,9 @@ def _repair_cross_market_researcher_payload(value: Any) -> Optional[Dict[str, An
         return None
 
     repaired: Dict[str, Any] = dict(value)
-    action = _clean_action(_first(repaired, ("action", "proposed_action"), "code_change"))
-    if action not in ALLOWED_ACTIONS:
-        action = "code_change"
+    action = _clean_action(_first(repaired, ("action", "proposed_action"), "diagnostic"))
+    if action not in {"diagnostic", "no_action"}:
+        action = "diagnostic"
     repaired["action"] = action
 
     try:
