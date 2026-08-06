@@ -156,6 +156,7 @@ def parse_central_bank_of_bahrain_treasury_bill_auction(
     age_seconds = max(0.0, (fetched_at - result_at).total_seconds())
     freshness_state = "fresh" if age_seconds <= max(0.0, stale_after_hours) * 3600 else "stale"
     inst_id = f"{VENUE}:TBILL:ISSUE:{issue_number}"
+    coverage_ratio = 1.0 + (float(oversubscription_pct) / 100.0)
     return [
         {
             "venue": VENUE,
@@ -176,13 +177,16 @@ def parse_central_bank_of_bahrain_treasury_bill_auction(
             "auction_amount_millions_bhd": amount_millions,
             "awarded_amount_millions_bhd": amount_millions,
             "maturity_days": int(maturity_days),
+            "term_days": int(maturity_days),
             "issue_date": issue_date.isoformat(),
             "maturity_date": maturity_date.isoformat(),
             "average_interest_rate_pct": average_rate,
+            "average_yield_pct": average_rate,
             "previous_average_interest_rate_pct": prior_average_rate,
             "average_price_per_100": average_price,
             "lowest_accepted_price_per_100": lowest_accepted_price,
             "oversubscription_pct": oversubscription_pct,
+            "coverage_ratio": round(coverage_ratio, 6),
             "data_status": "reachable",
             "fetch_status": "reachable",
             "quality_status": "official_auction_result",
@@ -190,6 +194,7 @@ def parse_central_bank_of_bahrain_treasury_bill_auction(
             "freshness_basis": "official_results_publication_date",
             "freshness_age_seconds": round(age_seconds, 3),
             "session_status": "results_published",
+            "auction_at": result_at.isoformat(),
             "observed_at": fetched_at.isoformat(),
             "fetched_at": fetched_at.isoformat(),
             "result_published_date": published_at.isoformat(),

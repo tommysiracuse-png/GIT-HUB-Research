@@ -394,6 +394,82 @@ def boc_auction_reference_logic() -> dict:
     }
 
 
+def bahrain_auction_observation(
+    price: float,
+    published_at: dt.datetime,
+    *,
+    issue_number: int,
+    maturity_days: int = 91,
+    average_interest_rate_pct: float = 4.91,
+    previous_average_interest_rate_pct: float = 4.90,
+    oversubscription_pct: float = 101.0,
+    **overrides: object,
+) -> dict:
+    row = {
+        "inst_id": f"CENTRAL_BANK_OF_BAHRAIN:TBILL:ISSUE:{issue_number}",
+        "venue": "CENTRAL_BANK_OF_BAHRAIN",
+        "trade_type": "official_primary_auction_result",
+        "market_type": "treasury_bill_auction_reference",
+        "asset_class": "sovereign_treasury_bill",
+        "quote": "BHD_PER_100_FACE",
+        "base": f"BAHRAIN_TBILL_{maturity_days}",
+        "last": price,
+        "maturity_days": maturity_days,
+        "term_days": maturity_days,
+        "average_interest_rate_pct": average_interest_rate_pct,
+        "average_yield_pct": average_interest_rate_pct,
+        "previous_average_interest_rate_pct": previous_average_interest_rate_pct,
+        "average_price_per_100": price,
+        "lowest_accepted_price_per_100": price - 0.046,
+        "oversubscription_pct": oversubscription_pct,
+        "coverage_ratio": 1.0 + (oversubscription_pct / 100.0),
+        "quality_status": "official_auction_result",
+        "market_surface": "bahrain_government_treasury_bill_auctions",
+        "freshness_state": "fresh",
+        "candidate_reject_reason": "official_auction_result_not_executable_quote",
+        "session_status": "results_published",
+        "auction_at": published_at.isoformat(),
+        "result_published_date": published_at.date().isoformat(),
+        "issue_date": (published_at + dt.timedelta(days=2)).date().isoformat(),
+        "observed_at": published_at.isoformat(),
+        "price_source": "Central Bank of Bahrain Treasury-bill allotment press release",
+    }
+    row.update(overrides)
+    return row
+
+
+def bahrain_auction_reference_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["CENTRAL_BANK_OF_BAHRAIN"],
+            "asset_classes": ["sovereign_treasury_bill"],
+            "market_types": ["treasury_bill_auction_reference"],
+            "market_surfaces": ["bahrain_government_treasury_bill_auctions"],
+        },
+        "calculated_features": {
+            "rate_change_bps": "100 * (average_interest_rate_pct - previous_average_interest_rate_pct)",
+            "bahrain_demand_pressure": "oversubscription_pct - max(rate_change_bps, 0)",
+        },
+        "entry_expression": (
+            "market_surface == 'bahrain_government_treasury_bill_auctions' "
+            "and quality_status == 'official_auction_result' "
+            "and candidate_reject_reason == 'official_auction_result_not_executable_quote' "
+            "and freshness_state == 'fresh' and oversubscription_pct >= 100 "
+            "and average_interest_rate_pct > 0 and previous_average_interest_rate_pct > 0 "
+            "and maturity_days > 0 and auction_result_published >= 1"
+        ),
+        "invalidation_expression": (
+            "freshness_state != 'fresh' or average_interest_rate_pct <= 0 "
+            "or previous_average_interest_rate_pct <= 0 or maturity_days <= 0"
+        ),
+        "direction": "long",
+        "edge_expression": "bahrain_demand_pressure / 10",
+        "score_expression": "clip(45 + bahrain_demand_pressure / 2, 0, 100)",
+        "route_surface": "auction_reference",
+    }
+
+
 def carb_allowance_auction_observation(
     price: float,
     event_date: dt.date,
@@ -1304,6 +1380,126 @@ class StrategyProgramTests(unittest.TestCase):
         candidates, diagnostic = generate_program_candidates(experiment, [invalid], cfg)
         self.assertEqual([], candidates, diagnostic)
         self.assertEqual(1, diagnostic["reject_reasons"]["entry_expression_false"])
+
+    def test_bahrain_auction_reference_uses_normalized_fields_and_next_same_maturity_label(self) -> None:
+        cfg = settings()
+        cfg["paper_exploration"]["enabled"] = True
+        cfg["learning"]["horizon_minutes"] = [0]
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        entry_published_at = now - dt.timedelta(days=7)
+        next_published_at = now - dt.timedelta(days=1)
+        recommendation = lab_recommendation(
+            "bahrain_auction_reference_v1",
+            bahrain_auction_reference_logic(),
+        )
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["hypothesis"] = (
+            "Strongly oversubscribed Bahrain Treasury-bill results with limited rate step-up "
+            "predict lower next same-maturity average yields."
+        )
+        experiment["source_surface"] = "bahrain_government_treasury_bill_auctions"
+        experiment["permitted_target_surface"] = ["bahrain_government_treasury_bill_auctions"]
+        entry = bahrain_auction_observation(
+            98.773,
+            entry_published_at,
+            issue_number=2099,
+            average_interest_rate_pct=4.91,
+            previous_average_interest_rate_pct=4.90,
+            oversubscription_pct=101.0,
+        )
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            generated, report = generate_strategy_lab_candidates(conn, cfg, [], [entry])
+
+            self.assertEqual(1, len(generated), report)
+            candidate = generated[0]
+            self.assertEqual(
+                "bahrain_government_treasury_bill_auctions",
+                candidate["target_surface"],
+            )
+            self.assertTrue(candidate["paper_auction_reference"])
+            self.assertTrue(candidate["paper_auction_reference_provenance_valid"])
+            self.assertEqual(
+                101.0,
+                candidate["strategy_lab_program_features"]["oversubscription_pct"],
+            )
+            self.assertEqual(
+                4.90,
+                candidate["strategy_lab_program_features"]["previous_average_interest_rate_pct"],
+            )
+
+            execution = execute_order(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"], "paper_allocation_multiplier": 1.0},
+                cfg,
+            )
+            self.assertTrue(execution["paper_filled"])
+            self.assertEqual(
+                "synthetic_auction_reference_paper",
+                execution["order"]["route_id"],
+            )
+
+            trade_id = open_paper_trade(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"]},
+                execution=execution,
+                settings=cfg,
+            )
+            self.assertEqual([], record_due_horizon_outcomes(conn, {entry["inst_id"]: entry}, cfg))
+
+            same_auction = {**entry, "average_interest_rate_pct": 4.50, "average_yield_pct": 4.50}
+            wrong_maturity = bahrain_auction_observation(
+                98.820,
+                next_published_at,
+                issue_number=2100,
+                maturity_days=182,
+                average_interest_rate_pct=4.70,
+                previous_average_interest_rate_pct=4.91,
+                oversubscription_pct=120.0,
+            )
+            stale_same_maturity = bahrain_auction_observation(
+                98.810,
+                entry_published_at + dt.timedelta(days=2),
+                issue_number=2101,
+                average_interest_rate_pct=4.80,
+                previous_average_interest_rate_pct=4.91,
+                oversubscription_pct=99.0,
+                freshness_state="stale",
+            )
+            next_same_maturity = bahrain_auction_observation(
+                98.805,
+                next_published_at,
+                issue_number=2102,
+                average_interest_rate_pct=4.85,
+                previous_average_interest_rate_pct=4.91,
+                oversubscription_pct=108.0,
+            )
+            recorded = record_due_horizon_outcomes(
+                conn,
+                {
+                    same_auction["inst_id"]: same_auction,
+                    wrong_maturity["inst_id"]: wrong_maturity,
+                    stale_same_maturity["inst_id"]: stale_same_maturity,
+                    next_same_maturity["inst_id"]: next_same_maturity,
+                },
+                cfg,
+            )
+            self.assertEqual(1, len(recorded))
+            self.assertEqual("valid_auction_event", recorded[0]["measurement_status"])
+            self.assertGreater(recorded[0]["pnl_bps"], 0)
+
+            outcome = conn.execute(
+                "select price, pnl_bps, measurement_status, context_json from paper_trade_outcomes where trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+            self.assertEqual(4.85, outcome["price"])
+            self.assertEqual("valid_auction_event", outcome["measurement_status"])
+            context = json.loads(outcome["context_json"])["paper_auction_reference_outcome"]
+            self.assertEqual(next_same_maturity["inst_id"], context["outcome_inst_id"])
+            self.assertEqual(next_published_at.isoformat(), context["outcome_auction_at"])
 
     def test_carb_allowance_auction_reference_uses_paired_features_and_next_current_settlement(self) -> None:
         cfg = settings()

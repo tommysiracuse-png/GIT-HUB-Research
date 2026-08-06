@@ -2315,9 +2315,21 @@ def _auction_reference_outcome(
         if str(raw.get("freshness_state") or "") != "fresh":
             continue
         try:
-            candidate_term_days = int(float(raw.get("term_days") or 0))
-            outcome_yield = float(raw.get("average_yield_pct") or 0)
-            auction_at = _parse_storage_iso(str(raw.get("auction_at") or ""))
+            candidate_term_days = int(
+                float(raw.get("term_days") or raw.get("maturity_days") or 0)
+            )
+            outcome_yield = float(
+                raw.get("average_yield_pct") or raw.get("average_interest_rate_pct") or 0
+            )
+            auction_at = _parse_storage_iso(
+                str(
+                    raw.get("auction_at")
+                    or raw.get("result_published_date")
+                    or raw.get("issue_date")
+                    or raw.get("observed_at")
+                    or ""
+                )
+            )
         except (TypeError, ValueError):
             continue
         if candidate_term_days != term_days or outcome_yield <= 0 or auction_at <= entry_auction_at:

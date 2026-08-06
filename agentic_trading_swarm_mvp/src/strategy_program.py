@@ -101,6 +101,12 @@ BASE_FEATURES = {
     "auction_average_yield_pct",
     "auction_stop_out_yield_pct",
     "auction_result_published",
+    "average_interest_rate_pct",
+    "previous_average_interest_rate_pct",
+    "average_price_per_100",
+    "lowest_accepted_price_per_100",
+    "oversubscription_pct",
+    "maturity_days",
     "auction_settlement_price_usd",
     "allowances_offered",
     "allowances_sold",
@@ -531,6 +537,28 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
     )
     recent_basis = historical_basis + [basis] if basis_history_ready else []
     basis_change_5m = basis - historical_basis[-1] if basis_history_ready else 0.0
+    average_interest_rate_pct = max(0.0, _float(row.get("average_interest_rate_pct")))
+    previous_average_interest_rate_pct = max(
+        0.0,
+        _float(row.get("previous_average_interest_rate_pct")),
+    )
+    average_price_per_100 = max(0.0, _float(row.get("average_price_per_100"), last))
+    lowest_accepted_price_per_100 = max(
+        0.0,
+        _float(row.get("lowest_accepted_price_per_100")),
+    )
+    oversubscription_pct = max(0.0, _float(row.get("oversubscription_pct")))
+    maturity_days = max(0.0, _float(row.get("maturity_days")))
+    auction_at = str(
+        row.get("auction_at")
+        or row.get("result_published_date")
+        or row.get("issue_date")
+        or row.get("observed_at")
+        or ""
+    )
+    coverage_ratio = _float(row.get("coverage_ratio"))
+    if coverage_ratio <= 0 and oversubscription_pct > 0:
+        coverage_ratio = 1.0 + (oversubscription_pct / 100.0)
     return {
         **row,
         "last": last,
@@ -588,14 +616,24 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
         "quote_volume_1m": max(0.0, _float(row.get("quote_volume_1m"))),
         "relative_volume_1m_60m": max(0.0, _float(row.get("relative_volume_1m_60m"))),
         "microstructure_history_ready": 1.0 if _float(row.get("microstructure_history_ready")) >= 1.0 else 0.0,
-        "auction_coverage_ratio": max(0.0, _float(row.get("coverage_ratio"))),
+        "auction_coverage_ratio": max(0.0, coverage_ratio),
         "auction_tail_bps": _float(row.get("tail_bps")),
-        "auction_term_days": max(0.0, _float(row.get("term_days"))),
-        "auction_average_yield_pct": max(0.0, _float(row.get("average_yield_pct"))),
+        "auction_term_days": max(0.0, _float(row.get("term_days"), maturity_days)),
+        "auction_average_yield_pct": max(
+            0.0,
+            _float(row.get("average_yield_pct"), average_interest_rate_pct),
+        ),
         "auction_stop_out_yield_pct": max(0.0, _float(row.get("stop_out_yield_pct"))),
         "auction_result_published": (
             1.0 if str(row.get("quality_status") or "") == AUCTION_REFERENCE_QUALITY_STATUS else 0.0
         ),
+        "average_interest_rate_pct": average_interest_rate_pct,
+        "previous_average_interest_rate_pct": previous_average_interest_rate_pct,
+        "average_price_per_100": average_price_per_100,
+        "lowest_accepted_price_per_100": lowest_accepted_price_per_100,
+        "oversubscription_pct": oversubscription_pct,
+        "maturity_days": maturity_days,
+        "auction_at": auction_at,
         "auction_settlement_price_usd": _float(
             row.get("auction_settlement_price_usd"),
             _float(row.get("last")),
