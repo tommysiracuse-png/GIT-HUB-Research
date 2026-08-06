@@ -16,6 +16,7 @@ from paper_order_router import (
     PAPER_NET_EDGE_GUARD_REASON,
     apply_frontier_paper_admission_guard,
     apply_frontier_paper_guard,
+    paper_route_feasibility_gate_review,
 )
 from paper_context_cost import enforce_paper_context_cost_gate
 from paper_decay_quarantine import apply_quarantine as apply_okx_basis_decay_quarantine
@@ -350,6 +351,14 @@ def _restore_yahoo_proxy_freshness_shadow(candidate: dict) -> dict:
     return restored
 
 
+def _route_feasibility_shadow_recoverable_for_exploration(candidate: dict, settings: dict) -> bool:
+    detail = candidate.get("candidate_reject_detail")
+    if isinstance(detail, dict) and detail.get("guard") == "paper_route_feasibility_score_gate":
+        return bool(candidate.get("shadow_filtered"))
+    gate = paper_route_feasibility_gate_review(candidate, settings)
+    return bool(gate.get("applies") and not gate.get("eligible"))
+
+
 def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
     paper_mode = settings.get("mode", "paper") == "paper" and not settings.get(
         "allow_live_trading", False
@@ -364,7 +373,10 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         isinstance(context_loss_quarantine, dict)
         and not context_loss_quarantine.get("paper_fill_allowed", True)
     )
-    if exploration_enabled(settings) and not candidate.get("shadow_filtered"):
+    recoverable_route_shadow = _route_feasibility_shadow_recoverable_for_exploration(candidate, settings)
+    if exploration_enabled(settings) and (
+        not candidate.get("shadow_filtered") or recoverable_route_shadow
+    ):
         candidate = prepare_candidate_for_exploration(dict(candidate), settings)
         # This explicit paper-only family exception survives exploration's
         # otherwise permissive synthetic-route preparation.
@@ -399,7 +411,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
         candidate = apply_frontier_paper_admission_guard(candidate, settings)
         candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
-        if not candidate.get("shadow_filtered"):
+        if not candidate.get("shadow_filtered") and not recoverable_route_shadow:
             # Exploration can substitute a synthetic route, but the fill-time
             # frontier net-edge guard still decides whether a paper order is
             # worth turning into a fill versus a shadow observation.
