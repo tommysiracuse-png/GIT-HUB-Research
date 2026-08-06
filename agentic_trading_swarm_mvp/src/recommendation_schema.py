@@ -21,6 +21,10 @@ REQUIRED_RECOMMENDATION_KEYS = (
     "proposed_change",
 )
 
+CROSS_MARKET_RESEARCHER_ALLOWED_ACTIONS = frozenset(
+    {"no_action", "propose_diagnostic_hypothesis"}
+)
+
 
 def _reject_non_json_constant(value: str) -> None:
     """Reject JavaScript-style numeric constants that are not valid JSON."""
@@ -68,6 +72,57 @@ def validate_recommendation_object(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
     return all(key in payload for key in REQUIRED_RECOMMENDATION_KEYS)
+
+
+def validate_cross_market_researcher_object(payload: Any) -> None:
+    """Raise when a cross-market recommendation violates its runtime contract."""
+    if not isinstance(payload, dict):
+        raise ValueError("cross-market recommendation must be a JSON object")
+    missing = [key for key in REQUIRED_RECOMMENDATION_KEYS if key not in payload]
+    if missing:
+        raise ValueError(
+            "cross-market recommendation missing required fields: " + ", ".join(missing)
+        )
+    if payload["action"] not in CROSS_MARKET_RESEARCHER_ALLOWED_ACTIONS:
+        raise ValueError("cross-market recommendation action is not allowed")
+    # bool is an int subclass, but it is not a meaningful recommendation priority.
+    if isinstance(payload["priority"], bool) or not isinstance(payload["priority"], int):
+        raise ValueError("cross-market recommendation priority must be an integer")
+
+
+def finalize_cross_market_researcher_response(response: str | bytes | bytearray) -> dict[str, Any]:
+    """Parse and validate one complete cross-market researcher response."""
+    payload = finalize_recommendation_response(response)
+    validate_cross_market_researcher_object(payload)
+    return payload
+
+
+def cross_market_researcher_schema_fallback(
+    validation_error: str,
+    *,
+    raw_generation_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a paper-only diagnostic recommendation after schema validation fails."""
+    return {
+        "action": "propose_diagnostic_hypothesis",
+        "priority": 100,
+        "title": "Cross-market researcher response schema violation",
+        "rationale": (
+            "The generated cross-market recommendation was not schema-valid; retain the "
+            "failure as a paper-only diagnostic rather than using it for execution."
+        ),
+        "market_key": "paper.cross_market_researcher.schema_fallback",
+        "evidence": {
+            "schema_violation": validation_error,
+            "raw_generation_metadata": raw_generation_metadata,
+            "paper_only": True,
+        },
+        "proposed_change": {
+            "summary": "Repair the cross-market response schema and rerun the paper-only analysis.",
+            "paper_only": True,
+            "live_trading": "disabled",
+        },
+    }
 
 
 def finalize_recommendation_response(response: str | bytes | bytearray) -> dict[str, Any]:

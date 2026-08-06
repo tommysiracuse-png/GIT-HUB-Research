@@ -32,7 +32,12 @@ from memory_graph import (
     sync_graphiti,
     write_memory_exports,
 )
-from recommendation_schema import REQUIRED_RECOMMENDATION_KEYS, finalize_recommendation_response
+from recommendation_schema import (
+    CROSS_MARKET_RESEARCHER_ALLOWED_ACTIONS,
+    REQUIRED_RECOMMENDATION_KEYS,
+    cross_market_researcher_schema_fallback,
+    finalize_cross_market_researcher_response,
+)
 from settings import load_settings
 from storage import RUNS_DIR, connect
 from dynamic_agents import (
@@ -876,6 +881,7 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
         reasoning_effort_override=reasoning_override,
         structured_json=True,
     )
+    generation_attempts = {"initial": _generation_metadata(result)}
     rec = parse_recommendation(result.text, agent, packet)
     if _should_retry_schema(
         rec,
@@ -899,6 +905,13 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
         retry_rec["initial_parse_status"] = rec.get("parse_status")
         result = retry
         rec = retry_rec
+        generation_attempts["retry"] = _generation_metadata(result)
+    rec = _finalize_cross_market_recommendation(
+        agent,
+        rec,
+        result.text,
+        generation_attempts,
+    )
     if result.model_tier == "frontier" and not rec.get("frontier_escalation_reason"):
         rec["frontier_escalation_reason"] = escalation_reason or "Frontier tier selected by model policy."
     rec["model"] = {
@@ -914,6 +927,55 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
         "frontier_escalation_reason": rec.get("frontier_escalation_reason"),
     }
     return rec
+
+
+def _generation_metadata(result: Any) -> dict[str, Any]:
+    """Keep model output context with a fallback without exposing configuration secrets."""
+    return {
+        "response_text": str(getattr(result, "text", "") or ""),
+        "model_name": getattr(result, "model_name", None),
+        "model_tier": getattr(result, "model_tier", None),
+        "status": getattr(result, "status", None),
+        "api": getattr(result, "api", None),
+        "reasoning_effort": getattr(result, "reasoning_effort", None),
+        "reasoning_mode": getattr(result, "reasoning_mode", None),
+        "verbosity": getattr(result, "verbosity", None),
+        "structured_json": getattr(result, "structured_json", None),
+    }
+
+
+def _finalize_cross_market_recommendation(
+    agent: dict,
+    recommendation: dict,
+    raw_response: str,
+    generation_attempts: dict[str, dict[str, Any]],
+) -> dict:
+    """Apply the final strict schema gate for cross-market researcher output."""
+    if agent.get("name") != "cross_market_researcher":
+        return recommendation
+    try:
+        finalize_cross_market_researcher_response(raw_response)
+    except ValueError as exc:
+        fallback = cross_market_researcher_schema_fallback(
+            str(exc),
+            raw_generation_metadata=generation_attempts,
+        )
+        fallback.update(
+            {
+                "agent_name": agent["name"],
+                "parse_status": "schema_fallback",
+                "terminal_failure_reason": "cross_market_response_schema_violation",
+                "provenance": {
+                    "state_packet": str(STATE_JSON),
+                    "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+            }
+        )
+        for field in ("retry_count", "initial_parse_status"):
+            if field in recommendation:
+                fallback[field] = recommendation[field]
+        return fallback
+    return recommendation
 
 
 def _json_objects(text: str) -> list[dict]:
@@ -969,7 +1031,7 @@ def _parse_json_recommendation(
         return None, "empty_response", "empty_response"
     if strict_contract:
         try:
-            return finalize_recommendation_response(raw), "native_valid", None
+            return finalize_cross_market_researcher_response(raw), "native_valid", None
         except ValueError:
             if _appears_truncated_json(raw):
                 return None, "truncated_json", "truncated_json"
@@ -982,6 +1044,11 @@ def _parse_json_recommendation(
             missing = [key for key in REQUIRED_RECOMMENDATION_KEYS if key not in parsed]
             if missing:
                 return None, "invalid_schema", f"missing_required_fields:{','.join(missing)}"
+            if parsed.get("action") not in CROSS_MARKET_RESEARCHER_ALLOWED_ACTIONS:
+                return None, "invalid_action", "action_not_allowed_for_cross_market_researcher"
+            priority = parsed.get("priority")
+            if isinstance(priority, bool) or not isinstance(priority, int):
+                return None, "invalid_schema", "priority_must_be_integer"
             return None, "invalid_schema", "recommendation_schema_invalid"
     try:
         parsed = json.loads(raw)
@@ -1028,7 +1095,13 @@ def _should_retry_schema(rec: dict, model: dict) -> bool:
     status = str(model.get("status") or "").lower()
     if status.startswith("fallback_") or "budget_guard" in status:
         return False
-    return _is_rejected(rec) and rec.get("parse_status") in {"invalid_json", "truncated_json", "empty_response", "invalid_schema"}
+    return _is_rejected(rec) and rec.get("parse_status") in {
+        "invalid_json",
+        "truncated_json",
+        "empty_response",
+        "invalid_schema",
+        "invalid_action",
+    }
 
 
 def _schema_retry_prompt(agent: dict, original_text: str) -> str:

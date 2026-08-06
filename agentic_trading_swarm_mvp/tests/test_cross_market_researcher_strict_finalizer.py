@@ -12,7 +12,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import llm_swarm_runner
-from recommendation_schema import finalize_recommendation_response
+from recommendation_schema import (
+    finalize_cross_market_researcher_response,
+    finalize_recommendation_response,
+)
 
 
 def _payload(**overrides):
@@ -80,6 +83,18 @@ class RecommendationFinalizerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     finalize_recommendation_response(response)
 
+    def test_cross_market_schema_rejects_contract_violations(self):
+        top_level_array = [_payload()]
+        missing_field = _payload()
+        missing_field.pop("evidence")
+        invalid_action = _payload(action="propose_code_change")
+        invalid_priority = _payload(priority="high")
+
+        for response in (top_level_array, missing_field, invalid_action, invalid_priority):
+            with self.subTest(response=response):
+                with self.assertRaises(ValueError):
+                    finalize_cross_market_researcher_response(json.dumps(response))
+
 
 class CrossMarketResearcherRetryTests(unittest.TestCase):
     def setUp(self):
@@ -119,7 +134,7 @@ class CrossMarketResearcherRetryTests(unittest.TestCase):
         self.assertEqual(rec["retry_count"], 1)
         self.assertEqual(rec["initial_parse_status"], "invalid_schema")
 
-    def test_invalid_retry_remains_rejected(self):
+    def test_invalid_retry_becomes_paper_only_schema_diagnostic(self):
         wrapped = f"```json\n{json.dumps(_payload())}\n```"
 
         with mock.patch.object(
@@ -130,9 +145,27 @@ class CrossMarketResearcherRetryTests(unittest.TestCase):
             rec = llm_swarm_runner.run_agent(self.agent, self.packet, [])
 
         self.assertEqual(complete.call_count, 2)
-        self.assertTrue(rec["_rejected"])
+        self.assertEqual(rec["action"], "propose_diagnostic_hypothesis")
+        self.assertEqual(rec["parse_status"], "schema_fallback")
+        self.assertTrue(rec["evidence"]["paper_only"])
+        self.assertIn("exactly one complete JSON object", rec["evidence"]["schema_violation"])
+        self.assertEqual(rec["evidence"]["raw_generation_metadata"]["retry"]["response_text"], wrapped)
         self.assertEqual(rec["retry_count"], 1)
-        self.assertEqual(rec["parse_status"], "invalid_json")
+
+    def test_invalid_action_becomes_schema_diagnostic_after_retry(self):
+        invalid_action = json.dumps(_payload(action="propose_code_change"))
+
+        with mock.patch.object(
+            llm_swarm_runner,
+            "complete",
+            side_effect=[_model_result(invalid_action), _model_result(invalid_action)],
+        ) as complete:
+            rec = llm_swarm_runner.run_agent(self.agent, self.packet, [])
+
+        self.assertEqual(complete.call_count, 2)
+        self.assertEqual(rec["action"], "propose_diagnostic_hypothesis")
+        self.assertEqual(rec["evidence"]["raw_generation_metadata"]["initial"]["response_text"], invalid_action)
+        self.assertIn("action is not allowed", rec["evidence"]["schema_violation"])
 
 
 if __name__ == "__main__":
