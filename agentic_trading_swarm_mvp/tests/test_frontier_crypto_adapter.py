@@ -891,6 +891,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             old_md = frontier.REPORT_MD
             frontier.REPORT_JSON = pathlib.Path(tmp) / "frontier.json"
             frontier.REPORT_MD = pathlib.Path(tmp) / "frontier.md"
+            report_md_path = frontier.REPORT_MD
             try:
                 report = frontier.write_outputs(
                     observations,
@@ -902,6 +903,17 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                         "selected_by_venue": {"A": 1, "B": 1, "C": 1},
                         "selection_limits": {"max_symbols_per_cycle": 300, "max_symbols_per_venue": 32},
                         "worker_count": 16,
+                        "blind_under_sampled_coverage_quota": {
+                            "reserved_slot_cap": 20,
+                            "preserved_baseline_slots": 40,
+                            "selected_count": 2,
+                            "selected_instruments": [
+                                {"inst_id": "B:ABC-USDT", "eligible_reasons": ["venue"]},
+                                {"inst_id": "C:ABC-USDT", "eligible_reasons": ["quote"]},
+                            ],
+                            "before_selection": {"selected_count": 0},
+                            "after_selection": {"selected_count": 2},
+                        },
                         "venue_quota_report": {
                             "A": {
                                 "target_selected_this_cycle": 2,
@@ -912,6 +924,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                         },
                     },
                 )
+                report_md = report_md_path.read_text(encoding="utf-8")
             finally:
                 frontier.REPORT_JSON = old_json
                 frontier.REPORT_MD = old_md
@@ -944,6 +957,12 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual(summary["expansion_map"]["worker_count"], 16)
         self.assertEqual(summary["expansion_map"]["selection_limits"]["max_symbols_per_cycle"], 300)
         self.assertEqual(summary["expansion_map"]["venue_quota_report"]["A"]["status"], "partial")
+        self.assertEqual(summary["blind_under_sampled_coverage_quota"]["selected_count"], 2)
+        self.assertEqual(
+            summary["expansion_map"]["blind_under_sampled_coverage_quota"]["before_selection"]["selected_count"],
+            0,
+        )
+        self.assertIn("Blind/under-sampled quota", report_md)
 
     def test_dislocation_quality_ranks_broad_stable_references_without_blocking_fragile_paper(self) -> None:
         cfg = settings()

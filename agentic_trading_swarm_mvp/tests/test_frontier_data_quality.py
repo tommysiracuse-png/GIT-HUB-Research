@@ -656,6 +656,132 @@ class EnrichmentSelectionTests(unittest.TestCase):
         self.assertEqual(escalation["max_symbols_per_cycle"], 5)
         self.assertEqual(escalation["extra_symbols_requested"], 2)
 
+    def test_blind_under_sampled_quota_preserves_top_40_and_replaces_tail(self) -> None:
+        conn = memory_conn()
+        cfg = settings()
+        cfg["frontier_data_quality"].update(
+            {
+                "adaptive_selection": False,
+                "max_symbols_per_cycle": 60,
+                "max_symbols_per_venue": 80,
+                "quality_target_escalation_enabled": False,
+                "unknown_quality_reserve_per_cycle": 0,
+                "regional_reserve_per_cycle": 0,
+                "exploit_variant_reserve_per_cycle": 0,
+                "zero_quality_venue_probe_reserve_per_cycle": 0,
+                "blind_under_sampled_quota_max_per_cycle": 20,
+                "blind_under_sampled_quota_top_selection_minimum": 40,
+                "blind_under_sampled_quota_min_observation_count": 5,
+                "blind_under_sampled_quota_max_known_quality_rate": 0.05,
+                "starved_venues": [],
+                "starved_venue_min_depth_per_cycle": 0,
+                "venue_depth_minimums": {},
+            }
+        )
+        observations = []
+        for index in range(60):
+            row = observation()
+            row.update(
+                {
+                    "venue": "GATE",
+                    "instrument_id": f"GATE:CORE{index}",
+                    "symbol": f"CORE{index}",
+                    "quote": "USDT",
+                    "quote_volume_24h": 1_000_000.0 - index,
+                    "spread_bps": 2.0,
+                }
+            )
+            observations.append(row)
+        for index in range(12):
+            row = observation()
+            row.update(
+                {
+                    "venue": "BITSO",
+                    "instrument_id": f"BITSO:BRL{index}",
+                    "symbol": f"BRL{index}",
+                    "quote": "BRL",
+                    "quote_volume_24h": 200_000.0 - index,
+                    "spread_bps": 4.0,
+                }
+            )
+            observations.append(row)
+        for index in range(12):
+            row = observation()
+            row.update(
+                {
+                    "venue": "GATE",
+                    "instrument_id": f"GATE:MXN{index}",
+                    "symbol": f"MXN{index}",
+                    "quote": "MXN",
+                    "quote_volume_24h": 150_000.0 - index,
+                    "spread_bps": 5.0,
+                }
+            )
+            observations.append(row)
+        for suffix, spread_bps, quote_volume_24h in (
+            ("MISS_SPREAD", None, 120_000.0),
+            ("MISS_VOLUME", 6.0, None),
+            ("MISS_BOTH", None, None),
+        ):
+            row = observation()
+            row.update(
+                {
+                    "venue": "BITSO",
+                    "instrument_id": f"BITSO:{suffix}",
+                    "symbol": suffix,
+                    "quote": "BRL",
+                    "quote_volume_24h": quote_volume_24h,
+                    "spread_bps": spread_bps,
+                }
+            )
+            observations.append(row)
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        for index in range(10):
+            conn.execute(
+                """
+                insert into frontier_quality_snapshots (
+                    bucket_at, observed_at, venue, inst_id, quality_status,
+                    quality_score, latency_ms, freshness_age_seconds, spread_bps,
+                    bid_depth_10bps_usd, ask_depth_10bps_usd,
+                    buy_slippage_1000_bps, sell_slippage_1000_bps,
+                    anomaly_json, metrics_json
+                ) values (?, ?, 'GATE', ?, 'verified', 85, 10, 1, 2, 1000, 1000, 0, 0, '[]', '{}')
+                """,
+                (f"2026-06-30T00:{index:02d}:00+00:00", now, f"GATE:CORE{index}"),
+            )
+        conn.commit()
+
+        selected = quality.select_enrichment_observations(conn, observations, [], {}, cfg)
+
+        self.assertEqual(60, len(selected))
+        self.assertEqual(
+            [f"GATE:CORE{index}" for index in range(40)],
+            [row["instrument_id"] for row in selected[:40]],
+        )
+        blind_quota_rows = [
+            row for row in selected if row["depth_selection_bucket"] == "blind_under_sampled_coverage_quota"
+        ]
+        self.assertEqual(20, len(blind_quota_rows))
+        self.assertTrue(any(row["instrument_id"].startswith("BITSO:BRL") for row in blind_quota_rows))
+        self.assertTrue(any(row["instrument_id"].startswith("GATE:MXN") for row in blind_quota_rows))
+        self.assertNotIn("BITSO:MISS_SPREAD", {row["instrument_id"] for row in blind_quota_rows})
+        self.assertNotIn("BITSO:MISS_VOLUME", {row["instrument_id"] for row in blind_quota_rows})
+        self.assertNotIn("BITSO:MISS_BOTH", {row["instrument_id"] for row in blind_quota_rows})
+        blind_report = selected[0]["depth_selection_blind_under_sampled_quota_report"]
+        self.assertEqual(20, blind_report["reserved_slot_cap"])
+        self.assertEqual(40, blind_report["preserved_baseline_slots"])
+        self.assertEqual(0, blind_report["before_selection"]["selected_count"])
+        self.assertEqual(20, blind_report["after_selection"]["selected_count"])
+        self.assertEqual(20, blind_report["selected_count"])
+        self.assertIn("BITSO", blind_report["eligible_venues"])
+        self.assertIn("MXN", blind_report["eligible_quotes"])
+        self.assertTrue(
+            any(
+                item["inst_id"].startswith("GATE:MXN") and item["eligible_reasons"] == ["quote"]
+                for item in blind_report["selected_instruments"]
+            )
+        )
+
     def test_starved_venue_minimums_reserve_per_venue_depth_samples(self) -> None:
         conn = memory_conn()
         cfg = settings()
