@@ -3218,7 +3218,7 @@ def hydrate_paper_family_decay_statistics(
     try:
         rows = conn.execute(
             """
-            select venue, direction, trade_type, pnl_bps, candidate_json
+            select venue, direction, trade_type, pnl_bps, candidate_json, review_json, context_json
             from paper_trades
             where status = 'closed'
               and pnl_bps is not null
@@ -4778,7 +4778,7 @@ def hydrate_paper_context_loss_statistics(
     try:
         rows = conn.execute(
             """
-            select venue, direction, trade_type, pnl_bps, candidate_json
+            select venue, direction, trade_type, pnl_bps, candidate_json, review_json, context_json
             from paper_trades
             where status = 'closed' and pnl_bps is not null
             order by closed_at desc, id desc
@@ -6048,7 +6048,7 @@ def _build_yahoo_proxy_transfer_friction_diagnostic(
         try:
             rows = conn.execute(
                 """
-                select opened_at, venue, inst_id, signal_key, pnl_bps, candidate_json
+                select opened_at, venue, inst_id, signal_key, pnl_bps, candidate_json, review_json, context_json
                 from paper_trades
                 where status = 'closed'
                   and pnl_bps is not null

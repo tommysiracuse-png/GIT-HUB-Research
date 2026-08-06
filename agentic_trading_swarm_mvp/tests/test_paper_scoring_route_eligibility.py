@@ -21,6 +21,7 @@ from storage import (  # noqa: E402
     UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
     init_db,
     open_paper_trade,
+    paper_label_eligibility_for_trade_row,
     performance_summary,
 )
 
@@ -68,6 +69,33 @@ def insert_closed_trade(
 
 
 class PaperScoringRouteEligibilityTests(unittest.TestCase):
+    def test_sparse_trade_rows_still_apply_unresolved_route_label_exclusion(self) -> None:
+        eligibility = paper_label_eligibility_for_trade_row(
+            {
+                "candidate_json": json.dumps(
+                    {
+                        "venue": "BITGET",
+                        "inst_id": "BITGET:BTC-USDT",
+                        "direction": "short_frontier_spot",
+                        "trade_type": "frontier_crypto_venue_map",
+                    },
+                    sort_keys=True,
+                ),
+                "review_json": "{}",
+                "context_json": "{}",
+                "route_status": "conditional",
+                "route_id": "conditional_crypto_route_paper",
+                "route_blockers": json.dumps(["spot_borrow"]),
+            }
+        )
+
+        self.assertFalse(eligibility["paper_label_eligible"])
+        self.assertEqual(
+            UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
+            eligibility["paper_label_exclusion_reason"],
+        )
+        self.assertEqual(["spot_borrow"], eligibility["paper_label_route_blockers"])
+
     def test_open_paper_trade_persists_unresolved_route_label_exclusion(self) -> None:
         conn = make_conn()
         try:
@@ -213,6 +241,65 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
         self.assertEqual(3, stats[signal_key]["closed_count"])
         self.assertEqual(8.333, stats[signal_key]["avg_pnl_bps"])
         self.assertEqual(0.667, stats[signal_key]["win_rate"])
+
+    def test_performance_summary_excludes_unresolved_open_shadow_from_headline_open_count(self) -> None:
+        conn = make_conn()
+        try:
+            open_paper_trade(
+                conn,
+                {
+                    "venue": "COINBASE",
+                    "inst_id": "COINBASE:BTC-USD",
+                    "direction": "long_frontier_spot",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "score": 80.0,
+                    "last": 100.0,
+                    "execution_feasibility": {"status": "standard", "route_status": "standard"},
+                },
+                {
+                    "learned_score": 80.0,
+                    "feasibility_status": "standard",
+                    "route_status": "standard",
+                    "effective_route_id": "generic_paper_route",
+                },
+                settings=DEFAULT_SETTINGS,
+            )
+            open_paper_trade(
+                conn,
+                {
+                    "venue": "BITSO",
+                    "inst_id": "BITSO:XRP_MXN",
+                    "direction": "short_frontier_spot",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "score": 82.0,
+                    "last": 100.0,
+                    "execution_feasibility": {"status": "conditional", "route_status": "conditional"},
+                    "execution_route": {
+                        "route_id": "conditional_crypto_route_paper",
+                        "route_status": "conditional",
+                        "route_blockers": ["spot_borrow"],
+                    },
+                },
+                {
+                    "learned_score": 82.0,
+                    "feasibility_status": "conditional",
+                    "route_status": "conditional",
+                    "effective_route_id": "conditional_crypto_route_paper",
+                    "missing_requirements": ["spot_borrow"],
+                },
+                settings=DEFAULT_SETTINGS,
+            )
+
+            summary = performance_summary(conn)
+        finally:
+            conn.close()
+
+        self.assertEqual(0, summary["closed"])
+        self.assertEqual(1, summary["open"])
+        self.assertEqual(
+            1,
+            summary["unresolved_route_requirement_shadow"]["open_count"],
+        )
 
     def test_performance_summary_separates_unresolved_route_shadow_pnl_by_blocker(self) -> None:
         conn = make_conn()

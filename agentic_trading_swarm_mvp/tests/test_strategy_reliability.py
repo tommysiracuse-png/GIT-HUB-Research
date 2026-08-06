@@ -949,6 +949,105 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(-10.0, diagnostic["segments"]["spread_regime"]["wide"]["avg_pnl_bps"])
         self.assertIn("## Yahoo Proxy Transfer Friction", strategy_reliability.REPORT_MD.read_text(encoding="utf-8"))
 
+    def test_yahoo_proxy_transfer_report_ignores_sparse_unresolved_conditional_shadow_rows(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        source_key = "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard"
+        try:
+            conn.execute(
+                """
+                insert into paper_trades (
+                    opened_at, closed_at, venue, inst_id, direction, trade_type,
+                    signal_key, base_score, learned_score, entry, exit, pnl_bps,
+                    status, thesis, candidate_json, review_json, context_json
+                ) values (?, ?, ?, ?, ?, ?, ?, 80, 80, 100, 101, ?, 'closed', 'test', ?, ?, ?)
+                """,
+                (
+                    "2026-08-05T14:00:00+00:00",
+                    "2026-08-05T15:00:00+00:00",
+                    "YAHOO_PROXY",
+                    "YAHOO_PROXY:EWZ",
+                    "long_proxy",
+                    "global_proxy_momentum",
+                    source_key,
+                    4.0,
+                    json.dumps(
+                        {
+                            "venue": "YAHOO_PROXY",
+                            "inst_id": "YAHOO_PROXY:EWZ",
+                            "trade_type": "global_proxy_momentum",
+                            "direction": "long_proxy",
+                            "signal_key": source_key,
+                            "score": 84.0,
+                            "source_quote_timestamp": "2026-08-05T14:00:00+00:00",
+                            "spread_bps": 2.0,
+                            "liquidity_score": 0.9,
+                            "basis_bps": 0.0,
+                        }
+                    ),
+                    "{}",
+                    "{}",
+                ),
+            )
+            conn.execute(
+                """
+                insert into paper_trades (
+                    opened_at, closed_at, venue, inst_id, direction, trade_type,
+                    signal_key, base_score, learned_score, entry, exit, pnl_bps,
+                    status, thesis, candidate_json, review_json, context_json
+                ) values (?, ?, ?, ?, ?, ?, ?, 80, 80, 100, 101, ?, 'closed', 'test', ?, ?, ?)
+                """,
+                (
+                    "2026-08-05T14:20:00+00:00",
+                    "2026-08-05T15:20:00+00:00",
+                    "OKX",
+                    "OKX:BTC-USDT-SWAP",
+                    "long_frontier_perp",
+                    "frontier_crypto_venue_map",
+                    "OKX|frontier_crypto_venue_map|long_frontier_perp|conditional",
+                    -10.0,
+                    json.dumps(
+                        {
+                            "venue": "OKX",
+                            "inst_id": "OKX:BTC-USDT-SWAP",
+                            "trade_type": "frontier_crypto_venue_map",
+                            "direction": "long_frontier_perp",
+                            "score": 75.0,
+                            "source_signal_key": source_key,
+                            "source_quote_timestamp": "2026-08-05T14:00:00+00:00",
+                            "spread_bps": 11.0,
+                            "liquidity_score": 0.25,
+                            "basis_bps": 18.0,
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "feasibility_status": "conditional",
+                            "route_status": "conditional",
+                            "effective_route_id": "conditional_crypto_route_paper",
+                            "missing_requirements": ["spot_borrow"],
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "route_status": "conditional",
+                            "route_id": "conditional_crypto_route_paper",
+                            "route_blockers": ["spot_borrow"],
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+
+            _, report = strategy_reliability.apply_strategy_reliability([], {"mode": "paper"}, conn=conn)
+        finally:
+            conn.close()
+
+        diagnostic = report["yahoo_proxy_transfer_friction_diagnostic"]
+        self.assertEqual(1, diagnostic["closed_trade_count"])
+        self.assertEqual({}, diagnostic["transferred_routes"])
+
     def test_distinct_proxy_shock_reversal_uses_its_own_quality_profile(self) -> None:
         candidate = base_candidate(
             venue="YAHOO_PROXY",

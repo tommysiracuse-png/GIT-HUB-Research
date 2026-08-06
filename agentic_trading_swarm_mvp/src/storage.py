@@ -100,8 +100,11 @@ def _storage_coerce_flag_list(value: object) -> list[str]:
         if not text:
             return []
         if text[:1] in "[{":
-            parsed = _storage_json_mapping(text)
-            if parsed:
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, (Mapping, list, tuple, set)):
                 return _storage_coerce_flag_list(parsed)
         return [text]
     if isinstance(value, Mapping):
@@ -109,6 +112,15 @@ def _storage_coerce_flag_list(value: object) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item) for item in value if str(item or "").strip()]
     return [str(value)]
+
+
+def _storage_truthy_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    token = str(value or "").strip().lower()
+    return token in {"1", "true", "t", "yes", "y", "on"}
 
 
 def _storage_first_present(
@@ -204,11 +216,12 @@ def paper_label_eligibility(
         }
     )
     conditional_route = route_status == "conditional" or _is_conditional_paper_route_id(route_id)
-    label_eligible = bool(explicit_eligible) or not (conditional_route and deduped_blockers)
+    explicit_override = _storage_truthy_flag(explicit_eligible)
+    label_eligible = explicit_override or not (conditional_route and deduped_blockers)
     exclusion_reason = None if label_eligible else UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON
     return {
         "paper_label_eligible": label_eligible,
-        "paper_label_explicit_override": bool(explicit_eligible),
+        "paper_label_explicit_override": explicit_override,
         "paper_label_exclusion_reason": exclusion_reason,
         "paper_label_route_status": route_status or "unknown",
         "paper_label_route_id": route_id or None,
@@ -225,7 +238,9 @@ def paper_label_eligibility_for_trade_row(row: sqlite3.Row | Mapping[str, object
     candidate = _storage_json_mapping(row_mapping.get("candidate_json"))
     review = _storage_json_mapping(row_mapping.get("review_json"))
     context = _storage_json_mapping(row_mapping.get("context_json"))
-    return paper_label_eligibility(candidate=candidate, review=review, context=context)
+    row_context = dict(row_mapping)
+    row_context.update(context)
+    return paper_label_eligibility(candidate=candidate, review=review, context=row_context)
 
 
 def unresolved_route_requirement_shadow_summary(conn: sqlite3.Connection) -> dict[str, object]:
@@ -2918,7 +2933,7 @@ def record_due_horizon_outcomes(
 
 
 def performance_summary(conn: sqlite3.Connection) -> dict:
-    rows = conn.execute(
+    closed_rows = conn.execute(
         """
         select status, pnl_bps, candidate_json, review_json, context_json
         from paper_trades
@@ -2927,21 +2942,24 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
         """
     ).fetchall()
     pnls = []
-    for row in rows:
+    for row in closed_rows:
         if row["pnl_bps"] is None:
             continue
         eligibility = paper_label_eligibility_for_trade_row(row)
         if eligibility["paper_label_eligible"]:
             pnls.append(float(row["pnl_bps"]))
-    open_count = int(
-        conn.execute(
-            """
-            select count(*) as n
-            from paper_trades
-            where status = 'open'
-              and coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
-            """
-        ).fetchone()["n"]
+    open_rows = conn.execute(
+        """
+        select status, pnl_bps, candidate_json, review_json, context_json
+        from paper_trades
+        where status = 'open'
+          and coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
+        """
+    ).fetchall()
+    open_count = sum(
+        1
+        for row in open_rows
+        if paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]
     )
     synthetic_row = conn.execute(
         """
