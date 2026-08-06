@@ -1045,7 +1045,11 @@ def frontier_shadow_filter_reason(
     eligible for paper fills.
     """
     decay_quarantine = okx_basis_decay_quarantine_record(candidate, settings=config)
-    if isinstance(decay_quarantine, Mapping) and decay_quarantine.get("active"):
+    if (
+        isinstance(decay_quarantine, Mapping)
+        and decay_quarantine.get("active")
+        and not decay_quarantine.get("diagnostic_only")
+    ):
         return {
             **dict(decay_quarantine),
             "reason": decay_quarantine.get("reason") or "decay_quarantine",

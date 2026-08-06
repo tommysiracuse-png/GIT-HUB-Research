@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
 
 from execution_engine import execute_order
 from paper_order_router import apply_frontier_paper_guard
-from paper_decay_quarantine import quarantine_record, runtime_report
+from paper_decay_quarantine import quarantine_record, runtime_report, target_signal
 from paper_exploration_report import build_paper_exploration_report
 from settings import DEFAULT_SETTINGS
 from storage import connect
@@ -45,7 +45,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         candidate.update(overrides)
         return candidate
 
-    def test_only_named_okx_families_become_observe_only(self) -> None:
+    def test_only_named_okx_families_are_diagnostic_in_exploration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
             decayed = self.candidate()
@@ -58,12 +58,10 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
 
             by_direction = {row["direction"]: row for row in rows}
             blocked = by_direction["basis_mean_reversion_short_perp"]
-            self.assertEqual("decay_quarantine", blocked["candidate_reject_reason"])
-            self.assertEqual("shadow_trial", blocked["paper_action"])
-            self.assertEqual("observe_only", blocked["paper_execution_mode"])
-            self.assertFalse(blocked["paper_fill_allowed"])
-            self.assertFalse(blocked.get("paper_entry_blocked", False))
-            self.assertEqual(80.0, blocked["score"])
+            self.assertTrue(blocked["paper_okx_basis_decay_quarantine"]["diagnostic_only"])
+            self.assertIn("decay_quarantine", blocked["paper_exploration_would_block_reasons"])
+            self.assertNotEqual("shadow_trial", blocked.get("paper_action"))
+            self.assertTrue(blocked.get("paper_fill_allowed", True))
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["funding_capture_long_perp"])
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["short_perp_long_spot"])
             self.assertEqual(1, report["summary"]["okx_basis_decay_quarantine_count"])
@@ -88,28 +86,50 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
 
         self.assertTrue(quarantine_record(conditional, self.settings)["active"])
 
-    def test_execution_never_emits_a_paper_fill_for_quarantined_family(self) -> None:
+    def test_exploration_emits_a_paper_fill_with_quarantine_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
             review = {"paper_allocation_multiplier": 1.0, "decision": "approve_paper_trade"}
 
             execution = execute_order(conn, self.candidate(), review, self.settings)
 
-            self.assertFalse(execution["paper_filled"])
-            self.assertEqual("shadow_filtered", execution["order"]["status"])
-            self.assertEqual("shadow_trial", execution["candidate"]["paper_action"])
-            self.assertEqual("decay_quarantine", execution["candidate"]["candidate_reject_reason"])
+            self.assertTrue(execution["paper_filled"])
+            self.assertEqual("paper_filled", execution["order"]["status"])
+            self.assertTrue(execution["candidate"]["paper_okx_basis_decay_quarantine"]["diagnostic_only"])
+            self.assertIn("decay_quarantine", execution["candidate"]["paper_exploration_would_block_reasons"])
             conn.close()
 
-    def test_router_marks_target_as_shadow_trial_observe_only(self) -> None:
+    def test_router_keeps_target_admissible_in_exploration(self) -> None:
         guarded = apply_frontier_paper_guard(
             self.candidate(paper_filled=True, status="paper_filled"), self.settings
+        )
+
+        self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertTrue(guarded["paper_filled"])
+
+    def test_non_exploration_mode_retains_hard_quarantine(self) -> None:
+        settings = copy.deepcopy(self.settings)
+        settings["paper_exploration"]["enabled"] = False
+        guarded = apply_frontier_paper_guard(
+            self.candidate(paper_filled=True, status="paper_filled"), settings
         )
 
         self.assertTrue(guarded["shadow_filtered"])
         self.assertFalse(guarded["paper_filled"])
         self.assertEqual("shadow_trial", guarded["paper_action"])
-        self.assertEqual("observe_only", guarded["paper_execution_mode"])
+
+    def test_proxy_lineage_is_not_reclassified_as_the_direct_decayed_family(self) -> None:
+        proxy = self.candidate(
+            direction="long_perp_short_spot",
+            signal_key="PAPER_PROXY|okx_derivatives_paper|OKX|perp_funding_basis|long_perp_short_spot|conditional",
+            signal_stats_scope="paper_proxy",
+            paper_proxy_activated=True,
+            paper_proxy_not_live_equivalent=True,
+            paper_execution_semantics="proxy_not_live_equivalent",
+        )
+
+        self.assertIsNone(target_signal(proxy))
+        self.assertIsNone(quarantine_record(proxy, self.settings))
 
     def test_runtime_report_releases_after_one_hundred_closed_target_labels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

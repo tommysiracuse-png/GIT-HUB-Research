@@ -3968,12 +3968,25 @@ def _apply_okx_basis_decay_quarantine(
     config: Mapping[str, Any] | bool | None = None,
     conn: Any | None = None,
 ) -> dict | None:
-    """Move only the evidence-named OKX basis families to paper shadow trials."""
+    """Record exact-family decay; only hard-quarantine outside exploration mode."""
     record = okx_basis_decay_quarantine_record(candidate, settings=config, conn=conn)
     if record is None:
         return None
     candidate["paper_okx_basis_decay_quarantine"] = dict(record)
     if not record["active"]:
+        return None
+    if record.get("diagnostic_only"):
+        reasons = list(candidate.get("paper_exploration_would_block_reasons") or [])
+        reasons.append(record["reason"])
+        candidate["paper_exploration_would_block_reasons"] = list(dict.fromkeys(reasons))
+        candidate["paper_guard_would_block"] = {
+            "reason": record["reason"],
+            "guard": record.get("guard"),
+            "record": dict(record),
+        }
+        candidate["promotion_eligible"] = False
+        candidate["_hunter_bucket"] = "diagnose"
+        _append_note(candidate, "paper_guard_would_block:okx_basis_decay_quarantine")
         return None
     pre_quarantine_score = _as_float(candidate.get("score"), 0.0)
     reliability = _annotate(
@@ -4221,7 +4234,10 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         1 for item in items if item.get("profile") == "paper_context_loss_quarantine"
     )
     okx_basis_decay_quarantined = sum(
-        1 for item in items if item.get("profile") == "okx_basis_decay_quarantine"
+        1
+        for candidate in candidates
+        if isinstance(candidate.get("paper_okx_basis_decay_quarantine"), Mapping)
+        and candidate["paper_okx_basis_decay_quarantine"].get("active")
     )
     by_quality_failure = collections.Counter(
         reason

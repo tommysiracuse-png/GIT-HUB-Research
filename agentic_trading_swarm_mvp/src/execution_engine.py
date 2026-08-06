@@ -326,9 +326,12 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
                 "reason", "paper_context_loss_quarantine"
             )
             candidate["candidate_reject_detail"] = dict(context_loss_quarantine)
-        elif (candidate.get("paper_okx_basis_decay_quarantine") or {}).get("active"):
-            # The dedicated decay quarantine is a deliberate exception to
-            # exploration's usual synthetic-paper admission reset.
+        elif (
+            (candidate.get("paper_okx_basis_decay_quarantine") or {}).get("active")
+            and not (candidate.get("paper_okx_basis_decay_quarantine") or {}).get("diagnostic_only")
+        ):
+            # Non-exploration quarantine semantics remain available for paper
+            # configurations that explicitly disable exploration mode.
             pass
         elif candidate.get("paper_experiment_capacity_deferred"):
             # A scanner can defer an otherwise valid priceable idea when the

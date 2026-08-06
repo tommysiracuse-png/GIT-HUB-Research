@@ -7,6 +7,8 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from paper_exploration import exploration_enabled
+
 
 POLICY_KEY = "okx_perp_funding_basis_decay_quarantine"
 REASON = "decay_quarantine"
@@ -85,8 +87,27 @@ def _feasibility_status(candidate: Mapping[str, Any]) -> str:
     return str(candidate.get("feasibility_status") or "unknown").strip().lower()
 
 
+def _separate_proxy_lineage(candidate: Mapping[str, Any]) -> bool:
+    signal_key = str(candidate.get("signal_key") or "").strip().upper()
+    stats_scope = str(candidate.get("signal_stats_scope") or "").strip().lower()
+    semantics = str(
+        candidate.get("paper_execution_semantics")
+        or candidate.get("execution_semantics")
+        or ""
+    ).strip().lower()
+    return bool(
+        signal_key.startswith("PAPER_PROXY|")
+        or stats_scope == "paper_proxy"
+        or candidate.get("paper_proxy_activated")
+        or candidate.get("paper_proxy_not_live_equivalent")
+        or semantics == "proxy_not_live_equivalent"
+    )
+
+
 def target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
     """Return the exact decayed signal family identity, without prose matching."""
+    if _separate_proxy_lineage(candidate):
+        return None
     signal_key = str(candidate.get("signal_key") or "")
     parts = signal_key.split("|")
     venue = str(candidate.get("venue") or (parts[0] if len(parts) >= 1 else "")).strip().upper()
@@ -217,7 +238,21 @@ def quarantine_record(
         return None
     existing = candidate.get("paper_okx_basis_decay_quarantine")
     if conn is None and isinstance(existing, Mapping):
-        return dict(existing) if existing.get("active") else None
+        if not existing.get("active"):
+            return None
+        record = dict(existing)
+        diagnostic_only = exploration_enabled(settings if isinstance(settings, Mapping) else None)
+        record.update(
+            {
+                "diagnostic_only": diagnostic_only,
+                "would_block": True,
+                "paper_fill_allowed": diagnostic_only,
+                "quarantine_action": (
+                    "would_block_diagnostic" if diagnostic_only else "shadow_trial_observe_only"
+                ),
+            }
+        )
+        return record
 
     now = dt.datetime.now(dt.timezone.utc)
     state = _load_state(conn)
@@ -253,13 +288,24 @@ def quarantine_record(
     state["updated_at"] = now.isoformat()
     _persist_state(conn, state)
     active = state.get("status") == "active"
+    diagnostic_only = bool(
+        active and exploration_enabled(settings if isinstance(settings, Mapping) else None)
+    )
     return {
         "reason": REASON,
         "guard": POLICY_KEY,
         "paper_only": True,
         "active": active,
-        "paper_fill_allowed": not active,
-        "quarantine_action": "shadow_trial_observe_only" if active else "released",
+        "diagnostic_only": diagnostic_only,
+        "would_block": active,
+        "paper_fill_allowed": not active or diagnostic_only,
+        "quarantine_action": (
+            "would_block_diagnostic"
+            if diagnostic_only
+            else "shadow_trial_observe_only"
+            if active
+            else "released"
+        ),
         "target": target,
         "started_at": state["started_at"],
         "expires_at": state["expires_at"],
@@ -278,13 +324,33 @@ def apply_quarantine(
     settings: Mapping[str, Any] | bool | None = None,
     conn: Any | None = None,
 ) -> dict[str, Any]:
-    """Preserve a priceable candidate while making the decayed family observe-only."""
+    """Annotate decay evidence without suppressing exploration-mode paper tests."""
     guarded = dict(candidate)
     record = quarantine_record(guarded, settings, conn=conn)
     if record is None:
         return guarded
     guarded["paper_okx_basis_decay_quarantine"] = record
     if not record["active"]:
+        return guarded
+    if record.get("diagnostic_only"):
+        reasons = list(guarded.get("paper_exploration_would_block_reasons") or [])
+        reasons.append(REASON)
+        guarded["paper_exploration_would_block_reasons"] = list(dict.fromkeys(reasons))
+        guarded["paper_guard_would_block"] = {
+            "reason": REASON,
+            "guard": POLICY_KEY,
+            "record": dict(record),
+        }
+        guarded["promotion_eligible"] = False
+        guarded["_hunter_bucket"] = "diagnose"
+        if not guarded.get("paper_exploration_immutable_rejections") and not guarded.get(
+            "paper_experiment_capacity_deferred"
+        ):
+            guarded["shadow_filtered"] = False
+            guarded["paper_fill_allowed"] = True
+            guarded["paper_entry_blocked"] = False
+            guarded.pop("candidate_reject_reason", None)
+            guarded.pop("candidate_reject_detail", None)
         return guarded
     guarded.update(
         {
