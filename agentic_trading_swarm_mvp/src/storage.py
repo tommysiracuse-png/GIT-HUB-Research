@@ -2787,6 +2787,10 @@ def _auction_reference_outcome(
         entry_auction_at = _parse_storage_iso(str(provenance.get("auction_at") or ""))
     except (TypeError, ValueError):
         return None
+    entry_isin = str(provenance.get("isin") or candidate.get("isin") or "").strip().upper()
+    entry_maturity_date_iso = str(
+        provenance.get("maturity_date_iso") or candidate.get("maturity_date_iso") or ""
+    ).strip()
     if not venue or not surface or term_days <= 0 or entry_yield <= 0:
         return None
 
@@ -2822,7 +2826,16 @@ def _auction_reference_outcome(
             )
         except (TypeError, ValueError):
             continue
-        if candidate_term_days != term_days or outcome_yield <= 0 or auction_at <= entry_auction_at:
+        raw_isin = str(raw.get("isin") or "").strip().upper()
+        raw_maturity_date_iso = str(raw.get("maturity_date_iso") or "").strip()
+        same_identity = False
+        if entry_isin and raw_isin:
+            same_identity = raw_isin == entry_isin
+        elif entry_maturity_date_iso and raw_maturity_date_iso:
+            same_identity = raw_maturity_date_iso == entry_maturity_date_iso
+        else:
+            same_identity = candidate_term_days == term_days
+        if not same_identity or outcome_yield <= 0 or auction_at <= entry_auction_at:
             continue
         if earliest is None or auction_at < earliest[0]:
             earliest = (auction_at, raw)

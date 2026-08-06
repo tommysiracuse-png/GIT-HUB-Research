@@ -35,6 +35,8 @@ CARB_ALLOWANCE_SURFACE = "california_quebec_cap_and_invest_joint_allowance_aucti
 CARB_ALLOWANCE_LAB_ID = "carb_joint_allowance_discount_tightness_v1"
 ANP_OPC_SURFACE = "anp_oferta_permanente_de_concessao"
 ANP_OPC_LAB_ID = "anp_opc_brazil_upstream_proxy_v1"
+AOFM_SURFACE = "australian_treasury_bond_tenders_and_results"
+AOFM_LAB_ID = "aofm_treasury_bond_tender_strength_v1"
 
 
 def _strategy_lab_id(state: dict[str, Any]) -> str:
@@ -833,6 +835,148 @@ def _create_carb_allowance_paper_program(
     }
 
 
+def _create_aofm_tender_paper_program(
+    conn: sqlite3.Connection,
+    settings: dict,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the canonical paper-only AOFM Treasury-bond tender program."""
+
+    claim = _claim(conn, state, "activate_aofm_tender_paper_research", 90)
+    if claim.duplicate and claim.canonical_row_id:
+        return {
+            "action": "strategy_lab_aofm_tender_program",
+            "status": "deduplicated",
+            "topic_key": claim.topic_key,
+        }
+    evidence = _evidence(state)
+    details = state.get("details") if isinstance(state.get("details"), dict) else {}
+    rec = {
+        "recommendation_id": f"market_admission:{state['admission_key']}:aofm_tender_program",
+        "source_agent": "market_admission_bridge",
+        "payload": {
+            "agent_name": "market_admission_bridge",
+            "title": "Paper-test AOFM Treasury bond tender strength",
+            "rationale": (
+                "AOFM publishes official Treasury-bond tender results with weighted-average yields and coverage, "
+                "but no executable secondary route. Those same-surface observations should feed the existing "
+                "synthetic auction-reference paper path instead of stalling at generic enrichment."
+            ),
+            "strategy_lab_experiment": {
+                "strategy_lab_id": AOFM_LAB_ID,
+                "version": 1,
+                "experiment_type": "market_strategy",
+                "hypothesis": (
+                    "Fresh AOFM bond tenders that clear with strong bid cover and moderate weighted-average yields "
+                    "tend to be followed by firmer next same-ISIN tender outcomes, so the official result can seed "
+                    "a same-surface synthetic auction-reference measurement."
+                ),
+                "source_surface": AOFM_SURFACE,
+                "permitted_target_surface": [AOFM_SURFACE],
+                "strategy_logic": {
+                    "type": "observation_program",
+                    "universe": {
+                        "venues": ["AUSTRALIAN_OFFICE_OF_FINANCIAL_MANAGEMENT"],
+                        "asset_classes": ["australian_government_treasury_bond"],
+                        "market_surfaces": [AOFM_SURFACE],
+                    },
+                    "calculated_features": {
+                        "aofm_term_years": "auction_term_days / 365",
+                        "aofm_demand_pressure": "auction_coverage_ratio - max(auction_average_yield_pct - 4, 0)",
+                    },
+                    "entry_expression": (
+                        "market_surface == 'australian_treasury_bond_tenders_and_results' "
+                        "and quality_status == 'official_auction_result' "
+                        "and candidate_reject_reason == 'official_auction_result_not_executable_quote' "
+                        "and freshness_state == 'fresh' and auction_coverage_ratio >= 2 "
+                        "and auction_average_yield_pct > 0 and auction_term_days >= 365 "
+                        "and auction_result_published >= 1"
+                    ),
+                    "invalidation_expression": (
+                        "freshness_state != 'fresh' or auction_coverage_ratio < 1.25 "
+                        "or auction_average_yield_pct <= 0 or auction_term_days < 365"
+                    ),
+                    "direction": "long",
+                    "edge_expression": "aofm_demand_pressure + min(aofm_term_years / 2, 5)",
+                    "score_expression": (
+                        "clip(45 + 10 * aofm_demand_pressure + min(aofm_term_years, 12), 0, 100)"
+                    ),
+                    "route_surface": "auction_reference",
+                },
+                "data_requirements": {
+                    "admission_key": state.get("admission_key"),
+                    "adapter_id": details.get("adapter_id"),
+                    "paper_only": True,
+                    "venue": "AUSTRALIAN_OFFICE_OF_FINANCIAL_MANAGEMENT",
+                    "market_surface": AOFM_SURFACE,
+                    "source_surface": AOFM_SURFACE,
+                    "permitted_target_surface": [AOFM_SURFACE],
+                    "required_fields": [
+                        "isin",
+                        "coupon_pct",
+                        "maturity_date_iso",
+                        "tender_date",
+                        "settlement_date",
+                        "term_days",
+                        "average_yield_pct",
+                        "weighted_average_yield_pct",
+                        "coverage_ratio",
+                        "bid_cover_ratio",
+                        "quality_status",
+                        "candidate_reject_reason",
+                        "price_source",
+                        "source_url",
+                    ],
+                    "supported_snapshot_features": [
+                        "auction_coverage_ratio",
+                        "auction_term_days",
+                        "auction_average_yield_pct",
+                    ],
+                    "label_requirement": "next later official result on the same ISIN, or same maturity bucket when ISIN is unavailable",
+                    "paper_only_reference": True,
+                    "requires_independent_signal_logic": True,
+                },
+                "risk_gates": {
+                    "require_route_feasible": False,
+                    "paper_allocation_multiplier": 0.25,
+                    "synthetic_research_only": True,
+                    "data_quality": [
+                        "Use only official AOFM result rows with candidate_reject_reason='official_auction_result_not_executable_quote'.",
+                        "Require fresh weighted-average yield and coverage data from the public issuance workbook.",
+                        "Preserve ISIN, maturity, and source_url provenance for every paper label.",
+                    ],
+                    "exposure_limits": [
+                        "Paper-only synthetic auction-reference measurement.",
+                        "At most one active Strategy Lab signal per AOFM ISIN.",
+                        "No broker routing, no live trading, and no non-paper execution surface.",
+                    ],
+                },
+                "promotion_rules": {
+                    "minimum_sample_size": 8,
+                    "holdout_requirements": [
+                        "Positive median next same-ISIN tender yield move in the intended direction.",
+                        "Positive average labeled outcome after excluding the single strongest winner.",
+                    ],
+                    "route_constraints": [
+                        "Remain on synthetic_auction_reference_paper semantics only.",
+                        "Do not promote to any live or broker-connected route from this experiment.",
+                    ],
+                },
+            },
+            "evidence": evidence,
+        },
+    }
+    result = ingest_strategy_lab_recommendation(conn, rec, settings)[0]
+    if result.get("strategy_lab_id"):
+        bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
+    return {
+        "action": "strategy_lab_aofm_tender_program",
+        "status": "created" if result.get("created") else "updated",
+        "strategy_lab_id": result.get("strategy_lab_id"),
+        "topic_key": claim.topic_key,
+    }
+
+
 def _create_anp_opc_companion_program(
     conn: sqlite3.Connection,
     settings: dict,
@@ -1082,6 +1226,11 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
                 and str(state.get("market_surface") or "") == EEX_SECONDARY_SPOT_SURFACE
             ):
                 actions.append(_create_eex_secondary_spot_program(conn, settings, state))
+            elif (
+                str(state.get("venue") or "").upper() == "AUSTRALIAN_OFFICE_OF_FINANCIAL_MANAGEMENT"
+                and str(state.get("market_surface") or "") == AOFM_SURFACE
+            ):
+                actions.append(_create_aofm_tender_paper_program(conn, settings, state))
             elif (
                 str(state.get("venue") or "").upper() == "CARB_CA_QC"
                 and str(state.get("market_surface") or "") == CARB_ALLOWANCE_SURFACE

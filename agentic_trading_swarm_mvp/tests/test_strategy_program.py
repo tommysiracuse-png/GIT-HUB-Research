@@ -470,6 +470,82 @@ def bahrain_auction_reference_logic() -> dict:
     }
 
 
+def aofm_tender_observation(
+    average_yield_pct: float,
+    auction_at: dt.datetime,
+    *,
+    isin: str = "AU000XCLWAM8",
+    maturity_date_iso: str = "2047-03-21",
+    term_days: int = 7514,
+    coverage_ratio: float = 2.15,
+    coupon_pct: float = 3.0,
+    **overrides: object,
+) -> dict:
+    row = {
+        "inst_id": f"AUSTRALIAN_OFFICE_OF_FINANCIAL_MANAGEMENT:TBOND:RESULT:{isin}:{auction_at.date().isoformat()}",
+        "venue": "AUSTRALIAN_OFFICE_OF_FINANCIAL_MANAGEMENT",
+        "trade_type": "official_primary_auction_result",
+        "source_trade_type": "official_primary_tender_result",
+        "market_type": "sovereign_treasury_bond_tender_result_reference",
+        "asset_class": "australian_government_treasury_bond",
+        "quote": "AUD_YIELD_PCT",
+        "base": isin,
+        "symbol": isin,
+        "isin": isin,
+        "coupon_pct": coupon_pct,
+        "maturity_date_iso": maturity_date_iso,
+        "last": average_yield_pct,
+        "average_yield_pct": average_yield_pct,
+        "weighted_average_yield_pct": average_yield_pct,
+        "coverage_ratio": coverage_ratio,
+        "bid_cover_ratio": coverage_ratio,
+        "term_days": term_days,
+        "market_surface": "australian_treasury_bond_tenders_and_results",
+        "quality_status": "official_auction_result",
+        "source_quality_status": "official_tender_result",
+        "freshness_state": "fresh",
+        "candidate_reject_reason": "official_auction_result_not_executable_quote",
+        "session_status": "results_published",
+        "auction_at": auction_at.isoformat(),
+        "observed_at": auction_at.isoformat(),
+        "price_source": "AOFM Treasury Bonds issuance Data Hub workbook",
+        "source_url": "https://www.aofm.gov.au/data-hub",
+    }
+    row.update(overrides)
+    return row
+
+
+def aofm_tender_reference_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["AUSTRALIAN_OFFICE_OF_FINANCIAL_MANAGEMENT"],
+            "asset_classes": ["australian_government_treasury_bond"],
+            "market_surfaces": ["australian_treasury_bond_tenders_and_results"],
+        },
+        "calculated_features": {
+            "aofm_term_years": "auction_term_days / 365",
+            "aofm_demand_pressure": "auction_coverage_ratio - max(auction_average_yield_pct - 4, 0)",
+        },
+        "entry_expression": (
+            "market_surface == 'australian_treasury_bond_tenders_and_results' "
+            "and quality_status == 'official_auction_result' "
+            "and candidate_reject_reason == 'official_auction_result_not_executable_quote' "
+            "and freshness_state == 'fresh' and auction_coverage_ratio >= 2 "
+            "and auction_average_yield_pct > 0 and auction_term_days >= 365 "
+            "and auction_result_published >= 1"
+        ),
+        "invalidation_expression": (
+            "freshness_state != 'fresh' or auction_coverage_ratio < 1.25 "
+            "or auction_average_yield_pct <= 0 or auction_term_days < 365"
+        ),
+        "direction": "long",
+        "edge_expression": "aofm_demand_pressure + min(aofm_term_years / 2, 5)",
+        "score_expression": "clip(45 + 10 * aofm_demand_pressure + min(aofm_term_years, 12), 0, 100)",
+        "route_surface": "auction_reference",
+    }
+
+
 def carb_allowance_auction_observation(
     price: float,
     event_date: dt.date,
@@ -1927,6 +2003,98 @@ class StrategyProgramTests(unittest.TestCase):
             context = json.loads(outcome["context_json"])["paper_auction_reference_outcome"]
             self.assertEqual(next_same_maturity["inst_id"], context["outcome_inst_id"])
             self.assertEqual(next_published_at.isoformat(), context["outcome_auction_at"])
+
+    def test_aofm_auction_reference_uses_same_isin_for_next_tender_label(self) -> None:
+        cfg = settings()
+        cfg["paper_exploration"]["enabled"] = True
+        cfg["learning"]["horizon_minutes"] = [0]
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        entry_auction_at = now - dt.timedelta(days=14)
+        next_auction_at = now - dt.timedelta(days=1)
+        recommendation = lab_recommendation(
+            "aofm_treasury_bond_tender_strength_v1",
+            aofm_tender_reference_logic(),
+        )
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["hypothesis"] = (
+            "Strongly covered AOFM bond tenders tend to be followed by firmer next same-ISIN tender yields."
+        )
+        experiment["source_surface"] = "australian_treasury_bond_tenders_and_results"
+        experiment["permitted_target_surface"] = ["australian_treasury_bond_tenders_and_results"]
+        entry = aofm_tender_observation(4.321, entry_auction_at)
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            generated, report = generate_strategy_lab_candidates(conn, cfg, [], [entry])
+
+            self.assertEqual(1, len(generated), report)
+            candidate = generated[0]
+            self.assertEqual("australian_treasury_bond_tenders_and_results", candidate["target_surface"])
+            self.assertTrue(candidate["paper_auction_reference"])
+            self.assertTrue(candidate["paper_auction_reference_provenance_valid"])
+            self.assertEqual("AU000XCLWAM8", candidate["paper_auction_reference_provenance"]["isin"])
+            self.assertEqual(2.15, candidate["strategy_lab_program_features"]["auction_coverage_ratio"])
+
+            execution = execute_order(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"], "paper_allocation_multiplier": 1.0},
+                cfg,
+            )
+            self.assertTrue(execution["paper_filled"])
+            self.assertEqual("synthetic_auction_reference_paper", execution["order"]["route_id"])
+
+            trade_id = open_paper_trade(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"]},
+                execution=execution,
+                settings=cfg,
+            )
+            self.assertEqual([], record_due_horizon_outcomes(conn, {entry["inst_id"]: entry}, cfg))
+
+            same_auction = {**entry, "average_yield_pct": 4.10}
+            wrong_isin = aofm_tender_observation(
+                4.10,
+                next_auction_at,
+                isin="AU000XCLWAF4",
+                maturity_date_iso="2036-10-21",
+                term_days=3728,
+            )
+            stale_same_isin = aofm_tender_observation(
+                4.20,
+                entry_auction_at + dt.timedelta(days=7),
+                term_days=7507,
+                freshness_state="stale",
+            )
+            next_same_isin = aofm_tender_observation(
+                4.100,
+                next_auction_at,
+                term_days=7440,
+            )
+            recorded = record_due_horizon_outcomes(
+                conn,
+                {
+                    same_auction["inst_id"]: same_auction,
+                    wrong_isin["inst_id"]: wrong_isin,
+                    stale_same_isin["inst_id"]: stale_same_isin,
+                    next_same_isin["inst_id"]: next_same_isin,
+                },
+                cfg,
+            )
+            self.assertEqual(1, len(recorded))
+            self.assertEqual("valid_auction_event", recorded[0]["measurement_status"])
+            self.assertGreater(recorded[0]["pnl_bps"], 0)
+
+            outcome = conn.execute(
+                "select price, pnl_bps, measurement_status, context_json from paper_trade_outcomes where trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+            self.assertEqual(4.10, outcome["price"])
+            self.assertEqual("valid_auction_event", outcome["measurement_status"])
+            context = json.loads(outcome["context_json"])["paper_auction_reference_outcome"]
+            self.assertEqual(next_same_isin["inst_id"], context["outcome_inst_id"])
+            self.assertEqual(next_auction_at.isoformat(), context["outcome_auction_at"])
 
     def test_carb_allowance_auction_reference_uses_paired_features_and_next_current_settlement(self) -> None:
         cfg = settings()

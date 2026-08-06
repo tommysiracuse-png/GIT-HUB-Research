@@ -32,6 +32,7 @@ TREASURY_BOND_ISSUANCE_URL = (
 )
 VENUE = "AUSTRALIAN_OFFICE_OF_FINANCIAL_MANAGEMENT"
 MARKET_SURFACE = "australian_treasury_bond_tenders_and_results"
+_AEST = dt.timezone(dt.timedelta(hours=10), name="AEST")
 
 
 class AofmTreasuryBondTenderParseError(ValueError):
@@ -96,6 +97,38 @@ def _bond_parts(series: str) -> tuple[float | None, str | None]:
     return (float(match.group(1)), match.group(2)) if match else (None, None)
 
 
+def _auction_term_days(
+    tender_date: dt.date | None,
+    settlement_date: dt.date | None,
+    maturity_date: dt.date | None,
+) -> int | None:
+    anchor = settlement_date or tender_date
+    if anchor is None or maturity_date is None:
+        return None
+    days = (maturity_date - anchor).days
+    return days if days > 0 else None
+
+
+def _auction_timestamp(
+    tender_date: dt.date | None,
+    bid_window: str | None = None,
+) -> str | None:
+    if tender_date is None:
+        return None
+    bid_text = " ".join(str(bid_window or "").upper().split())
+    match = re.search(r"(\d{1,2}:\d{2})\s*(AM|PM)", bid_text)
+    if match:
+        try:
+            auction_time = dt.datetime.strptime(
+                f"{match.group(1)} {match.group(2)}", "%I:%M %p"
+            ).time()
+        except ValueError:
+            auction_time = dt.time(11, 0)
+    else:
+        auction_time = dt.time(11, 0)
+    return dt.datetime.combine(tender_date, auction_time, tzinfo=_AEST).isoformat()
+
+
 def parse_aofm_forthcoming_transactions(
     document: str,
     *,
@@ -130,6 +163,7 @@ def parse_aofm_forthcoming_transactions(
             amount = _decimal(amounts[index] if index < len(amounts) else None)
             bid_window = " ".join(str(bid_times[index] if index < len(bid_times) else "").split()) or None
             settlement = _date(settlements[index] if index < len(settlements) else None)
+            term_days = _auction_term_days(tender_date, settlement, _date(maturity))
             rows.append(
                 {
                     "venue": VENUE,
@@ -149,8 +183,11 @@ def parse_aofm_forthcoming_transactions(
                     "isin": isin,
                     "coupon_pct": coupon,
                     "maturity_date": maturity,
+                    "maturity_date_iso": _date(maturity).isoformat() if _date(maturity) else None,
                     "offered_to_public_millions_aud": amount,
                     "tender_date": tender_date.isoformat(),
+                    "auction_at": _auction_timestamp(tender_date, bid_window),
+                    "term_days": term_days,
                     "bid_submission_window_aest": bid_window,
                     "settlement_date": settlement.isoformat() if settlement else None,
                     "data_status": "reachable",
@@ -302,6 +339,10 @@ def parse_aofm_treasury_bond_issuance_workbook(
                 freshness_state, freshness_age = _freshness(tender_date, fetched_at, stale_after_hours)
                 average_price = _decimal(raw.get(price_column)) if price_column else None
                 settlement_date = _date(raw.get(settlement_column)) if settlement_column else None
+                average_yield = _decimal(raw.get(yield_column)) if yield_column else None
+                maturity_iso = maturity.isoformat() if maturity else _date(maturity_text).isoformat() if _date(maturity_text) else None
+                auction_term_days = _auction_term_days(tender_date, settlement_date, maturity)
+                last = average_price if average_price is not None else average_yield if average_yield is not None else 0.0
                 observations.append(
                     {
                         "venue": VENUE,
@@ -310,29 +351,44 @@ def parse_aofm_treasury_bond_issuance_workbook(
                         "symbol": isin or slug(series),
                         "name": f"Australian Treasury Bond tender result {series}",
                         "base": isin or slug(series),
-                        "quote": "AUD_PER_100_FACE",
+                        "quote": "AUD_PER_100_FACE" if average_price is not None else "AUD_YIELD_PCT",
                         "market_type": "sovereign_treasury_bond_tender_result_reference",
                         "market_surface": MARKET_SURFACE,
                         "asset_class": "australian_government_treasury_bond",
-                        "trade_type": "official_primary_tender_result",
+                        "trade_type": "official_primary_auction_result",
+                        "source_trade_type": "official_primary_tender_result",
                         "direction": "watch_only",
-                        "last": average_price if average_price is not None else 0.0,
+                        "last": last,
                         "series_offered": series,
                         "isin": isin or None,
                         "tender_number": str(raw.get(tender_number_column) or "") or None if tender_number_column else None,
                         "coupon_pct": coupon if coupon is not None else coupon_value,
                         "maturity_date": maturity_text or (maturity.isoformat() if maturity else None),
-                        "maturity_date_iso": maturity.isoformat() if maturity else _date(maturity_text).isoformat() if _date(maturity_text) else None,
+                        "maturity_date_iso": maturity_iso,
                         "tender_date": tender_date.isoformat(),
+                        "auction_at": _auction_timestamp(tender_date),
+                        "term_days": auction_term_days,
                         "settlement_date": settlement_date.isoformat() if settlement_date else None,
                         "offered_to_public_millions_aud": _amount_millions(raw.get(offered_column), headers.get(offered_column)) if offered_column else None,
                         "allotted_millions_aud": _amount_millions(raw.get(allotted_column), headers.get(allotted_column)) if allotted_column else None,
-                        "weighted_average_yield_pct": _decimal(raw.get(yield_column)) if yield_column else None,
+                        "weighted_average_yield_pct": average_yield,
+                        "average_yield_pct": average_yield,
                         "weighted_average_price_per_100": average_price,
+                        "average_price_per_100": average_price,
                         "bid_cover_ratio": _decimal(raw.get(cover_column)) if cover_column else None,
+                        "coverage_ratio": _decimal(raw.get(cover_column)) if cover_column else None,
+                        "price_available": average_price is not None or average_yield is not None,
+                        "price_basis": (
+                            "official_weighted_average_price_per_100"
+                            if average_price is not None
+                            else "official_weighted_average_yield_pct"
+                            if average_yield is not None
+                            else "official_tender_result_reference"
+                        ),
                         "data_status": "reachable",
                         "fetch_status": "reachable",
-                        "quality_status": "official_tender_result",
+                        "quality_status": "official_auction_result",
+                        "source_quality_status": "official_tender_result",
                         "freshness_state": freshness_state,
                         "freshness_basis": "official_tender_date",
                         "freshness_age_seconds": freshness_age,
@@ -342,7 +398,7 @@ def parse_aofm_treasury_bond_issuance_workbook(
                         "price_source": "AOFM Treasury Bonds issuance Data Hub workbook",
                         "source_url": source_url,
                         "source_page_url": DATA_HUB_URL,
-                        "candidate_reject_reason": "official_tender_result_not_executable_quote",
+                        "candidate_reject_reason": "official_auction_result_not_executable_quote",
                     }
                 )
     if not observations:
