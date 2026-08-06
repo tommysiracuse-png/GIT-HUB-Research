@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import sqlite3
 
-from paper_order_router import apply_frontier_paper_guard
+from paper_order_router import apply_frontier_paper_admission_guard, apply_frontier_paper_guard
 from paper_context_cost import enforce_paper_context_cost_gate
 from paper_exploration import exploration_enabled, prepare_candidate_for_exploration
 from storage import save_execution_fill, save_execution_order
@@ -334,6 +334,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             candidate["shadow_filtered"] = False
             candidate["paper_fill_allowed"] = True
             candidate["paper_entry_blocked"] = False
+        candidate = apply_frontier_paper_admission_guard(candidate, settings)
     else:
         candidate = apply_frontier_paper_guard(candidate, settings)
         recovery_probe = bool(

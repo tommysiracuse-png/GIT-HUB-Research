@@ -10225,6 +10225,12 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
     )
     for candidate in candidates:
         _refresh_frontier_short_route_requirements_report(candidate, settings)
+        if paper_only_active:
+            try:
+                from paper_order_router import apply_frontier_paper_admission_guard
+            except ImportError:  # pragma: no cover - package import fallback
+                from src.paper_order_router import apply_frontier_paper_admission_guard
+            candidate.update(apply_frontier_paper_admission_guard(candidate, settings))
         quality_score = as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0
         base_score = as_float(candidate.get("score"), 0.0) or 0.0
         effective_edge = as_float(candidate.get("effective_edge_bps"), None)
@@ -11270,6 +11276,7 @@ def _candidate_from_observation(
         "source_venue_count": source_venue_count,
         "asset_class": "crypto_derivatives" if observation["market_type"] == "perp" else "crypto_spot",
         "trade_type": "frontier_crypto_venue_map",
+        "frontier_paper_admission_guard_applies": True,
         "direction": direction,
         "execution_feasibility": feasibility,
         "thesis": "frontier crypto venue map price/funding dislocation candidate",
