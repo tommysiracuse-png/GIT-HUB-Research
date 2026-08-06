@@ -23,6 +23,13 @@ _TARGET_DIRECTIONS = frozenset(
         "basis_mean_reversion_short_perp",
     }
 )
+_EXACT_SIGNAL_ID_FIELDS = (
+    "signal_key",
+    "market_key",
+    "paper_context_key",
+    "route_id",
+    "route_registry_id",
+)
 
 
 def _as_bool(value: Any, default: bool = True) -> bool:
@@ -176,11 +183,11 @@ def _separate_proxy_lineage(candidate: Mapping[str, Any]) -> bool:
     )
 
 
-def _explicit_target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
-    signal_key = str(candidate.get("signal_key") or "").strip()
-    if not signal_key:
+def _parse_exact_target_signal(raw_value: object) -> dict[str, str] | None:
+    raw = str(raw_value or "").strip()
+    if not raw:
         return None
-    parts = signal_key.split("|")
+    parts = raw.split("|")
     if len(parts) < 4:
         return None
     venue = parts[0].strip().upper()
@@ -200,6 +207,18 @@ def _explicit_target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | No
     }
 
 
+def _has_explicit_signal_identity(candidate: Mapping[str, Any]) -> bool:
+    return any(str(candidate.get(field) or "").strip() for field in _EXACT_SIGNAL_ID_FIELDS)
+
+
+def _explicit_target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
+    for field in _EXACT_SIGNAL_ID_FIELDS:
+        explicit = _parse_exact_target_signal(candidate.get(field))
+        if explicit is not None:
+            return explicit
+    return None
+
+
 def target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
     """Return the exact decayed signal family identity, without prose matching."""
     if _separate_proxy_lineage(candidate):
@@ -207,7 +226,7 @@ def target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
     explicit = _explicit_target_signal(candidate)
     if explicit is not None:
         return explicit
-    if candidate.get("signal_key") or candidate.get("strategy_lab_id") or candidate.get("signal_lineage_key"):
+    if _has_explicit_signal_identity(candidate) or candidate.get("strategy_lab_id") or candidate.get("signal_lineage_key"):
         return None
     signal_key = str(candidate.get("signal_key") or "")
     parts = signal_key.split("|")

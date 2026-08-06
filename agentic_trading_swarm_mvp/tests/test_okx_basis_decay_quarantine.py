@@ -127,6 +127,34 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
 
         self.assertIsNone(quarantine_record(protected, self.settings))
 
+    def test_market_key_target_is_quarantined_without_signal_key(self) -> None:
+        candidate = self.candidate(
+            signal_key=None,
+            market_key="OKX|perp_funding_basis|basis_mean_reversion_long_perp|conditional",
+            venue=None,
+            trade_type=None,
+            direction=None,
+        )
+
+        record = quarantine_record(candidate, self.settings)
+
+        self.assertTrue(record["active"])
+        self.assertEqual(
+            "OKX|perp_funding_basis|basis_mean_reversion_long_perp|conditional",
+            record["target"]["signal_key"],
+        )
+
+    def test_market_key_positive_control_is_not_quarantined(self) -> None:
+        protected = self.candidate(
+            signal_key=None,
+            market_key="OKX|perp_funding_basis|funding_capture_short_perp|standard",
+            venue=None,
+            trade_type=None,
+            direction=None,
+        )
+
+        self.assertIsNone(quarantine_record(protected, self.settings))
+
     def test_strategy_lab_lineage_is_not_reclassified_as_native_decay_signal(self) -> None:
         translated = self.candidate(
             strategy_lab_id="okx_basis_lab_v2",
@@ -340,6 +368,32 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
                 0,
                 paper_report["summary"]["okx_basis_decay_quarantine_current_cycle_would_have_filled_count"],
             )
+            conn.close()
+
+    def test_runtime_report_cycle_counts_market_key_only_reviewed_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            candidate = self.candidate(
+                signal_key=None,
+                market_key="OKX|perp_funding_basis|basis_mean_reversion_short_perp|standard",
+                venue=None,
+                trade_type=None,
+                direction=None,
+            )
+            candidate["paper_okx_basis_decay_quarantine"] = quarantine_record(
+                candidate, self.settings, conn=conn
+            )
+
+            paper_report = build_paper_exploration_report(
+                conn,
+                self.settings,
+                reviewed=[
+                    {"candidate": candidate, "review": {"decision": "approve_paper_trade"}},
+                ],
+            )
+
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["current_cycle_quarantined_count"])
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["current_cycle_would_have_filled_count"])
             conn.close()
 
     def test_runtime_report_releases_after_the_fourteen_day_deadline(self) -> None:
