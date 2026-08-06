@@ -16,6 +16,7 @@ RUNS_DIR = ROOT / "runs"
 DB_PATH = RUNS_DIR / "radar.sqlite"
 SQLITE_BUSY_TIMEOUT_MS = 60_000
 UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON = "unresolved_route_requirement"
+SHADOW_EXCLUDED_FROM_LEARNING_REASON = "shadow_excluded_from_learning"
 
 _PAPER_LONG_DIRECTIONS = frozenset(
     {
@@ -146,9 +147,96 @@ def _normalize_route_status_token(value: object) -> str:
     return token
 
 
+def _storage_normalize_token(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _storage_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric
+
+
 def _is_conditional_paper_route_id(value: object) -> bool:
     route_id = str(value or "").strip().lower()
     return bool(route_id) and route_id.startswith("conditional_") and route_id.endswith("_paper")
+
+
+def _frontier_shadow_learning_exclusion(
+    containers: tuple[Mapping[str, object], ...],
+    deduped_blockers: list[str],
+) -> dict[str, object]:
+    trade_type = _storage_normalize_token(
+        _storage_first_present(containers, "trade_type", "signal_family", "market_key")
+    )
+    if "frontier_crypto_venue_map" not in trade_type:
+        return {
+            "paper_shadow_excluded_from_learning": False,
+            "paper_shadow_exclusion_reason": None,
+            "paper_shadow_exclusion_triggers": [],
+            "paper_shadow_exclusion_candidate_reject_reason": None,
+        }
+
+    direction = _storage_normalize_token(_storage_first_present(containers, "direction"))
+    quality_action = _storage_normalize_token(_storage_first_present(containers, "quality_action"))
+    reject_reason_raw = _storage_first_present(
+        containers,
+        "candidate_reject_reason",
+        "shadow_reason",
+        "paper_observation_reason",
+    )
+    reject_reason = str(reject_reason_raw).strip() if reject_reason_raw not in (None, "") else None
+
+    anomaly_flags: list[str] = []
+    for container in containers:
+        for field in ("anomaly_flags", "critical_anomaly_flags", "paper_label_anomaly_flags"):
+            anomaly_flags.extend(_storage_coerce_flag_list(container.get(field)))
+    normalized_anomaly_flags = sorted({_storage_normalize_token(flag) for flag in anomaly_flags if str(flag or "").strip()})
+
+    net_edge = _storage_float(
+        _storage_first_present(
+            containers,
+            "frontier_net_edge_bps",
+            "edge_bps_estimate",
+            "net_edge_bps_estimate",
+            "paper_label_net_edge_bps",
+        )
+    )
+    if net_edge is None:
+        gross_edge = _storage_float(_storage_first_present(containers, "gross_edge_bps_estimate"))
+        round_trip_cost = _storage_float(
+            _storage_first_present(containers, "estimated_round_trip_cost_bps")
+        )
+        if gross_edge is not None and round_trip_cost is not None:
+            net_edge = gross_edge - round_trip_cost
+
+    triggers: list[str] = []
+    if quality_action == "shadow_only":
+        triggers.append("quality_action_shadow_only")
+    if direction == "short_frontier_spot" and "spot_borrow" in deduped_blockers:
+        triggers.append("short_spot_borrow_blocked")
+    if reject_reason:
+        triggers.append("candidate_reject_reason_present")
+    if (
+        "simulated_slippage_exceeds_edge" in normalized_anomaly_flags
+        and net_edge is not None
+        and net_edge <= 0.0
+    ):
+        triggers.append("simulated_slippage_exceeds_edge")
+
+    triggers = list(dict.fromkeys(triggers))
+    return {
+        "paper_shadow_excluded_from_learning": bool(triggers),
+        "paper_shadow_exclusion_reason": (
+            SHADOW_EXCLUDED_FROM_LEARNING_REASON if triggers else None
+        ),
+        "paper_shadow_exclusion_triggers": triggers,
+        "paper_shadow_exclusion_candidate_reject_reason": reject_reason,
+    }
 
 
 def paper_label_eligibility(
@@ -222,8 +310,12 @@ def paper_label_eligibility(
     )
     conditional_route = route_status == "conditional" or _is_conditional_paper_route_id(route_id)
     explicit_override = _storage_truthy_flag(explicit_eligible)
+    frontier_shadow_exclusion = _frontier_shadow_learning_exclusion(containers, deduped_blockers)
     label_eligible = explicit_override or not (conditional_route and deduped_blockers)
     exclusion_reason = None if label_eligible else UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON
+    if frontier_shadow_exclusion["paper_shadow_excluded_from_learning"]:
+        label_eligible = False
+        exclusion_reason = SHADOW_EXCLUDED_FROM_LEARNING_REASON
     return {
         "paper_label_eligible": label_eligible,
         "paper_label_explicit_override": explicit_override,
@@ -232,6 +324,7 @@ def paper_label_eligibility(
         "paper_label_route_id": route_id or None,
         "paper_label_route_blockers": deduped_blockers,
         "paper_shadow_observation": not label_eligible,
+        **frontier_shadow_exclusion,
     }
 
 
@@ -248,7 +341,11 @@ def paper_label_eligibility_for_trade_row(row: sqlite3.Row | Mapping[str, object
     return paper_label_eligibility(candidate=candidate, review=review, context=row_context)
 
 
-def unresolved_route_requirement_shadow_summary(conn: sqlite3.Connection) -> dict[str, object]:
+def _paper_label_shadow_summary(
+    conn: sqlite3.Connection,
+    *,
+    exclusion_reason: str,
+) -> dict[str, object]:
     rows = conn.execute(
         """
         select status, pnl_bps, candidate_json, review_json, context_json
@@ -257,22 +354,25 @@ def unresolved_route_requirement_shadow_summary(conn: sqlite3.Connection) -> dic
         """
     ).fetchall()
     summary: dict[str, object] = {
-        "exclusion_reason": UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
+        "exclusion_reason": exclusion_reason,
         "open_count": 0,
         "closed_count": 0,
         "avg_pnl_bps": None,
         "win_rate": None,
         "total_pnl_bps": None,
         "by_blocker": {},
+        "by_trigger": {},
     }
     pnls: list[float] = []
     by_blocker: dict[str, dict[str, object]] = {}
+    by_trigger: dict[str, dict[str, object]] = {}
     for row in rows:
         eligibility = paper_label_eligibility_for_trade_row(row)
-        if eligibility["paper_label_exclusion_reason"] != UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON:
+        if eligibility["paper_label_exclusion_reason"] != exclusion_reason:
             continue
         status = str(row["status"] or "").strip().lower()
         blockers = list(eligibility.get("paper_label_route_blockers") or [])
+        triggers = list(eligibility.get("paper_shadow_exclusion_triggers") or [])
         if status == "open":
             summary["open_count"] = int(summary["open_count"]) + 1
         elif status == "closed" and row["pnl_bps"] is not None:
@@ -289,6 +389,16 @@ def unresolved_route_requirement_shadow_summary(conn: sqlite3.Connection) -> dic
             elif status == "closed" and row["pnl_bps"] is not None:
                 blocker_bucket["closed_count"] = int(blocker_bucket["closed_count"]) + 1
                 blocker_bucket["_pnls"].append(float(row["pnl_bps"]))
+        for trigger in triggers:
+            trigger_bucket = by_trigger.setdefault(
+                trigger,
+                {"open_count": 0, "closed_count": 0, "_pnls": []},
+            )
+            if status == "open":
+                trigger_bucket["open_count"] = int(trigger_bucket["open_count"]) + 1
+            elif status == "closed" and row["pnl_bps"] is not None:
+                trigger_bucket["closed_count"] = int(trigger_bucket["closed_count"]) + 1
+                trigger_bucket["_pnls"].append(float(row["pnl_bps"]))
     if pnls:
         summary["avg_pnl_bps"] = round(sum(pnls) / len(pnls), 3)
         summary["win_rate"] = round(sum(value > 0.0 for value in pnls) / len(pnls), 3)
@@ -306,7 +416,34 @@ def unresolved_route_requirement_shadow_summary(conn: sqlite3.Connection) -> dic
             "total_pnl_bps": round(sum(blocker_pnls), 3) if blocker_pnls else None,
         }
     summary["by_blocker"] = rendered_blockers
+    rendered_triggers: dict[str, dict[str, object]] = {}
+    for trigger, trigger_bucket in sorted(by_trigger.items()):
+        trigger_pnls = [float(value) for value in trigger_bucket.pop("_pnls", [])]
+        rendered_triggers[trigger] = {
+            "open_count": int(trigger_bucket["open_count"]),
+            "closed_count": int(trigger_bucket["closed_count"]),
+            "avg_pnl_bps": round(sum(trigger_pnls) / len(trigger_pnls), 3) if trigger_pnls else None,
+            "win_rate": round(sum(value > 0.0 for value in trigger_pnls) / len(trigger_pnls), 3)
+            if trigger_pnls
+            else None,
+            "total_pnl_bps": round(sum(trigger_pnls), 3) if trigger_pnls else None,
+        }
+    summary["by_trigger"] = rendered_triggers
     return summary
+
+
+def unresolved_route_requirement_shadow_summary(conn: sqlite3.Connection) -> dict[str, object]:
+    return _paper_label_shadow_summary(
+        conn,
+        exclusion_reason=UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
+    )
+
+
+def shadow_excluded_from_learning_summary(conn: sqlite3.Connection) -> dict[str, object]:
+    return _paper_label_shadow_summary(
+        conn,
+        exclusion_reason=SHADOW_EXCLUDED_FROM_LEARNING_REASON,
+    )
 
 
 def _parse_storage_iso(value: str) -> dt.datetime:
@@ -1759,6 +1896,21 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "paper_execution_semantics": candidate.get("paper_execution_semantics"),
         "paper_proxy_not_live_equivalent": bool(candidate.get("paper_proxy_not_live_equivalent")),
         "direct_signal_key": candidate.get("direct_signal_key"),
+        "quality_status": candidate.get("quality_status"),
+        "quality_action": candidate.get("quality_action"),
+        "candidate_reject_reason": candidate.get("candidate_reject_reason") or candidate.get("shadow_reason"),
+        "shadow_reason": candidate.get("shadow_reason"),
+        "anomaly_flags": list(candidate.get("anomaly_flags") or []),
+        "gross_edge_bps_estimate": candidate.get("gross_edge_bps_estimate"),
+        "edge_bps_estimate": candidate.get("edge_bps_estimate"),
+        "net_edge_bps_estimate": (
+            candidate.get("frontier_net_edge_bps")
+            if candidate.get("frontier_net_edge_bps") is not None
+            else candidate.get("edge_bps_estimate")
+            if candidate.get("edge_bps_estimate") is not None
+            else (review or {}).get("net_edge_bps_estimate")
+        ),
+        "estimated_round_trip_cost_bps": candidate.get("estimated_round_trip_cost_bps"),
         "liquidity_bucket": _bucket(candidate.get("liquidity_score", 0), [0.35, 0.65, 0.85]),
         "spread_bucket": _bucket(candidate.get("spread_bps", 999), [3, 8, 20], reverse=True),
         "feasibility_status": (review or {}).get("feasibility_status") or feasibility.get("status"),
@@ -2993,6 +3145,7 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
         "avg_pnl_bps": round(float(synthetic_row["avg_pnl_bps"]), 3) if synthetic_row["avg_pnl_bps"] is not None else None,
     }
     unresolved_shadow = unresolved_route_requirement_shadow_summary(conn)
+    shadow_excluded = shadow_excluded_from_learning_summary(conn)
     if not pnls:
         return {
             "closed": 0,
@@ -3001,6 +3154,7 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
             "win_rate": None,
             "synthetic_research": synthetic,
             "unresolved_route_requirement_shadow": unresolved_shadow,
+            "shadow_excluded_from_learning": shadow_excluded,
         }
     wins = sum(1 for pnl in pnls if pnl > 0)
     return {
@@ -3012,6 +3166,7 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
         "worst_bps": round(min(pnls), 3),
         "synthetic_research": synthetic,
         "unresolved_route_requirement_shadow": unresolved_shadow,
+        "shadow_excluded_from_learning": shadow_excluded,
     }
 
 

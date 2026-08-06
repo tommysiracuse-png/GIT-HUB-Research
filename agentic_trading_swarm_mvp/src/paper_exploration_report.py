@@ -8,7 +8,11 @@ import re
 import sqlite3
 from collections import Counter, defaultdict
 
-from storage import RUNS_DIR, unresolved_route_requirement_shadow_summary
+from storage import (
+    RUNS_DIR,
+    shadow_excluded_from_learning_summary,
+    unresolved_route_requirement_shadow_summary,
+)
 from paper_decay_quarantine import (
     REASON as OKX_BASIS_DECAY_QUARANTINE_REASON,
     candidate_quarantine_record as okx_basis_decay_candidate_record,
@@ -574,6 +578,7 @@ def build_paper_exploration_report(
 
     frontier_short_diagnostics = _frontier_short_diagnostic_report(rows, horizon)
     unresolved_route_shadow = unresolved_route_requirement_shadow_summary(conn)
+    shadow_excluded = shadow_excluded_from_learning_summary(conn)
 
     guard_value = []
     for reason, count in guard_trade_counts.most_common():
@@ -695,6 +700,13 @@ def build_paper_exploration_report(
                 unresolved_route_shadow.get("closed_count", 0)
             ),
             "unresolved_route_requirement_shadow_avg_pnl_bps": unresolved_route_shadow.get("avg_pnl_bps"),
+            "shadow_excluded_from_learning_open_count": int(
+                shadow_excluded.get("open_count", 0)
+            ),
+            "shadow_excluded_from_learning_closed_count": int(
+                shadow_excluded.get("closed_count", 0)
+            ),
+            "shadow_excluded_from_learning_avg_pnl_bps": shadow_excluded.get("avg_pnl_bps"),
         },
         "decisions_24h": dict(decisions),
         "true_rejection_reasons_24h": dict(true_rejections.most_common()),
@@ -707,6 +719,7 @@ def build_paper_exploration_report(
         "okx_basis_decay_quarantine": decay_quarantine,
         "frontier_short_diagnostics": frontier_short_diagnostics,
         "unresolved_route_requirement_shadow": unresolved_route_shadow,
+        "shadow_excluded_from_learning": shadow_excluded,
     }
 
 
@@ -734,6 +747,8 @@ def write_paper_exploration_report(
         f"- Synthetic research trades: `{summary['synthetic_paper_trades']}`",
         f"- Unresolved-route shadow fills: `{summary['unresolved_route_requirement_shadow_closed_count']}` "
         f"closed / `{summary['unresolved_route_requirement_shadow_open_count']}` open",
+        f"- Frontier shadow labels excluded from learning: `{summary['shadow_excluded_from_learning_closed_count']}` "
+        f"closed / `{summary['shadow_excluded_from_learning_open_count']}` open",
         f"- True invalid-data rejections (24h): `{summary['true_invalid_data_rejections_24h']}`",
         f"- Capacity deferrals (24h): `{summary['capacity_deferrals_24h']}`",
         "",
@@ -769,6 +784,27 @@ def write_paper_exploration_report(
             f"| {blocker} | {blocker_summary.get('open_count', 0)} | "
             f"{blocker_summary.get('closed_count', 0)} | {blocker_summary.get('avg_pnl_bps')} | "
             f"{blocker_summary.get('win_rate')} | {blocker_summary.get('total_pnl_bps')} |"
+        )
+    shadow_excluded = report.get("shadow_excluded_from_learning") or {}
+    lines.extend(
+        [
+            "",
+            "## Frontier Shadow Labels Excluded From Learning",
+            "",
+            f"- Exclusion reason: `{shadow_excluded.get('exclusion_reason')}`",
+            f"- Closed excluded labels: `{shadow_excluded.get('closed_count', 0)}`",
+            f"- Open excluded labels: `{shadow_excluded.get('open_count', 0)}`",
+            f"- Avg excluded-label PnL: `{shadow_excluded.get('avg_pnl_bps')}` bps",
+            "",
+            "| Trigger | Open | Closed | Avg bps | Win rate | Total bps |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for trigger, trigger_summary in sorted((shadow_excluded.get("by_trigger") or {}).items()):
+        lines.append(
+            f"| {trigger} | {trigger_summary.get('open_count', 0)} | "
+            f"{trigger_summary.get('closed_count', 0)} | {trigger_summary.get('avg_pnl_bps')} | "
+            f"{trigger_summary.get('win_rate')} | {trigger_summary.get('total_pnl_bps')} |"
         )
     decay_quarantine = report.get("okx_basis_decay_quarantine") or {}
     lines.extend(
@@ -846,6 +882,7 @@ def compact_paper_exploration_report(report: dict, guard_limit: int = 10) -> dic
         "admission_zero_streaks": report.get("admission_zero_streaks") or {},
         "okx_basis_decay_quarantine": report.get("okx_basis_decay_quarantine") or {},
         "unresolved_route_requirement_shadow": report.get("unresolved_route_requirement_shadow") or {},
+        "shadow_excluded_from_learning": report.get("shadow_excluded_from_learning") or {},
         "frontier_short_diagnostics": {
             "evidence": list((report.get("frontier_short_diagnostics") or {}).get("evidence") or []),
             "frontier_short_count": (report.get("frontier_short_diagnostics") or {}).get("frontier_short_count", 0),

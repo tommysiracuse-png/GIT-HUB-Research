@@ -19,6 +19,7 @@ from storage import (
     add_hunter_directive,
     add_improvement_task,
     open_hunter_directives,
+    paper_label_eligibility_for_trade_row,
 )
 
 
@@ -70,14 +71,19 @@ IMPLEMENTED_CATEGORY_STATUSES = {
 
 
 def _rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return conn.execute(
+    rows = conn.execute(
         """
-        select signal_key, opened_at, closed_at, pnl_bps
+        select signal_key, opened_at, closed_at, pnl_bps, candidate_json, review_json, context_json
         from paper_trades
         where status = 'closed' and pnl_bps is not null
         order by closed_at asc, id asc
         """
     ).fetchall()
+    return [
+        row
+        for row in rows
+        if paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]
+    ]
 
 
 def _market_from_signal(signal_key: str) -> str:

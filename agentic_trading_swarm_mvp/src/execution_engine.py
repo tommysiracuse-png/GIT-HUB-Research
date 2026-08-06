@@ -189,6 +189,26 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         "paper_label_eligible": bool(label_eligibility.get("paper_label_eligible")),
         "paper_label_exclusion_reason": label_eligibility.get("paper_label_exclusion_reason"),
         "paper_label_route_blockers": list(label_eligibility.get("paper_label_route_blockers") or []),
+        "paper_shadow_excluded_from_learning": bool(
+            label_eligibility.get("paper_shadow_excluded_from_learning")
+        ),
+        "paper_shadow_exclusion_triggers": list(
+            label_eligibility.get("paper_shadow_exclusion_triggers") or []
+        ),
+        "quality_action": candidate.get("quality_action"),
+        "quality_status": candidate.get("quality_status"),
+        "candidate_reject_reason": candidate.get("candidate_reject_reason") or candidate.get("shadow_reason"),
+        "anomaly_flags": list(candidate.get("anomaly_flags") or []),
+        "gross_edge_bps_estimate": candidate.get("gross_edge_bps_estimate"),
+        "edge_bps_estimate": candidate.get("edge_bps_estimate"),
+        "net_edge_bps_estimate": (
+            candidate.get("frontier_net_edge_bps")
+            if candidate.get("frontier_net_edge_bps") is not None
+            else candidate.get("edge_bps_estimate")
+            if candidate.get("edge_bps_estimate") is not None
+            else review.get("net_edge_bps_estimate")
+        ),
+        "estimated_round_trip_cost_bps": candidate.get("estimated_round_trip_cost_bps"),
         "signal_key": review.get("signal_key"),
         "direct_signal_key": candidate.get("direct_signal_key"),
         "direct_route_id": candidate.get("paper_proxy_source_route_id"),

@@ -15,9 +15,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import learning  # noqa: E402
+import market_hunter  # noqa: E402
 import strategy_reliability as sr  # noqa: E402
 from settings import DEFAULT_SETTINGS  # noqa: E402
 from storage import (  # noqa: E402
+    SHADOW_EXCLUDED_FROM_LEARNING_REASON,
     UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
     init_db,
     open_paper_trade,
@@ -91,7 +93,7 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
 
         self.assertFalse(eligibility["paper_label_eligible"])
         self.assertEqual(
-            UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
+            SHADOW_EXCLUDED_FROM_LEARNING_REASON,
             eligibility["paper_label_exclusion_reason"],
         )
         self.assertEqual(["spot_borrow"], eligibility["paper_label_route_blockers"])
@@ -162,7 +164,7 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
         context = json.loads(row["context_json"])
         self.assertFalse(context["paper_label_eligible"])
         self.assertEqual(
-            UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
+            SHADOW_EXCLUDED_FROM_LEARNING_REASON,
             context["paper_label_exclusion_reason"],
         )
         self.assertEqual(["spot_borrow"], context["paper_label_route_blockers"])
@@ -212,7 +214,52 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
             context["paper_label_exclusion_reason"],
         )
 
-    def test_learning_excludes_unresolved_conditional_labels_but_keeps_overrides(self) -> None:
+    def test_open_paper_trade_persists_frontier_shadow_learning_metadata(self) -> None:
+        conn = make_conn()
+        try:
+            candidate = {
+                "venue": "OKX_SPOT",
+                "inst_id": "OKX_SPOT:ICP-USDT",
+                "direction": "long_frontier_spot",
+                "trade_type": "frontier_crypto_venue_map",
+                "score": 82.0,
+                "last": 100.0,
+                "quality_status": "verified",
+                "quality_action": "normal",
+                "anomaly_flags": ["simulated_slippage_exceeds_edge"],
+                "edge_bps_estimate": 0.0,
+                "gross_edge_bps_estimate": 12.898,
+                "estimated_round_trip_cost_bps": 20.092,
+                "execution_feasibility": {"status": "standard", "route_status": "standard"},
+            }
+            review = {
+                "learned_score": 82.0,
+                "feasibility_status": "standard",
+                "route_status": "standard",
+                "effective_route_id": "generic_paper_route",
+                "net_edge_bps_estimate": 0.0,
+            }
+
+            trade_id = open_paper_trade(conn, candidate, review, settings=DEFAULT_SETTINGS)
+            row = conn.execute(
+                "select context_json from paper_trades where id = ?",
+                (trade_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        context = json.loads(row["context_json"])
+        self.assertEqual("normal", context["quality_action"])
+        self.assertEqual(["simulated_slippage_exceeds_edge"], context["anomaly_flags"])
+        self.assertEqual(0.0, context["net_edge_bps_estimate"])
+        self.assertFalse(context["paper_label_eligible"])
+        self.assertTrue(context["paper_shadow_excluded_from_learning"])
+        self.assertEqual(
+            SHADOW_EXCLUDED_FROM_LEARNING_REASON,
+            context["paper_label_exclusion_reason"],
+        )
+
+    def test_learning_excludes_frontier_shadow_labels_even_with_explicit_override(self) -> None:
         conn = make_conn()
         signal_key = "TEST|frontier_crypto_venue_map|short_frontier_spot|mixed"
         try:
@@ -312,9 +359,200 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
         finally:
             conn.close()
 
-        self.assertEqual(3, stats[signal_key]["closed_count"])
-        self.assertEqual(8.333, stats[signal_key]["avg_pnl_bps"])
-        self.assertEqual(0.667, stats[signal_key]["win_rate"])
+        self.assertEqual(2, stats[signal_key]["closed_count"])
+        self.assertEqual(15.0, stats[signal_key]["avg_pnl_bps"])
+        self.assertEqual(1.0, stats[signal_key]["win_rate"])
+
+    def test_frontier_shadow_labels_are_excluded_from_learning_but_visible_in_reports(self) -> None:
+        conn = make_conn()
+        try:
+            insert_closed_trade(
+                conn,
+                signal_key="GATE|frontier_crypto_venue_map|long_frontier_spot|standard",
+                pnl_bps=-40.0,
+                candidate={
+                    "venue": "GATE",
+                    "inst_id": "GATE:ESPORTS_USDT",
+                    "direction": "long_frontier_spot",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "quality_status": "degraded",
+                    "quality_action": "shadow_only",
+                    "edge_bps_estimate": 45.0,
+                    "estimated_round_trip_cost_bps": 30.0,
+                    "execution_feasibility": {"status": "standard", "route_status": "standard"},
+                },
+                review={
+                    "feasibility_status": "standard",
+                    "route_status": "standard",
+                    "effective_route_id": "generic_paper_route",
+                },
+                context={"route_status": "standard", "route_id": "generic_paper_route"},
+            )
+            insert_closed_trade(
+                conn,
+                signal_key="BITSO|frontier_crypto_venue_map|short_frontier_spot|conditional",
+                pnl_bps=-25.0,
+                candidate={
+                    "venue": "BITSO",
+                    "inst_id": "BITSO:XRP_MXN",
+                    "direction": "short_frontier_spot",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "quality_status": "verified",
+                    "quality_action": "normal",
+                    "execution_feasibility": {"status": "conditional", "route_status": "conditional"},
+                },
+                review={
+                    "feasibility_status": "conditional",
+                    "route_status": "conditional",
+                    "effective_route_id": "conditional_crypto_route_paper",
+                    "missing_requirements": ["spot_borrow"],
+                },
+                context={
+                    "route_status": "conditional",
+                    "route_id": "conditional_crypto_route_paper",
+                    "route_blockers": ["spot_borrow"],
+                },
+            )
+            insert_closed_trade(
+                conn,
+                signal_key="KRAKEN|frontier_crypto_venue_map|long_frontier_spot|standard",
+                pnl_bps=-15.0,
+                candidate={
+                    "venue": "KRAKEN",
+                    "inst_id": "KRAKEN:XBTUSD",
+                    "direction": "long_frontier_spot",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "quality_status": "verified",
+                    "quality_action": "normal",
+                    "anomaly_flags": ["simulated_slippage_exceeds_edge"],
+                    "edge_bps_estimate": 0.0,
+                    "gross_edge_bps_estimate": 12.898,
+                    "estimated_round_trip_cost_bps": 20.092,
+                    "execution_feasibility": {"status": "standard", "route_status": "standard"},
+                },
+                review={
+                    "feasibility_status": "standard",
+                    "route_status": "standard",
+                    "effective_route_id": "generic_paper_route",
+                    "net_edge_bps_estimate": 0.0,
+                },
+                context={
+                    "route_status": "standard",
+                    "route_id": "generic_paper_route",
+                    "anomaly_flags": ["simulated_slippage_exceeds_edge"],
+                    "net_edge_bps_estimate": 0.0,
+                },
+            )
+            insert_closed_trade(
+                conn,
+                signal_key="COINBASE|frontier_crypto_venue_map|long_frontier_spot|standard",
+                pnl_bps=12.0,
+                candidate={
+                    "venue": "COINBASE",
+                    "inst_id": "COINBASE:BTC-USD",
+                    "direction": "long_frontier_spot",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "quality_status": "verified",
+                    "quality_action": "normal",
+                    "edge_bps_estimate": 12.0,
+                    "estimated_round_trip_cost_bps": 20.0,
+                    "execution_feasibility": {"status": "standard", "route_status": "standard"},
+                },
+                review={
+                    "feasibility_status": "standard",
+                    "route_status": "standard",
+                    "effective_route_id": "generic_paper_route",
+                    "net_edge_bps_estimate": 12.0,
+                },
+                context={"route_status": "standard", "route_id": "generic_paper_route"},
+            )
+            conn.commit()
+
+            rows = conn.execute(
+                """
+                select inst_id, candidate_json, review_json, context_json
+                from paper_trades
+                order by id asc
+                """
+            ).fetchall()
+            by_inst = {
+                row["inst_id"]: paper_label_eligibility_for_trade_row(row)
+                for row in rows
+            }
+
+            with (
+                mock.patch.object(learning, "generate_improvement_tasks"),
+                mock.patch.object(learning, "generate_growth_experiments"),
+                mock.patch.object(learning, "write_backlog"),
+                mock.patch.object(learning, "write_growth_plan"),
+            ):
+                stats = learning.update_signal_stats(conn, copy.deepcopy(DEFAULT_SETTINGS))
+            summary = performance_summary(conn)
+            directives = market_hunter.analyze_markets(
+                conn,
+                {"hunter": {"min_samples_to_classify": 1, "promotion_avg_bps": 5.0, "promotion_win_rate": 0.5}},
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual(
+            SHADOW_EXCLUDED_FROM_LEARNING_REASON,
+            by_inst["GATE:ESPORTS_USDT"]["paper_label_exclusion_reason"],
+        )
+        self.assertEqual(
+            ["quality_action_shadow_only"],
+            by_inst["GATE:ESPORTS_USDT"]["paper_shadow_exclusion_triggers"],
+        )
+        self.assertEqual(
+            SHADOW_EXCLUDED_FROM_LEARNING_REASON,
+            by_inst["BITSO:XRP_MXN"]["paper_label_exclusion_reason"],
+        )
+        self.assertIn(
+            "short_spot_borrow_blocked",
+            by_inst["BITSO:XRP_MXN"]["paper_shadow_exclusion_triggers"],
+        )
+        self.assertEqual(
+            SHADOW_EXCLUDED_FROM_LEARNING_REASON,
+            by_inst["KRAKEN:XBTUSD"]["paper_label_exclusion_reason"],
+        )
+        self.assertIn(
+            "simulated_slippage_exceeds_edge",
+            by_inst["KRAKEN:XBTUSD"]["paper_shadow_exclusion_triggers"],
+        )
+        self.assertTrue(by_inst["COINBASE:BTC-USD"]["paper_label_eligible"])
+
+        self.assertEqual(
+            ["COINBASE|frontier_crypto_venue_map|long_frontier_spot|standard"],
+            sorted(stats.keys()),
+        )
+        self.assertEqual(1, stats["COINBASE|frontier_crypto_venue_map|long_frontier_spot|standard"]["closed_count"])
+        self.assertEqual(12.0, stats["COINBASE|frontier_crypto_venue_map|long_frontier_spot|standard"]["avg_pnl_bps"])
+
+        self.assertEqual(1, summary["closed"])
+        self.assertEqual(12.0, summary["avg_pnl_bps"])
+        self.assertEqual(3, summary["shadow_excluded_from_learning"]["closed_count"])
+        self.assertEqual(-26.667, summary["shadow_excluded_from_learning"]["avg_pnl_bps"])
+        self.assertEqual(
+            1,
+            summary["shadow_excluded_from_learning"]["by_trigger"]["quality_action_shadow_only"]["closed_count"],
+        )
+        self.assertEqual(
+            1,
+            summary["shadow_excluded_from_learning"]["by_trigger"]["short_spot_borrow_blocked"]["closed_count"],
+        )
+        self.assertEqual(
+            1,
+            summary["shadow_excluded_from_learning"]["by_trigger"]["simulated_slippage_exceeds_edge"]["closed_count"],
+        )
+
+        by_market_key = {item["market_key"]: item for item in directives}
+        self.assertEqual(
+            "exploit_more",
+            by_market_key["COINBASE|frontier_crypto_venue_map|long_frontier_spot|standard"]["directive"],
+        )
+        self.assertNotIn("GATE|frontier_crypto_venue_map|long_frontier_spot|standard", by_market_key)
+        self.assertNotIn("BITSO|frontier_crypto_venue_map|short_frontier_spot|conditional", by_market_key)
+        self.assertNotIn("KRAKEN|frontier_crypto_venue_map|long_frontier_spot|standard", by_market_key)
 
     def test_performance_summary_excludes_unresolved_open_shadow_from_headline_open_count(self) -> None:
         conn = make_conn()
@@ -372,7 +610,7 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
         self.assertEqual(1, summary["open"])
         self.assertEqual(
             1,
-            summary["unresolved_route_requirement_shadow"]["open_count"],
+            summary["shadow_excluded_from_learning"]["open_count"],
         )
 
     def test_performance_summary_separates_unresolved_route_shadow_pnl_by_blocker(self) -> None:
@@ -450,13 +688,19 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
         self.assertEqual(1, summary["closed"])
         self.assertEqual(5.0, summary["avg_pnl_bps"])
         shadow = summary["unresolved_route_requirement_shadow"]
-        self.assertEqual(2, shadow["closed_count"])
-        self.assertEqual(-20.0, shadow["avg_pnl_bps"])
-        self.assertEqual(-40.0, shadow["total_pnl_bps"])
-        self.assertEqual(1, shadow["by_blocker"]["spot_borrow"]["closed_count"])
+        self.assertEqual(1, shadow["closed_count"])
+        self.assertEqual(-15.0, shadow["avg_pnl_bps"])
+        self.assertEqual(-15.0, shadow["total_pnl_bps"])
         self.assertEqual(
             1,
             shadow["by_blocker"]["prediction_markets_account"]["closed_count"],
+        )
+        frontier_shadow = summary["shadow_excluded_from_learning"]
+        self.assertEqual(1, frontier_shadow["closed_count"])
+        self.assertEqual(-25.0, frontier_shadow["avg_pnl_bps"])
+        self.assertEqual(
+            1,
+            frontier_shadow["by_trigger"]["short_spot_borrow_blocked"]["closed_count"],
         )
 
     def test_strategy_reliability_realized_context_ignores_unresolved_conditional_shadow_labels(self) -> None:

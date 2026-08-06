@@ -43,6 +43,36 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
         self.assertEqual(600.0, ticket["notional_usd"])
         self.assertEqual("ready_for_paper_execution", ticket["status"])
 
+    def test_frontier_ticket_carries_shadow_learning_metadata(self) -> None:
+        candidate = {
+            "venue": "OKX_SPOT",
+            "inst_id": "OKX_SPOT:ICP-USDT",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "last": 10.0,
+            "quality_status": "verified",
+            "quality_action": "normal",
+            "anomaly_flags": ["simulated_slippage_exceeds_edge"],
+            "edge_bps_estimate": 0.0,
+            "gross_edge_bps_estimate": 12.898,
+            "estimated_round_trip_cost_bps": 20.092,
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+        }
+        review = {
+            "paper_allocation_multiplier": 1.0,
+            "net_edge_bps_estimate": 0.0,
+            "feasibility_status": "standard",
+            "route_status": "standard",
+        }
+
+        ticket = build_order_ticket(candidate, review, DEFAULT_SETTINGS)
+
+        self.assertEqual("shadow_excluded_from_learning", ticket["paper_label_exclusion_reason"])
+        self.assertTrue(ticket["paper_shadow_excluded_from_learning"])
+        self.assertEqual(["simulated_slippage_exceeds_edge"], ticket["paper_shadow_exclusion_triggers"])
+        self.assertEqual(["simulated_slippage_exceeds_edge"], ticket["anomaly_flags"])
+        self.assertEqual(0.0, ticket["net_edge_bps_estimate"])
+
     def test_unconfirmed_frontier_spot_borrow_is_shadow_observed_without_an_order(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
