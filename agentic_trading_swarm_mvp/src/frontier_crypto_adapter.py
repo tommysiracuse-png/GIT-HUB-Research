@@ -8875,6 +8875,8 @@ def _base_observation(target: dict, result: dict, symbol: str | None = None) -> 
         "quote_ccy": quote,
         "fx_to_usd": None,
         "fx_age_minutes": None,
+        "native_quote_volume_24h": None,
+        "normalized_quote_volume_usd": None,
         "normalized_mid_usd": None,
         "premium_vs_reference_bps": None,
         "local_quote_flag": False,
@@ -10089,6 +10091,13 @@ def _local_quote_normalization_telemetry(row: dict) -> dict:
     )
     raw_last = as_float(output.get("last"), None)
     normalized_last = as_float(output.get("usd_normalized_last"), None)
+    native_quote_volume = as_float(
+        output.get("local_quote_volume_24h")
+        if output.get("local_quote_volume_24h") is not None
+        else output.get("quote_volume_24h"),
+        None,
+    )
+    normalized_quote_volume = as_float(output.get("quote_volume_24h"), None)
     bid = as_float(output.get("bid"), None)
     ask = as_float(output.get("ask"), None)
     native_mid = (
@@ -10103,6 +10112,8 @@ def _local_quote_normalization_telemetry(row: dict) -> dict:
         # Both external FX and same-venue USDT references express local quote
         # units per USD, so the conversion to USD is the observed ratio.
         fx_to_usd = normalized_last / raw_last
+    if normalized_quote_volume is None and native_quote_volume is not None and fx_to_usd is not None:
+        normalized_quote_volume = native_quote_volume * fx_to_usd
     fx_age_seconds = as_float(output.get("fx_age_seconds"), None)
     output.update(
         {
@@ -10110,6 +10121,12 @@ def _local_quote_normalization_telemetry(row: dict) -> dict:
             "fx_to_usd": round(fx_to_usd, 12) if fx_to_usd is not None else None,
             "quote_to_usd_multiplier": round(fx_to_usd, 12) if fx_to_usd is not None else None,
             "fx_age_minutes": round(fx_age_seconds / 60.0, 3) if fx_age_seconds is not None else None,
+            "native_quote_volume_24h": native_quote_volume,
+            "normalized_quote_volume_usd": (
+                round(normalized_quote_volume, 3)
+                if normalized_quote_volume is not None and normalized_quote_volume > 0
+                else None
+            ),
             "normalized_mid_usd": (
                 round(native_mid * fx_to_usd, 12)
                 if native_mid is not None and native_mid > 0 and fx_to_usd is not None
@@ -12896,6 +12913,8 @@ def _candidate_from_observation(
         "fx_age_seconds": observation.get("fx_age_seconds"),
         "fx_to_usd": observation.get("fx_to_usd"),
         "fx_age_minutes": observation.get("fx_age_minutes"),
+        "native_quote_volume_24h": observation.get("native_quote_volume_24h"),
+        "normalized_quote_volume_usd": observation.get("normalized_quote_volume_usd"),
         "normalized_mid_usd": observation.get("normalized_mid_usd"),
         "premium_vs_reference_bps": observation.get("premium_vs_reference_bps"),
         "local_quote_flag": bool(observation.get("local_quote_flag")),
@@ -13536,6 +13555,8 @@ def summarize(
             "quote_ccy": row.get("quote_ccy"),
             "fx_to_usd": row.get("fx_to_usd"),
             "fx_age_minutes": row.get("fx_age_minutes"),
+            "native_quote_volume_24h": row.get("native_quote_volume_24h"),
+            "normalized_quote_volume_usd": row.get("normalized_quote_volume_usd"),
             "normalized_mid_usd": row.get("normalized_mid_usd"),
             "premium_vs_reference_bps": row.get("premium_vs_reference_bps"),
             "local_quote_flag": row.get("local_quote_flag"),
@@ -13792,6 +13813,7 @@ def _markdown(report: dict) -> str:
             f"native_quote=`{row.get('native_quote_currency')}` canonical_price=`{row.get('canonical_normalized_price')}` "
             f"fx_source=`{row.get('fx_source')}` fx_age=`{row.get('fx_age_seconds')}` suppress=`{row.get('suppression_reason')}` "
             f"quote_ccy=`{row.get('quote_ccy')}` fx_to_usd=`{row.get('fx_to_usd')}` "
+            f"native_volume=`{row.get('native_quote_volume_24h')}` normalized_volume_usd=`{row.get('normalized_quote_volume_usd')}` "
             f"normalized_mid_usd=`{row.get('normalized_mid_usd')}` premium_bps=`{row.get('premium_vs_reference_bps')}` "
             f"local_quote=`{row.get('local_quote_flag')}` "
             f"route=`{row.get('route_status')}` blockers={row.get('route_blockers')} "
@@ -13809,6 +13831,7 @@ def _markdown(report: dict) -> str:
             f"native_quote=`{row.get('native_quote_currency')}` canonical_price=`{row.get('canonical_normalized_price')}` "
             f"fx_source=`{row.get('fx_source')}` fx_age=`{row.get('fx_age_seconds')}` suppress=`{row.get('suppression_reason')}` "
             f"quote_ccy=`{row.get('quote_ccy')}` fx_to_usd=`{row.get('fx_to_usd')}` "
+            f"native_volume=`{row.get('native_quote_volume_24h')}` normalized_volume_usd=`{row.get('normalized_quote_volume_usd')}` "
             f"normalized_mid_usd=`{row.get('normalized_mid_usd')}` premium_bps=`{row.get('premium_vs_reference_bps')}` "
             f"local_quote=`{row.get('local_quote_flag')}` "
             f"quality=`{row.get('quality_score')}` qstatus=`{row.get('quality_status')}` anomalies={row.get('anomaly_flags', [])}"

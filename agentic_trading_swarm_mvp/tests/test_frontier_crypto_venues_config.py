@@ -87,3 +87,19 @@ class FrontierCryptoVenuesConfigTest(unittest.TestCase):
         self.assertIn("No live trading.", hard_limits)
         self.assertNotIn("No credentials.", [])
 
+    def test_regional_fx_filters_match_paper_runtime_defaults(self):
+        config_path = Path("config/frontier_crypto_venues.example.json")
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+
+        filters = data.get("filters", {})
+        quote_assets = set(filters.get("quote_assets", []))
+        excluded_bases = set(filters.get("exclude_base_assets", []))
+
+        self.assertIn("TZS", quote_assets)
+        self.assertIn("UGX", quote_assets)
+        self.assertIn("TZS", excluded_bases)
+        self.assertIn("UGX", excluded_bases)
+        self.assertTrue(filters.get("regional_fx_normalization_enabled"))
+        self.assertTrue(filters.get("regional_fx_require_fresh_reference"))
+        self.assertEqual(filters.get("regional_fx_max_age_seconds"), 300)
+
