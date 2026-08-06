@@ -96,6 +96,36 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
         )
         self.assertEqual(["spot_borrow"], eligibility["paper_label_route_blockers"])
 
+    def test_sparse_trade_rows_honor_missing_prerequisites_from_route_eligibility(self) -> None:
+        eligibility = paper_label_eligibility_for_trade_row(
+            {
+                "candidate_json": json.dumps(
+                    {
+                        "venue": "BITGET",
+                        "inst_id": "BITGET:BTC-USDT",
+                        "direction": "short_frontier_spot",
+                        "trade_type": "frontier_crypto_venue_map",
+                        "paper_route_eligibility": {
+                            "suppressed": True,
+                            "missing_prerequisites": ["venue_api_access"],
+                        },
+                    },
+                    sort_keys=True,
+                ),
+                "review_json": "{}",
+                "context_json": "{}",
+                "route_status": "conditional",
+                "route_id": "conditional_crypto_route_paper",
+            }
+        )
+
+        self.assertFalse(eligibility["paper_label_eligible"])
+        self.assertEqual(
+            UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
+            eligibility["paper_label_exclusion_reason"],
+        )
+        self.assertEqual(["venue_api_access"], eligibility["paper_label_route_blockers"])
+
     def test_open_paper_trade_persists_unresolved_route_label_exclusion(self) -> None:
         conn = make_conn()
         try:
@@ -137,6 +167,50 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
         )
         self.assertEqual(["spot_borrow"], context["paper_label_route_blockers"])
         self.assertTrue(context["paper_shadow_observation"])
+
+    def test_open_paper_trade_persists_missing_prerequisites_from_route_eligibility(self) -> None:
+        conn = make_conn()
+        try:
+            candidate = {
+                "venue": "BITGET",
+                "inst_id": "BITGET:BTC-USDT",
+                "direction": "short_frontier_spot",
+                "trade_type": "frontier_crypto_venue_map",
+                "score": 82.0,
+                "last": 100.0,
+                "execution_feasibility": {"status": "conditional", "route_status": "conditional"},
+                "execution_route": {
+                    "route_id": "conditional_crypto_route_paper",
+                    "route_status": "conditional",
+                },
+                "paper_route_eligibility": {
+                    "suppressed": True,
+                    "missing_prerequisites": ["venue_api_access"],
+                },
+            }
+            review = {
+                "learned_score": 82.0,
+                "feasibility_status": "conditional",
+                "route_status": "conditional",
+                "effective_route_id": "conditional_crypto_route_paper",
+            }
+
+            trade_id = open_paper_trade(conn, candidate, review, settings=DEFAULT_SETTINGS)
+            row = conn.execute(
+                "select context_json from paper_trades where id = ?",
+                (trade_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        context = json.loads(row["context_json"])
+        self.assertEqual(["venue_api_access"], context["missing_prerequisites"])
+        self.assertEqual(["venue_api_access"], context["route_blockers"])
+        self.assertFalse(context["paper_label_eligible"])
+        self.assertEqual(
+            UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
+            context["paper_label_exclusion_reason"],
+        )
 
     def test_learning_excludes_unresolved_conditional_labels_but_keeps_overrides(self) -> None:
         conn = make_conn()

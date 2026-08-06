@@ -163,11 +163,13 @@ def paper_label_eligibility(
         candidate,
         _storage_json_mapping(candidate.get("execution_feasibility")),
         _storage_json_mapping(candidate.get("execution_route")),
+        _storage_json_mapping(candidate.get("paper_route_eligibility")),
         _storage_json_mapping(candidate.get("route_requirements")),
         _storage_json_mapping(candidate.get("paper_route_requirements")),
     )
     nested_review = (
         review,
+        _storage_json_mapping(review.get("paper_route_eligibility")),
         _storage_json_mapping(review.get("route_alternative")),
     )
     containers = tuple(
@@ -206,6 +208,9 @@ def paper_label_eligibility(
             "missing_requirements",
             "missing_permissions",
             "direct_missing_requirements",
+            "missing_prerequisites",
+            "eligibility_missing_prerequisites",
+            "direct_missing_prerequisites",
         ):
             blockers.extend(_storage_coerce_flag_list(container.get(field)))
     deduped_blockers = sorted(
@@ -1720,6 +1725,7 @@ def has_open_trade(conn: sqlite3.Connection, inst_id: str, direction: str) -> bo
 def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
     feasibility = candidate.get("execution_feasibility", {})
     route = candidate.get("execution_route") or {}
+    route_eligibility = candidate.get("paper_route_eligibility") or route.get("paper_route_eligibility") or {}
     context = {
         "venue": candidate.get("venue"),
         "trade_type": candidate.get("trade_type"),
@@ -1732,11 +1738,20 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "route_id": (review or {}).get("effective_route_id") or (review or {}).get("route_id") or candidate.get("route_id") or route.get("route_id"),
         "route_status": candidate.get("paper_route_status") or (review or {}).get("route_status") or candidate.get("route_status") or route.get("route_status"),
         "missing_requirements": (review or {}).get("missing_requirements") or route.get("missing_permissions", []),
+        "missing_prerequisites": (
+            route_eligibility.get("missing_prerequisites")
+            or route.get("eligibility_missing_prerequisites")
+            or candidate.get("missing_prerequisites")
+            or []
+        ),
         "route_blockers": (
             candidate.get("route_blockers")
             or (review or {}).get("missing_requirements")
             or route.get("route_blockers")
             or route.get("missing_permissions")
+            or route_eligibility.get("missing_prerequisites")
+            or route.get("eligibility_missing_prerequisites")
+            or candidate.get("missing_prerequisites")
             or []
         ),
         "signal_stats_scope": candidate.get("signal_stats_scope") or "direct",
