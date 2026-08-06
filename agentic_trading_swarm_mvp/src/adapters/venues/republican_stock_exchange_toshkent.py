@@ -45,6 +45,8 @@ BOARD_SURFACES = {
     "Nego Board": "uzse_nego_board_trade_results",
     "FoP Board": "uzse_fop_board_trade_results",
 }
+BOARD_ACTIVATION_SURFACE = "uzse_board_trade_results"
+SECURITY_HISTORY_ACTIVATION_SURFACE = "uzse_security_trade_history"
 
 
 class UzseParseError(ValueError):
@@ -341,6 +343,7 @@ def parse_uzse_trade_results(
                 "board_name": board_name,
                 "market_type": market_type,
                 "market_surface": BOARD_SURFACES.get(board_name, "uzse_other_board_trade_results"),
+                "activation_market_surface": BOARD_ACTIVATION_SURFACE,
                 "asset_class": asset_class,
                 "trade_type": "official_completed_trade",
                 "direction": "watch_only",
@@ -465,6 +468,7 @@ def parse_uzse_security_history(
                 "market": market,
                 "market_type": market_type,
                 "market_surface": surface,
+                "activation_market_surface": SECURITY_HISTORY_ACTIVATION_SURFACE,
                 "asset_class": asset_class,
                 "trade_type": (
                     "official_split_adjusted_history"

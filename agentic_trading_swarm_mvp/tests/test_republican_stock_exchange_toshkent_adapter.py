@@ -92,6 +92,9 @@ class RepublicanStockExchangeToshkentParserTests(unittest.TestCase):
         self.assertEqual("Main Board", by_board["G1"]["board_name"])
         self.assertEqual("uzse_nego_board_trade_results", by_board["T1"]["market_surface"])
         self.assertEqual("FoP Board", by_board["NC"]["board_name"])
+        self.assertTrue(
+            all(row["activation_market_surface"] == "uzse_board_trade_results" for row in rows)
+        )
         self.assertEqual(1_500.0, by_board["G1"]["last"])
         self.assertEqual(250_050_000.0, by_board["T1"]["trade_value_uzs"])
         self.assertEqual("fresh", by_board["G1"]["freshness_state"])
@@ -109,6 +112,8 @@ class RepublicanStockExchangeToshkentParserTests(unittest.TestCase):
         adjusted = by_surface["uzse_split_adjusted_security_history"]
         self.assertEqual("2026-08-04T10:25:01+05:00", intraday["observed_at"])
         self.assertEqual("UZ6058027AB0", intraday["security_code"])
+        self.assertEqual("uzse_security_trade_history", intraday["activation_market_surface"])
+        self.assertEqual("uzse_security_trade_history", adjusted["activation_market_surface"])
         self.assertEqual(525_000.0, adjusted["closed_price"])
         self.assertEqual("2:1", adjusted["splits_applied"])
         self.assertEqual(SECURITY_HISTORY_URL, adjusted["source_url"])
