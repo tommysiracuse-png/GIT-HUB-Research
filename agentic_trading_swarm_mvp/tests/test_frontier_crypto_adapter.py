@@ -590,16 +590,16 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertGreater(candidate["local_quote_score_penalty"], 0.0)
         self.assertFalse(candidate["paper_entry_blocked"])
 
-    def test_stale_external_fx_is_quarantined_before_reference_scoring(self) -> None:
+    def test_stale_external_fx_stays_priceable_but_is_excluded_from_active_ranking(self) -> None:
         cfg = settings()
-        local = self._obs("BUDA", "BTC-CLP", "BTC", "CLP", 90_000_000.0, 180_000_000, region="LATAM")
+        local = self._obs("LUNO", "XBTZAR", "BTC", "ZAR", 1_782_000.0, 180_000_000, region="Africa")
         peer = self._obs("COINBASE", "BTC-USD", "BTC", "USD", 100_000.0, 10_000_000)
 
         normalized = frontier._normalize_regional_quotes(
             [local, peer],
             fx_references={
-                "CLP": {
-                    "rate": 900.0,
+                "ZAR": {
+                    "rate": 18.0,
                     "provider": "public_fx",
                     "age_seconds": 61.0,
                     "source_url": "https://example.test/fx",
@@ -611,18 +611,45 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                 "regional_fx_max_age_seconds": 60.0,
             },
         )
-        buda = next(row for row in normalized if row["venue"] == "BUDA")
-        candidate = frontier._candidate_from_observation(buda, cfg, 100_000.0, 2)
+        luno = next(row for row in normalized if row["venue"] == "LUNO")
+        luno.update(
+            {
+                "quality_status": "verified",
+                "quality_score": 90.0,
+                "venue_health_score": 90.0,
+                "venue_health": {"venue_quality_score": 90.0},
+                "verified_depth_snapshot_count": 3,
+                "simulated_fills": {
+                    "buy": {"1000": {"filled": True, "slippage_bps": 1.0}},
+                    "sell": {"1000": {"filled": True, "slippage_bps": 1.0}},
+                },
+                "anomaly_flags": [],
+                "critical_anomaly_flags": [],
+            }
+        )
+        candidate = frontier._candidate_from_observation(
+            luno,
+            cfg,
+            100_000.0,
+            2,
+            reference_observations=normalized,
+        )
+        ranked = frontier.rank_frontier_paper_candidates([candidate], cfg)
 
-        self.assertEqual(buda["quote_normalization_status"], "stale_fx_reference")
-        self.assertEqual(buda["suppression_reason"], "stale_fx_reference")
-        self.assertEqual(buda["fx_age_seconds"], 61.0)
-        self.assertIsNone(buda["canonical_normalized_price"])
-        self.assertEqual(frontier._comparison_price(buda), 0.0)
+        self.assertEqual(luno["quote_normalization_status"], "stale_fx_reference")
+        self.assertEqual(luno["suppression_reason"], "stale_fx_reference")
+        self.assertEqual(luno["fx_age_seconds"], 61.0)
+        self.assertAlmostEqual(luno["canonical_normalized_price"], 99_000.0)
+        self.assertEqual(frontier._comparison_price(luno), 99_000.0)
         self.assertNotIn("BTC", frontier._reference_prices(normalized, cfg))
-        self.assertEqual(candidate["direction"], "watch_only")
+        self.assertEqual(candidate["direction"], "long_frontier_spot")
         self.assertEqual(candidate["suppression_reason"], "stale_fx_reference")
-        self.assertTrue(candidate["paper_entry_blocked"])
+        self.assertFalse(candidate["paper_entry_blocked"])
+        self.assertFalse(candidate["quote_ranking_eligible"])
+        self.assertFalse(ranked[0]["paper_active_scoring_eligible"])
+        self.assertEqual("stale_fx_reference", ranked[0]["paper_fx_ranking_reason"])
+        self.assertEqual("stale_fx_reference_shadow_only", ranked[0]["paper_quality_filter_status"])
+        self.assertEqual(0.0, ranked[0]["paper_ranking_score"])
 
     def test_unmatched_quote_and_invalid_product_metadata_fail_closed(self) -> None:
         unmatched = self._obs("LOCAL", "BTC-XYZ", "BTC", "XYZ", 100_000.0, 1_000_000)

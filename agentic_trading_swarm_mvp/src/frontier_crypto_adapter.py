@@ -10055,6 +10055,13 @@ def _set_quote_suppression(output: dict, status: str, reason: str) -> None:
     output["suppression_reason"] = reason
 
 
+def _set_stale_fx_ranking_state(output: dict, reason: str = "stale_fx_reference") -> None:
+    output["quote_normalization_status"] = "stale_fx_reference"
+    output["suppression_reason"] = reason
+    output["quote_ranking_eligible"] = False
+    output["quote_ranking_reason"] = reason
+
+
 def _local_quote_normalization_telemetry(row: dict) -> dict:
     """Expose stable paper-only FX fields alongside legacy normalization data."""
     output = dict(row)
@@ -10160,6 +10167,8 @@ def _normalize_regional_quotes(
                 "suppression_reason": None,
                 "paper_only_quote_normalization": True,
                 "conversion_path_validated": False,
+                "quote_ranking_eligible": True,
+                "quote_ranking_reason": None,
                 "product_metadata_validated": bool(
                     base
                     and quote
@@ -10198,20 +10207,19 @@ def _normalize_regional_quotes(
                 output["quote_normalization_source"] = fx.get("instrument_id")
                 output["fx_source"] = fx.get("instrument_id")
                 output["fx_age_seconds"] = round(fx_age, 3) if fx_age is not None else None
-                if require_fresh_reference and (fx_age is None or fx_age > max_fx_age_seconds):
-                    _set_quote_suppression(output, "stale_fx_reference", "stale_fx_reference")
-                    normalized.append(output)
-                    continue
                 output["usd_normalized_last"] = round(last / fx_price, 12)
                 output["canonical_normalized_price"] = output["usd_normalized_last"]
                 output["canonical_quote_currency"] = "USD"
                 output["comparison_price"] = output["usd_normalized_last"]
-                output["quote_normalization_status"] = "same_venue_stablecoin_reference"
                 output["conversion_path_validated"] = True
                 output["local_quote_observe_only"] = base in STABLE_OR_FIAT_BASES
                 if output.get("quote_volume_24h") is not None:
                     output["local_quote_volume_24h"] = output.get("quote_volume_24h")
                     output["quote_volume_24h"] = round(float(output["quote_volume_24h"]) / fx_price, 3)
+                if require_fresh_reference and (fx_age is None or fx_age > max_fx_age_seconds):
+                    _set_stale_fx_ranking_state(output)
+                else:
+                    output["quote_normalization_status"] = "same_venue_stablecoin_reference"
             elif quote in fx_references and last > 0 and float(fx_references[quote].get("rate") or 0.0) > 0:
                 ref = fx_references[quote]
                 fx_price = float(ref["rate"])
@@ -10223,24 +10231,23 @@ def _normalize_regional_quotes(
                 output["fx_reference_provider"] = ref.get("provider")
                 output["fx_reference_age_seconds"] = output["fx_age_seconds"]
                 output["fx_reference_source_url"] = ref.get("source_url")
-                if require_fresh_reference and (
-                    bool(ref.get("stale"))
-                    or fx_age is None
-                    or float(fx_age) > max_fx_age_seconds
-                ):
-                    _set_quote_suppression(output, "stale_fx_reference", "stale_fx_reference")
-                    normalized.append(output)
-                    continue
                 output["usd_normalized_last"] = round(last / fx_price, 12)
                 output["canonical_normalized_price"] = output["usd_normalized_last"]
                 output["canonical_quote_currency"] = "USD"
                 output["comparison_price"] = output["usd_normalized_last"]
-                output["quote_normalization_status"] = "external_fx_reference"
                 output["conversion_path_validated"] = True
                 output["local_quote_observe_only"] = base in STABLE_OR_FIAT_BASES
                 if output.get("quote_volume_24h") is not None:
                     output["local_quote_volume_24h"] = output.get("quote_volume_24h")
                     output["quote_volume_24h"] = round(float(output["quote_volume_24h"]) / fx_price, 3)
+                if require_fresh_reference and (
+                    bool(ref.get("stale"))
+                    or fx_age is None
+                    or float(fx_age) > max_fx_age_seconds
+                ):
+                    _set_stale_fx_ranking_state(output)
+                else:
+                    output["quote_normalization_status"] = "external_fx_reference"
             else:
                 output["quote_normalization_source"] = None
                 _set_quote_suppression(
@@ -10398,6 +10405,8 @@ def _reference_prices(observations: list[dict], settings: dict) -> dict[str, flo
             continue
         if row.get("local_quote_observe_only"):
             continue
+        if not bool(row.get("quote_ranking_eligible", True)):
+            continue
         key = row.get("comparison_key")
         last = _comparison_price(row)
         if not key or last <= 0:
@@ -10427,6 +10436,8 @@ def _variant_reference(
         if row.get("data_status") != "reachable" or row.get("market_type") != "spot":
             continue
         if row.get("local_quote_observe_only"):
+            continue
+        if not bool(row.get("quote_ranking_eligible", True)):
             continue
         row_key = (
             (row.get("base"), row.get("quote"))
@@ -11643,6 +11654,20 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
                 paper_ranking_score,
                 as_float(frontier_paper_admission.get("score_cap"), 59.999) or 59.999,
             )
+        quote_ranking_eligible = bool(candidate.get("quote_ranking_eligible", True))
+        if not quote_ranking_eligible:
+            paper_ranking_score = 0.0
+            candidate["paper_active_scoring_eligible"] = False
+            candidate["paper_fx_shadow_label"] = True
+            candidate["paper_ineligible"] = True
+            candidate["paper_ineligible_reason"] = (
+                candidate.get("quote_ranking_reason")
+                or candidate.get("paper_ineligible_reason")
+                or "stale_fx_reference"
+            )
+            candidate["paper_fx_ranking_reason"] = (
+                candidate.get("quote_ranking_reason") or "stale_fx_reference"
+            )
         candidate["paper_ranking_score"] = paper_ranking_score
         candidate["paper_ranking_edge_bps"] = round(ranking_edge, 6) if ranking_edge is not None else None
         candidate["paper_ranking_edge_source"] = ranking_edge_source
@@ -11656,6 +11681,8 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         candidate["paper_quality_filter_status"] = (
             "route_feasibility_shadow_only"
             if route_feasibility_gate.get("shadow_label", False)
+            else "stale_fx_reference_shadow_only"
+            if not quote_ranking_eligible
             else "ranked_not_blocked"
             if paper_only_active
             else "paper_only_ranking_inactive"
@@ -11669,7 +11696,11 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         )
     ranked = sorted(
         candidates,
-        key=lambda row: (float(row.get("paper_ranking_score") or 0.0), float(row.get("score") or 0.0)),
+        key=lambda row: (
+            bool(row.get("paper_active_scoring_eligible", True)),
+            float(row.get("paper_ranking_score") or 0.0),
+            float(row.get("score") or 0.0),
+        ),
         reverse=True,
     )
     for rank, candidate in enumerate(ranked, start=1):
@@ -12675,6 +12706,8 @@ def _candidate_from_observation(
         "product_metadata_validated": bool(observation.get("product_metadata_validated")),
         "conversion_path_validated": bool(observation.get("conversion_path_validated")),
         "paper_only_quote_normalization": bool(observation.get("paper_only_quote_normalization")),
+        "quote_ranking_eligible": bool(observation.get("quote_ranking_eligible", True)),
+        "quote_ranking_reason": observation.get("quote_ranking_reason"),
         "fx_reference_rate": observation.get("fx_reference_rate"),
         "fx_reference_provider": observation.get("fx_reference_provider"),
         "fx_reference_age_seconds": observation.get("fx_reference_age_seconds"),
