@@ -768,6 +768,19 @@ def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str,
             "missing_permissions": sorted(alternative_missing),
         }
 
+    route_feasibility_reason = (
+        candidate.get("route_feasibility_reason")
+        or (candidate.get("frontier_short_spot_route_intelligence") or {}).get("route_feasibility_reason")
+        or (candidate.get("frontier_short_spot_route_requirements_report") or {}).get("route_feasibility_reason")
+        or (candidate.get("paper_route_requirement_report") or {}).get("route_feasibility_reason")
+        or (candidate.get("route_requirement_summary") or {}).get("route_feasibility_reason")
+    )
+    paper_active_scoring_eligible = _as_bool(candidate.get("paper_active_scoring_eligible"), True)
+    paper_route_feasibility_shadow_label = _as_bool(
+        candidate.get("paper_route_feasibility_shadow_label"),
+        False,
+    )
+
     return {
         "paper_route_status": paper_route_status,
         "execution_semantics": execution_semantics,
@@ -782,11 +795,80 @@ def frontier_route_feasibility_record(candidate: Mapping[str, Any]) -> dict[str,
         "direct_route_status": direct_status or "unknown",
         "alternative_status": alternative_status or None,
         "proxy_route": proxy_route,
+        "route_feasibility_reason": route_feasibility_reason,
+        "paper_active_scoring_eligible": paper_active_scoring_eligible,
+        "paper_route_feasibility_shadow_label": paper_route_feasibility_shadow_label,
     }
 
 
-def _apply_route_feasibility_metadata(candidate: Mapping[str, Any]) -> dict[str, Any]:
+def _frontier_conditional_short_route_feasibility_gate(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    if (
+        not frontier_route_feasibility_guard_enabled(config)
+        or not is_frontier_crypto_candidate(candidate)
+        or not _is_short_frontier_spot(candidate)
+    ):
+        return None
+    profile = config if isinstance(config, Mapping) else {}
+    if (
+        str(profile.get("mode", "paper")).strip().lower() != "paper"
+        or _as_bool(profile.get("allow_live_trading"), False)
+    ):
+        return None
+    try:
+        from frontier_crypto_adapter import paper_only_conditional_short_route_feasibility_gate
+    except ImportError:  # pragma: no cover - package import fallback
+        try:
+            from src.frontier_crypto_adapter import paper_only_conditional_short_route_feasibility_gate
+        except ImportError:
+            return None
+    gate = paper_only_conditional_short_route_feasibility_gate(
+        venue=str(candidate.get("venue") or ""),
+        direction=str(candidate.get("direction") or ""),
+        context_stats=dict(candidate),
+        enabled=True,
+    )
+    return dict(gate) if isinstance(gate, Mapping) else None
+
+
+def _annotate_frontier_route_feasibility_state(
+    candidate: dict[str, Any],
+    gate: Mapping[str, Any],
+) -> None:
+    reason = str(gate.get("route_feasibility_reason") or gate.get("reason") or "unknown")
+    active_scoring_eligible = _as_bool(gate.get("active_scoring_eligible"), True)
+    shadow_label = _as_bool(gate.get("shadow_label"), False)
+    candidate["route_feasibility_reason"] = reason
+    candidate["paper_active_scoring_eligible"] = active_scoring_eligible
+    candidate["paper_route_feasibility_shadow_label"] = shadow_label
+    if shadow_label:
+        candidate["paper_route_feasibility_shadow_reason"] = reason
+
+    for field in (
+        "frontier_short_spot_route_intelligence",
+        "frontier_short_spot_route_requirements_report",
+        "paper_route_requirement_report",
+        "route_requirement_summary",
+    ):
+        packet = candidate.get(field)
+        if not isinstance(packet, Mapping):
+            continue
+        packet["route_feasibility_reason"] = reason
+        packet["paper_active_scoring_eligible"] = active_scoring_eligible
+        packet["paper_route_feasibility_shadow_label"] = shadow_label
+
+
+def _apply_route_feasibility_metadata(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any]:
     annotated = dict(candidate)
+    route_gate = _frontier_conditional_short_route_feasibility_gate(annotated, config)
+    if route_gate is not None:
+        annotated["frontier_conditional_short_route_feasibility_gate"] = route_gate
+        _annotate_frontier_route_feasibility_state(annotated, route_gate)
     record = frontier_route_feasibility_record(annotated)
     annotated["frontier_route_feasibility"] = record
     annotated["paper_route_status"] = record["paper_route_status"]
@@ -1411,6 +1493,28 @@ def frontier_shadow_filter_reason(
                     },
                 }
             )
+        elif (
+            route_record.get("route_feasibility_reason") not in (None, "", "not_applicable")
+            and not _as_bool(route_record.get("paper_active_scoring_eligible"), True)
+            and _as_bool(route_record.get("paper_route_feasibility_shadow_label"), False)
+        ):
+            return {
+                "reason": route_record.get("route_feasibility_reason"),
+                "paper_only": True,
+                "paper_fill_allowed": False,
+                "guard": "frontier_conditional_short_route_feasibility_shadow_guard",
+                "candidate": _candidate_reference(candidate),
+                "cell": _paper_signal_cell(candidate),
+                "route_feasibility": {
+                    "paper_route_status": route_record.get("paper_route_status"),
+                    "execution_semantics": route_record.get("execution_semantics"),
+                    "route_feasibility_reason": route_record.get("route_feasibility_reason"),
+                    "paper_active_scoring_eligible": route_record.get("paper_active_scoring_eligible"),
+                    "paper_route_feasibility_shadow_label": route_record.get(
+                        "paper_route_feasibility_shadow_label"
+                    ),
+                },
+            }
 
 
     if not checks:
@@ -1643,7 +1747,7 @@ def apply_frontier_paper_guard(
             guarded["emit_recommendation"] = False
             guarded["emit_route"] = False
     guarded = _apply_paper_route_eligibility_metadata(guarded) if route_guard_enabled else guarded
-    guarded = _apply_route_feasibility_metadata(guarded) if (
+    guarded = _apply_route_feasibility_metadata(guarded, config) if (
         is_frontier_crypto_candidate(guarded) and route_guard_enabled
     ) else guarded
     if isinstance(alignment_guard, Mapping) and alignment_guard.get("quarantine_status") == "shadow_quarantined":

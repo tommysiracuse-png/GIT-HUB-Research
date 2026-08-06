@@ -6380,6 +6380,27 @@ def _paper_only_is_conditional_short_context(direction: str, context_stats: dict
     return False
 
 
+def _paper_only_is_frontier_short_route_context(direction: str, context_stats: dict | None) -> bool:
+    normalized_direction = str(direction or "").strip().lower()
+    if normalized_direction == "short_frontier_spot":
+        return True
+
+    stats = context_stats or {}
+    descriptors = " ".join(
+        str(stats.get(field) or "")
+        for field in (
+            "trade_type",
+            "signal_family",
+            "market_surface",
+            "strategy",
+            "strategy_id",
+            "context_key",
+            "signal_key",
+        )
+    ).lower()
+    return "frontier_crypto_venue_map" in descriptors and "short" in normalized_direction
+
+
 def _paper_only_frontier_short_route_feasibility_reason(
     *,
     venue: str,
@@ -6475,6 +6496,7 @@ def _paper_only_frontier_short_route_feasibility_reason(
         if explicit_borrow_ok:
             break
 
+    frontier_short_route = _paper_only_is_frontier_short_route_context(direction, stats)
     verified_standard_route = bool(
         route_status in {"standard", "executable", "feasible", "supported"}
         or registry_status == "supported"
@@ -6505,8 +6527,8 @@ def _paper_only_frontier_short_route_feasibility_reason(
         active_scoring_eligible = False
     else:
         reason = "conditional_short_support_unknown"
-        shadow_label = False
-        active_scoring_eligible = True
+        shadow_label = frontier_short_route
+        active_scoring_eligible = not frontier_short_route
     return {
         "applies": True,
         "route_feasibility_reason": reason,
@@ -6578,7 +6600,10 @@ def paper_only_conditional_short_route_feasibility_gate(
     score_multiplier = 1.0
     if route_review.get("shadow_label", False):
         reasons.append(str(route_review.get("route_feasibility_reason") or "conditional_short_exact_route_unsupported"))
-        if str(route_review.get("route_registry_status") or "").strip().lower() == "unsupported":
+        route_reason = str(route_review.get("route_feasibility_reason") or "").strip().lower()
+        if route_reason == "conditional_short_support_unknown":
+            score_multiplier *= max(0.0, min(1.0, float(merged_policy.get("unknown_multiplier", 0.75) or 0.75)))
+        elif str(route_review.get("route_registry_status") or "").strip().lower() == "unsupported":
             score_multiplier *= max(
                 0.0,
                 min(1.0, float(merged_policy.get("exact_unsupported_multiplier", 0.15) or 0.15)),

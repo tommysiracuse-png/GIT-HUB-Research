@@ -52,11 +52,12 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
     def test_score_adjustment_reports_unknown_route_penalty_without_full_suppression(self):
         adjustment = paper_only_frontier_score_adjustment(
             venue="BITSO",
-            direction="short",
+            direction="short_frontier_spot",
             context_stats={
                 "closed_trade_count": 10,
                 "recent_expectancy_bps": 6.0,
                 "conditional": True,
+                "trade_type": "frontier_crypto_venue_map",
                 "context_key": "feasibility:conditional",
                 "cross_market_divergence_bps": 2.0,
                 "cross_market_trigger_bps": 1.0,
@@ -64,7 +65,7 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
                 "source_b_freshness_ms": 25.0,
             },
             registry={
-                "BITSO_SHORT": {
+                "BITSO_SHORT_FRONTIER_SPOT": {
                     "enabled": True,
                     "min_closed_trades": 1,
                     "min_expectancy_bps": -999.0,
@@ -81,15 +82,16 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
             adjustment["route_feasibility_gate"]["route_requirements"]["support_status"],
             "unknown",
         )
+        self.assertFalse(adjustment["active_scoring_eligible"])
+        self.assertTrue(adjustment["route_feasibility_gate"]["shadow_label"])
         self.assertEqual(
             adjustment["route_feasibility_gate"]["reason"],
-            "unknown_spot_short_support",
+            "conditional_short_support_unknown",
         )
         self.assertEqual(
             adjustment["route_feasibility_reason"],
             "conditional_short_support_unknown",
         )
-        self.assertTrue(adjustment["active_scoring_eligible"])
 
     def test_non_conditional_short_context_is_neutral(self):
         gate = paper_only_conditional_short_route_feasibility_gate(

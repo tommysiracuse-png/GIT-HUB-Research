@@ -191,6 +191,29 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(record["paper_route_status"], "executable")
         self.assertFalse(record["paper_proxy_used"])
 
+    def test_unverified_conditional_frontier_short_is_shadowed_with_route_reason(self):
+        candidate = _candidate(
+            venue="BITSO",
+            trade_type="frontier_crypto_venue_map",
+            quality_action="verified",
+            execution_feasibility={"status": "conditional", "route_status": "conditional"},
+        )
+
+        guarded = apply_frontier_paper_guard(candidate)
+
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("conditional_short_support_unknown", guarded["candidate_reject_reason"])
+        self.assertEqual("conditional_short_support_unknown", guarded["route_feasibility_reason"])
+        self.assertFalse(guarded["paper_active_scoring_eligible"])
+        self.assertTrue(guarded["paper_route_feasibility_shadow_label"])
+        self.assertEqual(
+            "conditional_short_support_unknown",
+            guarded["frontier_route_feasibility"]["route_feasibility_reason"],
+        )
+        self.assertFalse(
+            guarded["frontier_route_feasibility"]["paper_active_scoring_eligible"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
