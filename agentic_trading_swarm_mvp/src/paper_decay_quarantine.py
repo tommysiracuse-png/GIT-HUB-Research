@@ -7,20 +7,23 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from paper_exploration import exploration_enabled
-
-
 POLICY_KEY = "okx_perp_funding_basis_decay_quarantine"
 REASON = "decayed_basis_mean_reversion_quarantine"
 REASON_ALIASES = frozenset({REASON, "decay_quarantine"})
 DEFAULT_CLOSED_LABEL_LIMIT = 100
 DEFAULT_DURATION_DAYS = 14
 DEFAULT_MAX_LEARNED_PENALTY = 15.0
+DEFAULT_PAPER_SCORE_CAP = 20.0
+DEFAULT_MIN_CLOSED_COUNT = 20
+DEFAULT_MAX_AVG_PNL_BPS = -25.0
+DEFAULT_MAX_SCORE_ADJUSTMENT = -10.0
+DEFAULT_RELEASE_MIN_AVG_PNL_BPS = 10.0
 _LIVE_MODES = {"live", "production", "prod", "real", "broker"}
-_TARGET_DIRECTIONS = frozenset(
+_EXEMPT_DIRECTIONS = frozenset(
     {
-        "basis_mean_reversion_long_perp",
-        "basis_mean_reversion_short_perp",
+        "funding_capture_long_perp",
+        "funding_capture_short_perp",
+        "short_perp_long_spot",
     }
 )
 _EXACT_SIGNAL_ID_FIELDS = (
@@ -52,6 +55,11 @@ def _policy(settings: Mapping[str, Any] | bool | None) -> dict[str, Any]:
         "enabled": True,
         "closed_label_limit": DEFAULT_CLOSED_LABEL_LIMIT,
         "duration_days": DEFAULT_DURATION_DAYS,
+        "paper_score_cap": DEFAULT_PAPER_SCORE_CAP,
+        "min_closed_count": DEFAULT_MIN_CLOSED_COUNT,
+        "max_avg_pnl_bps": DEFAULT_MAX_AVG_PNL_BPS,
+        "max_score_adjustment": DEFAULT_MAX_SCORE_ADJUSTMENT,
+        "release_min_avg_pnl_bps": DEFAULT_RELEASE_MIN_AVG_PNL_BPS,
     }
     if isinstance(settings, bool):
         policy["enabled"] = settings
@@ -81,6 +89,26 @@ def _policy(settings: Mapping[str, Any] | bool | None) -> dict[str, Any]:
         policy["duration_days"] = max(1, int(policy.get("duration_days", DEFAULT_DURATION_DAYS)))
     except (TypeError, ValueError):
         policy["duration_days"] = DEFAULT_DURATION_DAYS
+    policy["paper_score_cap"] = round(
+        max(0.0, _as_float(policy.get("paper_score_cap"), DEFAULT_PAPER_SCORE_CAP)),
+        3,
+    )
+    try:
+        policy["min_closed_count"] = max(1, int(policy.get("min_closed_count", DEFAULT_MIN_CLOSED_COUNT)))
+    except (TypeError, ValueError):
+        policy["min_closed_count"] = DEFAULT_MIN_CLOSED_COUNT
+    policy["max_avg_pnl_bps"] = round(
+        _as_float(policy.get("max_avg_pnl_bps"), DEFAULT_MAX_AVG_PNL_BPS),
+        3,
+    )
+    policy["max_score_adjustment"] = round(
+        _as_float(policy.get("max_score_adjustment"), DEFAULT_MAX_SCORE_ADJUSTMENT),
+        3,
+    )
+    policy["release_min_avg_pnl_bps"] = round(
+        _as_float(policy.get("release_min_avg_pnl_bps"), DEFAULT_RELEASE_MIN_AVG_PNL_BPS),
+        3,
+    )
     return policy
 
 
@@ -120,7 +148,7 @@ def apply_score_policy(
     zero_score: bool,
 ) -> dict[str, Any]:
     existing = candidate.get("okx_basis_decay_quarantine_score_policy")
-    desired_mode = "zero_cap" if zero_score else "max_learned_penalty"
+    desired_mode = "zero_cap" if zero_score else "paper_score_cap"
     if (
         isinstance(existing, Mapping)
         and matches_reason(existing.get("reason"))
@@ -154,15 +182,15 @@ def apply_score_policy(
             "max_learned_penalty": maximum_learned_penalty(settings),
         }
     else:
-        penalty = maximum_learned_penalty(settings)
-        post_score = max(0.0, pre_score - penalty)
+        score_cap = _policy(settings).get("paper_score_cap", DEFAULT_PAPER_SCORE_CAP)
+        post_score = min(pre_score, _as_float(score_cap, DEFAULT_PAPER_SCORE_CAP))
         policy = {
             "reason": REASON,
-            "mode": "max_learned_penalty",
+            "mode": "paper_score_cap",
             "pre_quarantine_score": round(pre_score, 3),
             "post_quarantine_score": round(post_score, 3),
             "score_delta": round(post_score - pre_score, 3),
-            "max_learned_penalty": round(penalty, 3),
+            "paper_score_cap": round(_as_float(score_cap, DEFAULT_PAPER_SCORE_CAP), 3),
         }
     candidate["pre_okx_basis_decay_quarantine_score"] = round(pre_score, 3)
     candidate["score"] = round(post_score, 3)
@@ -214,15 +242,30 @@ def clear_quarantine_state(
 
     if candidate.get("paper_action") == "shadow_trial":
         candidate.pop("paper_action", None)
+    if candidate.get("paper_action") == "shadow_only":
+        candidate.pop("paper_action", None)
     if candidate.get("paper_quarantine_status") == "shadow_quarantined":
+        candidate.pop("paper_quarantine_status", None)
+    if candidate.get("paper_quarantine_status") == "shadow_only":
         candidate.pop("paper_quarantine_status", None)
     if candidate.get("candidate_status") == "shadow_quarantined":
         candidate.pop("candidate_status", None)
+    if candidate.get("candidate_status") == "shadow_only":
+        candidate.pop("candidate_status", None)
+    if candidate.get("paper_status") == "shadow_only":
+        candidate.pop("paper_status", None)
+    if candidate.get("paper_fill_status") == "shadow_only":
+        candidate.pop("paper_fill_status", None)
+    if candidate.get("paper_order_status") == "shadow_only":
+        candidate.pop("paper_order_status", None)
+    if candidate.get("quality_action") == "shadow_only":
+        candidate.pop("quality_action", None)
 
     candidate.pop("shadow_filtered", None)
     candidate["paper_fill_allowed"] = True
     candidate["paper_eligible"] = True
     candidate["paper_entry_blocked"] = False
+    candidate["paper_observation_only"] = False
     return candidate
 
 
@@ -267,7 +310,7 @@ def _parse_exact_target_signal(raw_value: object) -> dict[str, str] | None:
     status = parts[3].strip().lower() or "unknown"
     if venue != "OKX" or trade_type != "perp_funding_basis":
         return None
-    if direction not in _TARGET_DIRECTIONS:
+    if not direction or direction in _EXEMPT_DIRECTIONS:
         return None
     return {
         "venue": venue,
@@ -309,7 +352,7 @@ def target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
         status = parts[3].strip().lower()
     if venue != "OKX" or trade_type != "perp_funding_basis":
         return None
-    if direction not in _TARGET_DIRECTIONS:
+    if not direction or direction in _EXEMPT_DIRECTIONS:
         return None
     return {
         "venue": venue,
@@ -318,6 +361,123 @@ def target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
         "feasibility_status": status,
         "signal_key": f"{venue}|{trade_type}|{direction}|{status}",
     }
+
+
+def _thresholds(policy: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "min_closed_count": int(policy.get("min_closed_count", DEFAULT_MIN_CLOSED_COUNT)),
+        "max_avg_pnl_bps": round(
+            _as_float(policy.get("max_avg_pnl_bps"), DEFAULT_MAX_AVG_PNL_BPS),
+            3,
+        ),
+        "max_score_adjustment": round(
+            _as_float(policy.get("max_score_adjustment"), DEFAULT_MAX_SCORE_ADJUSTMENT),
+            3,
+        ),
+        "paper_score_cap": round(
+            _as_float(policy.get("paper_score_cap"), DEFAULT_PAPER_SCORE_CAP),
+            3,
+        ),
+        "release_min_avg_pnl_bps": round(
+            _as_float(policy.get("release_min_avg_pnl_bps"), DEFAULT_RELEASE_MIN_AVG_PNL_BPS),
+            3,
+        ),
+    }
+
+
+def _normalize_signal_stats(value: Mapping[str, Any] | None, *, expected_signal_key: str) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    signal_key_value = str(
+        value.get("signal_key")
+        or value.get("source_signal_key")
+        or value.get("target_signal_key")
+        or expected_signal_key
+    ).strip()
+    if signal_key_value != expected_signal_key:
+        return None
+    closed_count = int(max(0, _as_float(value.get("closed_count"), 0.0)))
+    return {
+        "signal_key": signal_key_value,
+        "closed_count": closed_count,
+        "avg_pnl_bps": round(_as_float(value.get("avg_pnl_bps"), 0.0), 3),
+        "score_adjustment": round(_as_float(value.get("score_adjustment"), 0.0), 3),
+        "win_rate": round(_as_float(value.get("win_rate"), 0.0), 6),
+        "updated_at": value.get("updated_at"),
+    }
+
+
+def _candidate_signal_stats(candidate: Mapping[str, Any], *, expected_signal_key: str) -> dict[str, Any] | None:
+    for field in (
+        "paper_okx_basis_decay_signal_stats",
+        "okx_basis_decay_signal_stats",
+        "target_signal_stats",
+        "signal_stats",
+    ):
+        normalized = _normalize_signal_stats(candidate.get(field), expected_signal_key=expected_signal_key)
+        if normalized is not None:
+            return normalized
+    existing = candidate.get("paper_okx_basis_decay_quarantine")
+    if isinstance(existing, Mapping):
+        normalized = _normalize_signal_stats(existing.get("signal_stats"), expected_signal_key=expected_signal_key)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _load_signal_stats(conn: Any | None, *, expected_signal_key: str) -> dict[str, Any] | None:
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            """
+            select signal_key, closed_count, avg_pnl_bps, win_rate, score_adjustment, updated_at
+            from signal_stats
+            where signal_key = ?
+            """,
+            (expected_signal_key,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - missing optional runtime evidence disables this guard
+        return None
+    if row is None:
+        return None
+    try:
+        raw = dict(row)
+    except (TypeError, ValueError):
+        raw = {
+            "signal_key": row[0],
+            "closed_count": row[1],
+            "avg_pnl_bps": row[2],
+            "win_rate": row[3],
+            "score_adjustment": row[4],
+            "updated_at": row[5],
+        }
+    return _normalize_signal_stats(raw, expected_signal_key=expected_signal_key)
+
+
+def _matching_signal_stats(
+    candidate: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    conn: Any | None,
+    *,
+    expected_signal_key: str,
+) -> dict[str, Any] | None:
+    stats = _candidate_signal_stats(candidate, expected_signal_key=expected_signal_key)
+    if stats is None:
+        stats = _load_signal_stats(conn, expected_signal_key=expected_signal_key)
+    if stats is None:
+        return None
+    thresholds = _thresholds(policy)
+    if (
+        int(stats.get("closed_count") or 0) < int(thresholds["min_closed_count"])
+        or _as_float(stats.get("avg_pnl_bps"), 0.0) > _as_float(thresholds["max_avg_pnl_bps"], DEFAULT_MAX_AVG_PNL_BPS)
+        or _as_float(stats.get("score_adjustment"), 0.0) > _as_float(
+            thresholds["max_score_adjustment"],
+            DEFAULT_MAX_SCORE_ADJUSTMENT,
+        )
+    ):
+        return None
+    return stats
 
 
 def _parse_time(value: object) -> dt.datetime | None:
@@ -431,20 +591,31 @@ def quarantine_record(
     policy = _policy(settings)
     if target is None or not policy["enabled"] or not _paper_context(settings):
         return None
+    signal_stats = _matching_signal_stats(
+        candidate,
+        policy,
+        conn,
+        expected_signal_key=target["signal_key"],
+    )
+    if signal_stats is None:
+        return None
     existing = candidate.get("paper_okx_basis_decay_quarantine")
     if conn is None and isinstance(existing, Mapping):
         if not existing.get("active"):
             return None
         record = dict(existing)
-        diagnostic_only = exploration_enabled(settings if isinstance(settings, Mapping) else None)
         record.update(
             {
-                "diagnostic_only": diagnostic_only,
+                "diagnostic_only": True,
                 "would_block": True,
-                "paper_fill_allowed": diagnostic_only,
-                "quarantine_action": (
-                    "would_block_diagnostic" if diagnostic_only else "shadow_trial_observe_only"
-                ),
+                "paper_fill_allowed": False,
+                "shadow_only": True,
+                "quarantine_action": "shadow_only_counterfactual",
+                "signal_stats_scope": "synthetic_research",
+                "paper_execution_mode": "observe_only",
+                "paper_execution_semantics": "counterfactual_okx_basis_decay_guard",
+                "signal_stats": signal_stats,
+                "thresholds": _thresholds(policy),
             }
         )
         return record
@@ -473,7 +644,15 @@ def quarantine_record(
     expires_at = _parse_time(state.get("expires_at"))
     release_reason = None
     if state.get("status") == "active":
-        if state["closed_label_count"] >= int(state["closed_label_limit"]):
+        if (
+            int(signal_stats.get("closed_count") or 0) >= int(policy["min_closed_count"])
+            and _as_float(signal_stats.get("avg_pnl_bps"), 0.0) > _as_float(
+                policy.get("release_min_avg_pnl_bps"),
+                DEFAULT_RELEASE_MIN_AVG_PNL_BPS,
+            )
+        ):
+            release_reason = "reliable_signal_stats_recovered"
+        elif state["closed_label_count"] >= int(state["closed_label_limit"]):
             release_reason = "closed_label_limit_reached"
         elif expires_at is not None and now >= expires_at:
             release_reason = "duration_elapsed"
@@ -483,9 +662,7 @@ def quarantine_record(
     state["updated_at"] = now.isoformat()
     _persist_state(conn, state)
     active = state.get("status") == "active"
-    diagnostic_only = bool(
-        active and exploration_enabled(settings if isinstance(settings, Mapping) else None)
-    )
+    diagnostic_only = bool(active)
     return {
         "reason": REASON,
         "guard": POLICY_KEY,
@@ -493,11 +670,10 @@ def quarantine_record(
         "active": active,
         "diagnostic_only": diagnostic_only,
         "would_block": active,
-        "paper_fill_allowed": not active or diagnostic_only,
+        "paper_fill_allowed": not active,
+        "shadow_only": active,
         "quarantine_action": (
-            "would_block_diagnostic"
-            if diagnostic_only
-            else "shadow_trial_observe_only"
+            "shadow_only_counterfactual"
             if active
             else "released"
         ),
@@ -510,6 +686,12 @@ def quarantine_record(
         "avg_pnl_bps": label_statistics["avg_pnl_bps"],
         "win_rate": label_statistics["win_rate"],
         "max_learned_penalty": round(maximum_learned_penalty(settings), 3),
+        "paper_score_cap": round(_as_float(policy.get("paper_score_cap"), DEFAULT_PAPER_SCORE_CAP), 3),
+        "signal_stats": signal_stats,
+        "thresholds": _thresholds(policy),
+        "signal_stats_scope": "synthetic_research",
+        "paper_execution_mode": "observe_only",
+        "paper_execution_semantics": "counterfactual_okx_basis_decay_guard",
         "status": state["status"],
         "release_reason": state.get("release_reason"),
     }
@@ -520,7 +702,7 @@ def apply_quarantine(
     settings: Mapping[str, Any] | bool | None = None,
     conn: Any | None = None,
 ) -> dict[str, Any]:
-    """Annotate decay evidence without suppressing exploration-mode paper tests."""
+    """Convert decayed OKX basis variants into shadow-only paper diagnostics."""
     guarded = dict(candidate)
     record = quarantine_record(guarded, settings, conn=conn)
     if record is None:
@@ -529,46 +711,46 @@ def apply_quarantine(
     if not record["active"]:
         clear_quarantine_state(guarded)
         return guarded
-    if record.get("diagnostic_only"):
-        clear_quarantine_state(guarded)
-        apply_score_policy(guarded, settings, zero_score=False)
-        reasons = list(guarded.get("paper_exploration_would_block_reasons") or [])
-        reasons.append(REASON)
-        guarded["paper_exploration_would_block_reasons"] = list(dict.fromkeys(reasons))
-        guarded["paper_guard_would_block"] = {
-            "reason": REASON,
-            "guard": POLICY_KEY,
-            "record": dict(record),
-        }
-        guarded["candidate_status"] = "shadow_quarantined"
-        guarded["paper_quarantine_status"] = "shadow_quarantined"
-        guarded["promotion_eligible"] = False
-        guarded["_hunter_bucket"] = "diagnose"
-        if not guarded.get("paper_exploration_immutable_rejections") and not guarded.get(
-            "paper_experiment_capacity_deferred"
-        ):
-            guarded["shadow_filtered"] = False
-            guarded["paper_fill_allowed"] = True
-            guarded["paper_eligible"] = True
-            guarded["paper_entry_blocked"] = False
-            guarded.pop("candidate_reject_reason", None)
-            guarded.pop("candidate_reject_detail", None)
-        return guarded
-    apply_score_policy(guarded, settings, zero_score=True)
+    clear_quarantine_state(guarded)
+    score_policy = apply_score_policy(guarded, settings, zero_score=False)
+    reasons = list(guarded.get("paper_exploration_would_block_reasons") or [])
+    reasons.append(REASON)
+    guarded["paper_exploration_would_block_reasons"] = list(dict.fromkeys(reasons))
+    guarded["paper_guard_would_block"] = {
+        "reason": REASON,
+        "guard": POLICY_KEY,
+        "record": dict(record),
+    }
     guarded.update(
         {
             "shadow_filtered": True,
             "paper_fill_allowed": False,
             "paper_eligible": False,
-            "paper_action": "shadow_trial",
+            "paper_action": "shadow_only",
+            "paper_status": "shadow_only",
+            "paper_fill_status": "shadow_only",
+            "paper_order_status": "shadow_only",
             "paper_execution_mode": "observe_only",
             "paper_observation_only": True,
             "paper_observation_reason": REASON,
-            "candidate_status": "shadow_quarantined",
-            "paper_quarantine_status": "shadow_quarantined",
+            "paper_execution_semantics": str(
+                record.get("paper_execution_semantics") or "counterfactual_okx_basis_decay_guard"
+            ),
+            "signal_stats_scope": str(record.get("signal_stats_scope") or "synthetic_research"),
+            "candidate_status": "shadow_only",
+            "paper_quarantine_status": "shadow_only",
             "promotion_eligible": False,
+            "paper_entry_blocked": True,
+            "paper_score_eligible": False,
+            "paper_rank_eligible": True,
+            "paper_allocation_multiplier": 0.0,
+            "quality_action": "shadow_only",
             "candidate_reject_reason": REASON,
             "candidate_reject_detail": record,
+            "shadow_reason": REASON,
+            "_hunter_bucket": "diagnose",
+            "paper_okx_basis_decay_signal_stats": dict(record.get("signal_stats") or {}),
+            "okx_basis_decay_quarantine_score_policy": score_policy,
         }
     )
     return guarded

@@ -53,6 +53,11 @@ DEFAULT_SETTINGS = {
         "enabled": True,
         "closed_label_limit": 100,
         "duration_days": 14,
+        "paper_score_cap": 20.0,
+        "min_closed_count": 20,
+        "max_avg_pnl_bps": -25.0,
+        "max_score_adjustment": -10.0,
+        "release_min_avg_pnl_bps": 10.0,
     },
     "paper_context_drag": {
         "enabled": True,

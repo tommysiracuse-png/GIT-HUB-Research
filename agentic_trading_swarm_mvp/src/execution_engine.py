@@ -362,6 +362,37 @@ def _restore_yahoo_proxy_freshness_shadow(candidate: dict) -> dict:
     return restored
 
 
+def _restore_okx_basis_decay_shadow(candidate: dict) -> dict:
+    record = candidate.get("paper_okx_basis_decay_quarantine")
+    if not isinstance(record, dict):
+        return candidate
+    if not record.get("active") or record.get("paper_fill_allowed", True):
+        return candidate
+    restored = dict(candidate)
+    restored["shadow_filtered"] = True
+    restored["paper_fill_allowed"] = False
+    restored["paper_entry_blocked"] = True
+    restored["paper_observation_only"] = True
+    restored["paper_observation_reason"] = str(
+        record.get("reason") or "decayed_basis_mean_reversion_quarantine"
+    )
+    restored["paper_execution_mode"] = str(record.get("paper_execution_mode") or "observe_only")
+    restored["paper_execution_semantics"] = str(
+        record.get("paper_execution_semantics") or "counterfactual_okx_basis_decay_guard"
+    )
+    restored["signal_stats_scope"] = str(record.get("signal_stats_scope") or "synthetic_research")
+    restored["candidate_status"] = "shadow_only"
+    restored["paper_action"] = "shadow_only"
+    restored["paper_status"] = "shadow_only"
+    restored["paper_fill_status"] = "shadow_only"
+    restored["paper_order_status"] = "shadow_only"
+    restored["shadow_reason"] = str(record.get("reason") or "decayed_basis_mean_reversion_quarantine")
+    restored["candidate_reject_reason"] = restored["shadow_reason"]
+    restored["candidate_reject_detail"] = dict(record)
+    restored["_hunter_bucket"] = "diagnose"
+    return restored
+
+
 def _route_feasibility_shadow_recoverable_for_exploration(candidate: dict, settings: dict) -> bool:
     detail = candidate.get("candidate_reject_detail")
     if isinstance(detail, dict) and detail.get("guard") == "paper_route_feasibility_score_gate":
@@ -379,6 +410,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         # synthetic route and hide direct route blockers from the fill guard.
         candidate = apply_frontier_paper_admission_guard(candidate, settings)
         candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
+        candidate = _restore_okx_basis_decay_shadow(candidate)
     context_loss_quarantine = candidate.get("paper_context_loss_quarantine") or {}
     context_loss_quarantined = bool(
         isinstance(context_loss_quarantine, dict)
@@ -392,6 +424,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         # This explicit paper-only family exception survives exploration's
         # otherwise permissive synthetic-route preparation.
         candidate = apply_okx_basis_decay_quarantine(candidate, settings, conn=conn)
+        candidate = _restore_okx_basis_decay_shadow(candidate)
         if context_loss_quarantined:
             candidate["shadow_filtered"] = True
             candidate["paper_fill_allowed"] = False
@@ -402,10 +435,9 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             candidate["candidate_reject_detail"] = dict(context_loss_quarantine)
         elif (
             (candidate.get("paper_okx_basis_decay_quarantine") or {}).get("active")
-            and not (candidate.get("paper_okx_basis_decay_quarantine") or {}).get("diagnostic_only")
         ):
-            # Non-exploration quarantine semantics remain available for paper
-            # configurations that explicitly disable exploration mode.
+            # Preserve the paper-only shadow-only quarantine instead of
+            # resetting it back into a fillable exploration candidate.
             pass
         elif candidate.get("paper_experiment_capacity_deferred"):
             # A scanner can defer an otherwise valid priceable idea when the
@@ -420,19 +452,23 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             candidate["paper_fill_allowed"] = True
             candidate["paper_entry_blocked"] = False
         candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
+        candidate = _restore_okx_basis_decay_shadow(candidate)
         candidate = apply_frontier_paper_admission_guard(candidate, settings)
         candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
+        candidate = _restore_okx_basis_decay_shadow(candidate)
         if not candidate.get("shadow_filtered") and not recoverable_route_shadow:
             # Exploration can substitute a synthetic route, but the fill-time
             # frontier net-edge guard still decides whether a paper order is
             # worth turning into a fill versus a shadow observation.
             candidate = apply_frontier_paper_guard(candidate, settings)
             candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
+            candidate = _restore_okx_basis_decay_shadow(candidate)
     else:
         # Apply the persisted paper-only state before the router recomputes
         # its guard.  This lets a released quarantine re-admit the exact
         # family in non-exploration paper configurations as well.
         candidate = apply_okx_basis_decay_quarantine(dict(candidate), settings, conn=conn)
+        candidate = _restore_okx_basis_decay_shadow(candidate)
         existing_reject_detail = candidate.get("candidate_reject_detail") or {}
         scanner_shadow_preserved = (
             paper_mode
@@ -460,6 +496,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             candidate["paper_context_recovery_probe"] = True
             candidate["gating_reason"] = "bounded_paper_recovery_probe_below_cost_floor"
         candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
+        candidate = _restore_okx_basis_decay_shadow(candidate)
     if candidate.get("paper_nav_reference"):
         return _nav_reference_execution(candidate, settings)
     if candidate.get("paper_auction_reference"):
@@ -482,6 +519,33 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             )
             order["notes"].append(
                 "Yahoo proxy paper entry converted to a synthetic-research shadow observation; no paper fill was created."
+            )
+            order_id = save_execution_order(conn, order, candidate, review)
+            return {
+                "order_id": order_id,
+                "order": order,
+                "fills": [],
+                "fill_ids": [],
+                "paper_filled": False,
+                "paper_observation_ready": True,
+                "candidate": candidate,
+            }
+        okx_basis_decay_shadow = (
+            candidate.get("paper_observation_only")
+            and isinstance(candidate.get("paper_okx_basis_decay_quarantine"), dict)
+            and not candidate["paper_okx_basis_decay_quarantine"].get("paper_fill_allowed", True)
+        )
+        if okx_basis_decay_shadow:
+            order["status"] = "shadow_only"
+            order["shadow_filter"] = candidate.get("candidate_reject_detail")
+            order["shadow_reason"] = candidate.get("shadow_reason") or candidate.get("candidate_reject_reason")
+            order["signal_stats_scope"] = candidate.get("signal_stats_scope", "synthetic_research")
+            order["execution_semantics"] = candidate.get(
+                "paper_execution_semantics",
+                "counterfactual_okx_basis_decay_guard",
+            )
+            order["notes"].append(
+                "OKX basis candidate recorded as a synthetic-research shadow observation due to decayed paper performance."
             )
             order_id = save_execution_order(conn, order, candidate, review)
             return {

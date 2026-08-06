@@ -17,7 +17,7 @@ from typing import Any
 
 from paper_context_cost import realized_paper_cost_audit
 from paper_decay_quarantine import (
-    apply_score_policy as apply_okx_basis_decay_score_policy,
+    apply_quarantine as apply_okx_basis_decay_shadow_quarantine,
     clear_quarantine_state as clear_okx_basis_decay_quarantine_state,
     quarantine_record as okx_basis_decay_quarantine_record,
 )
@@ -5230,67 +5230,27 @@ def _apply_okx_basis_decay_quarantine(
     config: Mapping[str, Any] | bool | None = None,
     conn: Any | None = None,
 ) -> dict | None:
-    """Record exact-family decay; only hard-quarantine outside exploration mode."""
+    """Shadow exact decayed OKX basis variants using persisted signal stats."""
     record = okx_basis_decay_quarantine_record(candidate, settings=config, conn=conn)
     if record is None:
         return None
-    candidate["paper_okx_basis_decay_quarantine"] = dict(record)
+    guarded = apply_okx_basis_decay_shadow_quarantine(dict(candidate), config, conn=conn)
+    candidate.clear()
+    candidate.update(guarded)
+    record = candidate.get("paper_okx_basis_decay_quarantine") or {}
     if not record["active"]:
         clear_okx_basis_decay_quarantine_state(candidate)
         return None
     reliability = _annotate(
         candidate,
         profile="okx_basis_decay_quarantine",
-        action="decay_quarantine_shadow_trial",
+        action="decay_quarantine_shadow_only",
         reasons=[record["reason"]],
-        allocation_multiplier=0.0 if not record.get("diagnostic_only") else 1.0,
-        # Keep exploration-mode candidates priceable while still surfacing the
-        # exact-family quarantine and score penalty in the ranking pipeline.
+        allocation_multiplier=0.0,
         shadow_only=False,
     )
-    if record.get("diagnostic_only"):
-        clear_okx_basis_decay_quarantine_state(candidate)
-        score_policy = apply_okx_basis_decay_score_policy(candidate, config, zero_score=False)
-        reasons = list(candidate.get("paper_exploration_would_block_reasons") or [])
-        reasons.append(record["reason"])
-        candidate["paper_exploration_would_block_reasons"] = list(dict.fromkeys(reasons))
-        candidate["paper_guard_would_block"] = {
-            "reason": record["reason"],
-            "guard": record.get("guard"),
-            "record": dict(record),
-        }
-        candidate["candidate_status"] = "shadow_quarantined"
-        candidate["paper_quarantine_status"] = "shadow_quarantined"
-        candidate["paper_fill_allowed"] = True
-        candidate["paper_eligible"] = True
-        candidate["promotion_eligible"] = False
-        candidate["_hunter_bucket"] = "diagnose"
-        if not candidate.get("paper_exploration_immutable_rejections") and not candidate.get(
-            "paper_experiment_capacity_deferred"
-        ):
-            candidate["shadow_filtered"] = False
-            candidate["paper_entry_blocked"] = False
-            candidate.pop("candidate_reject_reason", None)
-            candidate.pop("candidate_reject_detail", None)
-        reliability["paper_okx_basis_decay_quarantine"] = dict(record)
-        reliability["okx_basis_decay_quarantine_score_policy"] = dict(score_policy)
-        _append_note(candidate, "paper_guard_would_block:okx_basis_decay_quarantine")
-        return reliability
-    score_policy = apply_okx_basis_decay_score_policy(candidate, config, zero_score=True)
-    candidate["candidate_status"] = "shadow_quarantined"
-    candidate["paper_fill_allowed"] = False
-    candidate["paper_eligible"] = False
-    candidate["paper_action"] = "shadow_trial"
-    candidate["paper_execution_mode"] = "observe_only"
-    candidate["paper_observation_only"] = True
-    candidate["paper_observation_reason"] = record["reason"]
-    candidate["paper_quarantine_status"] = "shadow_quarantined"
-    candidate["paper_score_multiplier"] = 0.0
-    candidate["paper_score_eligible"] = False
-    candidate["paper_rank_eligible"] = False
-    candidate["promotion_eligible"] = False
-    candidate["candidate_reject_reason"] = record["reason"]
-    candidate["candidate_reject_detail"] = dict(record)
+    score_policy = dict(candidate.get("okx_basis_decay_quarantine_score_policy") or {})
+    candidate["candidate_status"] = "shadow_only"
     reliability["paper_okx_basis_decay_quarantine"] = dict(record)
     reliability["okx_basis_decay_quarantine_score_policy"] = dict(score_policy)
     return reliability
@@ -5544,6 +5504,20 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         if isinstance(candidate.get("paper_okx_basis_decay_quarantine"), Mapping)
         and candidate["paper_okx_basis_decay_quarantine"].get("active")
     )
+    okx_basis_decay_signals = sorted(
+        {
+            str(
+                (
+                    (candidate.get("paper_okx_basis_decay_quarantine") or {}).get("target") or {}
+                ).get("signal_key")
+                or ""
+            )
+            for candidate in candidates
+            if isinstance(candidate.get("paper_okx_basis_decay_quarantine"), Mapping)
+            and candidate["paper_okx_basis_decay_quarantine"].get("active")
+        }
+        - {""}
+    )
     by_quality_failure = collections.Counter(
         reason
         for candidate in candidates
@@ -5573,6 +5547,8 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         "lineage_source_health_guard_count": lineage_source_health_guarded,
         "context_loss_quarantine_count": context_loss_quarantined,
         "okx_basis_decay_quarantine_count": okx_basis_decay_quarantined,
+        "okx_basis_decay_quarantine_reason": "decayed_basis_mean_reversion_quarantine",
+        "okx_basis_decay_quarantined_signals": okx_basis_decay_signals[:10],
         "by_quality_failure": dict(by_quality_failure),
         "route_feasibility_reason_counts": dict(route_feasibility_reason_counts),
         "route_feasibility_shadow_count": route_feasibility_shadow_count,

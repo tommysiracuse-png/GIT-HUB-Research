@@ -503,15 +503,24 @@ class StrategyReliabilityTests(unittest.TestCase):
             basis_bps=40.0,
             change_24h_pct=35.0,
             quality_score=None,
+            paper_okx_basis_decay_signal_stats={
+                "signal_key": "OKX|perp_funding_basis|basis_mean_reversion_short_perp|standard",
+                "closed_count": 21,
+                "avg_pnl_bps": -352.202,
+                "score_adjustment": -15.0,
+                "win_rate": 0.476,
+                "updated_at": "2026-08-06T00:00:00+00:00",
+            },
         )
 
         rows, _ = strategy_reliability.apply_strategy_reliability([candidate])
 
-        self.assertFalse(rows[0].get("paper_entry_blocked", False))
-        self.assertEqual(rows[0]["strategy_reliability_action"], "decay_quarantine_shadow_trial")
-        self.assertEqual(rows[0]["candidate_status"], "shadow_quarantined")
+        self.assertTrue(rows[0].get("paper_entry_blocked", False))
+        self.assertEqual(rows[0]["strategy_reliability_action"], "decay_quarantine_shadow_only")
+        self.assertEqual(rows[0]["candidate_status"], "shadow_only")
         self.assertEqual(rows[0]["candidate_reject_reason"], "decayed_basis_mean_reversion_quarantine")
-        self.assertEqual(rows[0]["score"], 0.0)
+        self.assertEqual(rows[0]["quality_action"], "shadow_only")
+        self.assertEqual(rows[0]["score"], 20.0)
 
     def test_yahoo_proxy_direction_family_is_quarantined_on_both_sides(self) -> None:
         short = base_candidate(

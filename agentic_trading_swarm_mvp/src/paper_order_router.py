@@ -1517,13 +1517,12 @@ def frontier_shadow_filter_reason(
     if (
         isinstance(decay_quarantine, Mapping)
         and decay_quarantine.get("active")
-        and not decay_quarantine.get("diagnostic_only")
     ):
         return {
             **dict(decay_quarantine),
             "reason": decay_quarantine.get("reason") or OKX_BASIS_DECAY_QUARANTINE_REASON,
             "paper_only": True,
-            "paper_fill_allowed": False,
+            "paper_fill_allowed": bool(decay_quarantine.get("paper_fill_allowed", False)),
             "guard": OKX_BASIS_DECAY_QUARANTINE_POLICY_KEY,
             "candidate": _candidate_reference(candidate),
             "cell": _paper_signal_cell(candidate),
@@ -1837,11 +1836,22 @@ def _annotate_shadow_filtered_candidate(
             FRONTIER_COST_SWALLOWED_SCORE_CAP,
         )
     if reason.get("guard") == OKX_BASIS_DECAY_QUARANTINE_POLICY_KEY:
-        guarded["paper_action"] = "shadow_trial"
+        guarded["paper_action"] = "shadow_only"
+        guarded["paper_status"] = "shadow_only"
+        guarded["paper_fill_status"] = "shadow_only"
+        guarded["paper_order_status"] = "shadow_only"
         guarded["router_action"] = "observe_only"
         guarded["paper_execution_mode"] = "observe_only"
         guarded["paper_observation_only"] = True
         guarded["paper_observation_reason"] = reason.get("reason") or OKX_BASIS_DECAY_QUARANTINE_REASON
+        guarded["paper_execution_semantics"] = str(
+            reason.get("paper_execution_semantics") or "counterfactual_okx_basis_decay_guard"
+        )
+        guarded["signal_stats_scope"] = str(reason.get("signal_stats_scope") or "synthetic_research")
+        guarded["candidate_status"] = "shadow_only"
+        guarded["paper_quarantine_status"] = "shadow_only"
+        guarded["paper_entry_blocked"] = True
+        guarded["promotion_eligible"] = False
     if reason.get("guard") == "paper_yahoo_proxy_freshness_shadow_gate":
         guarded["paper_action"] = "shadow_only"
         guarded["paper_status"] = "shadow_only"

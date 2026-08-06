@@ -1525,6 +1525,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "signal_redesign": _compact_signal_redesign(payload.get("signal_redesign", {})),
         "okx_signal_research": _compact_okx_signal_research(payload.get("okx_signal_research", {})),
         "strategy_reliability": _compact_strategy_reliability(payload.get("strategy_reliability", {})),
+        "paper_exploration": payload.get("paper_exploration", {}),
         "yahoo_counterfactual": payload.get("yahoo_counterfactual", {}),
         "strategy_lab": payload.get("strategy_lab") or strategy_lab_summary(conn),
         "strategy_implementation_owner": strategy_owner_summary(conn, limit=40),

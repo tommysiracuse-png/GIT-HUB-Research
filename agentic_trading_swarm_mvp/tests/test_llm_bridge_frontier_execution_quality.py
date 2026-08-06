@@ -57,7 +57,15 @@ class FrontierExecutionQualityPacketTests(unittest.TestCase):
                                 "direction": "short_perp_long_spot",
                                 "score": 58.0,
                             },
-                        ]
+                        ],
+                        "paper_exploration": {
+                            "okx_basis_decay_quarantine": {
+                                "reason": "decayed_basis_mean_reversion_quarantine",
+                                "current_cycle_signal_keys": [
+                                    "OKX|perp_funding_basis|basis_mean_reversion_short_perp|standard"
+                                ],
+                            }
+                        },
                     },
                     DEFAULT_SETTINGS,
                 )
@@ -76,6 +84,10 @@ class FrontierExecutionQualityPacketTests(unittest.TestCase):
         self.assertTrue(route_summaries["read_only"])
         self.assertEqual(2, route_summaries["candidate_count"])
         self.assertEqual(0.0, route_summaries["candidates"][0]["ranking_annotation"]["score_adjustment"])
+        self.assertEqual(
+            "decayed_basis_mean_reversion_quarantine",
+            packet["paper_exploration"]["okx_basis_decay_quarantine"]["reason"],
+        )
 
     def test_state_packet_exposes_frontier_gap_summary_to_market_scout(self):
         conn = sqlite3.connect(":memory:")

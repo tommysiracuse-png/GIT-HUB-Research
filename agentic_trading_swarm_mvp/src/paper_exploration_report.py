@@ -519,6 +519,7 @@ def build_paper_exploration_report(
     decay_quarantine = okx_basis_decay_quarantine_runtime_report(conn, settings)
     cycle_quarantined_count = 0
     cycle_would_have_filled_count = 0
+    cycle_signal_keys: list[str] = []
     for item in reviewed or []:
         candidate = (item or {}).get("candidate") or {}
         review = (item or {}).get("review") or {}
@@ -531,6 +532,9 @@ def build_paper_exploration_report(
         ):
             continue
         cycle_quarantined_count += 1
+        signal_key = str(((record.get("target") or {}).get("signal_key")) or "")
+        if signal_key:
+            cycle_signal_keys.append(signal_key)
         if (
             record.get("paper_fill_allowed")
             and str(review.get("decision") or "").strip()
@@ -541,6 +545,7 @@ def build_paper_exploration_report(
         **decay_quarantine,
         "current_cycle_quarantined_count": cycle_quarantined_count,
         "current_cycle_would_have_filled_count": cycle_would_have_filled_count,
+        "current_cycle_signal_keys": sorted(set(cycle_signal_keys)),
     }
     horizon = int(cfg.get("guard_value_horizon_minutes", 60))
     rows = conn.execute(
@@ -669,6 +674,9 @@ def build_paper_exploration_report(
             ),
             "okx_basis_decay_quarantine_current_cycle_would_have_filled_count": int(
                 decay_quarantine.get("current_cycle_would_have_filled_count") or 0
+            ),
+            "okx_basis_decay_quarantine_current_cycle_signal_count": len(
+                decay_quarantine.get("current_cycle_signal_keys") or []
             ),
             "frontier_short_diagnostic_count": int(frontier_short_diagnostics.get("frontier_short_count") or 0),
             "frontier_short_diagnostic_valid_outcome_count": int(
