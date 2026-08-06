@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
 import llm_swarm_runner
 from recommendation_schema import (
     finalize_cross_market_researcher_response,
+    finalize_red_team_response,
     finalize_recommendation_response,
 )
 
@@ -94,6 +95,15 @@ class RecommendationFinalizerTests(unittest.TestCase):
             with self.subTest(response=response):
                 with self.assertRaises(ValueError):
                     finalize_cross_market_researcher_response(json.dumps(response))
+
+    def test_red_team_schema_rejects_wrappers_and_extra_fields(self):
+        wrapped = f"Recommendation: {json.dumps(_payload())}"
+        extra_field = _payload(extra="not allowed")
+
+        for response in (wrapped, json.dumps(extra_field)):
+            with self.subTest(response=response[:60]):
+                with self.assertRaises(ValueError):
+                    finalize_red_team_response(response)
 
 
 class CrossMarketResearcherRetryTests(unittest.TestCase):
@@ -211,6 +221,77 @@ class CrossMarketResearcherRetryTests(unittest.TestCase):
         self.assertTrue(integrity["truncation_suspected"])
         self.assertTrue(integrity["token_limit_reached"])
         self.assertEqual(integrity["cutoff_assessment"], "token_limit_cutoff_suspected")
+
+
+class RedTeamStrictRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.agent = next(
+            agent
+            for agent in llm_swarm_runner.AGENTS
+            if agent["name"] == "red_team"
+        )
+        self.packet = {
+            "allowed_recommendation_actions": [
+                "propose_diagnostic_hypothesis",
+                "propose_code_change",
+            ],
+            "growth_experiments": [],
+        }
+
+    def test_invalid_action_retries_once_and_accepts_valid_retry(self):
+        invalid_action = json.dumps(
+            {
+                "action": "propose_code_change",
+                "priority": 82,
+                "title": "Repair the failure family",
+                "rationale": "The route should be fixed in code.",
+                "market_key": "paper.red_team",
+                "evidence": {"issue": "schema"},
+                "proposed_change": {"summary": "Open a build task."},
+            }
+        )
+        valid_retry = json.dumps(
+            {
+                "action": "propose_diagnostic_hypothesis",
+                "priority": 79,
+                "title": "Retry produced a diagnostic hypothesis",
+                "rationale": "The loss pattern still needs paper-only diagnosis.",
+                "market_key": "paper.red_team.okx",
+                "evidence": {"issue": "basis decay"},
+                "proposed_change": {"summary": "Measure decay versus route quality."},
+            }
+        )
+
+        with mock.patch.object(
+            llm_swarm_runner,
+            "complete",
+            side_effect=[_model_result(invalid_action), _model_result(valid_retry)],
+        ) as complete:
+            rec = llm_swarm_runner.run_agent(self.agent, self.packet, [])
+
+        self.assertEqual(complete.call_count, 2)
+        self.assertEqual(complete.call_args.kwargs["operation"], "llm_swarm_schema_retry")
+        self.assertEqual(rec["title"], "Retry produced a diagnostic hypothesis")
+        self.assertEqual(rec["retry_count"], 1)
+        self.assertEqual(rec["initial_parse_status"], "invalid_action")
+
+    def test_invalid_retry_becomes_red_team_schema_diagnostic(self):
+        wrapped = f"```json\n{json.dumps(_payload())}\n```"
+
+        with mock.patch.object(
+            llm_swarm_runner,
+            "complete",
+            side_effect=[_model_result(wrapped), _model_result(wrapped)],
+        ) as complete:
+            rec = llm_swarm_runner.run_agent(self.agent, self.packet, [])
+
+        self.assertEqual(complete.call_count, 2)
+        self.assertEqual(rec["action"], "propose_diagnostic_hypothesis")
+        self.assertEqual(rec["parse_status"], "schema_fallback")
+        self.assertTrue(rec["evidence"]["paper_only"])
+        self.assertIn("exactly one complete JSON object", rec["evidence"]["schema_violation"])
+        self.assertEqual(rec["evidence"]["raw_generation_metadata"]["retry"]["response_text"], wrapped)
+        self.assertEqual(rec["retry_count"], 1)
 
 
 if __name__ == "__main__":

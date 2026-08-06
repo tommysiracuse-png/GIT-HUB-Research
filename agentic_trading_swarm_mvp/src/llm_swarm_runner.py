@@ -37,8 +37,10 @@ from recommendation_schema import (
     REQUIRED_RECOMMENDATION_KEYS,
     cross_market_researcher_schema_fallback,
     finalize_cross_market_researcher_response,
+    finalize_red_team_response,
     finalize_recommendation_response,
     paper_only_no_action_fallback,
+    red_team_schema_fallback,
     validate_recommendation_object,
 )
 from settings import load_settings
@@ -887,6 +889,10 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
     )
     generation_attempts = {"initial": _generation_metadata(result)}
     rec = parse_recommendation(result.text, agent, packet)
+    strict_failure = _strict_contract_failure(agent, result.text)
+    if strict_failure is not None:
+        parse_status, reason = strict_failure
+        rec = _reject_recommendation(agent, result.text, parse_status, reason)
     _record_post_processor_output(generation_attempts["initial"], rec)
     if _should_retry_schema(
         rec,
@@ -906,13 +912,17 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
             structured_json=True,
         )
         retry_rec = parse_recommendation(retry.text, agent, packet)
+        strict_failure = _strict_contract_failure(agent, retry.text)
+        if strict_failure is not None:
+            parse_status, reason = strict_failure
+            retry_rec = _reject_recommendation(agent, retry.text, parse_status, reason)
         generation_attempts["retry"] = _generation_metadata(retry)
         _record_post_processor_output(generation_attempts["retry"], retry_rec)
         retry_rec["retry_count"] = 1
         retry_rec["initial_parse_status"] = rec.get("parse_status")
         result = retry
         rec = retry_rec
-    rec = _finalize_cross_market_recommendation(
+    rec = _finalize_strict_contract_recommendation(
         agent,
         rec,
         result.text,
@@ -1105,37 +1115,61 @@ def _finalize_agent_recommendation(
     return recommendation
 
 
-def _finalize_cross_market_recommendation(
+def _finalize_strict_contract_recommendation(
     agent: dict,
     recommendation: dict,
     raw_response: str,
     generation_attempts: dict[str, dict[str, Any]],
 ) -> dict:
-    """Apply the final strict schema gate for cross-market researcher output."""
-    if agent.get("name") != "cross_market_researcher":
+    """Apply final strict schema gates for agents with locked response contracts."""
+    name = agent.get("name")
+    if name == "cross_market_researcher":
+        try:
+            finalize_cross_market_researcher_response(raw_response)
+        except ValueError as exc:
+            fallback = cross_market_researcher_schema_fallback(
+                str(exc),
+                raw_generation_metadata=generation_attempts,
+            )
+            fallback.update(
+                {
+                    "agent_name": agent["name"],
+                    "parse_status": "schema_fallback",
+                    "terminal_failure_reason": "cross_market_response_schema_violation",
+                    "provenance": {
+                        "state_packet": str(STATE_JSON),
+                        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    },
+                }
+            )
+            for field in ("retry_count", "initial_parse_status"):
+                if field in recommendation:
+                    fallback[field] = recommendation[field]
+            return fallback
         return recommendation
-    try:
-        finalize_cross_market_researcher_response(raw_response)
-    except ValueError as exc:
-        fallback = cross_market_researcher_schema_fallback(
-            str(exc),
-            raw_generation_metadata=generation_attempts,
-        )
-        fallback.update(
-            {
-                "agent_name": agent["name"],
-                "parse_status": "schema_fallback",
-                "terminal_failure_reason": "cross_market_response_schema_violation",
-                "provenance": {
-                    "state_packet": str(STATE_JSON),
-                    "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                },
-            }
-        )
-        for field in ("retry_count", "initial_parse_status"):
-            if field in recommendation:
-                fallback[field] = recommendation[field]
-        return fallback
+    if name == "red_team":
+        try:
+            finalize_red_team_response(raw_response)
+        except ValueError as exc:
+            fallback = red_team_schema_fallback(
+                str(exc),
+                raw_generation_metadata=generation_attempts,
+            )
+            fallback.update(
+                {
+                    "agent_name": agent["name"],
+                    "parse_status": "schema_fallback",
+                    "terminal_failure_reason": "red_team_response_schema_violation",
+                    "provenance": {
+                        "state_packet": str(STATE_JSON),
+                        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    },
+                }
+            )
+            for field in ("retry_count", "initial_parse_status"):
+                if field in recommendation:
+                    fallback[field] = recommendation[field]
+            return fallback
     return recommendation
 
 
@@ -1265,6 +1299,44 @@ def _should_retry_schema(rec: dict, model: dict) -> bool:
     }
 
 
+def _strict_contract_failure(agent: dict, raw_response: str) -> tuple[str, str] | None:
+    """Return a parse status and reason when an agent's raw contract is violated."""
+    name = str(agent.get("name") or "")
+    if name not in {"cross_market_researcher", "red_team"}:
+        return None
+    try:
+        if name == "cross_market_researcher":
+            finalize_cross_market_researcher_response(raw_response)
+        else:
+            finalize_red_team_response(raw_response)
+        return None
+    except ValueError:
+        if _appears_truncated_json(raw_response):
+            return "truncated_json", "truncated_json"
+        try:
+            parsed = json.loads(raw_response)
+        except json.JSONDecodeError:
+            return "invalid_json", "extra_text_or_invalid_json"
+        if not isinstance(parsed, dict):
+            return "invalid_schema", "top_level_json_not_object"
+        missing = [key for key in REQUIRED_RECOMMENDATION_KEYS if key not in parsed]
+        if missing:
+            return "invalid_schema", f"missing_required_fields:{','.join(missing)}"
+        if name == "cross_market_researcher":
+            if parsed.get("action") not in CROSS_MARKET_RESEARCHER_ALLOWED_ACTIONS:
+                return "invalid_action", "action_not_allowed_for_cross_market_researcher"
+        else:
+            if parsed.get("action") not in {"no_action", "propose_diagnostic_hypothesis"}:
+                return "invalid_action", "action_not_allowed_for_red_team"
+            unexpected = [key for key in parsed if key not in REQUIRED_RECOMMENDATION_KEYS]
+            if unexpected:
+                return "invalid_schema", f"unexpected_fields:{','.join(sorted(unexpected))}"
+        priority = parsed.get("priority")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            return "invalid_schema", "priority_must_be_integer"
+        return "invalid_schema", "recommendation_schema_invalid"
+
+
 def _schema_retry_prompt(agent: dict, original_text: str) -> str:
     allowed_actions = list(agent.get("allowed_actions") or [agent.get("default_action")])
     allowed_actions = [str(action) for action in allowed_actions if action]
@@ -1275,6 +1347,20 @@ def _schema_retry_prompt(agent: dict, original_text: str) -> str:
             " If action is propose_strategy_lab_experiment, include strategy_lab_experiment with "
             "strategy_lab_id, version, experiment_type='market_strategy', hypothesis, source_surface, "
             "non-empty permitted_target_surface, strategy_logic, data_requirements, risk_gates, and promotion_rules."
+        )
+    if agent.get("name") == "red_team":
+        return (
+            "The previous red_team response was not a complete valid JSON recommendation. "
+            "Return exactly one JSON object and no prose. Use exactly these top-level keys: "
+            "action, priority, title, rationale, market_key, evidence, proposed_change. "
+            "action must be either \"no_action\" or \"propose_diagnostic_hypothesis\". "
+            "priority must be an integer 1-100. evidence and proposed_change must be JSON objects. "
+            "Use this exact schema-locked template shape:\n"
+            "{\"action\":\"propose_diagnostic_hypothesis\",\"priority\":50,\"title\":\"...\","
+            "\"rationale\":\"...\",\"market_key\":\"paper.red_team.<scope>\","
+            "\"evidence\":{\"issue\":\"...\"},\"proposed_change\":{\"summary\":\"...\"}}\n"
+            "No markdown, no commentary, no extra keys, no arrays at the top level. Keep it paper-only.\n\n"
+            f"Previous response preview:\n{(original_text or '')[:1200]}"
         )
     return (
         f"The previous {agent['name']} response was not a complete valid JSON recommendation. "

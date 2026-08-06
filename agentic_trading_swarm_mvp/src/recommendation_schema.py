@@ -24,6 +24,7 @@ REQUIRED_RECOMMENDATION_KEYS = (
 CROSS_MARKET_RESEARCHER_ALLOWED_ACTIONS = frozenset(
     {"no_action", "propose_diagnostic_hypothesis"}
 )
+RED_TEAM_ALLOWED_ACTIONS = frozenset({"no_action", "propose_diagnostic_hypothesis"})
 
 
 def _reject_non_json_constant(value: str) -> None:
@@ -119,10 +120,42 @@ def validate_cross_market_researcher_object(payload: Any) -> None:
         raise ValueError("cross-market recommendation priority must be an integer")
 
 
+def validate_red_team_object(payload: Any) -> None:
+    """Raise when a red-team recommendation violates the strict output contract."""
+    if not isinstance(payload, dict):
+        raise ValueError("red-team recommendation must be a JSON object")
+    missing = [key for key in REQUIRED_RECOMMENDATION_KEYS if key not in payload]
+    if missing:
+        raise ValueError(
+            "red-team recommendation missing required fields: " + ", ".join(missing)
+        )
+    unexpected = [key for key in payload if key not in REQUIRED_RECOMMENDATION_KEYS]
+    if unexpected:
+        raise ValueError(
+            "red-team recommendation contains unexpected fields: "
+            + ", ".join(sorted(unexpected))
+        )
+    if payload["action"] not in RED_TEAM_ALLOWED_ACTIONS:
+        raise ValueError("red-team recommendation action is not allowed")
+    if isinstance(payload["priority"], bool) or not isinstance(payload["priority"], int):
+        raise ValueError("red-team recommendation priority must be an integer")
+    if not isinstance(payload["evidence"], dict):
+        raise ValueError("red-team recommendation evidence must be a JSON object")
+    if not isinstance(payload["proposed_change"], dict):
+        raise ValueError("red-team recommendation proposed_change must be a JSON object")
+
+
 def finalize_cross_market_researcher_response(response: str | bytes | bytearray) -> dict[str, Any]:
     """Parse and validate one complete cross-market researcher response."""
     payload = finalize_recommendation_response(response)
     validate_cross_market_researcher_object(payload)
+    return payload
+
+
+def finalize_red_team_response(response: str | bytes | bytearray) -> dict[str, Any]:
+    """Parse and validate one complete red-team response."""
+    payload = finalize_recommendation_response(response)
+    validate_red_team_object(payload)
     return payload
 
 
@@ -148,6 +181,34 @@ def cross_market_researcher_schema_fallback(
         },
         "proposed_change": {
             "summary": "Repair the cross-market response schema and rerun the paper-only analysis.",
+            "paper_only": True,
+            "live_trading": "disabled",
+        },
+    }
+
+
+def red_team_schema_fallback(
+    validation_error: str,
+    *,
+    raw_generation_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a paper-only diagnostic recommendation after red-team schema failure."""
+    return {
+        "action": "propose_diagnostic_hypothesis",
+        "priority": 100,
+        "title": "Red-team response schema violation",
+        "rationale": (
+            "The generated red-team recommendation was not schema-valid, so the "
+            "response was converted into a paper-only diagnostic record."
+        ),
+        "market_key": "paper.red_team.schema_fallback",
+        "evidence": {
+            "schema_violation": validation_error,
+            "raw_generation_metadata": raw_generation_metadata,
+            "paper_only": True,
+        },
+        "proposed_change": {
+            "summary": "Repair the red-team response schema and rerun the paper-only diagnosis.",
             "paper_only": True,
             "live_trading": "disabled",
         },
