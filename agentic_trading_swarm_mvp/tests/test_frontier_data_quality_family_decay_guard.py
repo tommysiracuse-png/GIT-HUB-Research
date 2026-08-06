@@ -92,6 +92,23 @@ class PaperOnlyFamilyDecayGuardTests(unittest.TestCase):
         self.assertEqual("YAHOO_PROXY", review["market_key"])
         self.assertTrue(review["recovery_status"]["current_recovered"])
 
+    def test_source_signal_key_descendant_inherits_family_decay_guard(self):
+        review = _paper_only_family_decay_guard_review(
+            {
+                "market_key": "OKX_PERP|frontier_crypto_venue_map|long_frontier_perp|standard",
+                "source_signal_key": "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
+                "signal_family": "global_proxy_momentum",
+                "direction": "long_frontier_perp",
+                "execution_mode": "paper",
+            }
+        )
+
+        self.assertTrue(review["applies"])
+        self.assertTrue(review["blocked"])
+        self.assertEqual("YAHOO_PROXY", review["market_key"])
+        self.assertEqual("family_decay_suppressed", review["reason"])
+        self.assertEqual(["long", "short"], review["failed_legs"])
+
     def test_recovery_evidence_can_release_static_decay_snapshot(self):
         passing_window = {
             "sample_count": 12,

@@ -352,6 +352,19 @@ def _paper_only_family_decay_guard_review(record, config=None):
                     return value
         return None
 
+    def _lookup_values(*keys):
+        values = []
+        for container in _containers():
+            for key in keys:
+                value = container.get(key)
+                if value in (None, "", [], {}, ()):
+                    continue
+                if isinstance(value, (list, tuple, set)):
+                    values.extend(item for item in value if item not in (None, "", [], {}, ()))
+                else:
+                    values.append(value)
+        return values
+
     def _token(value):
         text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
         return text or None
@@ -451,19 +464,51 @@ def _paper_only_family_decay_guard_review(record, config=None):
     elif explicit_toggle is False:
         reason = "guard_disabled"
 
-    market_identity = str(_lookup("market_key", "signal_key", "source_market_key") or "").strip().upper() or None
+    market_identity_candidates = [
+        str(value).strip().upper()
+        for value in _lookup_values(
+            "source_signal_key",
+            "source_market_key",
+            "paper_family_key",
+            "strategy_family_key",
+            "family_key",
+            "signal_key",
+            "market_key",
+        )
+        if str(value).strip()
+    ]
+    matching_market_identity = next(
+        (
+            identity
+            for identity in market_identity_candidates
+            if _market_root(identity) == _PAPER_ONLY_FAMILY_DECAY_TARGET["market_key"]
+        ),
+        None,
+    )
+    market_identity = matching_market_identity or (market_identity_candidates[0] if market_identity_candidates else None)
     market_key = _market_root(market_identity)
-    strategy_family = _token(
-        _lookup(
+    strategy_family_candidates = [
+        _token(value)
+        for value in _lookup_values(
             "strategy_family",
             "candidate_family",
             "signal_family",
             "family",
             "feature_family",
         )
+    ]
+    strategy_family = next(
+        (
+            family
+            for family in strategy_family_candidates
+            if family == _PAPER_ONLY_FAMILY_DECAY_TARGET["strategy_family"]
+        ),
+        None,
     )
-    if strategy_family is None and market_identity and "GLOBAL_PROXY_MOMENTUM" in market_identity:
+    if strategy_family is None and any("GLOBAL_PROXY_MOMENTUM" in identity for identity in market_identity_candidates):
         strategy_family = _PAPER_ONLY_FAMILY_DECAY_TARGET["strategy_family"]
+    if strategy_family is None:
+        strategy_family = next((family for family in strategy_family_candidates if family), None)
     applies = (
         market_key == _PAPER_ONLY_FAMILY_DECAY_TARGET["market_key"]
         and strategy_family == _PAPER_ONLY_FAMILY_DECAY_TARGET["strategy_family"]

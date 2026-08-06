@@ -754,6 +754,34 @@ class StrategyReliabilityTests(unittest.TestCase):
             row["latest_family_paper"]["long_proxy_standard"]["evidence_source"],
         )
 
+    def test_yahoo_proxy_source_lineage_descendant_is_quarantined(self) -> None:
+        candidate = base_candidate(
+            venue="OKX",
+            inst_id="OKX:BTC-USDT-SWAP",
+            direction="long_frontier_perp",
+            trade_type="frontier_crypto_venue_map",
+            market_key="OKX_PERP|frontier_crypto_venue_map|long_frontier_perp|standard",
+            signal_family="global_proxy_momentum",
+            source_family="yahoo_proxy",
+            source_signal_key="YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
+            score=84.0,
+            quality_score=86.0,
+            execution_feasibility={"status": "standard", "route_status": "standard"},
+        )
+
+        rows, report = strategy_reliability.apply_strategy_reliability([candidate], {"mode": "paper"})
+
+        row = rows[0]
+        self.assertEqual("family_quarantine_shadow_only", row["strategy_reliability_action"])
+        self.assertFalse(row["paper_fill_allowed"])
+        self.assertTrue(row["paper_observation_only"])
+        self.assertEqual("synthetic_paper", row["paper_execution_mode"])
+        self.assertEqual(1, report["summary"]["family_quarantine_count"])
+        self.assertEqual(
+            "YAHOO_PROXY",
+            row["paper_strategy_quarantine"]["family_decay_guard_review"]["market_key"],
+        )
+
     def test_yahoo_proxy_transfer_diagnostic_tags_translated_okx_route(self) -> None:
         candidate = base_candidate(
             seen_at="2026-08-06T14:05:00+00:00",
