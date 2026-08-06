@@ -11384,6 +11384,32 @@ def _candidate_from_observation(
     return _apply_frontier_marketability_gate(candidate, observation, settings, reference_observations)
 
 
+def _strategy_lab_observation(row: dict) -> dict:
+    """Attach canonical frontier metadata before observation-program evaluation.
+
+    Frontier scans build ordinary candidates and complete price observations from
+    the same raw venue rows.  Candidate construction already derives these
+    fields, but observation programs run on the latter path and must not lose
+    either the source identity or public-candle confirmation values.
+    """
+
+    output = dict(row)
+    market_type = str(output.get("market_type") or "spot").lower()
+    output["market_type"] = market_type
+    output["inst_id"] = output.get("inst_id") or output.get("instrument_id")
+    output["observed_at"] = (
+        output.get("observed_at")
+        or output.get("last_checked_at")
+        or _utc_now()
+    )
+    output["asset_class"] = (
+        "crypto_derivatives" if market_type in {"perp", "future", "futures"} else "crypto_spot"
+    )
+    output["trade_type"] = "frontier_crypto_venue_map"
+    output.setdefault("price_source", f"{output.get('venue')} public REST")
+    return output
+
+
 def build_scan_batch(
     settings: dict,
     limit: int | None = None,
@@ -11400,6 +11426,7 @@ def build_scan_batch(
         required_inst_ids=required_inst_ids,
         conn=conn,
     )
+    all_observations = [_strategy_lab_observation(row) for row in all_observations]
     observations = _select_observations(all_observations, registry)
     selected_ids = {row.get("instrument_id") for row in observations}
     for row in all_observations:

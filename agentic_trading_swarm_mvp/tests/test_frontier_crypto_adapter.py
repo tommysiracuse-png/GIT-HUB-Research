@@ -92,7 +92,13 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                 {
                     "strategy_lab_id": "coverage_test_v1",
                     "required_features": ["microstructure_history_ready"],
-                    "universe": {"market_types": ["spot"], "quotes": ["USDT"], "bases": ["LOW"]},
+                    "universe": {
+                        "asset_classes": ["crypto_spot"],
+                        "trade_types": ["frontier_crypto_venue_map"],
+                        "market_types": ["spot"],
+                        "quotes": ["USDT"],
+                        "bases": ["LOW"],
+                    },
                 }
             ],
         }
@@ -116,10 +122,17 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             )
 
         self.assertEqual(1, fetch.call_count)
+        self.assertEqual(1, batch.metadata["intraday_features"]["strategy_required_eligible_count"])
         self.assertEqual(1, batch.metadata["intraday_features"]["strategy_required_selected_count"])
         low_frame = next(row for row in batch.observations if row["inst_id"] == low["instrument_id"])
-        self.assertEqual(1.0, low_frame["candidate"]["microstructure_history_ready"])
-        self.assertGreater(low_frame["candidate"]["return_1m_bps"], 0.0)
+        self.assertEqual("crypto_spot", low_frame["asset_class"])
+        self.assertEqual("frontier_crypto_venue_map", low_frame["trade_type"])
+        self.assertEqual("spot", low_frame["market_type"])
+        self.assertEqual("USDT", low_frame["quote"])
+        self.assertEqual("LOW", low_frame["base"])
+        self.assertEqual(1.0, low_frame["microstructure_history_ready"])
+        self.assertGreater(low_frame["return_1m_bps"], 0.0)
+        self.assertGreater(low_frame["relative_volume_1m_60m"], 1.0)
 
     def test_public_venue_parsers_normalize_symbols(self) -> None:
         cases = [

@@ -314,7 +314,14 @@ class FrontierShockSnapbackFeatureTests(unittest.TestCase):
         self.assertEqual(1.0, stored["microstructure_history_ready"])
 
     def test_snapback_program_compiles_and_emits_only_with_ready_confirmation(self) -> None:
-        program, diagnostic = compile_observation_program(snapback_program())
+        program_logic = snapback_program()
+        program_logic["universe"] = {
+            "asset_classes": ["crypto_spot"],
+            "trade_types": ["frontier_crypto_venue_map"],
+            "market_types": ["spot"],
+            "quotes": ["USDT"],
+        }
+        program, diagnostic = compile_observation_program(program_logic)
         self.assertIsNotNone(program, diagnostic)
         cfg = settings()
         now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
@@ -329,7 +336,7 @@ class FrontierShockSnapbackFeatureTests(unittest.TestCase):
                     "hypothesis": "Liquid spot downside shocks snap back after volume-backed recovery confirmation.",
                     "source_surface": "spot",
                     "permitted_target_surface": ["spot"],
-                    "strategy_logic": snapback_program(),
+                    "strategy_logic": program_logic,
                     "data_requirements": {"paper_only": True, "closed_1m_candles": 61},
                     "risk_gates": {"max_spread_bps": 8, "min_quality_score": 60},
                     "promotion_rules": {},
@@ -346,7 +353,7 @@ class FrontierShockSnapbackFeatureTests(unittest.TestCase):
                     [observation(price, (now - dt.timedelta(minutes=minutes_ago)).isoformat())],
                     cfg,
                 )
-            ready = observation(
+            raw_ready = observation(
                 96.0,
                 now.isoformat(),
                 return_1m_bps=30.0,
@@ -354,6 +361,11 @@ class FrontierShockSnapbackFeatureTests(unittest.TestCase):
                 relative_volume_1m_60m=2.0,
                 microstructure_history_ready=1.0,
             )
+            raw_ready["instrument_id"] = raw_ready.pop("inst_id")
+            raw_ready["last_checked_at"] = raw_ready.pop("observed_at")
+            raw_ready.pop("asset_class")
+            raw_ready.pop("trade_type")
+            ready = frontier._strategy_lab_observation(raw_ready)
             generated, report = generate_strategy_lab_candidates(
                 conn,
                 cfg,
@@ -361,8 +373,20 @@ class FrontierShockSnapbackFeatureTests(unittest.TestCase):
                 {ready["inst_id"]: ready},
                 runtime_diagnostics={"frontier_crypto_intraday": {"attempted_count": 1, "ready_count": 1}},
             )
+            unready = {**ready, "microstructure_history_ready": 0.0}
+            blocked, _ = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                {unready["inst_id"]: unready},
+                runtime_diagnostics={"frontier_crypto_intraday": {"attempted_count": 1, "ready_count": 0}},
+            )
 
         self.assertEqual(1, len(generated), report)
+        self.assertEqual([], blocked)
+        self.assertEqual("crypto_spot", ready["asset_class"])
+        self.assertEqual("frontier_crypto_venue_map", ready["trade_type"])
+        self.assertEqual(1.0, ready["microstructure_history_ready"])
         self.assertEqual("long_frontier_spot", generated[0]["direction"])
         self.assertEqual("observation_program", generated[0]["strategy_lab_logic_type"])
         self.assertEqual(2.0, generated[0]["strategy_lab_program_features"]["relative_volume_1m_60m"])
