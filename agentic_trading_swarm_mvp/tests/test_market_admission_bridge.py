@@ -130,6 +130,44 @@ class MarketAdmissionBridgeTests(unittest.TestCase):
         self.assertIn("source_contract_url", requirements["required_fields"])
         self.assertFalse(json.loads(row["risk_gates_json"])["require_route_feasible"])
 
+    def test_b3_quality_verified_bdr_etf_companion_quote_creates_canonical_program(self) -> None:
+        b3_state = state(
+            "quality_verified",
+            venue="B3",
+            inst_id="B3:PUBLIC_DATA_SURFACE:BDR_ETF",
+            market_surface="b3_bdr_etf_public_data",
+            session_status="unknown",
+            details={
+                "adapter_id": "b3_public_data_hub",
+                "quality_status": "verified_proxy",
+                "candidate_reject_reason": "public_companion_price_requires_strategy_logic",
+                "route_status": "unknown",
+            },
+        )
+        result = market_admission_bridge.run_market_admission_bridge(
+            self.conn, self.settings, {"states": [b3_state]}
+        )
+        row = self.conn.execute(
+            "select strategy_lab_id, strategy_logic_json, data_requirements_json, risk_gates_json from strategy_lab_experiments"
+        ).fetchone()
+
+        self.assertEqual(1, result["summary"]["actions_created"])
+        self.assertEqual("strategy_lab_b3_bdr_etf_program", result["actions"][0]["action"])
+        self.assertEqual("b3_bdr_etf_companion_quote_v1", row["strategy_lab_id"])
+        logic = json.loads(row["strategy_logic_json"])
+        self.assertEqual("observation_program", logic["type"])
+        self.assertEqual("proxy", logic["route_surface"])
+        self.assertIn("price_basis == 'public_companion_brazil_equity_etf_quote'", logic["entry_expression"])
+        self.assertEqual("companion_return_strength_bps", logic["edge_expression"])
+        self.assertEqual("abs(return_5m_bps)", logic["calculated_features"]["companion_return_strength_bps"])
+        requirements = json.loads(row["data_requirements_json"])
+        self.assertEqual("b3_public_data_hub", requirements["adapter_id"])
+        self.assertIn("source_contract_url", requirements["required_fields"])
+        self.assertIn("companion_quote_symbol", requirements["required_fields"])
+        risk_gates = json.loads(row["risk_gates_json"])
+        self.assertFalse(risk_gates["require_route_feasible"])
+        self.assertNotIn("synthetic_research_only", risk_gates)
+
     def test_anp_quality_verified_companion_quotes_create_canonical_program(self) -> None:
         anp_state = state(
             "quality_verified",

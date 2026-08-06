@@ -3,11 +3,15 @@
 The hub entries describe public data and product catalogs; they are not
 executable quotes.  Reachable entries are emitted as official observations,
 but remain watch-only so neither paper nor live order routing can infer a
-price from catalog availability.
+price from catalog availability.  The BDR ETF surface is additionally paired
+with a public Brazil ETF companion quote so Strategy Lab can paper-test that
+reference surface without fabricating a native B3 price.
 """
 
 from __future__ import annotations
 
+import datetime as dt
+import re
 import unicodedata
 from html.parser import HTMLParser
 from typing import Any, Callable
@@ -25,6 +29,9 @@ DISTRIBUTOR_FAQ_URL = (
     "https://www.b3.com.br/en_us/market-data-and-indices/data-services/"
     "market-data/distributors/faq/"
 )
+COMPANION_QUOTE_SYMBOL = "EWZ"
+COMPANION_QUOTE_URL = "https://www.tradingview.com/symbols/AMEX-EWZ/"
+COMPANION_MARKET_SURFACE = "b3_bdr_etf_public_data"
 MARKET_SURFACE = "b3_public_data_hub"
 
 
@@ -57,6 +64,14 @@ class _AnchorParser(HTMLParser):
         self.anchors.append((label, self._href))
         self._href = None
         self._parts = []
+
+
+def _received_time(value: str | None) -> dt.datetime:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value or utc_now()).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise B3PublicDataParseError("received_at is not an ISO-8601 timestamp") from exc
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
 def _token(value: Any) -> str:
@@ -165,6 +180,7 @@ def parse_b3_public_data_hub(
         inst_id = f"B3:PUBLIC_DATA_SURFACE:{surface_id.upper()}"
         observations.append(
             {
+                "source_adapter_id": "b3_public_data_hub",
                 "venue": "B3",
                 "inst_id": inst_id,
                 "instrument_id": inst_id,
@@ -202,6 +218,92 @@ def parse_b3_public_data_hub(
     return observations
 
 
+def parse_tradingview_b3_etf_quote(
+    payload: str,
+    *,
+    symbol: str = COMPANION_QUOTE_SYMBOL,
+    source_url: str = COMPANION_QUOTE_URL,
+    received_at: str | None = None,
+) -> dict[str, Any]:
+    """Parse a public Brazil ETF quote page used as a paper-only companion price."""
+
+    text = str(payload or "").strip()
+    quote_symbol = str(symbol or "").strip().upper()
+    if not text:
+        raise B3PublicDataParseError("TradingView Brazil ETF quote page is empty")
+    if not quote_symbol:
+        raise B3PublicDataParseError("TradingView Brazil ETF quote symbol is missing")
+    match = re.search(
+        rf"The current price of {re.escape(quote_symbol)} is ([0-9]+(?:\.[0-9]+)?)\s*USD",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise B3PublicDataParseError(
+            f"TradingView Brazil ETF quote page missing current price for {quote_symbol}"
+        )
+    try:
+        last = float(match.group(1))
+    except ValueError as exc:
+        raise B3PublicDataParseError(
+            f"TradingView Brazil ETF quote page has invalid current price for {quote_symbol}"
+        ) from exc
+    if last <= 0:
+        raise B3PublicDataParseError(
+            f"TradingView Brazil ETF quote page current price must be positive for {quote_symbol}"
+        )
+    fetched_at = _received_time(received_at)
+    return {
+        "last": last,
+        "price_available": True,
+        "price_basis": "public_companion_brazil_equity_etf_quote",
+        "quality_status": "verified_proxy",
+        "proxy_quality_status": "verified_proxy",
+        "proxy_symbol": f"AMEX:{quote_symbol}",
+        "companion_quote_symbol": quote_symbol,
+        "companion_quote_url": source_url,
+        "freshness_state": "fresh",
+        "freshness_basis": "public_quote_page_fetch",
+        "freshness_age_seconds": 0.0,
+        "session_status": "unknown",
+        "session_basis": "public_quote_page_has_no_session_clock",
+        "price_reference_role": "brazil_equity_etf_proxy",
+        "price_source": "TradingView public Brazil ETF companion quote",
+        "source_record_type": "tradingview_public_symbol_faq",
+        "observed_at": fetched_at.isoformat(),
+        "fetched_at": fetched_at.isoformat(),
+    }
+
+
+def _apply_bdr_etf_companion_quote(observation: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
+    """Preserve B3 surface provenance while attaching a public Brazil ETF proxy price."""
+
+    updated = dict(observation)
+    updated["last"] = float(quote["last"])
+    updated["price_available"] = True
+    updated["quote"] = "USD"
+    updated["price_basis"] = str(quote["price_basis"])
+    updated["quality_status"] = str(quote["quality_status"])
+    updated["proxy_quality_status"] = str(quote["proxy_quality_status"])
+    updated["proxy_symbol"] = str(quote["proxy_symbol"])
+    updated["freshness_state"] = str(quote["freshness_state"])
+    updated["freshness_basis"] = str(quote["freshness_basis"])
+    updated["freshness_age_seconds"] = float(quote["freshness_age_seconds"])
+    updated["session_status"] = str(quote["session_status"])
+    updated["session_basis"] = str(quote["session_basis"])
+    updated["price_reference_role"] = str(quote["price_reference_role"])
+    updated["price_source"] = str(quote["price_source"])
+    updated["source_record_type"] = str(quote["source_record_type"])
+    updated["source_contract_url"] = str(updated.get("source_url") or "")
+    updated["source_url"] = str(quote["companion_quote_url"])
+    updated["companion_quote_symbol"] = str(quote["companion_quote_symbol"])
+    updated["companion_quote_url"] = str(quote["companion_quote_url"])
+    updated["observed_at"] = str(quote["observed_at"])
+    updated["fetched_at"] = str(quote["fetched_at"])
+    updated["candidate_reject_reason"] = "public_companion_price_requires_strategy_logic"
+    return updated
+
+
 def _fetch_evidence(result: dict[str, Any], source_url: str) -> dict[str, Any]:
     return {
         "source_url": source_url,
@@ -225,6 +327,7 @@ def _failure_observation(
     observation = health_observation("B3", source_url, evidence, MARKET_SURFACE)
     observation.update(
         {
+            "source_adapter_id": "b3_public_data_hub",
             "fetch_status": str(result.get("status") or "unavailable"),
             "freshness_state": "unknown",
             "freshness_basis": "unavailable",
@@ -287,8 +390,12 @@ class B3PublicDataHubAdapter:
         cfg = _adapter_config(settings or {}, self.info.adapter_id)
         timeout = max(1, int(cfg.get("timeout_seconds", 15)))
         source_url = str(cfg.get("source_url") or HUB_URL)
+        companion_source_url = str(cfg.get("companion_quote_url") or COMPANION_QUOTE_URL)
+        companion_symbol = str(cfg.get("companion_quote_symbol") or COMPANION_QUOTE_SYMBOL)
         result = fetch_text(source_url, timeout)
+        companion_result: dict[str, Any] | None = None
         parser_failures: list[dict[str, str]] = []
+        companion_failures: list[dict[str, str]] = []
 
         if not result.get("ok"):
             observations = [_failure_observation(result, source_url=source_url)]
@@ -302,6 +409,35 @@ class B3PublicDataHubAdapter:
                     source_url=source_url,
                     received_at=result.get("received_at"),
                 )
+                companion_result = fetch_text(companion_source_url, timeout)
+                if companion_result.get("ok"):
+                    try:
+                        companion_quote = parse_tradingview_b3_etf_quote(
+                            companion_result.get("text") or "",
+                            symbol=companion_symbol,
+                            source_url=companion_source_url,
+                            received_at=companion_result.get("received_at"),
+                        )
+                        observations = [
+                            _apply_bdr_etf_companion_quote(row, companion_quote)
+                            if row.get("market_surface") == COMPANION_MARKET_SURFACE
+                            else row
+                            for row in observations
+                        ]
+                    except (B3PublicDataParseError, TypeError, ValueError) as exc:
+                        companion_failures.append(
+                            {
+                                "source_url": companion_source_url,
+                                "error": f"B3 companion quote parser failed: {exc}"[:300],
+                            }
+                        )
+                else:
+                    companion_failures.append(
+                        {
+                            "source_url": companion_source_url,
+                            "error": str(companion_result.get("error") or "companion quote unavailable")[:300],
+                        }
+                    )
                 source_status = "reachable"
                 freshness_state = "fresh"
                 session_state = "reference_catalog"
@@ -323,17 +459,33 @@ class B3PublicDataHubAdapter:
                 "adapter_id": self.info.adapter_id,
                 "adapter_spec_id": 622,
                 "source_status": source_status,
-                "source_urls": [HUB_URL, PORTUGUESE_HUB_URL, DISTRIBUTOR_FAQ_URL],
-                "fetch_status": {"hub": _fetch_evidence(result, source_url)},
+                "source_urls": [HUB_URL, PORTUGUESE_HUB_URL, DISTRIBUTOR_FAQ_URL, COMPANION_QUOTE_URL],
+                "fetch_status": {
+                    "hub": _fetch_evidence(result, source_url),
+                    "bdr_etf_companion": (
+                        _fetch_evidence(companion_result, companion_source_url)
+                        if companion_result is not None
+                        else {
+                            "source_url": companion_source_url,
+                            "fetch_status": "not_attempted",
+                            "http_status": None,
+                            "fetched_at": None,
+                            "latency_ms": None,
+                            "error": None,
+                        }
+                    ),
+                },
                 "freshness_state": freshness_state,
                 "session_state": session_state,
                 "parser_failures": parser_failures,
+                "companion_failures": companion_failures,
                 "observation_count": len(observations),
                 "surface_count": sum(
                     1
                     for row in observations
                     if row.get("quality_status") == "official_public_data_surface"
                 ),
+                "priceable_surface_count": sum(1 for row in observations if float(row.get("last") or 0.0) > 0.0),
                 "capability_gap": "public_entry_quality_quotes",
                 "paper_only": True,
             },

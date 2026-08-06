@@ -27,6 +27,8 @@ EEX_SECONDARY_SPOT_SURFACE = "eex_eu_ets_secondary_spot_trades"
 EEX_SECONDARY_SPOT_LAB_ID = "eex_eu_ets_secondary_spot_reported_trade_v1"
 ADX_DERIVATIVES_SURFACE = "adx_equity_and_index_futures_contract_catalog"
 ADX_DERIVATIVES_LAB_ID = "adx_derivatives_companion_quote_v1"
+B3_BDR_ETF_SURFACE = "b3_bdr_etf_public_data"
+B3_BDR_ETF_LAB_ID = "b3_bdr_etf_companion_quote_v1"
 ICDX_CPOTR_SURFACE = "icdx_cpotr"
 ICDX_CPOTR_LAB_ID = "icdx_cpotr_price_card_reference_v1"
 ICDX_MILESTONES_SURFACE = "icdx_exchange_milestones"
@@ -406,6 +408,118 @@ def _create_adx_derivatives_companion_program(
         bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
     return {
         "action": "strategy_lab_adx_derivatives_program",
+        "status": "created" if result.get("created") else "updated",
+        "strategy_lab_id": result.get("strategy_lab_id"),
+        "topic_key": claim.topic_key,
+    }
+
+
+def _create_b3_bdr_etf_companion_program(
+    conn: sqlite3.Connection,
+    settings: dict,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the canonical paper-only B3 BDR ETF companion-price program."""
+
+    claim = _claim(conn, state, "activate_b3_bdr_etf_companion_program", 90)
+    if claim.duplicate and claim.canonical_row_id:
+        return {
+            "action": "strategy_lab_b3_bdr_etf_program",
+            "status": "deduplicated",
+            "topic_key": claim.topic_key,
+        }
+    evidence = _evidence(state)
+    details = state.get("details") if isinstance(state.get("details"), dict) else {}
+    rec = {
+        "recommendation_id": f"market_admission:{state['admission_key']}:b3_bdr_etf_program",
+        "source_agent": "market_admission_bridge",
+        "payload": {
+            "agent_name": "market_admission_bridge",
+            "title": "Paper-test B3 BDR ETF public data with a Brazil ETF companion quote",
+            "rationale": (
+                "B3's public-data hub BDR ETF surface is a catalog reference, not an executable quote. "
+                "The repaired adapter now attaches a defensible public Brazil ETF companion price so "
+                "Strategy Lab can measure same-surface paper proxy continuation without implying a live B3 route."
+            ),
+            "strategy_lab_experiment": {
+                "strategy_lab_id": B3_BDR_ETF_LAB_ID,
+                "version": 1,
+                "experiment_type": "market_strategy",
+                "hypothesis": (
+                    "Fresh B3 BDR ETF surface availability paired with a live Brazil ETF companion quote "
+                    "can seed same-surface paper proxy continuation experiments until native public entry quotes exist."
+                ),
+                "source_surface": B3_BDR_ETF_SURFACE,
+                "permitted_target_surface": [B3_BDR_ETF_SURFACE],
+                "strategy_logic": {
+                    "type": "observation_program",
+                    "universe": {
+                        "venues": ["B3"],
+                        "trade_types": ["official_market_catalog"],
+                        "market_surfaces": [B3_BDR_ETF_SURFACE],
+                    },
+                    "calculated_features": {
+                        "companion_return_strength_bps": "abs(return_5m_bps)",
+                    },
+                    "entry_expression": (
+                        "market_surface == 'b3_bdr_etf_public_data' "
+                        "and price_basis == 'public_companion_brazil_equity_etf_quote' "
+                        "and quality_status == 'verified_proxy' and freshness_state == 'fresh' "
+                        "and candidate_reject_reason == 'public_companion_price_requires_strategy_logic' "
+                        "and last > 0"
+                    ),
+                    "invalidation_expression": "freshness_state != 'fresh' or last <= 0",
+                    "long_expression": "return_5m_bps > 0",
+                    "short_expression": "return_5m_bps < 0",
+                    "edge_expression": "companion_return_strength_bps",
+                    "score_expression": "clip(45 + companion_return_strength_bps / 4, 0, 100)",
+                    "route_surface": "proxy",
+                },
+                "data_requirements": {
+                    "admission_key": state.get("admission_key"),
+                    "adapter_id": details.get("adapter_id"),
+                    "paper_only": True,
+                    "venue": "B3",
+                    "market_surface": B3_BDR_ETF_SURFACE,
+                    "source_surface": B3_BDR_ETF_SURFACE,
+                    "permitted_target_surface": [B3_BDR_ETF_SURFACE],
+                    "required_fields": [
+                        "last",
+                        "price_basis",
+                        "quality_status",
+                        "candidate_reject_reason",
+                        "freshness_state",
+                        "price_source",
+                        "source_url",
+                        "source_contract_url",
+                        "companion_quote_symbol",
+                    ],
+                    "paper_only_reference": True,
+                    "requires_independent_signal_logic": True,
+                },
+                "risk_gates": {
+                    "require_route_feasible": False,
+                    "paper_allocation_multiplier": 0.25,
+                    "data_quality": [
+                        "Use only verified companion-price rows with price_basis='public_companion_brazil_equity_etf_quote'.",
+                        "Retain the originating B3 hub page via source_contract_url and source_catalog_url.",
+                        "Never treat the Brazil ETF proxy quote as a native B3 executable route.",
+                    ],
+                    "exposure_limits": [
+                        "Paper-only proxy route.",
+                        "At most one active Strategy Lab signal per inst_id.",
+                        "No live trading, no broker writes, and no non-paper execution path.",
+                    ],
+                },
+            },
+            "evidence": evidence,
+        },
+    }
+    result = ingest_strategy_lab_recommendation(conn, rec, settings)[0]
+    if result.get("strategy_lab_id"):
+        bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
+    return {
+        "action": "strategy_lab_b3_bdr_etf_program",
         "status": "created" if result.get("created") else "updated",
         "strategy_lab_id": result.get("strategy_lab_id"),
         "topic_key": claim.topic_key,
@@ -1249,6 +1363,11 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
                 and str(state.get("market_surface") or "") == ADX_DERIVATIVES_SURFACE
             ):
                 actions.append(_create_adx_derivatives_companion_program(conn, settings, state))
+            elif (
+                str(state.get("venue") or "").upper() == "B3"
+                and str(state.get("market_surface") or "") == B3_BDR_ETF_SURFACE
+            ):
+                actions.append(_create_b3_bdr_etf_companion_program(conn, settings, state))
             elif (
                 str(state.get("venue") or "").upper() == "ANP_BRAZIL_OPC"
                 and str(state.get("market_surface") or "") == ANP_OPC_SURFACE

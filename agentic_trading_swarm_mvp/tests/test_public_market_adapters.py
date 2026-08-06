@@ -29,9 +29,11 @@ import storage
 from adapters.venues import common as venue_common
 from adapters.registry import discover_adapters, get_adapter
 from adapters.venues.b3 import (
+    COMPANION_QUOTE_URL as B3_COMPANION_QUOTE_URL,
     HUB_URL as B3_HUB_URL,
     B3PublicDataHubAdapter,
     parse_b3_public_data_hub,
+    parse_tradingview_b3_etf_quote,
 )
 from adapters.venues.aib_eex_france import (
     EEX_CPB_PAGE_URL,
@@ -2083,6 +2085,46 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual("public_catalog_parser_failure", batch.observations[0]["candidate_reject_reason"])
         self.assertIn("required B3 public-data surfaces", batch.observations[0]["parser_failure"])
 
+    def test_b3_adapter_attaches_brazil_etf_companion_quote_to_bdr_etf_surface(self) -> None:
+        hub = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": """
+            <section><a href="/en_us/b3/esg/otc-market.htm">Decarbonization credits CBIO</a></section>
+            <section><a href="/pt_br/fi-infra-listados/">FI-Infra</a><a href="/en_us/fiagro.htm">FIAGRO</a><a href="/pt_br/fidc.htm">FIDC</a></section>
+            <section>
+              <a href="/en_us/stock-etf.htm">Stock Exchange Traded Fund - Stock ETF</a>
+              <a href="/pt_br/bdr-etf.htm">BDRs ETFs</a>
+              <a href="/en_us/unsponsored-bdr.htm">Unsponsored Brazilian Depositary Receipts - BDRs</a>
+            </section>
+            """,
+            "received_at": "2026-08-04T12:00:00+00:00",
+            "latency_ms": 4.0,
+        }
+        companion = {
+            "ok": True,
+            "status": "reachable",
+            "http_status": 200,
+            "text": "<html><body><p>The current price of EWZ is 29.84 USD.</p></body></html>",
+            "received_at": "2026-08-04T12:00:05+00:00",
+            "latency_ms": 3.0,
+        }
+        with mock.patch("adapters.venues.b3.fetch_text", side_effect=[hub, companion]):
+            batch = B3PublicDataHubAdapter().scan({})
+
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual("reachable", batch.metadata["fetch_status"]["bdr_etf_companion"]["fetch_status"])
+        self.assertEqual(1, batch.metadata["priceable_surface_count"])
+        bdr = next(row for row in batch.observations if row["market_surface"] == "b3_bdr_etf_public_data")
+        self.assertEqual(29.84, bdr["last"])
+        self.assertEqual("public_companion_brazil_equity_etf_quote", bdr["price_basis"])
+        self.assertEqual("verified_proxy", bdr["quality_status"])
+        self.assertEqual("AMEX:EWZ", bdr["proxy_symbol"])
+        self.assertEqual(B3_COMPANION_QUOTE_URL, bdr["source_url"])
+        self.assertEqual("https://www.b3.com.br/pt_br/bdr-etf.htm", bdr["source_contract_url"])
+        self.assertEqual("public_companion_price_requires_strategy_logic", bdr["candidate_reject_reason"])
+
     def test_b3_adapter_emits_watch_only_fetch_evidence_when_unavailable(self) -> None:
         result = {
             "ok": False,
@@ -2103,6 +2145,17 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual("watch_only", batch.observations[0]["direction"])
         self.assertEqual("public_catalog_source_unavailable", batch.observations[0]["candidate_reject_reason"])
         self.assertEqual(B3_HUB_URL, batch.observations[0]["source_url"])
+
+    def test_b3_tradingview_quote_parser_extracts_public_etf_price(self) -> None:
+        quote = parse_tradingview_b3_etf_quote(
+            "<html><body><p>The current price of EWZ is 30.12 USD.</p></body></html>",
+            received_at="2026-08-04T12:00:00+00:00",
+        )
+
+        self.assertEqual(30.12, quote["last"])
+        self.assertEqual("public_companion_brazil_equity_etf_quote", quote["price_basis"])
+        self.assertEqual("AMEX:EWZ", quote["proxy_symbol"])
+        self.assertEqual(B3_COMPANION_QUOTE_URL, quote["companion_quote_url"])
 
     def test_polymarket_sports_plugin_is_runtime_discoverable_and_watch_only(self) -> None:
         self.assertIn("polymarket_sports_websocket", discover_adapters())
