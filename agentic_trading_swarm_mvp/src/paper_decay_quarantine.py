@@ -176,9 +176,38 @@ def _separate_proxy_lineage(candidate: Mapping[str, Any]) -> bool:
     )
 
 
+def _explicit_target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
+    signal_key = str(candidate.get("signal_key") or "").strip()
+    if not signal_key:
+        return None
+    parts = signal_key.split("|")
+    if len(parts) < 4:
+        return None
+    venue = parts[0].strip().upper()
+    trade_type = parts[1].strip()
+    direction = parts[2].strip()
+    status = parts[3].strip().lower() or "unknown"
+    if venue != "OKX" or trade_type != "perp_funding_basis":
+        return None
+    if direction not in _TARGET_DIRECTIONS:
+        return None
+    return {
+        "venue": venue,
+        "trade_type": trade_type,
+        "direction_mode": direction,
+        "feasibility_status": status,
+        "signal_key": f"{venue}|{trade_type}|{direction}|{status}",
+    }
+
+
 def target_signal(candidate: Mapping[str, Any]) -> dict[str, str] | None:
     """Return the exact decayed signal family identity, without prose matching."""
     if _separate_proxy_lineage(candidate):
+        return None
+    explicit = _explicit_target_signal(candidate)
+    if explicit is not None:
+        return explicit
+    if candidate.get("signal_key") or candidate.get("strategy_lab_id") or candidate.get("signal_lineage_key"):
         return None
     signal_key = str(candidate.get("signal_key") or "")
     parts = signal_key.split("|")

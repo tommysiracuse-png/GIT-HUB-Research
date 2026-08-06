@@ -119,6 +119,21 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             record["target"]["signal_key"],
         )
 
+    def test_explicit_non_target_signal_key_is_not_quarantined(self) -> None:
+        protected = self.candidate(
+            signal_key="OKX|perp_funding_basis|funding_capture_short_perp|standard",
+        )
+
+        self.assertIsNone(quarantine_record(protected, self.settings))
+
+    def test_strategy_lab_lineage_is_not_reclassified_as_native_decay_signal(self) -> None:
+        translated = self.candidate(
+            strategy_lab_id="okx_basis_lab_v2",
+            strategy_lab_version=2,
+        )
+
+        self.assertIsNone(quarantine_record(translated, self.settings))
+
     def test_exploration_emits_a_paper_fill_with_quarantine_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
