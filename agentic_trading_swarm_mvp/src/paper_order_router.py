@@ -14,6 +14,8 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from paper_route_registry import apply_paper_route_registry
+from paper_decay_quarantine import POLICY_KEY as OKX_BASIS_DECAY_QUARANTINE_POLICY_KEY
+from paper_decay_quarantine import quarantine_record as okx_basis_decay_quarantine_record
 
 
 FRONTIER_MARKER = "frontier_crypto_venue_map"
@@ -1042,6 +1044,18 @@ def frontier_shadow_filter_reason(
     verified positive-net candidates with no slippage or quality blocker remain
     eligible for paper fills.
     """
+    decay_quarantine = okx_basis_decay_quarantine_record(candidate, settings=config)
+    if isinstance(decay_quarantine, Mapping) and decay_quarantine.get("active"):
+        return {
+            **dict(decay_quarantine),
+            "reason": decay_quarantine.get("reason") or "decay_quarantine",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": OKX_BASIS_DECAY_QUARANTINE_POLICY_KEY,
+            "candidate": _candidate_reference(candidate),
+            "cell": _paper_signal_cell(candidate),
+            "checks": [{"code": "decay_quarantine", "field": "paper_okx_basis_decay_quarantine"}],
+        }
     # Recompute this policy at the routing boundary.  Cached reviews created
     # before the quarantine may still say that local alignment was eligible.
     alignment_guard = _paper_yahoo_proxy_cross_surface_alignment_guard(candidate, config)
@@ -1296,6 +1310,12 @@ def _annotate_shadow_filtered_candidate(
     guarded["candidate_reject_reason"] = guarded.get("candidate_reject_reason") or reason.get("reason") or FRONTIER_SHADOW_REASON
     guarded["candidate_reject_detail"] = dict(reason)
     guarded[detail_field] = dict(reason)
+    if reason.get("guard") == OKX_BASIS_DECAY_QUARANTINE_POLICY_KEY:
+        guarded["paper_action"] = "shadow_trial"
+        guarded["router_action"] = "observe_only"
+        guarded["paper_execution_mode"] = "observe_only"
+        guarded["paper_observation_only"] = True
+        guarded["paper_observation_reason"] = reason.get("reason") or "decay_quarantine"
     if reason.get("guard") in {
         "yahoo_proxy_cross_surface_alignment_guard",
         "paper_lineage_source_health",

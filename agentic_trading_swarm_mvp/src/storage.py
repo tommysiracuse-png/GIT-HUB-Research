@@ -287,6 +287,20 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists paper_decay_quarantines (
+            policy_key text primary key,
+            status text not null,
+            started_at text not null,
+            expires_at text not null,
+            closed_label_limit integer not null,
+            closed_label_count integer not null default 0,
+            release_reason text,
+            updated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists llm_cost_events (
             id integer primary key autoincrement,
             created_at text not null,

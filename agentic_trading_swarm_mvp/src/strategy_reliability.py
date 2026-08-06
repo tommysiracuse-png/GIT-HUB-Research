@@ -16,6 +16,7 @@ import math
 from typing import Any
 
 from paper_context_cost import realized_paper_cost_audit
+from paper_decay_quarantine import quarantine_record as okx_basis_decay_quarantine_record
 from proxy_signal_quality import PROXY_TRADE_TYPES, proxy_short_quality_review
 from storage import RUNS_DIR, signal_key
 from frontier_data_quality import (
@@ -3962,6 +3963,44 @@ def _apply_family_quarantine(
     return reliability
 
 
+def _apply_okx_basis_decay_quarantine(
+    candidate: dict,
+    config: Mapping[str, Any] | bool | None = None,
+    conn: Any | None = None,
+) -> dict | None:
+    """Move only the evidence-named OKX basis families to paper shadow trials."""
+    record = okx_basis_decay_quarantine_record(candidate, settings=config, conn=conn)
+    if record is None:
+        return None
+    candidate["paper_okx_basis_decay_quarantine"] = dict(record)
+    if not record["active"]:
+        return None
+    pre_quarantine_score = _as_float(candidate.get("score"), 0.0)
+    reliability = _annotate(
+        candidate,
+        profile="okx_basis_decay_quarantine",
+        action="decay_quarantine_shadow_trial",
+        reasons=[record["reason"]],
+        allocation_multiplier=0.0,
+        shadow_only=True,
+    )
+    candidate["pre_okx_basis_decay_quarantine_score"] = pre_quarantine_score
+    candidate["score"] = 0.0
+    candidate["paper_score_multiplier"] = 0.0
+    candidate["paper_score_eligible"] = False
+    candidate["paper_rank_eligible"] = False
+    candidate["paper_fill_allowed"] = False
+    candidate["paper_action"] = "shadow_trial"
+    candidate["paper_execution_mode"] = "observe_only"
+    candidate["paper_observation_only"] = True
+    candidate["paper_observation_reason"] = record["reason"]
+    candidate["promotion_eligible"] = False
+    candidate["candidate_reject_reason"] = record["reason"]
+    candidate["candidate_reject_detail"] = dict(record)
+    reliability["paper_okx_basis_decay_quarantine"] = dict(record)
+    return reliability
+
+
 def _apply_lineage_source_health(
     candidate: dict,
     config: Mapping[str, Any] | bool | None = None,
@@ -4143,6 +4182,9 @@ def _apply_one(
     portability_quarantine = _apply_portability_quarantine(candidate, config=config)
     if portability_quarantine is not None:
         return portability_quarantine
+    okx_basis_decay_quarantine = _apply_okx_basis_decay_quarantine(candidate, config=config, conn=conn)
+    if okx_basis_decay_quarantine is not None:
+        return okx_basis_decay_quarantine
     quarantined = _apply_family_quarantine(candidate, config=config)
     if quarantined is not None:
         return quarantined
@@ -4179,6 +4221,9 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
     context_loss_quarantined = sum(
         1 for item in items if item.get("profile") == "paper_context_loss_quarantine"
     )
+    okx_basis_decay_quarantined = sum(
+        1 for item in items if item.get("profile") == "okx_basis_decay_quarantine"
+    )
     by_quality_failure = collections.Counter(
         reason
         for candidate in candidates
@@ -4192,6 +4237,7 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         "portability_quarantine_count": portability_quarantined,
         "lineage_source_health_guard_count": lineage_source_health_guarded,
         "context_loss_quarantine_count": context_loss_quarantined,
+        "okx_basis_decay_quarantine_count": okx_basis_decay_quarantined,
         "by_quality_failure": dict(by_quality_failure),
         "protected_working_slice_count": protected,
         "by_action": dict(by_action),
@@ -4398,6 +4444,7 @@ def apply_strategy_reliability(
             for record in [
                 _apply_portability_quarantine(candidate, config=settings)
                 or _apply_context_loss_quarantine(candidate, config=settings, conn=conn)
+                or _apply_okx_basis_decay_quarantine(candidate, config=settings, conn=conn)
                 or _apply_family_quarantine(candidate, config=settings)
                 or _apply_lineage_source_health(candidate, config=settings)
             ]

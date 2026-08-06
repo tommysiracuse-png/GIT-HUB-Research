@@ -13,6 +13,7 @@ import sqlite3
 
 from paper_order_router import apply_frontier_paper_admission_guard, apply_frontier_paper_guard
 from paper_context_cost import enforce_paper_context_cost_gate
+from paper_decay_quarantine import apply_quarantine as apply_okx_basis_decay_quarantine
 from paper_exploration import exploration_enabled, prepare_candidate_for_exploration
 from storage import save_execution_fill, save_execution_order
 
@@ -314,6 +315,9 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
     )
     if exploration_enabled(settings):
         candidate = prepare_candidate_for_exploration(dict(candidate), settings)
+        # This explicit paper-only family exception survives exploration's
+        # otherwise permissive synthetic-route preparation.
+        candidate = apply_okx_basis_decay_quarantine(candidate, settings, conn=conn)
         if context_loss_quarantined:
             candidate["shadow_filtered"] = True
             candidate["paper_fill_allowed"] = False
@@ -322,6 +326,10 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
                 "reason", "paper_context_loss_quarantine"
             )
             candidate["candidate_reject_detail"] = dict(context_loss_quarantine)
+        elif (candidate.get("paper_okx_basis_decay_quarantine") or {}).get("active"):
+            # The dedicated decay quarantine is a deliberate exception to
+            # exploration's usual synthetic-paper admission reset.
+            pass
         elif candidate.get("paper_experiment_capacity_deferred"):
             # A scanner can defer an otherwise valid priceable idea when the
             # bounded paper window cannot produce a meaningful experiment.

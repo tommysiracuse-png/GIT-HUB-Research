@@ -193,7 +193,7 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["strategy_reliability_action"], "protect_working_funding_slice")
         self.assertTrue(rows[0]["strategy_reliability"]["protect_working_slice"])
 
-    def test_okx_basis_mean_reversion_requires_regime_confirmation(self) -> None:
+    def test_okx_basis_mean_reversion_is_decay_quarantined_before_regime_confirmation(self) -> None:
         candidate = base_candidate(
             venue="OKX",
             inst_id="OKX:BTC-USDT-SWAP",
@@ -208,8 +208,8 @@ class StrategyReliabilityTests(unittest.TestCase):
         rows, _ = strategy_reliability.apply_strategy_reliability([candidate])
 
         self.assertTrue(rows[0]["paper_entry_blocked"])
-        self.assertEqual(rows[0]["strategy_reliability_action"], "basis_regime_shadow_only")
-        self.assertIn("basis_not_extreme", rows[0]["strategy_reliability_reasons"])
+        self.assertEqual(rows[0]["strategy_reliability_action"], "decay_quarantine_shadow_trial")
+        self.assertEqual(rows[0]["candidate_reject_reason"], "decay_quarantine")
 
     def test_yahoo_proxy_direction_family_is_quarantined_on_both_sides(self) -> None:
         short = base_candidate(

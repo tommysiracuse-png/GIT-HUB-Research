@@ -49,6 +49,11 @@ DEFAULT_SETTINGS = {
         "zero_admission_revert_loops": 3,
         "guard_value_horizon_minutes": 60,
     },
+    "okx_perp_funding_basis_decay_quarantine": {
+        "enabled": True,
+        "closed_label_limit": 100,
+        "duration_days": 14,
+    },
     "paper_context_drag": {
         "enabled": True,
         "paper_only": True,

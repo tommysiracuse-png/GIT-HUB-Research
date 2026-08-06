@@ -9,6 +9,7 @@ import sqlite3
 from collections import Counter, defaultdict
 
 from storage import RUNS_DIR
+from paper_decay_quarantine import runtime_report as okx_basis_decay_quarantine_runtime_report
 
 
 _GUARD_REASON_PATTERNS = (
@@ -58,6 +59,7 @@ def build_paper_exploration_report(
     reviewed: list[dict] | None = None,
 ) -> dict:
     cfg = settings.get("paper_exploration", {})
+    decay_quarantine = okx_basis_decay_quarantine_runtime_report(conn, settings)
     horizon = int(cfg.get("guard_value_horizon_minutes", 60))
     rows = conn.execute(
         """
@@ -171,6 +173,8 @@ def build_paper_exploration_report(
             "capacity_deferrals_24h": int(decisions.get("deferred_capacity", 0)),
             "duplicate_exposure_rejections_24h": int(decisions.get("reject_duplicate_open_exposure", 0)),
             "would_block_guard_count": len(guard_value),
+            "okx_basis_decay_quarantine_active": int(decay_quarantine.get("status") == "active"),
+            "okx_basis_decay_quarantine_closed_labels": int(decay_quarantine.get("closed_label_count") or 0),
         },
         "decisions_24h": dict(decisions),
         "true_rejection_reasons_24h": dict(true_rejections.most_common()),
@@ -180,6 +184,7 @@ def build_paper_exploration_report(
             "admitted_or_deferred": dict(current_admitted),
         },
         "admission_zero_streaks": zero_streaks,
+        "okx_basis_decay_quarantine": decay_quarantine,
     }
 
 
@@ -220,6 +225,20 @@ def write_paper_exploration_report(
             f"{item['losses_would_have_avoided_bps']} | {item['profits_would_have_missed_bps']} | "
             f"{item['net_guard_value_bps']} |"
         )
+    decay_quarantine = report.get("okx_basis_decay_quarantine") or {}
+    lines.extend(
+        [
+            "",
+            "## OKX Basis Decay Quarantine",
+            "",
+            f"- Reason: `{decay_quarantine.get('reason', 'decay_quarantine')}`",
+            f"- Status: `{decay_quarantine.get('status', 'not_started')}`",
+            f"- Closed labels: `{decay_quarantine.get('closed_label_count', 0)}` / `{decay_quarantine.get('closed_label_limit', 100)}`",
+            f"- Labels remaining: `{decay_quarantine.get('closed_label_remaining', 100)}`",
+            f"- Label avg PnL / win rate: `{decay_quarantine.get('avg_pnl_bps')}` bps / `{decay_quarantine.get('win_rate')}`",
+            f"- Expires: `{decay_quarantine.get('expires_at')}`",
+        ]
+    )
     (RUNS_DIR / "paper_exploration_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report
 
@@ -236,4 +255,5 @@ def compact_paper_exploration_report(report: dict, guard_limit: int = 10) -> dic
         "top_guard_value": list(report.get("guard_value") or [])[: max(0, int(guard_limit))],
         "current_cycle_lineages": report.get("current_cycle_lineages") or {},
         "admission_zero_streaks": report.get("admission_zero_streaks") or {},
+        "okx_basis_decay_quarantine": report.get("okx_basis_decay_quarantine") or {},
     }
