@@ -1347,6 +1347,75 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             summary["paper_short_route_gate"]["status_counts"]["shadow_only_route_feasibility"],
         )
 
+    def test_summary_counts_frontier_paper_fill_gate_reasons(self) -> None:
+        cfg = settings()
+        net_edge_floor = {
+            "venue": "COINBASE",
+            "inst_id": "COINBASE:BTC-USD",
+            "trade_type": "frontier_crypto_venue_map",
+            "market_surface": "frontier_crypto_venue_map",
+            "frontier_paper_admission_guard_applies": True,
+            "direction": "long_frontier_spot",
+            "score": 90.0,
+            "quality_status": "verified",
+            "quality_action": "normal",
+            "edge_bps_estimate": 0.0,
+            "gross_edge_bps_estimate": 25.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "anomaly_flags": [],
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+        }
+        shadow_only_quality = {
+            "venue": "OKX_SPOT",
+            "inst_id": "OKX_SPOT:STRK-USDT",
+            "trade_type": "frontier_crypto_venue_map",
+            "market_surface": "frontier_crypto_venue_map",
+            "frontier_paper_admission_guard_applies": True,
+            "direction": "long_frontier_spot",
+            "score": 95.4,
+            "quality_status": "verified",
+            "quality_action": "shadow_only",
+            "edge_bps_estimate": 16.0,
+            "gross_edge_bps_estimate": 30.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "anomaly_flags": ["depth_cliff"],
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+        }
+        healthy = {
+            "venue": "KRAKEN",
+            "inst_id": "KRAKEN:XBTUSD",
+            "trade_type": "frontier_crypto_venue_map",
+            "market_surface": "frontier_crypto_venue_map",
+            "frontier_paper_admission_guard_applies": True,
+            "direction": "long_frontier_spot",
+            "score": 88.0,
+            "quality_status": "verified",
+            "quality_action": "normal",
+            "edge_bps_estimate": 18.0,
+            "gross_edge_bps_estimate": 40.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "anomaly_flags": [],
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+        }
+
+        ranked = frontier.rank_frontier_paper_candidates(
+            [net_edge_floor, shadow_only_quality, healthy],
+            cfg,
+        )
+        summary = frontier.summarize([], ranked)
+
+        self.assertEqual(2, summary["paper_fill_gate"]["blocked_candidate_count"])
+        self.assertEqual(1, summary["paper_fill_gate"]["reason_counts"]["net_edge_floor_failed"])
+        self.assertEqual(1, summary["paper_fill_gate"]["reason_counts"]["shadow_only_quality_gate"])
+        self.assertEqual(
+            2,
+            summary["candidate_activity"]["paper_fill_gate_blocked_candidates"],
+        )
+        self.assertEqual(
+            1,
+            summary["candidate_activity"]["paper_fill_gate_trigger_counts"]["quality_action_shadow_only"],
+        )
+
     def test_short_cost_decomposition_reorders_synthetic_route_by_net_edge(self) -> None:
         cfg = settings()
         direct = {

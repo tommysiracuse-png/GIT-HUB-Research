@@ -15,6 +15,7 @@ from paper_order_router import (
     FRONTIER_SHADOW_REASON,
     PAPER_NET_EDGE_GUARD_REASON,
     apply_frontier_paper_admission_guard,
+    apply_frontier_paper_fill_gate,
     apply_frontier_paper_guard,
     paper_route_feasibility_gate_review,
 )
@@ -528,6 +529,8 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         return _nav_reference_execution(candidate, settings)
     if candidate.get("paper_auction_reference"):
         return _auction_reference_execution(candidate, settings)
+    if paper_mode:
+        candidate = apply_frontier_paper_fill_gate(candidate, settings)
     order = build_order_ticket(candidate, review, settings)
     if candidate.get("shadow_filtered"):
         yahoo_proxy_freshness_shadow = (
@@ -595,18 +598,27 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             isinstance(reject_detail, dict)
             and reject_detail.get("guard") == "frontier_paper_admission_guard"
         )
+        fill_gate_shadow_observation = (
+            isinstance(reject_detail, dict)
+            and reject_detail.get("guard") == "frontier_paper_fill_gate"
+        )
         shadow_observation = reject_reason == FRONTIER_SHADOW_REASON or (
             paper_mode
             and (
                 reject_reason == PAPER_NET_EDGE_GUARD_REASON
                 or scanner_shadow_observation
+                or fill_gate_shadow_observation
             )
         )
         if shadow_observation:
             observation_id = save_frontier_paper_shadow_observation(conn, candidate, review)
             order["status"] = (
                 "shadow_only"
-                if reject_reason == PAPER_NET_EDGE_GUARD_REASON or scanner_shadow_observation
+                if (
+                    reject_reason == PAPER_NET_EDGE_GUARD_REASON
+                    or scanner_shadow_observation
+                    or fill_gate_shadow_observation
+                )
                 else "shadow_observed"
             )
             order["shadow_filter"] = candidate.get("candidate_reject_detail")

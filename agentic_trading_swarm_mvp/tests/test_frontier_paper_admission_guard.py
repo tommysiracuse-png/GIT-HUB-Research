@@ -202,11 +202,11 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         self.assertEqual("shadow_only", result["order"]["status"])
         self.assertIsNone(result["order_id"])
         self.assertEqual(
-            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:cost",
+            "net_edge_floor_failed",
             result["candidate"]["candidate_reject_reason"],
         )
         self.assertEqual(
-            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:cost",
+            "net_edge_floor_failed",
             result["candidate"]["shadow_reason"],
         )
         self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
@@ -214,7 +214,7 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
             "select reject_reason from frontier_paper_shadow_observations"
         ).fetchone()
         self.assertEqual(
-            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:cost",
+            "net_edge_floor_failed",
             observation[0],
         )
 

@@ -11826,10 +11826,34 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         _annotate_frontier_route_feasibility_shadow_state(candidate, route_feasibility_gate)
         if paper_only_active:
             try:
-                from paper_order_router import apply_frontier_paper_admission_guard
+                from paper_order_router import (
+                    apply_frontier_paper_admission_guard,
+                    frontier_paper_fill_gate_reason,
+                )
             except ImportError:  # pragma: no cover - package import fallback
-                from src.paper_order_router import apply_frontier_paper_admission_guard
+                from src.paper_order_router import (
+                    apply_frontier_paper_admission_guard,
+                    frontier_paper_fill_gate_reason,
+                )
             candidate.update(apply_frontier_paper_admission_guard(candidate, settings))
+            fill_gate = frontier_paper_fill_gate_reason(candidate, settings)
+            candidate["frontier_paper_fill_gate"] = (
+                dict(fill_gate)
+                if isinstance(fill_gate, dict)
+                else {
+                    "guard": "frontier_paper_fill_gate",
+                    "paper_only": True,
+                    "paper_fill_allowed": True,
+                    "reason": None,
+                    "checks": [],
+                    "trigger_codes": [],
+                }
+            )
+            candidate["paper_fill_gate_blocked"] = bool(fill_gate)
+            candidate["paper_fill_gate_reason"] = None if fill_gate is None else fill_gate.get("reason")
+            candidate["paper_fill_gate_trigger_codes"] = (
+                [] if fill_gate is None else list(fill_gate.get("trigger_codes") or [])
+            )
         quality_score = as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0
         base_score = as_float(candidate.get("score"), 0.0) or 0.0
         effective_edge = as_float(candidate.get("effective_edge_bps"), None)
@@ -13500,6 +13524,8 @@ def summarize(
     short_cost_components: collections.Counter[str] = collections.Counter()
     route_feasibility_reason_counts: collections.Counter[str] = collections.Counter()
     route_feasibility_status_counts: collections.Counter[str] = collections.Counter()
+    paper_fill_gate_reason_counts: collections.Counter[str] = collections.Counter()
+    paper_fill_gate_trigger_counts: collections.Counter[str] = collections.Counter()
     route_feasibility_verified_exception_count = 0
     for row in candidates:
         marketability_failures.update((row.get("marketability_gate") or {}).get("failed_checks") or [])
@@ -13545,6 +13571,15 @@ def summarize(
                 route_feasibility_status_counts["allowed_other_route_reason"] += 1
         elif bool(row.get("paper_route_feasibility_shadow_label")):
             route_feasibility_status_counts["shadow_only_route_feasibility"] += 1
+        if bool(row.get("paper_fill_gate_blocked")):
+            paper_fill_gate_reason = str(row.get("paper_fill_gate_reason") or "").strip()
+            if paper_fill_gate_reason:
+                paper_fill_gate_reason_counts[paper_fill_gate_reason] += 1
+            paper_fill_gate_trigger_counts.update(
+                str(code)
+                for code in (row.get("paper_fill_gate_trigger_codes") or [])
+                if code
+            )
     active_candidate_count = sum(
         1
         for row in candidates
@@ -13572,6 +13607,9 @@ def summarize(
         "route_feasibility_verified_exception_candidates": route_feasibility_verified_exception_count,
         "route_feasibility_reason_counts": dict(route_feasibility_reason_counts),
         "route_feasibility_status_counts": dict(route_feasibility_status_counts),
+        "paper_fill_gate_blocked_candidates": sum(paper_fill_gate_reason_counts.values()),
+        "paper_fill_gate_reason_counts": dict(paper_fill_gate_reason_counts),
+        "paper_fill_gate_trigger_counts": dict(paper_fill_gate_trigger_counts),
         "regional_admitted_candidates": regional_candidate_blockers.get("passed", 0),
         "regional_blocked_candidates": sum(
             count
@@ -13587,6 +13625,7 @@ def summarize(
             "active_paper_review_candidates": active_candidate_count,
             "shadow_or_observe_only_candidates": shadow_only_candidate_count,
             "route_feasibility_shadow_candidates": route_feasibility_shadow_count,
+            "paper_fill_gate_blocked_candidates": sum(paper_fill_gate_reason_counts.values()),
             "venue_quota_report": depth_summary.get("venue_quota_report", {}),
             "selection_limits": depth_summary.get("selection_limits", {}),
             "worker_count": depth_summary.get("worker_count"),
@@ -13658,6 +13697,9 @@ def summarize(
             "paper_route_feasibility_shadow_label": row.get(
                 "paper_route_feasibility_shadow_label"
             ),
+            "paper_fill_gate_blocked": row.get("paper_fill_gate_blocked"),
+            "paper_fill_gate_reason": row.get("paper_fill_gate_reason"),
+            "paper_fill_gate_trigger_codes": row.get("paper_fill_gate_trigger_codes", []),
             "paper_venue_diagnostics": row.get("paper_venue_diagnostics"),
         }
         for row in candidates[:20]
@@ -13701,6 +13743,12 @@ def summarize(
             "verified_exception_count": route_feasibility_verified_exception_count,
             "status_counts": dict(route_feasibility_status_counts),
             "route_feasibility_reason_counts": dict(route_feasibility_reason_counts),
+        },
+        "paper_fill_gate": {
+            "paper_only": True,
+            "blocked_candidate_count": sum(paper_fill_gate_reason_counts.values()),
+            "reason_counts": dict(paper_fill_gate_reason_counts),
+            "trigger_counts": dict(paper_fill_gate_trigger_counts),
         },
         "by_preliminary_route_status": dict(route_status),
         "by_route_blocker": dict(route_blockers),

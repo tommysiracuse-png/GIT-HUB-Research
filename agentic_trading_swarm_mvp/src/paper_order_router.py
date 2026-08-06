@@ -23,6 +23,8 @@ FRONTIER_MARKER = "frontier_crypto_venue_map"
 FRONTIER_PAPER_ADMISSION_MARKER = "frontier_paper_admission_guard_applies"
 FRONTIER_SHADOW_REASON = "cost_swallowed_or_route_blocked"
 PAPER_NET_EDGE_GUARD_REASON = "paper_net_edge_guard"
+FRONTIER_PAPER_FILL_REASON_NET_EDGE_FLOOR = "net_edge_floor_failed"
+FRONTIER_PAPER_FILL_REASON_SHADOW_ONLY_QUALITY = "shadow_only_quality_gate"
 FRONTIER_PAPER_ADMISSION_GUARD = "frontier_paper_admission_guard"
 FRONTIER_PAPER_ADMISSION_REASON_PREFIX = "frontier_paper_admission_failed"
 FRONTIER_PAPER_ADMISSION_DATA_QUALITY = "data_quality"
@@ -665,7 +667,7 @@ def frontier_paper_cost_diagnostic(candidate: Mapping[str, Any]) -> dict[str, An
     checks: list[dict[str, Any]] = []
     if edge_bps is not None and edge_bps <= 0.0:
         checks.append({"code": "non_positive_net_edge", "field": edge_field, "value": edge_bps})
-    if gross_bps is not None and cost_bps is not None and gross_bps < cost_bps + FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS:
+    if gross_bps is not None and cost_bps is not None and gross_bps <= cost_bps + FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS:
         checks.append({"code": "gross_edge_not_at_least_5bps_above_round_trip_cost", "gross_field": gross_field, "gross_edge_bps": gross_bps, "cost_field": cost_field, "round_trip_cost_bps": cost_bps})
     if "simulated_slippage_exceeds_edge" in flags:
         checks.append({"code": "simulated_slippage_exceeds_edge", "field": "anomaly_flags", "value": sorted(flags)})
@@ -745,7 +747,7 @@ def frontier_paper_net_edge_guard_reason(
     if (
         gross_bps is not None
         and cost_bps is not None
-        and gross_bps < cost_bps + FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS
+        and gross_bps <= cost_bps + FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS
     ):
         checks.append(
             {
@@ -784,6 +786,7 @@ def frontier_paper_net_edge_guard_reason(
 
     if not checks:
         return None
+    fill_gate = frontier_paper_fill_gate_reason(candidate, config)
     return {
         "reason": PAPER_NET_EDGE_GUARD_REASON,
         "paper_only": True,
@@ -793,7 +796,140 @@ def frontier_paper_net_edge_guard_reason(
         "cell": _paper_signal_cell(candidate),
         "net_edge_bps": _frontier_net_edge_bps(candidate),
         "checks": checks,
+        "bounded_reject_reason": None if fill_gate is None else fill_gate.get("reason"),
     }
+
+
+def frontier_paper_fill_gate_reason(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    """Return the bounded frontier paper-fill gate requested by runtime policy."""
+    profile = config if isinstance(config, Mapping) else {}
+    if (
+        not is_frontier_crypto_candidate(candidate)
+        or str(profile.get("mode", "paper")).strip().lower() != "paper"
+        or _as_bool(profile.get("allow_live_trading"), False)
+    ):
+        return None
+
+    checks: list[dict[str, Any]] = []
+    quality_action = _normalize_route_status(candidate.get("quality_action"))
+    if quality_action == "shadow_only":
+        checks.append(
+            {
+                "code": "quality_action_shadow_only",
+                "field": "quality_action",
+                "value": candidate.get("quality_action"),
+            }
+        )
+
+    edge_bps = _finite_float(candidate.get("edge_bps_estimate"))
+    if edge_bps is not None and edge_bps <= 0.0:
+        checks.append(
+            {
+                "code": "edge_bps_estimate_not_positive",
+                "field": "edge_bps_estimate",
+                "value": edge_bps,
+            }
+        )
+
+    gross_bps = _finite_float(candidate.get("gross_edge_bps_estimate"))
+    cost_bps = _finite_float(candidate.get("estimated_round_trip_cost_bps"))
+    if (
+        gross_bps is not None
+        and cost_bps is not None
+        and gross_bps <= cost_bps + FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS
+    ):
+        checks.append(
+            {
+                "code": "gross_edge_not_above_round_trip_cost_plus_buffer",
+                "field": "gross_edge_bps_estimate",
+                "gross_edge_bps": gross_bps,
+                "cost_field": "estimated_round_trip_cost_bps",
+                "estimated_round_trip_cost_bps": cost_bps,
+                "minimum_net_edge_bps": FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS,
+            }
+        )
+
+    anomaly_flags = _coerce_flags(candidate.get("anomaly_flags"))
+    if "simulated_slippage_exceeds_edge" in anomaly_flags:
+        checks.append(
+            {
+                "code": "simulated_slippage_exceeds_edge",
+                "field": "anomaly_flags",
+                "value": sorted(anomaly_flags),
+            }
+        )
+
+    if not checks:
+        return None
+
+    bounded_reason = (
+        FRONTIER_PAPER_FILL_REASON_SHADOW_ONLY_QUALITY
+        if any(check.get("code") == "quality_action_shadow_only" for check in checks)
+        else FRONTIER_PAPER_FILL_REASON_NET_EDGE_FLOOR
+    )
+    return {
+        "reason": bounded_reason,
+        "paper_only": True,
+        "paper_fill_allowed": False,
+        "guard": "frontier_paper_fill_gate",
+        "candidate": _candidate_reference(candidate),
+        "cell": _paper_signal_cell(candidate),
+        "net_edge_bps": _frontier_net_edge_bps(candidate),
+        "checks": checks,
+        "trigger_codes": [str(check.get("code")) for check in checks if check.get("code")],
+    }
+
+
+def apply_frontier_paper_fill_gate(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any]:
+    """Apply the bounded frontier paper-fill gate without touching live mode."""
+    gated = dict(candidate)
+    reason = frontier_paper_fill_gate_reason(gated, config)
+    if reason is None:
+        gated["frontier_paper_fill_gate"] = {
+            "guard": "frontier_paper_fill_gate",
+            "paper_only": True,
+            "paper_fill_allowed": True,
+            "reason": None,
+            "checks": [],
+            "trigger_codes": [],
+        }
+        gated["paper_fill_gate_blocked"] = False
+        gated["paper_fill_gate_reason"] = None
+        gated["paper_fill_gate_trigger_codes"] = []
+        return gated
+
+    gated["frontier_paper_fill_gate"] = dict(reason)
+    gated["paper_fill_gate_blocked"] = True
+    gated["paper_fill_gate_reason"] = reason["reason"]
+    gated["paper_fill_gate_trigger_codes"] = list(reason.get("trigger_codes") or [])
+    gated["shadow_filtered"] = True
+    gated["paper_fill_allowed"] = False
+    gated["paper_eligible"] = False
+    gated["paper_action"] = "shadow_only"
+    gated["paper_status"] = "shadow_only"
+    gated["paper_fill_status"] = "shadow_only"
+    gated["paper_order_status"] = "shadow_only"
+    gated["router_action"] = "shadow_only"
+    gated["candidate_status"] = "shadow_only"
+    gated["candidate_reject_reason"] = reason["reason"]
+    gated["candidate_reject_detail"] = dict(reason)
+    gated["shadow_reason"] = reason["reason"]
+    gated["paper_observation_only"] = True
+    gated["paper_observation_reason"] = reason["reason"]
+    gated["paper_score_eligible"] = False
+    gated["paper_score_multiplier"] = 0.0
+    gated["paper_rank_eligible"] = False
+    gated["promotion_eligible"] = False
+    gated["paper_entry_blocked"] = True
+    gated["paper_allocation_multiplier"] = 0.0
+    gated["frontier_net_edge_bps"] = reason.get("net_edge_bps")
+    return gated
 
 
 def annotate_frontier_paper_cost_diagnostic(candidate: Mapping[str, Any]) -> dict[str, Any]:

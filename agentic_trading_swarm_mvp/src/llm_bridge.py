@@ -1703,6 +1703,9 @@ def _compact_frontier_crypto(report: dict) -> dict:
                 "route_blockers": (row.get("execution_feasibility") or {}).get("route_blockers", []),
                 "best_route_alternative": (row.get("execution_feasibility") or {}).get("best_route_alternative"),
                 "candidate_reject_reason": row.get("candidate_reject_reason"),
+                "paper_fill_gate_blocked": row.get("paper_fill_gate_blocked"),
+                "paper_fill_gate_reason": row.get("paper_fill_gate_reason"),
+                "paper_fill_gate_trigger_codes": row.get("paper_fill_gate_trigger_codes", [])[:5],
             }
         )
     return {
@@ -1754,9 +1757,17 @@ def _compact_frontier_gap_summary(report: dict) -> dict:
         "route_feasibility_shadow_candidates": int(
             candidate_activity.get("route_feasibility_shadow_candidates") or 0
         ),
+        "paper_fill_gate_blocked_candidates": int(
+            candidate_activity.get("paper_fill_gate_blocked_candidates") or 0
+        ),
         "marketability_conservative_route_candidates": int(
             candidate_activity.get("marketability_conservative_route_candidates") or 0
         ),
+    }
+    paper_fill_gate_counts = {
+        "blocked_candidates": int(candidate_activity.get("paper_fill_gate_blocked_candidates") or 0),
+        "reason_counts": dict(candidate_activity.get("paper_fill_gate_reason_counts") or {}),
+        "trigger_counts": dict(candidate_activity.get("paper_fill_gate_trigger_counts") or {}),
     }
 
     priority_gaps = []
@@ -1823,6 +1834,7 @@ def _compact_frontier_gap_summary(report: dict) -> dict:
         "quote_gap_counts": quote_gap_counts,
         "venue_health_gap_counts": venue_health_gap_counts,
         "directive_hygiene_gap_counts": directive_hygiene_gap_counts,
+        "paper_fill_gate_counts": paper_fill_gate_counts,
         "priority_gaps": priority_gaps[:5],
     }
 

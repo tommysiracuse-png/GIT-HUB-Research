@@ -196,6 +196,69 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
         self.assertEqual(1, counters["accepted"])
         self.assertEqual(0, counters["shadowed"])
 
+    def test_frontier_fill_gate_uses_bounded_net_edge_reason(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        candidate = {
+            "venue": "COINBASE",
+            "inst_id": "COINBASE:ETH-USD",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "market_surface": "frontier_crypto_venue_map",
+            "frontier_paper_admission_guard_applies": True,
+            "last": 100.0,
+            "edge_bps_estimate": 0.0,
+            "gross_edge_bps_estimate": 25.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "quality_status": "verified",
+            "quality_action": "normal",
+            "anomaly_flags": [],
+        }
+        review = {"paper_allocation_multiplier": 1.0, "net_edge_bps_estimate": 0.0}
+
+        execution = execute_order(conn, candidate, review, DEFAULT_SETTINGS)
+
+        self.assertFalse(execution["paper_filled"])
+        self.assertEqual("shadow_only", execution["order"]["status"])
+        self.assertEqual("net_edge_floor_failed", execution["candidate"]["candidate_reject_reason"])
+        observation = conn.execute(
+            "select reject_reason from frontier_paper_shadow_observations"
+        ).fetchone()
+        self.assertEqual("net_edge_floor_failed", observation["reject_reason"])
+
+    def test_frontier_fill_gate_uses_bounded_shadow_only_quality_reason(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        candidate = {
+            "venue": "OKX_SPOT",
+            "inst_id": "OKX_SPOT:STRK-USDT",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "market_surface": "frontier_crypto_venue_map",
+            "frontier_paper_admission_guard_applies": True,
+            "last": 1.0,
+            "score": 95.4,
+            "edge_bps_estimate": 16.0,
+            "gross_edge_bps_estimate": 30.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "quality_status": "degraded",
+            "quality_action": "shadow_only",
+            "anomaly_flags": ["depth_cliff"],
+        }
+        review = {"paper_allocation_multiplier": 1.0, "net_edge_bps_estimate": 16.0}
+
+        execution = execute_order(conn, candidate, review, DEFAULT_SETTINGS)
+
+        self.assertFalse(execution["paper_filled"])
+        self.assertEqual("shadow_only", execution["order"]["status"])
+        self.assertEqual("shadow_only_quality_gate", execution["candidate"]["candidate_reject_reason"])
+        observation = conn.execute(
+            "select reject_reason from frontier_paper_shadow_observations"
+        ).fetchone()
+        self.assertEqual("shadow_only_quality_gate", observation["reject_reason"])
+
     def test_yahoo_proxy_freshness_shadow_only_candidate_opens_synthetic_research_trade(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

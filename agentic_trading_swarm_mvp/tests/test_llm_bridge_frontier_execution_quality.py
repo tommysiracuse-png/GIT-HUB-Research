@@ -134,6 +134,11 @@ class FrontierExecutionQualityPacketTests(unittest.TestCase):
                                     "active_paper_review_candidates": 9,
                                     "regional_admitted_candidates": 0,
                                     "route_feasibility_shadow_candidates": 3,
+                                    "paper_fill_gate_blocked_candidates": 4,
+                                    "paper_fill_gate_reason_counts": {
+                                        "net_edge_floor_failed": 3,
+                                        "shadow_only_quality_gate": 1,
+                                    },
                                 },
                                 "by_quote_normalization": {
                                     "unsupported_quote": 4,
@@ -162,6 +167,8 @@ class FrontierExecutionQualityPacketTests(unittest.TestCase):
         self.assertEqual(9, gap_summary["active_paper_review_candidates"])
         self.assertEqual(30.09, gap_summary["depth_enrichment_rate_pct"])
         self.assertEqual(162, gap_summary["quote_gap_counts"]["needs_same_venue_stablecoin_reference"])
+        self.assertEqual(4, gap_summary["paper_fill_gate_counts"]["blocked_candidates"])
+        self.assertEqual(3, gap_summary["paper_fill_gate_counts"]["reason_counts"]["net_edge_floor_failed"])
         self.assertEqual("request_quote_adapter", gap_summary["priority_gaps"][0]["recommended_request"])
         self.assertIn("Frontier gap summary", markdown)
 
