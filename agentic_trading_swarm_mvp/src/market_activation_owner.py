@@ -265,15 +265,35 @@ def sync_backlog(conn: sqlite3.Connection, settings: dict) -> dict[str, Any]:
     }
 
 
+def _task_surface_members(task: dict[str, Any]) -> list[str]:
+    adapter = _runtime_adapter(task)
+    members: list[str] = []
+    raw_members = adapter.get("activation_surface_members")
+    if isinstance(raw_members, dict):
+        raw = raw_members.get(task["market_surface"])
+        if isinstance(raw, (list, tuple, set)):
+            members.extend(str(item).strip() for item in raw if str(item).strip())
+    members.append(str(task["market_surface"]).strip())
+    output: list[str] = []
+    seen = set()
+    for member in members:
+        if member and member not in seen:
+            output.append(member)
+            seen.add(member)
+    return output or [str(task["market_surface"]).strip() or "unknown"]
+
+
 def _admission_metrics(conn: sqlite3.Connection, task: dict[str, Any]) -> dict[str, Any]:
+    members = _task_surface_members(task)
+    placeholders = ",".join("?" for _ in members)
     rows = conn.execute(
-        """
-        select admission_key,current_stage,highest_stage,health_status,blocker_code,
+        f"""
+        select admission_key,market_surface,current_stage,highest_stage,health_status,blocker_code,
                eligible_scans,stalled_eligible_scans,details_json
         from market_admission_states
-        where upper(venue)=? and market_surface=?
+        where upper(venue)=? and market_surface in ({placeholders})
         """,
-        (str(task["venue"]).upper(), task["market_surface"]),
+        [str(task["venue"]).upper(), *members],
     ).fetchall()
     matched = []
     for row in rows:
@@ -298,6 +318,10 @@ def _admission_metrics(conn: sqlite3.Connection, task: dict[str, Any]) -> dict[s
         "eligible_scans": max([int(row.get("eligible_scans") or 0) for row in matched], default=0),
         "stalled_eligible_scans": max([int(row.get("stalled_eligible_scans") or 0) for row in matched], default=0),
         "sample_admission_keys": [str(row["admission_key"]) for row in matched[:10]],
+        "matched_market_surfaces": sorted(
+            {str(row.get("market_surface") or "") for row in matched if str(row.get("market_surface") or "").strip()}
+            | {member for member in members if matched}
+        ),
     }
 
 

@@ -133,6 +133,15 @@ def _write_report(report: dict) -> None:
     REPORT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _activation_surface(row: dict[str, Any]) -> str:
+    return str(
+        row.get("activation_market_surface")
+        or row.get("market_surface")
+        or row.get("market_type")
+        or "unknown"
+    )
+
+
 def build_scan_batch(settings: dict) -> ScanBatch:
     cfg = settings.get("public_market_adapters") or {}
     if not cfg.get("enabled", True):
@@ -198,11 +207,13 @@ def build_scan_batch(settings: dict) -> ScanBatch:
         source_status = str(batch.metadata.get("source_status") or "unknown")
         statuses[source_status] += 1
         venues[str(info.venue)] += len(batch_observations)
-        batch_surfaces = Counter(
-            str(row.get("market_surface") or row.get("market_type") or "unknown")
-            for row in batch_observations
-        )
+        batch_surfaces = Counter(_activation_surface(row) for row in batch_observations)
         surfaces.update(batch_surfaces)
+        activation_surface_members: dict[str, set[str]] = {}
+        for row in batch_observations:
+            activation_surface = _activation_surface(row)
+            detailed_surface = str(row.get("market_surface") or row.get("market_type") or activation_surface)
+            activation_surface_members.setdefault(activation_surface, set()).add(detailed_surface)
         available_fields = sorted(
             {
                 str(key)
@@ -227,6 +238,10 @@ def build_scan_batch(settings: dict) -> ScanBatch:
                     if row.get("direction") == "watch_only" or row.get("candidate_reject_reason")
                 ),
                 "market_surfaces": dict(batch_surfaces),
+                "activation_surface_members": {
+                    surface: sorted(members)
+                    for surface, members in sorted(activation_surface_members.items())
+                },
                 "sample_instruments": [
                     str(row.get("inst_id") or row.get("instrument_id"))
                     for row in batch_observations

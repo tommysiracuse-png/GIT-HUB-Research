@@ -58,6 +58,8 @@ class MarketActivationOwnerTests(unittest.TestCase):
         price_observations: int = 0,
         candidates: int = 0,
         source_status: str = "reachable",
+        market_surfaces: dict[str, int] | None = None,
+        activation_surface_members: dict[str, list[str]] | None = None,
     ) -> None:
         self.report_json.write_text(
             json.dumps(
@@ -73,7 +75,8 @@ class MarketActivationOwnerTests(unittest.TestCase):
                             "price_observation_count": price_observations,
                             "candidate_count": candidates,
                             "research_only_count": 4,
-                            "market_surfaces": {"test_exchange_spot_market": 4},
+                            "market_surfaces": market_surfaces or {"test_exchange_spot_market": 4},
+                            "activation_surface_members": activation_surface_members or {},
                             "sample_instruments": ["TEST_EXCHANGE:ABC_USD"],
                             "available_fields": ["inst_id", "last", "bid", "ask", "observed_at"],
                             "docs_url": "https://example.test/public-market-data",
@@ -88,7 +91,7 @@ class MarketActivationOwnerTests(unittest.TestCase):
     def _task(self) -> sqlite3.Row:
         return self.conn.execute("select * from market_activation_tasks").fetchone()
 
-    def _insert_admission(self, stage: str = "priceable") -> None:
+    def _insert_admission(self, stage: str = "priceable", *, market_surface: str = "test_exchange_spot_market") -> None:
         self.conn.execute(
             """
             insert into market_admission_states(
@@ -98,12 +101,12 @@ class MarketActivationOwnerTests(unittest.TestCase):
                 first_seen_at,last_seen_at,last_advanced_at,details_json
             ) values(
                 'admission-test','TEST_EXCHANGE','TEST_EXCHANGE:ABC_USD','public',
-                'test_exchange_spot_market','adapter_observation',?,?, 'healthy',null,'continuous',
+                ?,'adapter_observation',?,?, 'healthy',null,'continuous',
                 4,4,0,0,'2026-08-05T12:00:00+00:00','2026-08-05T12:05:00+00:00',
                 '2026-08-05T12:05:00+00:00',?
             )
             """,
-            (stage, stage, json.dumps({"adapter_id": "test_exchange_spot"})),
+            (market_surface, stage, stage, json.dumps({"adapter_id": "test_exchange_spot"})),
         )
         self.conn.commit()
 
@@ -143,6 +146,28 @@ class MarketActivationOwnerTests(unittest.TestCase):
         self.assertEqual("observation_program", experiment["experiment_type"])
         self.assertNotIn("strategy_logic", experiment)
         self.assertEqual("test_exchange_spot", experiment["data_requirements"]["adapter_id"])
+
+    def test_activation_surface_members_advance_existing_umbrella_task(self) -> None:
+        self._write_adapter_report(
+            price_observations=4,
+            candidates=0,
+            market_surfaces={"test_exchange_reference_family": 4},
+            activation_surface_members={
+                "test_exchange_reference_family": ["test_exchange_price_card", "test_exchange_milestones"]
+            },
+        )
+        with self._patch_paths():
+            owner.run_once(self.conn, self.settings, execute_turn=False, cycle_id="cycle-1")
+        self._insert_admission("priceable", market_surface="test_exchange_price_card")
+
+        with self._patch_paths():
+            report = owner.run_once(self.conn, self.settings, execute_turn=False, cycle_id="cycle-2")
+
+        task = self._task()
+        self.assertEqual("test_exchange_reference_family", task["market_surface"])
+        self.assertEqual("strategy_handoff", task["status"])
+        self.assertTrue(task["strategy_owner_task_id"])
+        self.assertEqual(1, len(report["strategy_handoffs"]))
 
     def test_codex_turn_owns_full_runtime_chain_not_just_adapter_file(self) -> None:
         self._write_adapter_report(price_observations=0, candidates=0)

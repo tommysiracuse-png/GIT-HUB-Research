@@ -226,6 +226,15 @@ class IndonesiaCommodityDerivativesExchangeIcdxAdapterTests(unittest.TestCase):
         report = batch.metadata["public_market_adapters"]
         self.assertEqual(adapter_id, report["adapters"][0]["adapter_id"])
         self.assertEqual("reachable", report["adapters"][0]["source_status"])
+        self.assertEqual({"icdx_gofx_cpotr_public_reference": 7}, report["adapters"][0]["market_surfaces"])
+        self.assertIn(
+            "icdx_cpotr",
+            report["adapters"][0]["activation_surface_members"]["icdx_gofx_cpotr_public_reference"],
+        )
+        self.assertIn(
+            "icdx_exchange_milestones",
+            report["adapters"][0]["activation_surface_members"]["icdx_gofx_cpotr_public_reference"],
+        )
         self.assertEqual(456, report["adapters"][0]["adapter_spec_id"])
 
 
