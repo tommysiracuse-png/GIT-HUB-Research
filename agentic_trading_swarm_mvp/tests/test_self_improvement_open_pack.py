@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import sqlite3
 import sys
@@ -136,6 +137,70 @@ class SelfImprovementOpenPackTests(unittest.TestCase):
         self.assertEqual(statuses[78527], pack.IMPLEMENTED_STATUS)
         self.assertEqual(statuses[74464], pack.DEDUPED_STATUS)
         self.assertEqual(conn.execute("select count(*) as n from growth_experiments").fetchone()["n"], 2)
+
+    def test_yahoo_proxy_decay_analysis_localizes_stale_cross_surface_cohorts(self) -> None:
+        conn = make_conn()
+        trades = [
+            ("ALPHA", "long_proxy", "proxy", 300.0, 2.0, "emea", "Europe/London", {60: 20.0, 240: 10.0}),
+            ("BETA", "long_proxy", "proxy", 600.0, 3.0, "emea", "Europe/London", {60: 10.0, 240: 5.0}),
+            ("GAMMA", "short_proxy", "cross_surface", 5400.0, 14.0, "apac", "Asia/Tokyo", {60: -40.0, 240: -30.0}),
+            ("DELTA", "short_proxy", "cross_surface", 7200.0, 18.0, "apac", "Asia/Tokyo", {60: -50.0, 240: -35.0}),
+        ]
+        for symbol, direction, route_surface, provider_age, spread_bps, region, timezone, outcomes in trades:
+            candidate = {
+                "route_surface": route_surface,
+                "provider_age_seconds": provider_age,
+                "spread_bps": spread_bps,
+                "region": region,
+                "timezone": timezone,
+            }
+            cur = conn.execute(
+                """
+                insert into paper_trades (
+                    opened_at, venue, inst_id, direction, trade_type, signal_key,
+                    base_score, learned_score, entry, status, thesis,
+                    candidate_json, review_json, context_json
+                ) values (?, 'YAHOO_PROXY', ?, ?, 'global_proxy_momentum', ?, 70, 70, 100, 'closed', 'test', ?, '{}', ?)
+                """,
+                (
+                    utc_now(),
+                    symbol,
+                    direction,
+                    f"YAHOO_PROXY|global_proxy_momentum|{direction}|standard",
+                    json.dumps(candidate),
+                    json.dumps({"route_surface": route_surface, "region": region, "timezone": timezone}),
+                ),
+            )
+            trade_id = cur.lastrowid
+            for horizon, pnl in outcomes.items():
+                conn.execute(
+                    """
+                    insert into paper_trade_outcomes (
+                        trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                        context_json, measurement_status, delay_seconds
+                    ) values (?, ?, ?, 100, ?, '{}', 'valid', 5)
+                    """,
+                    (trade_id, horizon, utc_now(), pnl),
+                )
+        conn.commit()
+
+        report = pack.build_open_pack_report(conn, DEFAULT_SETTINGS)
+        analysis = report["signal_repair_diagnostics"]["yahoo_proxy_decay_analysis"]
+
+        self.assertEqual(8, analysis["reliable_label_count"])
+        self.assertEqual(4, analysis["unique_trade_count"])
+        self.assertEqual(60, analysis["primary_horizon_minutes"])
+        self.assertEqual(15.0, analysis["direction_horizon_curves"]["long_proxy"]["60"]["avg_pnl_bps"])
+        self.assertEqual(-45.0, analysis["direction_horizon_curves"]["short_proxy"]["60"]["avg_pnl_bps"])
+        self.assertEqual("cross_surface", analysis["route_surface_outcomes"][0]["route_surface"])
+        self.assertEqual(-45.0, analysis["route_surface_outcomes"][0]["avg_pnl_bps"])
+        self.assertEqual("apac|Asia/Tokyo", analysis["proxy_cohort_outcomes"][0]["proxy_cohort"])
+        self.assertEqual("stale_gt_60m", analysis["signal_age_outcomes"][0]["signal_age_bucket"])
+        self.assertTrue(analysis["localization_summary"]["localized_decay_detected"])
+        self.assertIn("route_surface_mismatch", analysis["localization_summary"]["likely_decay_sources"])
+        self.assertIn("stale_proxy_concentration", analysis["localization_summary"]["likely_decay_sources"])
+        self.assertIn("regional_time_zone_cohort_mismatch", analysis["localization_summary"]["likely_decay_sources"])
+        self.assertIn("directional_asymmetry", analysis["localization_summary"]["likely_decay_sources"])
 
     def test_duplicate_text_matches_open_pack_scope(self) -> None:
         self.assertTrue(pack.is_duplicate_open_pack_text("Add Kalshi read-only public event market coverage"))
