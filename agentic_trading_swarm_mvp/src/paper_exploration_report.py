@@ -83,7 +83,11 @@ def build_paper_exploration_report(
         ):
             continue
         cycle_quarantined_count += 1
-        if str(review.get("decision") or "").strip() in {"approve_paper_trade", "approve_conditional_paper_trade"}:
+        if (
+            record.get("paper_fill_allowed")
+            and str(review.get("decision") or "").strip()
+            in {"approve_paper_trade", "approve_conditional_paper_trade"}
+        ):
             cycle_would_have_filled_count += 1
     decay_quarantine = {
         **decay_quarantine,

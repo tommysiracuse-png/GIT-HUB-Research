@@ -314,6 +314,32 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             )
             conn.close()
 
+    def test_runtime_report_cycle_would_have_filled_count_ignores_hard_quarantine_reviews(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            settings = copy.deepcopy(self.settings)
+            settings["paper_exploration"]["enabled"] = False
+            rows, _ = apply_strategy_reliability([self.candidate()], settings, conn=conn)
+            blocked = rows[0]
+
+            self.assertFalse(blocked["paper_okx_basis_decay_quarantine"]["paper_fill_allowed"])
+
+            paper_report = build_paper_exploration_report(
+                conn,
+                settings,
+                reviewed=[
+                    {"candidate": blocked, "review": {"decision": "approve_paper_trade"}},
+                ],
+            )
+
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["current_cycle_quarantined_count"])
+            self.assertEqual(0, paper_report["okx_basis_decay_quarantine"]["current_cycle_would_have_filled_count"])
+            self.assertEqual(
+                0,
+                paper_report["summary"]["okx_basis_decay_quarantine_current_cycle_would_have_filled_count"],
+            )
+            conn.close()
+
     def test_runtime_report_releases_after_the_fourteen_day_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
