@@ -45,6 +45,12 @@ CONTEXT_PENALTY_SCOPES = (
     "paper_policy",
     "strategy_reliability",
 )
+PAPER_CONTEXT_PRIOR_POLICY_KEY = "paper_context_priors"
+PAPER_CONTEXT_PRIOR_SCOPES = (
+    "paper",
+    "paper_policy",
+    "strategy_reliability",
+)
 PAPER_CONTEXT_PRIOR_DEFAULTS = {
     "enabled": True,
     "paper_only": True,
@@ -3235,9 +3241,19 @@ def _paper_context_prior_policy(config: Mapping[str, Any] | None) -> dict[str, A
     )
     if not isinstance(config, Mapping):
         return policy
-    configured = config.get("paper_context_priors")
+    configured_blocks: list[Mapping[str, Any]] = []
+    configured = config.get(PAPER_CONTEXT_PRIOR_POLICY_KEY)
     if isinstance(configured, Mapping):
-        for key, value in configured.items():
+        configured_blocks.append(configured)
+    for scope in PAPER_CONTEXT_PRIOR_SCOPES:
+        scoped = config.get(scope)
+        if not isinstance(scoped, Mapping):
+            continue
+        nested = scoped.get(PAPER_CONTEXT_PRIOR_POLICY_KEY)
+        if isinstance(nested, Mapping):
+            configured_blocks.append(nested)
+    for block in configured_blocks:
+        for key, value in block.items():
             if key == "venue_direction_feasibility_priors" and isinstance(value, Mapping):
                 policy[key].update(value)
             elif key == "venue_direction_priors" and isinstance(value, Mapping):
@@ -3266,6 +3282,10 @@ def _paper_context_prior_active(candidate: Mapping[str, Any], config: Mapping[st
     combined: list[Mapping[str, Any]] = [candidate]
     if isinstance(config, Mapping):
         combined.insert(0, config)
+        for scope in PAPER_CONTEXT_PRIOR_SCOPES:
+            scoped = config.get(scope)
+            if isinstance(scoped, Mapping):
+                combined.insert(1, scoped)
     paper_mode_confirmed = False
     for scope in combined:
         if _as_bool(scope.get("allow_live_trading"), False):

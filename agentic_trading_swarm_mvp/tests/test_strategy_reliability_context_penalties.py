@@ -226,6 +226,77 @@ class StrategyReliabilityContextPenaltyTests(unittest.TestCase):
         self.assertEqual(candidate["score"], 60.0)
         self.assertNotIn("paper_context_prior", candidate)
 
+    def test_context_priors_honor_nested_scoped_policy_overrides(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "asset_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "conditional"},
+        }
+
+        detail = sr.apply_paper_context_priors(
+            candidate,
+            {
+                "mode": "paper",
+                "allow_live_trading": False,
+                "strategy_reliability": {
+                    "paper_context_priors": {
+                        "feasibility_conditional_prior": -14.0,
+                        "venue_direction_feasibility_priors": {
+                            "OKX_SPOT|long|conditional": -5.0,
+                        },
+                        "realized_context_stats": {
+                            "OKX_SPOT|long|conditional": {
+                                "closed_count": 10,
+                                "avg_pnl_bps": -10.0,
+                                "win_rate": 0.4,
+                            }
+                        },
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(detail["feasibility_prior"], -14.0)
+        self.assertEqual(detail["context_slice_prior"], -5.0)
+        self.assertTrue(detail["realized_context_persistent_negative"])
+        self.assertEqual(detail["realized_context_prior"], -7.875)
+        self.assertEqual(detail["raw_total_prior"], -22.875)
+        self.assertEqual(candidate["score"], 35.0)
+        self.assertEqual(candidate["paper_context_prior_status"], "ranked_hard_gated")
+
+    def test_context_priors_are_inert_for_nested_live_scope(self) -> None:
+        candidate = {
+            "score": 60.0,
+            "venue": "OKX",
+            "asset_surface": "spot",
+            "direction": "long_frontier_spot",
+            "trade_type": "spot_carry",
+            "liquidity_score": 0.8,
+            "execution_feasibility": {"status": "standard"},
+        }
+
+        detail = sr.apply_paper_context_priors(
+            candidate,
+            {
+                "strategy_reliability": {
+                    "mode": "live",
+                    "paper_context_priors": {
+                        "venue_direction_feasibility_priors": {
+                            "OKX_SPOT|long|standard": 20.0,
+                        }
+                    },
+                }
+            },
+        )
+
+        self.assertIsNone(detail)
+        self.assertEqual(candidate["score"], 60.0)
+        self.assertNotIn("paper_context_prior", candidate)
+
     def test_context_penalties_disabled_by_default(self) -> None:
         candidate = {
             "score": 50.0,
