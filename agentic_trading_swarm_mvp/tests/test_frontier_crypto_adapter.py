@@ -937,6 +937,52 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual("unsupported", report["per_venue_status"]["status"])
         self.assertFalse(report["entry_blocked"])
 
+    def test_ranking_shadow_labels_exact_unsupported_conditional_short_without_blocking_emission(self) -> None:
+        candidate = {
+            "venue": "MEXC",
+            "inst_id": "MEXC:EDGE-USDT",
+            "direction": "short_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "score": 70.0,
+            "dislocation_quality_score": 65.0,
+            "effective_edge_bps": 18.0,
+            "estimated_fee_bps_per_side": 10.0,
+            "gross_edge_bps_estimate": 32.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "freshness_age_seconds": 2.0,
+            "execution_feasibility": {"status": "conditional", "route_status": "conditional"},
+            "quality_action": "normal",
+            "anomaly_flags": [],
+        }
+
+        ranked = frontier.rank_frontier_paper_candidates([candidate], settings())
+
+        self.assertEqual([candidate], ranked)
+        self.assertFalse(candidate.get("paper_entry_blocked", False))
+        self.assertFalse(candidate["paper_active_scoring_eligible"])
+        self.assertTrue(candidate["paper_route_feasibility_shadow_label"])
+        self.assertEqual(
+            "conditional_short_exact_route_unsupported",
+            candidate["route_feasibility_reason"],
+        )
+        self.assertEqual(
+            "route_feasibility_shadow_only",
+            candidate["paper_quality_filter_status"],
+        )
+        self.assertLess(candidate["paper_ranking_score"], 20.0)
+        report = candidate["frontier_short_spot_route_requirements_report"]
+        self.assertEqual(
+            "conditional_short_exact_route_unsupported",
+            report["route_feasibility_reason"],
+        )
+        summary = frontier.summarize([], ranked)
+        self.assertEqual(0, summary["active_paper_review_candidate_count"])
+        self.assertEqual(1, summary["shadow_or_observe_only_candidate_count"])
+        self.assertEqual(
+            1,
+            summary["candidate_activity"]["route_feasibility_shadow_candidates"],
+        )
+
     def test_short_cost_decomposition_prices_short_friction_without_blocking_paper(self) -> None:
         cfg = settings()
         local = self._quality_obs("FRONTIER", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)

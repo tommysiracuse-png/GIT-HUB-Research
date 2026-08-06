@@ -5648,6 +5648,8 @@ DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_POLICY = {
     "unsupported_behavior": "suppress",
     "unknown_behavior": "penalize",
     "unknown_multiplier": 0.75,
+    "exact_unsupported_multiplier": 0.15,
+    "generic_unsupported_multiplier": 0.15,
     "margin_permission_multiplier": 0.96,
     "borrow_check_multiplier": 0.94,
     "fee_bps_reference": 10.0,
@@ -6378,6 +6380,145 @@ def _paper_only_is_conditional_short_context(direction: str, context_stats: dict
     return False
 
 
+def _paper_only_frontier_short_route_feasibility_reason(
+    *,
+    venue: str,
+    direction: str,
+    context_stats: dict | None = None,
+    registry: dict | None = None,
+) -> dict:
+    """Classify paper-only frontier short route confidence without blocking emission."""
+
+    stats = context_stats or {}
+    normalized_direction = str(direction or "").strip().lower()
+    route_status = ""
+    for container in (
+        stats,
+        stats.get("execution_feasibility"),
+        stats.get("execution_route"),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for field in ("route_status", "status", "paper_route_status"):
+            value = str(container.get(field) or "").strip().lower()
+            if value:
+                route_status = value
+                break
+        if route_status:
+            break
+    applies = bool(
+        "short" in normalized_direction
+        and (
+            route_status in {"conditional", "route_unknown", "unsupported_or_unknown"}
+            or _paper_only_is_conditional_short_context(direction, stats)
+        )
+    )
+    if not applies:
+        return {
+            "applies": False,
+            "route_feasibility_reason": "not_applicable",
+            "shadow_label": False,
+            "active_scoring_eligible": True,
+            "explicit_borrow_ok": False,
+            "verified_standard_route": False,
+            "route_registry_status": "not_applicable",
+            "route_requirement_support_status": "not_applicable",
+        }
+
+    route_registry = stats.get("paper_route_registry")
+    if not isinstance(route_registry, dict):
+        trade_type = str(stats.get("trade_type") or "frontier_crypto_venue_map").strip().lower()
+        route_registry = assess_paper_route_registry(
+            {
+                "venue": venue,
+                "trade_type": trade_type,
+                "direction": normalized_direction,
+            }
+        )
+    generic_requirements = paper_only_conditional_short_route_requirements(
+        venue=venue,
+        registry=registry,
+    )
+    registry_status = str(route_registry.get("support_status") or "unspecified").strip().lower()
+    generic_status = str(generic_requirements.get("support_status") or "unknown").strip().lower()
+
+    explicit_borrow_ok = False
+    for container in (
+        stats,
+        stats.get("execution_feasibility"),
+        stats.get("execution_route"),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for field in (
+            "borrow_confirmed",
+            "borrowable",
+            "spot_borrow_confirmed",
+            "spot_borrow_available",
+            "borrow_ok",
+        ):
+            if _paper_only_is_truthy(container.get(field)):
+                explicit_borrow_ok = True
+                break
+        if explicit_borrow_ok:
+            break
+        for field in (
+            "borrow_status",
+            "borrow_availability",
+            "borrow_availability_status",
+            "spot_borrow_status",
+        ):
+            status = str(container.get(field) or "").strip().lower()
+            if status in {"confirmed", "configured", "available"}:
+                explicit_borrow_ok = True
+                break
+        if explicit_borrow_ok:
+            break
+
+    verified_standard_route = bool(
+        route_status in {"standard", "executable", "feasible", "supported"}
+        or registry_status == "supported"
+        or (
+            registry_status in {"", "unknown", "unspecified"}
+            and generic_status == "supported"
+        )
+    )
+    if explicit_borrow_ok:
+        reason = "explicit_borrow_ok"
+        shadow_label = False
+        active_scoring_eligible = True
+    elif verified_standard_route:
+        reason = (
+            "supported_venue_short_route_exception"
+            if registry_status in {"", "unknown", "unspecified"} and generic_status == "supported"
+            else "verified_standard_short_route"
+        )
+        shadow_label = False
+        active_scoring_eligible = True
+    elif registry_status == "unsupported":
+        reason = "conditional_short_exact_route_unsupported"
+        shadow_label = True
+        active_scoring_eligible = False
+    elif generic_status == "unsupported":
+        reason = "conditional_short_generic_route_unsupported"
+        shadow_label = True
+        active_scoring_eligible = False
+    else:
+        reason = "conditional_short_support_unknown"
+        shadow_label = False
+        active_scoring_eligible = True
+    return {
+        "applies": True,
+        "route_feasibility_reason": reason,
+        "shadow_label": shadow_label,
+        "active_scoring_eligible": active_scoring_eligible,
+        "explicit_borrow_ok": explicit_borrow_ok,
+        "verified_standard_route": verified_standard_route,
+        "route_registry_status": registry_status,
+        "route_requirement_support_status": generic_status,
+    }
+
+
 def paper_only_conditional_short_route_feasibility_gate(
     *,
     venue: str,
@@ -6392,6 +6533,12 @@ def paper_only_conditional_short_route_feasibility_gate(
     merged_policy = copy.deepcopy(DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_POLICY)
     if isinstance(policy, dict):
         merged_policy.update(policy)
+    route_review = _paper_only_frontier_short_route_feasibility_reason(
+        venue=venue,
+        direction=direction,
+        context_stats=context_stats,
+        registry=registry,
+    )
 
     if not enabled or not bool(merged_policy.get("enabled", True)):
         return {
@@ -6405,16 +6552,22 @@ def paper_only_conditional_short_route_feasibility_gate(
             "route_requirements": None,
         }
 
-    if not _paper_only_is_conditional_short_context(direction, context_stats):
+    if not route_review.get("applies", False):
         return {
             "enabled": True,
             "applied": False,
             "allow": True,
             "suppressed": False,
             "score_multiplier": 1.0,
-            "reason": "not_applicable",
-            "reasons": ["not_applicable"],
+            "reason": route_review.get("route_feasibility_reason", "not_applicable"),
+            "reasons": [route_review.get("route_feasibility_reason", "not_applicable")],
             "route_requirements": None,
+            "route_feasibility_reason": route_review.get("route_feasibility_reason", "not_applicable"),
+            "active_scoring_eligible": bool(route_review.get("active_scoring_eligible", True)),
+            "shadow_label": bool(route_review.get("shadow_label", False)),
+            "route_registry_status": route_review.get("route_registry_status"),
+            "verified_standard_route": bool(route_review.get("verified_standard_route", False)),
+            "explicit_borrow_ok": bool(route_review.get("explicit_borrow_ok", False)),
         }
 
     requirements = paper_only_conditional_short_route_requirements(venue=venue, registry=registry)
@@ -6423,14 +6576,26 @@ def paper_only_conditional_short_route_feasibility_gate(
     suppressed = False
     allow = True
     score_multiplier = 1.0
+    if route_review.get("shadow_label", False):
+        reasons.append(str(route_review.get("route_feasibility_reason") or "conditional_short_exact_route_unsupported"))
+        if str(route_review.get("route_registry_status") or "").strip().lower() == "unsupported":
+            score_multiplier *= max(
+                0.0,
+                min(1.0, float(merged_policy.get("exact_unsupported_multiplier", 0.15) or 0.15)),
+            )
+        else:
+            score_multiplier *= max(
+                0.0,
+                min(1.0, float(merged_policy.get("generic_unsupported_multiplier", 0.15) or 0.15)),
+            )
 
-    if support_status == "unsupported":
+    if route_review.get("active_scoring_eligible", True) and support_status == "unsupported":
         reasons.append("unsupported_spot_short")
         if str(merged_policy.get("unsupported_behavior", "suppress")).strip().lower() == "suppress":
             suppressed = True
             allow = False
             score_multiplier = 0.0
-    elif support_status == "unknown":
+    elif route_review.get("active_scoring_eligible", True) and support_status == "unknown":
         reasons.append("unknown_spot_short_support")
         if str(merged_policy.get("unknown_behavior", "penalize")).strip().lower() == "suppress":
             suppressed = True
@@ -6474,7 +6639,59 @@ def paper_only_conditional_short_route_feasibility_gate(
         "reason": reasons[0] if reasons else "supported",
         "reasons": reasons or ["supported"],
         "route_requirements": requirements,
+        "route_feasibility_reason": str(
+            route_review.get("route_feasibility_reason") or (reasons[0] if reasons else "supported")
+        ),
+        "active_scoring_eligible": bool(route_review.get("active_scoring_eligible", True)),
+        "shadow_label": bool(route_review.get("shadow_label", False)),
+        "route_registry_status": route_review.get("route_registry_status"),
+        "verified_standard_route": bool(route_review.get("verified_standard_route", False)),
+        "explicit_borrow_ok": bool(route_review.get("explicit_borrow_ok", False)),
     }
+
+
+def _annotate_frontier_route_feasibility_shadow_state(candidate: dict, gate: dict) -> None:
+    """Project non-blocking route-feasibility ranking state into report packets."""
+
+    if not isinstance(candidate, dict) or not isinstance(gate, dict):
+        return
+    reason = str(
+        gate.get("route_feasibility_reason")
+        or gate.get("reason")
+        or "unknown"
+    )
+    active_scoring_eligible = bool(gate.get("active_scoring_eligible", True))
+    shadow_label = bool(gate.get("shadow_label", False))
+    candidate["route_feasibility_reason"] = reason
+    candidate["paper_active_scoring_eligible"] = active_scoring_eligible
+    candidate["paper_route_feasibility_shadow_label"] = shadow_label
+    if shadow_label:
+        candidate["paper_route_feasibility_shadow_reason"] = reason
+
+    report_fields = (
+        "frontier_short_spot_route_intelligence",
+        "frontier_short_spot_route_requirements_report",
+        "paper_route_requirement_report",
+        "route_requirement_summary",
+    )
+    for field in report_fields:
+        report = candidate.get(field)
+        if not isinstance(report, dict):
+            continue
+        report["route_feasibility_reason"] = reason
+        report["paper_active_scoring_eligible"] = active_scoring_eligible
+        report["paper_route_feasibility_shadow_label"] = shadow_label
+        if field == "paper_route_requirement_report":
+            nested = report.get("frontier_short_spot_route_intelligence")
+            if isinstance(nested, dict):
+                nested["route_feasibility_reason"] = reason
+                nested["paper_active_scoring_eligible"] = active_scoring_eligible
+                nested["paper_route_feasibility_shadow_label"] = shadow_label
+            nested = report.get("frontier_short_spot_route_requirements_report")
+            if isinstance(nested, dict):
+                nested["route_feasibility_reason"] = reason
+                nested["paper_active_scoring_eligible"] = active_scoring_eligible
+                nested["paper_route_feasibility_shadow_label"] = shadow_label
 
 
 def paper_only_frontier_score_adjustment(
@@ -6578,6 +6795,10 @@ def paper_only_frontier_score_adjustment(
         "enabled": bool(enabled),
         "allow": allow,
         "suppressed": suppressed,
+        "active_scoring_eligible": bool(
+            route_feasibility_gate.get("active_scoring_eligible", not suppressed)
+        ),
+        "route_feasibility_reason": route_feasibility_gate.get("route_feasibility_reason"),
         "cross_market_gate": cross_market_gate,
         "score_multiplier": max(0.0, min(1.0, score_multiplier)),
         "route_feasibility_gate": route_feasibility_gate,
@@ -10231,6 +10452,14 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             except ImportError:  # pragma: no cover - package import fallback
                 from src.paper_order_router import apply_frontier_paper_admission_guard
             candidate.update(apply_frontier_paper_admission_guard(candidate, settings))
+        route_feasibility_gate = paper_only_conditional_short_route_feasibility_gate(
+            venue=str(candidate.get("venue") or ""),
+            direction=str(candidate.get("direction") or ""),
+            context_stats=candidate,
+            enabled=paper_only_active,
+        )
+        candidate["route_feasibility_gate"] = route_feasibility_gate
+        _annotate_frontier_route_feasibility_shadow_state(candidate, route_feasibility_gate)
         quality_score = as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0
         base_score = as_float(candidate.get("score"), 0.0) or 0.0
         effective_edge = as_float(candidate.get("effective_edge_bps"), None)
@@ -10278,6 +10507,12 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         cost_diagnostic = candidate.get("paper_cost_diagnostic") or {}
         if isinstance(cost_diagnostic, dict) and cost_diagnostic.get("emission_action") == "counterfactual_guard_value":
             paper_ranking_score = min(paper_ranking_score, as_float(cost_diagnostic.get("score_cap"), 59.999) or 59.999)
+        if route_feasibility_gate.get("enabled", False) and route_feasibility_gate.get("applied", False):
+            paper_ranking_score = round(
+                max(0.0, paper_ranking_score)
+                * float(route_feasibility_gate.get("score_multiplier", 1.0) or 1.0),
+                3,
+            )
         candidate["paper_ranking_score"] = paper_ranking_score
         candidate["paper_ranking_edge_bps"] = round(ranking_edge, 6) if ranking_edge is not None else None
         candidate["paper_ranking_edge_source"] = ranking_edge_source
@@ -10289,7 +10524,11 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             else "baseline"
         )
         candidate["paper_quality_filter_status"] = (
-            "ranked_not_blocked" if paper_only_active else "paper_only_ranking_inactive"
+            "route_feasibility_shadow_only"
+            if route_feasibility_gate.get("shadow_label", False)
+            else "ranked_not_blocked"
+            if paper_only_active
+            else "paper_only_ranking_inactive"
         )
         candidate["paper_market_context_filter_status"] = (
             "ranked_and_counterfactually_routed"
@@ -11815,6 +12054,7 @@ def summarize(
         if row.get("direction") != "watch_only"
         and not row.get("paper_entry_blocked")
         and not row.get("candidate_reject_reason")
+        and bool(row.get("paper_active_scoring_eligible", True))
     )
     shadow_only_candidate_count = sum(
         1
@@ -11823,10 +12063,15 @@ def summarize(
         or row.get("paper_entry_blocked")
         or row.get("quality_action") == "shadow_only"
         or bool(row.get("candidate_reject_reason"))
+        or not bool(row.get("paper_active_scoring_eligible", True))
+    )
+    route_feasibility_shadow_count = sum(
+        1 for row in candidates if bool(row.get("paper_route_feasibility_shadow_label"))
     )
     candidate_activity = {
         "active_paper_review_candidates": active_candidate_count,
         "shadow_or_observe_only_candidates": shadow_only_candidate_count,
+        "route_feasibility_shadow_candidates": route_feasibility_shadow_count,
         "regional_admitted_candidates": regional_candidate_blockers.get("passed", 0),
         "regional_blocked_candidates": sum(
             count
@@ -11841,6 +12086,7 @@ def summarize(
             "candidate_activity": candidate_activity,
             "active_paper_review_candidates": active_candidate_count,
             "shadow_or_observe_only_candidates": shadow_only_candidate_count,
+            "route_feasibility_shadow_candidates": route_feasibility_shadow_count,
             "venue_quota_report": depth_summary.get("venue_quota_report", {}),
             "selection_limits": depth_summary.get("selection_limits", {}),
             "worker_count": depth_summary.get("worker_count"),
@@ -11905,6 +12151,11 @@ def summarize(
             "premium_vs_reference_bps": row.get("premium_vs_reference_bps"),
             "local_quote_flag": row.get("local_quote_flag"),
             "local_quote_diagnostics": row.get("local_quote_diagnostics", []),
+            "route_feasibility_reason": row.get("route_feasibility_reason"),
+            "paper_active_scoring_eligible": row.get("paper_active_scoring_eligible"),
+            "paper_route_feasibility_shadow_label": row.get(
+                "paper_route_feasibility_shadow_label"
+            ),
         }
         for row in candidates[:20]
     ]
@@ -12146,6 +12397,8 @@ def _markdown(report: dict) -> str:
             f"normalized_mid_usd=`{row.get('normalized_mid_usd')}` premium_bps=`{row.get('premium_vs_reference_bps')}` "
             f"local_quote=`{row.get('local_quote_flag')}` "
             f"route=`{row.get('route_status')}` blockers={row.get('route_blockers')} "
+            f"route_reason=`{row.get('route_feasibility_reason')}` "
+            f"active_scoring=`{row.get('paper_active_scoring_eligible')}` "
             f"route_health_confirmed=`{row.get('route_health_confirmed')}` "
             f"simulated_allocation=`{row.get('simulated_order_allocation')}`"
         )

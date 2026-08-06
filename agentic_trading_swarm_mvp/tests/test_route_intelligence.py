@@ -183,6 +183,7 @@ class RouteIntelligenceTests(unittest.TestCase):
                 "inst_id": "BITSO:BTC-MXN",
                 "direction": "short_frontier_spot",
                 "route_status": "conditional",
+                "route_feasibility_reason": "conditional_short_support_unknown",
                 "required_permissions": ["crypto_spot", "margin_spot", "spot_borrow"],
                 "route_blockers": ["spot_borrow"],
                 "borrow_available": "unknown",
@@ -209,6 +210,10 @@ class RouteIntelligenceTests(unittest.TestCase):
         self.assertEqual("required_unconfirmed", intelligence["margin_mode"])
         self.assertEqual("public_data_only", intelligence["api_route_status"])
         self.assertEqual("needs route validation", intelligence["route_validation_status"])
+        self.assertEqual(
+            "conditional_short_support_unknown",
+            intelligence["route_feasibility_reason"],
+        )
         self.assertIn("latency_ms:31.5", intelligence["freshness_latency_notes"])
         self.assertIn("depth_latency_ms:44.0", intelligence["freshness_latency_notes"])
         self.assertFalse(intelligence["hard_blocking"])
@@ -310,6 +315,7 @@ class RouteIntelligenceTests(unittest.TestCase):
         markdown = render_route_requirements_markdown([candidate])
 
         self.assertEqual("needs route validation", row["route_validation_status"])
+        self.assertEqual("unknown", row["route_feasibility_reason"])
         self.assertIn("borrow_availability", row["frontier_short_spot_route_intelligence"]["missing_route_metadata"])
         self.assertIn("latency_ms:19.0", row["freshness_latency_notes"])
         self.assertIn("route_validation_status", markdown)

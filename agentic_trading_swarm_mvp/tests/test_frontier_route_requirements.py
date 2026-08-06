@@ -31,7 +31,7 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
         self.assertIsNone(requirements["supports_spot_short"])
         self.assertIn("support_unknown", requirements["notes"])
 
-    def test_unsupported_conditional_short_is_suppressed(self):
+    def test_unsupported_conditional_short_is_shadow_ranked_without_entry_block(self):
         gate = paper_only_conditional_short_route_feasibility_gate(
             venue="BINANCE_US_SPOT",
             direction="short",
@@ -42,10 +42,12 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
         )
         self.assertTrue(gate["enabled"])
         self.assertTrue(gate["applied"])
-        self.assertFalse(gate["allow"])
-        self.assertTrue(gate["suppressed"])
-        self.assertEqual(gate["score_multiplier"], 0.0)
-        self.assertEqual(gate["reason"], "unsupported_spot_short")
+        self.assertTrue(gate["allow"])
+        self.assertFalse(gate["suppressed"])
+        self.assertEqual(gate["score_multiplier"], 0.15)
+        self.assertEqual(gate["route_feasibility_reason"], "conditional_short_generic_route_unsupported")
+        self.assertFalse(gate["active_scoring_eligible"])
+        self.assertTrue(gate["shadow_label"])
 
     def test_score_adjustment_reports_unknown_route_penalty_without_full_suppression(self):
         adjustment = paper_only_frontier_score_adjustment(
@@ -83,6 +85,11 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
             adjustment["route_feasibility_gate"]["reason"],
             "unknown_spot_short_support",
         )
+        self.assertEqual(
+            adjustment["route_feasibility_reason"],
+            "conditional_short_support_unknown",
+        )
+        self.assertTrue(adjustment["active_scoring_eligible"])
 
     def test_non_conditional_short_context_is_neutral(self):
         gate = paper_only_conditional_short_route_feasibility_gate(
@@ -95,6 +102,24 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
         self.assertTrue(gate["allow"])
         self.assertFalse(gate["suppressed"])
         self.assertEqual(gate["score_multiplier"], 1.0)
+
+    def test_supported_venue_short_route_exception_remains_active(self):
+        gate = paper_only_conditional_short_route_feasibility_gate(
+            venue="GATE",
+            direction="short_frontier_spot",
+            context_stats={
+                "execution_feasibility": {"status": "conditional"},
+                "trade_type": "frontier_crypto_venue_map",
+            },
+        )
+
+        self.assertTrue(gate["applied"])
+        self.assertTrue(gate["active_scoring_eligible"])
+        self.assertFalse(gate["shadow_label"])
+        self.assertEqual(
+            gate["route_feasibility_reason"],
+            "supported_venue_short_route_exception",
+        )
 
 
 if __name__ == "__main__":

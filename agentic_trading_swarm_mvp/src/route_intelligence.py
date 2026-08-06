@@ -104,6 +104,7 @@ ROUTE_REQUIREMENT_FIELDS = (
     "frontier_short_spot_route_requirements_report",
     "route_economics_telemetry",
     "route_validation_status",
+    "route_feasibility_reason",
     "route_validation_notes",
     "freshness_latency_status",
     "freshness_latency_notes",
@@ -536,6 +537,7 @@ def build_route_requirements_matrix(
                 "frontier_short_spot_route_requirements_report": frontier_requirements_report,
                 "route_economics_telemetry": frontier_intelligence["route_economics_telemetry"],
                 "route_validation_status": frontier_intelligence["route_validation_status"],
+                "route_feasibility_reason": frontier_intelligence["route_feasibility_reason"],
                 "route_validation_notes": frontier_intelligence["route_validation_notes"],
                 "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
                 "freshness_latency_notes": frontier_intelligence["freshness_latency_notes"],
@@ -597,6 +599,7 @@ def build_route_requirements_annotation(opportunity: dict[str, Any]) -> dict[str
         "frontier_short_spot_route_intelligence": frontier_intelligence,
         "frontier_short_spot_route_requirements_report": frontier_requirements_report,
         "route_validation_status": frontier_intelligence["route_validation_status"],
+        "route_feasibility_reason": frontier_intelligence["route_feasibility_reason"],
         "route_validation_notes": frontier_intelligence["route_validation_notes"],
         "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
         "freshness_latency_notes": frontier_intelligence["freshness_latency_notes"],
@@ -607,6 +610,7 @@ def build_route_requirements_annotation(opportunity: dict[str, Any]) -> dict[str
                 **panel,
                 "frontier_short_spot_route_intelligence": frontier_intelligence,
                 "route_validation_status": frontier_intelligence["route_validation_status"],
+                "route_feasibility_reason": frontier_intelligence["route_feasibility_reason"],
                 "route_validation_notes": frontier_intelligence["route_validation_notes"],
                 "freshness_latency_status": frontier_intelligence["freshness_latency_status"],
                 "freshness_latency_notes": frontier_intelligence["freshness_latency_notes"],
@@ -1093,6 +1097,7 @@ def build_paper_route_requirement_report(
         "frontier_short_spot_route_intelligence": frontier_short_spot_route_intelligence,
         "frontier_short_spot_route_requirements_report": frontier_short_spot_route_requirements_report,
         "route_economics_telemetry": route_economics_telemetry,
+        "route_feasibility_reason": frontier_short_spot_route_intelligence["route_feasibility_reason"],
         "route_requirement_summary": route_requirement_summary,
         "hard_blocking": False,
         "entry_blocked": False,
@@ -1187,6 +1192,11 @@ def build_frontier_short_spot_route_intelligence(
         if applies
         else "not_applicable"
     )
+    route_feasibility_reason = str(
+        source.get("route_feasibility_reason")
+        or resolved_route.get("route_feasibility_reason")
+        or ("not_applicable" if not applies else UNKNOWN)
+    )
     validation_notes = []
     if applies and missing_route_metadata:
         validation_notes.append(
@@ -1206,6 +1216,7 @@ def build_frontier_short_spot_route_intelligence(
         "route_economics_telemetry": route_economics_telemetry,
         "missing_route_metadata": missing_route_metadata,
         "route_validation_status": validation_status,
+        "route_feasibility_reason": route_feasibility_reason,
         "route_validation_notes": validation_notes,
         "hard_blocking": False,
         "entry_blocked": False,
@@ -1680,6 +1691,16 @@ def _frontier_short_spot_route_requirements_report(
             "notes": list(intelligence.get("freshness_latency_notes") or []),
         },
         "route_economics_telemetry": dict(intelligence.get("route_economics_telemetry") or {}),
+        "route_feasibility_reason": intelligence.get("route_feasibility_reason", UNKNOWN),
+        "paper_active_scoring_eligible": bool(
+            intelligence.get("paper_active_scoring_eligible", source.get("paper_active_scoring_eligible", True))
+        ),
+        "paper_route_feasibility_shadow_label": bool(
+            intelligence.get(
+                "paper_route_feasibility_shadow_label",
+                source.get("paper_route_feasibility_shadow_label", False),
+            )
+        ),
         "hard_blocking": False,
         "entry_blocked": False,
         "routing_decision_changed": False,

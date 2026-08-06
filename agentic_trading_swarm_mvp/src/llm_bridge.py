@@ -1241,6 +1241,7 @@ def _compact_frontier_execution_quality(research_worker: dict[str, Any] | None) 
                         "asset_or_event": item.get("asset_or_event"),
                         "surface_type_raw": surface_type,
                         "route_feasibility_state": route_state,
+                        "route_feasibility_reason": item.get("route_feasibility_reason"),
                         "failed_gates": failed_gates,
                         "route_blockers": _as_text_list(item.get("route_blockers") or item.get("blockers")),
                     }
