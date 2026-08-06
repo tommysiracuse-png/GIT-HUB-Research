@@ -6777,6 +6777,77 @@ def _paper_only_conditional_short_prerequisite_review(profile: dict, *, applies:
     }
 
 
+def _paper_only_frontier_short_borrow_confirmed(profile: dict) -> bool:
+    """Accept explicit borrow confirmation from nested route-report packets."""
+
+    direct_state = _paper_only_route_prerequisite_state(
+        _paper_only_route_profile_value(
+            profile,
+            "borrow_confirmed",
+            "borrowable",
+            "spot_borrow_confirmed",
+            "spot_borrow_available",
+            "borrow_ok",
+        )
+    )
+    if direct_state == "affirmed":
+        return True
+    if direct_state == "negative":
+        return False
+
+    nested_state = _paper_only_route_prerequisite_state(
+        _paper_only_route_profile_value(
+            profile,
+            "borrow_status",
+            "borrow_availability",
+            "borrow_availability_status",
+            "spot_borrow_status",
+            ("frontier_short_spot_route_intelligence", "borrow_availability"),
+            ("frontier_short_spot_route_requirements_report", "short_borrow_availability", "status"),
+            ("frontier_short_spot_route_requirements_report", "short_borrow_availability", "availability_status"),
+            ("paper_route_requirement_report", "route_requirement_summary", "short_borrow_availability", "status"),
+            ("paper_route_requirement_report", "route_requirement_summary", "short_borrow_availability", "availability_status"),
+            ("paper_route_requirement_report", "route_requirement_summary", "borrow_availability", "status"),
+            ("paper_route_requirement_report", "route_requirement_summary", "borrow_availability"),
+            ("route_requirement_summary", "short_borrow_availability", "status"),
+            ("route_requirement_summary", "short_borrow_availability", "availability_status"),
+            ("route_requirement_summary", "borrow_availability", "status"),
+            ("route_requirement_summary", "borrow_availability"),
+        )
+    )
+    return nested_state == "affirmed"
+
+
+def _paper_only_frontier_short_verified_route_support(profile: dict) -> bool:
+    """Treat supported nested route reports as verified paper-route exceptions."""
+
+    supported_values = (
+        _paper_only_route_profile_value(
+            profile,
+            "paper_route_registry_status",
+            ("paper_route_requirement_report", "route_requirements", "support_status"),
+            ("frontier_short_spot_route_requirements_report", "per_venue_status", "status"),
+            ("paper_route_requirement_report", "route_requirement_summary", "route_requirement_status"),
+            ("route_requirement_summary", "route_requirement_status"),
+        ),
+    )
+    for value in supported_values:
+        if isinstance(value, dict):
+            value = (
+                value.get("support_status")
+                or value.get("route_requirement_status")
+                or value.get("status")
+            )
+        text = str(value or "").strip().lower()
+        if not text:
+            continue
+        if text in {"standard", "executable", "feasible", "supported", "available", "configured", "ready"}:
+            return True
+        if text.startswith("supported") and not text.startswith("unsupported"):
+            return True
+    return False
+
+
 def _paper_only_frontier_short_route_feasibility_reason(
     *,
     venue: str,
@@ -6839,43 +6910,25 @@ def _paper_only_frontier_short_route_feasibility_reason(
     registry_status = str(route_registry.get("support_status") or "unspecified").strip().lower()
     generic_status = str(generic_requirements.get("support_status") or "unknown").strip().lower()
 
-    explicit_borrow_ok = False
-    for container in (
-        stats,
-        stats.get("execution_feasibility"),
-        stats.get("execution_route"),
-    ):
-        if not isinstance(container, dict):
-            continue
-        for field in (
-            "borrow_confirmed",
-            "borrowable",
-            "spot_borrow_confirmed",
-            "spot_borrow_available",
-            "borrow_ok",
-        ):
-            if _paper_only_is_truthy(container.get(field)):
-                explicit_borrow_ok = True
-                break
-        if explicit_borrow_ok:
-            break
-        for field in (
-            "borrow_status",
-            "borrow_availability",
-            "borrow_availability_status",
-            "spot_borrow_status",
-        ):
-            status = str(container.get(field) or "").strip().lower()
-            if status in {"confirmed", "configured", "available"}:
-                explicit_borrow_ok = True
-                break
-        if explicit_borrow_ok:
-            break
+    explicit_borrow_ok = any(
+        _paper_only_frontier_short_borrow_confirmed(container)
+        for container in (
+            stats,
+            stats.get("execution_feasibility"),
+            stats.get("execution_route"),
+            stats.get("frontier_short_spot_route_intelligence"),
+            stats.get("frontier_short_spot_route_requirements_report"),
+            stats.get("paper_route_requirement_report"),
+            stats.get("route_requirement_summary"),
+        )
+        if isinstance(container, dict)
+    )
 
     frontier_short_route = _paper_only_is_frontier_short_route_context(direction, stats)
     verified_standard_route = bool(
         route_status in {"standard", "executable", "feasible", "supported"}
         or registry_status == "supported"
+        or _paper_only_frontier_short_verified_route_support(stats)
     )
     generic_supported_without_verified_route = bool(
         not explicit_borrow_ok
