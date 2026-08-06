@@ -621,7 +621,7 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertIn("cross_tick_direction_inconsistent", row["strategy_reliability_reasons"])
         self.assertEqual(88.0, row["score"])
 
-    def test_yahoo_proxy_with_fresh_session_telemetry_skips_family_quarantine(self) -> None:
+    def test_yahoo_proxy_with_fresh_session_telemetry_does_not_bypass_family_quarantine(self) -> None:
         candidate = base_candidate(
             seen_at="2026-08-06T14:15:00+00:00",
             venue="YAHOO_PROXY",
@@ -651,9 +651,8 @@ class StrategyReliabilityTests(unittest.TestCase):
 
         row = rows[0]
         self.assertFalse(row.get("paper_entry_blocked", False))
-        self.assertNotEqual("family_quarantine_shadow_only", row["strategy_reliability_action"])
-        self.assertEqual("long_proxy_context_tracking", row["strategy_reliability_action"])
-        self.assertEqual(0, report["summary"]["family_quarantine_count"])
+        self.assertEqual("family_quarantine_shadow_only", row["strategy_reliability_action"])
+        self.assertEqual(1, report["summary"]["family_quarantine_count"])
         self.assertTrue(row["paper_yahoo_proxy_freshness_gate"]["eligible"])
 
     def test_yahoo_proxy_recovery_snapshot_releases_family_quarantine(self) -> None:
@@ -679,6 +678,81 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertFalse(row.get("paper_entry_blocked", False))
         self.assertEqual("long_proxy_context_tracking", row["strategy_reliability_action"])
         self.assertEqual(0, report["summary"]["family_quarantine_count"])
+
+    def test_yahoo_proxy_runtime_family_recovery_releases_family_quarantine(self) -> None:
+        candidate = base_candidate(
+            seen_at="2026-08-06T14:15:00+00:00",
+            venue="YAHOO_PROXY",
+            inst_id="YAHOO_PROXY:EWT",
+            trade_type="global_proxy_momentum",
+            direction="long_proxy",
+            score=81.0,
+            edge_bps_estimate=9.0,
+            spread_bps=2.0,
+            stale_minutes=1.0,
+            source_quote_timestamp="2026-08-06T14:05:00+00:00",
+            source_session_status="open",
+            source_session_open=True,
+            source_quote_age_seconds=600.0,
+            last_trade_timestamp="2026-08-06T14:05:00+00:00",
+            last_trade_age_seconds=600.0,
+            pre_entry_tick_returns_bps=[7.0, 9.0, 6.0, 4.0],
+            proxy_reuse_gate={
+                "quote_age_seconds": 600.0,
+                "source_session_status": "open",
+                "reasons": [],
+            },
+            quality_score=None,
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        try:
+            for index in range(24):
+                for direction, pnl_bps, inst_id in (
+                    ("long_proxy", 2.0, "YAHOO_PROXY:EWT"),
+                    ("short_proxy", -1.5, "YAHOO_PROXY:EWZ"),
+                ):
+                    payload = {
+                        "venue": "YAHOO_PROXY",
+                        "inst_id": inst_id,
+                        "trade_type": "global_proxy_momentum",
+                        "direction": direction,
+                    }
+                    conn.execute(
+                        """
+                        insert into paper_trades (
+                            opened_at, closed_at, venue, inst_id, direction, trade_type,
+                            signal_key, base_score, learned_score, entry, exit, pnl_bps,
+                            status, thesis, candidate_json, review_json
+                        ) values (?, ?, 'YAHOO_PROXY', ?, ?, 'global_proxy_momentum',
+                                  ?, 80, 80, 100, 101, ?, 'closed', 'test', ?, '{}')
+                        """,
+                        (
+                            f"2026-08-05T00:{index:02d}:00+00:00",
+                            f"2026-08-05T01:{index:02d}:00+00:00",
+                            inst_id,
+                            direction,
+                            f"YAHOO_PROXY|global_proxy_momentum|{direction}|runtime_recovery",
+                            pnl_bps,
+                            json.dumps(payload),
+                        ),
+                    )
+            conn.commit()
+            rows, report = strategy_reliability.apply_strategy_reliability(
+                [candidate], {"mode": "paper"}, conn=conn
+            )
+        finally:
+            conn.close()
+
+        row = rows[0]
+        self.assertFalse(row.get("paper_entry_blocked", False))
+        self.assertEqual("long_proxy_context_tracking", row["strategy_reliability_action"])
+        self.assertEqual(0, report["summary"]["family_quarantine_count"])
+        self.assertEqual(
+            "runtime_closed_paper_trades",
+            row["latest_family_paper"]["long_proxy_standard"]["evidence_source"],
+        )
 
     def test_yahoo_proxy_transfer_diagnostic_tags_translated_okx_route(self) -> None:
         candidate = base_candidate(

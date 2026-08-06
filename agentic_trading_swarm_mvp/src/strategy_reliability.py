@@ -3182,6 +3182,104 @@ def paper_family_quarantine_record(
     }
 
 
+def hydrate_paper_family_decay_statistics(
+    candidates: list[dict],
+    conn: Any | None,
+    config: Mapping[str, Any] | bool | None = None,
+) -> None:
+    """Attach rolling direct-family paper outcomes for the Yahoo proxy decay guard."""
+    if conn is None:
+        return
+
+    targets = [
+        candidate
+        for candidate in candidates
+        if _paper_family_quarantine_match(candidate) is not None
+        and not isinstance(candidate.get("latest_family_paper"), Mapping)
+    ]
+    if not targets:
+        return
+
+    window = 30
+    if isinstance(config, Mapping):
+        policy = config.get("paper_family_decay_guard")
+        if not isinstance(policy, Mapping):
+            strategy_reliability = config.get("strategy_reliability")
+            if isinstance(strategy_reliability, Mapping):
+                policy = strategy_reliability.get("paper_family_decay_guard")
+        if isinstance(policy, Mapping):
+            window = max(1, _as_int(policy.get("rolling_window_closed_trades"), 30))
+
+    grouped: dict[str, list[float]] = {
+        "long_proxy_standard": [],
+        "short_proxy_conditional": [],
+    }
+    try:
+        rows = conn.execute(
+            """
+            select venue, direction, trade_type, pnl_bps, candidate_json
+            from paper_trades
+            where status = 'closed'
+              and pnl_bps is not null
+              and trade_type = 'global_proxy_momentum'
+            order by closed_at desc, id desc
+            """
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - optional paper evidence is read-only
+        return
+
+    for row in rows:
+        try:
+            raw = dict(row)
+        except (TypeError, ValueError):
+            continue
+        try:
+            trade_candidate = json.loads(raw.get("candidate_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            trade_candidate = {}
+        if not isinstance(trade_candidate, Mapping):
+            trade_candidate = {}
+        if str(trade_candidate.get("signal_stats_scope") or "").lower() == "synthetic_research":
+            continue
+        venue = str(trade_candidate.get("venue") or raw.get("venue") or "").strip().upper()
+        trade_type = str(trade_candidate.get("trade_type") or raw.get("trade_type") or "").strip()
+        if venue != "YAHOO_PROXY" or trade_type != "global_proxy_momentum":
+            continue
+        direction = str(trade_candidate.get("direction") or raw.get("direction") or "").strip().lower()
+        leg_key = (
+            "long_proxy_standard"
+            if direction == "long_proxy"
+            else "short_proxy_conditional"
+            if direction == "short_proxy"
+            else None
+        )
+        if leg_key is None or len(grouped[leg_key]) >= window:
+            continue
+        pnl_bps = _finite_float(raw.get("pnl_bps"))
+        if pnl_bps is None:
+            continue
+        grouped[leg_key].append(pnl_bps)
+
+    latest_family_paper: dict[str, dict[str, Any]] = {}
+    for leg_key, pnl_values in grouped.items():
+        if not pnl_values:
+            continue
+        latest_family_paper[leg_key] = {
+            "closed_count": len(pnl_values),
+            "avg_pnl_bps": round(sum(pnl_values) / len(pnl_values), 6),
+            "win_rate": round(sum(value > 0.0 for value in pnl_values) / len(pnl_values), 6),
+            "evidence_source": "runtime_closed_paper_trades",
+            "rolling_window_closed_trades": window,
+        }
+    if not latest_family_paper:
+        return
+
+    for candidate in targets:
+        candidate["latest_family_paper"] = {
+            leg_key: dict(metrics) for leg_key, metrics in latest_family_paper.items()
+        }
+
+
 def _venue(candidate: dict) -> str:
     return str(candidate.get("venue") or candidate.get("source_venue") or "").upper()
 
@@ -5306,10 +5404,8 @@ def _apply_one(
     _record_proxy_short_quality(candidate, config)
     _hydrate_frontier_short_route_feasibility(candidate, config=config)
     yahoo_proxy_freshness_gate = paper_yahoo_proxy_freshness_shadow_record(candidate, config=config)
-    skip_family_quarantine = False
     if yahoo_proxy_freshness_gate is not None:
         candidate["paper_yahoo_proxy_freshness_gate"] = dict(yahoo_proxy_freshness_gate)
-        skip_family_quarantine = True
     route_lineage = apply_paper_route_lineage_confirmation(candidate, config=config)
     context_loss_quarantine = _apply_context_loss_quarantine(candidate, config=config, conn=conn)
     if context_loss_quarantine is not None:
@@ -5325,7 +5421,7 @@ def _apply_one(
         True,
     ):
         return _apply_yahoo_proxy_freshness_shadow(candidate, yahoo_proxy_freshness_gate)
-    quarantined = None if skip_family_quarantine else _apply_family_quarantine(candidate, config=config)
+    quarantined = _apply_family_quarantine(candidate, config=config)
     if quarantined is not None:
         return quarantined
     lineage_source_health = _apply_lineage_source_health(candidate, config=config)
@@ -6041,6 +6137,7 @@ def apply_strategy_reliability(
     _hydrate_portability_paper_evidence(candidates, conn)
     hydrate_paper_context_loss_statistics(candidates, conn, settings)
     hydrate_paper_context_prior_statistics(candidates, conn, settings)
+    hydrate_paper_family_decay_statistics(candidates, conn, settings)
     _hydrate_yahoo_proxy_transfer_diagnostics(candidates, conn)
     for candidate in candidates:
         _remove_invalid_proxy_confirmation(candidate)
@@ -6049,10 +6146,8 @@ def apply_strategy_reliability(
         quarantined = []
         for candidate in candidates:
             yahoo_proxy_freshness_gate = paper_yahoo_proxy_freshness_shadow_record(candidate, config=settings)
-            skip_family_quarantine = False
             if yahoo_proxy_freshness_gate is not None:
                 candidate["paper_yahoo_proxy_freshness_gate"] = dict(yahoo_proxy_freshness_gate)
-                skip_family_quarantine = True
             record = (
                 _apply_portability_quarantine(candidate, config=settings)
                 or _apply_context_loss_quarantine(candidate, config=settings, conn=conn)
@@ -6063,7 +6158,7 @@ def apply_strategy_reliability(
                     and not _as_bool(yahoo_proxy_freshness_gate.get("paper_fill_allowed"), True)
                     else None
                 )
-                or (None if skip_family_quarantine else _apply_family_quarantine(candidate, config=settings))
+                or _apply_family_quarantine(candidate, config=settings)
                 or _apply_lineage_source_health(candidate, config=settings)
             )
             if record is not None:
