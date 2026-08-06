@@ -25,6 +25,31 @@ CROSS_MARKET_RESEARCHER_ALLOWED_ACTIONS = frozenset(
     {"no_action", "propose_diagnostic_hypothesis"}
 )
 RED_TEAM_ALLOWED_ACTIONS = frozenset({"no_action", "propose_diagnostic_hypothesis"})
+_CROSS_MARKET_EVIDENCE_KEYS = frozenset(
+    {
+        "sample_count",
+        "market_count",
+        "matched_context_count",
+        "observed_markets",
+        "supporting_markets",
+        "cross_market_context",
+        "cross_market_observation",
+        "cross_market_observations",
+        "thesis_support",
+        "support_summary",
+    }
+)
+_CROSS_MARKET_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "issue",
+        "issue_type",
+        "schema_violation",
+        "validation_error",
+        "insufficient_market_evidence",
+        "insufficient_market_data",
+        "market_recommendation_blocked",
+    }
+)
 
 
 def _reject_non_json_constant(value: str) -> None:
@@ -98,10 +123,44 @@ def paper_only_no_action_fallback(
     }
 
 
+def _has_non_empty_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_has_non_empty_value(item) for item in value.values())
+    return value not in (None, [], {}, ())
+
+
+def _mapping_has_non_empty_value(value: Any) -> bool:
+    return isinstance(value, dict) and any(_has_non_empty_value(item) for item in value.values())
+
+
+def _is_paper_market_key(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return normalized == "paper" or (
+        normalized.startswith("paper")
+        and len(normalized) > len("paper")
+        and not normalized[len("paper")].isalnum()
+    )
+
+
 def validate_recommendation_object(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
-    return all(key in payload for key in REQUIRED_RECOMMENDATION_KEYS)
+    if any(key not in payload for key in REQUIRED_RECOMMENDATION_KEYS):
+        return False
+    if not _has_non_empty_value(payload.get("priority")) or isinstance(payload.get("priority"), bool):
+        return False
+    for field in ("action", "title", "rationale", "market_key"):
+        if not isinstance(payload.get(field), str) or not payload[field].strip():
+            return False
+    if not _mapping_has_non_empty_value(payload.get("evidence")):
+        return False
+    if not _mapping_has_non_empty_value(payload.get("proposed_change")):
+        return False
+    return True
 
 
 def validate_cross_market_researcher_object(payload: Any) -> None:
@@ -130,14 +189,24 @@ def validate_cross_market_researcher_object(payload: Any) -> None:
     # bool is an int subclass, but it is not a meaningful recommendation priority.
     if isinstance(payload["priority"], bool) or not isinstance(payload["priority"], int):
         raise ValueError("cross-market recommendation priority must be an integer")
+    if not _is_paper_market_key(payload["market_key"]):
+        raise ValueError("cross-market recommendation market_key must stay paper-scoped")
     if not isinstance(payload["evidence"], dict):
         raise ValueError("cross-market recommendation evidence must be a JSON object")
-    if not payload["evidence"]:
-        raise ValueError("cross-market recommendation evidence must not be empty")
+    if not _mapping_has_non_empty_value(payload["evidence"]):
+        raise ValueError("cross-market recommendation evidence must contain a non-empty value")
     if not isinstance(payload["proposed_change"], dict):
         raise ValueError("cross-market recommendation proposed_change must be a JSON object")
-    if not payload["proposed_change"]:
-        raise ValueError("cross-market recommendation proposed_change must not be empty")
+    if not _mapping_has_non_empty_value(payload["proposed_change"]):
+        raise ValueError("cross-market recommendation proposed_change must contain a non-empty value")
+    evidence = payload["evidence"]
+    if not any(_has_non_empty_value(evidence.get(key)) for key in _CROSS_MARKET_EVIDENCE_KEYS) and not any(
+        _has_non_empty_value(evidence.get(key)) for key in _CROSS_MARKET_DIAGNOSTIC_KEYS
+    ):
+        raise ValueError(
+            "cross-market recommendation evidence must include explicit market support "
+            "or an explicit insufficiency/validation diagnostic"
+        )
 
 
 def validate_red_team_object(payload: Any) -> None:
@@ -199,10 +268,16 @@ def cross_market_researcher_schema_fallback(
             "schema_violation": validation_error,
             "raw_generation_metadata": raw_generation_metadata,
             "insufficient_market_evidence_defaults_to_diagnostic": True,
+            "market_recommendation_blocked": True,
             "paper_only": True,
         },
         "proposed_change": {
             "summary": "Repair the cross-market response schema and rerun the paper-only analysis.",
+            "next_step": (
+                "Do not emit a market recommendation until a single schema-complete JSON "
+                "object includes sufficient cross-market evidence."
+            ),
+            "required_fields": ", ".join(REQUIRED_RECOMMENDATION_KEYS),
             "fallback_mode": "paper_only_diagnostic_hypothesis",
             "paper_only": True,
             "live_trading": "disabled",

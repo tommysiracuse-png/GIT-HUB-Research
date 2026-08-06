@@ -40,3 +40,13 @@ class RecommendationSchemaTests(unittest.TestCase):
         self.assertIn("action='no_action'", schema["fallback_behavior"])
         self.assertIn("behavioral_test", schema["code_change"]["runtime_integration"])
         self.assertIn("Import/existence-only tests are insufficient", schema["code_change"]["runtime_integration"])
+
+    def test_cross_market_contract_requires_explicit_evidence_or_diagnostic_fallback(self) -> None:
+        schema = llm_bridge._recommendation_schema(["propose_diagnostic_hypothesis", "no_action"])
+
+        contract = schema["market_key_contracts"]["paper.cross_market_researcher"]
+        self.assertIn("Every required field must be present and non-empty", contract)
+        self.assertIn("explicit cross-market support facts in-schema", contract)
+        fallback = schema["fallback_recommendations"]["paper.cross_market_researcher"]
+        self.assertEqual(fallback["action"], "propose_diagnostic_hypothesis")
+        self.assertTrue(fallback["evidence"]["market_recommendation_blocked"])

@@ -23,3 +23,13 @@ class RecommendationSchemaTests(unittest.TestCase):
         }
 
         self.assertFalse(validate_recommendation_object(payload))
+
+    def test_validation_rejects_blank_required_values(self) -> None:
+        payload = paper_only_fallback_recommendation(
+            title="   ",
+            rationale="schema failed",
+        )
+        payload["evidence"] = {"issue_type": ""}
+        payload["proposed_change"] = {"summary": "   "}
+
+        self.assertFalse(validate_recommendation_object(payload))

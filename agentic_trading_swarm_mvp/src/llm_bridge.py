@@ -489,6 +489,28 @@ EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION = default_paper_recommendation(
     }
 )
 
+CROSS_MARKET_RESEARCHER_FALLBACK_RECOMMENDATION = {
+    "action": "propose_diagnostic_hypothesis",
+    "priority": 100,
+    "title": "Cross-market schema fallback",
+    "rationale": (
+        "Auto-generated because the prior cross-market response was incomplete, "
+        "not schema-valid, or lacked sufficient in-schema evidence for a reliable "
+        "cross-market thesis."
+    ),
+    "market_key": "paper.cross_market_researcher.schema_fallback",
+    "evidence": {
+        "issue": "schema_validation_failed",
+        "market_recommendation_blocked": True,
+        "paper_only": True,
+    },
+    "proposed_change": {
+        "summary": "Return one schema-complete paper-only diagnostic object and wait for sufficient cross-market evidence before making a market recommendation.",
+        "required_fields": ", ".join(REQUIRED_RECOMMENDATION_FIELDS),
+        "safety_mode": "paper_only",
+    },
+}
+
 CODE_CHANGE_ACTIONABLE_FIELDS = (
     "change_category",
     "implementation_mode",
@@ -1450,6 +1472,16 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
                 "provided paper-only no_action fallback recommendation object with the "
                 "validation failure captured in evidence."
             ),
+            "paper.cross_market_researcher": (
+                "Always emit exactly one schema-complete top-level JSON object with "
+                "action, priority, title, rationale, market_key, evidence, and "
+                "proposed_change. Every required field must be present and non-empty. "
+                "Keep market_key paper-scoped. Do not emit a market recommendation unless "
+                "evidence contains explicit cross-market support facts in-schema. If the "
+                "response is partial, malformed, or lacks sufficient cross-market evidence, "
+                "emit the provided paper-only diagnostic fallback recommendation object "
+                "instead of a market thesis."
+            ),
             "paper_system.integrity.market_scout": "Always emit exactly one schema-complete top-level JSON object with action, priority, title, rationale, market_key, evidence, and proposed_change. If generation or validation fails, emit the provided fallback paper-only hold recommendation object instead of partial output.",
         },
         "paper_safety_policies": {
@@ -1459,8 +1491,18 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
                 "require_explicit_paper_safe_route": True,
                 "required_fields": required_fields,
             },
+            "paper.cross_market_researcher": {
+                "mode": "paper_only",
+                "required_fields": required_fields,
+                "require_non_empty_required_fields": True,
+                "require_explicit_cross_market_evidence_or_diagnostic": True,
+            },
         },
-        "fallback_recommendations": {"paper.execution_route_hunter": EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION, "paper_system.integrity.market_scout": MARKET_SCOUT_FALLBACK_RECOMMENDATION},
+        "fallback_recommendations": {
+            "paper.execution_route_hunter": EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION,
+            "paper.cross_market_researcher": CROSS_MARKET_RESEARCHER_FALLBACK_RECOMMENDATION,
+            "paper_system.integrity.market_scout": MARKET_SCOUT_FALLBACK_RECOMMENDATION,
+        },
         "allowed_actions": allowed_actions,
     }
 

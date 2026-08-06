@@ -97,6 +97,10 @@ class RecommendationFinalizerTests(unittest.TestCase):
         extra_field = _payload(extra="not allowed")
         empty_evidence = _payload(evidence={})
         string_proposed_change = _payload(proposed_change="partial")
+        non_paper_market_key = _payload(market_key="global_cross_market")
+        blank_evidence = _payload(evidence={"sample_count": ""})
+        blank_proposed_change = _payload(proposed_change={"analysis": "   "})
+        unsupported_evidence_shape = _payload(evidence={"note": "No support facts or diagnostic markers"})
 
         for response in (
             top_level_array,
@@ -106,6 +110,10 @@ class RecommendationFinalizerTests(unittest.TestCase):
             extra_field,
             empty_evidence,
             string_proposed_change,
+            non_paper_market_key,
+            blank_evidence,
+            blank_proposed_change,
+            unsupported_evidence_shape,
         ):
             with self.subTest(response=response):
                 with self.assertRaises(ValueError):
@@ -177,10 +185,12 @@ class CrossMarketResearcherRetryTests(unittest.TestCase):
         self.assertEqual(rec["evidence"]["raw_generation_metadata"]["retry"]["response_text"], wrapped)
         self.assertEqual(rec["retry_count"], 1)
         self.assertTrue(rec["evidence"]["insufficient_market_evidence_defaults_to_diagnostic"])
+        self.assertTrue(rec["evidence"]["market_recommendation_blocked"])
         self.assertEqual(
             rec["proposed_change"]["fallback_mode"],
             "paper_only_diagnostic_hypothesis",
         )
+        self.assertIn("sufficient cross-market evidence", rec["proposed_change"]["next_step"])
 
     def test_invalid_action_becomes_schema_diagnostic_after_retry(self):
         invalid_action = json.dumps(_payload(action="propose_code_change"))
@@ -344,6 +354,8 @@ class CrossMarketSchemaRetryPromptTests(unittest.TestCase):
         self.assertIn("paper-only diagnostic hypothesis", prompt)
         self.assertIn("no extra keys", prompt)
         self.assertIn("evidence and proposed_change must be non-empty JSON objects", prompt)
+        self.assertIn("Every required key must be present and non-empty", prompt)
+        self.assertIn("blocked until sufficient cross-market evidence is supplied in-schema", prompt)
 
 
 if __name__ == "__main__":
