@@ -33,6 +33,7 @@ from code_evolution import code_evolution_summary, default_paper_recommendation
 from self_improvement_open_pack import IMPLEMENTED_STATUS as OPEN_PACK_IMPLEMENTED_STATUS
 from self_improvement_open_pack import is_duplicate_open_pack_text
 from recommendation_registry import registry_summary
+from recommendation_schema import cross_market_researcher_schema_fallback
 from strategy_lab import strategy_lab_summary
 from dynamic_agents import dynamic_agent_summary, ingest_spawn_agent_recommendation
 from market_activation_owner import summary as market_activation_owner_summary
@@ -489,28 +490,10 @@ EXECUTION_ROUTE_HUNTER_FALLBACK_RECOMMENDATION = default_paper_recommendation(
     }
 )
 
-CROSS_MARKET_RESEARCHER_FALLBACK_RECOMMENDATION = {
-    "action": "propose_diagnostic_hypothesis",
-    "priority": 100,
-    "title": "Cross-market schema fallback",
-    "rationale": (
-        "Auto-generated because the prior cross-market response was incomplete, "
-        "not schema-valid, or lacked sufficient in-schema evidence for a reliable "
-        "cross-market thesis."
-    ),
-    "market_key": "paper.cross_market_researcher.schema_fallback",
-    "evidence": {
-        "issue": "schema_validation_failed",
-        "market_recommendation_blocked": True,
-        "insufficient_structured_evidence": True,
-        "paper_only": True,
-    },
-    "proposed_change": {
-        "summary": "Return one schema-complete paper-only diagnostic object and wait for sufficient cross-market evidence with explicit support facts in-schema before making a market recommendation.",
-        "required_fields": ", ".join(REQUIRED_RECOMMENDATION_FIELDS),
-        "safety_mode": "paper_only",
-    },
-}
+CROSS_MARKET_RESEARCHER_FALLBACK_RECOMMENDATION = cross_market_researcher_schema_fallback(
+    "schema_validation_failed",
+    raw_generation_metadata={},
+)
 
 CODE_CHANGE_ACTIONABLE_FIELDS = (
     "change_category",

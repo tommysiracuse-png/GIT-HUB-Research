@@ -6,6 +6,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 import llm_bridge
+from recommendation_schema import validate_cross_market_researcher_object
 
 
 class RecommendationSchemaTests(unittest.TestCase):
@@ -56,5 +57,11 @@ class RecommendationSchemaTests(unittest.TestCase):
         )
         fallback = schema["fallback_recommendations"]["paper.cross_market_researcher"]
         self.assertEqual(fallback["action"], "propose_diagnostic_hypothesis")
+        self.assertEqual(fallback["title"], "Cross-market researcher response schema violation")
         self.assertTrue(fallback["evidence"]["market_recommendation_blocked"])
+        self.assertTrue(fallback["evidence"]["insufficient_market_evidence_defaults_to_diagnostic"])
         self.assertTrue(fallback["evidence"]["insufficient_structured_evidence"])
+        self.assertEqual(fallback["proposed_change"]["fallback_mode"], "paper_only_diagnostic_hypothesis")
+        self.assertEqual(fallback["proposed_change"]["live_trading"], "disabled")
+        self.assertEqual(fallback["evidence"]["raw_generation_metadata"], {})
+        validate_cross_market_researcher_object(fallback)
