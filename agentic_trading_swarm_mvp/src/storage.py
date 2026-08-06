@@ -3627,7 +3627,11 @@ def save_frontier_paper_shadow_observation(
             str(candidate.get("inst_id") or candidate.get("instrument_id") or "unknown"),
             str(candidate.get("direction") or "unknown"),
             str(candidate.get("trade_type") or "unknown"),
-            str(candidate.get("candidate_reject_reason") or "cost_swallowed_or_route_blocked"),
+            str(
+                candidate.get("shadow_reason")
+                or candidate.get("candidate_reject_reason")
+                or "cost_swallowed_or_route_blocked"
+            ),
             json.dumps(candidate, sort_keys=True),
             json.dumps(review, sort_keys=True),
         ),

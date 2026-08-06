@@ -57,7 +57,8 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
             "edge_bps_estimate": 24.0,
             "gross_edge_bps_estimate": 60.0,
             "estimated_round_trip_cost_bps": 20.0,
-            "quality_action": "verified",
+            "quality_status": "verified",
+            "quality_action": "normal",
             "execution_route": {
                 "route_id": "conditional_crypto_route_paper",
                 "route_status": "conditional",
@@ -121,7 +122,8 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
             "gross_edge_bps_estimate": 35.0,
             "estimated_round_trip_cost_bps": 20.0,
             "anomaly_flags": [],
-            "quality_action": "conditional",
+            "quality_status": "verified",
+            "quality_action": "normal",
         }
         review = {"paper_allocation_multiplier": 1.0, "net_edge_bps_estimate": 12.0}
 

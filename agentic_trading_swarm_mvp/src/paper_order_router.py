@@ -51,6 +51,7 @@ _ROUTE_PROXY_STATUSES = {"paper_testable_proxy", "proxy", "paper_proxy", "proxy_
 _ROUTE_BLOCKED_STATUSES = {"blocked", "not_executable", "unavailable", "denied", "rejected"}
 _ROUTE_RESEARCH_ONLY_STATUSES = {"research_only", "manual_only", "live_only", "requires_live_borrow", "needs_live_borrow"}
 _FLAG_KEYS = (
+    "paper_frontier_admission_guard_enabled",
     "frontier_shadow_guard_enabled",
     "frontier_paper_shadow_guard_enabled",
     "paper_frontier_shadow_guard_enabled",
@@ -444,7 +445,6 @@ def frontier_paper_admission_reason(
     if (
         not frontier_paper_guard_enabled(config)
         or not is_frontier_crypto_candidate(candidate)
-        or not _as_bool(candidate.get(FRONTIER_PAPER_ADMISSION_MARKER), False)
         or str(profile.get("mode", "paper")).strip().lower() != "paper"
         or _as_bool(profile.get("allow_live_trading"), False)
     ):
@@ -469,7 +469,7 @@ def frontier_paper_cost_diagnostic(candidate: Mapping[str, Any]) -> dict[str, An
     checks: list[dict[str, Any]] = []
     if edge_bps is not None and edge_bps <= 0.0:
         checks.append({"code": "non_positive_net_edge", "field": edge_field, "value": edge_bps})
-    if gross_bps is not None and cost_bps is not None and gross_bps <= cost_bps + FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS:
+    if gross_bps is not None and cost_bps is not None and gross_bps < cost_bps + FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS:
         checks.append({"code": "gross_edge_not_at_least_5bps_above_round_trip_cost", "gross_field": gross_field, "gross_edge_bps": gross_bps, "cost_field": cost_field, "round_trip_cost_bps": cost_bps})
     if "simulated_slippage_exceeds_edge" in flags:
         checks.append({"code": "simulated_slippage_exceeds_edge", "field": "anomaly_flags", "value": sorted(flags)})
@@ -494,9 +494,10 @@ def frontier_paper_net_edge_guard_reason(
 ) -> dict[str, Any] | None:
     """Return the paper-only fill exclusion for known unpriceable frontier rows.
 
-    This intentionally leaves quality, liquidity, route quality, and ordinary
-    cost diagnostics to the exploration/ranking path.  Only the four explicit
-    order-admission conditions below become shadow-only observations.
+    This is the candidate-to-paper-order boundary for the frontier scanner.
+    Missing optional scanner metadata remains diagnostic-only, but an explicit
+    adverse quality, cost, anomaly, or short-borrow value is shadowed before a
+    paper fill can be created.
     """
     profile = config if isinstance(config, Mapping) else {}
     if (
@@ -508,6 +509,25 @@ def frontier_paper_net_edge_guard_reason(
         return None
 
     checks: list[dict[str, Any]] = []
+    quality_action = _normalize_route_status(candidate.get("quality_action"))
+    if quality_action and quality_action != "normal":
+        checks.append(
+            {
+                "code": "quality_action_not_normal",
+                "field": "quality_action",
+                "value": candidate.get("quality_action"),
+            }
+        )
+    quality_status = _normalize_route_status(candidate.get("quality_status"))
+    if quality_status and quality_status != "verified":
+        checks.append(
+            {
+                "code": "quality_status_not_verified",
+                "field": "quality_status",
+                "value": candidate.get("quality_status"),
+            }
+        )
+
     edge_bps = _finite_float(candidate.get("edge_bps_estimate"))
     if edge_bps is not None and edge_bps <= 0.0:
         checks.append(
@@ -523,7 +543,7 @@ def frontier_paper_net_edge_guard_reason(
     if (
         gross_bps is not None
         and cost_bps is not None
-        and gross_bps <= cost_bps + FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS
+        and gross_bps < cost_bps + FRONTIER_PAPER_ADMISSION_MIN_NET_BUFFER_BPS
     ):
         checks.append(
             {
@@ -537,10 +557,10 @@ def frontier_paper_net_edge_guard_reason(
         )
 
     anomaly_flags = _coerce_flags(candidate.get("anomaly_flags"))
-    if "simulated_slippage_exceeds_edge" in anomaly_flags:
+    for anomaly in sorted(anomaly_flags & FRONTIER_PAPER_ADMISSION_HIGH_SEVERITY_ANOMALIES):
         checks.append(
             {
-                "code": "simulated_slippage_exceeds_edge",
+                "code": anomaly,
                 "field": "anomaly_flags",
                 "value": sorted(anomaly_flags),
             }
@@ -1402,6 +1422,10 @@ def _annotate_shadow_filtered_candidate(
     else:
         guarded["candidate_reject_reason"] = guarded.get("candidate_reject_reason") or reason.get("reason") or FRONTIER_SHADOW_REASON
     guarded["candidate_reject_detail"] = dict(reason)
+    # ``candidate_reject_reason`` is retained for existing reporting.  The
+    # explicit shadow reason makes the observation intent unambiguous to
+    # horizon diagnostics and downstream consumers.
+    guarded["shadow_reason"] = reason.get("reason") or FRONTIER_SHADOW_REASON
     guarded[detail_field] = dict(reason)
     if paper_net_edge_guard:
         # A shadow observation can support horizon diagnostics, but it is not
@@ -1409,6 +1433,7 @@ def _annotate_shadow_filtered_candidate(
         guarded["paper_observation_only"] = True
         guarded["paper_observation_reason"] = PAPER_NET_EDGE_GUARD_REASON
         guarded["paper_score_eligible"] = False
+        guarded["paper_score_multiplier"] = 0.0
         guarded["paper_rank_eligible"] = False
         guarded["promotion_eligible"] = False
         guarded["frontier_net_edge_bps"] = reason.get("net_edge_bps")

@@ -75,11 +75,54 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, guarded["candidate_reject_reason"])
         self.assertTrue(
             {
+                "quality_action_not_normal",
+                "quality_status_not_verified",
                 "edge_bps_estimate_not_positive",
                 "gross_edge_not_above_round_trip_cost_plus_buffer",
                 "simulated_slippage_exceeds_edge",
+                "empty_book",
+                "invalid_best_prices",
+                "ticker_book_midpoint_mismatch",
+                "stale_book",
+                "depth_cliff",
             }.issubset(codes)
         )
+        self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, guarded["shadow_reason"])
+        self.assertFalse(guarded["paper_score_eligible"])
+        self.assertEqual(0.0, guarded["paper_score_multiplier"])
+
+    def test_explicit_quality_or_anomaly_failure_is_shadowed(self) -> None:
+        guarded = apply_frontier_paper_admission_guard(
+            candidate(quality_action="conditional", anomaly_flags=["empty_book"])
+        )
+
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("shadow_only", guarded["paper_action"])
+        self.assertEqual(
+            {"quality_action_not_normal", "empty_book"},
+            {check["code"] for check in guarded["candidate_reject_detail"]["checks"]},
+        )
+
+    def test_exactly_five_bps_of_gross_cost_headroom_is_eligible(self) -> None:
+        guarded = apply_frontier_paper_admission_guard(
+            candidate(gross_edge_bps_estimate=25.0, estimated_round_trip_cost_bps=20.0)
+        )
+
+        self.assertFalse(guarded.get("shadow_filtered", False))
+
+    def test_missing_optional_scanner_fields_do_not_shadow_an_otherwise_valid_candidate(self) -> None:
+        guarded = apply_frontier_paper_admission_guard(
+            candidate(
+                quality_status=None,
+                quality_action=None,
+                gross_edge_bps_estimate=None,
+                estimated_round_trip_cost_bps=None,
+                anomaly_flags=None,
+            )
+        )
+
+        self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertIsNone(guarded.get("candidate_reject_reason"))
 
     def test_ranked_shadow_candidate_remains_reportable(self) -> None:
         weak = candidate(gross_edge_bps_estimate=24.0)
@@ -110,6 +153,7 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         self.assertEqual("shadow_only", result["order"]["status"])
         self.assertIsNone(result["order_id"])
         self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, result["candidate"]["candidate_reject_reason"])
+        self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, result["candidate"]["shadow_reason"])
         self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
         observation = conn.execute(
             "select reject_reason from frontier_paper_shadow_observations"

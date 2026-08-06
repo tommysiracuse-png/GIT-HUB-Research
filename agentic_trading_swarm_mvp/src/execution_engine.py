@@ -14,7 +14,6 @@ import sqlite3
 from paper_order_router import (
     FRONTIER_SHADOW_REASON,
     PAPER_NET_EDGE_GUARD_REASON,
-    apply_frontier_cost_or_route_paper_guard,
     apply_frontier_paper_admission_guard,
     apply_frontier_paper_guard,
 )
@@ -325,7 +324,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
     if paper_mode:
         # Evaluate the direct candidate before exploration can substitute a
         # synthetic route and hide direct route blockers from the fill guard.
-        candidate = apply_frontier_cost_or_route_paper_guard(candidate, settings)
+        candidate = apply_frontier_paper_admission_guard(candidate, settings)
     context_loss_quarantine = candidate.get("paper_context_loss_quarantine") or {}
     context_loss_quarantined = bool(
         isinstance(context_loss_quarantine, dict)
@@ -405,6 +404,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
                 else "shadow_observed"
             )
             order["shadow_filter"] = candidate.get("candidate_reject_detail")
+            order["shadow_reason"] = candidate.get("shadow_reason") or reject_reason
             order["notes"].append(
                 "Frontier candidate recorded as a shadow observation; no paper order or fill was created."
             )
