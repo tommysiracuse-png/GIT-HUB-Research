@@ -469,10 +469,10 @@ DEFAULT_SETTINGS = {
     },
     "frontier_regional_fx": {
         "enabled": True,
-        "cache_ttl_minutes": 60,
+        "cache_ttl_minutes": 5,
         "max_reference_age_hours": 30,
         "timeout_seconds": 10,
-        "quotes": ["ARS", "AUD", "BRL", "CLP", "COP", "EUR", "GBP", "GHS", "IDR", "KES", "MXN", "MYR", "NGN", "PEN", "PHP", "SGD", "THB", "ZAR"],
+        "quotes": ["ARS", "AUD", "BRL", "CLP", "COP", "EUR", "GBP", "GHS", "IDR", "KES", "MXN", "MYR", "NGN", "PEN", "PHP", "SGD", "THB", "TZS", "UGX", "ZAR"],
     },
     "public_market_adapters": {
         "enabled": True,

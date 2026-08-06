@@ -37,6 +37,14 @@ class RegionalFxReferenceTests(unittest.TestCase):
         self.assertIn("AUD", fx.DEFAULT_QUOTES)
         self.assertIn("EUR", fx.DEFAULT_QUOTES)
         self.assertIn("GBP", fx.DEFAULT_QUOTES)
+        self.assertIn("TZS", fx.DEFAULT_QUOTES)
+        self.assertIn("UGX", fx.DEFAULT_QUOTES)
+
+    def test_default_settings_request_frontier_fiat_fx_for_new_quotes(self) -> None:
+        configured = set(DEFAULT_SETTINGS["frontier_regional_fx"]["quotes"])
+        self.assertIn("TZS", configured)
+        self.assertIn("UGX", configured)
+        self.assertEqual(5, DEFAULT_SETTINGS["frontier_regional_fx"]["cache_ttl_minutes"])
 
     def test_parse_exchange_rate_api_open_response(self) -> None:
         rows = fx.parse_exchange_rate_api(

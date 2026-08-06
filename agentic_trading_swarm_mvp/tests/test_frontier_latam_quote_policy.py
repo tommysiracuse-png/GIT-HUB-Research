@@ -12,7 +12,7 @@ import frontier_crypto_adapter as adapter
 
 
 class FrontierLatamQuotePolicyTests(unittest.TestCase):
-    def test_finalize_marks_latam_quote_as_review_only_when_normalized(self):
+    def test_finalize_keeps_latam_quote_rankable_when_normalized(self):
         row = {
             "symbol": "BTC-CLP",
             "base": "BTC",
@@ -30,7 +30,7 @@ class FrontierLatamQuotePolicyTests(unittest.TestCase):
 
         finalized = adapter._finalize_observation(row)
 
-        self.assertTrue(finalized["local_quote_observe_only"])
+        self.assertFalse(finalized["local_quote_observe_only"])
         self.assertEqual(finalized["paper_only_review_scope"], "frontier_candidate_review")
         self.assertIn("usd_normalized_via_reference_fx", finalized["notes"])
 

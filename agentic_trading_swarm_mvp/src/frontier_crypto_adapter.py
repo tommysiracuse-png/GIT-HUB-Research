@@ -7879,7 +7879,20 @@ QUOTE_ASSETS = USD_LIKE_QUOTES | REGIONAL_FIAT_QUOTES
 # These venues publish spot prices in a local fiat currency.  The flag is
 # deliberately descriptive: a fresh, priceable local quote remains a paper
 # candidate and is ranked with its FX/premium telemetry rather than discarded.
-LOCAL_FIAT_CEX_VENUES = frozenset({"INDODAX", "BITSO", "VALR", "LUNO", "BUDA"})
+LOCAL_FIAT_CEX_VENUES = frozenset(
+    {
+        "BITKUB",
+        "BITSO",
+        "BUDA",
+        "COINJAR",
+        "INDODAX",
+        "LUNO",
+        "MERCADO_BITCOIN",
+        "QUIDAX",
+        "RIPIO",
+        "VALR",
+    }
+)
 
 DEFAULT_FRONTIER_MARKETABILITY_GATES = {
     "enabled": True,
@@ -8057,7 +8070,7 @@ DEFAULT_REGISTRY = {
         "min_cross_venue_count": 2,
         "regional_fx_normalization_enabled": True,
         "regional_fx_require_fresh_reference": True,
-        "regional_fx_max_age_seconds": 21_600,
+        "regional_fx_max_age_seconds": 300,
         "regional_fx_stale_confidence_haircut": 0.35,
     },
     "paper_trade_policy": DEFAULT_PAPER_TRADE_POLICY,
@@ -8815,6 +8828,7 @@ def _apply_paper_only_review_policy(row: dict) -> dict:
     row["paper_only_review_scope"] = "frontier_candidate_review"
     normalized_last = as_float(row.get("usd_normalized_last"), default=None)
     if normalized_last is not None and normalized_last > 0 and row.get("quote_normalization_source"):
+        row["local_quote_observe_only"] = False
         _append_note(row, "usd_normalized_via_reference_fx")
     else:
         _append_note(row, "review_only_pending_usd_normalization")
@@ -10066,8 +10080,13 @@ def _local_quote_normalization_telemetry(row: dict) -> dict:
     """Expose stable paper-only FX fields alongside legacy normalization data."""
     output = dict(row)
     quote = str(output.get("quote") or "").upper() or None
+    base = str(output.get("base") or "").upper() or None
     venue = str(output.get("venue") or "").upper()
-    is_local_quote = bool(venue in LOCAL_FIAT_CEX_VENUES and quote in REGIONAL_FIAT_QUOTES)
+    is_local_quote = bool(
+        venue in LOCAL_FIAT_CEX_VENUES
+        and quote in REGIONAL_FIAT_QUOTES
+        and base not in STABLE_OR_FIAT_BASES
+    )
     raw_last = as_float(output.get("last"), None)
     normalized_last = as_float(output.get("usd_normalized_last"), None)
     bid = as_float(output.get("bid"), None)
@@ -10089,6 +10108,7 @@ def _local_quote_normalization_telemetry(row: dict) -> dict:
         {
             "quote_ccy": quote,
             "fx_to_usd": round(fx_to_usd, 12) if fx_to_usd is not None else None,
+            "quote_to_usd_multiplier": round(fx_to_usd, 12) if fx_to_usd is not None else None,
             "fx_age_minutes": round(fx_age_seconds / 60.0, 3) if fx_age_seconds is not None else None,
             "normalized_mid_usd": (
                 round(native_mid * fx_to_usd, 12)
@@ -12957,7 +12977,7 @@ def _candidate_from_observation(
             "paper-trade only",
             "public endpoint data may be delayed, blocked, or venue-specific",
             "cross-venue price differences can reflect USD/USDT/USDC, fees, withdrawal friction, and index methodology",
-            "regional fiat quotes require same-venue stablecoin normalization before paper entry",
+            "regional fiat quotes require fresh same-venue stablecoin or trusted FX normalization before paper entry",
             "frontier fees use a conservative global estimate until read-only account-specific fee data is configured",
             "live execution remains blocked until route, credentials, legal access, and limits are configured",
         ],

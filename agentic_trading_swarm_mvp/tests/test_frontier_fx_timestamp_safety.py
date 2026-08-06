@@ -42,7 +42,7 @@ class FrontierFxTimestampSafetyTests(unittest.TestCase):
         filters = adapter.DEFAULT_REGISTRY["filters"]
         self.assertIs(filters["regional_fx_normalization_enabled"], True)
         self.assertIs(filters["regional_fx_require_fresh_reference"], True)
-        self.assertEqual(filters["regional_fx_max_age_seconds"], 21_600)
+        self.assertEqual(filters["regional_fx_max_age_seconds"], 300)
         self.assertEqual(filters["regional_fx_stale_confidence_haircut"], 0.35)
 
     def test_timestamp_to_iso_accepts_iso_strings(self) -> None:
