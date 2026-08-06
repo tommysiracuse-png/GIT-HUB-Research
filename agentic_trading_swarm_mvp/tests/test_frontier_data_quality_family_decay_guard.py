@@ -132,6 +132,24 @@ class PaperOnlyFamilyDecayGuardTests(unittest.TestCase):
         self.assertEqual("runtime_leg_metrics", review["latest_family_paper"]["long_proxy_standard"]["evidence_source"])
         self.assertEqual("runtime_leg_metrics", review["latest_family_paper"]["short_proxy_conditional"]["evidence_source"])
 
+    def test_partial_runtime_leg_evidence_does_not_inherit_static_other_leg_failure(self):
+        review = _paper_only_family_decay_guard_review(
+            {
+                "market_key": "YAHOO_PROXY",
+                "strategy_family": "global_proxy_momentum",
+                "execution_mode": "paper",
+                "long_closed_count": 24,
+                "long_after_cost_expectancy_bps": -1.4,
+                "rolling_realized_edge_bps": -1.4,
+            }
+        )
+
+        self.assertFalse(review["blocked"])
+        self.assertFalse(review["bilateral_failure"])
+        self.assertEqual(["long"], review["failed_legs"])
+        self.assertEqual("runtime_partial_evidence", review["family_decay_evidence_source"])
+        self.assertNotIn("short_proxy_conditional", review["latest_family_paper"])
+
     def test_positive_explicit_rolling_edge_prevents_decay_block(self):
         review = _paper_only_family_decay_guard_review(
             {

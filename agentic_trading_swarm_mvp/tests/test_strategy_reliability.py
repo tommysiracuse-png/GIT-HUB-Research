@@ -768,6 +768,48 @@ class StrategyReliabilityTests(unittest.TestCase):
         )
         self.assertEqual("family_decay_recovered", row["paper_family_decay_guard_review"]["reason"])
 
+    def test_partial_runtime_family_decay_evidence_does_not_trigger_family_quarantine(self) -> None:
+        candidate = base_candidate(
+            seen_at="2026-08-06T14:15:00+00:00",
+            venue="YAHOO_PROXY",
+            inst_id="YAHOO_PROXY:EWT",
+            trade_type="global_proxy_momentum",
+            direction="long_proxy",
+            score=81.0,
+            edge_bps_estimate=9.0,
+            spread_bps=2.0,
+            stale_minutes=1.0,
+            source_quote_timestamp="2026-08-06T14:05:00+00:00",
+            source_session_status="open",
+            source_session_open=True,
+            source_quote_age_seconds=600.0,
+            last_trade_timestamp="2026-08-06T14:05:00+00:00",
+            last_trade_age_seconds=600.0,
+            pre_entry_tick_returns_bps=[7.0, 9.0, 6.0, 4.0],
+            proxy_reuse_gate={
+                "quote_age_seconds": 600.0,
+                "source_session_status": "open",
+                "reasons": [],
+            },
+            quality_score=None,
+            long_closed_count=24,
+            long_after_cost_expectancy_bps=-1.4,
+            rolling_realized_edge_bps=-1.4,
+        )
+
+        rows, report = strategy_reliability.apply_strategy_reliability([candidate], {"mode": "paper"})
+
+        row = rows[0]
+        self.assertEqual("long_proxy_context_tracking", row["strategy_reliability_action"])
+        self.assertFalse(row.get("paper_observation_only", False))
+        self.assertEqual(0, report["summary"]["family_quarantine_count"])
+        self.assertFalse(row["paper_family_decay_guard_review"]["blocked"])
+        self.assertEqual(
+            "runtime_partial_evidence",
+            row["paper_family_decay_guard_review"]["family_decay_evidence_source"],
+        )
+        self.assertEqual(["long"], row["paper_family_decay_guard_review"]["failed_legs"])
+
     def test_nested_strategy_lab_family_decay_policy_controls_runtime_window(self) -> None:
         candidate = base_candidate(
             venue="YAHOO_PROXY",

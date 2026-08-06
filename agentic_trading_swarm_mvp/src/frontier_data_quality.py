@@ -578,15 +578,42 @@ def _paper_only_family_decay_guard_review(record, config=None):
             merged.update(flat_metrics)
         return merged
 
+    explicit_rolling_expectancy_bps = _float_value(
+        _lookup(
+            "rolling_realized_edge_bps",
+            "rolling_expectancy_bps",
+            "family_decay_rolling_realized_edge_bps",
+            "family_decay_rolling_expectancy_bps",
+            "paper_family_decay_rolling_realized_edge_bps",
+            "paper_family_decay_rolling_expectancy_bps",
+        )
+    )
+    runtime_leg_metrics_present = any(
+        _flat_leg_metrics(direction) for direction in ("long", "short")
+    )
+    runtime_decay_evidence_present = bool(
+        runtime_leg_metrics_present or explicit_rolling_expectancy_bps is not None
+    )
+
     latest_family_paper = _lookup(
         "latest_family_paper",
         "family_decay_latest_family_paper",
         "paper_family_decay_latest_family_paper",
     )
+    family_decay_evidence_source = "candidate_snapshot"
     if not isinstance(latest_family_paper, dict):
         latest_family_paper = policy.get("latest_family_paper")
+        if isinstance(latest_family_paper, dict):
+            family_decay_evidence_source = "configured_snapshot"
     if not isinstance(latest_family_paper, dict):
-        latest_family_paper = _PAPER_ONLY_FAMILY_DECAY_TARGET["latest_family_paper"]
+        latest_family_paper = (
+            {}
+            if runtime_decay_evidence_present
+            else _PAPER_ONLY_FAMILY_DECAY_TARGET["latest_family_paper"]
+        )
+        family_decay_evidence_source = (
+            "runtime_partial_evidence" if runtime_decay_evidence_present else "static_default_snapshot"
+        )
     latest_family_paper = _copy_latest_family_paper(latest_family_paper)
     normalized_latest_family_paper = {}
     for leg_name in ("long_proxy_standard", "short_proxy_conditional"):
@@ -685,16 +712,6 @@ def _paper_only_family_decay_guard_review(record, config=None):
             continue
         weighted_expectancy_numerator += expectancy_bps * closed_count
         weighted_expectancy_denominator += closed_count
-    explicit_rolling_expectancy_bps = _float_value(
-        _lookup(
-            "rolling_realized_edge_bps",
-            "rolling_expectancy_bps",
-            "family_decay_rolling_realized_edge_bps",
-            "family_decay_rolling_expectancy_bps",
-            "paper_family_decay_rolling_realized_edge_bps",
-            "paper_family_decay_rolling_expectancy_bps",
-        )
-    )
     rolling_expectancy_bps = explicit_rolling_expectancy_bps
     if rolling_expectancy_bps is None and weighted_expectancy_denominator > 0:
         rolling_expectancy_bps = round(weighted_expectancy_numerator / weighted_expectancy_denominator, 6)
@@ -799,6 +816,7 @@ def _paper_only_family_decay_guard_review(record, config=None):
         "freshness_state": freshness_state,
         "paper_score_multiplier": 0.0 if blocked else 1.0,
         "latest_family_paper": latest_family_paper,
+        "family_decay_evidence_source": family_decay_evidence_source,
         "leg_reviews": leg_reviews,
         "minimum_closed_count_per_leg": min_closed_count,
         "max_expectancy_bps": max_expectancy_bps,
