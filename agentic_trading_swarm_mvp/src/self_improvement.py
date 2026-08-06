@@ -3059,6 +3059,8 @@ def _report_markdown(report: dict) -> str:
         africa = open_pack.get("africa_rail_watchlist") or {}
         kalshi = open_pack.get("kalshi_public_coverage") or {}
         diagnostics = open_pack.get("signal_repair_diagnostics") or {}
+        yahoo_decay = diagnostics.get("yahoo_proxy_decay_analysis") or {}
+        bounded_windows = ((yahoo_decay.get("bounded_hypothesis_labels") or {}).get("windows") or {})
         lines.extend(["", "## Self-Improvement Open Pack", ""])
         lines.append(f"- Report: `{RUNS_DIR / 'self_improvement_open_pack.md'}`")
         lines.append(
@@ -3078,6 +3080,19 @@ def _report_markdown(report: dict) -> str:
             f"Yahoo `{len(diagnostics.get('yahoo_proxy_diagnostics', []))}`, "
             f"OKX `{len(diagnostics.get('okx_basis_funding_diagnostics', []))}`"
         )
+        if yahoo_decay:
+            lines.append(
+                f"- Yahoo decay hypothesis: `{yahoo_decay.get('leading_counterfactual_hypothesis')}` "
+                f"primary_horizon=`{yahoo_decay.get('primary_horizon_minutes')}` "
+                f"sources=`{(yahoo_decay.get('localization_summary') or {}).get('likely_decay_sources', [])}`"
+            )
+            lines.append(
+                f"- Yahoo bounded windows: "
+                f"`{{'5m': {(bounded_windows.get('5m') or {}).get('overall', {})}, "
+                f"'15m': {(bounded_windows.get('15m') or {}).get('overall', {})}, "
+                f"'60m': {(bounded_windows.get('60m') or {}).get('overall', {})}, "
+                f"'realized_post_entry': {(bounded_windows.get('realized_post_entry') or {}).get('overall', {})}}}`"
+            )
 
     code_evolution = report.get("code_evolution") or {}
     if code_evolution:

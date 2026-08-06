@@ -2031,6 +2031,9 @@ def _compact_self_improvement_open_pack(report: dict) -> dict:
     africa = report.get("africa_rail_watchlist") or {}
     kalshi = report.get("kalshi_public_coverage") or {}
     diagnostics = report.get("signal_repair_diagnostics") or {}
+    yahoo_decay = diagnostics.get("yahoo_proxy_decay_analysis") or {}
+    bounded = yahoo_decay.get("bounded_hypothesis_labels") or {}
+    bounded_windows = bounded.get("windows") or {}
     return {
         "generated_at": report.get("generated_at"),
         "paper_only": report.get("paper_only"),
@@ -2060,6 +2063,16 @@ def _compact_self_improvement_open_pack(report: dict) -> dict:
             "yahoo_count": len(diagnostics.get("yahoo_proxy_diagnostics", [])),
             "okx_count": len(diagnostics.get("okx_basis_funding_diagnostics", [])),
             "positive_shadow_expansions": len(diagnostics.get("positive_shadow_expansion_variants", [])),
+            "yahoo_decay": {
+                "primary_horizon_minutes": yahoo_decay.get("primary_horizon_minutes"),
+                "leading_counterfactual_hypothesis": yahoo_decay.get("leading_counterfactual_hypothesis"),
+                "localized_decay_detected": ((yahoo_decay.get("localization_summary") or {}).get("localized_decay_detected")),
+                "likely_decay_sources": ((yahoo_decay.get("localization_summary") or {}).get("likely_decay_sources", [])),
+                "bounded_windows": {
+                    str(window): (bounded_windows.get(str(window)) or {}).get("overall", {})
+                    for window in bounded.get("tracked_windows", [])
+                },
+            },
             "top_frontier": (diagnostics.get("frontier_weak_signal_diagnostics") or [])[:10],
         },
         "report": str(RUNS_DIR / "self_improvement_open_pack.md"),

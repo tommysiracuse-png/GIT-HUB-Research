@@ -282,6 +282,73 @@ class SelfImprovementOpenPackTests(unittest.TestCase):
             analysis["cost_drag_bucket_outcomes"][0]["cost_drag_bucket"],
         )
 
+    def test_yahoo_proxy_decay_analysis_surfaces_bounded_hypothesis_labels_and_realized_window(self) -> None:
+        conn = make_conn()
+        trades = [
+            ("P1", "long_proxy", "proxy", 300.0, 2.0, 0.92, 6.0, {5: 8.0, 15: 12.0, 60: 4.0}),
+            ("P2", "long_proxy", "proxy", 600.0, 4.0, 0.78, 4.0, {5: 6.0, 15: 10.0, 60: 2.0}),
+            ("X1", "short_proxy", "cross_surface", 5400.0, 12.0, 0.25, -8.0, {5: -10.0, 15: -14.0, 60: -20.0}),
+            ("X2", "short_proxy", "cross_surface", 7200.0, 18.0, 0.18, -6.0, {5: -8.0, 15: -12.0, 60: -18.0}),
+        ]
+        for symbol, direction, route_surface, provider_age, spread_bps, liquidity_score, realized_pnl, outcomes in trades:
+            candidate = {
+                "route_surface": route_surface,
+                "provider_age_seconds": provider_age,
+                "spread_bps": spread_bps,
+                "liquidity_score": liquidity_score,
+                "region": "emea" if route_surface == "proxy" else "apac",
+                "timezone": "Europe/London" if route_surface == "proxy" else "Asia/Tokyo",
+            }
+            cur = conn.execute(
+                """
+                insert into paper_trades (
+                    opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
+                    base_score, learned_score, entry, exit, pnl_bps, status, thesis,
+                    candidate_json, review_json, context_json
+                ) values (?, ?, 'YAHOO_PROXY', ?, ?, 'global_proxy_momentum', ?, 70, 70, 100, 101, ?, 'closed', 'test', ?, '{}', ?)
+                """,
+                (
+                    utc_now(),
+                    utc_now(),
+                    symbol,
+                    direction,
+                    f"YAHOO_PROXY|global_proxy_momentum|{direction}|standard",
+                    realized_pnl,
+                    json.dumps(candidate),
+                    json.dumps({"route_surface": route_surface}),
+                ),
+            )
+            trade_id = cur.lastrowid
+            for horizon, pnl in outcomes.items():
+                conn.execute(
+                    """
+                    insert into paper_trade_outcomes (
+                        trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                        context_json, measurement_status, delay_seconds
+                    ) values (?, ?, ?, 100, ?, '{}', 'valid', 5)
+                    """,
+                    (trade_id, horizon, utc_now(), pnl),
+                )
+        conn.commit()
+
+        report = pack.build_open_pack_report(conn, DEFAULT_SETTINGS)
+        analysis = report["signal_repair_diagnostics"]["yahoo_proxy_decay_analysis"]
+        labels = analysis["bounded_hypothesis_labels"]
+        five_minute = labels["windows"]["5m"]
+        realized = labels["windows"]["realized_post_entry"]
+        markdown = pack.render_open_pack_markdown(report)
+
+        self.assertEqual(["5m", "15m", "60m", "realized_post_entry"], labels["tracked_windows"])
+        self.assertEqual("stale_gt_60m", analysis["signal_freshness_outcomes"][0]["signal_age_bucket"])
+        self.assertEqual("low", analysis["liquidity_bucket_outcomes"][0]["liquidity_bucket"])
+        self.assertEqual(4, five_minute["overall"]["count"])
+        self.assertEqual(-9.0, five_minute["route_surface_outcomes"][0]["avg_pnl_bps"])
+        self.assertEqual("cross_surface", five_minute["route_surface_outcomes"][0]["route_surface"])
+        self.assertEqual("low", realized["entry_liquidity_bucket_outcomes"][0]["liquidity_bucket"])
+        self.assertEqual(-7.0, realized["route_surface_outcomes"][0]["avg_pnl_bps"])
+        self.assertIn("Yahoo bounded hypothesis windows", markdown)
+        self.assertIn("Yahoo realized_post_entry failure labels", markdown)
+
     def test_duplicate_text_matches_open_pack_scope(self) -> None:
         self.assertTrue(pack.is_duplicate_open_pack_text("Add Kalshi read-only public event market coverage"))
         self.assertTrue(pack.is_duplicate_open_pack_text("Resolve spot borrow route data for frontier shorts"))

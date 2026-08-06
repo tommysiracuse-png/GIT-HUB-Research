@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 
 from llm_state_packet import build_route_intelligence_packet_fragment  # noqa: E402
 from llm_bridge import (  # noqa: E402
+    _compact_self_improvement_open_pack,
     _compact_frontier_crypto,
     _compact_frontier_gap_summary,
     build_paper_route_requirement_summaries,
@@ -223,6 +224,7 @@ class LLMStatePacketTests(unittest.TestCase):
                     "direction": "short_frontier_spot",
                     "trade_type": "frontier_crypto_venue_map",
                     "route_status": "conditional",
+                    "route_blockers": ["spot_borrow"],
                     "route_feasibility_reason": "conditional_short_paper_metadata_missing",
                     "paper_active_scoring_eligible": False,
                     "paper_route_feasibility_shadow_label": True,
@@ -233,6 +235,7 @@ class LLMStatePacketTests(unittest.TestCase):
                     "direction": "short_frontier_spot",
                     "trade_type": "frontier_crypto_venue_map",
                     "route_status": "conditional",
+                    "route_blockers": ["spot_borrow"],
                     "route_feasibility_reason": "verified_standard_short_route",
                     "paper_active_scoring_eligible": True,
                     "paper_route_feasibility_shadow_label": False,
@@ -264,6 +267,40 @@ class LLMStatePacketTests(unittest.TestCase):
             "conditional_short_paper_metadata_missing",
             gated["suppression_reason"],
         )
+
+    def test_open_pack_compaction_keeps_yahoo_decay_window_summary(self) -> None:
+        compact = _compact_self_improvement_open_pack(
+            {
+                "generated_at": "2026-08-06T00:00:00+00:00",
+                "paper_only": True,
+                "signal_repair_diagnostics": {
+                    "yahoo_proxy_decay_analysis": {
+                        "primary_horizon_minutes": 60,
+                        "leading_counterfactual_hypothesis": "horizon_or_sign_mismatch",
+                        "localization_summary": {
+                            "localized_decay_detected": True,
+                            "likely_decay_sources": ["route_surface_mismatch"],
+                        },
+                        "bounded_hypothesis_labels": {
+                            "tracked_windows": ["5m", "15m", "60m", "realized_post_entry"],
+                            "windows": {
+                                "5m": {"overall": {"count": 12, "avg_pnl_bps": -3.0}},
+                                "15m": {"overall": {"count": 12, "avg_pnl_bps": -6.0}},
+                                "60m": {"overall": {"count": 12, "avg_pnl_bps": -11.0}},
+                                "realized_post_entry": {"overall": {"count": 12, "avg_pnl_bps": -7.5}},
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        yahoo_decay = compact["signal_repair_diagnostics"]["yahoo_decay"]
+        self.assertEqual(60, yahoo_decay["primary_horizon_minutes"])
+        self.assertEqual("horizon_or_sign_mismatch", yahoo_decay["leading_counterfactual_hypothesis"])
+        self.assertTrue(yahoo_decay["localized_decay_detected"])
+        self.assertEqual(["route_surface_mismatch"], yahoo_decay["likely_decay_sources"])
+        self.assertEqual(-7.5, yahoo_decay["bounded_windows"]["realized_post_entry"]["avg_pnl_bps"])
 
 
 if __name__ == "__main__":

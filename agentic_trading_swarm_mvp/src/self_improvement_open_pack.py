@@ -162,6 +162,12 @@ WEAK_SIGNAL_TARGETS = (
     ("YAHOO_PROXY", "short_proxy", "global_proxy"),
     ("OKX", "basis", "perp_funding_basis"),
 )
+YAHOO_PROXY_DECAY_WINDOW_LABELS = {
+    5: "5m",
+    15: "15m",
+    60: "60m",
+}
+YAHOO_PROXY_REALIZED_WINDOW = "realized_post_entry"
 
 
 def utc_now() -> str:
@@ -367,6 +373,18 @@ def _spread_bucket(spread_bps: float | None) -> str:
     return "extreme_gt_15bps"
 
 
+def _liquidity_bucket(liquidity_score: float | None) -> str:
+    if liquidity_score is None:
+        return "unknown"
+    if liquidity_score <= 0.35:
+        return "low"
+    if liquidity_score <= 0.65:
+        return "mid"
+    if liquidity_score <= 0.85:
+        return "high"
+    return "elite"
+
+
 def _proxy_cohort_label(candidate: Mapping[str, Any], context: Mapping[str, Any], review: Mapping[str, Any]) -> str:
     direct = _lookup_nested(
         (candidate, context, review),
@@ -448,11 +466,39 @@ def _aggregate_labeled_metrics(
     return rows
 
 
+def _yahoo_bounded_hypothesis_window(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    route_values: dict[str, list[float]] = collections.defaultdict(list)
+    freshness_values: dict[str, list[float]] = collections.defaultdict(list)
+    spread_values: dict[str, list[float]] = collections.defaultdict(list)
+    liquidity_values: dict[str, list[float]] = collections.defaultdict(list)
+    for row in rows:
+        pnl = _as_float(row.get("pnl_bps"))
+        if pnl is None:
+            continue
+        route_values[str(row.get("route_surface") or "unknown")].append(pnl)
+        freshness_values[str(row.get("signal_age_bucket") or "unknown")].append(pnl)
+        spread_values[str(row.get("spread_bucket") or "unknown")].append(pnl)
+        liquidity_values[str(row.get("liquidity_bucket") or "unknown")].append(pnl)
+    freshness_rows = _aggregate_labeled_metrics(freshness_values, "signal_age_bucket")
+    spread_rows = _aggregate_labeled_metrics(spread_values, "spread_bucket")
+    liquidity_rows = _aggregate_labeled_metrics(liquidity_values, "liquidity_bucket")
+    return {
+        "overall": _report_metrics(row["pnl_bps"] for row in rows if row.get("pnl_bps") is not None),
+        "route_surface_outcomes": _aggregate_labeled_metrics(route_values, "route_surface"),
+        "signal_age_outcomes": freshness_rows,
+        "signal_freshness_outcomes": freshness_rows,
+        "spread_bucket_outcomes": spread_rows,
+        "entry_spread_bucket_outcomes": spread_rows,
+        "liquidity_bucket_outcomes": liquidity_rows,
+        "entry_liquidity_bucket_outcomes": liquidity_rows,
+    }
+
+
 def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
     rows = conn.execute(
         """
         select p.id, p.direction, p.signal_key, p.context_json, p.candidate_json, p.review_json,
-               o.horizon_minutes, o.pnl_bps
+               p.pnl_bps as realized_pnl_bps, o.horizon_minutes, o.pnl_bps
         from paper_trade_outcomes o
         join paper_trades p on p.id = o.trade_id
         where p.venue = 'YAHOO_PROXY'
@@ -475,12 +521,21 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
             "route_surface_outcomes": [],
             "proxy_cohort_outcomes": [],
             "signal_age_outcomes": [],
+            "signal_freshness_outcomes": [],
             "spread_bucket_outcomes": [],
+            "liquidity_bucket_outcomes": [],
             "realized_cost_bucket_outcomes": [],
             "cost_drag_bucket_outcomes": [],
             "counterfactual_cost_summary": {},
             "counterfactual_hypothesis_tests": [],
             "leading_counterfactual_hypothesis": None,
+            "bounded_hypothesis_labels": {
+                "tracked_windows": [*YAHOO_PROXY_DECAY_WINDOW_LABELS.values(), YAHOO_PROXY_REALIZED_WINDOW],
+                "windows": {
+                    label: _yahoo_bounded_hypothesis_window([])
+                    for label in [*YAHOO_PROXY_DECAY_WINDOW_LABELS.values(), YAHOO_PROXY_REALIZED_WINDOW]
+                },
+            },
             "regional_timezone_outcomes": [],
             "localization_summary": {
                 "localized_decay_detected": False,
@@ -494,6 +549,8 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
     direction_horizon_values: dict[str, dict[int, list[float]]] = collections.defaultdict(
         lambda: collections.defaultdict(list)
     )
+    bounded_window_rows: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    realized_trade_ids: set[int] = set()
     for row in rows:
         horizon = int(row["horizon_minutes"])
         by_horizon_count[horizon] += 1
@@ -504,6 +561,11 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
         pnl = float(row["pnl_bps"])
         signal_age_seconds = _signal_age_seconds(candidate, context, review)
         spread_bps = _as_float(_lookup_nested((candidate, context, review), "spread_bps", "current_spread_bps"))
+        liquidity_score = _as_float(_lookup_nested((candidate, context, review), "liquidity_score", "current_liquidity_score"))
+        route_surface = _route_surface_label(candidate, context, review)
+        signal_age_bucket = _signal_age_bucket(signal_age_seconds)
+        spread_bucket = _spread_bucket(spread_bps)
+        liquidity_bucket = _liquidity_bucket(liquidity_score)
         direction_horizon_values[direction][horizon].append(pnl)
         all_primary_candidates.append(
             {
@@ -511,12 +573,14 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
                 "direction": direction,
                 "horizon_minutes": horizon,
                 "pnl_bps": pnl,
-                "route_surface": _route_surface_label(candidate, context, review),
+                "route_surface": route_surface,
                 "proxy_cohort": _proxy_cohort_label(candidate, context, review),
                 "signal_age_seconds": signal_age_seconds,
-                "signal_age_bucket": _signal_age_bucket(signal_age_seconds),
+                "signal_age_bucket": signal_age_bucket,
                 "spread_bps": spread_bps,
-                "spread_bucket": _spread_bucket(spread_bps),
+                "spread_bucket": spread_bucket,
+                "liquidity_score": liquidity_score,
+                "liquidity_bucket": liquidity_bucket,
                 "region": str(_lookup_nested((candidate, context, review), "region") or "unknown"),
                 "timezone": str(
                     _lookup_nested((candidate, context, review), "timezone", "market_timezone", "exchange_timezone")
@@ -524,6 +588,32 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
                 ),
             }
         )
+        window_label = YAHOO_PROXY_DECAY_WINDOW_LABELS.get(horizon)
+        if window_label is not None:
+            bounded_window_rows[window_label].append(
+                {
+                    "trade_id": int(row["id"]),
+                    "pnl_bps": pnl,
+                    "route_surface": route_surface,
+                    "signal_age_bucket": signal_age_bucket,
+                    "spread_bucket": spread_bucket,
+                    "liquidity_bucket": liquidity_bucket,
+                }
+            )
+        trade_id = int(row["id"])
+        realized_pnl_bps = _as_float(row["realized_pnl_bps"])
+        if trade_id not in realized_trade_ids and realized_pnl_bps is not None:
+            realized_trade_ids.add(trade_id)
+            bounded_window_rows[YAHOO_PROXY_REALIZED_WINDOW].append(
+                {
+                    "trade_id": trade_id,
+                    "pnl_bps": realized_pnl_bps,
+                    "route_surface": route_surface,
+                    "signal_age_bucket": signal_age_bucket,
+                    "spread_bucket": spread_bucket,
+                    "liquidity_bucket": liquidity_bucket,
+                }
+            )
 
     primary_horizon = 60 if by_horizon_count.get(60) else min(by_horizon_count)
     primary_rows = [row for row in all_primary_candidates if row["horizon_minutes"] == primary_horizon]
@@ -554,7 +644,18 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
     cohort_rows = _aggregate_labeled_metrics(cohort_values, "proxy_cohort")
     age_rows = _aggregate_labeled_metrics(age_values, "signal_age_bucket")
     spread_rows = _aggregate_labeled_metrics(spread_values, "spread_bucket")
+    liquidity_values: dict[str, list[float]] = collections.defaultdict(list)
+    for row in primary_rows:
+        liquidity_values[str(row["liquidity_bucket"])].append(float(row["pnl_bps"]))
+    liquidity_rows = _aggregate_labeled_metrics(liquidity_values, "liquidity_bucket")
     regional_timezone_rows = _aggregate_labeled_metrics(regional_timezone_values, "regional_timezone_cohort")
+    bounded_hypothesis_labels = {
+        "tracked_windows": [*YAHOO_PROXY_DECAY_WINDOW_LABELS.values(), YAHOO_PROXY_REALIZED_WINDOW],
+        "windows": {
+            label: _yahoo_bounded_hypothesis_window(bounded_window_rows.get(label, []))
+            for label in [*YAHOO_PROXY_DECAY_WINDOW_LABELS.values(), YAHOO_PROXY_REALIZED_WINDOW]
+        },
+    }
 
     likely_sources: list[str] = []
     overall_avg = overall_primary.get("avg_pnl_bps")
@@ -606,12 +707,15 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
         "route_surface_outcomes": route_rows,
         "proxy_cohort_outcomes": cohort_rows,
         "signal_age_outcomes": age_rows,
+        "signal_freshness_outcomes": age_rows,
         "spread_bucket_outcomes": spread_rows,
+        "liquidity_bucket_outcomes": liquidity_rows,
         "realized_cost_bucket_outcomes": counterfactual_attribution.get("realized_cost_bucket_outcomes", []),
         "cost_drag_bucket_outcomes": counterfactual_attribution.get("cost_drag_bucket_outcomes", []),
         "counterfactual_cost_summary": counterfactual_attribution.get("cost_summary", {}),
         "counterfactual_hypothesis_tests": counterfactual_attribution.get("hypothesis_tests", []),
         "leading_counterfactual_hypothesis": counterfactual_attribution.get("leading_hypothesis"),
+        "bounded_hypothesis_labels": bounded_hypothesis_labels,
         "regional_timezone_outcomes": regional_timezone_rows,
         "localization_summary": {
             "localized_decay_detected": localized,
@@ -671,10 +775,14 @@ def build_signal_repair_diagnostics(conn: sqlite3.Connection) -> dict[str, Any]:
                 "1d_momentum",
                 "5d_momentum",
                 "20d_momentum",
+                "route_surface",
                 "spread_bucket",
+                "signal_freshness",
+                "liquidity_bucket",
                 "quote_staleness",
                 "gap_bucket",
                 "risk_context",
+                "realized_post_entry_window",
             ],
             "okx_basis_funding": [
                 "route_status",
@@ -834,6 +942,8 @@ def render_open_pack_markdown(report: Mapping[str, Any]) -> str:
     yahoo_decay = diagnostics.get("yahoo_proxy_decay_analysis") or {}
     if yahoo_decay:
         summary = yahoo_decay.get("localization_summary") or {}
+        bounded = yahoo_decay.get("bounded_hypothesis_labels") or {}
+        bounded_windows = bounded.get("windows") or {}
         lines.append(
             f"- Yahoo decay localization: localized=`{summary.get('localized_decay_detected')}` "
             f"primary_horizon=`{yahoo_decay.get('primary_horizon_minutes')}` "
@@ -849,6 +959,19 @@ def render_open_pack_markdown(report: Mapping[str, Any]) -> str:
         lines.append(
             f"- Yahoo realized cost buckets: `{yahoo_decay.get('realized_cost_bucket_outcomes', [])}`"
         )
+        lines.append(
+            f"- Yahoo bounded hypothesis windows: `{bounded.get('tracked_windows', [])}`"
+        )
+        for window_label in bounded.get("tracked_windows", []):
+            window = bounded_windows.get(str(window_label)) or {}
+            lines.append(
+                f"- Yahoo {window_label} failure labels: "
+                f"`{{'overall': {window.get('overall', {})}, "
+                f"'routes': {window.get('route_surface_outcomes', [])}, "
+                f"'freshness': {window.get('signal_freshness_outcomes', [])}, "
+                f"'spread': {window.get('entry_spread_bucket_outcomes', [])}, "
+                f"'liquidity': {window.get('entry_liquidity_bucket_outcomes', [])}}}`"
+            )
     for row in (diagnostics.get("frontier_weak_signal_diagnostics") or [])[:10]:
         lines.append(
             f"- `{row.get('signal_key')}` action=`{row.get('recommended_action')}` "
