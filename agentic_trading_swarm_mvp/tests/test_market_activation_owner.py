@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 import market_activation_owner as owner
 from code_evolution import preflight_proposal
 from storage import init_db
+from strategy_lab import ingest_strategy_lab_recommendation
 
 
 class MarketActivationOwnerTests(unittest.TestCase):
@@ -146,6 +147,54 @@ class MarketActivationOwnerTests(unittest.TestCase):
         self.assertEqual("observation_program", experiment["experiment_type"])
         self.assertNotIn("strategy_logic", experiment)
         self.assertEqual("test_exchange_spot", experiment["data_requirements"]["adapter_id"])
+
+    def test_existing_strategy_lab_experiment_counts_as_runtime_handoff(self) -> None:
+        self._write_adapter_report(price_observations=2, candidates=0)
+        with self._patch_paths():
+            owner.run_once(self.conn, self.settings, execute_turn=False, cycle_id="cycle-1")
+        self._insert_admission("priceable")
+        ingest_strategy_lab_recommendation(
+            self.conn,
+            {
+                "recommendation_id": "existing-anp-style-program",
+                "payload": {
+                    "action": "propose_strategy_lab_experiment",
+                    "agent_name": "market_admission_bridge",
+                    "title": "Existing surface program",
+                    "rationale": "A surface-specific observation program already exists.",
+                    "strategy_lab_experiment": {
+                        "strategy_lab_id": "existing_surface_program_v1",
+                        "experiment_type": "market_strategy",
+                        "source_surface": "test_exchange_spot_market",
+                        "permitted_target_surface": ["test_exchange_spot_market"],
+                        "hypothesis": "Use the existing repaired program instead of creating a duplicate handoff.",
+                        "strategy_logic": {
+                            "type": "observation_program",
+                            "universe": {"venues": ["TEST_EXCHANGE"], "market_surfaces": ["test_exchange_spot_market"]},
+                            "entry_expression": "last > 0",
+                            "invalidation_expression": "last <= 0",
+                            "direction": "long",
+                            "edge_expression": "last",
+                            "score_expression": "50",
+                            "route_surface": "proxy",
+                        },
+                        "data_requirements": {
+                            "adapter_id": "test_exchange_spot",
+                            "market_surface": "test_exchange_spot_market",
+                        },
+                        "risk_gates": {"require_route_feasible": False},
+                    },
+                },
+            },
+        )
+
+        with self._patch_paths():
+            report = owner.run_once(self.conn, self.settings, execute_turn=False, cycle_id="cycle-2")
+
+        task = self._task()
+        self.assertEqual("strategy_handoff", task["status"])
+        self.assertEqual(0, len(report["strategy_handoffs"]))
+        self.assertEqual(0, self.conn.execute("select count(*) from strategy_owner_tasks").fetchone()[0])
 
     def test_activation_surface_members_advance_existing_umbrella_task(self) -> None:
         self._write_adapter_report(

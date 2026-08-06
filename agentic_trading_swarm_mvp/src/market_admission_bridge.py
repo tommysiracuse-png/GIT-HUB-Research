@@ -33,6 +33,8 @@ ICDX_MILESTONES_SURFACE = "icdx_exchange_milestones"
 ICDX_MILESTONES_LAB_ID = "icdx_exchange_milestones_companion_v1"
 CARB_ALLOWANCE_SURFACE = "california_quebec_cap_and_invest_joint_allowance_auctions"
 CARB_ALLOWANCE_LAB_ID = "carb_joint_allowance_discount_tightness_v1"
+ANP_OPC_SURFACE = "anp_oferta_permanente_de_concessao"
+ANP_OPC_LAB_ID = "anp_opc_brazil_upstream_proxy_v1"
 
 
 def _strategy_lab_id(state: dict[str, Any]) -> str:
@@ -831,6 +833,136 @@ def _create_carb_allowance_paper_program(
     }
 
 
+def _create_anp_opc_companion_program(
+    conn: sqlite3.Connection,
+    settings: dict,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the canonical paper-only ANP OPC companion-price program."""
+
+    claim = _claim(conn, state, "activate_anp_opc_companion_program", 90)
+    if claim.duplicate and claim.canonical_row_id:
+        return {
+            "action": "strategy_lab_anp_opc_program",
+            "status": "deduplicated",
+            "topic_key": claim.topic_key,
+        }
+    evidence = _evidence(state)
+    details = state.get("details") if isinstance(state.get("details"), dict) else {}
+    rec = {
+        "recommendation_id": f"market_admission:{state['admission_key']}:anp_opc_program",
+        "source_agent": "market_admission_bridge",
+        "payload": {
+            "agent_name": "market_admission_bridge",
+            "title": "Paper-test ANP OPC reference intensity with Petrobras ADR companion pricing",
+            "rationale": (
+                "ANP's Oferta Permanente de Concessao records are official exploration-programme references, not "
+                "tradable quotes. The repaired adapter now preserves those reference fields while attaching a "
+                "defensible public Petrobras ADR companion price so Strategy Lab can measure same-surface synthetic "
+                "paper signals without implying a live ANP execution route."
+            ),
+            "strategy_lab_experiment": {
+                "strategy_lab_id": ANP_OPC_LAB_ID,
+                "version": 1,
+                "experiment_type": "market_strategy",
+                "hypothesis": (
+                    "Fresh ANP OPC catalogue depth and exploratory-block amendment intensity, combined with a "
+                    "public Petrobras ADR companion quote, can tag Brazilian upstream sentiment regimes for "
+                    "synthetic paper continuation measurement."
+                ),
+                "source_surface": ANP_OPC_SURFACE,
+                "permitted_target_surface": [ANP_OPC_SURFACE],
+                "strategy_logic": {
+                    "type": "observation_program",
+                    "universe": {
+                        "venues": ["ANP_BRAZIL_OPC"],
+                        "trade_types": ["official_regulatory_programme_reference"],
+                        "market_surfaces": [ANP_OPC_SURFACE],
+                    },
+                    "calculated_features": {
+                        "opc_catalogue_depth_signal": "available_exploratory_blocks / 25",
+                        "opc_new_block_signal": "new_exploratory_blocks * 2",
+                        "opc_offshore_bias_pct": "offshore_new_blocks / max(new_exploratory_blocks, 1)",
+                        "opc_reference_intensity": "max(opc_catalogue_depth_signal, opc_new_block_signal)",
+                    },
+                    "entry_expression": (
+                        "market_surface == 'anp_oferta_permanente_de_concessao' "
+                        "and price_basis == 'public_companion_petrobras_adr_quote' "
+                        "and quality_status == 'verified_proxy' "
+                        "and candidate_reject_reason == 'public_companion_price_requires_strategy_logic' "
+                        "and freshness_state == 'fresh' and last > 0 and opc_reference_intensity > 0"
+                    ),
+                    "invalidation_expression": (
+                        "freshness_state != 'fresh' or last <= 0 or opc_reference_intensity <= 0"
+                    ),
+                    "direction": "long",
+                    "edge_expression": "opc_reference_intensity + 10 * opc_offshore_bias_pct",
+                    "score_expression": (
+                        "clip(45 + min(opc_reference_intensity, 80) / 2 + 10 * opc_offshore_bias_pct, 0, 100)"
+                    ),
+                    "route_surface": "proxy",
+                },
+                "data_requirements": {
+                    "admission_key": state.get("admission_key"),
+                    "adapter_id": details.get("adapter_id"),
+                    "paper_only": True,
+                    "venue": "ANP_BRAZIL_OPC",
+                    "market_surface": ANP_OPC_SURFACE,
+                    "source_surface": ANP_OPC_SURFACE,
+                    "permitted_target_surface": [ANP_OPC_SURFACE],
+                    "required_fields": [
+                        "available_exploratory_blocks",
+                        "new_exploratory_blocks",
+                        "offshore_new_blocks",
+                        "onshore_new_blocks",
+                        "price_basis",
+                        "quality_status",
+                        "candidate_reject_reason",
+                        "price_source",
+                        "source_url",
+                        "source_programme_url",
+                        "companion_quote_symbol",
+                        "last",
+                    ],
+                    "supported_snapshot_features": [
+                        "available_exploratory_blocks",
+                        "new_exploratory_blocks",
+                        "offshore_new_blocks",
+                        "onshore_new_blocks",
+                    ],
+                    "paper_only_reference": True,
+                    "requires_independent_signal_logic": True,
+                },
+                "risk_gates": {
+                    "require_route_feasible": False,
+                    "paper_allocation_multiplier": 0.25,
+                    "synthetic_research_only": True,
+                    "data_quality": [
+                        "Use only verified companion-price rows with price_basis='public_companion_petrobras_adr_quote'.",
+                        "Retain the official ANP reference provenance via source_programme_url and source_url.",
+                        "Never treat the Petrobras ADR quote as an ANP executable route.",
+                    ],
+                    "exposure_limits": [
+                        "Paper-only synthetic research route.",
+                        "At most one active Strategy Lab signal per inst_id.",
+                        "No live trading, no broker writes, and no non-paper execution path.",
+                    ],
+                },
+            },
+            "evidence": evidence,
+        },
+    }
+    result = ingest_strategy_lab_recommendation(conn, rec, settings)[0]
+    if result.get("strategy_lab_id"):
+        bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
+    return {
+        "action": "strategy_lab_anp_opc_program",
+        "status": "created" if result.get("created") else "updated",
+        "strategy_lab_id": result.get("strategy_lab_id"),
+        "topic_key": claim.topic_key,
+    }
+
+
 def _create_strategy_discovery(
     conn: sqlite3.Connection,
     settings: dict,
@@ -968,6 +1100,11 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
                 and str(state.get("market_surface") or "") == ADX_DERIVATIVES_SURFACE
             ):
                 actions.append(_create_adx_derivatives_companion_program(conn, settings, state))
+            elif (
+                str(state.get("venue") or "").upper() == "ANP_BRAZIL_OPC"
+                and str(state.get("market_surface") or "") == ANP_OPC_SURFACE
+            ):
+                actions.append(_create_anp_opc_companion_program(conn, settings, state))
             elif (
                 str(state.get("venue") or "").upper() == "ICDX"
                 and str(state.get("market_surface") or "") == ICDX_MILESTONES_SURFACE

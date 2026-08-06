@@ -138,6 +138,10 @@ BASE_FEATURES = {
     "suggested_opening_price",
     "previous_settlement_price",
     "cpotr_opening_gap_bps",
+    "available_exploratory_blocks",
+    "new_exploratory_blocks",
+    "offshore_new_blocks",
+    "onshore_new_blocks",
     "exchange_established_year",
     "cpotr_launch_year",
     "gofx_launch_year",
@@ -205,11 +209,16 @@ PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS = {
     "price_source",
     "source_adapter_id",
     "source_url",
+    "source_programme_url",
     "source_contract_url",
     "source_record_type",
     "proxy_quality_status",
     "proxy_symbol",
     "companion_quote_symbol",
+    "available_exploratory_blocks",
+    "new_exploratory_blocks",
+    "offshore_new_blocks",
+    "onshore_new_blocks",
     "trade_id",
     "traded_volume",
     "allowance_category",
@@ -1306,6 +1315,38 @@ def _icdx_milestone_companion_provenance(frame: dict) -> tuple[bool, list[str]]:
     return not missing, missing
 
 
+def _anp_opc_companion_provenance(frame: dict) -> tuple[bool, list[str]]:
+    """Validate ANP OPC rows enriched with a Petrobras ADR companion quote."""
+
+    missing: list[str] = []
+    if str(frame.get("market_surface") or "").strip() != "anp_oferta_permanente_de_concessao":
+        missing.append("market_surface")
+    if str(frame.get("quality_status") or "") != "verified_proxy":
+        missing.append("quality_status")
+    if str(frame.get("candidate_reject_reason") or "") != "public_companion_price_requires_strategy_logic":
+        missing.append("candidate_reject_reason")
+    if str(frame.get("freshness_state") or "") != "fresh":
+        missing.append("freshness_state")
+    if str(frame.get("price_basis") or "") != "public_companion_petrobras_adr_quote":
+        missing.append("price_basis")
+    if not str(frame.get("price_source") or "").strip():
+        missing.append("price_source")
+    if not str(frame.get("source_url") or "").strip():
+        missing.append("source_url")
+    if not str(frame.get("source_programme_url") or "").strip():
+        missing.append("source_programme_url")
+    if not str(frame.get("companion_quote_symbol") or "").strip():
+        missing.append("companion_quote_symbol")
+    if _float(frame.get("last")) <= 0:
+        missing.append("last")
+    if max(
+        _float(frame.get("available_exploratory_blocks")),
+        _float(frame.get("new_exploratory_blocks")),
+    ) <= 0:
+        missing.append("opc_reference_signal")
+    return not missing, missing
+
+
 def _program_values(frame: dict, program: dict) -> dict:
     values = {key: frame.get(key) for key in BASE_FEATURES | METADATA_NAMES if frame.get(key) is not None}
     for name, expression in (program.get("calculated_features") or {}).items():
@@ -1390,6 +1431,14 @@ def generate_program_candidates(
             and str(frame.get("candidate_reject_reason") or "")
             == "public_companion_price_requires_strategy_logic"
         )
+        is_anp_opc_companion_reference = (
+            str(frame.get("venue") or "").upper() == "ANP_BRAZIL_OPC"
+            and str(frame.get("market_surface") or "") == "anp_oferta_permanente_de_concessao"
+            and str(frame.get("trade_type") or "") == "official_regulatory_programme_reference"
+            and str(frame.get("quality_status") or "") == "verified_proxy"
+            and str(frame.get("candidate_reject_reason") or "")
+            == "public_companion_price_requires_strategy_logic"
+        )
         icdx_cpotr_provenance_valid = bool(
             is_icdx_cpotr_price_card_reference
             and str(frame.get("freshness_state") or "") == "fresh"
@@ -1403,6 +1452,10 @@ def generate_program_candidates(
         icdx_milestone_provenance_valid = bool(
             is_icdx_milestone_companion_reference
             and _icdx_milestone_companion_provenance(frame)[0]
+        )
+        anp_opc_provenance_valid = bool(
+            is_anp_opc_companion_reference
+            and _anp_opc_companion_provenance(frame)[0]
         )
         provenance_valid = True
         provenance_missing: list[str] = []
@@ -1426,6 +1479,13 @@ def generate_program_candidates(
                 rejects["icdx_milestone_reference_provenance_invalid"] += 1
                 for field in provenance_missing:
                     rejects[f"icdx_milestone_reference_missing:{field}"] += 1
+                continue
+        if is_anp_opc_companion_reference:
+            provenance_valid, provenance_missing = _anp_opc_companion_provenance(frame)
+            if not provenance_valid:
+                rejects["anp_opc_reference_provenance_invalid"] += 1
+                for field in provenance_missing:
+                    rejects[f"anp_opc_reference_missing:{field}"] += 1
                 continue
         try:
             values = _program_values(frame, program)
@@ -1507,16 +1567,19 @@ def generate_program_candidates(
                 or is_reported_spot_reference
                 or is_icdx_cpotr_price_card_reference
                 or is_icdx_milestone_companion_reference
+                or is_anp_opc_companion_reference
             ),
             "paper_reported_spot_reference": is_reported_spot_reference,
             "paper_cpotr_price_card_reference": is_icdx_cpotr_price_card_reference,
             "paper_icdx_milestone_reference": is_icdx_milestone_companion_reference,
+            "paper_anp_opc_reference": is_anp_opc_companion_reference,
             "synthetic_route_id": (
                 synthetic_route_id
                 if (
                     is_reported_spot_reference
                     or is_icdx_cpotr_price_card_reference
                     or is_icdx_milestone_companion_reference
+                    or is_anp_opc_companion_reference
                 )
                 else None
             ),
@@ -1525,6 +1588,7 @@ def generate_program_candidates(
                 or is_reported_spot_reference
                 or is_icdx_cpotr_price_card_reference
                 or is_icdx_milestone_companion_reference
+                or is_anp_opc_companion_reference
             ),
             "paper_execution_semantics": (
                 "synthetic_research_not_live_equivalent"
@@ -1532,6 +1596,7 @@ def generate_program_candidates(
                     is_reported_spot_reference
                     or is_icdx_cpotr_price_card_reference
                     or is_icdx_milestone_companion_reference
+                    or is_anp_opc_companion_reference
                 )
                 else None
             ),
@@ -1542,6 +1607,7 @@ def generate_program_candidates(
                     or is_reported_spot_reference
                     or is_icdx_cpotr_price_card_reference
                     or is_icdx_milestone_companion_reference
+                    or is_anp_opc_companion_reference
                 )
                 else None
             ),
@@ -1616,6 +1682,24 @@ def generate_program_candidates(
             }
             if is_icdx_milestone_companion_reference
             else {},
+            "paper_anp_opc_provenance_valid": anp_opc_provenance_valid,
+            "paper_anp_opc_provenance": {
+                "market_surface": str(frame.get("market_surface") or ""),
+                "quality_status": str(frame.get("quality_status") or ""),
+                "candidate_reject_reason": str(frame.get("candidate_reject_reason") or ""),
+                "freshness_state": str(frame.get("freshness_state") or ""),
+                "price_source": str(frame.get("price_source") or ""),
+                "price_basis": str(frame.get("price_basis") or ""),
+                "source_url": str(frame.get("source_url") or ""),
+                "source_programme_url": str(frame.get("source_programme_url") or ""),
+                "companion_quote_symbol": str(frame.get("companion_quote_symbol") or ""),
+                "available_exploratory_blocks": _float(frame.get("available_exploratory_blocks")),
+                "new_exploratory_blocks": _float(frame.get("new_exploratory_blocks")),
+                "offshore_new_blocks": _float(frame.get("offshore_new_blocks")),
+                "onshore_new_blocks": _float(frame.get("onshore_new_blocks")),
+            }
+            if is_anp_opc_companion_reference
+            else {},
             "strategy_lab_id": str(experiment.get("strategy_lab_id")),
             "strategy_lab_version": int(experiment.get("version") or 1),
             "strategy_lab_experiment_type": "market_strategy",
@@ -1650,6 +1734,7 @@ def generate_program_candidates(
                 or is_reported_spot_reference
                 or is_icdx_cpotr_price_card_reference
                 or is_icdx_milestone_companion_reference
+                or is_anp_opc_companion_reference
             ),
             "strategy_reliability_allocation_multiplier": experimental_allocation,
             "strategy_lab_relaxation": risk_gates.get("adaptive_relaxation") or {},

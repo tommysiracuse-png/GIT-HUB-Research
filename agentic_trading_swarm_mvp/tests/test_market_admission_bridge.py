@@ -130,6 +130,44 @@ class MarketAdmissionBridgeTests(unittest.TestCase):
         self.assertIn("source_contract_url", requirements["required_fields"])
         self.assertFalse(json.loads(row["risk_gates_json"])["require_route_feasible"])
 
+    def test_anp_quality_verified_companion_quotes_create_canonical_program(self) -> None:
+        anp_state = state(
+            "quality_verified",
+            venue="ANP_BRAZIL_OPC",
+            inst_id="ANP:OPC:NEW_EXPLORATORY_BLOCKS:2026-04-14",
+            market_surface="anp_oferta_permanente_de_concessao",
+            session_status="unknown",
+            details={
+                "adapter_id": "anp_oferta_permanente_de_concessao",
+                "quality_status": "verified_proxy",
+                "candidate_reject_reason": "public_companion_price_requires_strategy_logic",
+                "route_status": "unknown",
+            },
+        )
+        result = market_admission_bridge.run_market_admission_bridge(
+            self.conn, self.settings, {"states": [anp_state]}
+        )
+        row = self.conn.execute(
+            "select strategy_lab_id, strategy_logic_json, data_requirements_json, risk_gates_json from strategy_lab_experiments"
+        ).fetchone()
+
+        self.assertEqual(1, result["summary"]["actions_created"])
+        self.assertEqual("strategy_lab_anp_opc_program", result["actions"][0]["action"])
+        self.assertEqual("anp_opc_brazil_upstream_proxy_v1", row["strategy_lab_id"])
+        logic = json.loads(row["strategy_logic_json"])
+        self.assertEqual("observation_program", logic["type"])
+        self.assertEqual("proxy", logic["route_surface"])
+        self.assertEqual("available_exploratory_blocks / 25", logic["calculated_features"]["opc_catalogue_depth_signal"])
+        self.assertIn("price_basis == 'public_companion_petrobras_adr_quote'", logic["entry_expression"])
+        self.assertEqual("opc_reference_intensity + 10 * opc_offshore_bias_pct", logic["edge_expression"])
+        requirements = json.loads(row["data_requirements_json"])
+        self.assertEqual("anp_oferta_permanente_de_concessao", requirements["adapter_id"])
+        self.assertIn("source_programme_url", requirements["required_fields"])
+        self.assertIn("offshore_new_blocks", requirements["supported_snapshot_features"])
+        risk_gates = json.loads(row["risk_gates_json"])
+        self.assertFalse(risk_gates["require_route_feasible"])
+        self.assertTrue(risk_gates["synthetic_research_only"])
+
     def test_icdx_priceable_price_card_creates_canonical_synthetic_research_program(self) -> None:
         icdx_state = state(
             "priceable",

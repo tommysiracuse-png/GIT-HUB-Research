@@ -605,6 +605,10 @@ def _desired_status(task: dict[str, Any], metrics: dict[str, Any]) -> str:
         return "needs_runtime_repair"
     if owner_task:
         return "strategy_handoff"
+    if int(strategy.get("compiled_experiment_count") or 0) > 0:
+        return "active_testing"
+    if int(strategy.get("experiment_count") or 0) > 0:
+        return "strategy_handoff"
     adapter = _runtime_adapter(task)
     if int(adapter.get("candidate_count") or 0) > 0:
         return "monitoring_runtime"

@@ -18,9 +18,11 @@ from adapters.registry import discover_adapters, get_adapter
 from adapters.venues.anp_oferta_permanente_de_concessao import (
     ANNOUNCEMENT_URL,
     BLOCKS_URL,
+    COMPANION_QUOTE_URL,
     AnpOfertaPermanenteDeConcessaoAdapter,
     parse_anp_opc_45_block_announcement,
     parse_anp_opc_exploratory_blocks,
+    parse_tradingview_petrobras_adr_quote,
 )
 
 
@@ -44,6 +46,13 @@ passará por audiência pública</h1>
 edital da Oferta Permanente de Concessão (OPC), com a inclusão de 45 novos blocos
 exploratórios. São 37 marítimos (Bacias de Campos e Santos) e oito terrestres
 (Bacia Potiguar).</p>
+</body></html>
+"""
+
+
+COMPANION_QUOTE_TEXT = """
+<html><body>
+<p>The current price of PBR is 14.62 USD.</p>
 </body></html>
 """
 
@@ -116,6 +125,48 @@ class AnpOfertaPermanenteAdapterTests(unittest.TestCase):
         self.assertTrue(all(item["direction"] == "watch_only" for item in [*catalogue, *announcement]))
         self.assertTrue(all(item["price_available"] is False for item in [*catalogue, *announcement]))
 
+    def test_companion_quote_parser_and_scan_attach_petrobras_proxy_price(self) -> None:
+        quote = parse_tradingview_petrobras_adr_quote(
+            COMPANION_QUOTE_TEXT,
+            received_at="2026-08-04T08:35:00+00:00",
+        )
+        self.assertEqual(14.62, quote["last"])
+        self.assertEqual("public_companion_petrobras_adr_quote", quote["price_basis"])
+        self.assertEqual("NYSE:PBR", quote["proxy_symbol"])
+
+        with mock.patch(
+            "adapters.venues.anp_oferta_permanente_de_concessao.fetch_text",
+            side_effect=[
+                fetch_result(CATALOG_TEXT),
+                fetch_result(ANNOUNCEMENT_TEXT),
+                fetch_result(COMPANION_QUOTE_TEXT, "2026-08-04T08:35:00+00:00"),
+            ],
+        ):
+            batch = AnpOfertaPermanenteDeConcessaoAdapter().scan({})
+
+        self.assertEqual("reachable", batch.metadata["source_status"])
+        self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertEqual([], batch.metadata["companion_failures"])
+        self.assertEqual("reachable", batch.metadata["companion_fetch_status"]["PBR"]["fetch_status"])
+        self.assertEqual(2, batch.metadata["real_observation_count"])
+        self.assertTrue(all(row["price_available"] is True for row in batch.observations))
+        self.assertTrue(all(row["quality_status"] == "verified_proxy" for row in batch.observations))
+        self.assertTrue(
+            all(
+                row["candidate_reject_reason"] == "public_companion_price_requires_strategy_logic"
+                for row in batch.observations
+            )
+        )
+        self.assertTrue(all(row["source_url"] == COMPANION_QUOTE_URL for row in batch.observations))
+        self.assertTrue(all(row["source_programme_url"] in {BLOCKS_URL, ANNOUNCEMENT_URL} for row in batch.observations))
+        self.assertEqual(
+            {"ANP:OPC:EXPLORATORY_BLOCKS:AVAILABLE": 495, "ANP:OPC:NEW_EXPLORATORY_BLOCKS:2026-04-14": 45},
+            {
+                row["inst_id"]: row.get("available_exploratory_blocks") or row.get("new_exploratory_blocks")
+                for row in batch.observations
+            },
+        )
+
     def test_adapter_retains_parser_and_fetch_health_evidence(self) -> None:
         blocked = {
             "ok": False,
@@ -151,7 +202,11 @@ class AnpOfertaPermanenteAdapterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch(
             "adapters.venues.anp_oferta_permanente_de_concessao.fetch_text",
-            side_effect=[fetch_result(CATALOG_TEXT), fetch_result(ANNOUNCEMENT_TEXT)],
+            side_effect=[
+                fetch_result(CATALOG_TEXT),
+                fetch_result(ANNOUNCEMENT_TEXT),
+                fetch_result(COMPANION_QUOTE_TEXT, "2026-08-04T08:35:00+00:00"),
+            ],
         ), mock.patch.object(adapter_runtime, "RUNS_DIR", pathlib.Path(tmp)), mock.patch.object(
             adapter_runtime, "CACHE_DIR", pathlib.Path(tmp) / "cache"
         ), mock.patch.object(adapter_runtime, "REPORT_JSON", pathlib.Path(tmp) / "report.json"), mock.patch.object(
@@ -173,6 +228,7 @@ class AnpOfertaPermanenteAdapterTests(unittest.TestCase):
         report = batch.metadata["public_market_adapters"]
         self.assertEqual(adapter_id, report["adapters"][0]["adapter_id"])
         self.assertEqual("reachable", report["adapters"][0]["source_status"])
+        self.assertEqual(2, report["adapters"][0]["price_observation_count"])
 
 
 if __name__ == "__main__":

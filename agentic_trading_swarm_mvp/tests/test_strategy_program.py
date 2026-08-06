@@ -779,6 +779,86 @@ def icdx_milestone_companion_logic() -> dict:
     }
 
 
+def anp_opc_companion_observation(
+    price: float,
+    observed_at: str,
+    *,
+    inst_id: str = "ANP:OPC:NEW_EXPLORATORY_BLOCKS:2026-04-14",
+    available_exploratory_blocks: float = 0.0,
+    new_exploratory_blocks: float = 45.0,
+    offshore_new_blocks: float = 37.0,
+    onshore_new_blocks: float = 8.0,
+    **overrides: object,
+) -> dict:
+    row = {
+        "inst_id": inst_id,
+        "venue": "ANP_BRAZIL_OPC",
+        "trade_type": "official_regulatory_programme_reference",
+        "market_type": "exploration_block_programme_amendment",
+        "market_surface": "anp_oferta_permanente_de_concessao",
+        "asset_class": "oil_and_gas_exploration_rights_reference",
+        "base": "BRAZIL_EXPLORATION_BLOCKS",
+        "quote": "USD_PER_ADR_PROXY",
+        "last": price,
+        "price_basis": "public_companion_petrobras_adr_quote",
+        "quality_status": "verified_proxy",
+        "proxy_quality_status": "verified_proxy",
+        "candidate_reject_reason": "public_companion_price_requires_strategy_logic",
+        "freshness_state": "fresh",
+        "session_status": "public_consultation_announced",
+        "data_status": "reachable",
+        "observed_at": observed_at,
+        "price_source": "TradingView public Petrobras ADR companion quote",
+        "source_url": "https://www.tradingview.com/symbols/NYSE-PBR/",
+        "source_programme_url": (
+            "https://www.gov.br/anp/pt-br/canais_atendimento/imprensa/noticias-comunicados/"
+            "oferta-permanente-de-concessao-opc-edital-com-inclusao-de-45-blocos-passara-por-audiencia-publica"
+        ),
+        "source_adapter_id": "anp_oferta_permanente_de_concessao",
+        "companion_quote_symbol": "PBR",
+        "proxy_symbol": "NYSE:PBR",
+        "available_exploratory_blocks": available_exploratory_blocks,
+        "new_exploratory_blocks": new_exploratory_blocks,
+        "offshore_new_blocks": offshore_new_blocks,
+        "onshore_new_blocks": onshore_new_blocks,
+    }
+    row.update(overrides)
+    return row
+
+
+def anp_opc_companion_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["ANP_BRAZIL_OPC"],
+            "trade_types": ["official_regulatory_programme_reference"],
+            "market_surfaces": ["anp_oferta_permanente_de_concessao"],
+        },
+        "calculated_features": {
+            "opc_catalogue_depth_signal": "available_exploratory_blocks / 25",
+            "opc_new_block_signal": "new_exploratory_blocks * 2",
+            "opc_offshore_bias_pct": "offshore_new_blocks / max(new_exploratory_blocks, 1)",
+            "opc_reference_intensity": "max(opc_catalogue_depth_signal, opc_new_block_signal)",
+        },
+        "entry_expression": (
+            "market_surface == 'anp_oferta_permanente_de_concessao' "
+            "and price_basis == 'public_companion_petrobras_adr_quote' "
+            "and quality_status == 'verified_proxy' "
+            "and candidate_reject_reason == 'public_companion_price_requires_strategy_logic' "
+            "and freshness_state == 'fresh' and last > 0 and opc_reference_intensity > 0"
+        ),
+        "invalidation_expression": (
+            "freshness_state != 'fresh' or last <= 0 or opc_reference_intensity <= 0"
+        ),
+        "direction": "long",
+        "edge_expression": "opc_reference_intensity + 10 * opc_offshore_bias_pct",
+        "score_expression": (
+            "clip(45 + min(opc_reference_intensity, 80) / 2 + 10 * opc_offshore_bias_pct, 0, 100)"
+        ),
+        "route_surface": "proxy",
+    }
+
+
 class StrategyProgramTests(unittest.TestCase):
     def test_safe_expression_rejects_code_and_attribute_access(self) -> None:
         with self.assertRaises(ProgramValidationError):
@@ -1485,6 +1565,64 @@ class StrategyProgramTests(unittest.TestCase):
             self.assertGreater(candidate["strategy_lab_program_features"]["cpotr_opening_gap_bps"], 0.0)
             self.assertEqual(16.0, candidate["strategy_lab_program_features"]["years_since_cpotr_launch"])
             self.assertEqual(30.0, candidate["strategy_lab_program_features"]["milestone_reference_depth_years"])
+
+            synthetic = prepare_candidate_for_exploration(candidate, cfg)
+            self.assertTrue(synthetic["synthetic_research_paper"])
+            self.assertFalse(synthetic["promotion_eligible"])
+            self.assertEqual("synthetic_research_not_live_equivalent", synthetic["paper_execution_semantics"])
+
+            execution = execute_order(
+                conn,
+                synthetic,
+                {"learned_score": synthetic["score"], "paper_allocation_multiplier": 1.0},
+                cfg,
+            )
+            self.assertTrue(execution["paper_filled"])
+            self.assertEqual("synthetic_research_paper", execution["order"]["route_id"])
+            self.assertEqual("paper", execution["order"]["mode"])
+
+    def test_anp_opc_program_uses_reference_features_and_synthetic_paper_route(self) -> None:
+        cfg = settings()
+        cfg["paper_exploration"]["enabled"] = True
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        recommendation = lab_recommendation(
+            "anp_opc_brazil_upstream_proxy_v1",
+            anp_opc_companion_logic(),
+        )
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["hypothesis"] = (
+            "Fresh ANP OPC catalogue and amendment intensity can drive same-surface synthetic paper testing with a Petrobras ADR companion quote."
+        )
+        experiment["source_surface"] = "anp_oferta_permanente_de_concessao"
+        experiment["permitted_target_surface"] = ["anp_oferta_permanente_de_concessao"]
+
+        observation = anp_opc_companion_observation(
+            14.62,
+            now.isoformat(),
+            available_exploratory_blocks=495.0,
+        )
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [observation],
+            )
+
+            self.assertEqual(1, len(generated), report)
+            candidate = generated[0]
+            self.assertEqual("anp_oferta_permanente_de_concessao", candidate["target_surface"])
+            self.assertEqual("long_proxy", candidate["direction"])
+            self.assertTrue(candidate["paper_anp_opc_reference"])
+            self.assertTrue(candidate["paper_anp_opc_provenance_valid"])
+            self.assertEqual("synthetic_research_paper", candidate["synthetic_route_id"])
+            self.assertEqual(45.0, candidate["strategy_lab_program_features"]["new_exploratory_blocks"])
+            self.assertEqual(37.0, candidate["strategy_lab_program_features"]["offshore_new_blocks"])
+            self.assertEqual(90.0, candidate["strategy_lab_program_features"]["opc_new_block_signal"])
+            self.assertGreater(candidate["edge_bps_estimate"], 90.0)
 
             synthetic = prepare_candidate_for_exploration(candidate, cfg)
             self.assertTrue(synthetic["synthetic_research_paper"])

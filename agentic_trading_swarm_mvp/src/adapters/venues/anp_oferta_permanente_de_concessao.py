@@ -30,6 +30,8 @@ DASHBOARD_URL = (
     "paineis-dinamicos-sobre-exploracao-e-producao-de-petroleo-e-gas/"
     "painel-dinamico-da-oferta-permanente"
 )
+COMPANION_QUOTE_SYMBOL = "PBR"
+COMPANION_QUOTE_URL = "https://www.tradingview.com/symbols/NYSE-PBR/"
 MARKET_SURFACE = "anp_oferta_permanente_de_concessao"
 VENUE = "ANP_BRAZIL_OPC"
 
@@ -252,6 +254,82 @@ def parse_anp_opc_45_block_announcement(
     ]
 
 
+def parse_tradingview_petrobras_adr_quote(
+    payload: str,
+    *,
+    symbol: str = COMPANION_QUOTE_SYMBOL,
+    source_url: str = COMPANION_QUOTE_URL,
+    received_at: str | None = None,
+) -> dict[str, Any]:
+    """Parse a public Petrobras ADR quote page used as a paper-only companion price."""
+
+    text = str(payload or "").strip()
+    quote_symbol = str(symbol or "").strip().upper()
+    if not text:
+        raise AnpOfertaPermanenteParseError("TradingView Petrobras ADR quote page is empty")
+    if not quote_symbol:
+        raise AnpOfertaPermanenteParseError("TradingView Petrobras ADR quote symbol is missing")
+    match = re.search(
+        rf"The current price of {re.escape(quote_symbol)} is ([0-9]+(?:\.[0-9]+)?)\s*USD",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise AnpOfertaPermanenteParseError(
+            f"TradingView Petrobras ADR quote page missing current price for {quote_symbol}"
+        )
+    try:
+        last = float(match.group(1))
+    except ValueError as exc:
+        raise AnpOfertaPermanenteParseError(
+            f"TradingView Petrobras ADR quote page has invalid current price for {quote_symbol}"
+        ) from exc
+    if last <= 0:
+        raise AnpOfertaPermanenteParseError(
+            f"TradingView Petrobras ADR quote page current price must be positive for {quote_symbol}"
+        )
+    fetched_at = _received_time(received_at)
+    return {
+        "last": last,
+        "price_available": True,
+        "price_basis": "public_companion_petrobras_adr_quote",
+        "quality_status": "verified_proxy",
+        "proxy_quality_status": "verified_proxy",
+        "proxy_symbol": f"NYSE:{quote_symbol}",
+        "companion_quote_symbol": quote_symbol,
+        "companion_quote_url": source_url,
+        "price_reference_role": "brazil_upstream_equity_proxy",
+        "price_source": "TradingView public Petrobras ADR companion quote",
+        "source_record_type": "tradingview_public_symbol_faq",
+        "observed_at": fetched_at.isoformat(),
+        "fetched_at": fetched_at.isoformat(),
+    }
+
+
+def _apply_companion_quote(observation: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
+    """Preserve the ANP regulatory record while attaching a public Petrobras proxy price."""
+
+    updated = dict(observation)
+    updated["last"] = float(quote["last"])
+    updated["price_available"] = True
+    updated["quote"] = "USD_PER_ADR_PROXY"
+    updated["price_basis"] = str(quote["price_basis"])
+    updated["quality_status"] = str(quote["quality_status"])
+    updated["proxy_quality_status"] = str(quote["proxy_quality_status"])
+    updated["proxy_symbol"] = str(quote["proxy_symbol"])
+    updated["price_reference_role"] = str(quote["price_reference_role"])
+    updated["price_source"] = str(quote["price_source"])
+    updated["source_record_type"] = str(quote["source_record_type"])
+    updated["source_programme_url"] = str(updated.get("source_url") or "")
+    updated["source_url"] = str(quote["companion_quote_url"])
+    updated["companion_quote_symbol"] = str(quote["companion_quote_symbol"])
+    updated["companion_quote_url"] = str(quote["companion_quote_url"])
+    updated["companion_observed_at"] = str(quote["observed_at"])
+    updated["companion_fetched_at"] = str(quote["fetched_at"])
+    updated["candidate_reject_reason"] = "public_companion_price_requires_strategy_logic"
+    return updated
+
+
 def _fetch_evidence(result: dict[str, Any], source_url: str) -> dict[str, Any]:
     return {
         "source_url": source_url,
@@ -334,6 +412,7 @@ class AnpOfertaPermanenteDeConcessaoAdapter:
     def scan(self, settings: dict | None = None) -> ScanBatch:
         cfg = _adapter_config(settings or {}, self.info.adapter_id)
         timeout = max(1, int(cfg.get("timeout_seconds", 15)))
+        companion_quote_url = str(cfg.get("companion_quote_url") or COMPANION_QUOTE_URL)
         sources = (
             (
                 "blocks_catalog",
@@ -351,6 +430,8 @@ class AnpOfertaPermanenteDeConcessaoAdapter:
         observations: list[dict[str, Any]] = []
         parser_failures: list[dict[str, str]] = []
         fetch_status: dict[str, dict[str, Any]] = {}
+        companion_fetch_status: dict[str, dict[str, Any]] = {}
+        companion_failures: list[dict[str, str]] = []
         usable_sources = 0
         for source_key, source_url, parser, stale_after_days in sources:
             result = fetch_text(source_url, timeout)
@@ -375,10 +456,46 @@ class AnpOfertaPermanenteDeConcessaoAdapter:
                 )
                 observations.append(_failure_observation(source_key, source_url, result, message))
 
+        real_rows = [row for row in observations if row.get("quality_status", "") != "source_health"]
+        if real_rows:
+            result = fetch_text(companion_quote_url, timeout)
+            companion_fetch_status[COMPANION_QUOTE_SYMBOL] = _fetch_evidence(result, companion_quote_url)
+            if not result.get("ok"):
+                companion_failures.append(
+                    {
+                        "symbol": COMPANION_QUOTE_SYMBOL,
+                        "source_url": companion_quote_url,
+                        "error": str(result.get("error") or "public companion quote unavailable")[:300],
+                    }
+                )
+            else:
+                try:
+                    quote = parse_tradingview_petrobras_adr_quote(
+                        str(result.get("text") or ""),
+                        symbol=COMPANION_QUOTE_SYMBOL,
+                        source_url=companion_quote_url,
+                        received_at=result.get("received_at"),
+                    )
+                    enriched_observations: list[dict[str, Any]] = []
+                    for row in observations:
+                        if row.get("quality_status") == "source_health":
+                            enriched_observations.append(row)
+                        else:
+                            enriched_observations.append(_apply_companion_quote(row, quote))
+                    observations = enriched_observations
+                except (AnpOfertaPermanenteParseError, TypeError, ValueError) as exc:
+                    companion_failures.append(
+                        {
+                            "symbol": COMPANION_QUOTE_SYMBOL,
+                            "source_url": companion_quote_url,
+                            "error": f"ANP OPC Petrobras companion quote parser failed: {exc}"[:300],
+                        }
+                    )
+
         statuses = [item["fetch_status"] for item in fetch_status.values()]
-        if usable_sources == len(sources) and not parser_failures:
+        if usable_sources == len(sources) and not parser_failures and not companion_failures:
             source_status = "reachable"
-        elif usable_sources or parser_failures:
+        elif usable_sources or parser_failures or companion_failures:
             source_status = "degraded"
         elif "blocked" in statuses:
             source_status = "blocked"
@@ -396,8 +513,9 @@ class AnpOfertaPermanenteDeConcessaoAdapter:
                 "adapter_spec_id": 1247,
                 "source_status": source_status,
                 "source_url": sources[0][1],
-                "source_urls": [sources[0][1], sources[1][1], DASHBOARD_URL],
+                "source_urls": [sources[0][1], sources[1][1], DASHBOARD_URL, companion_quote_url],
                 "fetch_status": fetch_status,
+                "companion_fetch_status": companion_fetch_status,
                 "freshness_state": (
                     freshness_states[0]
                     if len(freshness_states) == 1
@@ -415,6 +533,7 @@ class AnpOfertaPermanenteDeConcessaoAdapter:
                 ),
                 "session_states": session_states,
                 "parser_failures": parser_failures,
+                "companion_failures": companion_failures,
                 "observation_count": len(observations),
                 "real_observation_count": len(real_rows),
                 "capability_gap": "entry_quality_prices_bid_interest_and_order_routing",
