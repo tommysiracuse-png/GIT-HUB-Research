@@ -962,7 +962,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertFalse(candidate["paper_active_scoring_eligible"])
         self.assertTrue(candidate["paper_route_feasibility_shadow_label"])
         self.assertEqual(
-            "conditional_short_exact_route_unsupported",
+            "conditional_short_paper_metadata_unsupported",
             candidate["route_feasibility_reason"],
         )
         self.assertEqual(
@@ -970,9 +970,11 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             candidate["paper_quality_filter_status"],
         )
         self.assertLess(candidate["paper_ranking_score"], 20.0)
+        self.assertTrue(candidate["paper_ineligible"])
+        self.assertIn("borrow_availability_model_unsupported", candidate["paper_route_rationale_codes"])
         report = candidate["frontier_short_spot_route_requirements_report"]
         self.assertEqual(
-            "conditional_short_exact_route_unsupported",
+            "conditional_short_paper_metadata_unsupported",
             report["route_feasibility_reason"],
         )
         summary = frontier.summarize([], ranked)
@@ -1008,7 +1010,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertFalse(candidate["paper_active_scoring_eligible"])
         self.assertTrue(candidate["paper_route_feasibility_shadow_label"])
         self.assertEqual(
-            "conditional_short_support_unknown",
+            "conditional_short_paper_metadata_unsupported",
             candidate["route_feasibility_reason"],
         )
         self.assertEqual(
@@ -1016,9 +1018,11 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             candidate["paper_quality_filter_status"],
         )
         self.assertLess(candidate["paper_ranking_score"], 60.0)
+        self.assertTrue(candidate["paper_ineligible"])
+        self.assertIn("borrow_availability_model_unsupported", candidate["paper_route_rationale_codes"])
         report = candidate["frontier_short_spot_route_requirements_report"]
         self.assertEqual(
-            "conditional_short_support_unknown",
+            "conditional_short_paper_metadata_unsupported",
             report["route_feasibility_reason"],
         )
         summary = frontier.summarize([], ranked)

@@ -5650,6 +5650,10 @@ DEFAULT_PAPER_ONLY_CONDITIONAL_SHORT_ROUTE_POLICY = {
     "unknown_multiplier": 0.75,
     "exact_unsupported_multiplier": 0.15,
     "generic_unsupported_multiplier": 0.15,
+    "metadata_missing_behavior": "suppress",
+    "metadata_negative_behavior": "suppress",
+    "metadata_missing_multiplier": 0.0,
+    "metadata_negative_multiplier": 0.0,
     "margin_permission_multiplier": 0.96,
     "borrow_check_multiplier": 0.94,
     "fee_bps_reference": 10.0,
@@ -6401,6 +6405,310 @@ def _paper_only_is_frontier_short_route_context(direction: str, context_stats: d
     return "frontier_crypto_venue_map" in descriptors and "short" in normalized_direction
 
 
+def _paper_only_route_affirmation(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    if text in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+        "supported",
+        "available",
+        "confirmed",
+        "configured",
+        "ready",
+        "eligible",
+        "observed",
+        "satisfied",
+        "mapped",
+        "present",
+    }:
+        return True
+    if text in {
+        "0",
+        "false",
+        "f",
+        "no",
+        "n",
+        "off",
+        "unsupported",
+        "unavailable",
+        "blocked",
+        "rejected",
+        "denied",
+        "missing",
+        "unknown",
+        "unconfirmed",
+        "needs_confirmation",
+        "needs_route_validation",
+        "required_unconfirmed",
+        "not_checked",
+        "public_data_only",
+    }:
+        return False
+    return None
+
+
+def _paper_only_route_prerequisite_state(*values):
+    saw_unknown = False
+    for value in values:
+        if value in (None, "", [], {}, ()):
+            saw_unknown = True
+            continue
+        if isinstance(value, (list, tuple, set, frozenset)):
+            nested = _paper_only_route_prerequisite_state(*list(value))
+            if nested == "negative":
+                return "negative"
+            if nested == "affirmed":
+                return "affirmed"
+            saw_unknown = True
+            continue
+        if isinstance(value, dict):
+            status = value.get("status")
+            if status not in (None, ""):
+                nested = _paper_only_route_prerequisite_state(status)
+                if nested == "negative":
+                    return "negative"
+                if nested == "affirmed":
+                    return "affirmed"
+                saw_unknown = True
+                continue
+            saw_unknown = True
+            continue
+        normalized = _paper_only_route_affirmation(value)
+        if normalized is True:
+            return "affirmed"
+        if normalized is False:
+            return "negative"
+        saw_unknown = True
+    return "missing" if saw_unknown else "missing"
+
+
+def _paper_only_symbol_support_state(profile: dict) -> tuple[str, str]:
+    explicit = _paper_only_route_prerequisite_state(
+        _paper_only_route_profile_value(
+            profile,
+            "symbol_supported",
+            "instrument_supported",
+            "paper_symbol_supported",
+            "paper_instrument_supported",
+            "route_symbol_supported",
+        )
+    )
+    if explicit != "missing":
+        return explicit, "candidate.symbol_supported"
+
+    tokens = {
+        str(_paper_only_route_profile_value(profile, "inst_id", "route_primary_symbol") or "").strip().upper(),
+        str(_paper_only_route_profile_value(profile, "symbol", "route_hedge_symbol") or "").strip().upper(),
+    }
+    tokens.discard("")
+    for field in (
+        "supported_symbols",
+        "paper_supported_symbols",
+        "route_supported_symbols",
+        "supported_instruments",
+        "paper_supported_instruments",
+    ):
+        supported = _paper_only_route_profile_value(profile, field, ("venue_capabilities", field))
+        if supported in (None, "", [], {}, ()):
+            continue
+        supported_tokens: set[str] = set()
+        if isinstance(supported, dict):
+            supported_tokens.update(str(key).strip().upper() for key in supported)
+        elif isinstance(supported, (list, tuple, set, frozenset)):
+            supported_tokens.update(str(item).strip().upper() for item in supported if item not in (None, ""))
+        else:
+            supported_tokens.add(str(supported).strip().upper())
+        if not tokens:
+            return "affirmed", field
+        if tokens & supported_tokens:
+            return "affirmed", field
+        return "negative", field
+    return "missing", "candidate.symbol_supported"
+
+
+def _paper_only_conditional_order_support_state(profile: dict) -> tuple[str, str]:
+    explicit = _paper_only_route_prerequisite_state(
+        _paper_only_route_profile_value(
+            profile,
+            "supports_conditional_orders",
+            "conditional_order_support",
+            "conditional_orders_supported",
+            ("venue_capabilities", "supports_conditional_orders"),
+        )
+    )
+    if explicit != "missing":
+        return explicit, "candidate.supports_conditional_orders"
+
+    order_type_support = _paper_only_route_profile_value(
+        profile,
+        ("route_requirement_summary", "order_type_support"),
+        ("paper_route_requirement_report", "route_requirement_summary", "order_type_support"),
+        ("paper_route_requirement_report", "route_requirements", "order_type_support"),
+    )
+    if isinstance(order_type_support, dict):
+        status = str(order_type_support.get("status") or "").strip().lower()
+        if status in {"supported", "observed"}:
+            return "affirmed", "route_requirement_summary.order_type_support"
+        if status in {"unsupported", "missing"}:
+            return "negative", "route_requirement_summary.order_type_support"
+        supported = {
+            str(item or "").strip().lower().replace("-", "_")
+            for item in (order_type_support.get("supported_order_types") or [])
+        }
+        if supported & {"conditional", "trigger", "stop", "stop_limit", "stop_market"}:
+            return "affirmed", "route_requirement_summary.order_type_support"
+    return "missing", "route_requirement_summary.order_type_support"
+
+
+def _paper_only_conditional_short_prerequisite_review(profile: dict, *, applies: bool) -> dict:
+    if not applies:
+        return {
+            "applies": False,
+            "paper_ineligible": False,
+            "reason": "not_applicable",
+            "failed_prerequisites": [],
+            "failure_codes": [],
+            "prerequisites": {},
+        }
+
+    checklist = _paper_only_route_profile_value(
+        profile,
+        ("paper_route_requirement_report", "route_requirements", "route_requirement_checklist"),
+        ("route_requirements_panel", "route_requirement_checklist"),
+    )
+    checklist = checklist if isinstance(checklist, dict) else {}
+
+    def _check(name, state, source):
+        blocking = state != "affirmed"
+        failure_code = None
+        if state == "missing":
+            failure_code = f"{name}_missing"
+        elif state == "negative":
+            failure_code = f"{name}_unsupported"
+        return {
+            "status": state,
+            "source": source,
+            "blocking": blocking,
+            "failure_code": failure_code,
+        }
+
+    borrow_inventory_state = _paper_only_route_prerequisite_state(
+        _paper_only_route_profile_value(
+            profile,
+            "borrow_confirmed",
+            "borrowable",
+            "spot_borrow_confirmed",
+            "spot_borrow_available",
+        ),
+        checklist.get("shortable_inventory_declared"),
+    )
+    borrow_model_state = _paper_only_route_prerequisite_state(
+        _paper_only_route_profile_value(
+            profile,
+            "borrow_model_available",
+            "borrow_cost_model_present",
+            "borrow_fee_modeled",
+        ),
+        checklist.get("borrow_cost_model_present"),
+        _paper_only_route_profile_value(
+            profile,
+            "borrow_cost_bps",
+            "borrow_fee_bps",
+            "borrow_fee_bps_estimate",
+            ("paper_route_requirement_report", "route_requirement_summary", "short_borrow_availability", "borrow_fee_bps_estimate"),
+        ),
+    )
+    if "negative" in {borrow_inventory_state, borrow_model_state}:
+        borrow_state = "negative"
+    elif borrow_inventory_state == "affirmed" and borrow_model_state == "affirmed":
+        borrow_state = "affirmed"
+    else:
+        borrow_state = "missing"
+
+    margin_state = _paper_only_route_prerequisite_state(
+        _paper_only_route_profile_value(
+            profile,
+            "margin_eligible",
+            "margin_available",
+            ("venue_capabilities", "supports_margin_spot"),
+            ("venue_capabilities", "margin_supported"),
+        ),
+        checklist.get("venue_supports_margin_or_equivalent"),
+    )
+    fee_state = _paper_only_route_prerequisite_state(
+        _paper_only_route_profile_value(
+            profile,
+            "fees_modeled",
+            "fee_model_available",
+            "estimated_fee_bps_per_side",
+            "maker_fee_bps",
+            "taker_fee_bps",
+            ("paper_route_requirement_report", "route_requirement_summary", "fee_estimate", "estimated_round_trip_taker_bps"),
+        ),
+        checklist.get("fees_modeled"),
+    )
+    symbol_state, symbol_source = _paper_only_symbol_support_state(profile)
+    conditional_order_state, conditional_order_source = _paper_only_conditional_order_support_state(profile)
+
+    prerequisites = {
+        "borrow_availability_model": _check(
+            "borrow_availability_model",
+            borrow_state,
+            "route_requirement_checklist.shortable_inventory_declared+borrow_cost_model_present",
+        ),
+        "margin_eligibility": _check(
+            "margin_eligibility",
+            margin_state,
+            "route_requirement_checklist.venue_supports_margin_or_equivalent",
+        ),
+        "fee_assumptions": _check(
+            "fee_assumptions",
+            fee_state,
+            "route_requirement_checklist.fees_modeled",
+        ),
+        "symbol_support": _check(
+            "symbol_support",
+            symbol_state,
+            symbol_source,
+        ),
+        "conditional_order_route_support": _check(
+            "conditional_order_route_support",
+            conditional_order_state,
+            conditional_order_source,
+        ),
+    }
+    failed_prerequisites = [
+        name for name, details in prerequisites.items() if details["blocking"]
+    ]
+    failure_codes = [
+        details["failure_code"]
+        for details in prerequisites.values()
+        if details["failure_code"] is not None
+    ]
+    if any(details["status"] == "negative" for details in prerequisites.values()):
+        reason = "conditional_short_paper_metadata_unsupported"
+    elif failed_prerequisites:
+        reason = "conditional_short_paper_metadata_missing"
+    else:
+        reason = "supported"
+    return {
+        "applies": True,
+        "paper_ineligible": bool(failed_prerequisites),
+        "reason": reason,
+        "failed_prerequisites": failed_prerequisites,
+        "failure_codes": failure_codes,
+        "prerequisites": prerequisites,
+    }
+
+
 def _paper_only_frontier_short_route_feasibility_reason(
     *,
     venue: str,
@@ -6594,6 +6902,10 @@ def paper_only_conditional_short_route_feasibility_gate(
 
     requirements = paper_only_conditional_short_route_requirements(venue=venue, registry=registry)
     support_status = requirements.get("support_status")
+    prerequisite_review = _paper_only_conditional_short_prerequisite_review(
+        context_stats if isinstance(context_stats, dict) else {},
+        applies=True,
+    )
     reasons: list[str] = []
     suppressed = False
     allow = True
@@ -6655,6 +6967,64 @@ def paper_only_conditional_short_route_feasibility_gate(
             score_multiplier *= 1.0 - (max_fee_penalty_reduction * min(fee_bps / fee_reference, 1.0))
             reasons.append("fee_hint_penalty")
 
+    if prerequisite_review.get("paper_ineligible", False):
+        reasons = list(
+            dict.fromkeys(
+                [str(prerequisite_review.get("reason") or "conditional_short_paper_metadata_missing")]
+                + list(prerequisite_review.get("failure_codes") or [])
+                + reasons
+            )
+        )
+        score_multiplier = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    merged_policy.get(
+                        "metadata_negative_multiplier"
+                        if str(prerequisite_review.get("reason")) == "conditional_short_paper_metadata_unsupported"
+                        else "metadata_missing_multiplier",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+            ),
+        )
+        behavior = str(
+            merged_policy.get(
+                "metadata_negative_behavior"
+                if str(prerequisite_review.get("reason")) == "conditional_short_paper_metadata_unsupported"
+                else "metadata_missing_behavior",
+                "suppress",
+            )
+            or "suppress"
+        ).strip().lower()
+        if behavior == "suppress":
+            suppressed = True
+            allow = False
+        route_reason = str(prerequisite_review.get("reason") or "").strip()
+        return {
+            "enabled": True,
+            "applied": True,
+            "allow": allow,
+            "suppressed": suppressed,
+            "score_multiplier": score_multiplier,
+            "reason": route_reason,
+            "reasons": reasons,
+            "route_requirements": requirements,
+            "route_feasibility_reason": route_reason,
+            "active_scoring_eligible": False,
+            "shadow_label": True,
+            "route_registry_status": route_review.get("route_registry_status"),
+            "verified_standard_route": bool(route_review.get("verified_standard_route", False)),
+            "explicit_borrow_ok": bool(route_review.get("explicit_borrow_ok", False)),
+            "paper_ineligible": True,
+            "paper_ineligible_reason": route_reason,
+            "paper_rationale_fields": prerequisite_review["prerequisites"],
+            "paper_rationale_failures": prerequisite_review["failed_prerequisites"],
+            "paper_rationale_codes": prerequisite_review["failure_codes"],
+        }
+
     return {
         "enabled": True,
         "applied": True,
@@ -6672,6 +7042,11 @@ def paper_only_conditional_short_route_feasibility_gate(
         "route_registry_status": route_review.get("route_registry_status"),
         "verified_standard_route": bool(route_review.get("verified_standard_route", False)),
         "explicit_borrow_ok": bool(route_review.get("explicit_borrow_ok", False)),
+        "paper_ineligible": False,
+        "paper_ineligible_reason": None,
+        "paper_rationale_fields": prerequisite_review["prerequisites"],
+        "paper_rationale_failures": prerequisite_review["failed_prerequisites"],
+        "paper_rationale_codes": prerequisite_review["failure_codes"],
     }
 
 
@@ -6687,9 +7062,19 @@ def _annotate_frontier_route_feasibility_shadow_state(candidate: dict, gate: dic
     )
     active_scoring_eligible = bool(gate.get("active_scoring_eligible", True))
     shadow_label = bool(gate.get("shadow_label", False))
+    paper_ineligible = bool(gate.get("paper_ineligible", False))
+    paper_ineligible_reason = gate.get("paper_ineligible_reason")
+    rationale_fields = dict(gate.get("paper_rationale_fields") or {})
+    rationale_failures = list(gate.get("paper_rationale_failures") or [])
+    rationale_codes = list(gate.get("paper_rationale_codes") or [])
     candidate["route_feasibility_reason"] = reason
     candidate["paper_active_scoring_eligible"] = active_scoring_eligible
     candidate["paper_route_feasibility_shadow_label"] = shadow_label
+    candidate["paper_ineligible"] = paper_ineligible
+    candidate["paper_ineligible_reason"] = paper_ineligible_reason
+    candidate["paper_route_rationale_fields"] = rationale_fields
+    candidate["paper_route_rationale_failures"] = rationale_failures
+    candidate["paper_route_rationale_codes"] = rationale_codes
     if shadow_label:
         candidate["paper_route_feasibility_shadow_reason"] = reason
 
@@ -6706,17 +7091,32 @@ def _annotate_frontier_route_feasibility_shadow_state(candidate: dict, gate: dic
         report["route_feasibility_reason"] = reason
         report["paper_active_scoring_eligible"] = active_scoring_eligible
         report["paper_route_feasibility_shadow_label"] = shadow_label
+        report["paper_ineligible"] = paper_ineligible
+        report["paper_ineligible_reason"] = paper_ineligible_reason
+        report["paper_route_rationale_fields"] = rationale_fields
+        report["paper_route_rationale_failures"] = rationale_failures
+        report["paper_route_rationale_codes"] = rationale_codes
         if field == "paper_route_requirement_report":
             nested = report.get("frontier_short_spot_route_intelligence")
             if isinstance(nested, dict):
                 nested["route_feasibility_reason"] = reason
                 nested["paper_active_scoring_eligible"] = active_scoring_eligible
                 nested["paper_route_feasibility_shadow_label"] = shadow_label
+                nested["paper_ineligible"] = paper_ineligible
+                nested["paper_ineligible_reason"] = paper_ineligible_reason
+                nested["paper_route_rationale_fields"] = rationale_fields
+                nested["paper_route_rationale_failures"] = rationale_failures
+                nested["paper_route_rationale_codes"] = rationale_codes
             nested = report.get("frontier_short_spot_route_requirements_report")
             if isinstance(nested, dict):
                 nested["route_feasibility_reason"] = reason
                 nested["paper_active_scoring_eligible"] = active_scoring_eligible
                 nested["paper_route_feasibility_shadow_label"] = shadow_label
+                nested["paper_ineligible"] = paper_ineligible
+                nested["paper_ineligible_reason"] = paper_ineligible_reason
+                nested["paper_route_rationale_fields"] = rationale_fields
+                nested["paper_route_rationale_failures"] = rationale_failures
+                nested["paper_route_rationale_codes"] = rationale_codes
 
 
 def paper_only_frontier_score_adjustment(
@@ -6733,6 +7133,12 @@ def paper_only_frontier_score_adjustment(
     enabled: bool = True,
 ) -> dict:
     """Paper-only frontier score adjustment for safe, reportable gating."""
+
+    def _multiplier(value, default=1.0):
+        try:
+            return float(default if value is None else value)
+        except (TypeError, ValueError):
+            return float(default)
 
     stats = context_stats or {}
     cohort_closed = int(
@@ -6798,20 +7204,20 @@ def paper_only_frontier_score_adjustment(
 
     score_multiplier = 1.0
     if gate.get("allow", False):
-        score_multiplier *= float(gate.get("score_multiplier", 1.0) or 1.0)
+        score_multiplier *= _multiplier(gate.get("score_multiplier", 1.0))
     else:
         score_multiplier *= 0.0
 
     if not cohort_gate.get("suppressed", False):
-        score_multiplier *= float(cohort_gate.get("score_multiplier", 1.0) or 1.0)
+        score_multiplier *= _multiplier(cohort_gate.get("score_multiplier", 1.0))
     else:
         score_multiplier *= 0.0
 
     if cross_market_gate.get("enabled", False):
-        score_multiplier *= float(cross_market_gate.get("score_multiplier", 1.0) or 1.0)
+        score_multiplier *= _multiplier(cross_market_gate.get("score_multiplier", 1.0))
 
     if route_feasibility_gate.get("enabled", False) and route_feasibility_gate.get("applied", False):
-        score_multiplier *= float(route_feasibility_gate.get("score_multiplier", 1.0) or 1.0)
+        score_multiplier *= _multiplier(route_feasibility_gate.get("score_multiplier", 1.0))
         if route_feasibility_gate.get("suppressed", False):
             allow = False
             suppressed = True
@@ -10451,6 +10857,13 @@ def _apply_frontier_short_market_context(
 
 def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> list[dict]:
     """Rank the paper cohort while retaining every emitted, priceable candidate."""
+
+    def _multiplier(value, default=1.0):
+        try:
+            return float(default if value is None else value)
+        except (TypeError, ValueError):
+            return float(default)
+
     policy = _frontier_dislocation_quality_policy(settings)
     paper_only_active = bool(
         policy.get("enabled", True)
@@ -10471,12 +10884,6 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
     )
     for candidate in candidates:
         _refresh_frontier_short_route_requirements_report(candidate, settings)
-        if paper_only_active:
-            try:
-                from paper_order_router import apply_frontier_paper_admission_guard
-            except ImportError:  # pragma: no cover - package import fallback
-                from src.paper_order_router import apply_frontier_paper_admission_guard
-            candidate.update(apply_frontier_paper_admission_guard(candidate, settings))
         route_feasibility_gate = paper_only_conditional_short_route_feasibility_gate(
             venue=str(candidate.get("venue") or ""),
             direction=str(candidate.get("direction") or ""),
@@ -10485,6 +10892,12 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         )
         candidate["route_feasibility_gate"] = route_feasibility_gate
         _annotate_frontier_route_feasibility_shadow_state(candidate, route_feasibility_gate)
+        if paper_only_active:
+            try:
+                from paper_order_router import apply_frontier_paper_admission_guard
+            except ImportError:  # pragma: no cover - package import fallback
+                from src.paper_order_router import apply_frontier_paper_admission_guard
+            candidate.update(apply_frontier_paper_admission_guard(candidate, settings))
         quality_score = as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0
         base_score = as_float(candidate.get("score"), 0.0) or 0.0
         effective_edge = as_float(candidate.get("effective_edge_bps"), None)
@@ -10535,7 +10948,7 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         if route_feasibility_gate.get("enabled", False) and route_feasibility_gate.get("applied", False):
             paper_ranking_score = round(
                 max(0.0, paper_ranking_score)
-                * float(route_feasibility_gate.get("score_multiplier", 1.0) or 1.0),
+                * _multiplier(route_feasibility_gate.get("score_multiplier", 1.0)),
                 3,
             )
         candidate["paper_ranking_score"] = paper_ranking_score

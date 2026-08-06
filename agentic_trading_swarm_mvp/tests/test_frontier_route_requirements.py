@@ -42,14 +42,17 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
         )
         self.assertTrue(gate["enabled"])
         self.assertTrue(gate["applied"])
-        self.assertTrue(gate["allow"])
-        self.assertFalse(gate["suppressed"])
-        self.assertEqual(gate["score_multiplier"], 0.15)
-        self.assertEqual(gate["route_feasibility_reason"], "conditional_short_generic_route_unsupported")
+        self.assertFalse(gate["allow"])
+        self.assertTrue(gate["suppressed"])
+        self.assertEqual(gate["score_multiplier"], 0.0)
+        self.assertEqual(gate["route_feasibility_reason"], "conditional_short_paper_metadata_missing")
         self.assertFalse(gate["active_scoring_eligible"])
         self.assertTrue(gate["shadow_label"])
+        self.assertTrue(gate["paper_ineligible"])
+        self.assertIn("symbol_support_missing", gate["paper_rationale_codes"])
+        self.assertIn("conditional_order_route_support_missing", gate["paper_rationale_codes"])
 
-    def test_score_adjustment_reports_unknown_route_penalty_without_full_suppression(self):
+    def test_score_adjustment_fail_closes_when_route_prerequisites_are_missing(self):
         adjustment = paper_only_frontier_score_adjustment(
             venue="BITSO",
             direction="short_frontier_spot",
@@ -75,9 +78,9 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
                 "unknown_multiplier": 0.8,
             },
         )
-        self.assertTrue(adjustment["allow"])
-        self.assertFalse(adjustment["suppressed"])
-        self.assertAlmostEqual(adjustment["score_multiplier"], 0.8)
+        self.assertFalse(adjustment["allow"])
+        self.assertTrue(adjustment["suppressed"])
+        self.assertAlmostEqual(adjustment["score_multiplier"], 0.0)
         self.assertEqual(
             adjustment["route_feasibility_gate"]["route_requirements"]["support_status"],
             "unknown",
@@ -86,12 +89,13 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
         self.assertTrue(adjustment["route_feasibility_gate"]["shadow_label"])
         self.assertEqual(
             adjustment["route_feasibility_gate"]["reason"],
-            "conditional_short_support_unknown",
+            "conditional_short_paper_metadata_missing",
         )
         self.assertEqual(
             adjustment["route_feasibility_reason"],
-            "conditional_short_support_unknown",
+            "conditional_short_paper_metadata_missing",
         )
+        self.assertTrue(adjustment["route_feasibility_gate"]["paper_ineligible"])
 
     def test_non_conditional_short_context_is_neutral(self):
         gate = paper_only_conditional_short_route_feasibility_gate(
@@ -112,15 +116,22 @@ class FrontierRouteRequirementsTests(unittest.TestCase):
             context_stats={
                 "execution_feasibility": {"status": "conditional"},
                 "trade_type": "frontier_crypto_venue_map",
+                "borrow_confirmed": True,
+                "borrow_cost_model_present": True,
+                "margin_eligible": True,
+                "fees_modeled": True,
+                "symbol_supported": True,
+                "supports_conditional_orders": True,
             },
         )
 
         self.assertTrue(gate["applied"])
         self.assertTrue(gate["active_scoring_eligible"])
         self.assertFalse(gate["shadow_label"])
+        self.assertFalse(gate["paper_ineligible"])
         self.assertEqual(
             gate["route_feasibility_reason"],
-            "supported_venue_short_route_exception",
+            "explicit_borrow_ok",
         )
 
 

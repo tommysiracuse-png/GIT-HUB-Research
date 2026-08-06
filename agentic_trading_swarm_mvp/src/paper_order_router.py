@@ -840,9 +840,19 @@ def _annotate_frontier_route_feasibility_state(
     reason = str(gate.get("route_feasibility_reason") or gate.get("reason") or "unknown")
     active_scoring_eligible = _as_bool(gate.get("active_scoring_eligible"), True)
     shadow_label = _as_bool(gate.get("shadow_label"), False)
+    paper_ineligible = _as_bool(gate.get("paper_ineligible"), False)
+    paper_ineligible_reason = gate.get("paper_ineligible_reason")
+    rationale_fields = dict(gate.get("paper_rationale_fields") or {})
+    rationale_failures = list(gate.get("paper_rationale_failures") or [])
+    rationale_codes = list(gate.get("paper_rationale_codes") or [])
     candidate["route_feasibility_reason"] = reason
     candidate["paper_active_scoring_eligible"] = active_scoring_eligible
     candidate["paper_route_feasibility_shadow_label"] = shadow_label
+    candidate["paper_ineligible"] = paper_ineligible
+    candidate["paper_ineligible_reason"] = paper_ineligible_reason
+    candidate["paper_route_rationale_fields"] = rationale_fields
+    candidate["paper_route_rationale_failures"] = rationale_failures
+    candidate["paper_route_rationale_codes"] = rationale_codes
     if shadow_label:
         candidate["paper_route_feasibility_shadow_reason"] = reason
 
@@ -858,6 +868,11 @@ def _annotate_frontier_route_feasibility_state(
         packet["route_feasibility_reason"] = reason
         packet["paper_active_scoring_eligible"] = active_scoring_eligible
         packet["paper_route_feasibility_shadow_label"] = shadow_label
+        packet["paper_ineligible"] = paper_ineligible
+        packet["paper_ineligible_reason"] = paper_ineligible_reason
+        packet["paper_route_rationale_fields"] = rationale_fields
+        packet["paper_route_rationale_failures"] = rationale_failures
+        packet["paper_route_rationale_codes"] = rationale_codes
 
 
 def _apply_route_feasibility_metadata(

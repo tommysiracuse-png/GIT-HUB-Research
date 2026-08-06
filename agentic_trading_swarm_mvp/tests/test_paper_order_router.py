@@ -139,6 +139,7 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
             frontier_candidate(
                 signal_key="GATE|frontier_crypto_venue_map|short_frontier_spot|conditional",
                 inst_id="GATE:ARC_USDT",
+                venue="GATE",
                 direction="short_frontier_spot",
                 edge_bps_estimate=24.0,
                 gross_edge_bps_estimate=60.0,
@@ -149,6 +150,9 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
                 borrowable=True,
                 borrow_cost_bps=4.0,
                 margin_eligible=True,
+                fees_modeled=True,
+                symbol_supported=True,
+                supports_conditional_orders=True,
                 execution_route={
                     "route_status": "standard",
                     "missing_permissions": [],

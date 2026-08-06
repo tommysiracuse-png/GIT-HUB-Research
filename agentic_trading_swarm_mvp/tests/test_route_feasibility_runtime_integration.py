@@ -202,12 +202,14 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
         guarded = apply_frontier_paper_guard(candidate)
 
         self.assertTrue(guarded["shadow_filtered"])
-        self.assertEqual("conditional_short_support_unknown", guarded["candidate_reject_reason"])
-        self.assertEqual("conditional_short_support_unknown", guarded["route_feasibility_reason"])
+        self.assertEqual("conditional_short_paper_metadata_missing", guarded["candidate_reject_reason"])
+        self.assertEqual("conditional_short_paper_metadata_missing", guarded["route_feasibility_reason"])
         self.assertFalse(guarded["paper_active_scoring_eligible"])
         self.assertTrue(guarded["paper_route_feasibility_shadow_label"])
+        self.assertTrue(guarded["paper_ineligible"])
+        self.assertIn("symbol_support_missing", guarded["paper_route_rationale_codes"])
         self.assertEqual(
-            "conditional_short_support_unknown",
+            "conditional_short_paper_metadata_missing",
             guarded["frontier_route_feasibility"]["route_feasibility_reason"],
         )
         self.assertFalse(
