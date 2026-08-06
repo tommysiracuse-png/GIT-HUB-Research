@@ -11854,6 +11854,9 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             candidate["paper_fill_gate_trigger_codes"] = (
                 [] if fill_gate is None else list(fill_gate.get("trigger_codes") or [])
             )
+            candidate["paper_fill_gate_shadow_reason"] = (
+                None if fill_gate is None else fill_gate.get("shadow_reason") or fill_gate.get("reason")
+            )
         quality_score = as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0
         base_score = as_float(candidate.get("score"), 0.0) or 0.0
         effective_edge = as_float(candidate.get("effective_edge_bps"), None)
@@ -11940,6 +11943,17 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             candidate["paper_fx_ranking_reason"] = (
                 candidate.get("quote_ranking_reason") or "stale_fx_reference"
             )
+        if candidate.get("paper_fill_gate_blocked"):
+            paper_ranking_score = 0.0
+            candidate["paper_active_scoring_eligible"] = False
+            candidate["paper_fill_gate_shadow_label"] = True
+            candidate["paper_ineligible"] = True
+            candidate["paper_ineligible_reason"] = (
+                candidate.get("paper_fill_gate_shadow_reason")
+                or candidate.get("paper_fill_gate_reason")
+                or candidate.get("paper_ineligible_reason")
+                or "frontier_paper_fill_gate"
+            )
         candidate["paper_ranking_score"] = paper_ranking_score
         candidate["paper_ranking_edge_bps"] = round(ranking_edge, 6) if ranking_edge is not None else None
         candidate["paper_ranking_edge_source"] = ranking_edge_source
@@ -11955,6 +11969,8 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             if route_feasibility_gate.get("shadow_label", False)
             else "stale_fx_reference_shadow_only"
             if not quote_ranking_eligible
+            else "paper_fill_gate_shadow_only"
+            if candidate.get("paper_fill_gate_blocked")
             else "frontier_score_gate_shadow_only"
             if paper_frontier_score.get("hard_gate_applied")
             else "ranked_not_blocked"

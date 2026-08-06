@@ -10,6 +10,10 @@ import sqlite3
 from collections.abc import Mapping
 
 from paper_context_cost import realized_paper_cost_audit
+try:  # pragma: no cover - import fallback for package/script execution
+    from paper_order_router import frontier_paper_fill_hard_fail_review
+except ImportError:  # pragma: no cover
+    from src.paper_order_router import frontier_paper_fill_hard_fail_review
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
@@ -214,19 +218,40 @@ def _frontier_shadow_learning_exclusion(
         if gross_edge is not None and round_trip_cost is not None:
             net_edge = gross_edge - round_trip_cost
 
-    triggers: list[str] = []
-    if quality_action == "shadow_only":
-        triggers.append("quality_action_shadow_only")
-    if direction == "short_frontier_spot" and "spot_borrow" in deduped_blockers:
-        triggers.append("short_spot_borrow_blocked")
+    merged_candidate: dict[str, object] = {}
+    for container in containers:
+        merged_candidate.update(dict(container))
+    merged_candidate["trade_type"] = "frontier_crypto_venue_map"
+    merged_candidate["direction"] = direction
+    merged_candidate["quality_action"] = quality_action
+    merged_candidate["anomaly_flags"] = normalized_anomaly_flags
+    merged_candidate["route_blockers"] = deduped_blockers
+    if net_edge is not None:
+        merged_candidate["frontier_net_edge_bps"] = net_edge
     if reject_reason:
-        triggers.append("candidate_reject_reason_present")
-    if (
-        "simulated_slippage_exceeds_edge" in normalized_anomaly_flags
-        and net_edge is not None
-        and net_edge <= 0.0
-    ):
-        triggers.append("simulated_slippage_exceeds_edge")
+        merged_candidate.setdefault("shadow_reason", reject_reason)
+        merged_candidate.setdefault("candidate_reject_reason", reject_reason)
+
+    hard_fail = frontier_paper_fill_hard_fail_review(merged_candidate)
+    trigger_map = {
+        "short_frontier_spot_spot_borrow_blocked": "short_spot_borrow_blocked",
+    }
+    triggers = [
+        trigger_map.get(str(code), str(code))
+        for code in list((hard_fail or {}).get("trigger_codes") or [])
+    ]
+    if not triggers and reject_reason in {
+        "shadow_only_quality_gate",
+        "net_edge_floor_failed",
+        "simulated_slippage_exceeds_edge",
+        "stale_book",
+        "depth_cliff",
+        "invalid_best_prices",
+        "invalid_level_value",
+        "empty_book",
+        "short_frontier_spot_spot_borrow_blocked",
+    }:
+        triggers.append(trigger_map.get(reject_reason, reject_reason))
 
     triggers = list(dict.fromkeys(triggers))
     return {

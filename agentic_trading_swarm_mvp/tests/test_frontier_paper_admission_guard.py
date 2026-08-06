@@ -61,6 +61,7 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
                 anomaly_flags=[
                     "empty_book",
                     "invalid_best_prices",
+                    "invalid_level_value",
                     "ticker_book_midpoint_mismatch",
                     "simulated_slippage_exceeds_edge",
                     "stale_book",
@@ -86,6 +87,7 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
                 "route_status_not_standard",
                 "empty_book",
                 "invalid_best_prices",
+                "invalid_level_value",
                 "ticker_book_midpoint_mismatch",
                 "stale_book",
                 "depth_cliff",
@@ -196,7 +198,12 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
             "paper_allocation_multiplier": 1.0,
         }
 
-        result = execute_order(conn, candidate(edge_bps_estimate=0.0), review, copy.deepcopy(DEFAULT_SETTINGS))
+        result = execute_order(
+            conn,
+            candidate(edge_bps_estimate=0.0, gross_edge_bps_estimate=20.0),
+            review,
+            copy.deepcopy(DEFAULT_SETTINGS),
+        )
 
         self.assertFalse(result["paper_filled"])
         self.assertEqual("shadow_only", result["order"]["status"])

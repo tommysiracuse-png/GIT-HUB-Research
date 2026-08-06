@@ -69,7 +69,13 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
 
         self.assertEqual("shadow_excluded_from_learning", ticket["paper_label_exclusion_reason"])
         self.assertTrue(ticket["paper_shadow_excluded_from_learning"])
-        self.assertEqual(["simulated_slippage_exceeds_edge"], ticket["paper_shadow_exclusion_triggers"])
+        self.assertEqual(
+            [
+                "simulated_slippage_exceeds_edge",
+                "net_edge_after_round_trip_cost_not_positive",
+            ],
+            ticket["paper_shadow_exclusion_triggers"],
+        )
         self.assertEqual(["simulated_slippage_exceeds_edge"], ticket["anomaly_flags"])
         self.assertEqual(0.0, ticket["net_edge_bps_estimate"])
 
@@ -145,10 +151,7 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
         row = conn.execute(
             "select reject_reason from frontier_paper_shadow_observations"
         ).fetchone()
-        self.assertEqual(
-            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:route_feasibility",
-            row["reject_reason"],
-        )
+        self.assertEqual("short_frontier_spot_spot_borrow_blocked", row["reject_reason"])
         counters = execution_summary(conn)["frontier_paper_candidates"]
         self.assertEqual(0, counters["accepted"])
         self.assertEqual(1, counters["shadowed"])
@@ -209,7 +212,7 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
             "frontier_paper_admission_guard_applies": True,
             "last": 100.0,
             "edge_bps_estimate": 0.0,
-            "gross_edge_bps_estimate": 25.0,
+            "gross_edge_bps_estimate": 20.0,
             "estimated_round_trip_cost_bps": 20.0,
             "quality_status": "verified",
             "quality_action": "normal",
@@ -258,6 +261,38 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
             "select reject_reason from frontier_paper_shadow_observations"
         ).fetchone()
         self.assertEqual("shadow_only_quality_gate", observation["reject_reason"])
+
+    def test_frontier_fill_gate_persists_specific_shadow_reason_for_invalid_level_value(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        candidate = {
+            "venue": "OKX_SPOT",
+            "inst_id": "OKX_SPOT:ICP-USDT",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "market_surface": "frontier_crypto_venue_map",
+            "last": 1.0,
+            "score": 88.0,
+            "edge_bps_estimate": 16.0,
+            "gross_edge_bps_estimate": 30.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "quality_status": "verified",
+            "quality_action": "normal",
+            "anomaly_flags": ["invalid_level_value"],
+        }
+        review = {"paper_allocation_multiplier": 1.0, "net_edge_bps_estimate": 16.0}
+
+        execution = execute_order(conn, candidate, review, DEFAULT_SETTINGS)
+
+        self.assertFalse(execution["paper_filled"])
+        self.assertEqual("shadow_only", execution["order"]["status"])
+        self.assertEqual("net_edge_floor_failed", execution["candidate"]["candidate_reject_reason"])
+        self.assertEqual("invalid_level_value", execution["candidate"]["shadow_reason"])
+        observation = conn.execute(
+            "select reject_reason from frontier_paper_shadow_observations"
+        ).fetchone()
+        self.assertEqual("invalid_level_value", observation["reject_reason"])
 
     def test_yahoo_proxy_freshness_shadow_only_candidate_opens_synthetic_research_trade(self) -> None:
         conn = sqlite3.connect(":memory:")

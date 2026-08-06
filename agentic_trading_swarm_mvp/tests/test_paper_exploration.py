@@ -107,10 +107,38 @@ class PaperExplorationTests(unittest.TestCase):
             self.assertIsNone(execution["order_id"])
             self.assertEqual(0, conn.execute("select count(*) from paper_trades").fetchone()[0])
             self.assertEqual(
-                "paper_net_edge_guard",
+                "net_edge_floor_failed",
                 conn.execute("select reject_reason from frontier_paper_shadow_observations").fetchone()[0],
             )
             conn.close()
+
+    def test_frontier_fill_hard_fail_suppresses_learned_score_adjustment(self) -> None:
+        candidate = self.candidate(
+            venue="OKX_SPOT",
+            inst_id="OKX_SPOT:ICP-USDT",
+            direction="long_frontier_spot",
+            score=70.0,
+            edge_bps_estimate=16.0,
+            gross_edge_bps_estimate=30.0,
+            estimated_round_trip_cost_bps=20.0,
+            liquidity_score=0.9,
+            spread_bps=2.0,
+            paper_entry_blocked=False,
+            quality_status="verified",
+            quality_action="normal",
+            anomaly_flags=["stale_book"],
+            execution_feasibility={"status": "standard", "route_status": "standard"},
+            execution_route={"route_id": "generic_paper_route", "route_status": "standard"},
+        )
+        adjustment_key = signal_key(candidate)
+
+        review = review_candidate(candidate, self.settings, {adjustment_key: 12.5}, policies=[])
+
+        self.assertEqual(0.0, review["score_adjustment"])
+        self.assertEqual(70.0, review["learned_score"])
+        self.assertTrue(review["paper_score_adjustment_suppressed"])
+        self.assertEqual("stale_book", review["paper_score_adjustment_suppression_reason"])
+        self.assertIn("stale_book", review["paper_score_adjustment_suppression_triggers"])
 
     def test_invalid_price_and_dangerous_staleness_remain_hard_rejections(self) -> None:
         candidate = prepare_candidate_for_exploration(

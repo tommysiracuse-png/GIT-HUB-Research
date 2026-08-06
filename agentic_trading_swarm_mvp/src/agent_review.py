@@ -18,6 +18,11 @@ from paper_exploration import (
 )
 from storage import signal_key
 
+try:  # pragma: no cover - import fallback for package/script execution
+    from paper_order_router import frontier_paper_fill_hard_fail_review
+except ImportError:  # pragma: no cover
+    from src.paper_order_router import frontier_paper_fill_hard_fail_review
+
 
 def _matching_policies(key: str, policies: list[dict] | None, context_features: dict | None = None) -> list[dict]:
     if not policies:
@@ -88,7 +93,10 @@ def review_candidate(
     candidate = prepare_candidate_for_exploration(candidate, settings)
     risk = settings["risk"]
     key = signal_key(candidate)
+    frontier_fill_hard_fail = frontier_paper_fill_hard_fail_review(candidate, settings)
     adjustment = adjustments.get(key, 0.0)
+    if frontier_fill_hard_fail is not None:
+        adjustment = 0.0
     learned_score = round(candidate["score"] + adjustment, 3)
     feasibility = candidate.get("execution_feasibility", {})
     feasibility_status = feasibility.get("status", "unknown")
@@ -359,6 +367,17 @@ def review_candidate(
         "signal_key": key,
         "base_score": candidate["score"],
         "score_adjustment": round(adjustment, 3),
+        "paper_score_adjustment_suppressed": frontier_fill_hard_fail is not None,
+        "paper_score_adjustment_suppression_reason": (
+            None
+            if frontier_fill_hard_fail is None
+            else frontier_fill_hard_fail.get("shadow_reason") or frontier_fill_hard_fail.get("reason")
+        ),
+        "paper_score_adjustment_suppression_triggers": (
+            []
+            if frontier_fill_hard_fail is None
+            else list(frontier_fill_hard_fail.get("trigger_codes") or [])
+        ),
         "learned_score": learned_score,
         "confidence": confidence,
         "net_edge_bps_estimate": net_edge_bps,

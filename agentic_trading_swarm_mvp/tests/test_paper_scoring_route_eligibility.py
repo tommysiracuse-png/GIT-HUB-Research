@@ -259,6 +259,45 @@ class PaperScoringRouteEligibilityTests(unittest.TestCase):
             context["paper_label_exclusion_reason"],
         )
 
+    def test_invalid_level_value_shadow_is_excluded_from_learning(self) -> None:
+        eligibility = paper_label_eligibility_for_trade_row(
+            {
+                "candidate_json": json.dumps(
+                    {
+                        "venue": "OKX_SPOT",
+                        "inst_id": "OKX_SPOT:ICP-USDT",
+                        "direction": "long_frontier_spot",
+                        "trade_type": "frontier_crypto_venue_map",
+                        "quality_status": "verified",
+                        "quality_action": "normal",
+                        "anomaly_flags": ["invalid_level_value"],
+                        "gross_edge_bps_estimate": 30.0,
+                        "estimated_round_trip_cost_bps": 20.0,
+                    },
+                    sort_keys=True,
+                ),
+                "review_json": "{}",
+                "context_json": json.dumps(
+                    {
+                        "route_status": "standard",
+                        "route_id": "generic_paper_route",
+                        "shadow_reason": "invalid_level_value",
+                    },
+                    sort_keys=True,
+                ),
+            }
+        )
+
+        self.assertFalse(eligibility["paper_label_eligible"])
+        self.assertEqual(
+            SHADOW_EXCLUDED_FROM_LEARNING_REASON,
+            eligibility["paper_label_exclusion_reason"],
+        )
+        self.assertIn(
+            "invalid_level_value",
+            eligibility["paper_shadow_exclusion_triggers"],
+        )
+
     def test_learning_excludes_frontier_shadow_labels_even_with_explicit_override(self) -> None:
         conn = make_conn()
         signal_key = "TEST|frontier_crypto_venue_map|short_frontier_spot|mixed"

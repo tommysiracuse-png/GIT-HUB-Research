@@ -1360,7 +1360,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             "quality_status": "verified",
             "quality_action": "normal",
             "edge_bps_estimate": 0.0,
-            "gross_edge_bps_estimate": 25.0,
+            "gross_edge_bps_estimate": 20.0,
             "estimated_round_trip_cost_bps": 20.0,
             "anomaly_flags": [],
             "execution_feasibility": {"status": "standard", "route_status": "standard"},
@@ -1415,6 +1415,34 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             1,
             summary["candidate_activity"]["paper_fill_gate_trigger_counts"]["quality_action_shadow_only"],
         )
+
+    def test_fill_gate_shadow_is_removed_from_active_frontier_ranking(self) -> None:
+        candidate = {
+            "venue": "OKX_SPOT",
+            "inst_id": "OKX_SPOT:ICP-USDT",
+            "trade_type": "frontier_crypto_venue_map",
+            "market_surface": "frontier_crypto_venue_map",
+            "direction": "long_frontier_spot",
+            "score": 88.0,
+            "dislocation_quality_score": 72.0,
+            "effective_edge_bps": 18.0,
+            "quality_status": "verified",
+            "quality_action": "normal",
+            "gross_edge_bps_estimate": 30.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "anomaly_flags": ["invalid_level_value"],
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+        }
+
+        ranked = frontier.rank_frontier_paper_candidates([candidate], settings())
+
+        self.assertEqual([candidate], ranked)
+        self.assertTrue(candidate["paper_fill_gate_blocked"])
+        self.assertFalse(candidate["paper_active_scoring_eligible"])
+        self.assertTrue(candidate["paper_fill_gate_shadow_label"])
+        self.assertEqual("invalid_level_value", candidate["paper_ineligible_reason"])
+        self.assertEqual("paper_fill_gate_shadow_only", candidate["paper_quality_filter_status"])
+        self.assertEqual(0.0, candidate["paper_ranking_score"])
 
     def test_short_cost_decomposition_reorders_synthetic_route_by_net_edge(self) -> None:
         cfg = settings()
