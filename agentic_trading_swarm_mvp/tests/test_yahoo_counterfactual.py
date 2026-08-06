@@ -197,6 +197,101 @@ class YahooCounterfactualTests(unittest.TestCase):
         self.assertEqual(8.0, quote_age["fresh_le_15m"]["avg_net_pnl_bps"])
         self.assertEqual(-20.0, quote_age["stale_gt_60m"]["avg_net_pnl_bps"])
 
+    def test_closed_trade_bucket_attribution_segments_realized_proxy_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(pathlib.Path(tmp) / "radar.sqlite")
+            trades = [
+                {
+                    "inst_id": "FAST",
+                    "direction": "long_proxy",
+                    "entry": 100.0,
+                    "exit": 100.12,
+                    "pnl_bps": 12.0,
+                    "selected_hold_minutes": 15,
+                    "candidate": {
+                        "provider_age_seconds": 300.0,
+                        "spread_bps": 2.0,
+                        "seen_at": "2026-08-01T08:30:00+00:00",
+                        "source_quote_timestamp": "2026-08-01T08:25:00+00:00",
+                        "source_session_status": "open",
+                        "route_surface": "proxy",
+                    },
+                },
+                {
+                    "inst_id": "SLOW",
+                    "direction": "short_proxy",
+                    "entry": 100.0,
+                    "exit": 99.82,
+                    "pnl_bps": -18.0,
+                    "selected_hold_minutes": 240,
+                    "candidate": {
+                        "provider_age_seconds": 7200.0,
+                        "spread_bps": 18.0,
+                        "seen_at": "2026-08-01T19:15:00+00:00",
+                        "source_quote_timestamp": "2026-08-01T17:15:00+00:00",
+                        "source_session_status": "closed",
+                        "signal_stats_scope": "synthetic_research",
+                        "paper_execution_semantics": "proxy_not_live_equivalent",
+                        "paper_proxy_not_live_equivalent": True,
+                        "route_surface": "cross_surface",
+                    },
+                },
+            ]
+            for trade in trades:
+                candidate = trade["candidate"]
+                conn.execute(
+                    """
+                    insert into paper_trades (
+                        opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
+                        base_score, learned_score, entry, exit, pnl_bps, status, thesis,
+                        candidate_json, review_json, context_json, selected_hold_minutes
+                    ) values (?, ?, 'YAHOO_PROXY', ?, ?, 'global_proxy_momentum', ?, 70, 70, ?, ?, ?, 'closed', 'test', ?, '{}', '{}', ?)
+                    """,
+                    (
+                        candidate["seen_at"],
+                        candidate["seen_at"],
+                        trade["inst_id"],
+                        trade["direction"],
+                        f"YAHOO_PROXY|global_proxy_momentum|{trade['direction']}|standard",
+                        trade["entry"],
+                        trade["exit"],
+                        trade["pnl_bps"],
+                        json.dumps(candidate),
+                        trade["selected_hold_minutes"],
+                    ),
+                )
+                trade_id = conn.execute("select last_insert_rowid()").fetchone()[0]
+                conn.execute(
+                    """
+                    insert into paper_trade_outcomes (
+                        trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                        context_json, measurement_status, delay_seconds
+                    ) values (?, 60, ?, ?, ?, '{}', 'valid', 5)
+                    """,
+                    (trade_id, candidate["seen_at"], trade["exit"], trade["pnl_bps"]),
+                )
+            conn.commit()
+
+            report = yahoo.build_report(conn)
+            conn.close()
+
+        closed = report["diagnostic_attribution"]["closed_trade_bucket_attribution"]
+        holding = {row["selected_holding_horizon_bucket"]: row for row in closed["selected_holding_horizon_outcomes"]}
+        staleness = {row["quote_staleness_bucket"]: row for row in closed["quote_staleness_outcomes"]}
+        session = {row["session_bucket"]: row for row in closed["session_outcomes"]}
+        spread = {row["spread_regime_bucket"]: row for row in closed["spread_regime_outcomes"]}
+        routing = {row["routing_path_bucket"]: row for row in closed["routing_path_outcomes"]}
+
+        self.assertEqual(2, closed["closed_trade_count"])
+        self.assertEqual(12.0, holding["scalp_le_15m"]["avg_pnl_bps"])
+        self.assertEqual(-18.0, holding["swing_61m_to_240m"]["avg_pnl_bps"])
+        self.assertEqual(12.0, staleness["fresh_le_15m"]["avg_pnl_bps"])
+        self.assertEqual(-18.0, staleness["stale_gt_60m"]["avg_pnl_bps"])
+        self.assertEqual(12.0, session["open"]["avg_pnl_bps"])
+        self.assertEqual(-18.0, session["closed"]["avg_pnl_bps"])
+        self.assertEqual(-18.0, spread["extreme_gt_15bps"]["avg_pnl_bps"])
+        self.assertEqual(-18.0, routing["synthetic_proxy_not_live_equivalent"]["avg_pnl_bps"])
+
     def test_late_and_strategy_lab_labels_are_excluded(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

@@ -619,6 +619,7 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
     primary_rows = [row for row in all_primary_candidates if row["horizon_minutes"] == primary_horizon]
     counterfactual_report = yahoo_counterfactual.build_report(conn)
     counterfactual_attribution = counterfactual_report.get("diagnostic_attribution") or {}
+    closed_trade_bucket_attribution = counterfactual_attribution.get("closed_trade_bucket_attribution") or {}
 
     route_values: dict[str, list[float]] = collections.defaultdict(list)
     cohort_values: dict[str, list[float]] = collections.defaultdict(list)
@@ -712,6 +713,14 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
         "liquidity_bucket_outcomes": liquidity_rows,
         "realized_cost_bucket_outcomes": counterfactual_attribution.get("realized_cost_bucket_outcomes", []),
         "cost_drag_bucket_outcomes": counterfactual_attribution.get("cost_drag_bucket_outcomes", []),
+        "closed_trade_bucket_attribution": closed_trade_bucket_attribution,
+        "selected_holding_horizon_outcomes": closed_trade_bucket_attribution.get("selected_holding_horizon_outcomes", []),
+        "quote_staleness_outcomes": closed_trade_bucket_attribution.get("quote_staleness_outcomes", []),
+        "session_outcomes": closed_trade_bucket_attribution.get("session_outcomes", []),
+        "time_of_day_outcomes": closed_trade_bucket_attribution.get("time_of_day_outcomes", []),
+        "session_time_outcomes": closed_trade_bucket_attribution.get("session_time_outcomes", []),
+        "spread_regime_outcomes": closed_trade_bucket_attribution.get("spread_regime_outcomes", []),
+        "routing_path_outcomes": closed_trade_bucket_attribution.get("routing_path_outcomes", []),
         "counterfactual_cost_summary": counterfactual_attribution.get("cost_summary", {}),
         "counterfactual_hypothesis_tests": counterfactual_attribution.get("hypothesis_tests", []),
         "leading_counterfactual_hypothesis": counterfactual_attribution.get("leading_hypothesis"),
@@ -958,6 +967,9 @@ def render_open_pack_markdown(report: Mapping[str, Any]) -> str:
         )
         lines.append(
             f"- Yahoo realized cost buckets: `{yahoo_decay.get('realized_cost_bucket_outcomes', [])}`"
+        )
+        lines.append(
+            f"- Yahoo closed-trade attribution buckets: `{yahoo_decay.get('closed_trade_bucket_attribution', {})}`"
         )
         lines.append(
             f"- Yahoo bounded hypothesis windows: `{bounded.get('tracked_windows', [])}`"

@@ -10,6 +10,7 @@ import sqlite3
 from collections.abc import Mapping
 
 from paper_context_cost import realized_paper_cost_audit
+from proxy_signal_quality import proxy_paper_trade_diagnostic_tags
 try:  # pragma: no cover - import fallback for package/script execution
     from paper_order_router import frontier_paper_fill_hard_fail_review
 except ImportError:  # pragma: no cover
@@ -1923,7 +1924,13 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "strategy_lab_id": candidate.get("strategy_lab_id"),
         "strategy_lab_version": candidate.get("strategy_lab_version"),
         "region": candidate.get("region"),
+        "timezone": candidate.get("timezone") or candidate.get("market_timezone") or candidate.get("exchange_timezone"),
         "asset_class": candidate.get("asset_class"),
+        "route_surface": (
+            candidate.get("route_surface")
+            or route.get("route_surface")
+            or candidate.get("execution_surface")
+        ),
         "route_id": (review or {}).get("effective_route_id") or (review or {}).get("route_id") or candidate.get("route_id") or route.get("route_id"),
         "route_status": candidate.get("paper_route_status") or (review or {}).get("route_status") or candidate.get("route_status") or route.get("route_status"),
         "missing_requirements": (review or {}).get("missing_requirements") or route.get("missing_permissions", []),
@@ -1948,6 +1955,10 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "paper_execution_semantics": candidate.get("paper_execution_semantics"),
         "paper_proxy_not_live_equivalent": bool(candidate.get("paper_proxy_not_live_equivalent")),
         "direct_signal_key": candidate.get("direct_signal_key"),
+        "source_session_status": candidate.get("source_session_status"),
+        "source_session_open": candidate.get("source_session_open"),
+        "source_quote_timestamp": candidate.get("source_quote_timestamp"),
+        "source_quote_age_seconds": candidate.get("source_quote_age_seconds"),
         "quality_status": candidate.get("quality_status"),
         "quality_action": candidate.get("quality_action"),
         "candidate_reject_reason": candidate.get("candidate_reject_reason") or candidate.get("shadow_reason"),
@@ -2030,6 +2041,15 @@ def open_paper_trade(
     }
     hold_decision = select_paper_hold_minutes(conn, hold_trade_row, fallback_hold, settings)
     selected_hold_minutes = int(hold_decision["hold_minutes"])
+    context["selected_hold_minutes"] = selected_hold_minutes
+    diagnostic_tags = proxy_paper_trade_diagnostic_tags(
+        candidate,
+        context=context,
+        review=review,
+        selected_hold_minutes=selected_hold_minutes,
+    )
+    if diagnostic_tags:
+        context["paper_trade_diagnostic_tags"] = diagnostic_tags
     cur = conn.execute(
         """
         insert into paper_trades (
@@ -3095,6 +3115,14 @@ def record_due_horizon_outcomes(
             label_eligibility = paper_label_eligibility(candidate=candidate, context=outcome_context)
             for field, value in label_eligibility.items():
                 outcome_context.setdefault(field, value)
+            diagnostic_tags = proxy_paper_trade_diagnostic_tags(
+                candidate,
+                context=outcome_context,
+                selected_hold_minutes=outcome_context.get("selected_hold_minutes"),
+                outcome_horizon_minutes=int(horizon),
+            )
+            if diagnostic_tags:
+                outcome_context["paper_trade_diagnostic_tags"] = diagnostic_tags
             if auction_outcome is not None:
                 if auction_outcome.get("kind") == "allowance_price":
                     outcome_context["paper_auction_reference_outcome"] = {

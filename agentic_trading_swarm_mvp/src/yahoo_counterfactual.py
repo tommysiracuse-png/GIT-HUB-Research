@@ -10,6 +10,8 @@ import pathlib
 import sqlite3
 import statistics
 
+from proxy_signal_quality import proxy_paper_trade_diagnostic_tags
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
@@ -273,6 +275,34 @@ def _aggregate_labeled(rows: list[dict], label_field: str) -> list[dict]:
     return ordered
 
 
+def _aggregate_closed_trade_buckets(rows: list[dict], label_field: str) -> list[dict]:
+    grouped: dict[str, list[float]] = collections.defaultdict(list)
+    for row in rows:
+        pnl = row.get("net_pnl_bps")
+        if pnl is None:
+            continue
+        grouped[str(row.get(label_field) or "unknown")].append(float(pnl))
+    ordered = []
+    for label, values in grouped.items():
+        ordered.append(
+            {
+                label_field: label,
+                "count": len(values),
+                "avg_pnl_bps": round(statistics.fmean(values), 3),
+                "median_pnl_bps": round(statistics.median(values), 3),
+                "win_rate": round(sum(value > 0.0 for value in values) / len(values), 3),
+            }
+        )
+    ordered.sort(
+        key=lambda item: (
+            item.get("avg_pnl_bps") is None,
+            item.get("avg_pnl_bps") if item.get("avg_pnl_bps") is not None else 0.0,
+            str(item.get(label_field) or ""),
+        )
+    )
+    return ordered
+
+
 def _recommendations(horizons: dict[str, dict], inverted_60m: dict, freshness: dict[str, dict]) -> list[dict]:
     recommendations = []
     baseline = horizons.get("60") or {}
@@ -339,6 +369,8 @@ def build_report(conn: sqlite3.Connection) -> dict:
             """
             select p.id, p.opened_at, p.inst_id, p.direction, p.signal_key, p.entry,
                    p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
+                   p.context_json as trade_context_json, p.status as trade_status,
+                   p.pnl_bps as realized_trade_pnl_bps, p.selected_hold_minutes,
                    o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds, o.context_json
             from paper_trade_outcomes o
             join paper_trades p on p.id = o.trade_id
@@ -351,27 +383,49 @@ def build_report(conn: sqlite3.Connection) -> dict:
             """
         ).fetchall()
     except sqlite3.OperationalError:
-        rows = conn.execute(
-            """
-            select p.id, p.opened_at, p.inst_id, p.direction, '' as signal_key, p.entry,
-                   p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
-                   o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds, '{}' as context_json
-            from paper_trade_outcomes o
-            join paper_trades p on p.id = o.trade_id
-            where p.venue = 'YAHOO_PROXY'
-              and p.trade_type = 'global_proxy_momentum'
-              and (p.strategy_lab_id is null or p.strategy_lab_id = '')
-              and o.measurement_status = 'valid'
-              and o.pnl_bps is not null
-            order by p.id, o.horizon_minutes
-            """
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                """
+                select p.id, p.opened_at, p.inst_id, p.direction, '' as signal_key, p.entry,
+                       p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
+                       '{}' as trade_context_json, 'closed' as trade_status,
+                       p.pnl_bps as realized_trade_pnl_bps, null as selected_hold_minutes,
+                       o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds, '{}' as context_json
+                from paper_trade_outcomes o
+                join paper_trades p on p.id = o.trade_id
+                where p.venue = 'YAHOO_PROXY'
+                  and p.trade_type = 'global_proxy_momentum'
+                  and (p.strategy_lab_id is null or p.strategy_lab_id = '')
+                  and o.measurement_status = 'valid'
+                  and o.pnl_bps is not null
+                order by p.id, o.horizon_minutes
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                """
+                select p.id, p.opened_at, p.inst_id, p.direction, '' as signal_key, p.entry,
+                       p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
+                       '{}' as trade_context_json, 'closed' as trade_status,
+                       null as realized_trade_pnl_bps, null as selected_hold_minutes,
+                       o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds, '{}' as context_json
+                from paper_trade_outcomes o
+                join paper_trades p on p.id = o.trade_id
+                where p.venue = 'YAHOO_PROXY'
+                  and p.trade_type = 'global_proxy_momentum'
+                  and (p.strategy_lab_id is null or p.strategy_lab_id = '')
+                  and o.measurement_status = 'valid'
+                  and o.pnl_bps is not null
+                order by p.id, o.horizon_minutes
+                """
+            ).fetchall()
     by_horizon: dict[int, list[float]] = {}
     inverted_60m = []
     freshness_60m: dict[int, list[float]] = {30: [], 60: [], 90: []}
     timing_coverage = {"provider_age_present": 0, "source_bar_end_present": 0, "decision_time_present": 0}
     seen_trades = set()
     attribution_rows: list[dict] = []
+    closed_trade_attribution_rows: list[dict] = []
     horizons_seen: collections.Counter[int] = collections.Counter()
     for row in rows:
         pnl = _as_float(row["pnl_bps"])
@@ -379,13 +433,47 @@ def build_report(conn: sqlite3.Connection) -> dict:
         by_horizon.setdefault(horizon, []).append(pnl)
         horizons_seen[horizon] += 1
         candidate = _candidate(row)
+        candidate_for_tags = {
+            "venue": "YAHOO_PROXY",
+            "trade_type": "global_proxy_momentum",
+            **candidate,
+        }
+        trade_context = _safe_dict(row["trade_context_json"])
         outcome_context = _safe_dict(row["context_json"])
+        selected_hold_minutes = None
+        if row["selected_hold_minutes"] not in (None, ""):
+            try:
+                selected_hold_minutes = int(row["selected_hold_minutes"])
+            except (TypeError, ValueError):
+                selected_hold_minutes = None
         if row["id"] not in seen_trades:
             seen_trades.add(row["id"])
             provider_age = _provider_age_seconds(candidate)
             timing_coverage["provider_age_present"] += int(provider_age is not None)
             timing_coverage["source_bar_end_present"] += int(bool(candidate.get("source_bar_end_utc") or candidate.get("last_bar_utc")))
             timing_coverage["decision_time_present"] += int(bool(candidate.get("decision_time_utc") or candidate.get("seen_at")))
+            if str(row["trade_status"] or "").lower() == "closed" and row["realized_trade_pnl_bps"] is not None:
+                persisted_trade_tags = trade_context.get("paper_trade_diagnostic_tags")
+                persisted_trade_tags = persisted_trade_tags if isinstance(persisted_trade_tags, dict) else {}
+                computed_trade_tags = proxy_paper_trade_diagnostic_tags(
+                    candidate_for_tags,
+                    context=trade_context,
+                    selected_hold_minutes=selected_hold_minutes,
+                )
+                trade_tags = {**computed_trade_tags, **persisted_trade_tags}
+                closed_trade_attribution_rows.append(
+                    {
+                        "trade_id": int(row["id"]),
+                        "net_pnl_bps": float(row["realized_trade_pnl_bps"]),
+                        "selected_holding_horizon_bucket": trade_tags.get("selected_holding_horizon_bucket") or "unknown",
+                        "quote_staleness_bucket": trade_tags.get("quote_staleness_bucket") or "unknown",
+                        "session_bucket": trade_tags.get("session_bucket") or "unknown",
+                        "time_of_day_bucket": trade_tags.get("time_of_day_bucket") or "unknown",
+                        "session_time_bucket": trade_tags.get("session_time_bucket") or "unknown",
+                        "spread_regime_bucket": trade_tags.get("spread_regime_bucket") or "unknown",
+                        "routing_path_bucket": trade_tags.get("routing_path_bucket") or "unknown",
+                    }
+                )
         sign = _direction_sign(row["direction"])
         entry = _as_float(row["entry"])
         price = _as_float(row["price"])
@@ -408,7 +496,16 @@ def build_report(conn: sqlite3.Connection) -> dict:
             gross = pnl + realized_total_cost
         if realized_total_cost is None and gross is not None:
             realized_total_cost = gross - pnl
-        quote_age_seconds = _signal_age_seconds(candidate, outcome_context)
+        persisted_outcome_tags = outcome_context.get("paper_trade_diagnostic_tags")
+        persisted_outcome_tags = persisted_outcome_tags if isinstance(persisted_outcome_tags, dict) else {}
+        computed_outcome_tags = proxy_paper_trade_diagnostic_tags(
+            candidate_for_tags,
+            context=outcome_context,
+            selected_hold_minutes=selected_hold_minutes,
+            outcome_horizon_minutes=horizon,
+        )
+        outcome_tags = {**computed_outcome_tags, **persisted_outcome_tags}
+        quote_age_seconds = outcome_tags.get("quote_age_seconds")
         attribution_rows.append(
             {
                 "trade_id": int(row["id"]),
@@ -416,7 +513,10 @@ def build_report(conn: sqlite3.Connection) -> dict:
                 "direction": str(row["direction"] or "unknown"),
                 "family_leg": _family_leg_label(row["signal_key"], row["direction"], candidate, outcome_context),
                 "horizon_minutes": horizon,
-                "holding_horizon_bucket": _holding_horizon_bucket(horizon),
+                "holding_horizon_bucket": (
+                    outcome_tags.get("outcome_holding_horizon_bucket")
+                    or _holding_horizon_bucket(horizon)
+                ),
                 "net_pnl_bps": pnl,
                 "gross_return_bps": round(gross, 3) if gross is not None else None,
                 "realized_total_cost_bps": round(realized_total_cost, 3) if realized_total_cost is not None else None,
@@ -425,8 +525,11 @@ def build_report(conn: sqlite3.Connection) -> dict:
                 "modeled_context_cost_bps": round(modeled_backfill, 3) if modeled_backfill is not None else None,
                 "spread_bps": _spread_bps(candidate, outcome_context),
                 "slippage_bps": _slippage_bps(candidate, outcome_context, row),
-                "quote_age_seconds": round(quote_age_seconds, 3) if quote_age_seconds is not None else None,
-                "quote_age_bucket": _quote_age_bucket(quote_age_seconds),
+                "quote_age_seconds": round(float(quote_age_seconds), 3) if quote_age_seconds not in (None, "") else None,
+                "quote_age_bucket": (
+                    str(outcome_tags.get("quote_staleness_bucket") or "")
+                    or _quote_age_bucket(quote_age_seconds if isinstance(quote_age_seconds, (int, float)) else None)
+                ),
                 "cost_drag_bucket": _cost_drag_bucket(pnl, gross, realized_total_cost),
             }
         )
@@ -460,6 +563,37 @@ def build_report(conn: sqlite3.Connection) -> dict:
     quote_age_outcomes = _aggregate_labeled(primary_rows, "quote_age_bucket")
     realized_cost_bucket_outcomes = _aggregate_labeled(primary_rows, "realized_total_cost_bucket")
     cost_drag_bucket_outcomes = _aggregate_labeled(primary_rows, "cost_drag_bucket")
+    closed_trade_bucket_attribution = {
+        "closed_trade_count": len(closed_trade_attribution_rows),
+        "selected_holding_horizon_outcomes": _aggregate_closed_trade_buckets(
+            closed_trade_attribution_rows,
+            "selected_holding_horizon_bucket",
+        ),
+        "quote_staleness_outcomes": _aggregate_closed_trade_buckets(
+            closed_trade_attribution_rows,
+            "quote_staleness_bucket",
+        ),
+        "session_outcomes": _aggregate_closed_trade_buckets(
+            closed_trade_attribution_rows,
+            "session_bucket",
+        ),
+        "time_of_day_outcomes": _aggregate_closed_trade_buckets(
+            closed_trade_attribution_rows,
+            "time_of_day_bucket",
+        ),
+        "session_time_outcomes": _aggregate_closed_trade_buckets(
+            closed_trade_attribution_rows,
+            "session_time_bucket",
+        ),
+        "spread_regime_outcomes": _aggregate_closed_trade_buckets(
+            closed_trade_attribution_rows,
+            "spread_regime_bucket",
+        ),
+        "routing_path_outcomes": _aggregate_closed_trade_buckets(
+            closed_trade_attribution_rows,
+            "routing_path_bucket",
+        ),
+    }
     primary_cost_summary = _aggregate_records(primary_rows)
     family_leg_primary_map = {row["family_leg"]: row for row in family_leg_outcomes}
     mature_family_legs = {
@@ -598,6 +732,7 @@ def build_report(conn: sqlite3.Connection) -> dict:
             "quote_age_outcomes": quote_age_outcomes,
             "realized_cost_bucket_outcomes": realized_cost_bucket_outcomes,
             "cost_drag_bucket_outcomes": cost_drag_bucket_outcomes,
+            "closed_trade_bucket_attribution": closed_trade_bucket_attribution,
             "hypothesis_tests": hypothesis_tests,
             "leading_hypothesis": leading_hypothesis,
         },
@@ -640,6 +775,7 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Quote age buckets: `{attribution.get('quote_age_outcomes', [])}`")
     lines.append(f"- Realized cost buckets: `{attribution.get('realized_cost_bucket_outcomes', [])}`")
     lines.append(f"- Cost drag buckets: `{attribution.get('cost_drag_bucket_outcomes', [])}`")
+    lines.append(f"- Closed-trade bucket attribution: `{attribution.get('closed_trade_bucket_attribution', {})}`")
     for test in attribution.get("hypothesis_tests", []):
         lines.append(
             f"- Hypothesis `{test.get('hypothesis')}` status=`{test.get('status')}` details=`{test}`"

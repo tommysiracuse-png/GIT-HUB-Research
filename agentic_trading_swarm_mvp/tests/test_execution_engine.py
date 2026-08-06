@@ -353,8 +353,12 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
             (trade_id,),
         ).fetchone()
         context = json.loads(row["context_json"])
+        tags = context["paper_trade_diagnostic_tags"]
         self.assertEqual("open", row["status"])
         self.assertEqual("synthetic_research", context["signal_stats_scope"])
+        self.assertEqual("aging_15m_to_60m", tags["quote_staleness_bucket"])
+        self.assertEqual("closed", tags["session_bucket"])
+        self.assertEqual("intraday_16m_to_60m", tags["selected_holding_horizon_bucket"])
 
         observed_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=61)
         conn.execute("update paper_trades set opened_at = ? where id = ?", (observed_at.isoformat(), trade_id))
@@ -374,7 +378,11 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
             "select context_json from paper_trade_outcomes where trade_id = ?",
             (trade_id,),
         ).fetchone()
-        self.assertEqual("synthetic_research", json.loads(outcome["context_json"])["signal_stats_scope"])
+        outcome_context = json.loads(outcome["context_json"])
+        outcome_tags = outcome_context["paper_trade_diagnostic_tags"]
+        self.assertEqual("synthetic_research", outcome_context["signal_stats_scope"])
+        self.assertEqual("intraday_16m_to_60m", outcome_tags["outcome_holding_horizon_bucket"])
+        self.assertEqual("aging_15m_to_60m", outcome_tags["quote_staleness_bucket"])
 
 
 if __name__ == "__main__":

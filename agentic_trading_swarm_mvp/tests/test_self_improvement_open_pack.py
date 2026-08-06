@@ -341,13 +341,21 @@ class SelfImprovementOpenPackTests(unittest.TestCase):
         self.assertEqual(["5m", "15m", "60m", "realized_post_entry"], labels["tracked_windows"])
         self.assertEqual("stale_gt_60m", analysis["signal_freshness_outcomes"][0]["signal_age_bucket"])
         self.assertEqual("low", analysis["liquidity_bucket_outcomes"][0]["liquidity_bucket"])
+        self.assertEqual(4, analysis["closed_trade_bucket_attribution"]["closed_trade_count"])
         self.assertEqual(4, five_minute["overall"]["count"])
         self.assertEqual(-9.0, five_minute["route_surface_outcomes"][0]["avg_pnl_bps"])
         self.assertEqual("cross_surface", five_minute["route_surface_outcomes"][0]["route_surface"])
         self.assertEqual("low", realized["entry_liquidity_bucket_outcomes"][0]["liquidity_bucket"])
         self.assertEqual(-7.0, realized["route_surface_outcomes"][0]["avg_pnl_bps"])
+        spread_buckets = {
+            row["spread_regime_bucket"]: row
+            for row in analysis["spread_regime_outcomes"]
+        }
+        self.assertEqual(-8.0, spread_buckets["wide_8_to_15bps"]["avg_pnl_bps"])
+        self.assertEqual(-6.0, spread_buckets["extreme_gt_15bps"]["avg_pnl_bps"])
         self.assertIn("Yahoo bounded hypothesis windows", markdown)
         self.assertIn("Yahoo realized_post_entry failure labels", markdown)
+        self.assertIn("Yahoo closed-trade attribution buckets", markdown)
 
     def test_duplicate_text_matches_open_pack_scope(self) -> None:
         self.assertTrue(pack.is_duplicate_open_pack_text("Add Kalshi read-only public event market coverage"))
