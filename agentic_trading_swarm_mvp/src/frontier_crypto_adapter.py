@@ -8,6 +8,7 @@ uses credentials, private/account APIs, or order endpoints.
 
 from __future__ import annotations
 import datetime as dt
+from typing import Any
 
 try:
     from src.frontier_data_quality import (
@@ -10556,6 +10557,187 @@ def _annotate_frontier_quote_context(candidate: dict, observation: dict, setting
     return candidate
 
 
+def _frontier_short_route_support_score(status: str) -> float:
+    normalized = str(status or "").strip().lower()
+    if normalized == "supported":
+        return 1.0
+    if normalized == "conditional":
+        return 0.7
+    if normalized == "unsupported":
+        return 0.2
+    if normalized == "unspecified":
+        return 0.35
+    return 0.3
+
+
+def _annotate_frontier_short_paper_diagnostics(
+    candidate: dict,
+    observation: dict,
+    settings: dict,
+) -> dict:
+    """Expose paper-only short diagnostics without changing candidate eligibility."""
+
+    if str(candidate.get("direction") or "").strip().lower() != "short_frontier_spot":
+        return candidate
+
+    route_intelligence = candidate.get("frontier_short_spot_route_intelligence")
+    route_intelligence = dict(route_intelligence) if isinstance(route_intelligence, dict) else {}
+    route_telemetry = route_intelligence.get("route_economics_telemetry")
+    route_telemetry = dict(route_telemetry) if isinstance(route_telemetry, dict) else {}
+    registry = candidate.get("paper_route_registry")
+    registry = dict(registry) if isinstance(registry, dict) else {}
+    route_costs = candidate.get("paper_route_estimated_cost_bps")
+    route_costs = dict(route_costs) if isinstance(route_costs, dict) else {}
+
+    quote_policy = _frontier_quote_context_policy(settings)
+    stale_threshold_ms = max(1.0, float(quote_policy["stale_quote_age_ms"]))
+    shallow_threshold_usd = max(1.0, float(quote_policy["shallow_depth_notional"]))
+    wide_threshold_bps = max(0.001, float(quote_policy["wide_spread_bps"]))
+
+    quote_age_ms = as_float(candidate.get("quote_age_ms"), None)
+    if quote_age_ms is None:
+        freshness_age_seconds = as_float(candidate.get("freshness_age_seconds"), None)
+        quote_age_ms = freshness_age_seconds * 1000.0 if freshness_age_seconds is not None else None
+    quote_age_ms = max(0.0, quote_age_ms) if quote_age_ms is not None else None
+
+    spread_bps_value = as_float(candidate.get("spread_bps"), None)
+    if spread_bps_value is None:
+        spread_bps_value = as_float(route_telemetry.get("spread_bps"), None)
+    spread_bps_value = max(0.0, spread_bps_value) if spread_bps_value is not None else None
+
+    top_depth_usd = as_float(candidate.get("top_of_book_depth_notional"), None)
+    if top_depth_usd is None:
+        bid_depth, _ = _top_of_book_notional_usd(observation, "bid")
+        ask_depth, _ = _top_of_book_notional_usd(observation, "ask")
+        depth_candidates = [value for value in (bid_depth, ask_depth) if value is not None]
+        top_depth_usd = min(depth_candidates) if depth_candidates else None
+
+    entry_slippage_bps = as_float(candidate.get("entry_slippage_bps_estimate"), None)
+    exit_slippage_bps = as_float(candidate.get("exit_slippage_bps_estimate"), None)
+    estimated_slippage_bps = max(
+        value for value in (entry_slippage_bps, exit_slippage_bps) if value is not None
+    ) if any(value is not None for value in (entry_slippage_bps, exit_slippage_bps)) else as_float(
+        route_telemetry.get("slippage_estimate_bps"), None
+    )
+
+    support_status = str(
+        candidate.get("paper_route_registry_status")
+        or registry.get("support_status")
+        or candidate.get("route_status")
+        or "unknown"
+    ).strip().lower()
+    shortability_status = str(
+        route_telemetry.get("shortability_status")
+        or route_intelligence.get("borrow_availability")
+        or "unknown"
+    ).strip().lower()
+    is_shortable_paper = bool(
+        support_status == "supported"
+        or shortability_status == "observed"
+    )
+
+    borrow_proxy_bps = as_float(route_costs.get("borrow"), None)
+    if borrow_proxy_bps is None:
+        borrow_proxy_bps = as_float(
+            ((route_telemetry.get("borrow") or {}) if isinstance(route_telemetry.get("borrow"), dict) else {}).get(
+                "estimated_fee_bps"
+            ),
+            None,
+        )
+
+    route_health = candidate.get("route_health_confirmation")
+    route_health = dict(route_health) if isinstance(route_health, dict) else {}
+    counterfactual_route = route_health.get("mode") == "conservative_counterfactual_route"
+    synthetic_short_method = None
+    if not is_shortable_paper:
+        if support_status == "conditional":
+            synthetic_short_method = "conditional_margin_borrow_assumption"
+        elif candidate.get("synthetic_route_flag") or counterfactual_route:
+            synthetic_short_method = "counterfactual_paper_short"
+        elif borrow_proxy_bps is not None:
+            synthetic_short_method = "borrow_cost_proxy_assumption"
+        else:
+            synthetic_short_method = "unconfirmed_short_route_assumption"
+
+    route_id = str(candidate.get("route_id") or observation.get("route_id") or "").strip()
+    route_path = [
+        route_id or "public_spot_quote",
+        "native_margin_borrow_short" if is_shortable_paper else str(synthetic_short_method or "paper_short_assumption"),
+        "paper_cover",
+    ]
+
+    health_score = as_float(candidate.get("venue_score"), None)
+    if health_score is None:
+        health_score = as_float(candidate.get("venue_health_score"), None)
+    if health_score is None:
+        health_score = as_float(candidate.get("quality_score"), 50.0)
+    health_component = max(0.0, min(1.0, (health_score or 0.0) / 100.0))
+    route_component = _frontier_short_route_support_score(support_status)
+    freshness_component = (
+        max(0.0, min(1.0, stale_threshold_ms / max(stale_threshold_ms, quote_age_ms)))
+        if quote_age_ms is not None
+        else 0.35
+    )
+    depth_component = (
+        max(0.0, min(1.0, top_depth_usd / shallow_threshold_usd))
+        if top_depth_usd is not None
+        else 0.35
+    )
+    spread_component = (
+        max(0.0, min(1.0, wide_threshold_bps / max(wide_threshold_bps, spread_bps_value)))
+        if spread_bps_value is not None
+        else 0.35
+    )
+    venue_confidence_score = round(
+        max(
+            0.0,
+            min(
+                1.0,
+                (
+                    health_component * 0.35
+                    + route_component * 0.30
+                    + freshness_component * 0.15
+                    + depth_component * 0.10
+                    + spread_component * 0.10
+                ),
+            ),
+        ),
+        6,
+    )
+
+    diagnostics = {
+        "paper_only": True,
+        "emission_action": "diagnostics_and_ranking_only",
+        "is_shortable_paper": is_shortable_paper,
+        "synthetic_short_method": synthetic_short_method,
+        "route_path": route_path,
+        "best_bid_ask_spread_bps": round(spread_bps_value, 6) if spread_bps_value is not None else None,
+        "top_of_book_depth_usd": round(top_depth_usd, 6) if top_depth_usd is not None else None,
+        "estimated_slippage_bps": round(estimated_slippage_bps, 6) if estimated_slippage_bps is not None else None,
+        "quote_age_ms": round(quote_age_ms, 6) if quote_age_ms is not None else None,
+        "market_data_freshness_ms": round(quote_age_ms, 6) if quote_age_ms is not None else None,
+        "borrow_proxy_bps_if_applicable": round(borrow_proxy_bps, 6) if borrow_proxy_bps is not None else None,
+        "venue_confidence_score": venue_confidence_score,
+        "route_support_status": support_status,
+        "shortability_status": shortability_status,
+    }
+    candidate["frontier_short_paper_diagnostics"] = diagnostics
+    for field_name in (
+        "is_shortable_paper",
+        "synthetic_short_method",
+        "route_path",
+        "best_bid_ask_spread_bps",
+        "top_of_book_depth_usd",
+        "estimated_slippage_bps",
+        "quote_age_ms",
+        "market_data_freshness_ms",
+        "borrow_proxy_bps_if_applicable",
+        "venue_confidence_score",
+    ):
+        candidate[field_name] = diagnostics[field_name]
+    return candidate
+
+
 def _frontier_reference_peer_rows(
     observation: dict,
     reference_observations: list[dict] | None,
@@ -10707,6 +10889,12 @@ def _refresh_frontier_short_route_requirements_report(candidate: dict, settings:
     feasibility = dict(feasibility) if isinstance(feasibility, dict) else {}
     registry = assess_paper_route_registry(candidate, settings)
     support_status = str(registry.get("support_status") or "unknown").strip().lower()
+    candidate["paper_route_registry"] = registry
+    candidate["paper_route_registry_key"] = registry.get("route_key")
+    candidate["paper_route_registry_status"] = support_status
+    candidate["paper_route_required_permissions"] = list(registry.get("required_permissions") or [])
+    candidate["paper_route_required_account_modes"] = list(registry.get("required_account_modes") or [])
+    candidate["paper_route_estimated_cost_bps"] = dict(registry.get("estimated_cost_bps") or {})
     route_blockers = list(feasibility.get("route_blockers") or [])
     required_permissions = list(registry.get("required_permissions") or [])
     requires_borrow = bool(feasibility.get("requires_short_spot")) or "spot_borrow" in required_permissions
@@ -12122,7 +12310,8 @@ def _candidate_from_observation(
         candidate, observation, reference_observations, settings
     )
     _annotate_frontier_quote_context(candidate, observation, settings)
-    return _apply_frontier_marketability_gate(candidate, observation, settings, reference_observations)
+    candidate = _apply_frontier_marketability_gate(candidate, observation, settings, reference_observations)
+    return _annotate_frontier_short_paper_diagnostics(candidate, observation, settings)
 
 
 def _strategy_lab_observation(row: dict) -> dict:
@@ -12292,7 +12481,9 @@ def _venue_quote_context(candidates: list[dict]) -> dict[str, dict]:
                 "spread_bps": [],
                 "quote_age_ms": [],
                 "top_of_book_depth_notional": [],
+                "top_of_book_depth_usd": [],
                 "venue_score": [],
+                "venue_confidence_score": [],
                 "ranking_penalty_points": [],
             },
         )
@@ -12306,7 +12497,9 @@ def _venue_quote_context(candidates: list[dict]) -> dict[str, dict]:
             "spread_bps",
             "quote_age_ms",
             "top_of_book_depth_notional",
+            "top_of_book_depth_usd",
             "venue_score",
+            "venue_confidence_score",
             "quote_context_ranking_penalty",
         ):
             value = as_float(candidate.get(field), None)
@@ -12324,7 +12517,9 @@ def _venue_quote_context(candidates: list[dict]) -> dict[str, dict]:
             "spread_bps": _distribution(values["spread_bps"]),
             "quote_age_ms": _distribution(values["quote_age_ms"]),
             "top_of_book_depth_notional": _distribution(values["top_of_book_depth_notional"]),
+            "top_of_book_depth_usd": _distribution(values["top_of_book_depth_usd"]),
             "venue_score": _distribution(values["venue_score"]),
+            "venue_confidence_score": _distribution(values["venue_confidence_score"]),
             "ranking_penalty_points": _distribution(values["ranking_penalty_points"]),
         }
         for venue, values in sorted(grouped.items())

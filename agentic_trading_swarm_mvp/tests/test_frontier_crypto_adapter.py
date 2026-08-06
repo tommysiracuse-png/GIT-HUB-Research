@@ -1346,6 +1346,45 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual(0.25, candidate["paper_allocation_multiplier"])
         self.assertIn("marketability_venue_health_score", candidate["marketability_diagnostic_reasons"])
 
+    def test_short_frontier_paper_candidate_exposes_route_cost_and_shortability_diagnostics(self) -> None:
+        cfg = settings()
+        peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
+        local = self._quality_obs("MEXC", "ABC-USDT", "ABC", "USDT", 101.0, 100_000, quality_score=85)
+
+        candidate = frontier._candidate_from_observation(
+            local,
+            cfg,
+            100.5,
+            2,
+            reference_observations=[local, peer],
+        )
+
+        self.assertEqual("short_frontier_spot", candidate["direction"])
+        self.assertEqual("unsupported", candidate["paper_route_registry_status"])
+        self.assertIn("spot_borrow", candidate["paper_route_required_permissions"])
+        self.assertFalse(candidate["is_shortable_paper"])
+        self.assertEqual("unconfirmed_short_route_assumption", candidate["synthetic_short_method"])
+        self.assertEqual(["mexc_spot_public", "unconfirmed_short_route_assumption", "paper_cover"], candidate["route_path"])
+        self.assertAlmostEqual(candidate["spread_bps"], candidate["best_bid_ask_spread_bps"], places=6)
+        self.assertEqual(2000.0, candidate["top_of_book_depth_usd"])
+        self.assertEqual(2.0, candidate["estimated_slippage_bps"])
+        self.assertEqual(5000.0, candidate["quote_age_ms"])
+        self.assertEqual(5000.0, candidate["market_data_freshness_ms"])
+        self.assertIsNone(candidate["borrow_proxy_bps_if_applicable"])
+        self.assertGreater(candidate["venue_confidence_score"], 0.0)
+        self.assertLess(candidate["venue_confidence_score"], 1.0)
+        self.assertTrue(candidate["frontier_short_paper_diagnostics"]["paper_only"])
+
+        ranked = frontier.rank_frontier_paper_candidates([candidate], cfg)
+        summary = frontier.summarize([], ranked)
+        venue_context = summary["venue_quote_context"]["MEXC"]
+        self.assertEqual(2000.0, venue_context["top_of_book_depth_usd"]["median"])
+        self.assertAlmostEqual(
+            candidate["venue_confidence_score"],
+            venue_context["venue_confidence_score"]["median"],
+            places=3,
+        )
+
     def test_marketability_diagnostics_preserve_exploration_when_venue_telemetry_is_missing(self) -> None:
         cfg = settings()
         peer = self._quality_obs("REFERENCE", "ABC-USDT", "ABC", "USDT", 100.5, 1_000_000, quality_score=90)
