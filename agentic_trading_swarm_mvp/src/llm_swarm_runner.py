@@ -967,6 +967,11 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
 def _generation_metadata(result: Any) -> dict[str, Any]:
     """Keep model output context with a fallback without exposing configuration secrets."""
     response_text = str(getattr(result, "text", "") or "")
+    stop_reason = (
+        getattr(result, "stop_reason", None)
+        or getattr(result, "finish_reason", None)
+        or getattr(result, "status", None)
+    )
     return {
         # ``response_text`` remains for existing report readers.  The explicit
         # raw/post-processor fields make it possible to distinguish provider
@@ -977,7 +982,9 @@ def _generation_metadata(result: Any) -> dict[str, Any]:
         "model_tier": getattr(result, "model_tier", None),
         "status": getattr(result, "status", None),
         "api": getattr(result, "api", None),
+        "prompt_tokens": getattr(result, "prompt_tokens", None),
         "completion_tokens": getattr(result, "completion_tokens", None),
+        "stop_reason": stop_reason,
         "reasoning_effort": getattr(result, "reasoning_effort", None),
         "reasoning_mode": getattr(result, "reasoning_mode", None),
         "verbosity": getattr(result, "verbosity", None),
@@ -1002,8 +1009,14 @@ def _transport_integrity(raw_response: str, result: Any) -> dict[str, Any]:
     except ValueError as exc:
         raw_schema_error = str(exc)
     truncated = _appears_truncated_json(raw_response)
+    prompt_tokens = getattr(result, "prompt_tokens", None)
     completion_tokens = getattr(result, "completion_tokens", None)
     max_output_tokens = getattr(result, "max_output_tokens", None)
+    stop_reason = (
+        getattr(result, "stop_reason", None)
+        or getattr(result, "finish_reason", None)
+        or getattr(result, "status", None)
+    )
     token_limit_reached = (
         isinstance(completion_tokens, int)
         and not isinstance(completion_tokens, bool)
@@ -1023,8 +1036,11 @@ def _transport_integrity(raw_response: str, result: Any) -> dict[str, Any]:
         cutoff_assessment = "not_confirmed_schema_invalid"
     return {
         "raw_characters": len(raw_response),
+        "raw_payload_size_bytes": len(raw_response.encode("utf-8")),
+        "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "max_output_tokens": max_output_tokens,
+        "stop_reason": stop_reason,
         "token_limit_reached": token_limit_reached,
         "raw_schema_valid": raw_schema_valid,
         "raw_schema_error": raw_schema_error,

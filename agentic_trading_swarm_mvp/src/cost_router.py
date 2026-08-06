@@ -55,6 +55,7 @@ class ModelResult:
     frontier_escalation_reason: str | None = None
     structured_json: bool = False
     max_output_tokens: int | None = None
+    stop_reason: str | None = None
 
 
 def load_llm_config(path: pathlib.Path = CONFIG_PATH) -> dict:
@@ -469,7 +470,7 @@ def complete(
 
     try:
         if provider == "openai" and api == "responses":
-            text, actual_prompt_tokens, completion_tokens = _complete_openai_responses(
+            response_payload = _complete_openai_responses(
                 model_name=_provider_model_name(model_name),
                 prompt=prompt,
                 system=system,
@@ -483,9 +484,14 @@ def complete(
                 timeout_seconds=timeout_seconds,
                 tools=tools,
             )
+            if len(response_payload) == 3:
+                text, actual_prompt_tokens, completion_tokens = response_payload
+                stop_reason = None
+            else:
+                text, actual_prompt_tokens, completion_tokens, stop_reason = response_payload
             prompt_tokens = actual_prompt_tokens or prompt_tokens
         else:
-            text, completion_tokens = _complete_litellm(
+            response_payload = _complete_litellm(
                 model_name=model_name,
                 prompt=prompt,
                 system=system,
@@ -494,6 +500,11 @@ def complete(
                 temperature=tier_cfg.get("temperature"),
                 timeout_seconds=timeout_seconds,
             )
+            if len(response_payload) == 2:
+                text, completion_tokens = response_payload
+                stop_reason = None
+            else:
+                text, completion_tokens, stop_reason = response_payload
         estimated_cost = _cost_usd(prompt_tokens, completion_tokens, tier_cfg)
         _clear_quota_state()
         result = ModelResult(
@@ -514,6 +525,7 @@ def complete(
             frontier_escalation_reason=frontier_escalation_reason,
             structured_json=structured_json_enabled,
             max_output_tokens=max_output_tokens,
+            stop_reason=stop_reason,
         )
         _log(agent_name, result)
         return result
@@ -557,7 +569,7 @@ def _complete_openai_responses(
     prompt_cache_retention: str | None,
     timeout_seconds: float | None,
     tools: list[dict] | None = None,
-) -> tuple[str, int | None, int]:
+) -> tuple[str, int | None, int, str | None]:
     from openai import OpenAI
 
     client = OpenAI(timeout=float(timeout_seconds)) if timeout_seconds else OpenAI()
@@ -596,7 +608,13 @@ def _complete_openai_responses(
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0) if usage else None
     output_tokens = int(getattr(usage, "output_tokens", 0) or 0) if usage else estimate_tokens(text)
-    return text, input_tokens, output_tokens
+    stop_reason = getattr(response, "status", None)
+    incomplete = getattr(response, "incomplete_details", None)
+    if incomplete:
+        reason = getattr(incomplete, "reason", None)
+        if reason:
+            stop_reason = str(reason)
+    return text, input_tokens, output_tokens, stop_reason
 
 
 def _extract_response_text(response: object) -> str:
@@ -646,7 +664,7 @@ def _complete_litellm(
     structured_json: bool,
     temperature: float | None,
     timeout_seconds: float | None,
-) -> tuple[str, int]:
+) -> tuple[str, int, str | None]:
     import litellm  # type: ignore
 
     kwargs: dict = {
@@ -666,7 +684,8 @@ def _complete_litellm(
         kwargs["timeout"] = float(timeout_seconds)
     response = litellm.completion(**kwargs)
     text = response["choices"][0]["message"]["content"]
-    return text, estimate_tokens(text)
+    finish_reason = response["choices"][0].get("finish_reason")
+    return text, estimate_tokens(text), finish_reason
 
 
 def _log(agent_name: str, result: ModelResult) -> None:

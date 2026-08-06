@@ -39,8 +39,12 @@ def _model_result(text):
         model_name="test-model",
         model_tier="fast",
         status="model_call:test",
+        stop_reason="completed",
         estimated_cost_usd=0.0,
         api="test",
+        prompt_tokens=120,
+        completion_tokens=30,
+        max_output_tokens=400,
         reasoning_effort="low",
         reasoning_mode="test",
         verbosity="low",
@@ -237,6 +241,22 @@ class CrossMarketResearcherRetryTests(unittest.TestCase):
         self.assertTrue(integrity["truncation_suspected"])
         self.assertTrue(integrity["token_limit_reached"])
         self.assertEqual(integrity["cutoff_assessment"], "token_limit_cutoff_suspected")
+
+    def test_generation_metadata_records_stop_reason_and_payload_size(self):
+        raw = json.dumps(_payload(title="utf8 title cafe"))
+        result = _model_result(raw)
+
+        metadata = llm_swarm_runner._generation_metadata(result)
+
+        self.assertEqual(metadata["prompt_tokens"], 120)
+        self.assertEqual(metadata["completion_tokens"], 30)
+        self.assertEqual(metadata["stop_reason"], "completed")
+        self.assertEqual(
+            metadata["transport_integrity"]["raw_payload_size_bytes"],
+            len(raw.encode("utf-8")),
+        )
+        self.assertEqual(metadata["transport_integrity"]["prompt_tokens"], 120)
+        self.assertEqual(metadata["transport_integrity"]["stop_reason"], "completed")
 
 
 class RedTeamStrictRetryTests(unittest.TestCase):
