@@ -53,6 +53,44 @@ def current_commit(root: pathlib.Path) -> str | None:
     return result["stdout"].strip()
 
 
+def changed_paths_between_commits(
+    root: pathlib.Path,
+    base_commit: str,
+    target_commit: str,
+    *,
+    timeout: int = 120,
+) -> tuple[set[str] | None, dict[str, Any]]:
+    """Return tracked paths changed from ``base_commit`` to ``target_commit``."""
+
+    diff = run_git(["diff", "--name-only", f"{base_commit}..{target_commit}"], root, timeout=timeout)
+    if diff["returncode"] != 0:
+        return None, {"ok": False, "reason": "changed_paths_failed", "command": diff}
+    paths = {
+        line.strip().replace("\\", "/")
+        for line in diff["stdout"].splitlines()
+        if line.strip()
+    }
+    return paths, {
+        "ok": True,
+        "base_commit": base_commit,
+        "target_commit": target_commit,
+        "command": diff,
+    }
+
+
+def update_champion_latest(root: pathlib.Path, commit: str | None = None, *, timeout: int = 120) -> dict[str, Any]:
+    """Point ``champion/latest`` at an already-promoted commit."""
+
+    target_commit = commit or current_commit(root)
+    if not target_commit:
+        return {"ok": False, "reason": "promoted_head_missing"}
+    tag_name = "champion/latest"
+    tag = run_git(["tag", "-f", tag_name, target_commit], root, timeout=timeout)
+    if tag["returncode"] != 0:
+        return {"ok": False, "reason": "champion_tag_failed", "tag": tag}
+    return {"ok": True, "champion_tag": tag_name, "champion_commit": target_commit, "tag": tag}
+
+
 def latest_champion_tag(root: pathlib.Path) -> str | None:
     result = run_git(["tag", "--list", "champion/*", "--sort=-creatordate"], root)
     if result["returncode"] != 0:
@@ -209,41 +247,95 @@ def commit_candidate(release: CandidateRelease, message: str, *, timeout: int = 
     return release, {"ok": True, "candidate_commit": candidate, "commit": commit}
 
 
-def promote_candidate(release: CandidateRelease, app_root: pathlib.Path, *, timeout: int = 120) -> tuple[CandidateRelease, dict[str, Any]]:
+def promote_candidate(
+    release: CandidateRelease,
+    app_root: pathlib.Path,
+    *,
+    timeout: int = 120,
+    update_champion: bool = True,
+) -> tuple[CandidateRelease, dict[str, Any]]:
     root = repo_root(app_root)
     if root is None:
         return release, {"ok": False, "reason": "ambiguous_repo_root"}
     if not release.candidate_commit:
         return release, {"ok": False, "reason": "missing_candidate_commit"}
     source_candidate_commit = release.candidate_commit
-    merge = run_git(["merge", "--ff-only", source_candidate_commit], root, timeout=timeout)
-    if merge["returncode"] != 0:
+    main_head = current_commit(root)
+    if not main_head:
+        return release, {"ok": False, "reason": "promoted_head_missing"}
+
+    promotion_method: str
+    merge: dict[str, Any] | None = None
+    cherry: dict[str, Any] | None = None
+    if main_head == release.parent_commit:
+        merge = run_git(["merge", "--ff-only", source_candidate_commit], root, timeout=timeout)
+        if merge["returncode"] != 0:
+            return release, {"ok": False, "reason": "promotion_fast_forward_failed", "merge": merge}
+        promotion_method = "fast_forward"
+    else:
+        candidate_paths, candidate_paths_result = changed_paths_between_commits(
+            root, release.parent_commit, source_candidate_commit, timeout=timeout
+        )
+        main_paths, main_paths_result = changed_paths_between_commits(
+            root, release.parent_commit, main_head, timeout=timeout
+        )
+        if candidate_paths is None or main_paths is None:
+            return release, {
+                "ok": False,
+                "reason": "promotion_changed_paths_failed",
+                "candidate_paths": candidate_paths_result,
+                "main_paths": main_paths_result,
+            }
+        overlapping_paths = sorted(candidate_paths & main_paths)
+        if overlapping_paths:
+            release.status = "promotion_overlap_requires_repair"
+            return release, {
+                "ok": False,
+                "reason": "promotion_overlap_requires_repair",
+                "source_candidate_commit": source_candidate_commit,
+                "parent_commit": release.parent_commit,
+                "main_head": main_head,
+                "candidate_changed_paths": sorted(candidate_paths),
+                "main_changed_paths": sorted(main_paths),
+                "overlapping_paths": overlapping_paths,
+            }
+
         cherry = run_git(["cherry-pick", source_candidate_commit], root, timeout=timeout)
         if cherry["returncode"] != 0:
             abort = run_git(["cherry-pick", "--abort"], root, timeout=timeout)
             return release, {
                 "ok": False,
-                "reason": "promotion_failed",
-                "merge": merge,
+                "reason": "promotion_cherry_pick_failed",
                 "cherry_pick": cherry,
                 "cherry_pick_abort": abort,
+                "candidate_changed_paths": sorted(candidate_paths),
+                "main_changed_paths": sorted(main_paths),
             }
+        promotion_method = "disjoint_cherry_pick"
     promoted_commit = current_commit(root)
     if not promoted_commit:
         return release, {"ok": False, "reason": "promoted_head_missing", "merge": merge}
-    tag_name = "champion/latest"
-    tag = run_git(["tag", "-f", tag_name, promoted_commit], root, timeout=timeout)
-    if tag["returncode"] != 0:
-        return release, {"ok": False, "reason": "champion_tag_failed", "tag": tag}
+    champion = update_champion_latest(root, promoted_commit, timeout=timeout) if update_champion else {
+        "ok": True,
+        "status": "deferred_by_policy",
+        "champion_tag": "champion/latest",
+        "champion_commit": None,
+    }
+    if not champion["ok"]:
+        return release, {"ok": False, "reason": champion["reason"], "champion": champion}
     release.status = "promoted"
     release.promotion_reason = "candidate passed deterministic sandbox gates"
     return release, {
         "ok": True,
         "status": "promoted",
-        "champion_tag": tag_name,
+        "promotion_method": promotion_method,
+        "champion_tag": champion["champion_tag"],
+        "champion_update_deferred": not update_champion,
         "source_candidate_commit": source_candidate_commit,
         "promoted_commit": promoted_commit,
-        "tag": tag,
+        "merge": merge,
+        "cherry_pick": cherry,
+        "champion": champion,
     }
 
 

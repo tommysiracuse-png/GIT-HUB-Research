@@ -21,6 +21,7 @@ from evolution.worktree import (  # noqa: E402
     promote_candidate,
     release_preflight,
     run_git,
+    update_champion_latest,
 )
 
 
@@ -123,9 +124,129 @@ class EvolutionReleaseTests(unittest.TestCase):
             ).stdout.strip()
 
             self.assertTrue(promotion["ok"], promotion)
+            self.assertEqual(promotion["promotion_method"], "disjoint_cherry_pick")
             self.assertNotEqual(source_candidate, head)
             self.assertEqual(head, promotion["promoted_commit"])
             self.assertEqual(head, champion)
+            cleanup = cleanup_worktree(release, app)
+            self.assertTrue(cleanup["ok"], cleanup)
+
+    def test_fast_forward_promotion_preserves_current_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, app = self._repo(tmp)
+            release, created = create_candidate_worktree(app, "proposal:fast-forward", base_dir=pathlib.Path(tmp) / "worktrees")
+            self.assertIsNotNone(release, created)
+            assert release is not None
+            (pathlib.Path(release.app_worktree_path) / "src" / "demo.py").write_text("VALUE = 2\n", encoding="utf-8")
+            release, committed = commit_candidate(release, "candidate")
+            self.assertTrue(committed["ok"], committed)
+
+            release, promotion = promote_candidate(release, app)
+
+            self.assertTrue(promotion["ok"], promotion)
+            self.assertEqual(promotion["promotion_method"], "fast_forward")
+            current = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            self.assertEqual(current, release.candidate_commit)
+            champion = subprocess.run(
+                ["git", "rev-parse", "champion/latest"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            self.assertEqual(current, champion)
+            cleanup = cleanup_worktree(release, app)
+            self.assertTrue(cleanup["ok"], cleanup)
+
+    def test_failed_disjoint_cherry_pick_aborts_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, app = self._repo(tmp)
+            release, created = create_candidate_worktree(
+                app, "proposal:directory-file-conflict", base_dir=pathlib.Path(tmp) / "worktrees"
+            )
+            self.assertIsNotNone(release, created)
+            assert release is not None
+            candidate_app = pathlib.Path(release.app_worktree_path)
+            (candidate_app / "src" / "collision").write_text("candidate file\n", encoding="utf-8")
+            release, committed = commit_candidate(release, "candidate")
+            self.assertTrue(committed["ok"], committed)
+
+            main_collision = app / "src" / "collision"
+            main_collision.mkdir()
+            (main_collision / "main.py").write_text("MAIN = True\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "main directory"], cwd=root, check=True, capture_output=True, text=True)
+            main_before = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            release, promotion = promote_candidate(release, app)
+
+            self.assertFalse(promotion["ok"])
+            self.assertEqual(promotion["reason"], "promotion_cherry_pick_failed")
+            self.assertEqual(promotion["cherry_pick_abort"]["returncode"], 0)
+            self.assertEqual(run_git(["status", "--porcelain"], root)["stdout"], "")
+            main_after = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            self.assertEqual(main_before, main_after)
+            self.assertTrue(pathlib.Path(release.worktree_path).exists())
+            cleanup = cleanup_worktree(release, app)
+            self.assertTrue(cleanup["ok"], cleanup)
+
+    def test_overlapping_cherry_pick_requires_repair_without_destroying_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, app = self._repo(tmp)
+            release, created = create_candidate_worktree(app, "proposal:overlap", base_dir=pathlib.Path(tmp) / "worktrees")
+            self.assertIsNotNone(release, created)
+            assert release is not None
+            candidate_app = pathlib.Path(release.app_worktree_path)
+            (candidate_app / "src" / "demo.py").write_text("VALUE = 2\n", encoding="utf-8")
+            release, committed = commit_candidate(release, "candidate")
+            self.assertTrue(committed["ok"], committed)
+
+            (app / "src" / "demo.py").write_text("VALUE = 3\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "main overlap"], cwd=root, check=True, capture_output=True, text=True)
+            main_before = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            release, promotion = promote_candidate(release, app)
+
+            self.assertFalse(promotion["ok"])
+            self.assertEqual(promotion["reason"], "promotion_overlap_requires_repair")
+            self.assertEqual(release.status, "promotion_overlap_requires_repair")
+            self.assertEqual(promotion["overlapping_paths"], ["agentic_trading_swarm_mvp/src/demo.py"])
+            main_after = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            self.assertEqual(main_before, main_after)
+            self.assertTrue(pathlib.Path(release.worktree_path).exists())
+            self.assertEqual(run_git(["status", "--porcelain"], root)["stdout"], "")
+            cleanup = cleanup_worktree(release, app)
+            self.assertTrue(cleanup["ok"], cleanup)
+
+    def test_deferred_champion_update_does_not_move_latest_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, app = self._repo(tmp)
+            release, created = create_candidate_worktree(app, "proposal:deferred-champion", base_dir=pathlib.Path(tmp) / "worktrees")
+            self.assertIsNotNone(release, created)
+            assert release is not None
+            (pathlib.Path(release.app_worktree_path) / "src" / "demo.py").write_text("VALUE = 2\n", encoding="utf-8")
+            release, committed = commit_candidate(release, "candidate")
+            self.assertTrue(committed["ok"], committed)
+
+            release, promotion = promote_candidate(release, app, update_champion=False)
+
+            self.assertTrue(promotion["ok"], promotion)
+            self.assertTrue(promotion["champion_update_deferred"])
+            self.assertEqual(promotion["champion"]["status"], "deferred_by_policy")
+            self.assertNotEqual(run_git(["rev-parse", "--verify", "champion/latest"], root)["returncode"], 0)
+            champion_update = update_champion_latest(root, promotion["promoted_commit"])
+            self.assertTrue(champion_update["ok"], champion_update)
+            self.assertEqual(
+                run_git(["rev-parse", "champion/latest"], root)["stdout"].strip(),
+                promotion["promoted_commit"],
+            )
             cleanup = cleanup_worktree(release, app)
             self.assertTrue(cleanup["ok"], cleanup)
 
