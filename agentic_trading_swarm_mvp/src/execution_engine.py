@@ -344,6 +344,10 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             candidate["paper_entry_blocked"] = False
         candidate = apply_frontier_paper_admission_guard(candidate, settings)
     else:
+        # Apply the persisted paper-only state before the router recomputes
+        # its guard.  This lets a released quarantine re-admit the exact
+        # family in non-exploration paper configurations as well.
+        candidate = apply_okx_basis_decay_quarantine(dict(candidate), settings, conn=conn)
         candidate = apply_frontier_paper_guard(candidate, settings)
         recovery_probe = bool(
             settings.get("mode") == "paper"

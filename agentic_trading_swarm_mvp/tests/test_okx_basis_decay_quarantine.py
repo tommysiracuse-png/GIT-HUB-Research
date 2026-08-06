@@ -62,6 +62,8 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             self.assertEqual("shadow_trial", blocked["paper_action"])
             self.assertEqual("observe_only", blocked["paper_execution_mode"])
             self.assertFalse(blocked["paper_fill_allowed"])
+            self.assertFalse(blocked.get("paper_entry_blocked", False))
+            self.assertEqual(80.0, blocked["score"])
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["funding_capture_long_perp"])
             self.assertNotIn("paper_okx_basis_decay_quarantine", by_direction["short_perp_long_spot"])
             self.assertEqual(1, report["summary"]["okx_basis_decay_quarantine_count"])
@@ -76,6 +78,15 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
 
         self.assertTrue(quarantine_record(conditional, self.settings)["active"])
         self.assertIsNone(quarantine_record(standard, self.settings))
+
+    def test_explicit_feasibility_status_overrides_stale_nested_route_status(self) -> None:
+        conditional = self.candidate(
+            direction="long_perp_short_spot",
+            feasibility_status="conditional",
+            execution_feasibility={"status": "standard", "route_status": "standard"},
+        )
+
+        self.assertTrue(quarantine_record(conditional, self.settings)["active"])
 
     def test_execution_never_emits_a_paper_fill_for_quarantined_family(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -163,6 +174,33 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
             self.assertEqual("released", report["status"])
             self.assertEqual("duration_elapsed", report["release_reason"])
             conn.close()
+
+    def test_released_quarantine_allows_a_new_paper_fill(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            settings = copy.deepcopy(self.settings)
+            settings["paper_exploration"]["enabled"] = False
+            settings["paper_context_cost_floor"]["enabled"] = False
+            quarantine_record(self.candidate(), self.settings, conn=conn)
+            conn.execute(
+                "update paper_decay_quarantines set expires_at = ?",
+                ((dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)).isoformat(),),
+            )
+            conn.commit()
+
+            try:
+                execution = execute_order(
+                    conn,
+                    self.candidate(),
+                    {"paper_allocation_multiplier": 1.0, "decision": "approve_paper_trade"},
+                    settings,
+                )
+
+                self.assertTrue(execution["paper_filled"])
+                self.assertEqual("paper_filled", execution["order"]["status"])
+                self.assertEqual("released", execution["candidate"]["paper_okx_basis_decay_quarantine"]["status"])
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

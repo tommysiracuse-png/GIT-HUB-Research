@@ -3982,13 +3982,12 @@ def _apply_okx_basis_decay_quarantine(
         action="decay_quarantine_shadow_trial",
         reasons=[record["reason"]],
         allocation_multiplier=0.0,
-        shadow_only=True,
+        # Keep the priceable candidate in the paper-review cohort.  The
+        # execution boundary below turns it into an observe-only shadow trial;
+        # weak-family evidence must not erase the candidate before that point.
+        shadow_only=False,
     )
     candidate["pre_okx_basis_decay_quarantine_score"] = pre_quarantine_score
-    candidate["score"] = 0.0
-    candidate["paper_score_multiplier"] = 0.0
-    candidate["paper_score_eligible"] = False
-    candidate["paper_rank_eligible"] = False
     candidate["paper_fill_allowed"] = False
     candidate["paper_action"] = "shadow_trial"
     candidate["paper_execution_mode"] = "observe_only"

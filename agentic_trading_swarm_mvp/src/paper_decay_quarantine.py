@@ -75,6 +75,10 @@ def _paper_context(settings: Mapping[str, Any] | bool | None) -> bool:
 
 
 def _feasibility_status(candidate: Mapping[str, Any]) -> str:
+    # The normalized candidate field is the explicit signal-family status.
+    # Prefer it over an older nested route snapshot when both are present.
+    if candidate.get("feasibility_status") is not None:
+        return str(candidate["feasibility_status"]).strip().lower()
     feasibility = candidate.get("execution_feasibility")
     if isinstance(feasibility, Mapping) and feasibility.get("status") is not None:
         return str(feasibility["status"]).strip().lower()
@@ -285,7 +289,6 @@ def apply_quarantine(
     guarded.update(
         {
             "shadow_filtered": True,
-            "paper_entry_blocked": True,
             "paper_fill_allowed": False,
             "paper_action": "shadow_trial",
             "paper_execution_mode": "observe_only",
