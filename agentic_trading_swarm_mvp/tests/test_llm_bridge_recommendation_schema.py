@@ -47,6 +47,14 @@ class RecommendationSchemaTests(unittest.TestCase):
         contract = schema["market_key_contracts"]["paper.cross_market_researcher"]
         self.assertIn("Every required field must be present and non-empty", contract)
         self.assertIn("explicit cross-market support facts in-schema", contract)
+        self.assertIn("sample_count", contract)
+        self.assertIn("supporting_markets", contract)
+        self.assertTrue(
+            schema["paper_safety_policies"]["paper.cross_market_researcher"][
+                "require_structured_cross_market_support_facts"
+            ]
+        )
         fallback = schema["fallback_recommendations"]["paper.cross_market_researcher"]
         self.assertEqual(fallback["action"], "propose_diagnostic_hypothesis")
         self.assertTrue(fallback["evidence"]["market_recommendation_blocked"])
+        self.assertTrue(fallback["evidence"]["insufficient_structured_evidence"])

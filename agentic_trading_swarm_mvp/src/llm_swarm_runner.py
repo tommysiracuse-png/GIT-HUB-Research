@@ -737,6 +737,17 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
             "with explicit validated paper-only route facts such as route_status, route_decision, route_id, or "
             "route_actionability. If no explicit paper-safe route is available, return action='no_action'.\n"
         )
+    cross_market_instruction = ""
+    if agent["name"] == "cross_market_researcher":
+        cross_market_instruction = (
+            "Use a strict schema-locked cross-market contract. Do not emit a supported thesis unless evidence includes "
+            "explicit cross-market support facts in-schema: at least one positive count such as sample_count, "
+            "market_count, or matched_context_count, plus at least one non-empty support field such as "
+            "supporting_markets, observed_markets, cross_market_context, cross_market_observation, "
+            "cross_market_observations, thesis_support, or support_summary. "
+            "If that structured evidence is missing, return only a paper-only diagnostic hypothesis with "
+            "evidence.market_recommendation_blocked=true and evidence.insufficient_structured_evidence=true.\n"
+        )
     dynamic_instruction = ""
     if agent.get("dynamic_agent_id"):
         invention_context = ""
@@ -759,6 +770,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         f"{dynamic_instruction}"
         f"{build_planner_instruction}"
         f"{route_hunter_instruction}"
+        f"{cross_market_instruction}"
         "Paper exploration is enabled. Treat weak performance, route limits, low quality, spread, liquidity, and cost as diagnostic evidence, ranking, sizing, synthetic-paper routing, or guard-value measurement; do not propose new hard quarantines, candidate suppression, or paper-entry blocks for priceable candidates. Only invalid or dangerously stale prices, critically malformed data, undefined PnL, missing required multi-leg prices without a proxy, duplicate exposure, or capacity deferral may prevent a paper experiment.\n"
         "Return exactly one JSON object matching this schema:\n"
         "{"
@@ -1626,13 +1638,15 @@ def _schema_retry_prompt(agent: dict, original_text: str) -> str:
             "priority must be an integer 1-100. Every required key must be present and non-empty. "
             "title, rationale, and market_key must be non-empty strings. "
             "evidence and proposed_change must be non-empty JSON objects. "
-            "Do not emit a market recommendation unless the evidence object contains explicit cross-market support facts in-schema. "
+            "Do not emit a market recommendation unless the evidence object contains explicit cross-market support facts in-schema: "
+            "at least one positive count such as sample_count, market_count, or matched_context_count, plus at least one non-empty support field such as "
+            "supporting_markets, observed_markets, cross_market_context, cross_market_observation, cross_market_observations, thesis_support, or support_summary. "
             "If the available market evidence is insufficient for a reliable thesis, "
             "default to action=\"propose_diagnostic_hypothesis\" with a paper-only diagnostic hypothesis and make clear that the market recommendation is blocked until sufficient cross-market evidence is supplied in-schema. "
             "Use this exact schema-locked template shape:\n"
             "{\"action\":\"propose_diagnostic_hypothesis\",\"priority\":100,\"title\":\"...\"," 
             "\"rationale\":\"...\",\"market_key\":\"paper.cross_market_researcher.<scope>\","
-            "\"evidence\":{\"schema_violation\":\"...\",\"market_recommendation_blocked\":true,\"paper_only\":true},"
+            "\"evidence\":{\"schema_violation\":\"...\",\"market_recommendation_blocked\":true,\"insufficient_structured_evidence\":true,\"paper_only\":true},"
             "\"proposed_change\":{\"summary\":\"...\",\"paper_only\":true}}\n"
             "No markdown, no commentary, no extra keys, no arrays at the top level. Keep it paper-only.\n\n"
             f"Previous response preview:\n{(original_text or '')[:1200]}"

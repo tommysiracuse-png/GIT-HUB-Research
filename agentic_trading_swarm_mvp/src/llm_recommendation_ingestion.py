@@ -421,6 +421,9 @@ def _repair_cross_market_researcher_payload(value: Any) -> Optional[Dict[str, An
         "issue": "Incomplete cross_market_researcher recommendation object prevented strict downstream parsing.",
         "impact": "No actionable paper-trading recommendation reached the paper-only decision flow.",
         "constraint": "Output must remain paper-only and contain exactly one JSON object.",
+        "market_recommendation_blocked": True,
+        "insufficient_structured_evidence": True,
+        "paper_only": True,
     }
     current_evidence = repaired.get("evidence")
     if not _nonempty(current_evidence):
@@ -433,6 +436,7 @@ def _repair_cross_market_researcher_payload(value: Any) -> Optional[Dict[str, An
         "goal": "Enforce a strict single-object schema for all cross_market_researcher responses.",
         "required_fields": "action, priority, title, rationale, market_key, evidence, proposed_change",
         "safety_rule": "Paper-trading only; do not imply live execution.",
+        "next_step": "Keep the output as a paper-only diagnostic until explicit cross-market support facts are supplied in-schema.",
     }
     current_proposed_change = repaired.get("proposed_change")
     if not _nonempty(current_proposed_change):

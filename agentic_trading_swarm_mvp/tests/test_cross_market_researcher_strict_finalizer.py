@@ -26,7 +26,12 @@ def _payload(**overrides):
         "title": "Compare paper-market outcomes",
         "rationale": "The observed contexts have different paper-only outcomes.",
         "market_key": "paper_cross_market",
-        "evidence": {"sample_count": 12},
+        "evidence": {
+            "sample_count": 12,
+            "market_count": 3,
+            "supporting_markets": "okx_spot, bybit_spot, binance_spot",
+            "support_summary": "Matched paper-only contexts aligned across three sampled markets.",
+        },
         "proposed_change": {"analysis": "Compare the reliable labels."},
     }
     payload.update(overrides)
@@ -101,6 +106,7 @@ class RecommendationFinalizerTests(unittest.TestCase):
         blank_evidence = _payload(evidence={"sample_count": ""})
         blank_proposed_change = _payload(proposed_change={"analysis": "   "})
         unsupported_evidence_shape = _payload(evidence={"note": "No support facts or diagnostic markers"})
+        insufficient_structured_evidence = _payload(evidence={"sample_count": 12})
 
         for response in (
             top_level_array,
@@ -114,6 +120,7 @@ class RecommendationFinalizerTests(unittest.TestCase):
             blank_evidence,
             blank_proposed_change,
             unsupported_evidence_shape,
+            insufficient_structured_evidence,
         ):
             with self.subTest(response=response):
                 with self.assertRaises(ValueError):
@@ -185,6 +192,7 @@ class CrossMarketResearcherRetryTests(unittest.TestCase):
         self.assertEqual(rec["evidence"]["raw_generation_metadata"]["retry"]["response_text"], wrapped)
         self.assertEqual(rec["retry_count"], 1)
         self.assertTrue(rec["evidence"]["insufficient_market_evidence_defaults_to_diagnostic"])
+        self.assertTrue(rec["evidence"]["insufficient_structured_evidence"])
         self.assertTrue(rec["evidence"]["market_recommendation_blocked"])
         self.assertEqual(
             rec["proposed_change"]["fallback_mode"],
@@ -341,6 +349,24 @@ class RedTeamStrictRetryTests(unittest.TestCase):
 
 
 class CrossMarketSchemaRetryPromptTests(unittest.TestCase):
+    def test_cross_market_initial_prompt_requires_structured_support_or_blocked_diagnostic(self):
+        agent = next(
+            agent
+            for agent in llm_swarm_runner.AGENTS
+            if agent["name"] == "cross_market_researcher"
+        )
+
+        prompt = llm_swarm_runner.agent_prompt(
+            agent,
+            {"allowed_recommendation_actions": ["propose_diagnostic_hypothesis", "no_action"]},
+            [],
+        )
+
+        self.assertIn("explicit cross-market support facts in-schema", prompt)
+        self.assertIn("sample_count", prompt)
+        self.assertIn("supporting_markets", prompt)
+        self.assertIn("insufficient_structured_evidence=true", prompt)
+
     def test_cross_market_retry_prompt_requires_diagnostic_fallback_on_insufficient_evidence(self):
         agent = next(
             agent
@@ -356,6 +382,7 @@ class CrossMarketSchemaRetryPromptTests(unittest.TestCase):
         self.assertIn("evidence and proposed_change must be non-empty JSON objects", prompt)
         self.assertIn("Every required key must be present and non-empty", prompt)
         self.assertIn("blocked until sufficient cross-market evidence is supplied in-schema", prompt)
+        self.assertIn("insufficient_structured_evidence", prompt)
 
 
 if __name__ == "__main__":

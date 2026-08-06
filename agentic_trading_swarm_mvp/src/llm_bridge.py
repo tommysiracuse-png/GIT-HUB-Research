@@ -502,10 +502,11 @@ CROSS_MARKET_RESEARCHER_FALLBACK_RECOMMENDATION = {
     "evidence": {
         "issue": "schema_validation_failed",
         "market_recommendation_blocked": True,
+        "insufficient_structured_evidence": True,
         "paper_only": True,
     },
     "proposed_change": {
-        "summary": "Return one schema-complete paper-only diagnostic object and wait for sufficient cross-market evidence before making a market recommendation.",
+        "summary": "Return one schema-complete paper-only diagnostic object and wait for sufficient cross-market evidence with explicit support facts in-schema before making a market recommendation.",
         "required_fields": ", ".join(REQUIRED_RECOMMENDATION_FIELDS),
         "safety_mode": "paper_only",
     },
@@ -1477,8 +1478,13 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
                 "action, priority, title, rationale, market_key, evidence, and "
                 "proposed_change. Every required field must be present and non-empty. "
                 "Keep market_key paper-scoped. Do not emit a market recommendation unless "
-                "evidence contains explicit cross-market support facts in-schema. If the "
-                "response is partial, malformed, or lacks sufficient cross-market evidence, "
+                "evidence contains explicit cross-market support facts in-schema, meaning at "
+                "least one positive count such as sample_count, market_count, or "
+                "matched_context_count plus at least one non-empty support field such as "
+                "supporting_markets, observed_markets, cross_market_context, "
+                "cross_market_observation, cross_market_observations, thesis_support, or "
+                "support_summary. If the response is partial, malformed, or lacks sufficient "
+                "cross-market evidence, "
                 "emit the provided paper-only diagnostic fallback recommendation object "
                 "instead of a market thesis."
             ),
@@ -1496,6 +1502,7 @@ def _recommendation_schema(allowed_actions: list[str]) -> dict:
                 "required_fields": required_fields,
                 "require_non_empty_required_fields": True,
                 "require_explicit_cross_market_evidence_or_diagnostic": True,
+                "require_structured_cross_market_support_facts": True,
             },
         },
         "fallback_recommendations": {

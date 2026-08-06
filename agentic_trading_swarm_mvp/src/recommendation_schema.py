@@ -47,7 +47,15 @@ _CROSS_MARKET_DIAGNOSTIC_KEYS = frozenset(
         "validation_error",
         "insufficient_market_evidence",
         "insufficient_market_data",
+        "insufficient_structured_evidence",
         "market_recommendation_blocked",
+    }
+)
+_CROSS_MARKET_COUNT_KEYS = frozenset(
+    {
+        "sample_count",
+        "market_count",
+        "matched_context_count",
     }
 )
 
@@ -146,6 +154,34 @@ def _is_paper_market_key(value: Any) -> bool:
     )
 
 
+def _has_cross_market_support_counts(evidence: dict[str, Any]) -> bool:
+    for key in _CROSS_MARKET_COUNT_KEYS:
+        value = evidence.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value > 0:
+            return True
+    return False
+
+
+def _has_cross_market_support_facts(evidence: dict[str, Any]) -> bool:
+    if not _has_cross_market_support_counts(evidence):
+        return False
+    for key in _CROSS_MARKET_EVIDENCE_KEYS - _CROSS_MARKET_COUNT_KEYS:
+        if _has_non_empty_value(evidence.get(key)):
+            return True
+    return False
+
+
+def _has_cross_market_blocking_diagnostic(evidence: dict[str, Any]) -> bool:
+    if evidence.get("market_recommendation_blocked") is not True:
+        return False
+    for key in _CROSS_MARKET_DIAGNOSTIC_KEYS - {"market_recommendation_blocked"}:
+        if _has_non_empty_value(evidence.get(key)):
+            return True
+    return False
+
+
 def validate_recommendation_object(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -200,12 +236,18 @@ def validate_cross_market_researcher_object(payload: Any) -> None:
     if not _mapping_has_non_empty_value(payload["proposed_change"]):
         raise ValueError("cross-market recommendation proposed_change must contain a non-empty value")
     evidence = payload["evidence"]
-    if not any(_has_non_empty_value(evidence.get(key)) for key in _CROSS_MARKET_EVIDENCE_KEYS) and not any(
-        _has_non_empty_value(evidence.get(key)) for key in _CROSS_MARKET_DIAGNOSTIC_KEYS
-    ):
+    has_support_facts = _has_cross_market_support_facts(evidence)
+    has_blocking_diagnostic = _has_cross_market_blocking_diagnostic(evidence)
+    if not has_support_facts and not has_blocking_diagnostic:
         raise ValueError(
-            "cross-market recommendation evidence must include explicit market support "
-            "or an explicit insufficiency/validation diagnostic"
+            "cross-market recommendation evidence must include explicit cross-market "
+            "support facts in-schema or an explicit blocked paper-only diagnostic for "
+            "insufficient structured evidence"
+        )
+    if not has_support_facts and payload["action"] not in {"no_action", "propose_diagnostic_hypothesis"}:
+        raise ValueError(
+            "cross-market recommendation without explicit support facts must stay a "
+            "blocked paper-only diagnostic"
         )
 
 
@@ -268,6 +310,7 @@ def cross_market_researcher_schema_fallback(
             "schema_violation": validation_error,
             "raw_generation_metadata": raw_generation_metadata,
             "insufficient_market_evidence_defaults_to_diagnostic": True,
+            "insufficient_structured_evidence": True,
             "market_recommendation_blocked": True,
             "paper_only": True,
         },
@@ -275,7 +318,8 @@ def cross_market_researcher_schema_fallback(
             "summary": "Repair the cross-market response schema and rerun the paper-only analysis.",
             "next_step": (
                 "Do not emit a market recommendation until a single schema-complete JSON "
-                "object includes sufficient cross-market evidence."
+                "object includes sufficient cross-market evidence and explicit support "
+                "facts in-schema."
             ),
             "required_fields": ", ".join(REQUIRED_RECOMMENDATION_KEYS),
             "fallback_mode": "paper_only_diagnostic_hypothesis",

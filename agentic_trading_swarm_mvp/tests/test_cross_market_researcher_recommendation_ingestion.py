@@ -32,11 +32,14 @@ class CrossMarketResearcherRecommendationIngestionTests(unittest.TestCase):
             payload["evidence"]["constraint"],
             "Output must remain paper-only and contain exactly one JSON object.",
         )
+        self.assertTrue(payload["evidence"]["market_recommendation_blocked"])
+        self.assertTrue(payload["evidence"]["insufficient_structured_evidence"])
         self.assertEqual(payload["proposed_change"]["goal"], "keep one strict object")
         self.assertEqual(
             payload["proposed_change"]["format_rule"],
             "No markdown, no commentary, no arrays, valid JSON only.",
         )
+        self.assertIn("explicit cross-market support facts", payload["proposed_change"]["next_step"])
 
     def test_json_objects_repairs_single_cross_market_object(self) -> None:
         parsed = list(
@@ -51,6 +54,7 @@ class CrossMarketResearcherRecommendationIngestionTests(unittest.TestCase):
         self.assertEqual(parsed[0]["action"], "diagnostic")
         self.assertEqual(parsed[0]["priority"], 90)
         self.assertEqual(parsed[0]["evidence"]["impact"], "parser failure")
+        self.assertTrue(parsed[0]["evidence"]["market_recommendation_blocked"])
         self.assertIn("required_fields", parsed[0]["proposed_change"])
 
     def test_native_payload_preserves_no_action_cross_market_schema_guard(self) -> None:
