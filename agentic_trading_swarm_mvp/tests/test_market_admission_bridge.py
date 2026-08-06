@@ -164,6 +164,46 @@ class MarketAdmissionBridgeTests(unittest.TestCase):
         self.assertIn("cpotr_opening_gap_bps", requirements["required_fields"])
         self.assertTrue(json.loads(row["risk_gates_json"])["synthetic_research_only"])
 
+    def test_carb_closed_priceable_allowance_results_create_canonical_auction_reference_program(self) -> None:
+        carb_state = state(
+            "priceable",
+            venue="CARB_CA_QC",
+            inst_id="CARB:CA_QC_AUCTION:48:CURRENT:2026-08-19",
+            market_surface="california_quebec_cap_and_invest_joint_allowance_auctions",
+            session_status="closed",
+            blocker_code="market_closed",
+            details={
+                "adapter_id": "california_air_resources_board_cap_and_invest",
+                "quality_status": "official_auction_result",
+                "candidate_reject_reason": "official_allowance_auction_reference_not_order_routable",
+                "route_status": "unknown",
+            },
+        )
+        result = market_admission_bridge.run_market_admission_bridge(
+            self.conn, self.settings, {"states": [carb_state]}
+        )
+        row = self.conn.execute(
+            "select strategy_lab_id, strategy_logic_json, data_requirements_json, risk_gates_json "
+            "from strategy_lab_experiments"
+        ).fetchone()
+
+        self.assertEqual(1, result["summary"]["actions_created"])
+        self.assertEqual("strategy_lab_carb_allowance_program", result["actions"][0]["action"])
+        self.assertEqual("carb_joint_allowance_discount_tightness_v1", row["strategy_lab_id"])
+        logic = json.loads(row["strategy_logic_json"])
+        self.assertEqual("observation_program", logic["type"])
+        self.assertEqual("auction_reference", logic["route_surface"])
+        self.assertIn("allowance_category == 'current'", logic["entry_expression"])
+        self.assertIn("term_discount_bps <= 35", logic["entry_expression"])
+        self.assertEqual("max(0,-term_discount_zscore)", logic["calculated_features"]["discount_quality_signal"])
+        requirements = json.loads(row["data_requirements_json"])
+        self.assertEqual("california_air_resources_board_cap_and_invest", requirements["adapter_id"])
+        self.assertIn("term_discount_zscore", requirements["supported_snapshot_features"])
+        risk_gates = json.loads(row["risk_gates_json"])
+        self.assertFalse(risk_gates["require_route_feasible"])
+        self.assertTrue(risk_gates["synthetic_research_only"])
+        self.assertEqual(0, self.conn.execute("select count(*) from market_hunter_directives").fetchone()[0])
+
     def test_spot_borrow_user_constraint_suppresses_route_task(self) -> None:
         item = state(
             "strategy_candidate",

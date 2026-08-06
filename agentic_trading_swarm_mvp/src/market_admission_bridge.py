@@ -29,6 +29,8 @@ ADX_DERIVATIVES_SURFACE = "adx_equity_and_index_futures_contract_catalog"
 ADX_DERIVATIVES_LAB_ID = "adx_derivatives_companion_quote_v1"
 ICDX_CPOTR_SURFACE = "icdx_cpotr"
 ICDX_CPOTR_LAB_ID = "icdx_cpotr_price_card_reference_v1"
+CARB_ALLOWANCE_SURFACE = "california_quebec_cap_and_invest_joint_allowance_auctions"
+CARB_ALLOWANCE_LAB_ID = "carb_joint_allowance_discount_tightness_v1"
 
 
 def _strategy_lab_id(state: dict[str, Any]) -> str:
@@ -60,7 +62,10 @@ def _group_actionable_states(states: list[dict[str, Any]]) -> list[dict[str, Any
         stage = str(state.get("current_stage") or "")
         if stage not in {"priceable", "quality_verified", "strategy_candidate", "route_feasible"}:
             continue
-        if str(state.get("session_status") or "") == "closed":
+        if (
+            str(state.get("session_status") or "") == "closed"
+            and not _is_carb_closed_allowance_reference_state(state)
+        ):
             continue
         lineage = str(state.get("strategy_lineage") or "")
         if stage == "quality_verified" and lineage != "adapter_observation":
@@ -108,6 +113,18 @@ def _group_actionable_states(states: list[dict[str, Any]]) -> list[dict[str, Any
             -int((item.get("details") or {}).get("instrument_count") or 0),
             str(item.get("venue")),
         ),
+    )
+
+
+def _is_carb_closed_allowance_reference_state(state: dict[str, Any]) -> bool:
+    details = state.get("details") if isinstance(state.get("details"), dict) else {}
+    return (
+        str(state.get("current_stage") or "") == "priceable"
+        and str(state.get("venue") or "").upper() == "CARB_CA_QC"
+        and str(state.get("market_surface") or "") == CARB_ALLOWANCE_SURFACE
+        and str(details.get("quality_status") or "") == "official_auction_result"
+        and str(details.get("candidate_reject_reason") or "")
+        == "official_allowance_auction_reference_not_order_routable"
     )
 
 
@@ -504,6 +521,190 @@ def _create_icdx_cpotr_price_card_program(
     }
 
 
+def _create_carb_allowance_paper_program(
+    conn: sqlite3.Connection,
+    settings: dict,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the canonical paper-only CARB joint-auction reference program."""
+
+    claim = _claim(conn, state, "activate_carb_allowance_paper_research", 90)
+    if claim.duplicate and claim.canonical_row_id:
+        return {
+            "action": "strategy_lab_carb_allowance_program",
+            "status": "deduplicated",
+            "topic_key": claim.topic_key,
+        }
+    evidence = _evidence(state)
+    details = state.get("details") if isinstance(state.get("details"), dict) else {}
+    rec = {
+        "recommendation_id": f"market_admission:{state['admission_key']}:carb_allowance_program",
+        "source_agent": "market_admission_bridge",
+        "payload": {
+            "agent_name": "market_admission_bridge",
+            "title": "Paper-test CARB current-versus-advance auction discount tightness",
+            "rationale": (
+                "CARB publishes official current and advance settlement results with quantities, but no executable "
+                "allowance order route. Those same-surface records should feed a synthetic paper auction-reference "
+                "experiment instead of falling back to generic enrichment."
+            ),
+            "strategy_lab_experiment": {
+                "strategy_lab_id": CARB_ALLOWANCE_LAB_ID,
+                "version": 1,
+                "experiment_type": "market_strategy",
+                "hypothesis": (
+                    "Across California-Quebec joint allowance auctions, when CURRENT and ADVANCE allowances both "
+                    "fully clear and the CURRENT-versus-ADVANCE settlement discount is unusually tight, the next "
+                    "CURRENT auction settlement tends to be firmer because bidders are pricing forward scarcity "
+                    "rather than only spot compliance demand."
+                ),
+                "source_surface": CARB_ALLOWANCE_SURFACE,
+                "permitted_target_surface": [CARB_ALLOWANCE_SURFACE],
+                "strategy_logic": {
+                    "type": "observation_program",
+                    "universe": {
+                        "venues": ["CARB_CA_QC"],
+                        "asset_classes": ["greenhouse_gas_emission_allowance"],
+                        "market_types": ["joint_allowance_auction_result"],
+                        "market_surfaces": [CARB_ALLOWANCE_SURFACE],
+                    },
+                    "calculated_features": {
+                        "paired_sellthrough_total": "current_sellthrough + advance_sellthrough",
+                        "discount_quality_signal": "max(0,-term_discount_zscore)",
+                        "tight_discount_edge_bps": "max(0,35 - term_discount_bps)",
+                    },
+                    "entry_expression": (
+                        "market_surface == 'california_quebec_cap_and_invest_joint_allowance_auctions' "
+                        "and quality_status == 'official_auction_result' "
+                        "and candidate_reject_reason == 'official_allowance_auction_reference_not_order_routable' "
+                        "and allowance_category == 'current' "
+                        "and reserve_sale == False "
+                        "and price_available == True "
+                        "and paired_current_advance_observed >= 1 "
+                        "and current_sellthrough >= 1 "
+                        "and advance_sellthrough >= 1 "
+                        "and term_discount_bps > 0 "
+                        "and term_discount_bps <= 35"
+                    ),
+                    "invalidation_expression": (
+                        "freshness_state != 'fresh' or reserve_sale == True or price_available == False "
+                        "or paired_current_advance_observed < 1 or current_sellthrough < 1 "
+                        "or advance_sellthrough < 1"
+                    ),
+                    "direction": "long",
+                    "direction_logic": (
+                        "Emit a long paper-reference observation only from CURRENT auction rows when a paired "
+                        "ADVANCE result exists for the same auction_number, both categories fully clear, and the "
+                        "settlement discount remains tight."
+                    ),
+                    "edge_expression": (
+                        "tight_discount_edge_bps + 10 * discount_quality_signal + 5 * max(paired_sellthrough_total - 2,0)"
+                    ),
+                    "edge_formula": (
+                        "tight_discount_edge_bps + 10 * discount_quality_signal + 5 * max(paired_sellthrough_total - 2,0)"
+                    ),
+                    "score_expression": (
+                        "clip(50 + tight_discount_edge_bps / 2 + 10 * discount_quality_signal "
+                        "+ 5 * max(paired_sellthrough_total - 2,0),0,100)"
+                    ),
+                    "score_formula": (
+                        "clip(50 + tight_discount_edge_bps / 2 + 10 * discount_quality_signal "
+                        "+ 5 * max(paired_sellthrough_total - 2,0),0,100)"
+                    ),
+                    "route_surface": "auction_reference",
+                },
+                "data_requirements": {
+                    "admission_key": state.get("admission_key"),
+                    "adapter_id": details.get("adapter_id"),
+                    "paper_only": True,
+                    "venue": "CARB_CA_QC",
+                    "market_surface": CARB_ALLOWANCE_SURFACE,
+                    "source_surface": CARB_ALLOWANCE_SURFACE,
+                    "permitted_target_surface": [CARB_ALLOWANCE_SURFACE],
+                    "required_fields": [
+                        "allowance_category",
+                        "allowances_offered",
+                        "allowances_sold",
+                        "auction_number",
+                        "auction_settlement_price_usd",
+                        "event_date",
+                        "price_available",
+                        "quality_status",
+                        "reserve_sale",
+                        "session_status",
+                        "freshness_state",
+                        "candidate_reject_reason",
+                    ],
+                    "supported_snapshot_features": [
+                        "auction_settlement_price_usd",
+                        "allowances_offered",
+                        "allowances_sold",
+                        "allowance_sellthrough_ratio",
+                        "paired_current_advance_observed",
+                        "current_price_usd_by_auction",
+                        "advance_price_usd_by_auction",
+                        "current_sellthrough",
+                        "advance_sellthrough",
+                        "term_discount_bps",
+                        "term_discount_zscore",
+                    ],
+                    "label_requirement": "next later official CURRENT settlement result on the same market_surface",
+                    "paper_only_reference": True,
+                    "requires_independent_signal_logic": True,
+                },
+                "risk_gates": {
+                    "require_route_feasible": False,
+                    "paper_allocation_multiplier": 0.25,
+                    "synthetic_research_only": True,
+                    "data_quality": [
+                        "Use only quality_status='official_auction_result' rows with candidate_reject_reason='official_allowance_auction_reference_not_order_routable'.",
+                        "Use only CURRENT category entry rows with paired_current_advance_observed>=1.",
+                        "Require price_available=true and reserve_sale=false.",
+                        "Require current_sellthrough=1 and advance_sellthrough=1 before entry.",
+                    ],
+                    "exposure_limits": [
+                        "Paper-only synthetic auction-reference measurement.",
+                        "At most one active signal per auction_number.",
+                        "No broker routing, no live trading, and no non-paper execution surface.",
+                    ],
+                    "robustness": [
+                        "Judge fit only after at least 12 labeled CURRENT auction cycles.",
+                        "Confirm the edge is not solely driven by a single auction cycle.",
+                        "Retain exact same-surface routing and exact-surface outcome labeling only.",
+                    ],
+                },
+                "promotion_rules": {
+                    "minimum_sample_size": 12,
+                    "holdout_requirements": [
+                        "Positive median next-CURRENT settlement change for qualified entries.",
+                        "Positive average labeled outcome after excluding the single strongest winner.",
+                        "Same directional sign in at least 2 non-overlapping historical subperiods.",
+                    ],
+                    "robustness_checks": [
+                        "Edge persists after removing one strongest auction outcome.",
+                        "Edge is not dependent on reserve-sale rows, which are already excluded.",
+                        "Edge remains same-surface and paper-only with no cross-surface leakage.",
+                    ],
+                    "route_constraints": [
+                        "Remain on synthetic_auction_reference_paper semantics only.",
+                        "Do not promote to any live or broker-connected route from this experiment.",
+                    ],
+                },
+            },
+            "evidence": evidence,
+        },
+    }
+    result = ingest_strategy_lab_recommendation(conn, rec, settings)[0]
+    if result.get("strategy_lab_id"):
+        bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
+    return {
+        "action": "strategy_lab_carb_allowance_program",
+        "status": "created" if result.get("created") else "updated",
+        "strategy_lab_id": result.get("strategy_lab_id"),
+        "topic_key": claim.topic_key,
+    }
+
+
 def _create_strategy_discovery(
     conn: sqlite3.Connection,
     settings: dict,
@@ -623,6 +824,11 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
                 and str(state.get("market_surface") or "") == EEX_SECONDARY_SPOT_SURFACE
             ):
                 actions.append(_create_eex_secondary_spot_program(conn, settings, state))
+            elif (
+                str(state.get("venue") or "").upper() == "CARB_CA_QC"
+                and str(state.get("market_surface") or "") == CARB_ALLOWANCE_SURFACE
+            ):
+                actions.append(_create_carb_allowance_paper_program(conn, settings, state))
             elif (
                 str(state.get("venue") or "").upper() == "ICDX"
                 and str(state.get("market_surface") or "") == ICDX_CPOTR_SURFACE
