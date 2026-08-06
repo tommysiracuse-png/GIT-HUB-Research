@@ -5647,6 +5647,12 @@ INTRADAY_CONFIRMATION_FEATURES = frozenset(
         "microstructure_history_ready",
         "return_1m_bps",
         "relative_volume_1m_60m",
+        "rolling_vwap_60m",
+        "vwap_dislocation_bps",
+        "price_above_rolling_vwap",
+        "new_high_60m",
+        "momentum_confirmation_count",
+        "momentum_confirmation_ratio",
     }
 )
 
@@ -5656,6 +5662,28 @@ DEFAULT_PAPER_ONLY_CONFIDENCE_POLICY = {
     "trend_weight": 0.40,
     "momentum_weight": 0.35,
     "liquidity_weight": 0.25,
+}
+
+
+DEFAULT_SECONDARY_CEX_STRENGTH_POLICY = {
+    "enabled": True,
+    "preferred_venues": ("BITGET", "WHITEBIT", "OKX_SPOT"),
+    "comparable_venues": ("GATE", "MEXC", "KUCOIN", "BYBIT_SPOT"),
+    "minimum_momentum_confirmation_count": 2,
+}
+
+
+DEFAULT_FRONTIER_LONG_ENTRY_CONFIRMATION_POLICY = {
+    "enabled": True,
+    "paper_only": True,
+    "entry_confidence_min": 0.72,
+    "minimum_momentum_confirmation_count": 2,
+    "minimum_venue_strength_score": 55.0,
+    "require_price_above_vwap": True,
+    "allocation_cap": 0.25,
+    "ranking_score_cap": 59.999,
+    "max_spread_bps": 8.0,
+    "min_relative_volume_1m_60m": 0.75,
 }
 
 
@@ -8937,6 +8965,16 @@ def _finalize_observation(row: dict) -> dict:
     row.setdefault("return_1m_bps", 0.0)
     row.setdefault("quote_volume_1m", 0.0)
     row.setdefault("relative_volume_1m_60m", 0.0)
+    row.setdefault("rolling_vwap_60m", None)
+    row.setdefault("vwap_dislocation_bps", 0.0)
+    row.setdefault("price_above_rolling_vwap", 0.0)
+    row.setdefault("new_high_60m", 0.0)
+    row.setdefault("momentum_confirmation_count", 0.0)
+    row.setdefault("momentum_confirmation_ratio", 0.0)
+    row.setdefault("rolling_24_hour_volume", as_float(row.get("quote_volume_24h"), 0.0) or 0.0)
+    row.setdefault("best_bid", as_float(row.get("bid"), None))
+    row.setdefault("best_ask", as_float(row.get("ask"), None))
+    row.setdefault("last_trade_timestamp", row.get("exchange_timestamp"))
     row.setdefault("microstructure_history_ready", 0.0)
     row.setdefault("microstructure_status", "not_requested")
     return _apply_paper_only_review_policy(row)
@@ -8982,6 +9020,21 @@ def _intraday_candle_rows(config: dict, result: dict) -> list[dict]:
     return rows
 
 
+def _rolling_vwap(rows: list[dict]) -> float | None:
+    weighted_sum = 0.0
+    total_volume = 0.0
+    for row in rows:
+        price = as_float(row.get("close"), None)
+        volume = as_float(row.get("quote_volume"), None)
+        if price is None or price <= 0 or volume is None or volume <= 0:
+            continue
+        weighted_sum += price * volume
+        total_volume += volume
+    if total_volume <= 0:
+        return None
+    return weighted_sum / total_volume
+
+
 def _intraday_features(config: dict, result: dict) -> dict:
     rows = _intraday_candle_rows(config, result) if result.get("ok") else []
     if len(rows) < 61:
@@ -8989,12 +9042,20 @@ def _intraday_features(config: dict, result: dict) -> dict:
             "return_1m_bps": 0.0,
             "quote_volume_1m": 0.0,
             "relative_volume_1m_60m": 0.0,
+            "rolling_vwap_60m": None,
+            "vwap_dislocation_bps": 0.0,
+            "price_above_rolling_vwap": 0.0,
+            "new_high_60m": 0.0,
+            "momentum_confirmation_count": 0.0,
+            "momentum_confirmation_ratio": 0.0,
             "microstructure_history_ready": 0.0,
             "microstructure_status": "insufficient_closed_candles" if result.get("ok") else "unavailable",
         }
     recent = rows[-61:]
     latest = recent[-1]
     previous = recent[-2]
+    trailing_5m = recent[-6]
+    trailing_15m = recent[-16]
     baseline_volumes = [item["quote_volume"] for item in recent[:-1] if item["quote_volume"] > 0]
     baseline = statistics.median(baseline_volumes) if len(baseline_volumes) == 60 else 0.0
     if baseline <= 0:
@@ -9002,13 +9063,35 @@ def _intraday_features(config: dict, result: dict) -> dict:
             "return_1m_bps": 0.0,
             "quote_volume_1m": 0.0,
             "relative_volume_1m_60m": 0.0,
+            "rolling_vwap_60m": None,
+            "vwap_dislocation_bps": 0.0,
+            "price_above_rolling_vwap": 0.0,
+            "new_high_60m": 0.0,
+            "momentum_confirmation_count": 0.0,
+            "momentum_confirmation_ratio": 0.0,
             "microstructure_history_ready": 0.0,
             "microstructure_status": "invalid_volume_baseline",
         }
+    rolling_window = recent[-60:]
+    rolling_vwap = _rolling_vwap(rolling_window)
+    rolling_high = max(item["close"] for item in rolling_window[:-1])
+    return_1m = bps(latest["close"], previous["close"])
+    return_5m = bps(latest["close"], trailing_5m["close"])
+    return_15m = bps(latest["close"], trailing_15m["close"])
+    price_above_vwap = bool(rolling_vwap is not None and latest["close"] >= rolling_vwap)
+    new_high = bool(latest["close"] >= rolling_high)
+    momentum_confirmation_count = sum(value > 0.0 for value in (return_1m, return_5m, return_15m))
+    vwap_dislocation = bps(latest["close"], rolling_vwap) if rolling_vwap and rolling_vwap > 0 else 0.0
     return {
-        "return_1m_bps": round(bps(latest["close"], previous["close"]), 6),
+        "return_1m_bps": round(return_1m, 6),
         "quote_volume_1m": round(latest["quote_volume"], 6),
         "relative_volume_1m_60m": round(latest["quote_volume"] / baseline, 6),
+        "rolling_vwap_60m": round(rolling_vwap, 8) if rolling_vwap is not None else None,
+        "vwap_dislocation_bps": round(vwap_dislocation, 6),
+        "price_above_rolling_vwap": 1.0 if price_above_vwap else 0.0,
+        "new_high_60m": 1.0 if new_high else 0.0,
+        "momentum_confirmation_count": float(momentum_confirmation_count),
+        "momentum_confirmation_ratio": round(momentum_confirmation_count / 3.0, 6),
         "microstructure_history_ready": 1.0,
         "microstructure_status": "ready",
     }
@@ -9239,6 +9322,419 @@ def enrich_intraday_features(
         "selected_by_venue": dict(venue_counts),
         **coverage_base,
     }
+
+
+def _secondary_cex_strength_policy(settings: dict) -> dict:
+    policy = dict(DEFAULT_SECONDARY_CEX_STRENGTH_POLICY)
+    configured = settings.get("frontier_crypto_adapter", {}).get("secondary_cex_strength", {})
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    policy["preferred_venues"] = tuple(str(item).upper() for item in policy.get("preferred_venues", ()))
+    policy["comparable_venues"] = tuple(str(item).upper() for item in policy.get("comparable_venues", ()))
+    return policy
+
+
+def _frontier_long_entry_confirmation_policy(settings: dict) -> dict:
+    policy = dict(DEFAULT_FRONTIER_LONG_ENTRY_CONFIRMATION_POLICY)
+    configured = settings.get("frontier_crypto_adapter", {}).get("long_entry_confirmation", {})
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    if configured is False:
+        policy["enabled"] = False
+    return policy
+
+
+def _first_seen_snapshot_times(
+    conn,
+    observations: list[dict],
+) -> dict[tuple[str, str], dt.datetime]:
+    if conn is None or not callable(getattr(conn, "execute", None)):
+        return {}
+    keys = sorted(
+        {
+            (str(row.get("venue") or ""), str(row.get("inst_id") or row.get("instrument_id") or ""))
+            for row in observations
+            if row.get("venue") and (row.get("inst_id") or row.get("instrument_id"))
+        }
+    )
+    if not keys:
+        return {}
+    output: dict[tuple[str, str], dt.datetime] = {}
+    sources = (
+        ("strategy_feature_snapshots", "bucket_at"),
+        ("frontier_quality_snapshots", "observed_at"),
+    )
+    for table, time_field in sources:
+        for start in range(0, len(keys), 200):
+            chunk = keys[start : start + 200]
+            clauses = " or ".join("(venue = ? and inst_id = ?)" for _ in chunk)
+            params: list[str] = []
+            for venue, inst_id in chunk:
+                params.extend([venue, inst_id])
+            try:
+                rows = conn.execute(
+                    f"""
+                    select venue, inst_id, min({time_field}) as first_seen
+                    from {table}
+                    where {clauses}
+                    group by venue, inst_id
+                    """,
+                    params,
+                ).fetchall()
+            except Exception:  # noqa: BLE001 - optional tables are not guaranteed in every runtime.
+                continue
+            for raw in rows:
+                venue = str(raw["venue"] or "")
+                inst_id = str(raw["inst_id"] or "")
+                parsed = _paper_only_parse_timestamp(raw["first_seen"])
+                if not venue or not inst_id or parsed is None:
+                    continue
+                key = (venue, inst_id)
+                existing = output.get(key)
+                if existing is None or parsed < existing:
+                    output[key] = parsed
+    return output
+
+
+def _annotate_listing_age(
+    observations: list[dict],
+    conn=None,
+) -> list[dict]:
+    history = _first_seen_snapshot_times(conn, observations)
+    for row in observations:
+        observed_at = _paper_only_parse_timestamp(
+            row.get("observed_at")
+            or row.get("last_checked_at")
+            or row.get("last_trade_timestamp")
+            or row.get("exchange_timestamp")
+        ) or dt.datetime.now(dt.timezone.utc)
+        metadata = row.get("instrument_metadata")
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        explicit_listed_at = _paper_only_parse_timestamp(
+            row.get("listed_at")
+            or metadata.get("listed_at")
+            or metadata.get("listing_first_seen_at")
+        )
+        key = (
+            str(row.get("venue") or ""),
+            str(row.get("inst_id") or row.get("instrument_id") or ""),
+        )
+        historic_first_seen = history.get(key)
+        known_times = [item for item in (explicit_listed_at, historic_first_seen, observed_at) if item is not None]
+        first_seen = min(known_times) if known_times else observed_at
+        age_days = max(0.0, (observed_at - first_seen).total_seconds() / 86400.0)
+        row["listed_at"] = explicit_listed_at.isoformat() if explicit_listed_at is not None else None
+        row["listing_first_seen_at"] = first_seen.isoformat()
+        row["listing_age_days"] = round(age_days, 6)
+        row["rolling_24_hour_volume"] = max(
+            0.0,
+            as_float(row.get("rolling_24_hour_volume"), None)
+            if as_float(row.get("rolling_24_hour_volume"), None) is not None
+            else as_float(row.get("quote_volume_24h"), 0.0) or 0.0,
+        )
+        row["best_bid"] = (
+            as_float(row.get("best_bid"), None)
+            if as_float(row.get("best_bid"), None) is not None
+            else as_float(row.get("bid"), None)
+        )
+        row["best_ask"] = (
+            as_float(row.get("best_ask"), None)
+            if as_float(row.get("best_ask"), None) is not None
+            else as_float(row.get("ask"), None)
+        )
+        row["last_trade_timestamp"] = row.get("last_trade_timestamp") or row.get("exchange_timestamp")
+        metadata.update(
+            {
+                "listed_at": row.get("listed_at"),
+                "listing_first_seen_at": row.get("listing_first_seen_at"),
+                "listing_age_days": row.get("listing_age_days"),
+            }
+        )
+        if metadata:
+            row["instrument_metadata"] = metadata
+    return observations
+
+
+def _annotate_cross_venue_snapshot_fields(
+    observations: list[dict],
+    reference_prices: dict[str, float],
+    reference_venue_counts: collections.Counter,
+) -> list[dict]:
+    for row in observations:
+        comparison_key = str(row.get("comparison_key") or "")
+        reference_price = reference_prices.get(comparison_key)
+        local_price = _comparison_price(row)
+        if reference_price is not None and reference_price > 0 and local_price > 0:
+            row["cross_venue_reference_price"] = round(reference_price, 8)
+            row["cross_venue_dislocation_bps"] = round(bps(local_price, reference_price), 6)
+        else:
+            row["cross_venue_reference_price"] = None
+            row["cross_venue_dislocation_bps"] = None
+        row["cross_venue_reference_venue_count"] = int(reference_venue_counts.get(comparison_key, 0) or 0)
+    return observations
+
+
+def _secondary_cex_spot_strength_snapshot(
+    observations: list[dict],
+    candidates: list[dict],
+    settings: dict,
+) -> dict:
+    policy = _secondary_cex_strength_policy(settings)
+    preferred_venues = tuple(policy.get("preferred_venues") or ())
+    comparable_venues = tuple(policy.get("comparable_venues") or ())
+    target_venues = tuple(dict.fromkeys([*preferred_venues, *comparable_venues]))
+    if not policy.get("enabled", True):
+        return {
+            "enabled": False,
+            "paper_only": True,
+            "target_venues": list(target_venues),
+            "preferred_venues": list(preferred_venues),
+            "venues": [],
+            "by_venue": {},
+        }
+    rows = [
+        row
+        for row in observations
+        if str(row.get("venue") or "").upper() in target_venues
+        and row.get("market_type") == "spot"
+        and row.get("data_status") == "reachable"
+        and float(row.get("last") or 0.0) > 0.0
+    ]
+    by_venue: dict[str, list[dict]] = collections.defaultdict(list)
+    for row in rows:
+        by_venue[str(row.get("venue") or "").upper()].append(row)
+    candidate_lists: dict[str, list[dict]] = collections.defaultdict(list)
+    for candidate in candidates:
+        venue = str(candidate.get("venue") or "").upper()
+        if venue in target_venues and str(candidate.get("direction") or "").strip().lower() == "long_frontier_spot":
+            candidate_lists[venue].append(candidate)
+    min_momentum_count = max(1, int(policy.get("minimum_momentum_confirmation_count", 2)))
+    venue_summaries: list[dict] = []
+    total_priceable = 0
+    total_above_vwap = 0
+    total_new_high = 0
+    total_momentum_confirmed = 0
+    for venue in target_venues:
+        venue_rows = by_venue.get(venue, [])
+        if not venue_rows:
+            continue
+        total_priceable += len(venue_rows)
+        above_vwap = sum(as_float(row.get("price_above_rolling_vwap"), 0.0) >= 1.0 for row in venue_rows)
+        new_high = sum(as_float(row.get("new_high_60m"), 0.0) >= 1.0 for row in venue_rows)
+        momentum_confirmed = sum(
+            as_float(row.get("momentum_confirmation_count"), 0.0) >= min_momentum_count
+            for row in venue_rows
+        )
+        total_above_vwap += above_vwap
+        total_new_high += new_high
+        total_momentum_confirmed += momentum_confirmed
+        spreads = [as_float(row.get("spread_bps"), None) for row in venue_rows]
+        spreads = [value for value in spreads if value is not None]
+        dislocations = [abs(as_float(row.get("cross_venue_dislocation_bps"), 0.0) or 0.0) for row in venue_rows]
+        listing_ages = [
+            as_float(row.get("listing_age_days"), None)
+            for row in venue_rows
+            if as_float(row.get("listing_age_days"), None) is not None
+        ]
+        relative_volumes = [
+            as_float(row.get("relative_volume_1m_60m"), 0.0) or 0.0
+            for row in venue_rows
+        ]
+        top_depth = [
+            as_float(candidate.get("top_of_book_depth_notional"), None)
+            for candidate in candidate_lists.get(venue, [])
+            if as_float(candidate.get("top_of_book_depth_notional"), None) is not None
+        ]
+        above_rate = above_vwap / len(venue_rows)
+        new_high_rate = new_high / len(venue_rows)
+        momentum_rate = momentum_confirmed / len(venue_rows)
+        relative_volume_score = min(
+            1.0,
+            statistics.fmean(relative_volumes) / 2.0 if relative_volumes else 0.0,
+        )
+        venue_strength_score = 100.0 * (
+            0.35 * above_rate
+            + 0.25 * momentum_rate
+            + 0.20 * new_high_rate
+            + 0.10 * relative_volume_score
+            + 0.10 * min(1.0, len(candidate_lists.get(venue, [])) / 3.0)
+        )
+        confirmed_long_candidates = sum(
+            bool((candidate.get("frontier_long_entry_confirmation") or {}).get("eligible"))
+            for candidate in candidate_lists.get(venue, [])
+        )
+        venue_summaries.append(
+            {
+                "venue": venue,
+                "preferred_venue": venue in preferred_venues,
+                "priceable_symbol_count": len(venue_rows),
+                "long_candidate_count": len(candidate_lists.get(venue, [])),
+                "confirmed_long_candidate_count": confirmed_long_candidates,
+                "pct_symbols_above_rolling_vwap": round(100.0 * above_rate, 3),
+                "pct_symbols_at_new_60m_high": round(100.0 * new_high_rate, 3),
+                "momentum_confirmation_rate": round(momentum_rate, 6),
+                "momentum_confirmation_symbol_count": momentum_confirmed,
+                "median_cross_venue_dislocation_bps": round(statistics.median(dislocations), 6) if dislocations else None,
+                "average_spread_bps": round(statistics.fmean(spreads), 6) if spreads else None,
+                "median_listing_age_days": round(statistics.median(listing_ages), 6) if listing_ages else 0.0,
+                "average_relative_volume_1m_60m": round(statistics.fmean(relative_volumes), 6) if relative_volumes else 0.0,
+                "average_top_of_book_depth_notional": round(statistics.fmean(top_depth), 6) if top_depth else None,
+                "venue_strength_score": round(venue_strength_score, 6),
+            }
+        )
+    venue_summaries.sort(
+        key=lambda item: (
+            -float(item.get("venue_strength_score") or 0.0),
+            not bool(item.get("preferred_venue")),
+            item.get("venue"),
+        )
+    )
+    for index, item in enumerate(venue_summaries, start=1):
+        item["venue_strength_rank"] = index
+    return {
+        "enabled": True,
+        "paper_only": True,
+        "target_venues": list(target_venues),
+        "preferred_venues": list(preferred_venues),
+        "comparable_venues": list(comparable_venues),
+        "priceable_symbol_count": total_priceable,
+        "pct_symbols_above_rolling_vwap": round(100.0 * total_above_vwap / total_priceable, 3) if total_priceable else 0.0,
+        "pct_symbols_at_new_60m_high": round(100.0 * total_new_high / total_priceable, 3) if total_priceable else 0.0,
+        "momentum_confirmation_symbol_count": total_momentum_confirmed,
+        "momentum_confirmation_rate": round(total_momentum_confirmed / total_priceable, 6) if total_priceable else 0.0,
+        "long_candidate_count": sum(item["long_candidate_count"] for item in venue_summaries),
+        "confirmed_long_candidate_count": sum(item["confirmed_long_candidate_count"] for item in venue_summaries),
+        "venues": venue_summaries,
+        "by_venue": {
+            item["venue"]: item for item in venue_summaries
+        },
+    }
+
+
+def _annotate_secondary_cex_candidate_context(
+    candidates: list[dict],
+    snapshot: dict,
+) -> list[dict]:
+    by_venue = snapshot.get("by_venue") if isinstance(snapshot, dict) else {}
+    by_venue = by_venue if isinstance(by_venue, dict) else {}
+    for candidate in candidates:
+        venue_snapshot = by_venue.get(str(candidate.get("venue") or "").upper())
+        if not isinstance(venue_snapshot, dict):
+            continue
+        candidate["secondary_cex_target_venue"] = True
+        candidate["secondary_cex_preferred_venue"] = bool(venue_snapshot.get("preferred_venue"))
+        candidate["venue_strength_score"] = venue_snapshot.get("venue_strength_score")
+        candidate["venue_strength_rank"] = venue_snapshot.get("venue_strength_rank")
+        candidate["venue_breadth_above_vwap_pct"] = venue_snapshot.get("pct_symbols_above_rolling_vwap")
+        candidate["venue_breadth_new_high_pct"] = venue_snapshot.get("pct_symbols_at_new_60m_high")
+        candidate["venue_momentum_confirmation_rate"] = venue_snapshot.get("momentum_confirmation_rate")
+    return candidates
+
+
+def _frontier_long_entry_confirmation_review(candidate: dict, settings: dict) -> dict:
+    policy = _frontier_long_entry_confirmation_policy(settings)
+    applicable = bool(
+        policy.get("enabled", True)
+        and policy.get("paper_only", True)
+        and settings.get("mode", "paper") == "paper"
+        and not settings.get("allow_live_trading", False)
+        and bool(candidate.get("secondary_cex_target_venue"))
+        and str(candidate.get("direction") or "").strip().lower() == "long_frontier_spot"
+        and str(candidate.get("market_type") or "spot").strip().lower() == "spot"
+    )
+    if not applicable:
+        return {
+            "enabled": bool(policy.get("enabled", True)),
+            "applicable": False,
+            "paper_only": True,
+        }
+    momentum_confirmation_count = max(0.0, as_float(candidate.get("momentum_confirmation_count"), 0.0) or 0.0)
+    require_vwap = bool(policy.get("require_price_above_vwap", True))
+    trend_confirmation = (
+        (not require_vwap or as_float(candidate.get("price_above_rolling_vwap"), 0.0) >= 1.0)
+        and momentum_confirmation_count >= float(policy.get("minimum_momentum_confirmation_count", 2))
+        and (
+            as_float(candidate.get("new_high_60m"), 0.0) >= 1.0
+            or as_float(candidate.get("return_1m_bps"), 0.0) > 0.0
+        )
+    )
+    liquidity_confirmation = bool(
+        as_float(candidate.get("spread_bps"), math.inf) <= float(policy.get("max_spread_bps", 8.0))
+        and as_float(candidate.get("relative_volume_1m_60m"), 0.0) >= float(policy.get("min_relative_volume_1m_60m", 0.75))
+        and as_float(candidate.get("top_of_book_depth_notional"), math.inf)
+        >= float(settings.get("risk", {}).get("paper_notional_usd", 1000.0))
+    )
+    dislocation_component = max(0.0, min(1.0, (as_float(candidate.get("dislocation_quality_score"), 0.0) or 0.0) / 100.0))
+    venue_strength_component = max(0.0, min(1.0, (as_float(candidate.get("venue_strength_score"), 0.0) or 0.0) / 100.0))
+    liquidity_component = max(
+        0.0,
+        min(
+            1.0,
+            ((as_float(candidate.get("relative_volume_1m_60m"), 0.0) or 0.0) / 2.0),
+        ),
+    )
+    entry_confidence = (
+        0.45 * dislocation_component
+        + 0.35 * venue_strength_component
+        + 0.20 * liquidity_component
+    )
+    gate = paper_only_entry_confirmation_gate(
+        entry_confidence=entry_confidence,
+        trend_confirmation=trend_confirmation,
+        liquidity_confirmation=liquidity_confirmation,
+        entry_confidence_min=float(policy.get("entry_confidence_min", 0.72)),
+    )
+    review = {
+        **gate,
+        "enabled": True,
+        "applicable": True,
+        "paper_only": True,
+        "entry_confidence": round(entry_confidence, 6),
+        "momentum_confirmation_count": momentum_confirmation_count,
+        "minimum_momentum_confirmation_count": float(policy.get("minimum_momentum_confirmation_count", 2)),
+        "venue_strength_score": as_float(candidate.get("venue_strength_score"), None),
+        "minimum_venue_strength_score": float(policy.get("minimum_venue_strength_score", 55.0)),
+        "allocation_cap": float(policy.get("allocation_cap", 0.25)),
+        "ranking_score_cap": float(policy.get("ranking_score_cap", 59.999)),
+        "trend_confirmation": trend_confirmation,
+        "liquidity_confirmation": liquidity_confirmation,
+        "price_above_rolling_vwap": as_float(candidate.get("price_above_rolling_vwap"), 0.0) >= 1.0,
+    }
+    if review.get("eligible") and review["venue_strength_score"] is not None:
+        review["eligible"] = review["venue_strength_score"] >= review["minimum_venue_strength_score"]
+        if not review["eligible"]:
+            review["reason"] = "venue_strength_below_threshold"
+    return review
+
+
+def _apply_frontier_long_entry_confirmation(
+    candidate: dict,
+    settings: dict,
+) -> dict:
+    review = _frontier_long_entry_confirmation_review(candidate, settings)
+    candidate["frontier_long_entry_confirmation"] = review
+    if not review.get("applicable"):
+        return candidate
+    if review.get("eligible"):
+        candidate["paper_entry_confirmation_capped"] = False
+        return candidate
+    cap = max(0.01, min(1.0, as_float(review.get("allocation_cap"), 0.25) or 0.25))
+    score_cap = max(0.0, as_float(review.get("ranking_score_cap"), 59.999) or 59.999)
+    existing = as_float(candidate.get("paper_allocation_multiplier"), None)
+    candidate["paper_allocation_multiplier"] = min(
+        existing if existing is not None else 1.0,
+        cap,
+    )
+    candidate["paper_ranking_score"] = min(
+        as_float(candidate.get("paper_ranking_score"), 0.0) or 0.0,
+        score_cap,
+    )
+    candidate["paper_entry_confirmation_capped"] = True
+    candidate["paper_entry_confirmation_reason"] = review.get("reason")
+    candidate["risk_notes"] = list(candidate.get("risk_notes") or []) + [
+        "secondary-CEX long entry confirmation is weak; retain as a capped paper experiment",
+    ]
+    return candidate
 
 
 def _max_product_tickers(target: dict, default: int = 50) -> int:
@@ -9495,15 +9991,51 @@ def _parse_bitget_spot_tickers(target: dict, result: dict) -> list[dict]:
     for data in rows:
         symbol = str(data.get("symbol") or "")
         row = _base_observation(target, result, symbol)
+        last = as_float(data.get("close") or data.get("lastPr"))
+        bid = as_float(data.get("bestBid") or data.get("bidPr"))
+        ask = as_float(data.get("bestAsk") or data.get("askPr"))
+        last_trade_at = _paper_only_parse_timestamp(
+            data.get("ts")
+            or data.get("cTime")
+            or data.get("lastTradeTs")
+            or data.get("lastTradeTime")
+        )
+        listed_at = _paper_only_parse_timestamp(
+            data.get("listingTime")
+            or data.get("listTime")
+            or data.get("launchTime")
+        )
+        quote_volume = as_float(data.get("quoteVol") or data.get("quoteVolume"), None)
+        if quote_volume is None:
+            base_volume = as_float(data.get("baseVol") or data.get("baseVolume"), 0.0) or 0.0
+            quote_volume = base_volume * float(last or 0.0)
         row.update(
             {
-                "bid": as_float(data.get("bestBid") or data.get("bidPr")),
-                "ask": as_float(data.get("bestAsk") or data.get("askPr")),
-                "last": as_float(data.get("close") or data.get("lastPr")),
-                "quote_volume_24h": as_float(data.get("quoteVol") or data.get("quoteVolume")),
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+                "quote_volume_24h": quote_volume,
+                "rolling_24_hour_volume": quote_volume or 0.0,
+                "venue_symbol": symbol.upper(),
+                "best_bid": bid,
+                "best_ask": ask,
+                "last_trade_timestamp": last_trade_at.isoformat() if last_trade_at is not None else None,
+                "exchange_timestamp": last_trade_at.isoformat() if last_trade_at is not None else None,
+                "listed_at": listed_at.isoformat() if listed_at is not None else None,
+                "instrument_metadata": {
+                    "venue": "BITGET",
+                    "venue_symbol": symbol.upper(),
+                    "base_asset": row.get("base"),
+                    "quote_asset": row.get("quote"),
+                    "market_type": "spot",
+                    "public_read_only": True,
+                    "listed_at": listed_at.isoformat() if listed_at is not None else None,
+                },
             }
         )
-        observations.append(_finalize_observation(row))
+        output = _finalize_observation(row)
+        output.update(native_spot_surface_fields(output))
+        observations.append(output)
     return observations
 
 
@@ -9993,19 +10525,58 @@ def _parse_whitebit_tickers(target: dict, result: dict) -> list[dict]:
         if not base or not quote:
             continue
         row = _base_observation(target, result, symbol)
+        last = as_float(data.get("last_price") or data.get("last"))
+        bid = as_float(data.get("bid_price") or data.get("bid") or data.get("highest_bid"))
+        ask = as_float(data.get("ask_price") or data.get("ask") or data.get("lowest_ask"))
+        last_trade_at = _paper_only_parse_timestamp(
+            data.get("timestamp")
+            or data.get("time")
+            or data.get("updated_at")
+            or data.get("updatedAt")
+        )
+        listed_at = _paper_only_parse_timestamp(
+            data.get("created_at")
+            or data.get("createdAt")
+            or data.get("listing_timestamp")
+            or data.get("listingTime")
+        )
+        quote_volume = as_float(data.get("quote_volume"), None)
+        if quote_volume is None:
+            base_volume = as_float(data.get("base_volume") or data.get("volume"), 0.0) or 0.0
+            quote_volume = base_volume * float(last or 0.0)
         row.update(
             {
                 "base": base,
                 "quote": quote,
-                "last": as_float(data.get("last_price")),
-                "quote_volume_24h": as_float(data.get("quote_volume")),
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+                "quote_volume_24h": quote_volume,
+                "rolling_24_hour_volume": quote_volume or 0.0,
                 "change_24h_pct": as_float(data.get("change"), 0.0),
+                "venue_symbol": symbol,
+                "best_bid": bid,
+                "best_ask": ask,
+                "last_trade_timestamp": last_trade_at.isoformat() if last_trade_at is not None else None,
+                "exchange_timestamp": last_trade_at.isoformat() if last_trade_at is not None else None,
+                "listed_at": listed_at.isoformat() if listed_at is not None else None,
+                "instrument_metadata": {
+                    "venue": "WHITEBIT",
+                    "venue_symbol": symbol,
+                    "base_asset": base,
+                    "quote_asset": quote,
+                    "market_type": "spot",
+                    "public_read_only": True,
+                    "listed_at": listed_at.isoformat() if listed_at is not None else None,
+                },
             }
         )
         if data.get("isFrozen") or data.get("is_frozen"):
             row["data_status"] = "degraded"
             row["notes"].append("WhiteBIT market is frozen.")
-        observations.append(_finalize_observation(row))
+        output = _finalize_observation(row)
+        output.update(native_spot_surface_fields(output))
+        observations.append(output)
     observations.sort(key=lambda row: float(row.get("quote_volume_24h") or 0.0), reverse=True)
     return observations
 
@@ -11981,6 +12552,7 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
         candidate["paper_ranking_score"] = paper_ranking_score
         candidate["paper_ranking_edge_bps"] = round(ranking_edge, 6) if ranking_edge is not None else None
         candidate["paper_ranking_edge_source"] = ranking_edge_source
+        candidate = _apply_frontier_long_entry_confirmation(candidate, settings)
         candidate["paper_quality_cohort"] = (
             "quality_ranked"
             if paper_only_active and quality_score >= 60.0
@@ -12006,6 +12578,14 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             if context_score is not None and isinstance(context_review, dict) and not context_review.get("confirmed")
             else "ranked_with_confirmed_context"
             if context_score is not None
+            else "not_applicable"
+        )
+        long_confirmation = candidate.get("frontier_long_entry_confirmation") or {}
+        candidate["paper_entry_confirmation_status"] = (
+            "capped_for_counterfactual_entry"
+            if isinstance(long_confirmation, dict) and long_confirmation.get("applicable") and not long_confirmation.get("eligible")
+            else "confirmed"
+            if isinstance(long_confirmation, dict) and long_confirmation.get("applicable")
             else "not_applicable"
         )
     ranked = sorted(
@@ -13100,14 +13680,30 @@ def _candidate_from_observation(
         "frontier_cost_source": cost_source,
         "change_24h_pct": round(change_24h_pct, 3),
         "quote_volume_24h": round(float(observation.get("quote_volume_24h") or 0.0), 3),
+        "rolling_24_hour_volume": round(float(observation.get("rolling_24_hour_volume") or observation.get("quote_volume_24h") or 0.0), 3),
         "liquidity_score": liq,
         "depth_liquidity_score": observation.get("depth_liquidity_score"),
         "spread_bps": spread,
+        "best_bid": observation.get("best_bid"),
+        "best_ask": observation.get("best_ask"),
+        "last_trade_timestamp": observation.get("last_trade_timestamp"),
+        "listed_at": observation.get("listed_at"),
+        "listing_first_seen_at": observation.get("listing_first_seen_at"),
+        "listing_age_days": observation.get("listing_age_days"),
+        "cross_venue_reference_price": observation.get("cross_venue_reference_price"),
+        "cross_venue_dislocation_bps": observation.get("cross_venue_dislocation_bps"),
+        "cross_venue_reference_venue_count": observation.get("cross_venue_reference_venue_count"),
         "local_short_horizon_trend_bps": local_short_horizon_trend_bps,
         "local_short_horizon_trend_window": "1m",
         "local_short_horizon_trend_ready": microstructure_history_ready >= 1.0,
         "microstructure_history_ready": microstructure_history_ready,
         "microstructure_status": observation.get("microstructure_status"),
+        "rolling_vwap_60m": observation.get("rolling_vwap_60m"),
+        "vwap_dislocation_bps": observation.get("vwap_dislocation_bps"),
+        "price_above_rolling_vwap": observation.get("price_above_rolling_vwap"),
+        "new_high_60m": observation.get("new_high_60m"),
+        "momentum_confirmation_count": observation.get("momentum_confirmation_count"),
+        "momentum_confirmation_ratio": observation.get("momentum_confirmation_ratio"),
         "recent_volatility_bps": round(float(recent_volatility_bps), 3),
         "score": round(max(0.0, score), 3),
         "dislocation_quality_score": dislocation_quality["score"],
@@ -13238,6 +13834,7 @@ def build_scan_batch(
         registry,
         strategy_requirements=strategy_intraday_requirements,
     )
+    observations = _annotate_listing_age(observations, conn=conn)
     enriched_by_id = {
         str(row.get("instrument_id")): row
         for row in observations
@@ -13247,12 +13844,15 @@ def build_scan_batch(
         enriched_by_id.get(str(row.get("instrument_id") or ""), row)
         for row in all_observations
     ]
+    all_observations = _annotate_listing_age(all_observations, conn=conn)
     refs = _reference_prices(observations, settings)
     venue_counts = collections.Counter(
         row.get("comparison_key")
         for row in observations
         if row.get("data_status") == "reachable" and row.get("comparison_key") and not row.get("local_quote_observe_only")
     )
+    observations = _annotate_cross_venue_snapshot_fields(observations, refs, venue_counts)
+    all_observations = _annotate_cross_venue_snapshot_fields(all_observations, refs, venue_counts)
     candidates = [
         _candidate_from_observation(
             row,
@@ -13264,7 +13864,10 @@ def build_scan_batch(
         for row in observations
         if row.get("data_status") == "reachable" and row.get("comparison_key") in refs
     ]
+    secondary_cex_snapshot = _secondary_cex_spot_strength_snapshot(observations, candidates, settings)
+    candidates = _annotate_secondary_cex_candidate_context(candidates, secondary_cex_snapshot)
     candidates = rank_frontier_paper_candidates(candidates, settings)
+    secondary_cex_snapshot = _secondary_cex_spot_strength_snapshot(observations, candidates, settings)
     if limit:
         candidates = candidates[: int(limit)]
     if write_preliminary_report:
@@ -13282,6 +13885,7 @@ def build_scan_batch(
             "selected_observations": observations,
             "all_observation_count": len(all_observations),
             "intraday_features": intraday_summary,
+            "secondary_cex_spot_strength": secondary_cex_snapshot,
             "report": str(REPORT_JSON),
         },
     )
