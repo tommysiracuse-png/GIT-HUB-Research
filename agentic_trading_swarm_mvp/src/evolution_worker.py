@@ -33,10 +33,19 @@ from strategy_implementation_owner import run_once as run_strategy_implementatio
 
 REPORT_JSON = RUNS_DIR / "evolution_worker_report.json"
 REPORT_MD = RUNS_DIR / "evolution_worker_report.md"
+CODEX_POOL_REPORT = RUNS_DIR / "codex_worker_pool.json"
 
 
 def _database_locked(exc: BaseException) -> bool:
     return "database is locked" in str(exc).lower()
+
+
+def _read_json(path: pathlib.Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _run_db_stage(stage: str, callback: Any, *, attempts: int = 3) -> tuple[Any, dict | None]:
@@ -121,6 +130,7 @@ def _write_report(report: dict) -> dict:
         f"- Strategy owner status: `{((report.get('strategy_implementation_owner') or {}).get('last_cycle') or {}).get('status')}`",
         f"- Writer lane: `{(report.get('owner_scheduler') or {}).get('last_lane')}`",
         f"- Autonomous builder status: `{(report.get('autonomous_builder') or {}).get('status')}`",
+        f"- Concurrent Codex queue: `{((report.get('codex_worker_pool') or {}).get('summary') or {}).get('queue_depth', 0)}`",
     ]
     if report.get("reason"):
         lines.extend(["", "## Reason", "", str(report["reason"])])
@@ -169,18 +179,22 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         ),
     )
     activation_owner = activation_owner or {"status": "database_busy_retry_later", "last_cycle": {}}
+    concurrent_pool_enabled = bool((settings.get("codex_worker_pool") or {}).get("enabled", False))
     order_state, scheduler_error = _run_db_stage("owner_scheduler", lambda conn: lane_order(conn))
-    if order_state:
+    if concurrent_pool_enabled:
+        lanes, _initial_scheduler = [], {}
+    elif order_state:
         lanes, _initial_scheduler = order_state
     else:
         lanes, _initial_scheduler = ["strategy", "adapter", "activation", "general"], {}
 
-    adapter_owner = {"status": "deferred_by_scheduler"}
-    self_improvement = {"status": "deferred_by_scheduler", "consumed": []}
-    autonomous_builder = {"status": "deferred_by_scheduler"}
+    delegated_status = "delegated_to_concurrent_codex_pool" if concurrent_pool_enabled else "deferred_by_scheduler"
+    adapter_owner = {"status": delegated_status}
+    self_improvement = {"status": delegated_status, "consumed": []}
+    autonomous_builder = {"status": delegated_status}
     adapter_error = improvement_error = builder_error = None
     selected_lane = None
-    lane_status = "no_lane_consumed"
+    lane_status = delegated_status if concurrent_pool_enabled else "no_lane_consumed"
     for lane in lanes:
         consumed_writer = False
         if lane == "strategy":
@@ -253,6 +267,7 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
     owner_scheduler = owner_scheduler or {"next_lane": lanes[0] if lanes else "strategy"}
     owner_scheduler["selected_lane"] = selected_lane
     owner_scheduler["cycle_lane_status"] = lane_status
+    owner_scheduler["mode"] = "concurrent_codex_pool" if concurrent_pool_enabled else "single_writer_round_robin"
 
     research_worker_report = {}
     research_error = None
@@ -307,6 +322,10 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         "market_activation_owner": activation_owner,
         "autonomous_builder": autonomous_builder,
         "owner_scheduler": owner_scheduler,
+        "codex_worker_pool": (
+            _read_json(CODEX_POOL_REPORT)
+            if CODEX_POOL_REPORT.exists() else {"status": "awaiting_first_pool_cycle"}
+        ),
         "llm_inbox": inbox_summary or {},
         "llm_cost_summary": cost_summary or {},
         "database_errors": database_errors,

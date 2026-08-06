@@ -1299,7 +1299,9 @@ def _handle_code(conn: sqlite3.Connection, task: dict, decision: dict, settings:
         )
         upsert_memory_link(conn, "strategy_owner_task", task["task_id"], "implemented_by", "code_evolution_proposal", str(proposal_id))
         conn.commit()
-    if proposal_status in {"promoted", "candidate_committed", "workspace_kept", "kept"}:
+    if proposal_status in {
+        "promoted", "promoted_pending_verification", "verified", "candidate_committed", "workspace_kept", "kept"
+    }:
         if task.get("objective_type") == "promote_proven_experiment":
             if task.get("strategy_lab_id"):
                 conn.execute(
@@ -1317,7 +1319,9 @@ def _handle_code(conn: sqlite3.Connection, task: dict, decision: dict, settings:
         return "promoted_to_runtime", {"artifacts": artifacts, "proposal_status": proposal_status}
     if proposal_status in {"patch_generation_unavailable_retry_later", "blocked_model_quota"}:
         return "waiting_quota", {"artifacts": artifacts, "proposal_status": proposal_status}
-    if proposal_status in {"implementation_paused", "codex_writer_busy", "queued_probation_limit"}:
+    if proposal_status in {
+        "queued_concurrent_worker", "implementation_paused", "codex_writer_busy", "queued_probation_limit"
+    }:
         return "implementation_paused", {"artifacts": artifacts, "proposal_status": proposal_status}
     return "coding", {"artifacts": artifacts, "proposal_status": proposal_status}
 

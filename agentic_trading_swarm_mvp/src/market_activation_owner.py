@@ -38,11 +38,14 @@ TERMINAL_STATUSES = {
 CODE_SUCCESS_STATUSES = {
     "candidate_committed",
     "promoted",
+    "promoted_pending_verification",
+    "verified",
     "workspace_applied_probation",
     "workspace_kept",
     "kept",
 }
 CODE_PAUSED_STATUSES = {
+    "queued_concurrent_worker",
     "implementation_paused",
     "patch_generation_timeout",
     "patch_generation_failed",

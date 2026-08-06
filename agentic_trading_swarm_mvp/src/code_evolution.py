@@ -20,8 +20,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import closing, contextmanager
 from typing import Any
 
+from codex_coordination import (
+    acquire_resource_lease,
+    connect as connect_coordination,
+    enqueue_task as enqueue_coordination_task,
+    release_resource_lease,
+)
 from codex_repo_agent import codex_repo_agent_config, codex_write_lock, run_codex_repo_agent
 from cost_router import complete, completion_preflight_status
 from evolution.archive import write_candidate_archive
@@ -46,6 +54,7 @@ from storage import (
     add_code_evolution_proposal,
     code_evolution_by_status,
     code_evolution_recent,
+    get_code_evolution_proposal,
     link_recommendation_artifact,
     update_code_evolution_proposal,
 )
@@ -1836,7 +1845,97 @@ LEGACY_PROBATION_STATUS = "merged_probation"
 LEGACY_KEPT_STATUS = "kept"
 PROBATION_STATUSES = {LEGACY_PROBATION_STATUS, WORKSPACE_PROBATION_STATUS}
 RELEASE_SUCCESS_STATUSES = {"candidate_committed", "canary_running", "promoted"}
+POOL_SUCCESS_STATUSES = {"promoted_pending_verification", "verified"}
+RELEASE_SUCCESS_STATUSES.update(POOL_SUCCESS_STATUSES)
 SUCCESS_STATUSES = {LEGACY_PROBATION_STATUS, LEGACY_KEPT_STATUS, WORKSPACE_PROBATION_STATUS, WORKSPACE_KEPT_STATUS, *RELEASE_SUCCESS_STATUSES}
+
+
+def _pool_cfg(settings: dict) -> dict[str, Any]:
+    return dict(settings.get("codex_worker_pool") or {})
+
+
+def _pool_enabled(settings: dict) -> bool:
+    return bool(_pool_cfg(settings).get("enabled", False))
+
+
+def _pool_worker(settings: dict) -> bool:
+    return bool(settings.get("_codex_worker_execute", False))
+
+
+def _coordination_db_path(settings: dict) -> pathlib.Path:
+    raw = str(_pool_cfg(settings).get("coordination_db") or RUNS_DIR / "codex_coordination.sqlite")
+    path = pathlib.Path(raw).expanduser()
+    return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
+
+
+def _proposal_lane(payload: dict, category: str) -> str:
+    source = str(payload.get("agent_name") or "").lower()
+    if "strategy" in source or category == "strategy_lab_promotion":
+        return "strategy"
+    if "adapter" in source or category in {"public_data_adapter", "parser_improvement", "scanner_expansion"}:
+        return "adapter"
+    if "activation" in source or category == "runtime_pipeline_integration":
+        return "activation"
+    return "general"
+
+
+def enqueue_code_evolution_work(
+    proposal_id: str,
+    payload: dict,
+    settings: dict,
+    *,
+    priority: int,
+    category: str,
+    reactivate_terminal: bool = True,
+) -> dict[str, Any]:
+    with closing(connect_coordination(_coordination_db_path(settings))) as coordination:
+        return enqueue_coordination_task(
+            coordination,
+            "code_evolution_proposal",
+            proposal_id,
+            lane=_proposal_lane(payload, category),
+            priority=int(priority),
+            payload={"proposal_id": proposal_id, "category": category, "title": payload.get("title")},
+            reactivate_terminal=reactivate_terminal,
+        )
+
+
+@contextmanager
+def _main_promotion_lease(settings: dict, proposal_id: str):
+    if not (_pool_enabled(settings) and _pool_worker(settings)):
+        yield {"acquired": True, "mode": "legacy_single_writer"}
+        return
+    cfg = _pool_cfg(settings)
+    worker_id = str(settings.get("_codex_worker_id") or f"worker-{os.getpid()}")
+    deadline = time.monotonic() + max(5, int(cfg.get("promotion_lease_seconds", 180)))
+    lease = None
+    coordination = connect_coordination(_coordination_db_path(settings))
+    try:
+        while time.monotonic() < deadline:
+            lease = acquire_resource_lease(
+                coordination,
+                "main_promotion",
+                worker_id,
+                pid=os.getpid(),
+                lease_seconds=int(cfg.get("promotion_lease_seconds", 180)),
+                details={"proposal_id": proposal_id},
+            )
+            if lease:
+                break
+            time.sleep(0.25)
+        if not lease:
+            yield {"acquired": False, "reason": "main_promotion_lease_timeout"}
+            return
+        yield {"acquired": True, "lease": lease}
+    finally:
+        if lease:
+            release_resource_lease(
+                coordination,
+                "main_promotion",
+                worker_id,
+                str(lease.get("lease_token") or ""),
+            )
+        coordination.close()
 
 ALLOWED_CATEGORIES = {
     "runtime_pipeline_integration",
@@ -5160,17 +5259,45 @@ def _run_git_release_pipeline(
             "evaluation": evaluation,
         }
 
+    deferred_verification = bool(
+        _pool_enabled(settings)
+        and _pool_worker(settings)
+        and _pool_cfg(settings).get("defer_full_regression", True)
+    )
     if cfg.get("promote_candidate_after_canary", False):
-        release, promotion = promote_candidate(
-            release,
-            root,
-            timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
-        )
+        with _main_promotion_lease(settings, proposal_id) as promotion_lease:
+            if promotion_lease.get("acquired"):
+                release, promotion = promote_candidate(
+                    release,
+                    root,
+                    timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+                    update_champion=not deferred_verification,
+                )
+            else:
+                promotion = {
+                    "ok": False,
+                    "reason": promotion_lease.get("reason") or "main_promotion_lease_unavailable",
+                }
         evaluation["promotion"] = promotion
         if not promotion.get("ok"):
+            reason = str(promotion.get("reason") or "promotion_failed")
+            if preserve_failed_candidate or reason in {
+                "promotion_overlap_requires_repair",
+                "main_promotion_lease_timeout",
+                "main_promotion_lease_unavailable",
+            }:
+                release.status = "implementation_paused"
+                archived = archive("implementation_paused", reason=reason, promotion=promotion)
+                return {
+                    "status": "implementation_paused",
+                    "release": archived,
+                    "tests": tests,
+                    "canary": canary,
+                    "evaluation": {**evaluation, "reason": reason},
+                }
             release.status = "archived_failed"
             cleanup = cleanup_worktree(release, root)
-            archived = archive("archived_failed", cleanup=cleanup, reason=promotion.get("reason"), promotion=promotion)
+            archived = archive("archived_failed", cleanup=cleanup, reason=reason, promotion=promotion)
             return {
                 "status": "archived_failed",
                 "release": archived,
@@ -5180,12 +5307,15 @@ def _run_git_release_pipeline(
             }
         release.promotion_reason = str(gate.get("reason") or "candidate passed sandbox gates")
         promotion["promotion_reason"] = release.promotion_reason
-        status = "promoted"
+        status = "promoted_pending_verification" if deferred_verification else "promoted"
     else:
         status = "candidate_committed"
 
-    cleanup = cleanup_worktree(release, root)
-    metadata = archive(status, cleanup=cleanup)
+    if status == "promoted_pending_verification":
+        metadata = archive(status, cleanup={"ok": True, "deferred": "async_full_verification"})
+    else:
+        cleanup = cleanup_worktree(release, root)
+        metadata = archive(status, cleanup=cleanup)
     return {
         "status": status,
         "release": metadata,
@@ -5275,6 +5405,7 @@ def _codex_failure_context(row: dict | None, extra: dict | None = None) -> dict:
             "safety_reasons": safety.get("reasons") or [],
             "host_tests": tests,
             "evaluation_reason": evaluation.get("reason"),
+            "promotion": evaluation.get("promotion") or {},
             "post_promotion_health": evaluation.get("post_promotion_health") or {},
         }
     if extra:
@@ -5346,8 +5477,9 @@ def _run_codex_candidate(
 
         release_seed = existing_row or {}
         owner_release = payload.get("strategy_owner_release") if isinstance(payload.get("strategy_owner_release"), dict) else {}
-        if not release_seed and owner_release:
+        if _candidate_release_from_row(release_seed) is None and owner_release:
             release_seed = {
+                **release_seed,
                 "proposal_id": proposal_id,
                 "parent_commit": owner_release.get("parent_commit"),
                 "branch_name": owner_release.get("branch_name"),
@@ -5369,13 +5501,32 @@ def _run_codex_candidate(
         if release is None:
             base_dir = pathlib.Path(str(cfg.get("release_worktree_dir") or RUNS_DIR / "evolution_worktrees"))
             base_dir.mkdir(parents=True, exist_ok=True)
-            release, release_preflight = create_candidate_worktree(
-                root,
-                proposal_id,
-                base_dir=base_dir,
-                timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
-            )
+            with _main_promotion_lease(settings, f"{proposal_id}:worktree") as metadata_lease:
+                if metadata_lease.get("acquired"):
+                    release, release_preflight = create_candidate_worktree(
+                        root,
+                        proposal_id,
+                        base_dir=base_dir,
+                        timeout=int(cfg.get("sandbox_timeout_seconds", 120)),
+                    )
+                else:
+                    release, release_preflight = None, {
+                        "ok": False,
+                        "reason": metadata_lease.get("reason") or "git_metadata_lease_unavailable",
+                    }
         if release is None:
+            if _pool_enabled(settings) and _pool_worker(settings):
+                artifacts = _pause_codex_candidate(
+                    conn,
+                    proposal_id,
+                    None,
+                    release_preflight,
+                    {"status": "implementation_paused", "reason": release_preflight.get("reason")},
+                    str((existing_row or {}).get("patch_text") or ""),
+                    {"allowed": False, "reasons": [str(release_preflight.get("reason"))]},
+                    reason=str(release_preflight.get("reason") or "worktree_preparation_failed"),
+                )
+                return {"handled": True, "artifacts": artifacts}
             update_code_evolution_proposal(
                 conn,
                 proposal_id,
@@ -5509,11 +5660,8 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
     title = str(payload.get("title") or rec.get("title") or "LLM code evolution proposal")[:180]
     evidence = _proposal_evidence(payload)
     proposal_id = _proposal_id(rec.get("recommendation_id"), payload)
-    existing = conn.execute(
-        "select status, candidate_commit from code_evolution_proposals where proposal_id = ?",
-        (proposal_id,),
-    ).fetchone()
-    if existing and str(existing["status"] or "") in SUCCESS_STATUSES:
+    existing = get_code_evolution_proposal(conn, proposal_id)
+    if existing and str(existing.get("status") or "") in SUCCESS_STATUSES:
         link_recommendation_artifact(
             conn,
             rec.get("recommendation_id"),
@@ -5521,12 +5669,12 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
             proposal_id,
             "already_materialized_as",
             {
-                "status": existing["status"],
-                "candidate_commit": existing["candidate_commit"],
+                "status": existing.get("status"),
+                "candidate_commit": existing.get("candidate_commit"),
             },
         )
         conn.commit()
-        return [_artifact(proposal_id, "already_exists", str(existing["status"]))]
+        return [_artifact(proposal_id, "already_exists", str(existing.get("status")))]
     add_code_evolution_proposal(
         conn,
         proposal_id,
@@ -5550,6 +5698,7 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         {"category": category or "unknown", "priority": priority},
     )
     conn.commit()
+    existing = get_code_evolution_proposal(conn, proposal_id)
     preflight = preflight_proposal(payload, settings, root=root)
     if preflight.get("parsed_tests"):
         payload["_preflight_parsed_tests"] = preflight["parsed_tests"]
@@ -5559,6 +5708,30 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         update_code_evolution_proposal(conn, proposal_id, status="disabled")
         _append_ledger(conn, proposal_id, "disabled")
         return [_artifact(proposal_id, "skipped", "disabled")]
+
+    if _pool_enabled(settings) and not _pool_worker(settings):
+        queued = enqueue_code_evolution_work(
+            proposal_id,
+            payload,
+            settings,
+            priority=priority,
+            category=category or "unknown",
+        )
+        update_code_evolution_proposal(
+            conn,
+            proposal_id,
+            status="queued_concurrent_worker",
+            safety={
+                **((existing.get("safety") or {}) if isinstance(existing, dict) else {}),
+                "allowed": True,
+                "decision": "queued_concurrent_worker",
+                "preflight": preflight,
+                "implementation_mode": preflight.get("implementation_mode"),
+                "coordination_task_id": queued.get("task_id"),
+            },
+        )
+        _append_ledger(conn, proposal_id, "queued_concurrent_worker")
+        return [_artifact(proposal_id, "created", "queued_concurrent_worker")]
 
     diff_text = rewrite_diff_paths(_extract_patch(payload))
     patch_generation = {}
@@ -5570,6 +5743,7 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
             settings,
             preflight,
             root,
+            existing_row=existing,
         )
         if codex_result.get("handled"):
             return list(codex_result.get("artifacts") or [])
@@ -5895,7 +6069,7 @@ def _artifact(proposal_id: str, action_status: str, status: str, reasons: list[s
 
 
 def _resume_paused_codex_candidates(conn: Any, settings: dict, root: pathlib.Path) -> list[dict]:
-    if not _codex_agent_enabled(settings):
+    if _pool_enabled(settings) or not _codex_agent_enabled(settings):
         return []
     agent_cfg = codex_repo_agent_config(settings, RUNS_DIR)
     cooldown = int(agent_cfg.get("resume_cooldown_seconds", 300))
@@ -6013,9 +6187,10 @@ def _evaluate_promoted_codex_health(conn: Any, settings: dict, root: pathlib.Pat
         if applied_at is None or (now - applied_at).total_seconds() < grace_seconds:
             continue
         evaluation = dict(row.get("evaluation") or {})
-        failures: list[str] = []
+        catastrophic_failures: list[str] = []
+        repair_failures: list[str] = []
         if bool(settings.get("allow_live_trading", False)):
-            failures.append("live_trading_enabled")
+            catastrophic_failures.append("live_trading_enabled")
         artifacts = {
             "radar_heartbeat": RUNS_DIR / "radar_heartbeat.json",
             "llm_state_packet": RUNS_DIR / "llm_state_packet.json",
@@ -6024,7 +6199,8 @@ def _evaluate_promoted_codex_health(conn: Any, settings: dict, root: pathlib.Pat
         existing_artifacts = {name: path for name, path in artifacts.items() if path.exists()}
         for name, path in existing_artifacts.items():
             if not _runtime_artifact_advanced(path, applied_at):
-                failures.append(f"{name}_not_advanced")
+                target = catastrophic_failures if name == "radar_heartbeat" else repair_failures
+                target.append(f"{name}_not_advanced")
         changed_files = {
             str(item).replace("\\", "/")
             for item in (row.get("changed_files") or safety.get("changed_files") or [])
@@ -6045,7 +6221,8 @@ def _evaluate_promoted_codex_health(conn: Any, settings: dict, root: pathlib.Pat
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 zero_admission_lineages = {}
             if zero_admission_lineages:
-                failures.append("active_priceable_lineage_zero_admissions")
+                repair_failures.append("active_priceable_lineage_zero_admissions")
+        failures = [*catastrophic_failures, *repair_failures]
         health = {
             "checked_at": _utc_now(),
             "applied_at": applied_at.isoformat(),
@@ -6055,7 +6232,7 @@ def _evaluate_promoted_codex_health(conn: Any, settings: dict, root: pathlib.Pat
             "artifacts_checked": {name: str(path) for name, path in existing_artifacts.items()},
             "zero_admission_lineages": zero_admission_lineages,
         }
-        if failures:
+        if catastrophic_failures:
             promotion = evaluation.get("promotion") if isinstance(evaluation.get("promotion"), dict) else {}
             promoted_commit = str(promotion.get("promoted_commit") or row.get("candidate_commit") or "")
             recovery = _revert_promoted_commit(
@@ -6081,6 +6258,26 @@ def _evaluate_promoted_codex_health(conn: Any, settings: dict, root: pathlib.Pat
             )
             _append_ledger(conn, row["proposal_id"], status)
             results.append({"proposal_id": row["proposal_id"], "status": status, "decision": "revert_and_resume"})
+            continue
+        if repair_failures:
+            health.update({"status": "repair_required_without_revert", "loops_after": loops})
+            evaluation.update({
+                "reason": "post_promotion_health_repair_required",
+                "post_promotion_health": health,
+            })
+            update_code_evolution_proposal(
+                conn,
+                row["proposal_id"],
+                status="implementation_paused",
+                evaluation=evaluation,
+                probation_loops_observed=loops,
+            )
+            _append_ledger(conn, row["proposal_id"], "implementation_paused")
+            results.append({
+                "proposal_id": row["proposal_id"],
+                "status": "implementation_paused",
+                "decision": "keep_active_and_repair",
+            })
             continue
         loops += 1
         health.update({"status": "healthy" if loops >= required_loops else "observing", "loops_after": loops})

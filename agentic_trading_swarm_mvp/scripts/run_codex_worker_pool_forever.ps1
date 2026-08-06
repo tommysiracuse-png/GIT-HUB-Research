@@ -50,10 +50,12 @@ $SupervisorStartedAt = (Get-Date).ToUniversalTime().ToString("o")
 $env:PYTHONDONTWRITEBYTECODE = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8 = "1"
+$env:CODEX_WORKER_POOL_SUPERVISOR_PID = "$PID"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $env:RADAR_USE_LITELLM = "1"
 
 $ProviderEnvNames = @(
+    "CODEX_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",

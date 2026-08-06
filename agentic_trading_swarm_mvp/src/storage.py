@@ -3010,6 +3010,14 @@ def _decode_code_evolution_row(row: sqlite3.Row) -> dict:
     return item
 
 
+def get_code_evolution_proposal(conn: sqlite3.Connection, proposal_id: str) -> dict | None:
+    row = conn.execute(
+        "select * from code_evolution_proposals where proposal_id = ?",
+        (proposal_id,),
+    ).fetchone()
+    return _decode_code_evolution_row(row) if row else None
+
+
 def code_evolution_recent(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
     rows = conn.execute(
         """

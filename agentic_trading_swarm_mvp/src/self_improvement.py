@@ -66,6 +66,7 @@ ACTIVE_POLICIES_JSON = RUNS_DIR / "active_signal_policies.json"
 REPORT_JSON = RUNS_DIR / "self_improvement_report.json"
 REPORT_MD = RUNS_DIR / "self_improvement_report.md"
 TIMELINE_JSONL = RUNS_DIR / "self_improvement_timeline.jsonl"
+CODEX_WORKER_POOL_REPORT = RUNS_DIR / "codex_worker_pool.json"
 RECOMMENDATION_ALLOWED_PATH_PREFIXES = ("src/", "tests/", "config/", "docs/")
 RECOMMENDATION_ALLOWED_FILES = {
     "README.md",
@@ -76,6 +77,14 @@ RECOMMENDATION_ALLOWED_FILES = {
 }
 RECOMMENDATION_REJECTION_TTL_SECONDS = 6 * 3600
 _CONSUMER_REJECTION_CACHE: dict[str, dt.datetime] = {}
+
+
+def _codex_worker_pool_state() -> dict:
+    try:
+        value = json.loads(CODEX_WORKER_POOL_REPORT.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"status": "awaiting_first_pool_cycle"}
+    return value if isinstance(value, dict) else {"status": "invalid_pool_report"}
 _SAFE_CODE_EVOLUTION_TEST_FALLBACK = (
     "python -m unittest tests.test_code_evolution_runner",
     "python -m unittest tests.test_test_command_policy",
@@ -2619,6 +2628,7 @@ def write_reports(conn: sqlite3.Connection, report: dict | None = None, settings
     report["adapter_specs"] = open_adapter_specs(conn, limit=50)
     report["progress_summary"] = _progress_summary(conn, settings)
     report["code_evolution"] = report.get("code_evolution") or write_code_evolution_reports(conn, settings)
+    report["codex_worker_pool"] = _codex_worker_pool_state()
     report["strategy_lab"] = report.get("strategy_lab") or strategy_lab_summary(conn)
     report["strategy_implementation_owner"] = strategy_owner_summary(conn, limit=40)
     report["market_activation_owner"] = market_activation_owner_summary(conn, limit=60)
@@ -3054,6 +3064,13 @@ def _report_markdown(report: dict) -> str:
                 f"- `{item.get('proposal_id')}` `{item.get('category')}` "
                 f"status=`{item.get('status')}` files=`{item.get('changed_files')}`"
             )
+    pool = report.get("codex_worker_pool") or {}
+    if pool:
+        pool_summary = pool.get("summary") or pool
+        lines.extend(["", "## Concurrent Codex Workers", ""])
+        lines.append(f"- Queue depth: `{pool_summary.get('queue_depth', 0)}`")
+        lines.append(f"- Worker states: `{pool_summary.get('workers', [])}`")
+        lines.append(f"- Verification: `{pool_summary.get('verification_statuses', {})}`")
 
     lines.extend(["", "## Experiments", ""])
     experiments = report.get("experiments", [])

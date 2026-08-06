@@ -17,11 +17,16 @@ REPORT_JSON = RUNS_DIR / "adapter_implementation_owner.json"
 REPORT_MD = RUNS_DIR / "adapter_implementation_owner.md"
 MARKER = RUNS_DIR / "adapter_implementation_owner_last_attempt.txt"
 RETRYABLE_PROPOSAL_STATUSES = {
+    "queued_concurrent_worker",
+    "implementation_paused",
     "patch_generation_unavailable_retry_later",
     "patch_generation_timeout",
     "patch_generation_failed",
 }
-SUCCESS_PROPOSAL_STATUSES = {"candidate_committed", "promoted", "workspace_applied_probation", "workspace_kept", "kept"}
+SUCCESS_PROPOSAL_STATUSES = {
+    "candidate_committed", "promoted", "promoted_pending_verification", "verified",
+    "workspace_applied_probation", "workspace_kept", "kept",
+}
 
 
 def _utc_now() -> str:

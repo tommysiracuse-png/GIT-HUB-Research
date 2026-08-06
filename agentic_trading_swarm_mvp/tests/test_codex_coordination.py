@@ -4,9 +4,12 @@ import json
 import os
 import pathlib
 import sqlite3
+import sys
 import tempfile
 import threading
 import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 import codex_coordination as coordination
 
@@ -161,6 +164,27 @@ class CodexCoordinationTests(unittest.TestCase):
         self.assertEqual("verified", self.conn.execute(
             "select status from codex_tasks where task_id=?", (task["task_id"],)
         ).fetchone()[0])
+
+    def test_new_candidate_revision_reactivates_completed_verification_job(self) -> None:
+        task = coordination.enqueue_task(self.conn, "proposal", "repair-revision", lane="general")
+        job = coordination.enqueue_verification_job(
+            self.conn, task["task_id"], payload={"proposal_id": "p", "candidate_commit": "old"}
+        )
+        claim = coordination.claim_verification_job(self.conn, "verify-1", pid=os.getpid())
+        coordination.finish_verification_job(
+            self.conn, job["job_id"], worker_id="verify-1", claim_token=claim["claim_token"],
+            status="failed_needs_repair", task_status="repairing_post_promotion",
+        )
+
+        reactivated = coordination.enqueue_verification_job(
+            self.conn, task["task_id"], payload={"proposal_id": "p", "candidate_commit": "repaired"}
+        )
+
+        self.assertEqual(job["job_id"], reactivated["job_id"])
+        self.assertEqual("queued", reactivated["status"])
+        self.assertIsNone(reactivated["completed_at"])
+        claimed = coordination.claim_verification_job(self.conn, "verify-2", pid=os.getpid())
+        self.assertEqual("repaired", claimed["payload"]["candidate_commit"])
 
     def test_migration_metadata_and_json_summary_cover_queue_workers_promotions_and_repairs(self) -> None:
         coordination.record_migration(self.conn, "initial_import", {"tasks": 2})

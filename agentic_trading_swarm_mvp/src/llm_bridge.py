@@ -296,6 +296,15 @@ STATE_JSON = RUNS_DIR / "llm_state_packet.json"
 STATE_MD = RUNS_DIR / "llm_state_packet.md"
 INBOX = RUNS_DIR / "llm_recommendations_inbox.jsonl"
 PROCESSED = RUNS_DIR / "llm_recommendations_processed.jsonl"
+CODEX_WORKER_POOL_REPORT = RUNS_DIR / "codex_worker_pool.json"
+
+
+def _codex_worker_pool_state() -> dict:
+    try:
+        value = json.loads(CODEX_WORKER_POOL_REPORT.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"status": "awaiting_first_pool_cycle"}
+    return value if isinstance(value, dict) else {"status": "invalid_pool_report"}
 
 IMPLEMENTED_MANUAL_STATUSES = {
     "route_requirements": (
@@ -1545,6 +1554,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
             "adapter_specs": adapter_specs,
         },
         "code_evolution": code_evolution_summary(conn),
+        "codex_worker_pool": _codex_worker_pool_state(),
         "agent_memory": payload.get("agent_memory", {}),
         "memory_artifacts": {
             "latest_markdown": str(RUNS_DIR / "memory_facts_latest.md"),

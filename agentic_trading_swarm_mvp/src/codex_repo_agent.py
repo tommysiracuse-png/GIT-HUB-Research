@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import datetime as dt
+import hashlib
 import importlib
 import json
 import os
@@ -57,6 +58,8 @@ def codex_repo_agent_config(settings: dict, runs_dir: pathlib.Path) -> dict[str,
         "codex_home": str(DEFAULT_CODEX_HOME),
         "session_log_dir": str(runs_dir / "codex_sessions"),
         "lock_path": str(runs_dir / "codex_repo_agent.lock"),
+        "parallel_sessions_enabled": False,
+        "session_lock_dir": str(runs_dir / "codex_session_locks"),
         "lock_stale_seconds": 2400,
         "api_key_envs": ["CODEX_API_KEY", "OPENAI_API_KEY"],
         "chatgpt_account_fallback_enabled": True,
@@ -67,6 +70,16 @@ def codex_repo_agent_config(settings: dict, runs_dir: pathlib.Path) -> dict[str,
         "network_access": True,
     }
     return {**defaults, **(settings.get("codex_repo_agent") or {})}
+
+
+def _lock_path_for_owner(cfg: dict[str, Any], owner: str) -> pathlib.Path:
+    if not cfg.get("parallel_sessions_enabled", False):
+        return pathlib.Path(str(cfg["lock_path"])).expanduser().resolve()
+    digest = hashlib.sha256(owner.encode("utf-8")).hexdigest()[:24]
+    lock_dir = pathlib.Path(str(cfg.get("session_lock_dir") or "runs/codex_session_locks")).expanduser()
+    if not lock_dir.is_absolute():
+        lock_dir = pathlib.Path(__file__).resolve().parents[1] / lock_dir
+    return (lock_dir.resolve() / f"{digest}.lock")
 
 
 def _existing_path(value: object) -> pathlib.Path | None:
@@ -539,7 +552,7 @@ def _scrub_secret_text(value: str, *secrets: str | None) -> str:
 
 @contextlib.contextmanager
 def codex_write_lock(cfg: dict[str, Any], owner: str) -> Iterator[dict[str, Any]]:
-    path = pathlib.Path(str(cfg["lock_path"])).expanduser().resolve()
+    path = _lock_path_for_owner(cfg, owner)
     path.parent.mkdir(parents=True, exist_ok=True)
     stale_seconds = int(cfg.get("lock_stale_seconds", 2400))
     for _attempt in range(2):
@@ -723,7 +736,7 @@ def run_structured_codex_turn(
             if not lock.get("acquired"):
                 return {"status": "implementation_paused", "reason": lock.get("reason"), **lock}
             def record_started(pid: int) -> None:
-                pathlib.Path(str(cfg["lock_path"])).write_text(
+                _lock_path_for_owner(cfg, f"strategy-owner:{task_id}").write_text(
                     json.dumps(
                         {
                             "owner": f"strategy-owner:{task_id}",

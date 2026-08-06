@@ -277,6 +277,7 @@ def enqueue_task(
     priority: int = 0,
     payload: Mapping[str, Any] | None = None,
     status: str = "queued",
+    reactivate_terminal: bool = False,
 ) -> dict[str, Any]:
     """Idempotently enqueue a durable task keyed by source kind and source id."""
 
@@ -290,16 +291,23 @@ def enqueue_task(
         ).fetchone()
         if existing is not None:
             # New evidence may improve the priority/payload but cannot steal a live claim.
+            next_status = str(existing["status"])
+            if reactivate_terminal and next_status not in CLAIMABLE_TASK_STATUSES | ACTIVE_TASK_STATUSES:
+                next_status = status
             updates = {
                 "lane": lane or existing["lane"],
                 "priority": max(int(existing["priority"]), int(priority)),
                 "payload_json": _json(dict(payload or _decode_json(existing["payload_json"]))),
+                "status": next_status,
                 "updated_at": now,
             }
             conn.execute(
                 """
                 update codex_tasks
-                set lane=:lane, priority=:priority, payload_json=:payload_json, updated_at=:updated_at
+                set lane=:lane, priority=:priority, payload_json=:payload_json, status=:status,
+                    completed_at=case when :status in ('queued','requeued') then null else completed_at end,
+                    retry_at=case when :status in ('queued','requeued') then null else retry_at end,
+                    updated_at=:updated_at
                 where task_id=:task_id
                 """,
                 {**updates, "task_id": existing["task_id"]},
@@ -689,13 +697,28 @@ def enqueue_verification_job(
             (task_id, verification_kind),
         ).fetchone()
         if existing is not None:
-            conn.execute(
-                """
-                update codex_verification_jobs set priority=?, payload_json=?, updated_at=?
-                where job_id=?
-                """,
-                (max(int(existing["priority"]), int(priority)), _json(dict(payload or _decode_json(existing["payload_json"]))), now, existing["job_id"]),
-            )
+            previous_payload = _decode_json(existing["payload_json"])
+            next_payload = dict(payload or previous_payload)
+            changed_revision = next_payload != previous_payload
+            if changed_revision and str(existing["status"]) not in CLAIMABLE_VERIFICATION_STATUSES | {"claimed"}:
+                conn.execute(
+                    """
+                    update codex_verification_jobs set status='queued', priority=?, payload_json=?, result_json=null,
+                        claimed_by=null, claim_pid=null, claim_token=null, claimed_at=null,
+                        lease_expires_at=null, retry_at=null, completed_at=null, updated_at=?
+                    where job_id=?
+                    """,
+                    (max(int(existing["priority"]), int(priority)), _json(next_payload), now, existing["job_id"]),
+                )
+                _event(conn, "verification", existing["job_id"], "reactivated_for_new_revision", {})
+            else:
+                conn.execute(
+                    """
+                    update codex_verification_jobs set priority=?, payload_json=?, updated_at=?
+                    where job_id=?
+                    """,
+                    (max(int(existing["priority"]), int(priority)), _json(next_payload), now, existing["job_id"]),
+                )
             result = conn.execute(
                 "select * from codex_verification_jobs where job_id=?", (existing["job_id"],)
             ).fetchone()
@@ -816,6 +839,12 @@ def coordination_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         "select status,count(*) as count from codex_verification_jobs group by status"
     ).fetchall()
     worker_rows = conn.execute("select * from codex_workers order by worker_id").fetchall()
+    lane_rows = conn.execute(
+        "select lane,status,count(*) as count from codex_tasks group by lane,status order by lane,status"
+    ).fetchall()
+    source_rows = conn.execute(
+        "select source_kind,status,count(*) as count from codex_tasks group by source_kind,status order by source_kind,status"
+    ).fetchall()
     promotion_count = conn.execute(
         "select count(*) from codex_tasks where status in ('promoted','promoted_pending_verification','verified')"
     ).fetchone()[0]
@@ -829,6 +858,20 @@ def coordination_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "queue_depth": int(queue_depth),
         "task_statuses": {str(row["status"]): int(row["count"]) for row in status_rows},
+        "tasks_by_lane": {
+            lane: {
+                str(row["status"]): int(row["count"])
+                for row in lane_rows if str(row["lane"]) == lane
+            }
+            for lane in sorted({str(row["lane"]) for row in lane_rows})
+        },
+        "tasks_by_source": {
+            source: {
+                str(row["status"]): int(row["count"])
+                for row in source_rows if str(row["source_kind"]) == source
+            }
+            for source in sorted({str(row["source_kind"]) for row in source_rows})
+        },
         "verification_statuses": {str(row["status"]): int(row["count"]) for row in verification_rows},
         "promotions": int(promotion_count),
         "repairs": int(repair_count),
