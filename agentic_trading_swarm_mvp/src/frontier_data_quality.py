@@ -289,6 +289,12 @@ _PAPER_ONLY_FAMILY_DECAY_TARGET = {
     "market_key": "YAHOO_PROXY",
     "strategy_family": "global_proxy_momentum",
     "family": "YAHOO_PROXY|global_proxy_momentum",
+    "min_closed_count_per_leg": 20,
+    "max_expectancy_bps": 0.0,
+    "recovery_expectancy_bps": 0.0,
+    "min_recovery_windows": 3,
+    "min_samples_per_window": 10,
+    "min_diagnostic_pass_rate": 0.90,
     "latest_family_paper": {
         "long_proxy_standard": {
             "avg_pnl_bps": -16.225,
@@ -312,8 +318,34 @@ def _paper_only_family_decay_guard_review(record, config=None):
     record_payload = record if isinstance(record, dict) else {}
     config_payload = config if isinstance(config, dict) else {}
 
+    def _containers():
+        parents = [record_payload, config_payload]
+        containers = []
+        seen = set()
+        while parents:
+            container = parents.pop(0)
+            if not isinstance(container, dict):
+                continue
+            marker = id(container)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            containers.append(container)
+            for nested_key in (
+                "paper_policy",
+                "strategy_lab",
+                "strategy_reliability",
+                "metadata",
+                "route_requirements",
+                "context",
+            ):
+                nested = container.get(nested_key)
+                if isinstance(nested, dict):
+                    parents.append(nested)
+        return containers
+
     def _lookup(*keys):
-        for container in (record_payload, config_payload):
+        for container in _containers():
             for key in keys:
                 value = container.get(key)
                 if value not in (None, "", [], {}, ()):
@@ -346,6 +378,53 @@ def _paper_only_family_decay_guard_review(record, config=None):
         except (TypeError, ValueError):
             return None
 
+    def _int_value(value, default=0):
+        parsed = _float_value(value)
+        if parsed is None:
+            return int(default)
+        try:
+            return int(parsed)
+        except (TypeError, ValueError, OverflowError):
+            return int(default)
+
+    def _policy_mapping(*keys):
+        for container in _containers():
+            for key in keys:
+                value = container.get(key)
+                if isinstance(value, dict):
+                    return value
+        return {}
+
+    def _copy_latest_family_paper(latest_family_paper):
+        if not isinstance(latest_family_paper, dict):
+            return {}
+        copied = {}
+        for leg_name, metrics in latest_family_paper.items():
+            copied[str(leg_name)] = dict(metrics) if isinstance(metrics, dict) else metrics
+        return copied
+
+    def _market_root(value):
+        text = str(value or "").strip().upper().replace("/", "|").replace(":", "|")
+        if not text:
+            return None
+        return text.split("|")[0].strip() or None
+
+    def _leg_direction(value):
+        token = _token(value)
+        if token is None:
+            return None
+        if "long" in token:
+            return "long"
+        if "short" in token:
+            return "short"
+        return None
+
+    policy = _policy_mapping(
+        "paper_family_decay_guard",
+        "paper_only_family_decay_guard",
+        "family_decay_guard_policy",
+        "yahoo_proxy_momentum_source_veto",
+    )
     execution_mode = _token(
         _lookup(
             "execution_mode",
@@ -362,6 +441,8 @@ def _paper_only_family_decay_guard_review(record, config=None):
             "paper_family_decay_suppression_enabled",
         )
     )
+    if explicit_toggle is None:
+        explicit_toggle = _bool_value(policy.get("enabled"))
     enabled = explicit_toggle is not False
     reason = "not_applicable"
     if execution_mode and execution_mode not in {"paper", "paper_only", "simulation", "sim", "review"}:
@@ -370,7 +451,8 @@ def _paper_only_family_decay_guard_review(record, config=None):
     elif explicit_toggle is False:
         reason = "guard_disabled"
 
-    market_key = str(_lookup("market_key", "signal_key", "source_market_key") or "").strip().upper() or None
+    market_identity = str(_lookup("market_key", "signal_key", "source_market_key") or "").strip().upper() or None
+    market_key = _market_root(market_identity)
     strategy_family = _token(
         _lookup(
             "strategy_family",
@@ -380,13 +462,12 @@ def _paper_only_family_decay_guard_review(record, config=None):
             "feature_family",
         )
     )
+    if strategy_family is None and market_identity and "GLOBAL_PROXY_MOMENTUM" in market_identity:
+        strategy_family = _PAPER_ONLY_FAMILY_DECAY_TARGET["strategy_family"]
     applies = (
         market_key == _PAPER_ONLY_FAMILY_DECAY_TARGET["market_key"]
         and strategy_family == _PAPER_ONLY_FAMILY_DECAY_TARGET["strategy_family"]
     )
-    blocked = bool(enabled and applies)
-    if blocked:
-        reason = "family_decay_suppressed"
 
     attempted_direction = _token(
         _lookup("direction", "side", "signal_side", "candidate_direction", "position_side")
@@ -394,6 +475,186 @@ def _paper_only_family_decay_guard_review(record, config=None):
     freshness_state = _token(
         _lookup("freshness_state", "signal_freshness", "proxy_freshness_state", "freshness")
     ) or "unknown"
+    latest_family_paper = _lookup(
+        "latest_family_paper",
+        "family_decay_latest_family_paper",
+        "paper_family_decay_latest_family_paper",
+    )
+    if not isinstance(latest_family_paper, dict):
+        latest_family_paper = policy.get("latest_family_paper")
+    if not isinstance(latest_family_paper, dict):
+        latest_family_paper = _PAPER_ONLY_FAMILY_DECAY_TARGET["latest_family_paper"]
+    latest_family_paper = _copy_latest_family_paper(latest_family_paper)
+
+    min_closed_count = max(
+        1,
+        _int_value(
+            _lookup(
+                "min_closed_count_per_leg",
+                "family_decay_min_closed_count_per_leg",
+                "paper_family_decay_min_closed_count_per_leg",
+            ),
+            _PAPER_ONLY_FAMILY_DECAY_TARGET["min_closed_count_per_leg"],
+        ),
+    )
+    max_expectancy_bps = _float_value(
+        _lookup(
+            "max_expectancy_bps",
+            "family_decay_max_expectancy_bps",
+            "paper_family_decay_max_expectancy_bps",
+        )
+    )
+    if max_expectancy_bps is None:
+        max_expectancy_bps = _float_value(policy.get("max_expectancy_bps"))
+    if max_expectancy_bps is None:
+        max_expectancy_bps = float(_PAPER_ONLY_FAMILY_DECAY_TARGET["max_expectancy_bps"])
+
+    recovery_expectancy_bps = _float_value(
+        _lookup(
+            "recovery_expectancy_bps",
+            "family_decay_recovery_expectancy_bps",
+            "paper_family_decay_recovery_expectancy_bps",
+        )
+    )
+    if recovery_expectancy_bps is None:
+        recovery_expectancy_bps = _float_value(policy.get("recovery_expectancy_bps"))
+    if recovery_expectancy_bps is None:
+        recovery_expectancy_bps = float(_PAPER_ONLY_FAMILY_DECAY_TARGET["recovery_expectancy_bps"])
+
+    def _leg_review(leg_name, payload):
+        metrics = payload if isinstance(payload, dict) else {}
+        direction = _leg_direction(leg_name) or _leg_direction(metrics.get("direction"))
+        closed_count = max(
+            0,
+            _int_value(metrics.get("closed_count", metrics.get("sample_count", metrics.get("count"))), 0),
+        )
+        expectancy_bps = _float_value(
+            metrics.get(
+                "after_cost_expectancy_bps",
+                metrics.get(
+                    "expectancy_bps",
+                    metrics.get("realized_edge_bps", metrics.get("avg_pnl_bps")),
+                ),
+            )
+        )
+        win_rate = _float_value(metrics.get("win_rate", metrics.get("positive_rate")))
+        mature = closed_count >= min_closed_count
+        negative = bool(mature and expectancy_bps is not None and expectancy_bps < max_expectancy_bps)
+        recovered = bool(mature and expectancy_bps is not None and expectancy_bps >= recovery_expectancy_bps)
+        result = dict(metrics)
+        result.update(
+            {
+                "direction": direction,
+                "closed_count": closed_count,
+                "expectancy_bps": expectancy_bps,
+                "win_rate": win_rate,
+                "mature": mature,
+                "negative": negative,
+                "recovered": recovered,
+            }
+        )
+        return result
+
+    leg_reviews = {
+        leg_name: _leg_review(leg_name, metrics)
+        for leg_name, metrics in latest_family_paper.items()
+        if _leg_direction(leg_name) in {"long", "short"}
+    }
+    long_leg = next((review for review in leg_reviews.values() if review.get("direction") == "long"), None)
+    short_leg = next((review for review in leg_reviews.values() if review.get("direction") == "short"), None)
+    weighted_expectancy_numerator = 0.0
+    weighted_expectancy_denominator = 0
+    for leg in (long_leg, short_leg):
+        if not isinstance(leg, dict):
+            continue
+        expectancy_bps = _float_value(leg.get("expectancy_bps"))
+        closed_count = _int_value(leg.get("closed_count"), 0)
+        if expectancy_bps is None or closed_count <= 0:
+            continue
+        weighted_expectancy_numerator += expectancy_bps * closed_count
+        weighted_expectancy_denominator += closed_count
+    rolling_expectancy_bps = (
+        round(weighted_expectancy_numerator / weighted_expectancy_denominator, 6)
+        if weighted_expectancy_denominator > 0
+        else None
+    )
+    bilateral_failure = bool(
+        isinstance(long_leg, dict)
+        and isinstance(short_leg, dict)
+        and long_leg.get("negative")
+        and short_leg.get("negative")
+        and rolling_expectancy_bps is not None
+        and rolling_expectancy_bps < max_expectancy_bps
+    )
+    current_recovered = bool(
+        not bilateral_failure
+        and any(
+            isinstance(leg, dict) and leg.get("recovered")
+            for leg in (long_leg, short_leg)
+        )
+    )
+
+    min_recovery_windows = max(
+        1,
+        _int_value(policy.get("min_recovery_windows"), _PAPER_ONLY_FAMILY_DECAY_TARGET["min_recovery_windows"]),
+    )
+    min_samples_per_window = max(
+        1,
+        _int_value(policy.get("min_samples_per_window"), _PAPER_ONLY_FAMILY_DECAY_TARGET["min_samples_per_window"]),
+    )
+    min_diagnostic_pass_rate = _float_value(policy.get("min_diagnostic_pass_rate"))
+    if min_diagnostic_pass_rate is None:
+        min_diagnostic_pass_rate = float(_PAPER_ONLY_FAMILY_DECAY_TARGET["min_diagnostic_pass_rate"])
+    min_diagnostic_pass_rate = max(0.0, min(1.0, min_diagnostic_pass_rate))
+    recovery_evidence = policy.get("recovery_evidence") if isinstance(policy.get("recovery_evidence"), dict) else {}
+
+    def _window_passes(window):
+        if not isinstance(window, dict):
+            return False
+        expectancy_bps = _float_value(
+            window.get("after_cost_expectancy_bps", window.get("expectancy_bps", window.get("avg_pnl_bps")))
+        )
+        sample_count = _int_value(window.get("sample_count", window.get("closed_count", window.get("count"))), 0)
+        freshness_ok = window.get("freshness_acceptable")
+        if freshness_ok is None:
+            freshness_ok = _float_value(window.get("freshness_pass_rate"))
+            freshness_ok = freshness_ok is not None and freshness_ok >= min_diagnostic_pass_rate
+        execution_ok = window.get("execution_quality_acceptable")
+        if execution_ok is None:
+            execution_ok = _float_value(window.get("execution_quality_pass_rate"))
+            execution_ok = execution_ok is not None and execution_ok >= min_diagnostic_pass_rate
+        return bool(
+            expectancy_bps is not None
+            and expectancy_bps >= recovery_expectancy_bps
+            and sample_count >= min_samples_per_window
+            and _bool_value(freshness_ok) is True
+            and _bool_value(execution_ok) is True
+        )
+
+    recovery_scopes = {}
+    for scope_name in ("source_family", "immediate_descendants"):
+        scope = recovery_evidence.get(scope_name) if isinstance(recovery_evidence, dict) else None
+        windows = scope.get("windows") if isinstance(scope, dict) else None
+        windows = windows if isinstance(windows, list) else []
+        passing = [_window_passes(window) for window in windows]
+        recovery_scopes[scope_name] = {
+            "window_count": len(windows),
+            "passing_window_count": sum(1 for result in passing if result),
+            "recovered": len(windows) >= min_recovery_windows and bool(windows) and all(passing),
+        }
+    recovered_by_windows = bool(recovery_scopes) and all(scope["recovered"] for scope in recovery_scopes.values())
+    blocked = bool(enabled and applies and bilateral_failure and not recovered_by_windows)
+    if blocked:
+        reason = "family_decay_suppressed"
+    elif applies and (recovered_by_windows or current_recovered):
+        reason = "family_decay_recovered"
+    elif applies and not bilateral_failure:
+        reason = "family_decay_not_confirmed"
+    failed_legs = [
+        leg.get("direction")
+        for leg in (long_leg, short_leg)
+        if isinstance(leg, dict) and leg.get("negative") and leg.get("direction")
+    ]
 
     return {
         "flag": _PAPER_ONLY_FAMILY_DECAY_SUPPRESSION_FLAG,
@@ -402,15 +663,38 @@ def _paper_only_family_decay_guard_review(record, config=None):
         "blocked": blocked,
         "eligible": not blocked,
         "reason": reason,
-        "event": "family_decay_suppressed" if blocked else None,
+        "event": (
+            "family_decay_suppressed"
+            if blocked
+            else "family_decay_recovered"
+            if applies and (recovered_by_windows or current_recovered)
+            else None
+        ),
         "family": _PAPER_ONLY_FAMILY_DECAY_TARGET["family"],
         "market_key": market_key,
+        "market_identity": market_identity,
         "strategy_family": strategy_family,
         "attempted_direction": attempted_direction,
         "raw_score": _float_value(_lookup("raw_score", "paper_score", "score", "candidate_score")),
         "freshness_state": freshness_state,
         "paper_score_multiplier": 0.0 if blocked else 1.0,
-        "latest_family_paper": dict(_PAPER_ONLY_FAMILY_DECAY_TARGET["latest_family_paper"]),
+        "latest_family_paper": latest_family_paper,
+        "leg_reviews": leg_reviews,
+        "minimum_closed_count_per_leg": min_closed_count,
+        "max_expectancy_bps": max_expectancy_bps,
+        "recovery_expectancy_bps": recovery_expectancy_bps,
+        "rolling_expectancy_bps": rolling_expectancy_bps,
+        "bilateral_failure": bilateral_failure,
+        "failed_legs": failed_legs,
+        "recovery_status": {
+            "recovered": bool(recovered_by_windows or current_recovered),
+            "recovered_by_windows": recovered_by_windows,
+            "current_recovered": current_recovered,
+            "min_recovery_windows": min_recovery_windows,
+            "min_samples_per_window": min_samples_per_window,
+            "min_diagnostic_pass_rate": min_diagnostic_pass_rate,
+            "scopes": recovery_scopes,
+        },
     }
 
 

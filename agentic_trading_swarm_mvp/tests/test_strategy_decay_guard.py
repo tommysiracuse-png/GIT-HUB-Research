@@ -17,6 +17,9 @@ class StrategyDecayGuardTests(unittest.TestCase):
         self.assertEqual(result["strategy_decay_state"], "blocked_for_paper_selection")
         self.assertFalse(result["recovery_gate"])
         self.assertGreater(result["decay_score"], 0.0)
+        self.assertEqual(["long", "short"], result["failed_legs"])
+        self.assertTrue(result["bilateral_failure"])
+        self.assertLess(result["rolling_expectancy_recent"], 0.0)
 
     def test_allows_recovery_when_one_side_improves(self):
         result = paper_only_strategy_decay_guard(
@@ -31,6 +34,8 @@ class StrategyDecayGuardTests(unittest.TestCase):
 
         self.assertEqual(result["strategy_decay_state"], "active")
         self.assertTrue(result["recovery_gate"])
+        self.assertEqual("recovery_threshold_met", result["guard_reason"])
+        self.assertFalse(result["bilateral_failure"])
 
     def test_unknown_when_inputs_missing(self):
         result = paper_only_strategy_decay_guard(strategy_family="proxy momentum")

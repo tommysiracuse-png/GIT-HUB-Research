@@ -3442,6 +3442,12 @@ def paper_only_strategy_decay_guard(
         sample_value >= int(min_sample_size)
         and (long_value >= float(recovery_expectancy) or short_value >= float(recovery_expectancy))
     )
+    failed_legs = []
+    if long_value <= -abs(float(negative_margin)):
+        failed_legs.append("long")
+    if short_value <= -abs(float(negative_margin)):
+        failed_legs.append("short")
+    rolling_expectancy_recent = round((long_value + short_value) / 2.0, 6)
 
     return {
         "strategy_family": family,
@@ -3449,7 +3455,17 @@ def paper_only_strategy_decay_guard(
         "long_expectancy_recent": long_value,
         "short_expectancy_recent": short_value,
         "strategy_decay_state": "blocked_for_paper_selection" if decay_block else "active",
+        "guard_reason": (
+            "bilateral_negative_expectancy"
+            if decay_block
+            else "recovery_threshold_met"
+            if recovery_gate
+            else "bilateral_decay_not_confirmed"
+        ),
         "decay_score": round(max(0.0, -long_value) + max(0.0, -short_value), 6),
+        "rolling_expectancy_recent": rolling_expectancy_recent,
+        "failed_legs": failed_legs,
+        "bilateral_failure": len(failed_legs) == 2 and sample_value >= int(min_sample_size),
         "recovery_gate": bool(recovery_gate),
     }
 
