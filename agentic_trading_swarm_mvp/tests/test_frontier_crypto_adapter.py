@@ -1352,6 +1352,35 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         )
         self.assertLess(degraded_context["paper_ranking_score"], healthy_context["paper_ranking_score"])
 
+    def test_context_aware_frontier_score_multiplies_edge_by_execution_quality_and_freshness(self) -> None:
+        cfg = settings()
+        candidate = {
+            "inst_id": "BALANCED-CONTEXT",
+            "score": 60.0,
+            "dislocation_quality_score": 80.0,
+            "effective_edge_bps": 16.0,
+            "liquidity_score": 0.75,
+            "spread_bps": 8.0,
+            "freshness_age_seconds": 60.0,
+            "frontier_short_market_context": {"applicable": True, "score": 50.0},
+        }
+
+        frontier.rank_frontier_paper_candidates([candidate], cfg)
+
+        review = candidate["paper_frontier_score"]
+        self.assertEqual(0.86, review["execution_quality_term"])
+        self.assertEqual(0.5, review["freshness_term"])
+        self.assertEqual(6.88, review["score"])
+        self.assertEqual(
+            round(
+                review["expected_edge_value"]
+                * review["execution_quality_term"]
+                * review["freshness_term"],
+                3,
+            ),
+            review["score"],
+        )
+
     def test_frontier_score_gate_zeroes_ranking_without_blocking_paper_candidate(self) -> None:
         cfg = settings()
         candidate = {

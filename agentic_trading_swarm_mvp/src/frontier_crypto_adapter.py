@@ -11703,20 +11703,13 @@ def _frontier_paper_score_review(
         )
         if freshness_age >= freshness_max_age:
             freshness_term = freshness_min_term
-    context_multiplier = (
-        max(
-            float(policy["context_multiplier_floor"]),
-            min(float(policy["context_multiplier_ceiling"]), context_score / 100.0),
-        )
-        if context_score is not None
-        else 1.0
-    )
     hard_gate_reasons = []
     if observed_liquidity is not None and observed_liquidity < min_liquidity:
         hard_gate_reasons.append("liquidity_below_minimum")
     if spread_bps_value is not None and spread_bps_value > max_spread_bps:
         hard_gate_reasons.append("spread_above_maximum")
-    score = expected_edge_value * execution_quality_term * freshness_term * context_multiplier
+    # Context is already folded into the bounded execution-quality term.
+    score = expected_edge_value * execution_quality_term * freshness_term
     if hard_gate_reasons:
         score = 0.0
     return {
@@ -11727,7 +11720,7 @@ def _frontier_paper_score_review(
         "expected_edge_source": ranking_edge_source,
         "execution_quality_term": round(execution_quality_term, 6),
         "freshness_term": round(freshness_term, 6),
-        "context_multiplier": round(context_multiplier, 6),
+        "context_multiplier": 1.0,
         "quality_component": round(quality_component, 6),
         "liquidity_component": round(liquidity_component, 6),
         "spread_component": round(spread_component, 6),
