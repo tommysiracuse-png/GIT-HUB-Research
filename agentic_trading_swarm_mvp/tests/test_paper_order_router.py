@@ -32,7 +32,7 @@ def frontier_candidate(**overrides: object) -> dict[str, object]:
 
 
 class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
-    def test_cost_eroded_frontier_candidate_is_retained_as_counterfactual(self) -> None:
+    def test_cost_eroded_frontier_candidate_is_shadow_only(self) -> None:
         candidate = frontier_candidate(
             edge_bps_estimate=0.0,
             gross_edge_bps_estimate=13.044,
@@ -41,14 +41,14 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
 
         guarded = router.apply_frontier_paper_guard(candidate)
 
-        self.assertNotIn("shadow_filtered", guarded)
-        self.assertTrue(guarded["paper_filled"])
-        self.assertEqual("cost_swallowed_after_slippage", guarded["paper_cost_diagnostic_reason"])
-        self.assertFalse(guarded["paper_cost_diagnostic"]["blocks_paper_fill"])
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertFalse(guarded["paper_filled"])
+        self.assertEqual("shadow_only", guarded["status"])
+        self.assertEqual("paper_net_edge_guard", guarded["candidate_reject_reason"])
         self.assertTrue(candidate["paper_filled"])
         self.assertEqual(candidate["status"], "paper_filled")
 
-    def test_slippage_anomaly_is_a_cost_diagnostic(self) -> None:
+    def test_slippage_anomaly_is_shadow_only(self) -> None:
         guarded = router.apply_frontier_paper_guard(
             frontier_candidate(
                 edge_bps_estimate=8.0,
@@ -58,9 +58,9 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
             )
         )
 
-        codes = [check["code"] for check in guarded["paper_cost_diagnostic"]["checks"]]
+        codes = [check["code"] for check in guarded["candidate_reject_detail"]["checks"]]
         self.assertIn("simulated_slippage_exceeds_edge", codes)
-        self.assertNotIn("shadow_filtered", guarded)
+        self.assertEqual("shadow_only", guarded["paper_fill_status"])
 
     def test_shadow_only_quality_action_blocks_paper_fill(self) -> None:
         guarded = router.apply_frontier_paper_guard(
@@ -117,10 +117,10 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
         )
 
         codes = [check["code"] for check in guarded["candidate_reject_detail"]["checks"]]
-        self.assertIn(router.SPOT_BORROW_SHADOW_CODE, codes)
-        self.assertEqual(guarded["paper_fill_status"], "shadow_filtered")
+        self.assertIn("short_frontier_spot_spot_borrow_blocked", codes)
+        self.assertEqual(guarded["paper_fill_status"], "shadow_only")
 
-    def test_net_edge_is_computed_from_gross_less_cost_not_quality_score(self) -> None:
+    def test_gross_edge_at_cost_plus_five_bps_is_shadow_only(self) -> None:
         guarded = router.apply_frontier_paper_guard(
             frontier_candidate(
                 edge_bps_estimate=1.0,
@@ -131,7 +131,8 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
             )
         )
 
-        self.assertNotIn("shadow_filtered", guarded)
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("paper_net_edge_guard", guarded["candidate_reject_reason"])
 
     def test_confirmed_borrow_keeps_short_spot_eligible(self) -> None:
         guarded = router.apply_frontier_paper_guard(
@@ -183,7 +184,15 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
         self.assertNotIn("shadow_filtered", guarded)
         self.assertEqual(guarded["status"], "paper_filled")
 
-    def test_filter_helper_preserves_order_and_cost_diagnostics(self) -> None:
+    def test_net_edge_guard_is_inactive_outside_paper_mode(self) -> None:
+        candidate = frontier_candidate(edge_bps_estimate=0.0)
+
+        guarded = router.apply_frontier_paper_guard(candidate, {"mode": "live"})
+
+        self.assertNotIn("shadow_filtered", guarded)
+        self.assertEqual("paper_filled", guarded["status"])
+
+    def test_filter_helper_preserves_order_and_marks_shadow_only_rows(self) -> None:
         blocked = frontier_candidate(inst_id="KRAKEN:XBTUSD", edge_bps_estimate=0.0)
         eligible = frontier_candidate(inst_id="OKX:ABC-USDT", edge_bps_estimate=12.0)
 
@@ -191,7 +200,8 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
 
         self.assertEqual([row["inst_id"] for row in guarded], ["KRAKEN:XBTUSD", "OKX:ABC-USDT"])
         self.assertEqual("cost_swallowed_after_slippage", guarded[0]["paper_cost_diagnostic_reason"])
-        self.assertNotIn("shadow_filtered", guarded[0])
+        self.assertTrue(guarded[0]["shadow_filtered"])
+        self.assertEqual("paper_net_edge_guard", guarded[0]["candidate_reject_reason"])
         self.assertNotIn("shadow_filtered", guarded[1])
 
 

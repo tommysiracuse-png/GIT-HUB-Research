@@ -65,7 +65,7 @@ class RouteUnblockerTests(unittest.TestCase):
 
         guarded = paper_order_router.apply_frontier_paper_guard(enriched, cfg)
         self.assertTrue(guarded["shadow_filtered"])
-        self.assertEqual("cost_swallowed_or_route_blocked", guarded["candidate_reject_reason"])
+        self.assertEqual("paper_net_edge_guard", guarded["candidate_reject_reason"])
 
     def test_prediction_market_blockers_use_research_paper_route_only(self) -> None:
         cfg = settings()

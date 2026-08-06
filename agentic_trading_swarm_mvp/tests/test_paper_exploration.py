@@ -103,11 +103,11 @@ class PaperExplorationTests(unittest.TestCase):
             review = review_candidate(candidate, self.settings, {}, policies=[])
             execution = execute_order(conn, candidate, review, self.settings)
             self.assertFalse(execution["paper_filled"])
-            self.assertEqual("shadow_observed", execution["order"]["status"])
+            self.assertEqual("shadow_only", execution["order"]["status"])
             self.assertIsNone(execution["order_id"])
             self.assertEqual(0, conn.execute("select count(*) from paper_trades").fetchone()[0])
             self.assertEqual(
-                "cost_swallowed_or_route_blocked",
+                "paper_net_edge_guard",
                 conn.execute("select reject_reason from frontier_paper_shadow_observations").fetchone()[0],
             )
             conn.close()
@@ -138,7 +138,7 @@ class PaperExplorationTests(unittest.TestCase):
             review = review_candidate(candidate, self.settings, {}, policies=[])
             execution = execute_order(conn, candidate, review, self.settings)
             self.assertFalse(execution["paper_filled"])
-            self.assertEqual("shadow_filtered", execution["order"]["status"])
+            self.assertEqual("shadow_only", execution["order"]["status"])
             conn.close()
 
     def test_real_two_leg_candidate_requires_prices_or_explicit_proxy(self) -> None:

@@ -27,7 +27,7 @@ def _candidate(**overrides):
 
 
 class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
-    def test_assumption_backed_short_with_route_blockers_is_synthetic_research(self):
+    def test_assumption_backed_short_with_route_blockers_is_shadow_only(self):
         candidate = _candidate(
             venue="PAPER_SIM_VENUE",
             score=80.0,
@@ -49,6 +49,7 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
         guarded = apply_frontier_paper_guard(candidate)
 
         self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("paper_net_edge_guard", guarded["candidate_reject_reason"])
 
     def test_pretrade_route_metadata_remains_diagnostic_without_blockers(self):
         candidate = _candidate(
@@ -137,7 +138,7 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
             guarded["candidate_reject_detail"]["blocker_reasons"],
         )
 
-    def test_blocked_short_without_paper_proxy_retains_route_diagnostic(self):
+    def test_blocked_short_without_paper_proxy_is_shadow_only(self):
         candidate = _candidate(
             venue_capabilities={"paper_route_feasible": True},
             route_blockers=["spot_borrow"],
@@ -152,10 +153,9 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
 
         self.assertIsNotNone(reason)
         self.assertTrue(guarded["shadow_filtered"])
-        self.assertEqual(guarded["paper_route_status"], "blocked")
-        self.assertEqual(guarded["paper_route_type"], "blocked")
+        self.assertEqual("paper_net_edge_guard", guarded["candidate_reject_reason"])
 
-    def test_proxy_short_with_direct_route_blockers_remains_synthetic_research(self):
+    def test_proxy_short_with_direct_route_blockers_is_shadow_only(self):
         candidate = _candidate(
             venue_capabilities={"paper_route_feasible": True},
             route_blockers=["spot_borrow"],
@@ -175,7 +175,8 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
         guarded = apply_frontier_paper_guard(candidate)
         record = frontier_route_feasibility_record(candidate)
 
-        self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("paper_net_edge_guard", guarded["candidate_reject_reason"])
 
         self.assertTrue(record["paper_proxy_used"])
         self.assertEqual(record["paper_route_status"], "paper_testable_proxy")

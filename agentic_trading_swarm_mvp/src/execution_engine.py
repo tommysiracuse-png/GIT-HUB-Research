@@ -13,6 +13,7 @@ import sqlite3
 
 from paper_order_router import (
     FRONTIER_SHADOW_REASON,
+    PAPER_NET_EDGE_GUARD_REASON,
     apply_frontier_cost_or_route_paper_guard,
     apply_frontier_paper_admission_guard,
     apply_frontier_paper_guard,
@@ -392,9 +393,17 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         return _auction_reference_execution(candidate, settings)
     order = build_order_ticket(candidate, review, settings)
     if candidate.get("shadow_filtered"):
-        if candidate.get("candidate_reject_reason") == FRONTIER_SHADOW_REASON:
+        reject_reason = candidate.get("candidate_reject_reason")
+        shadow_observation = reject_reason == FRONTIER_SHADOW_REASON or (
+            paper_mode and reject_reason == PAPER_NET_EDGE_GUARD_REASON
+        )
+        if shadow_observation:
             observation_id = save_frontier_paper_shadow_observation(conn, candidate, review)
-            order["status"] = "shadow_observed"
+            order["status"] = (
+                "shadow_only"
+                if reject_reason == PAPER_NET_EDGE_GUARD_REASON
+                else "shadow_observed"
+            )
             order["shadow_filter"] = candidate.get("candidate_reject_detail")
             order["notes"].append(
                 "Frontier candidate recorded as a shadow observation; no paper order or fill was created."
