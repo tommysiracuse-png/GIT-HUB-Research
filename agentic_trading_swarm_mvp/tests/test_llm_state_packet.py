@@ -151,6 +151,57 @@ class LLMStatePacketTests(unittest.TestCase):
         )
         json.dumps(packet, sort_keys=True)
 
+    def test_frontier_short_packet_surfaces_route_feasibility_reasons_and_verified_exceptions(self) -> None:
+        packet = build_route_intelligence_packet_fragment(
+            [
+                {
+                    "venue": "BITSO",
+                    "inst_id": "BITSO:PEPE-USDT",
+                    "direction": "short_frontier_spot",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "route_status": "conditional",
+                    "route_feasibility_reason": "conditional_short_paper_metadata_missing",
+                    "paper_active_scoring_eligible": False,
+                    "paper_route_feasibility_shadow_label": True,
+                },
+                {
+                    "venue": "GATE",
+                    "inst_id": "GATE:ABC-USDT",
+                    "direction": "short_frontier_spot",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "route_status": "conditional",
+                    "route_feasibility_reason": "verified_standard_short_route",
+                    "paper_active_scoring_eligible": True,
+                    "paper_route_feasibility_shadow_label": False,
+                },
+            ]
+        )
+
+        gate = packet["paper_short_route_gate"]
+        self.assertTrue(gate["enabled"])
+        self.assertEqual(2, gate["candidate_count"])
+        self.assertEqual(1, gate["status_counts"]["allowed_verified_exception"])
+        self.assertEqual(1, gate["status_counts"]["shadow_only_route_feasibility"])
+        self.assertEqual(
+            1,
+            gate["route_feasibility_reason_counts"]["conditional_short_paper_metadata_missing"],
+        )
+        self.assertEqual(
+            1,
+            gate["route_feasibility_reason_counts"]["verified_standard_short_route"],
+        )
+        self.assertEqual(1, len(gate["gated_candidates"]))
+        gated = gate["gated_candidates"][0]
+        self.assertEqual("BITSO:PEPE-USDT", gated["inst_id"])
+        self.assertEqual(
+            "conditional_short_paper_metadata_missing",
+            gated["route_feasibility_reason"],
+        )
+        self.assertEqual(
+            "conditional_short_paper_metadata_missing",
+            gated["suppression_reason"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

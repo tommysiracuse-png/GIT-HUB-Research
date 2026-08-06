@@ -406,6 +406,53 @@ def _paper_gate_surface(candidate: dict, route: dict) -> str:
     )
 
 
+def _paper_gate_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = _paper_gate_text(value)
+    if text in {"true", "1", "yes", "y", "on", "enabled"}:
+        return True
+    if text in {"false", "0", "no", "n", "off", "disabled"}:
+        return False
+    return bool(value)
+
+
+def _paper_gate_frontier_route_feasibility_state(candidate: dict) -> dict[str, object]:
+    reason: str | None = None
+    paper_active_scoring_eligible = True
+    paper_route_feasibility_shadow_label = False
+
+    for container in (
+        candidate,
+        candidate.get("frontier_route_feasibility"),
+        candidate.get("frontier_conditional_short_route_feasibility_gate"),
+        candidate.get("frontier_short_spot_route_intelligence"),
+        candidate.get("frontier_short_spot_route_requirements_report"),
+        candidate.get("paper_route_requirement_report"),
+        candidate.get("route_requirement_summary"),
+    ):
+        if not isinstance(container, dict):
+            continue
+        if reason is None:
+            value = str(container.get("route_feasibility_reason") or "").strip()
+            if value:
+                reason = value
+        active = _paper_gate_bool(container.get("paper_active_scoring_eligible"))
+        if active is not None:
+            paper_active_scoring_eligible = active
+        shadow = _paper_gate_bool(container.get("paper_route_feasibility_shadow_label"))
+        if shadow is not None:
+            paper_route_feasibility_shadow_label = shadow
+
+    return {
+        "route_feasibility_reason": reason,
+        "paper_active_scoring_eligible": paper_active_scoring_eligible,
+        "paper_route_feasibility_shadow_label": paper_route_feasibility_shadow_label,
+    }
+
+
 def _paper_gate_missing_requirements(candidate: dict, route: dict) -> list[str]:
     missing: list[str] = []
     for requirement in route.get("requirements") or []:
@@ -446,15 +493,30 @@ def assess_paper_short_route_gate(candidate: dict) -> dict[str, object]:
 
     item = dict(candidate or {})
     route = _paper_gate_route(item)
-    direction = _paper_gate_direction(item, route)
-    surface = _paper_gate_surface(item, route)
+    raw_direction = _paper_gate_direction(item, route)
+    raw_surface = _paper_gate_surface(item, route)
+    direction = "short" if raw_direction in {"short", "short_frontier_spot"} else raw_direction
+    surface = (
+        "spot"
+        if raw_surface == "frontier_crypto_venue_map" and raw_direction == "short_frontier_spot"
+        else raw_surface
+    )
     applies = direction == "short" and surface == "spot"
     route_status = str(route.get("route_status") or item.get("route_status") or route.get("status") or "").strip()
     missing_requirements = _paper_gate_missing_requirements(item, route)
     direct_route_id = str(route.get("route_id") or item.get("route_id") or "").strip() or None
+    route_feasibility_state = _paper_gate_frontier_route_feasibility_state(item)
+    route_feasibility_reason = route_feasibility_state.get("route_feasibility_reason")
+    paper_active_scoring_eligible = bool(route_feasibility_state.get("paper_active_scoring_eligible", True))
+    paper_route_feasibility_shadow_label = bool(
+        route_feasibility_state.get("paper_route_feasibility_shadow_label", False)
+    )
 
     assessment: dict[str, object] = {
         "applies": applies,
+        "venue": str(item.get("venue") or "").strip() or None,
+        "inst_id": str(item.get("inst_id") or item.get("symbol") or "").strip() or None,
+        "trade_type": str(item.get("trade_type") or item.get("surface") or "").strip() or None,
         "direction": direction or None,
         "surface": surface or None,
         "route_status": route_status or None,
@@ -467,12 +529,32 @@ def assess_paper_short_route_gate(candidate: dict) -> dict[str, object]:
         "allocation_multiplier": 1.0,
         "suppression_reason": None,
         "proxy_route": None,
+        "route_feasibility_reason": route_feasibility_reason,
+        "paper_active_scoring_eligible": paper_active_scoring_eligible,
+        "paper_route_feasibility_shadow_label": paper_route_feasibility_shadow_label,
     }
     if not applies:
         return assessment
 
     if route_status == "standard":
         assessment["gate_status"] = "allowed_direct"
+        return assessment
+
+    if (
+        paper_active_scoring_eligible
+        and not paper_route_feasibility_shadow_label
+        and route_feasibility_reason in {
+            "explicit_borrow_ok",
+            "verified_standard_short_route",
+            "supported_venue_short_route_exception",
+        }
+    ):
+        assessment.update(
+            {
+                "gate_status": "allowed_verified_exception",
+                "execution_semantics": "paper_conditional_verified_exception",
+            }
+        )
         return assessment
 
     proxy_route = _paper_gate_proxy_alternative(item, route)
@@ -492,10 +574,16 @@ def assess_paper_short_route_gate(candidate: dict) -> dict[str, object]:
 
     assessment.update(
         {
-            "gate_status": "suppressed_no_proxy",
+            "gate_status": (
+                "shadow_only_route_feasibility"
+                if route_feasibility_reason
+                and not paper_active_scoring_eligible
+                and paper_route_feasibility_shadow_label
+                else "suppressed_no_proxy"
+            ),
             "paper_trade_allowed": False,
             "execution_semantics": "paper_trade_suppressed",
-            "suppression_reason": "spot_short_route_requirements_unconfirmed",
+            "suppression_reason": route_feasibility_reason or "spot_short_route_requirements_unconfirmed",
         }
     )
     return assessment
@@ -508,13 +596,23 @@ def summarize_paper_short_route_gates(candidates: Iterable[dict]) -> dict[str, o
     execution_semantics_counts = collections.Counter(
         str(item.get("execution_semantics")) for item in applicable
     )
+    route_feasibility_reason_counts = collections.Counter(
+        str(item.get("route_feasibility_reason"))
+        for item in applicable
+        if item.get("route_feasibility_reason") not in (None, "", "not_applicable")
+    )
     return {
         "enabled": bool(applicable),
         "paper_only": True,
         "candidate_count": len(applicable),
         "status_counts": dict(status_counts),
         "execution_semantics_counts": dict(execution_semantics_counts),
-        "gated_candidates": [item for item in applicable if str(item.get("gate_status")) != "allowed_direct"],
+        "route_feasibility_reason_counts": dict(route_feasibility_reason_counts),
+        "gated_candidates": [
+            item
+            for item in applicable
+            if str(item.get("gate_status")) not in {"allowed_direct", "allowed_verified_exception"}
+        ],
     }
 
 
