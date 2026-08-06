@@ -574,6 +574,47 @@ def apply_quarantine(
     return guarded
 
 
+def candidate_quarantine_record(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Recover the structured quarantine record from persisted candidate state."""
+    direct = candidate.get("paper_okx_basis_decay_quarantine")
+    if isinstance(direct, Mapping):
+        record = dict(direct)
+    else:
+        record = None
+
+    if record is None:
+        would_block = candidate.get("paper_guard_would_block")
+        if isinstance(would_block, Mapping):
+            nested = would_block.get("record")
+            if isinstance(nested, Mapping):
+                record = dict(nested)
+            elif (
+                str(would_block.get("guard") or "").strip() == POLICY_KEY
+                or matches_reason(would_block.get("reason"))
+            ):
+                record = {
+                    "reason": would_block.get("reason") or REASON,
+                    "guard": would_block.get("guard") or POLICY_KEY,
+                }
+
+    if record is None and matches_reason(candidate.get("candidate_reject_reason")):
+        detail = candidate.get("candidate_reject_detail")
+        if isinstance(detail, Mapping):
+            record = dict(detail)
+        else:
+            record = {
+                "reason": candidate.get("candidate_reject_reason") or REASON,
+                "guard": POLICY_KEY,
+            }
+
+    if not isinstance(record, dict) or not matches_reason(record.get("reason")):
+        return None
+    record.setdefault("reason", REASON)
+    record.setdefault("guard", POLICY_KEY)
+    record.setdefault("active", True)
+    return record
+
+
 def _execution_metrics(conn: Any | None) -> dict[str, Any]:
     metrics = {
         "quarantined_count": 0,
@@ -592,7 +633,7 @@ def _execution_metrics(conn: Any | None) -> dict[str, Any]:
         order_rows = []
     for row in order_rows:
         candidate = _load_candidate_json(row["candidate_json"])
-        record = candidate.get("paper_okx_basis_decay_quarantine")
+        record = candidate_quarantine_record(candidate)
         if (
             not isinstance(record, Mapping)
             or not bool(record.get("active"))
@@ -616,7 +657,7 @@ def _execution_metrics(conn: Any | None) -> dict[str, Any]:
     pnls: list[float] = []
     for row in outcome_rows:
         candidate = _load_candidate_json(row["candidate_json"])
-        record = candidate.get("paper_okx_basis_decay_quarantine")
+        record = candidate_quarantine_record(candidate)
         if (
             not isinstance(record, Mapping)
             or not bool(record.get("active"))

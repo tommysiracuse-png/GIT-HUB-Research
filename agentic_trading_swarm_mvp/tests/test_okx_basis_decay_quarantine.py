@@ -19,7 +19,7 @@ from paper_order_router import apply_frontier_paper_guard
 from paper_decay_quarantine import apply_quarantine, quarantine_record, runtime_report, target_signal
 from paper_exploration_report import build_paper_exploration_report
 from settings import DEFAULT_SETTINGS
-from storage import connect, open_paper_trade
+from storage import connect, open_paper_trade, save_execution_order
 from strategy_reliability import apply_strategy_reliability
 
 
@@ -440,6 +440,96 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
 
             self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["current_cycle_quarantined_count"])
             self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["current_cycle_would_have_filled_count"])
+            conn.close()
+
+    def test_runtime_report_cycle_counts_guard_only_reviewed_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            candidate = self.candidate(
+                signal_key=None,
+                market_key="OKX|perp_funding_basis|basis_mean_reversion_short_perp|standard",
+            )
+            record = quarantine_record(candidate, self.settings, conn=conn)
+            candidate["paper_guard_would_block"] = {
+                "reason": record["reason"],
+                "guard": record["guard"],
+                "record": dict(record),
+            }
+
+            paper_report = build_paper_exploration_report(
+                conn,
+                self.settings,
+                reviewed=[
+                    {"candidate": candidate, "review": {"decision": "approve_paper_trade"}},
+                ],
+            )
+
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["current_cycle_quarantined_count"])
+            self.assertEqual(1, paper_report["okx_basis_decay_quarantine"]["current_cycle_would_have_filled_count"])
+            conn.close()
+
+    def test_runtime_report_counts_guard_only_persisted_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            candidate = self.candidate(
+                signal_key=None,
+                market_key="OKX|perp_funding_basis|basis_mean_reversion_short_perp|standard",
+            )
+            record = quarantine_record(candidate, self.settings, conn=conn)
+            candidate["paper_guard_would_block"] = {
+                "reason": record["reason"],
+                "guard": record["guard"],
+                "record": dict(record),
+            }
+            order = {
+                "mode": "paper",
+                "route_id": "okx_derivatives_paper",
+                "status": "paper_filled",
+                "notional_usd": 1000.0,
+            }
+            review = {
+                "decision": "approve_paper_trade",
+                "learned_score": candidate["score"],
+                "paper_allocation_multiplier": 1.0,
+            }
+            order_id = save_execution_order(conn, order, candidate, review)
+            trade_id = open_paper_trade(
+                conn,
+                candidate,
+                review,
+                execution={"candidate": candidate, "order": order, "order_id": order_id, "fills": []},
+                settings=self.settings,
+            )
+            observed_at = dt.datetime.now(dt.timezone.utc).isoformat()
+            conn.execute(
+                """
+                insert into paper_trade_outcomes (
+                    trade_id, horizon_minutes, measured_at, price, pnl_bps, context_json,
+                    target_at, observed_at, delay_seconds, measurement_status, price_source
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_id,
+                    60,
+                    observed_at,
+                    101.0,
+                    12.5,
+                    "{}",
+                    observed_at,
+                    observed_at,
+                    0.0,
+                    "valid",
+                    "unit_test",
+                ),
+            )
+            conn.commit()
+
+            report = runtime_report(conn, self.settings)
+
+            self.assertEqual(1, report["quarantined_count"])
+            self.assertEqual(1, report["would_have_filled_count"])
+            self.assertEqual(1, report["shadow_valid_outcome_count"])
+            self.assertEqual(12.5, report["shadow_pnl_bps"])
             conn.close()
 
     def test_runtime_report_releases_after_the_fourteen_day_deadline(self) -> None:
