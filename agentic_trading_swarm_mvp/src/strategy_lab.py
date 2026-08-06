@@ -3531,6 +3531,7 @@ def _promotion_directions(experiment: dict) -> list[str]:
     surface = str(logic.get("route_surface") or "auto").lower()
     suffixes = {
         "proxy": ("long_proxy", "short_proxy"),
+        "nav_reference": ("long_proxy", "short_proxy"),
         "spot": ("long_frontier_spot", "short_frontier_spot"),
         "perp": ("long_frontier_perp", "short_frontier_perp"),
         "prediction": ("yes", "no"),

@@ -15,8 +15,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from settings import DEFAULT_SETTINGS  # noqa: E402
+from execution_engine import execute_order  # noqa: E402
 from radar_loop import _select_runtime_strategy_lab_candidates  # noqa: E402
-from storage import init_db  # noqa: E402
+from storage import init_db, open_paper_trade  # noqa: E402
 from strategy_lab import (  # noqa: E402
     _observation_program_inputs,
     _paper_route_eligible_candidates,
@@ -206,6 +207,55 @@ def observation(price: float, observed_at: str) -> dict:
         "stale_minutes": 0.0,
         "observed_at": observed_at,
         "price_source": "fixture",
+    }
+
+
+def adx_nav_observation(price: float, observed_at: str, **overrides: object) -> dict:
+    row = {
+        "inst_id": "ADX:ETF:CHADX15",
+        "venue": "ADX",
+        "trade_type": "official_factsheet_nav_reference",
+        "market_type": "exchange_traded_fund",
+        "asset_class": "equity_etf",
+        "quote": "AED",
+        "base": "CHADX15",
+        "last": price,
+        "spread_bps": 0.0,
+        "liquidity_score": 0.5,
+        "quality_score": 75.0,
+        "quality_status": "official_month_end_nav",
+        "market_surface": "adx_official_etf_factsheet_nav",
+        "freshness_state": "fresh",
+        "candidate_reject_reason": "factsheet_nav_not_entry_quality_quote",
+        "stale_minutes": 1.0,
+        "session_status": "open",
+        "observed_at": observed_at,
+        "price_source": "ADX official ETF factsheet NAV",
+    }
+    row.update(overrides)
+    return row
+
+
+def adx_nav_reference_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["ADX"],
+            "asset_classes": ["equity_etf"],
+            "market_types": ["exchange_traded_fund"],
+        },
+        "calculated_features": {"nav_update_edge_bps": "return_5m_bps - 5"},
+        "entry_expression": (
+            "market_surface == 'adx_official_etf_factsheet_nav' "
+            "and quality_status == 'official_month_end_nav' "
+            "and candidate_reject_reason == 'factsheet_nav_not_entry_quality_quote' "
+            "and freshness_state == 'fresh' and return_5m_bps >= 50"
+        ),
+        "invalidation_expression": "freshness_state != 'fresh'",
+        "direction": "long",
+        "edge_expression": "nav_update_edge_bps",
+        "score_expression": "clip(50 + nav_update_edge_bps / 4, 0, 100)",
+        "route_surface": "nav_reference",
     }
 
 
@@ -620,6 +670,80 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertEqual("diagnose", eligible[0]["_hunter_bucket"])
         self.assertEqual(1, missing["account_permission"])
         self.assertEqual(1, blockers["route_not_confirmed"])
+
+    def test_adx_nav_reference_is_same_surface_and_bypasses_execution_orders(self) -> None:
+        cfg = settings()
+        cfg["paper_exploration"]["enabled"] = True
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        recommendation = lab_recommendation("adx_nav_reference_v1", adx_nav_reference_logic())
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["hypothesis"] = "Fresh official ETF NAV updates support isolated paper-reference measurement."
+        experiment["source_surface"] = "adx_official_etf_factsheet_nav"
+        experiment["permitted_target_surface"] = ["adx_official_etf_factsheet_nav"]
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            record_feature_snapshots(
+                conn,
+                [adx_nav_observation(100.0, (now - dt.timedelta(minutes=5)).isoformat())],
+                cfg,
+            )
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [adx_nav_observation(101.0, now.isoformat())],
+            )
+
+            self.assertEqual(1, len(generated), report)
+            candidate = generated[0]
+            self.assertEqual("adx_official_etf_factsheet_nav", candidate["target_surface"])
+            self.assertTrue(candidate["paper_nav_reference"])
+            self.assertTrue(candidate["paper_nav_reference_provenance_valid"])
+            self.assertEqual("factsheet_nav_not_entry_quality_quote", candidate["candidate_reject_reason"])
+
+            execution = execute_order(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"], "paper_allocation_multiplier": 1.0},
+                cfg,
+            )
+            self.assertTrue(execution["paper_filled"])
+            self.assertIsNone(execution["order_id"])
+            self.assertEqual("paper_reference_labeled", execution["order"]["status"])
+            self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
+
+            trade_id = open_paper_trade(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"]},
+                execution=execution,
+                settings=cfg,
+            )
+            labeled = conn.execute(
+                "select execution_order_id, route_id, candidate_json from paper_trades where id = ?",
+                (trade_id,),
+            ).fetchone()
+            self.assertIsNone(labeled["execution_order_id"])
+            self.assertEqual("synthetic_nav_reference_paper", labeled["route_id"])
+            self.assertTrue(json.loads(labeled["candidate_json"])["paper_nav_reference"])
+
+        frame = {
+            **adx_nav_observation(101.0, now.isoformat()),
+            "return_5m_bps": 100.0,
+        }
+        for invalid in (
+            {"freshness_state": "stale"},
+            {"session_status": "closed"},
+            {"candidate_reject_reason": "unverified_reference"},
+        ):
+            candidates, diagnostic = generate_program_candidates(
+                experiment,
+                [{**frame, **invalid}],
+                cfg,
+            )
+            self.assertEqual([], candidates, diagnostic)
 
     def test_exploration_tests_non_positive_model_edge_without_promoting_it(self) -> None:
         cfg = settings()

@@ -27,6 +27,9 @@ OUTPUT_TRADE_TYPE_TARGET_SURFACES = {
     "global_proxy_shock_reversal": "proxy",
     "perp_funding_capture": "perp_funding_basis",
 }
+NAV_REFERENCE_ROUTE_SURFACE = "nav_reference"
+NAV_REFERENCE_QUALITY_STATUS = "official_month_end_nav"
+NAV_REFERENCE_REJECT_REASON = "factsheet_nav_not_entry_quality_quote"
 SHOCK_REVERSAL_CALCULATED_FEATURES = {
     "shock_magnitude_bps": "abs(return_60m_bps)",
     "shock_sigma": "abs(return_60m_bps) / max(volatility_60m_bps, 10)",
@@ -133,6 +136,11 @@ PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS = {
     "route_requirements",
     "route_id",
     "route_status",
+    "market_surface",
+    "freshness_state",
+    "candidate_reject_reason",
+    "price_source",
+    "source_adapter_id",
 }
 METADATA_NAMES = {
     "venue",
@@ -147,6 +155,10 @@ METADATA_NAMES = {
     "route_status",
     "quality_status",
     "data_status",
+    "market_surface",
+    "freshness_state",
+    "candidate_reject_reason",
+    "price_source",
 }
 ALLOWED_AST_NODES = (
     ast.Expression,
@@ -720,7 +732,14 @@ def compile_observation_program(logic: dict) -> tuple[dict | None, dict]:
         program["calculated_features"] = ordered_calculated
         program.update(expressions)
         program["route_surface"] = str(program.get("route_surface") or "auto").lower()
-        if program["route_surface"] not in {"auto", "spot", "perp", "proxy", "prediction"}:
+        if program["route_surface"] not in {
+            "auto",
+            "spot",
+            "perp",
+            "proxy",
+            "prediction",
+            NAV_REFERENCE_ROUTE_SURFACE,
+        }:
             raise ProgramValidationError("unsupported_route_surface")
         program["output_trade_type"] = str(program.get("output_trade_type") or "").lower()
         if program["output_trade_type"]:
@@ -792,6 +811,10 @@ def _route_mapping(frame: dict, program: dict, side: str) -> tuple[str, str]:
         direction = "funding_capture_short_perp" if side == "short" else "funding_capture_long_perp"
         return "perp_funding_basis", direction
     surface = _route_surface(frame, program)
+    if surface == NAV_REFERENCE_ROUTE_SURFACE:
+        # A reference NAV can support a directional paper measurement, but it
+        # is never evidence of an executable order route.
+        return "global_market_discovery_proxy", f"{side}_proxy"
     if surface == "spot":
         return "frontier_crypto_venue_map", f"{side}_frontier_spot"
     if surface == "perp":
@@ -807,10 +830,33 @@ def _route_mapping(frame: dict, program: dict, side: str) -> tuple[str, str]:
 
 def _target_surface(frame: dict, program: dict) -> str:
     output_trade_type = str(program.get("output_trade_type") or "")
+    if _route_surface(frame, program) == NAV_REFERENCE_ROUTE_SURFACE:
+        return str(frame.get("market_surface") or "").strip().lower()
     return OUTPUT_TRADE_TYPE_TARGET_SURFACES.get(
         output_trade_type,
         _route_surface(frame, program),
     )
+
+
+def _nav_reference_provenance(frame: dict) -> tuple[bool, list[str]]:
+    """Validate the disclosed-NAV contract before making a paper label.
+
+    Factsheet NAV observations are intentionally watch-only.  The reference
+    route accepts only the exact public disclosure shape and remains isolated
+    from ordinary order-ticket execution.
+    """
+    missing: list[str] = []
+    if not str(frame.get("market_surface") or "").strip():
+        missing.append("market_surface")
+    if str(frame.get("quality_status") or "") != NAV_REFERENCE_QUALITY_STATUS:
+        missing.append("quality_status")
+    if str(frame.get("candidate_reject_reason") or "") != NAV_REFERENCE_REJECT_REASON:
+        missing.append("candidate_reject_reason")
+    if str(frame.get("freshness_state") or "") != "fresh":
+        missing.append("freshness_state")
+    if not str(frame.get("price_source") or "").strip():
+        missing.append("price_source")
+    return not missing, missing
 
 
 def _program_values(frame: dict, program: dict) -> dict:
@@ -850,6 +896,16 @@ def generate_program_candidates(
         if str(frame.get("session_status") or "").lower() in {"closed", "stale", "unavailable"}:
             rejects["session_not_open"] += 1
             continue
+        is_nav_reference = _route_surface(frame, program) == NAV_REFERENCE_ROUTE_SURFACE
+        provenance_valid = True
+        provenance_missing: list[str] = []
+        if is_nav_reference:
+            provenance_valid, provenance_missing = _nav_reference_provenance(frame)
+            if not provenance_valid:
+                rejects["nav_reference_provenance_invalid"] += 1
+                for field in provenance_missing:
+                    rejects[f"nav_reference_missing:{field}"] += 1
+                continue
         try:
             values = _program_values(frame, program)
             if not bool(evaluate_expression(program["entry_expression"], values)):
@@ -925,6 +981,17 @@ def generate_program_candidates(
             "base": frame.get("base"),
             "quote": frame.get("quote"),
             "paper_only": True,
+            "paper_nav_reference": is_nav_reference,
+            "paper_nav_reference_provenance_valid": provenance_valid,
+            "paper_nav_reference_provenance": {
+                "market_surface": str(frame.get("market_surface") or ""),
+                "quality_status": str(frame.get("quality_status") or ""),
+                "candidate_reject_reason": str(frame.get("candidate_reject_reason") or ""),
+                "freshness_state": str(frame.get("freshness_state") or ""),
+                "price_source": str(frame.get("price_source") or ""),
+            }
+            if is_nav_reference
+            else {},
             "strategy_lab_id": str(experiment.get("strategy_lab_id")),
             "strategy_lab_version": int(experiment.get("version") or 1),
             "strategy_lab_experiment_type": "market_strategy",
