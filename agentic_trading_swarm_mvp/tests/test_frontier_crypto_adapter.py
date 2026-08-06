@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import frontier_crypto_adapter as frontier
+from paper_order_router import FRONTIER_PAPER_ADMISSION_REASON_PREFIX
 import route_resolver
 import signal_redesign
 from paper_exploration import fair_lineage_order
@@ -296,6 +297,7 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
 
         self.assertEqual(candidate["direction"], "long_frontier_spot")
         self.assertFalse(candidate["paper_entry_blocked"])
+        self.assertIsNone(candidate["candidate_reject_reason"])
         self.assertEqual(candidate["market_data_origin"], "native_public_spot")
         self.assertEqual(candidate["instrument_metadata"]["venue"], "VALR")
         self.assertEqual(candidate["venue_constraints"]["price_precision"], 0)
@@ -1107,7 +1109,12 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual(6.0, costs["borrow_proxy_penalty_bps"])
         self.assertEqual("unconfirmed_borrow_proxy", costs["borrow_proxy_source"])
         self.assertEqual("short_cost_decomposition.net_edge_bps", candidate["paper_ranking_edge_source"])
-        self.assertFalse(candidate["paper_entry_blocked"])
+        self.assertTrue(candidate["paper_entry_blocked"])
+        self.assertEqual(
+            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:route_feasibility",
+            candidate["candidate_reject_reason"],
+        )
+        self.assertFalse(candidate["frontier_paper_admission"]["admitted"])
 
     def test_summary_breaks_out_route_feasibility_reasons_and_verified_exceptions(self) -> None:
         gated = {

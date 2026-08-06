@@ -15,7 +15,7 @@ if str(SRC) not in sys.path:
 from execution_engine import execute_order  # noqa: E402
 from frontier_crypto_adapter import rank_frontier_paper_candidates  # noqa: E402
 from paper_order_router import (  # noqa: E402
-    PAPER_NET_EDGE_GUARD_REASON,
+    FRONTIER_PAPER_ADMISSION_REASON_PREFIX,
     apply_frontier_paper_admission_guard,
 )
 from settings import DEFAULT_SETTINGS  # noqa: E402
@@ -72,14 +72,18 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         codes = {check["code"] for check in guarded["candidate_reject_detail"]["checks"]}
         self.assertTrue(guarded["shadow_filtered"])
         self.assertEqual("shadow_only", guarded["paper_action"])
-        self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, guarded["candidate_reject_reason"])
+        self.assertEqual(
+            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:data_quality+cost+route_feasibility",
+            guarded["candidate_reject_reason"],
+        )
         self.assertTrue(
             {
-                "quality_action_not_normal",
+                "quality_action_shadow_only",
                 "quality_status_not_verified",
+                "quality_score_below_minimum",
                 "edge_bps_estimate_not_positive",
-                "gross_edge_not_above_round_trip_cost_plus_buffer",
                 "simulated_slippage_exceeds_edge",
+                "route_status_not_standard",
                 "empty_book",
                 "invalid_best_prices",
                 "ticker_book_midpoint_mismatch",
@@ -87,11 +91,16 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
                 "depth_cliff",
             }.issubset(codes)
         )
-        self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, guarded["shadow_reason"])
+        self.assertEqual(guarded["candidate_reject_reason"], guarded["shadow_reason"])
         self.assertFalse(guarded["paper_score_eligible"])
         self.assertEqual(0.0, guarded["paper_score_multiplier"])
+        self.assertFalse(guarded["frontier_paper_admission"]["admitted"])
+        self.assertEqual(
+            ["data_quality", "cost", "route_feasibility"],
+            guarded["frontier_paper_admission"]["failed_categories"],
+        )
 
-    def test_explicit_quality_or_anomaly_failure_is_shadowed(self) -> None:
+    def test_explicit_anomaly_failure_is_shadowed(self) -> None:
         guarded = apply_frontier_paper_admission_guard(
             candidate(quality_action="conditional", anomaly_flags=["empty_book"])
         )
@@ -99,8 +108,12 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         self.assertTrue(guarded["shadow_filtered"])
         self.assertEqual("shadow_only", guarded["paper_action"])
         self.assertEqual(
-            {"quality_action_not_normal", "empty_book"},
+            {"empty_book"},
             {check["code"] for check in guarded["candidate_reject_detail"]["checks"]},
+        )
+        self.assertEqual(
+            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:data_quality",
+            guarded["candidate_reject_reason"],
         )
 
     def test_exactly_five_bps_of_gross_cost_headroom_is_eligible(self) -> None:
@@ -109,6 +122,7 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         )
 
         self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertTrue(guarded["frontier_paper_admission"]["admitted"])
 
     def test_missing_optional_scanner_fields_do_not_shadow_an_otherwise_valid_candidate(self) -> None:
         guarded = apply_frontier_paper_admission_guard(
@@ -125,14 +139,35 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         self.assertIsNone(guarded.get("candidate_reject_reason"))
 
     def test_ranked_shadow_candidate_remains_reportable(self) -> None:
-        weak = candidate(gross_edge_bps_estimate=24.0)
+        weak = candidate(quality_score=79.0)
 
         ranked = rank_frontier_paper_candidates([weak], copy.deepcopy(DEFAULT_SETTINGS))
 
         self.assertEqual([weak], ranked)
         self.assertTrue(weak["shadow_filtered"])
         self.assertEqual("shadow_only", weak["candidate_status"])
-        self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, weak["candidate_reject_reason"])
+        self.assertEqual(
+            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:data_quality",
+            weak["candidate_reject_reason"],
+        )
+        self.assertLessEqual(float(weak["score"]), 59.999)
+
+    def test_verified_standard_route_positive_net_candidate_is_not_suppressed(self) -> None:
+        guarded = apply_frontier_paper_admission_guard(
+            candidate(
+                quality_status="verified",
+                quality_action="normal",
+                quality_score=85.0,
+                gross_edge_bps_estimate=24.0,
+                estimated_round_trip_cost_bps=20.0,
+                edge_bps_estimate=4.0,
+                route_status="standard",
+                anomaly_flags=[],
+            )
+        )
+
+        self.assertFalse(guarded.get("shadow_filtered", False))
+        self.assertIsNone(guarded.get("candidate_reject_reason"))
 
     def test_exploration_boundary_does_not_fill_a_rejected_frontier_candidate(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -152,13 +187,22 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         self.assertFalse(result["paper_filled"])
         self.assertEqual("shadow_only", result["order"]["status"])
         self.assertIsNone(result["order_id"])
-        self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, result["candidate"]["candidate_reject_reason"])
-        self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, result["candidate"]["shadow_reason"])
+        self.assertEqual(
+            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:cost",
+            result["candidate"]["candidate_reject_reason"],
+        )
+        self.assertEqual(
+            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:cost",
+            result["candidate"]["shadow_reason"],
+        )
         self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
         observation = conn.execute(
             "select reject_reason from frontier_paper_shadow_observations"
         ).fetchone()
-        self.assertEqual(PAPER_NET_EDGE_GUARD_REASON, observation[0])
+        self.assertEqual(
+            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:cost",
+            observation[0],
+        )
 
 
 if __name__ == "__main__":

@@ -404,7 +404,15 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         # its guard.  This lets a released quarantine re-admit the exact
         # family in non-exploration paper configurations as well.
         candidate = apply_okx_basis_decay_quarantine(dict(candidate), settings, conn=conn)
-        candidate = apply_frontier_paper_guard(candidate, settings)
+        existing_reject_detail = candidate.get("candidate_reject_detail") or {}
+        scanner_shadow_preserved = (
+            paper_mode
+            and candidate.get("shadow_filtered")
+            and isinstance(existing_reject_detail, dict)
+            and existing_reject_detail.get("guard") == "frontier_paper_admission_guard"
+        )
+        if not scanner_shadow_preserved:
+            candidate = apply_frontier_paper_guard(candidate, settings)
         recovery_probe = bool(
             settings.get("mode") == "paper"
             and not settings.get("allow_live_trading")
@@ -457,14 +465,23 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
                 "candidate": candidate,
             }
         reject_reason = candidate.get("candidate_reject_reason")
+        reject_detail = candidate.get("candidate_reject_detail") or {}
+        scanner_shadow_observation = (
+            isinstance(reject_detail, dict)
+            and reject_detail.get("guard") == "frontier_paper_admission_guard"
+        )
         shadow_observation = reject_reason == FRONTIER_SHADOW_REASON or (
-            paper_mode and reject_reason == PAPER_NET_EDGE_GUARD_REASON
+            paper_mode
+            and (
+                reject_reason == PAPER_NET_EDGE_GUARD_REASON
+                or scanner_shadow_observation
+            )
         )
         if shadow_observation:
             observation_id = save_frontier_paper_shadow_observation(conn, candidate, review)
             order["status"] = (
                 "shadow_only"
-                if reject_reason == PAPER_NET_EDGE_GUARD_REASON
+                if reject_reason == PAPER_NET_EDGE_GUARD_REASON or scanner_shadow_observation
                 else "shadow_observed"
             )
             order["shadow_filter"] = candidate.get("candidate_reject_detail")

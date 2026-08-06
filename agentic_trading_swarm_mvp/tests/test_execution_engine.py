@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from execution_engine import build_order_ticket, execute_order  # noqa: E402
+from paper_order_router import FRONTIER_PAPER_ADMISSION_REASON_PREFIX  # noqa: E402
 from settings import DEFAULT_SETTINGS  # noqa: E402
 from storage import execution_summary, init_db, open_paper_trade, record_due_horizon_outcomes  # noqa: E402
 import strategy_reliability  # noqa: E402
@@ -52,6 +53,7 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
             "direction": "short_frontier_spot",
             "trade_type": "frontier_crypto_venue_map",
             "market_surface": "frontier_crypto_venue_map",
+            "frontier_paper_admission_guard_applies": True,
             "signal_key": "GATE|frontier_crypto_venue_map|short_frontier_spot|conditional",
             "last": 1.0,
             "score": 80.0,
@@ -88,7 +90,10 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
         row = conn.execute(
             "select reject_reason from frontier_paper_shadow_observations"
         ).fetchone()
-        self.assertEqual("paper_net_edge_guard", row["reject_reason"])
+        self.assertEqual(
+            f"{FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:route_feasibility",
+            row["reject_reason"],
+        )
         counters = execution_summary(conn)["frontier_paper_candidates"]
         self.assertEqual(0, counters["accepted"])
         self.assertEqual(1, counters["shadowed"])
