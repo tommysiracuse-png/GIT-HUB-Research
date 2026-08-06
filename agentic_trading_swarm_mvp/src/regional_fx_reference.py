@@ -16,10 +16,13 @@ REPORT_JSON = RUNS_DIR / "regional_fx_reference_latest.json"
 
 DEFAULT_QUOTES = (
     "ARS",
+    "AUD",
     "BRL",
     "CLP",
     "COP",
+    "EUR",
     "GHS",
+    "GBP",
     "IDR",
     "KES",
     "MXN",
