@@ -170,9 +170,43 @@ def prepare_candidate_for_exploration(candidate: dict, settings: Mapping | None)
     """Annotate a candidate for direct or isolated synthetic paper execution."""
     if not exploration_enabled(settings):
         return candidate
+    cfg = exploration_config(settings)
+    if candidate.get("synthetic_research_paper") and candidate.get("paper_reported_spot_reference"):
+        # An explicit public-reference program may have passed through the
+        # generic route resolver for diagnostics. Its route metadata must
+        # still never make that reference look orderable: retain the direct
+        # route separately and always return the existing synthetic route.
+        prepared = dict(candidate)
+        direct_route = dict(prepared.get("execution_route") or {})
+        direct_feasibility = dict(prepared.get("execution_feasibility") or {})
+        if direct_route:
+            prepared["direct_execution_route"] = direct_route
+        if direct_feasibility:
+            prepared["direct_execution_feasibility"] = direct_feasibility
+        synthetic_route_id = str(cfg.get("synthetic_route_id") or SYNTHETIC_ROUTE_ID)
+        prepared["execution_route"] = {
+            "route_id": synthetic_route_id,
+            "route_status": "paper_testable_research",
+            "missing_permissions": [],
+            "notes": ["Synthetic research route; not evidence of real-world executability."],
+        }
+        prepared["execution_feasibility"] = {
+            "status": "paper_testable_research",
+            "route_status": "paper_testable_research",
+            "route_id": synthetic_route_id,
+            "missing_requirements": [],
+            "route_notes": ["Direct route diagnostics are retained separately for research."],
+        }
+        prepared["route_id"] = synthetic_route_id
+        prepared["route_status"] = "paper_testable_research"
+        prepared["synthetic_not_live_equivalent"] = True
+        prepared["paper_execution_semantics"] = "synthetic_research_not_live_equivalent"
+        prepared["signal_stats_scope"] = SYNTHETIC_STATS_SCOPE
+        prepared["promotion_eligible"] = False
+        prepared["_hunter_bucket"] = "diagnose"
+        return prepared
     if candidate.get("synthetic_research_paper") and candidate.get("signal_stats_scope") == SYNTHETIC_STATS_SCOPE:
         return candidate
-    cfg = exploration_config(settings)
     original_blocked = bool(candidate.get("paper_entry_blocked") or candidate.get("shadow_filtered"))
     prepared = dict(candidate)
     prepared["execution_structure"] = execution_structure(candidate)

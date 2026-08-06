@@ -54,7 +54,11 @@ def _side_for_direction(direction: str) -> str:
 
 def _route_for_candidate(candidate: dict, review: dict) -> str:
     if candidate.get("synthetic_research_paper"):
-        return str(candidate.get("route_id") or "synthetic_research_paper")
+        return str(
+            candidate.get("synthetic_route_id")
+            or candidate.get("route_id")
+            or "synthetic_research_paper"
+        )
     resolved_route = (
         review.get("effective_route_id")
         or review.get("route_id")

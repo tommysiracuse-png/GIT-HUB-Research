@@ -23,6 +23,8 @@ RESOLVABLE_TABLES = {
     "adapter_specs",
     "route_probe_tasks",
 }
+EEX_SECONDARY_SPOT_SURFACE = "eex_eu_ets_secondary_spot_trades"
+EEX_SECONDARY_SPOT_LAB_ID = "eex_eu_ets_secondary_spot_reported_trade_v1"
 
 
 def _strategy_lab_id(state: dict[str, Any]) -> str:
@@ -180,6 +182,105 @@ def _create_enrichment(conn: sqlite3.Connection, state: dict[str, Any]) -> dict[
     return {"action": directive, "status": "created", "topic_key": claim.topic_key}
 
 
+def _create_eex_secondary_spot_program(
+    conn: sqlite3.Connection,
+    settings: dict,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the canonical paper-only program for reported EEX spot trades.
+
+    EEX's public DataSource row is a completed trade, not an executable
+    quote. It is nevertheless a priceable official observation. The
+    program preserves that distinction and lets the normal exploration layer
+    select its existing synthetic research route rather than inventing a
+    broker or venue route.
+    """
+
+    claim = _claim(conn, state, "activate_eex_secondary_spot_paper_research", 90)
+    if claim.duplicate and claim.canonical_row_id:
+        return {"action": "strategy_lab_eex_spot_program", "status": "deduplicated", "topic_key": claim.topic_key}
+    evidence = _evidence(state)
+    rec = {
+        "recommendation_id": f"market_admission:{state['admission_key']}:eex_secondary_spot_program",
+        "source_agent": "market_admission_bridge",
+        "payload": {
+            "agent_name": "market_admission_bridge",
+            "title": "Paper-test EEX EU ETS reported secondary spot trades",
+            "rationale": (
+                "Fresh, validated official EEX secondary spot trades provide public price observations. "
+                "They are tested only as synthetic research and never as executable EEX quotes."
+            ),
+            "strategy_lab_experiment": {
+                "strategy_lab_id": EEX_SECONDARY_SPOT_LAB_ID,
+                "experiment_type": "market_strategy",
+                "hypothesis": (
+                    "A fresh validated EEX EUA or EUAA reported secondary spot trade supports a "
+                    "same-surface synthetic paper continuation measurement."
+                ),
+                "source_surface": EEX_SECONDARY_SPOT_SURFACE,
+                "permitted_target_surface": [EEX_SECONDARY_SPOT_SURFACE],
+                "strategy_logic": {
+                    "type": "observation_program",
+                    "universe": {
+                        "venues": ["EEX"],
+                        "asset_classes": ["emission_allowance"],
+                        "market_types": ["spot_trade_reference"],
+                        "market_surfaces": [EEX_SECONDARY_SPOT_SURFACE],
+                    },
+                    "calculated_features": {
+                        "reported_trade_volume_signal": "log1p(reported_trade_volume)",
+                        "reported_trade_validation_signal": "reported_trade_valid",
+                    },
+                    "entry_expression": (
+                        "quality_status == 'official_reported_trade' "
+                        "and candidate_reject_reason == 'reported_spot_trade_not_executable_quote' "
+                        "and freshness_state == 'fresh' and reported_trade_price > 0"
+                    ),
+                    "invalidation_expression": (
+                        "freshness_state != 'fresh' or reported_trade_price <= 0"
+                    ),
+                    "direction": "long",
+                    "edge_expression": "return_5m_bps",
+                    "score_expression": (
+                        "clip(50 + return_5m_bps / 4 + reported_trade_volume_signal "
+                        "+ reported_trade_validation_signal, 0, 100)"
+                    ),
+                    "route_surface": "proxy",
+                },
+                "data_requirements": {
+                    "admission_key": state.get("admission_key"),
+                    "market_surface": EEX_SECONDARY_SPOT_SURFACE,
+                    "required_fields": [
+                        "last",
+                        "reported_trade_price",
+                        "reported_trade_volume",
+                        "reported_trade_valid",
+                        "price_source",
+                        "source_url",
+                    ],
+                    "requires_independent_signal_logic": True,
+                    "paper_only_reference": True,
+                },
+                "risk_gates": {
+                    "require_route_feasible": False,
+                    "paper_allocation_multiplier": 0.25,
+                    "synthetic_research_only": True,
+                },
+            },
+            "evidence": evidence,
+        },
+    }
+    result = ingest_strategy_lab_recommendation(conn, rec, settings)[0]
+    if result.get("strategy_lab_id"):
+        bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
+    return {
+        "action": "strategy_lab_eex_spot_program",
+        "status": "created" if result.get("created") else "updated",
+        "strategy_lab_id": result.get("strategy_lab_id"),
+        "topic_key": claim.topic_key,
+    }
+
+
 def _create_strategy_discovery(
     conn: sqlite3.Connection,
     settings: dict,
@@ -294,7 +395,13 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
         resolved_topics += _resolve_prior_stage_topics(conn, state)
         stage = str(state.get("current_stage") or "")
         if stage == "priceable":
-            actions.append(_create_enrichment(conn, state))
+            if (
+                str(state.get("venue") or "").upper() == "EEX"
+                and str(state.get("market_surface") or "") == EEX_SECONDARY_SPOT_SURFACE
+            ):
+                actions.append(_create_eex_secondary_spot_program(conn, settings, state))
+            else:
+                actions.append(_create_enrichment(conn, state))
         elif stage == "quality_verified" and str(state.get("strategy_lineage") or "") == "adapter_observation":
             actions.append(_create_strategy_discovery(conn, settings, state))
         elif stage == "strategy_candidate":

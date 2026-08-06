@@ -874,6 +874,12 @@ def parse_eex_emissions_spot(
         allowance = _allowance_type(root, product, long_name)
         freshness_state, freshness_age = _freshness(event_time, received_at, stale_after_hours)
         trade_id = str(_row_value(row, "TradeID") or event_time.isoformat())
+        valid_trade = str(_row_value(row, "ValidTrade") or "").strip()
+        valid_trade_normalized = valid_trade.lower()
+        if valid_trade_normalized in {"no", "false", "0", "invalid"}:
+            # An explicitly invalid trade is not a defensible public price.
+            invalid_rows += 1
+            continue
         parsed.append(
             {
                 "venue": "EEX",
@@ -892,6 +898,20 @@ def parse_eex_emissions_spot(
                 "last": price,
                 "trade_price": price,
                 "traded_volume": number(_row_value(row, "TradedVolume")),
+                # These deliberately retain the reported-trade semantics. A
+                # Strategy Lab observation program can use them as public
+                # research features, but they are not a bid, ask, or orderable
+                # EEX quote.
+                "reported_trade_price": price,
+                "reported_trade_volume": number(_row_value(row, "TradedVolume")),
+                "reported_trade_valid": (
+                    1.0
+                    if valid_trade_normalized in {"yes", "true", "1", "valid"}
+                    # Missing validity metadata is diagnostic rather than a
+                    # candidate suppression: the official reported price can
+                    # still be measured on the synthetic paper path.
+                    else 0.5
+                ),
                 "market_area": str(_row_value(row, "MarketArea") or "").strip() or None,
                 "unit_of_prices": str(_row_value(row, "UnitOfPrices") or "EUR").strip(),
                 "unit_of_volumes": str(_row_value(row, "UnitOfVolumes") or "tCO2").strip(),
@@ -899,14 +919,18 @@ def parse_eex_emissions_spot(
                 "root": root,
                 "product": product or None,
                 "trade_id": trade_id,
-                "valid_trade": str(_row_value(row, "ValidTrade") or "").strip() or None,
+                "valid_trade": valid_trade or None,
                 "data_status": "reachable",
                 "fetch_status": "reachable",
                 "quality_status": "official_reported_trade",
                 "freshness_state": freshness_state,
                 "freshness_basis": "official_trade_timestamp",
                 "freshness_age_seconds": freshness_age,
-                "session_status": "closed",
+                # Secondary spot trading is a continuous market. The
+                # individual trade is historical, but a fresh reported trade
+                # remains a valid paper-research observation until its
+                # freshness window expires.
+                "session_status": "continuous",
                 "observed_at": event_time.astimezone(dt.timezone.utc).isoformat(),
                 "fetched_at": received_at or utc_now(),
                 "source_record_type": "datasource_getSpot",

@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 
 from settings import DEFAULT_SETTINGS  # noqa: E402
 from execution_engine import execute_order  # noqa: E402
+from paper_exploration import prepare_candidate_for_exploration  # noqa: E402
 from radar_loop import _select_runtime_strategy_lab_candidates  # noqa: E402
 from storage import init_db, open_paper_trade, record_due_horizon_outcomes  # noqa: E402
 from strategy_lab import (  # noqa: E402
@@ -322,6 +323,68 @@ def boc_auction_reference_logic() -> dict:
         "edge_expression": "auction_demand_pressure",
         "score_expression": "clip(50 + 10 * auction_demand_pressure, 0, 100)",
         "route_surface": "auction_reference",
+    }
+
+
+def eex_reported_spot_observation(price: float, observed_at: str, **overrides: object) -> dict:
+    row = {
+        "inst_id": "EEX:EUAA:SPOT:691200",
+        "venue": "EEX",
+        "trade_type": "official_market_reference",
+        "market_type": "spot_trade_reference",
+        "market_surface": "eex_eu_ets_secondary_spot_trades",
+        "asset_class": "emission_allowance",
+        "base": "EUAA",
+        "quote": "EUR_PER_TCO2",
+        "last": price,
+        "reported_trade_price": price,
+        "reported_trade_volume": 1_000.0,
+        "reported_trade_valid": 1.0,
+        "traded_volume": 1_000.0,
+        "trade_id": "691200",
+        "quality_status": "official_reported_trade",
+        "candidate_reject_reason": "reported_spot_trade_not_executable_quote",
+        "freshness_state": "fresh",
+        "session_status": "continuous",
+        "data_status": "reachable",
+        "observed_at": observed_at,
+        "price_source": "EEX EU ETS secondary spot trade",
+        "source_url": "https://api1.datasource.eex-group.com/getSpot/2026-08-04",
+        "source_record_type": "datasource_getSpot",
+        "source_adapter_id": "eex_eua_primary_auction_spot_public",
+    }
+    row.update(overrides)
+    return row
+
+
+def eex_reported_spot_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["EEX"],
+            "asset_classes": ["emission_allowance"],
+            "market_types": ["spot_trade_reference"],
+            "market_surfaces": ["eex_eu_ets_secondary_spot_trades"],
+        },
+        "calculated_features": {
+            "reported_trade_volume_signal": "log1p(reported_trade_volume)",
+            "reported_trade_validation_signal": "reported_trade_valid",
+        },
+        "entry_expression": (
+            "quality_status == 'official_reported_trade' "
+            "and candidate_reject_reason == 'reported_spot_trade_not_executable_quote' "
+            "and freshness_state == 'fresh' and reported_trade_price > 0"
+        ),
+        "invalidation_expression": (
+            "freshness_state != 'fresh' or reported_trade_price <= 0"
+        ),
+        "direction": "long",
+        "edge_expression": "return_5m_bps",
+        "score_expression": (
+            "clip(50 + return_5m_bps / 4 + reported_trade_volume_signal "
+            "+ reported_trade_validation_signal, 0, 100)"
+        ),
+        "route_surface": "proxy",
     }
 
 
@@ -870,6 +933,62 @@ class StrategyProgramTests(unittest.TestCase):
                 cfg,
             )
             self.assertEqual([], candidates, diagnostic)
+
+    def test_eex_reported_spot_program_preserves_provenance_and_uses_synthetic_paper_route(self) -> None:
+        cfg = settings()
+        cfg["paper_exploration"]["enabled"] = True
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        recommendation = lab_recommendation(
+            "eex_eu_ets_secondary_spot_reported_trade_v1", eex_reported_spot_logic()
+        )
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["hypothesis"] = "Fresh official EEX reported spot trades support isolated continuation measurement."
+        experiment["source_surface"] = "eex_eu_ets_secondary_spot_trades"
+        experiment["permitted_target_surface"] = ["eex_eu_ets_secondary_spot_trades"]
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            record_feature_snapshots(
+                conn,
+                [eex_reported_spot_observation(80.0, (now - dt.timedelta(minutes=5)).isoformat())],
+                cfg,
+            )
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [eex_reported_spot_observation(80.5, now.isoformat())],
+            )
+
+            self.assertEqual(1, len(generated), report)
+            candidate = generated[0]
+            self.assertEqual("eex_eu_ets_secondary_spot_trades", candidate["target_surface"])
+            self.assertEqual("reported_spot_trade_not_executable_quote", candidate["candidate_reject_reason"])
+            self.assertEqual(80.5, candidate["reported_trade_price"])
+            self.assertEqual(1_000.0, candidate["reported_trade_volume"])
+            self.assertEqual(1.0, candidate["reported_trade_valid"])
+            self.assertTrue(candidate["paper_reported_spot_reference"])
+            self.assertEqual("synthetic_research_paper", candidate["synthetic_route_id"])
+            self.assertEqual(
+                "https://api1.datasource.eex-group.com/getSpot/2026-08-04",
+                candidate["source_url"],
+            )
+
+            synthetic = prepare_candidate_for_exploration(candidate, cfg)
+            self.assertTrue(synthetic["synthetic_research_paper"])
+            self.assertFalse(synthetic["promotion_eligible"])
+            self.assertEqual("synthetic_research_not_live_equivalent", synthetic["paper_execution_semantics"])
+
+            execution = execute_order(
+                conn,
+                synthetic,
+                {"learned_score": synthetic["score"], "paper_allocation_multiplier": 1.0},
+                cfg,
+            )
+            self.assertTrue(execution["paper_filled"])
+            self.assertEqual("synthetic_research_paper", execution["order"]["route_id"])
+            self.assertEqual("paper", execution["order"]["mode"])
 
     def test_boc_auction_reference_uses_feature_snapshots_and_next_same_tenor_label(self) -> None:
         cfg = settings()

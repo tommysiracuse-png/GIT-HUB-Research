@@ -3147,7 +3147,11 @@ class PublicAdapterParserTests(unittest.TestCase):
         self.assertEqual("EEX:EUAA:SPOT:691200", row["inst_id"])
         self.assertEqual(80.5, row["last"])
         self.assertEqual(1_000.0, row["traded_volume"])
+        self.assertEqual(80.5, row["reported_trade_price"])
+        self.assertEqual(1_000.0, row["reported_trade_volume"])
+        self.assertEqual(1.0, row["reported_trade_valid"])
         self.assertEqual("fresh", row["freshness_state"])
+        self.assertEqual("continuous", row["session_status"])
         self.assertEqual("watch_only", row["direction"])
         self.assertEqual(source_url, row["source_url"])
 

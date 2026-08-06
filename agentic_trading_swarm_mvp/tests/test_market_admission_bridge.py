@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import pathlib
 import sqlite3
 import sys
@@ -69,6 +70,36 @@ class MarketAdmissionBridgeTests(unittest.TestCase):
         row = self.conn.execute("select * from strategy_lab_experiments").fetchone()
         self.assertIsNotNone(row)
         self.assertIn("admission_discovery_", row["strategy_lab_id"])
+
+    def test_eex_priceable_reported_spot_creates_canonical_synthetic_research_program(self) -> None:
+        eex_spot = state(
+            "priceable",
+            venue="EEX",
+            inst_id="EEX:EUAA:SPOT:691200",
+            market_surface="eex_eu_ets_secondary_spot_trades",
+            session_status="continuous",
+            blocker_code="quality_unverified",
+            details={"quality_status": "official_reported_trade", "route_status": "unknown"},
+        )
+        result = market_admission_bridge.run_market_admission_bridge(
+            self.conn, self.settings, {"states": [eex_spot]}
+        )
+        row = self.conn.execute(
+            "select strategy_lab_id, strategy_logic_json, risk_gates_json from strategy_lab_experiments"
+        ).fetchone()
+
+        self.assertEqual(1, result["summary"]["actions_created"])
+        self.assertEqual("strategy_lab_eex_spot_program", result["actions"][0]["action"])
+        self.assertEqual("eex_eu_ets_secondary_spot_reported_trade_v1", row["strategy_lab_id"])
+        logic = json.loads(row["strategy_logic_json"])
+        self.assertEqual("observation_program", logic["type"])
+        self.assertEqual(
+            "reported_trade_valid",
+            logic["calculated_features"]["reported_trade_validation_signal"],
+        )
+        self.assertNotIn("reported_trade_valid", logic["entry_expression"])
+        self.assertEqual("proxy", logic["route_surface"])
+        self.assertTrue(json.loads(row["risk_gates_json"])["synthetic_research_only"])
 
     def test_spot_borrow_user_constraint_suppresses_route_task(self) -> None:
         item = state(

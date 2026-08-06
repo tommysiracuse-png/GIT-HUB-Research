@@ -100,6 +100,12 @@ BASE_FEATURES = {
     "auction_average_yield_pct",
     "auction_stop_out_yield_pct",
     "auction_result_published",
+    # EEX publishes completed secondary spot trades rather than executable
+    # quotes. Keep the disclosed values distinct from the generic `last`
+    # feature so contracts can require the exact reported-trade provenance.
+    "reported_trade_price",
+    "reported_trade_volume",
+    "reported_trade_valid",
 }
 PERP_FUNDING_CAPTURE_REQUIRED_FEATURES = {
     "funding_bps",
@@ -152,6 +158,13 @@ PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS = {
     "candidate_reject_reason",
     "price_source",
     "source_adapter_id",
+    "source_url",
+    "source_record_type",
+    "trade_id",
+    "traded_volume",
+    "reported_trade_price",
+    "reported_trade_volume",
+    "reported_trade_valid",
 }
 METADATA_NAMES = {
     "venue",
@@ -422,6 +435,12 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
         "auction_result_published": (
             1.0 if str(row.get("quality_status") or "") == AUCTION_REFERENCE_QUALITY_STATUS else 0.0
         ),
+        "reported_trade_price": _float(row.get("reported_trade_price", last)),
+        "reported_trade_volume": max(
+            0.0,
+            _float(row.get("reported_trade_volume", row.get("traded_volume"))),
+        ),
+        "reported_trade_valid": max(0.0, _float(row.get("reported_trade_valid"))),
     }
 
 
@@ -951,6 +970,10 @@ def generate_program_candidates(
         min(1.0, _float(risk_gates.get("paper_allocation_multiplier"), 1.0)),
     )
     exploration_mode = bool((settings.get("paper_exploration") or {}).get("enabled", False))
+    synthetic_route_id = str(
+        (settings.get("paper_exploration") or {}).get("synthetic_route_id")
+        or "synthetic_research_paper"
+    )
     generated: list[dict] = []
     rejects: dict[str, int] = defaultdict(int)
     lifecycle_diagnostics: dict[str, int] = defaultdict(int)
@@ -967,6 +990,17 @@ def generate_program_candidates(
         route_surface = _route_surface(frame, program)
         is_nav_reference = route_surface == NAV_REFERENCE_ROUTE_SURFACE
         is_auction_reference = route_surface == AUCTION_REFERENCE_ROUTE_SURFACE
+        # EEX's public DataSource secondary-spot feed reports completed
+        # trades. It supplies a defensible public price for research but no
+        # executable quote, so preserve it on the generic synthetic research
+        # route even if a broad route resolver happens to know the venue.
+        is_reported_spot_reference = (
+            str(frame.get("venue") or "").upper() == "EEX"
+            and str(frame.get("market_surface") or "") == "eex_eu_ets_secondary_spot_trades"
+            and str(frame.get("quality_status") or "") == "official_reported_trade"
+            and str(frame.get("candidate_reject_reason") or "")
+            == "reported_spot_trade_not_executable_quote"
+        )
         provenance_valid = True
         provenance_missing: list[str] = []
         if is_nav_reference:
@@ -1058,7 +1092,18 @@ def generate_program_candidates(
             "base": frame.get("base"),
             "quote": frame.get("quote"),
             "paper_only": True,
-            "synthetic_research_paper": is_auction_reference,
+            "synthetic_research_paper": is_auction_reference or is_reported_spot_reference,
+            "paper_reported_spot_reference": is_reported_spot_reference,
+            "synthetic_route_id": synthetic_route_id if is_reported_spot_reference else None,
+            "synthetic_not_live_equivalent": is_auction_reference or is_reported_spot_reference,
+            "paper_execution_semantics": (
+                "synthetic_research_not_live_equivalent"
+                if is_reported_spot_reference
+                else None
+            ),
+            "signal_stats_scope": (
+                "synthetic_research" if is_auction_reference or is_reported_spot_reference else None
+            ),
             "paper_nav_reference": is_nav_reference,
             "paper_nav_reference_provenance_valid": provenance_valid,
             "paper_nav_reference_provenance": {
@@ -1113,7 +1158,10 @@ def generate_program_candidates(
                 else None
             ),
             "promotion_eligible": not (
-                invalidation_active_at_entry or non_positive_edge_at_entry
+                invalidation_active_at_entry
+                or non_positive_edge_at_entry
+                or is_auction_reference
+                or is_reported_spot_reference
             ),
             "strategy_reliability_allocation_multiplier": experimental_allocation,
             "strategy_lab_relaxation": risk_gates.get("adaptive_relaxation") or {},
