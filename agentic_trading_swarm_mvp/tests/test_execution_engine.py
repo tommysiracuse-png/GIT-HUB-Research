@@ -15,7 +15,8 @@ if str(SRC) not in sys.path:
 
 from execution_engine import build_order_ticket, execute_order  # noqa: E402
 from settings import DEFAULT_SETTINGS  # noqa: E402
-from storage import execution_summary, init_db, record_due_horizon_outcomes  # noqa: E402
+from storage import execution_summary, init_db, open_paper_trade, record_due_horizon_outcomes  # noqa: E402
+import strategy_reliability  # noqa: E402
 
 
 class ExecutionEnginePaperGuardTests(unittest.TestCase):
@@ -134,6 +135,88 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
         counters = execution_summary(conn)["frontier_paper_candidates"]
         self.assertEqual(1, counters["accepted"])
         self.assertEqual(0, counters["shadowed"])
+
+    def test_yahoo_proxy_freshness_shadow_only_candidate_opens_synthetic_research_trade(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        candidate = {
+            "seen_at": "2026-08-06T14:19:00+00:00",
+            "venue": "YAHOO_PROXY",
+            "inst_id": "YAHOO_PROXY:EWZ",
+            "direction": "long_proxy",
+            "trade_type": "global_proxy_momentum",
+            "last": 100.0,
+            "score": 88.0,
+            "spread_bps": 2.0,
+            "liquidity_score": 0.8,
+            "change_24h_pct": 1.2,
+            "edge_bps_estimate": 10.0,
+            "basis_bps": 0.0,
+            "funding_bps": 0.0,
+            "source_quote_timestamp": "2026-08-06T14:00:00+00:00",
+            "source_session_status": "closed",
+            "source_session_open": False,
+            "source_quote_age_seconds": 1140.0,
+            "last_trade_timestamp": "2026-08-06T14:00:00+00:00",
+            "last_trade_age_seconds": 1140.0,
+            "pre_entry_tick_returns_bps": [-18.0, -10.0, 5.0, -6.0],
+            "proxy_reuse_gate": {
+                "quote_age_seconds": 1140.0,
+                "source_session_status": "closed",
+                "reasons": ["opening_gap_without_live_followthrough"],
+            },
+            "execution_feasibility": {"status": "standard", "route_status": "standard"},
+        }
+        candidate, _ = strategy_reliability.apply_strategy_reliability([candidate], {"mode": "paper"})
+        reviewed = candidate[0]
+        review = {
+            "decision": "approve_paper_trade",
+            "signal_key": reviewed["inst_id"],
+            "learned_score": reviewed["score"],
+            "confidence": 0.8,
+            "net_edge_bps_estimate": 10.0,
+            "paper_allocation_multiplier": 1.0,
+            "feasibility_status": "standard",
+            "route_status": "standard",
+            "missing_requirements": [],
+        }
+
+        execution = execute_order(conn, reviewed, review, DEFAULT_SETTINGS)
+
+        self.assertFalse(execution["paper_filled"])
+        self.assertTrue(execution["paper_observation_ready"])
+        self.assertEqual("shadow_only", execution["order"]["status"])
+        self.assertEqual("synthetic_research", execution["order"]["signal_stats_scope"])
+
+        trade_id = open_paper_trade(conn, reviewed, review, execution=execution, settings=DEFAULT_SETTINGS)
+        row = conn.execute(
+            "select status, context_json from paper_trades where id = ?",
+            (trade_id,),
+        ).fetchone()
+        context = json.loads(row["context_json"])
+        self.assertEqual("open", row["status"])
+        self.assertEqual("synthetic_research", context["signal_stats_scope"])
+
+        observed_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=61)
+        conn.execute("update paper_trades set opened_at = ? where id = ?", (observed_at.isoformat(), trade_id))
+        conn.commit()
+        recorded = record_due_horizon_outcomes(
+            conn,
+            {
+                "YAHOO_PROXY:EWZ": {
+                    "last": 101.0,
+                    "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                }
+            },
+            {"learning": {"horizon_minutes": [60], "max_outcome_delay_seconds": 300}},
+        )
+        self.assertEqual(1, len(recorded))
+        outcome = conn.execute(
+            "select context_json from paper_trade_outcomes where trade_id = ?",
+            (trade_id,),
+        ).fetchone()
+        self.assertEqual("synthetic_research", json.loads(outcome["context_json"])["signal_stats_scope"])
 
 
 if __name__ == "__main__":

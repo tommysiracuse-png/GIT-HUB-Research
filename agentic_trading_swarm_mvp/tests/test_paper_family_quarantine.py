@@ -152,6 +152,34 @@ class PaperFamilyQuarantineTests(unittest.TestCase):
         self.assertFalse(guarded["paper_filled"])
         self.assertEqual(guarded["status"], "shadow_filtered")
 
+    def test_router_prefers_freshness_gate_over_family_quarantine_when_yahoo_telemetry_is_present(self) -> None:
+        candidate = self._candidate(
+            direction="long_proxy",
+            source_quote_timestamp="2026-08-06T14:00:00+00:00",
+            source_session_status="closed",
+            source_session_open=False,
+            source_quote_age_seconds=1140.0,
+            last_trade_timestamp="2026-08-06T14:00:00+00:00",
+            last_trade_age_seconds=1140.0,
+            pre_entry_tick_returns_bps=[-18.0, -10.0, 5.0, -6.0],
+            proxy_reuse_gate={
+                "quote_age_seconds": 1140.0,
+                "source_session_status": "closed",
+                "reasons": ["opening_gap_without_live_followthrough"],
+            },
+            seen_at="2026-08-06T14:19:00+00:00",
+            paper_filled=True,
+            status="paper_filled",
+        )
+
+        reason = frontier_shadow_filter_reason(candidate, config={"mode": "paper"})
+        guarded = apply_frontier_paper_guard(candidate, config={"mode": "paper"})
+
+        self.assertEqual("paper_yahoo_proxy_freshness_shadow_gate", reason["guard"])
+        self.assertEqual("shadow_only", guarded["paper_action"])
+        self.assertTrue(guarded["paper_observation_only"])
+        self.assertEqual("synthetic_research", guarded["signal_stats_scope"])
+
 
 if __name__ == "__main__":
     unittest.main()

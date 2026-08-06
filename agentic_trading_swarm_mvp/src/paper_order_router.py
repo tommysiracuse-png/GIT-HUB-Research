@@ -1123,6 +1123,24 @@ def _paper_family_quarantine_reason(
         return None
 
 
+def _paper_yahoo_proxy_freshness_shadow_reason(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    existing = candidate.get("paper_yahoo_proxy_freshness_gate")
+    if isinstance(existing, Mapping) and _as_bool(existing.get("applies"), False):
+        return dict(existing)
+    try:
+        from strategy_reliability import paper_yahoo_proxy_freshness_shadow_record
+    except Exception:
+        return None
+    try:
+        record = paper_yahoo_proxy_freshness_shadow_record(candidate, config=config)
+    except Exception:
+        return None
+    return dict(record) if isinstance(record, Mapping) else None
+
+
 def _paper_lineage_source_health_reason(
     candidate: Mapping[str, Any],
     config: Mapping[str, Any] | bool | None = None,
@@ -1421,6 +1439,25 @@ def frontier_shadow_filter_reason(
             }
 
     family_reason = _paper_family_quarantine_reason(candidate, config=config)
+    yahoo_proxy_freshness = _paper_yahoo_proxy_freshness_shadow_reason(candidate, config=config)
+    if yahoo_proxy_freshness is not None:
+        if _as_bool(yahoo_proxy_freshness.get("paper_fill_allowed"), True):
+            return None
+        return {
+            **yahoo_proxy_freshness,
+            "reason": yahoo_proxy_freshness.get("reason") or "proxy_freshness_degraded",
+            "paper_only": True,
+            "paper_fill_allowed": False,
+            "guard": "paper_yahoo_proxy_freshness_shadow_gate",
+            "candidate": _candidate_reference(candidate),
+            "cell": _paper_signal_cell(candidate),
+            "checks": [
+                {
+                    "code": yahoo_proxy_freshness.get("reason") or "proxy_freshness_degraded",
+                    "field": "paper_yahoo_proxy_freshness_gate",
+                }
+            ],
+        }
     if family_reason is not None:
         normalized = dict(family_reason) if isinstance(family_reason, Mapping) else {"detail": family_reason}
         normalized.setdefault("reason", "paper_strategy_family_quarantine")
@@ -1595,6 +1632,20 @@ def _annotate_shadow_filtered_candidate(
         guarded["paper_execution_mode"] = "observe_only"
         guarded["paper_observation_only"] = True
         guarded["paper_observation_reason"] = reason.get("reason") or OKX_BASIS_DECAY_QUARANTINE_REASON
+    if reason.get("guard") == "paper_yahoo_proxy_freshness_shadow_gate":
+        guarded["paper_action"] = "shadow_only"
+        guarded["paper_status"] = "shadow_only"
+        guarded["paper_fill_status"] = "shadow_only"
+        guarded["paper_order_status"] = "shadow_only"
+        guarded["router_action"] = "observe_only"
+        guarded["paper_execution_mode"] = "observe_only"
+        guarded["paper_observation_only"] = True
+        guarded["paper_observation_reason"] = reason.get("reason") or "proxy_freshness_degraded"
+        guarded["signal_stats_scope"] = "synthetic_research"
+        guarded["paper_execution_semantics"] = "synthetic_research_not_live_equivalent"
+        guarded["candidate_status"] = "shadow_only"
+        guarded["paper_entry_blocked"] = True
+        guarded["promotion_eligible"] = False
     if reason.get("guard") in {
         "yahoo_proxy_cross_surface_alignment_guard",
         "paper_lineage_source_health",

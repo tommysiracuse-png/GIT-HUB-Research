@@ -142,6 +142,7 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
         for index in range(max(1, len(pairs) - 12), len(pairs))
     ]
     recent_volatility_bps = statistics.pstdev(one_bar_returns) if len(one_bar_returns) > 1 else 0.0
+    pre_entry_tick_returns_bps = [round(value, 3) for value in one_bar_returns[-4:]]
     edge_bps = round(max(0.0, gross_edge_bps - spread), 3)
     score = round(max(0.0, min(100.0, abs_signal + (liq * 25.0) - spread - min(stale_minutes / 10.0, 15.0))), 3)
     if stale_minutes > 120:
@@ -171,13 +172,20 @@ def build_candidate(item: dict, settings: dict) -> dict | None:
         "spread_bps": round(spread, 3),
         "recent_volatility_bps": round(recent_volatility_bps, 3),
         "last_bar_utc": last_seen.isoformat(),
+        "last_trade_timestamp": last_seen.isoformat(),
         "source_bar_end_utc": last_seen.isoformat(),
+        "source_quote_timestamp": last_seen.isoformat(),
         "decision_time_utc": decision_time.isoformat(),
         "provider_age_seconds": round(max(0.0, (decision_time - last_seen).total_seconds()), 3),
+        "source_quote_age_seconds": round(max(0.0, (decision_time - last_seen).total_seconds()), 3),
+        "last_trade_age_seconds": round(max(0.0, (decision_time - last_seen).total_seconds()), 3),
         "entry_price_convention": "decision_time_last_bar_price",
         "stale_minutes": round(stale_minutes, 1),
         "proxy_valid_for_reuse": reuse_gate["proxy_valid_for_reuse"],
         "proxy_reuse_gate": reuse_gate,
+        "source_session_status": reuse_gate.get("source_session_status"),
+        "source_session_open": reuse_gate.get("source_session_status") == "open",
+        "pre_entry_tick_returns_bps": pre_entry_tick_returns_bps,
         "score": score,
         "risk_notes": [
             "paper-trade only",

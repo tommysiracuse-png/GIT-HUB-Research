@@ -321,6 +321,35 @@ def _auction_reference_execution(candidate: dict, settings: dict) -> dict:
     }
 
 
+def _restore_yahoo_proxy_freshness_shadow(candidate: dict) -> dict:
+    gate = candidate.get("paper_yahoo_proxy_freshness_gate")
+    if not isinstance(gate, dict):
+        return candidate
+    if not gate.get("applies") or gate.get("paper_fill_allowed", True):
+        return candidate
+    restored = dict(candidate)
+    restored["shadow_filtered"] = True
+    restored["paper_fill_allowed"] = False
+    restored["paper_entry_blocked"] = True
+    restored["paper_observation_only"] = True
+    restored["paper_observation_reason"] = gate.get("reason") or "proxy_freshness_degraded"
+    restored["paper_execution_mode"] = "observe_only"
+    restored["paper_execution_semantics"] = str(
+        gate.get("paper_execution_semantics") or "synthetic_research_not_live_equivalent"
+    )
+    restored["signal_stats_scope"] = str(gate.get("signal_stats_scope") or "synthetic_research")
+    restored["candidate_status"] = "shadow_only"
+    restored["paper_action"] = "shadow_only"
+    restored["paper_status"] = "shadow_only"
+    restored["paper_fill_status"] = "shadow_only"
+    restored["paper_order_status"] = "shadow_only"
+    restored["shadow_reason"] = str(gate.get("reason") or "proxy_freshness_degraded")
+    restored["candidate_reject_reason"] = restored["shadow_reason"]
+    restored["candidate_reject_detail"] = dict(gate)
+    restored["_hunter_bucket"] = "diagnose"
+    return restored
+
+
 def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
     paper_mode = settings.get("mode", "paper") == "paper" and not settings.get(
         "allow_live_trading", False
@@ -329,6 +358,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         # Evaluate the direct candidate before exploration can substitute a
         # synthetic route and hide direct route blockers from the fill guard.
         candidate = apply_frontier_paper_admission_guard(candidate, settings)
+        candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
     context_loss_quarantine = candidate.get("paper_context_loss_quarantine") or {}
     context_loss_quarantined = bool(
         isinstance(context_loss_quarantine, dict)
@@ -366,7 +396,9 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             candidate["shadow_filtered"] = False
             candidate["paper_fill_allowed"] = True
             candidate["paper_entry_blocked"] = False
+        candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
         candidate = apply_frontier_paper_admission_guard(candidate, settings)
+        candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
     else:
         # Apply the persisted paper-only state before the router recomputes
         # its guard.  This lets a released quarantine re-admit the exact
@@ -390,12 +422,40 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             candidate = dict(candidate)
             candidate["paper_context_recovery_probe"] = True
             candidate["gating_reason"] = "bounded_paper_recovery_probe_below_cost_floor"
+        candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
     if candidate.get("paper_nav_reference"):
         return _nav_reference_execution(candidate, settings)
     if candidate.get("paper_auction_reference"):
         return _auction_reference_execution(candidate, settings)
     order = build_order_ticket(candidate, review, settings)
     if candidate.get("shadow_filtered"):
+        yahoo_proxy_freshness_shadow = (
+            candidate.get("paper_observation_only")
+            and isinstance(candidate.get("paper_yahoo_proxy_freshness_gate"), dict)
+            and not candidate["paper_yahoo_proxy_freshness_gate"].get("paper_fill_allowed", True)
+        )
+        if yahoo_proxy_freshness_shadow:
+            order["status"] = "shadow_only"
+            order["shadow_filter"] = candidate.get("candidate_reject_detail")
+            order["shadow_reason"] = candidate.get("shadow_reason") or candidate.get("candidate_reject_reason")
+            order["signal_stats_scope"] = candidate.get("signal_stats_scope", "synthetic_research")
+            order["execution_semantics"] = candidate.get(
+                "paper_execution_semantics",
+                "synthetic_research_not_live_equivalent",
+            )
+            order["notes"].append(
+                "Yahoo proxy paper entry converted to a synthetic-research shadow observation; no paper fill was created."
+            )
+            order_id = save_execution_order(conn, order, candidate, review)
+            return {
+                "order_id": order_id,
+                "order": order,
+                "fills": [],
+                "fill_ids": [],
+                "paper_filled": False,
+                "paper_observation_ready": True,
+                "candidate": candidate,
+            }
         reject_reason = candidate.get("candidate_reject_reason")
         shadow_observation = reject_reason == FRONTIER_SHADOW_REASON or (
             paper_mode and reject_reason == PAPER_NET_EDGE_GUARD_REASON

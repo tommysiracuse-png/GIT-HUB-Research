@@ -704,6 +704,33 @@ def run_once(settings: dict) -> dict:
                 continue
             execution = execute_order(conn, candidate, review, settings)
             if not execution["paper_filled"]:
+                if execution.get("paper_observation_ready"):
+                    trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=settings)
+                    opened.append(
+                        {
+                            "id": trade_id,
+                            "order_id": execution["order_id"],
+                            "order_route_id": execution["order"]["route_id"],
+                            "inst_id": candidate["inst_id"],
+                            "direction": candidate["direction"],
+                            "learned_score": review["learned_score"],
+                            "confidence": review["confidence"],
+                            "net_edge_bps_estimate": review["net_edge_bps_estimate"],
+                            "gross_edge_bps": review.get("gross_edge_bps"),
+                            "modeled_cost_bps": review.get("modeled_cost_bps"),
+                            "net_edge_bps": review.get("net_edge_bps"),
+                            "freshness_minutes": review.get("freshness_minutes"),
+                            "gating_reason": execution["order"].get("shadow_reason"),
+                            "route_id": review.get("route_id"),
+                            "effective_route_id": review.get("effective_route_id"),
+                            "route_status": execution["order"].get("status"),
+                            "route_alternative_used": review.get("route_alternative_used"),
+                            "execution_semantics": execution["order"].get("execution_semantics"),
+                            "proxy_not_live_equivalent": execution["order"].get("proxy_not_live_equivalent", False),
+                            "signal_stats_scope": execution["order"].get("signal_stats_scope", "synthetic_research"),
+                            "strategy_lab_id": candidate.get("strategy_lab_id"),
+                        }
+                    )
                 continue
             trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=settings)
             record_open_policy_effects(conn, review)

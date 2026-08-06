@@ -376,6 +376,77 @@ class StrategyReliabilityTests(unittest.TestCase):
             report["summary"]["by_quality_failure"]["proxy_short_quality_missing_freshness"],
         )
 
+    def test_yahoo_proxy_freshness_gate_shadow_only_suppresses_fill_but_preserves_counterfactual_scope(self) -> None:
+        candidate = base_candidate(
+            seen_at="2026-08-06T14:19:00+00:00",
+            venue="YAHOO_PROXY",
+            inst_id="YAHOO_PROXY:EWZ",
+            trade_type="global_proxy_momentum",
+            direction="long_proxy",
+            score=88.0,
+            source_quote_timestamp="2026-08-06T14:00:00+00:00",
+            source_session_status="closed",
+            source_session_open=False,
+            source_quote_age_seconds=1260.0,
+            last_trade_timestamp="2026-08-06T14:00:00+00:00",
+            last_trade_age_seconds=1260.0,
+            pre_entry_tick_returns_bps=[-18.0, -10.0, 5.0, -6.0],
+            proxy_reuse_gate={
+                "quote_age_seconds": 1260.0,
+                "source_session_status": "closed",
+                "reasons": ["opening_gap_without_live_followthrough"],
+            },
+            quality_score=None,
+        )
+
+        rows, _ = strategy_reliability.apply_strategy_reliability([candidate], {"mode": "paper"})
+
+        row = rows[0]
+        self.assertTrue(row["paper_entry_blocked"])
+        self.assertFalse(row["paper_fill_allowed"])
+        self.assertTrue(row["paper_observation_only"])
+        self.assertEqual("synthetic_research", row["signal_stats_scope"])
+        self.assertEqual("yahoo_proxy_freshness_shadow_only", row["strategy_reliability_action"])
+        self.assertIn("proxy_quote_age_exceeded", row["strategy_reliability_reasons"])
+        self.assertIn("source_session_closed", row["strategy_reliability_reasons"])
+        self.assertIn("cross_tick_direction_inconsistent", row["strategy_reliability_reasons"])
+        self.assertEqual(88.0, row["score"])
+
+    def test_yahoo_proxy_with_fresh_session_telemetry_skips_family_quarantine(self) -> None:
+        candidate = base_candidate(
+            seen_at="2026-08-06T14:15:00+00:00",
+            venue="YAHOO_PROXY",
+            inst_id="YAHOO_PROXY:EWT",
+            trade_type="global_proxy_momentum",
+            direction="long_proxy",
+            score=81.0,
+            edge_bps_estimate=9.0,
+            spread_bps=2.0,
+            stale_minutes=1.0,
+            source_quote_timestamp="2026-08-06T14:05:00+00:00",
+            source_session_status="open",
+            source_session_open=True,
+            source_quote_age_seconds=600.0,
+            last_trade_timestamp="2026-08-06T14:05:00+00:00",
+            last_trade_age_seconds=600.0,
+            pre_entry_tick_returns_bps=[7.0, 9.0, 6.0, 4.0],
+            proxy_reuse_gate={
+                "quote_age_seconds": 600.0,
+                "source_session_status": "open",
+                "reasons": [],
+            },
+            quality_score=None,
+        )
+
+        rows, report = strategy_reliability.apply_strategy_reliability([candidate], {"mode": "paper"})
+
+        row = rows[0]
+        self.assertFalse(row.get("paper_entry_blocked", False))
+        self.assertNotEqual("family_quarantine_shadow_only", row["strategy_reliability_action"])
+        self.assertEqual("long_proxy_context_tracking", row["strategy_reliability_action"])
+        self.assertEqual(0, report["summary"]["family_quarantine_count"])
+        self.assertTrue(row["paper_yahoo_proxy_freshness_gate"]["eligible"])
+
     def test_distinct_proxy_shock_reversal_uses_its_own_quality_profile(self) -> None:
         candidate = base_candidate(
             venue="YAHOO_PROXY",

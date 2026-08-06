@@ -519,6 +519,20 @@ QUARANTINE_RELEASE_CONDITION = (
     "sustained non-negative paper expectancy with acceptable freshness and "
     "execution-quality diagnostics."
 )
+YAHOO_PROXY_FRESHNESS_SHADOW_POLICY_KEY = "yahoo_proxy_momentum_freshness_shadow_gate"
+YAHOO_PROXY_FRESHNESS_SHADOW_SCOPES = (
+    "paper",
+    "paper_policy",
+    "strategy_reliability",
+)
+YAHOO_PROXY_FRESHNESS_SHADOW_DEFAULTS = {
+    "enabled": True,
+    "max_quote_age_seconds": 20.0 * 60.0,
+    "max_last_trade_age_seconds": 20.0 * 60.0,
+    "min_tick_observations": 2,
+    "min_tick_move_bps": 3.0,
+    "min_alignment_ratio": 0.5,
+}
 SOURCE_VETO_POLICY_KEY = "yahoo_proxy_momentum_source_veto"
 SOURCE_VETO_DEFAULT_MIN_WINDOWS = 3
 SOURCE_VETO_DEFAULT_MIN_SAMPLES_PER_WINDOW = 10
@@ -1679,6 +1693,59 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _finite_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _parse_timestamp(value: Any) -> dt.datetime | None:
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=dt.timezone.utc)
+    numeric = _finite_float(value)
+    if numeric is not None:
+        if abs(numeric) > 10_000_000_000.0:
+            numeric /= 1000.0
+        try:
+            return dt.datetime.fromtimestamp(numeric, tz=dt.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def _float_list(value: Any) -> list[float]:
+    if isinstance(value, str):
+        text = value.strip()
+        if text[:1] == "[":
+            try:
+                value = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return []
+        else:
+            return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    numbers: list[float] = []
+    for item in value:
+        numeric = _finite_float(item)
+        if numeric is not None:
+            numbers.append(numeric)
+    return numbers
+
+
 def _paper_context_loss_policy(config: Mapping[str, Any] | bool | None) -> dict[str, Any]:
     policy = dict(PAPER_CONTEXT_LOSS_QUARANTINE_DEFAULTS)
     if isinstance(config, bool):
@@ -2248,6 +2315,219 @@ def _paper_family_quarantine_applies_in_context(
             if mode in LIVE_MODE_VALUES:
                 return False
     return True
+
+
+def _yahoo_proxy_freshness_shadow_policy(
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any]:
+    policy = dict(YAHOO_PROXY_FRESHNESS_SHADOW_DEFAULTS)
+    if not isinstance(config, Mapping):
+        return policy
+    configured = config.get(YAHOO_PROXY_FRESHNESS_SHADOW_POLICY_KEY)
+    if isinstance(configured, Mapping):
+        policy.update(configured)
+    for scope in YAHOO_PROXY_FRESHNESS_SHADOW_SCOPES:
+        scoped = config.get(scope)
+        if isinstance(scoped, Mapping):
+            nested = scoped.get(YAHOO_PROXY_FRESHNESS_SHADOW_POLICY_KEY)
+            if isinstance(nested, Mapping):
+                policy.update(nested)
+    return policy
+
+
+def _yahoo_proxy_freshness_lookup(
+    candidate: Mapping[str, Any],
+    *fields: str,
+) -> Any:
+    containers: list[Mapping[str, Any]] = [candidate]
+    for field in ("proxy_reuse_gate", "paper_yahoo_proxy_freshness_gate"):
+        nested = candidate.get(field)
+        if isinstance(nested, Mapping):
+            containers.append(nested)
+    for container in containers:
+        for field in fields:
+            value = container.get(field)
+            if value not in (None, "", [], {}, ()):
+                return value
+    return None
+
+
+def _yahoo_proxy_cross_tick_consistency(
+    candidate: Mapping[str, Any],
+    *,
+    min_tick_move_bps: float,
+    min_tick_observations: int,
+    min_alignment_ratio: float,
+) -> tuple[list[float], float | None, bool | None]:
+    direction = str(candidate.get("direction") or "")
+    direction_sign = 1.0 if direction == "long_proxy" else -1.0 if direction == "short_proxy" else 0.0
+    if direction_sign == 0.0:
+        return [], None, None
+
+    tick_returns = _float_list(
+        _yahoo_proxy_freshness_lookup(
+            candidate,
+            "pre_entry_tick_returns_bps",
+            "recent_bar_returns_bps",
+            "proxy_tick_returns_bps",
+        )
+    )
+    if not tick_returns:
+        short_return_pct = _finite_float(
+            _yahoo_proxy_freshness_lookup(candidate, "short_return_pct")
+        )
+        if short_return_pct is not None:
+            tick_returns = [short_return_pct * 100.0]
+    if not tick_returns:
+        followthrough = _finite_float(
+            _yahoo_proxy_freshness_lookup(candidate, "live_session_followthrough_bps")
+        )
+        if followthrough is not None:
+            tick_returns = [followthrough]
+
+    filtered = [value for value in tick_returns if abs(value) >= min_tick_move_bps]
+    if len(filtered) < max(1, min_tick_observations):
+        return filtered, None, None
+
+    aligned = sum(1 for value in filtered if direction_sign * value > 0.0)
+    ratio = aligned / len(filtered) if filtered else None
+    consistent = ratio is not None and ratio >= min_alignment_ratio
+    return filtered, ratio, consistent
+
+
+def paper_yahoo_proxy_freshness_shadow_record(
+    candidate: Mapping[str, Any],
+    config: Mapping[str, Any] | bool | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(candidate, Mapping):
+        return None
+    if str(candidate.get("venue") or "").upper() != "YAHOO_PROXY":
+        return None
+    if str(candidate.get("trade_type") or "") != "global_proxy_momentum":
+        return None
+    if not _paper_family_quarantine_applies_in_context(config):
+        return None
+
+    policy = _yahoo_proxy_freshness_shadow_policy(config)
+    if not _as_bool(policy.get("enabled"), True):
+        return None
+
+    evaluated_at = (
+        _parse_timestamp(_yahoo_proxy_freshness_lookup(candidate, "seen_at", "decision_time_utc"))
+        or dt.datetime.now(dt.timezone.utc)
+    )
+    quote_age = _finite_float(
+        _yahoo_proxy_freshness_lookup(
+            candidate,
+            "source_quote_age_seconds",
+            "provider_age_seconds",
+            "quote_age_seconds",
+            "proxy_quote_age_seconds",
+        )
+    )
+    source_quote_timestamp = _parse_timestamp(
+        _yahoo_proxy_freshness_lookup(
+            candidate,
+            "source_quote_timestamp",
+            "source_bar_end_utc",
+            "last_bar_utc",
+        )
+    )
+    if quote_age is None and source_quote_timestamp is not None:
+        quote_age = max(0.0, (evaluated_at - source_quote_timestamp).total_seconds())
+
+    last_trade_age = _finite_float(
+        _yahoo_proxy_freshness_lookup(
+            candidate,
+            "last_trade_age_seconds",
+            "provider_age_seconds",
+            "quote_age_seconds",
+        )
+    )
+    last_trade_timestamp = _parse_timestamp(
+        _yahoo_proxy_freshness_lookup(
+            candidate,
+            "last_trade_timestamp",
+            "source_bar_end_utc",
+            "last_bar_utc",
+        )
+    )
+    if last_trade_age is None and last_trade_timestamp is not None:
+        last_trade_age = max(0.0, (evaluated_at - last_trade_timestamp).total_seconds())
+
+    explicit_session_open = _yahoo_proxy_freshness_lookup(candidate, "source_session_open", "proxy_session_open")
+    source_session_open = _as_bool(explicit_session_open, False) if explicit_session_open is not None else None
+    session_status = str(
+        _yahoo_proxy_freshness_lookup(candidate, "source_session_status", "proxy_session_status") or ""
+    ).strip().lower()
+    if source_session_open is None:
+        if session_status in {"open", "regular", "trading", "active"}:
+            source_session_open = True
+        elif session_status in {"closed", "after_hours", "off_session", "halted", "holiday", "weekend"}:
+            source_session_open = False
+
+    tick_returns, alignment_ratio, cross_tick_consistent = _yahoo_proxy_cross_tick_consistency(
+        candidate,
+        min_tick_move_bps=max(0.0, _as_float(policy.get("min_tick_move_bps"), 3.0)),
+        min_tick_observations=max(1, _as_int(policy.get("min_tick_observations"), 2)),
+        min_alignment_ratio=max(0.0, min(1.0, _as_float(policy.get("min_alignment_ratio"), 0.5))),
+    )
+    if quote_age is None or source_session_open is None or cross_tick_consistent is None:
+        return None
+
+    max_quote_age = _finite_float(
+        _yahoo_proxy_freshness_lookup(candidate, "max_quote_age_seconds", "max_source_quote_age_seconds")
+    )
+    if max_quote_age is None or max_quote_age <= 0.0:
+        max_quote_age = max(1.0, _as_float(policy.get("max_quote_age_seconds"), 20.0 * 60.0))
+    max_last_trade_age = _finite_float(
+        _yahoo_proxy_freshness_lookup(candidate, "max_last_trade_age_seconds")
+    )
+    if max_last_trade_age is None or max_last_trade_age <= 0.0:
+        max_last_trade_age = max(1.0, _as_float(policy.get("max_last_trade_age_seconds"), max_quote_age))
+
+    reasons: list[str] = []
+    if quote_age > max_quote_age:
+        reasons.append("proxy_quote_age_exceeded")
+    if last_trade_age is not None and last_trade_age > max_last_trade_age:
+        reasons.append("proxy_last_trade_age_exceeded")
+    if source_session_open is not True:
+        reasons.append("source_session_closed" if source_session_open is False else "source_session_unknown")
+    if cross_tick_consistent is False:
+        reasons.append("cross_tick_direction_inconsistent")
+
+    reuse_reasons = _yahoo_proxy_freshness_lookup(candidate, "reasons")
+    if isinstance(reuse_reasons, list) and "opening_gap_without_live_followthrough" in reuse_reasons:
+        reasons.append("opening_gap_without_live_followthrough")
+
+    reasons = list(dict.fromkeys(reasons))
+    degraded = bool(reasons)
+    return {
+        "enabled": True,
+        "paper_only": True,
+        "applies": True,
+        "eligible": not degraded,
+        "paper_fill_allowed": not degraded,
+        "paper_observation_only": degraded,
+        "paper_execution_semantics": (
+            "synthetic_research_not_live_equivalent" if degraded else "direct_live_equivalent"
+        ),
+        "signal_stats_scope": "synthetic_research" if degraded else "direct",
+        "reason": reasons[0] if reasons else "fresh_proxy_session_confirmed",
+        "reasons": reasons,
+        "quote_age_seconds": round(quote_age, 3),
+        "max_quote_age_seconds": round(max_quote_age, 3),
+        "last_trade_age_seconds": round(last_trade_age, 3) if last_trade_age is not None else None,
+        "max_last_trade_age_seconds": round(max_last_trade_age, 3),
+        "source_quote_timestamp": source_quote_timestamp.isoformat() if source_quote_timestamp else None,
+        "last_trade_timestamp": last_trade_timestamp.isoformat() if last_trade_timestamp else None,
+        "source_session_open": source_session_open,
+        "source_session_status": session_status or ("open" if source_session_open else "closed"),
+        "cross_tick_returns_bps": [round(value, 3) for value in tick_returns],
+        "cross_tick_alignment_ratio": round(alignment_ratio, 6) if alignment_ratio is not None else None,
+        "cross_tick_consistent": cross_tick_consistent,
+        "hard_block_promotion_state": "shadow_evaluation_pending",
+    }
 
 
 def _lineage_texts(value: Any) -> list[str]:
@@ -4381,6 +4661,42 @@ def _apply_family_quarantine(
     return reliability
 
 
+def _apply_yahoo_proxy_freshness_shadow(
+    candidate: dict,
+    freshness_gate: Mapping[str, Any],
+) -> dict:
+    reliability = _annotate(
+        candidate,
+        profile="yahoo_proxy_freshness_shadow_gate",
+        action="yahoo_proxy_freshness_shadow_only",
+        reasons=list(freshness_gate.get("reasons") or [freshness_gate.get("reason") or "proxy_freshness_degraded"]),
+        allocation_multiplier=0.0,
+        shadow_only=True,
+    )
+    candidate["paper_yahoo_proxy_freshness_gate"] = dict(freshness_gate)
+    candidate["paper_fill_allowed"] = False
+    candidate["paper_observation_only"] = True
+    candidate["paper_observation_reason"] = freshness_gate.get("reason")
+    candidate["paper_execution_mode"] = "observe_only"
+    candidate["paper_execution_semantics"] = str(
+        freshness_gate.get("paper_execution_semantics") or "synthetic_research_not_live_equivalent"
+    )
+    candidate["signal_stats_scope"] = str(freshness_gate.get("signal_stats_scope") or "synthetic_research")
+    candidate["candidate_status"] = "shadow_only"
+    candidate["paper_action"] = "shadow_only"
+    candidate["paper_status"] = "shadow_only"
+    candidate["paper_fill_status"] = "shadow_only"
+    candidate["paper_order_status"] = "shadow_only"
+    candidate["shadow_reason"] = str(freshness_gate.get("reason") or "proxy_freshness_degraded")
+    candidate["candidate_reject_reason"] = candidate["shadow_reason"]
+    candidate["candidate_reject_detail"] = dict(freshness_gate)
+    candidate["paper_score_eligible"] = True
+    candidate["paper_rank_eligible"] = True
+    candidate["_hunter_bucket"] = "diagnose"
+    reliability["paper_yahoo_proxy_freshness_gate"] = dict(freshness_gate)
+    return reliability
+
+
 def _apply_okx_basis_decay_quarantine(
     candidate: dict,
     config: Mapping[str, Any] | bool | None = None,
@@ -4622,6 +4938,11 @@ def _apply_one(
     conn: Any | None = None,
 ) -> dict | None:
     _record_proxy_short_quality(candidate, config)
+    yahoo_proxy_freshness_gate = paper_yahoo_proxy_freshness_shadow_record(candidate, config=config)
+    skip_family_quarantine = False
+    if yahoo_proxy_freshness_gate is not None:
+        candidate["paper_yahoo_proxy_freshness_gate"] = dict(yahoo_proxy_freshness_gate)
+        skip_family_quarantine = True
     route_lineage = apply_paper_route_lineage_confirmation(candidate, config=config)
     context_loss_quarantine = _apply_context_loss_quarantine(candidate, config=config, conn=conn)
     if context_loss_quarantine is not None:
@@ -4632,7 +4953,12 @@ def _apply_one(
     okx_basis_decay_quarantine = _apply_okx_basis_decay_quarantine(candidate, config=config, conn=conn)
     if okx_basis_decay_quarantine is not None:
         return okx_basis_decay_quarantine
-    quarantined = _apply_family_quarantine(candidate, config=config)
+    if yahoo_proxy_freshness_gate is not None and not _as_bool(
+        yahoo_proxy_freshness_gate.get("paper_fill_allowed"),
+        True,
+    ):
+        return _apply_yahoo_proxy_freshness_shadow(candidate, yahoo_proxy_freshness_gate)
+    quarantined = None if skip_family_quarantine else _apply_family_quarantine(candidate, config=config)
     if quarantined is not None:
         return quarantined
     lineage_source_health = _apply_lineage_source_health(candidate, config=config)
@@ -4889,18 +5215,28 @@ def apply_strategy_reliability(
         _remove_invalid_proxy_confirmation(candidate)
         _record_proxy_short_quality(candidate, settings)
     if settings is not None and not settings.get("strategy_reliability", {}).get("enabled", True):
-        quarantined = [
-            record
-            for candidate in candidates
-            for record in [
+        quarantined = []
+        for candidate in candidates:
+            yahoo_proxy_freshness_gate = paper_yahoo_proxy_freshness_shadow_record(candidate, config=settings)
+            skip_family_quarantine = False
+            if yahoo_proxy_freshness_gate is not None:
+                candidate["paper_yahoo_proxy_freshness_gate"] = dict(yahoo_proxy_freshness_gate)
+                skip_family_quarantine = True
+            record = (
                 _apply_portability_quarantine(candidate, config=settings)
                 or _apply_context_loss_quarantine(candidate, config=settings, conn=conn)
                 or _apply_okx_basis_decay_quarantine(candidate, config=settings, conn=conn)
-                or _apply_family_quarantine(candidate, config=settings)
+                or (
+                    _apply_yahoo_proxy_freshness_shadow(candidate, yahoo_proxy_freshness_gate)
+                    if yahoo_proxy_freshness_gate is not None
+                    and not _as_bool(yahoo_proxy_freshness_gate.get("paper_fill_allowed"), True)
+                    else None
+                )
+                or (None if skip_family_quarantine else _apply_family_quarantine(candidate, config=settings))
                 or _apply_lineage_source_health(candidate, config=settings)
-            ]
-            if record is not None
-        ]
+            )
+            if record is not None:
+                quarantined.append(record)
         candidates.sort(key=lambda row: row.get("score", 0), reverse=True)
         return candidates, {
             "enabled": False,
