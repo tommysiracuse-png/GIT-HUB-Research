@@ -466,6 +466,12 @@ DEFAULT_SETTINGS = {
         "nzx_gdt_event_reference": {"enabled": True, "cache_minutes": 60},
         "bursa_derivatives_contract_catalog": {"enabled": True, "cache_minutes": 360},
         "bahrain_cross_listings_catalog": {"enabled": True, "cache_minutes": 360},
+        "gemini_prediction_markets_btc_5m": {
+            "enabled": True,
+            "cache_minutes": 0,
+            "event_limit": 50,
+            "timeout_seconds": 12,
+        },
         "whitebit_perpetuals_public": {
             "enabled": True,
             "cache_minutes": 2,
