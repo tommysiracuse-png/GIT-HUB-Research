@@ -651,6 +651,30 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(0, report["summary"]["family_quarantine_count"])
         self.assertTrue(row["paper_yahoo_proxy_freshness_gate"]["eligible"])
 
+    def test_yahoo_proxy_recovery_snapshot_releases_family_quarantine(self) -> None:
+        candidate = base_candidate(
+            venue="YAHOO_PROXY",
+            inst_id="YAHOO_PROXY:EWT",
+            trade_type="global_proxy_momentum",
+            direction="long_proxy",
+            score=81.0,
+            edge_bps_estimate=9.0,
+            spread_bps=2.0,
+            stale_minutes=1.0,
+            quality_score=None,
+            latest_family_paper={
+                "long_proxy_standard": {"closed_count": 30, "avg_pnl_bps": 1.25, "win_rate": 0.52},
+                "short_proxy_conditional": {"closed_count": 28, "avg_pnl_bps": -3.0, "win_rate": 0.41},
+            },
+        )
+
+        rows, report = strategy_reliability.apply_strategy_reliability([candidate], {"mode": "paper"})
+
+        row = rows[0]
+        self.assertFalse(row.get("paper_entry_blocked", False))
+        self.assertEqual("long_proxy_context_tracking", row["strategy_reliability_action"])
+        self.assertEqual(0, report["summary"]["family_quarantine_count"])
+
     def test_yahoo_proxy_transfer_diagnostic_tags_translated_okx_route(self) -> None:
         candidate = base_candidate(
             seen_at="2026-08-06T14:05:00+00:00",

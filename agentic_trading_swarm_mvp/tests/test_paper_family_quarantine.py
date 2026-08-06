@@ -86,6 +86,46 @@ class PaperFamilyQuarantineTests(unittest.TestCase):
             "red_team_yahoo_proxy_momentum_sanity_check_c6d14fc0",
         )
 
+    def test_releases_direct_family_when_one_leg_recovers(self) -> None:
+        candidate = self._candidate(
+            latest_family_paper={
+                "long_proxy_standard": {"closed_count": 30, "avg_pnl_bps": 1.25, "win_rate": 0.52},
+                "short_proxy_conditional": {"closed_count": 28, "avg_pnl_bps": -3.0, "win_rate": 0.41},
+            }
+        )
+
+        self.assertIsNone(paper_family_quarantine_record(candidate, config={"mode": "paper"}))
+
+    def test_releases_descendant_family_when_recovery_windows_pass(self) -> None:
+        passing_window = {
+            "sample_count": 12,
+            "after_cost_expectancy_bps": 0.1,
+            "freshness_pass_rate": 0.95,
+            "execution_quality_pass_rate": 0.96,
+        }
+        candidate = self._candidate(
+            venue="OKX_SPOT",
+            trade_type="frontier_crypto_venue_map",
+            strategy_lab_id="red_team_yahoo_proxy_momentum_sanity_check_c6d14fc0_asia_child_v2",
+        )
+
+        record = paper_family_quarantine_record(
+            candidate,
+            config={
+                "mode": "paper",
+                "strategy_lab": {
+                    "yahoo_proxy_momentum_source_veto": {
+                        "recovery_evidence": {
+                            "source_family": {"windows": [passing_window] * 3},
+                            "immediate_descendants": {"windows": [passing_window] * 3},
+                        }
+                    }
+                },
+            },
+        )
+
+        self.assertIsNone(record)
+
     def test_does_not_quarantine_unrelated_yahoo_or_momentum_family(self) -> None:
         yahoo_mean_reversion = self._candidate(trade_type="proxy_mean_reversion")
         non_yahoo_momentum = self._candidate(venue="DIRECT_JSE")

@@ -23,6 +23,7 @@ from paper_decay_quarantine import (
 from proxy_signal_quality import PROXY_TRADE_TYPES, proxy_short_quality_review
 from storage import RUNS_DIR, signal_key
 from frontier_data_quality import (
+    _paper_only_family_decay_guard_review,
     paper_only_proxy_frontier_target_evidence_review,
     paper_only_yahoo_proxy_cross_surface_alignment_guard,
 )
@@ -3122,9 +3123,28 @@ def paper_family_quarantine_record(
     matched_on = _paper_family_quarantine_match(candidate)
     if matched_on is None:
         return None
-    recovery = paper_source_veto_recovery_status(config if isinstance(config, Mapping) else None)
-    if recovery["recovered"]:
+    review_candidate = dict(candidate)
+    review_candidate.setdefault("market_key", "YAHOO_PROXY")
+    review_candidate.setdefault("strategy_family", QUARANTINED_PAPER_STRATEGY_FAMILY)
+    family_decay_review = _paper_only_family_decay_guard_review(
+        review_candidate,
+        config if isinstance(config, Mapping) else None,
+    )
+    if not family_decay_review.get("blocked"):
         return None
+    recovery = dict(family_decay_review.get("recovery_status") or {})
+    latest_family_paper = family_decay_review.get("latest_family_paper")
+    long_leg = (
+        dict(latest_family_paper.get("long_proxy_standard"))
+        if isinstance(latest_family_paper, Mapping) and isinstance(latest_family_paper.get("long_proxy_standard"), Mapping)
+        else {}
+    )
+    short_leg = (
+        dict(latest_family_paper.get("short_proxy_conditional"))
+        if isinstance(latest_family_paper, Mapping)
+        and isinstance(latest_family_paper.get("short_proxy_conditional"), Mapping)
+        else {}
+    )
     return {
         "reason": "quarantined_family_decay",
         "guard": "paper_strategy_family_quarantine",
@@ -3145,11 +3165,15 @@ def paper_family_quarantine_record(
         "matched_descendants": [str(matched_on.get("value") or "").lower()]
         if matched_on.get("type") == "strategy_lab_name_prefix"
         else [],
+        "bilateral_failure": bool(family_decay_review.get("bilateral_failure")),
+        "failed_legs": list(family_decay_review.get("failed_legs") or []),
+        "rolling_expectancy_bps": family_decay_review.get("rolling_expectancy_bps"),
+        "family_decay_guard_review": dict(family_decay_review),
         "evidence": {
-            "source": "paper_closed_trade_labels_current_cycle",
-            "finding": "family_level_degradation",
-            "long_proxy_standard": {"closed_count": 176, "avg_pnl_bps": -16.225, "win_rate": 0.318},
-            "short_proxy_conditional": {"closed_count": 171, "avg_pnl_bps": -24.614, "win_rate": 0.322},
+            "source": "family_decay_guard_review",
+            "finding": "bilateral_family_level_degradation",
+            "long_proxy_standard": long_leg,
+            "short_proxy_conditional": short_leg,
         },
     }
 
@@ -4936,11 +4960,17 @@ def _apply_family_quarantine(
         return None
 
     pre_quarantine_score = _as_float(candidate.get("score"), 0.0)
+    reasons = ["family_level_negative_after_cost_expectancy_and_hit_rate"]
+    if quarantine.get("bilateral_failure"):
+        reasons.append("family_bilateral_negative_expectancy")
+    rolling_expectancy_bps = _as_float(quarantine.get("rolling_expectancy_bps"))
+    if rolling_expectancy_bps is not None:
+        reasons.append(f"family_rolling_expectancy_bps={rolling_expectancy_bps:.6f}")
     reliability = _annotate(
         candidate,
         profile="yahoo_proxy_family_quarantine",
         action="family_quarantine_shadow_only",
-        reasons=["family_level_negative_after_cost_expectancy_and_hit_rate"],
+        reasons=reasons,
         allocation_multiplier=0.0,
         shadow_only=True,
     )
