@@ -217,6 +217,27 @@ class RecommendationIngestionTest(unittest.TestCase):
         self.assertEqual("route_review", result["action"])
         self.assertEqual("route_review", result["downstream_task_type"])
 
+    def test_cross_market_researcher_partial_payload_normalizes_to_blocked_paper_only_diagnostic(self):
+        result = normalize_recommendation(
+            {
+                "parsed": {
+                    "source_agent": "cross_market_researcher",
+                    "market_key": "paper_global_macro",
+                    "evidence": {"issue": "previous output was incomplete"},
+                    "proposed_change": {"goal": "keep one strict object"},
+                }
+            }
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual("native_valid", result["parse_status"])
+        self.assertEqual("propose_diagnostic_hypothesis", result["action"])
+        self.assertEqual("diagnostic", result["downstream_task_type"])
+        self.assertEqual("market_researcher", result["agent_role"])
+        self.assertTrue(result["evidence"]["market_recommendation_blocked"])
+        self.assertTrue(result["evidence"]["insufficient_structured_evidence"])
+        self.assertTrue(result["proposed_change"]["paper_only"])
+
 
 if __name__ == "__main__":
     unittest.main()

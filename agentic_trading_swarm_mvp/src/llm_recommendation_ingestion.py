@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
+from recommendation_schema import (
+    REQUIRED_RECOMMENDATION_KEYS as STRICT_RECOMMENDATION_KEYS,
+    validate_cross_market_researcher_object,
+)
+
 
 SCHEMA_VERSION = "paper-recommendation.v1"
 MAX_RAW_PREVIEW_CHARS = 800
@@ -33,6 +38,8 @@ ACTION_ALIASES = {
     "implementation": "code_change",
     "diagnose": "diagnostic",
     "propose_diagnostic": "diagnostic",
+    "propose_diagnostic_hypothesis": "propose_diagnostic_hypothesis",
+    "diagnostic_hypothesis": "propose_diagnostic_hypothesis",
     "analysis": "diagnostic",
     "research": "market_research",
     "propose_market_research": "market_research",
@@ -58,6 +65,7 @@ ACTION_ALIASES = {
 ALLOWED_ACTIONS = {
     "code_change",
     "diagnostic",
+    "propose_diagnostic_hypothesis",
     "market_research",
     "market_data_change",
     "strategy_change",
@@ -106,6 +114,7 @@ DOWNSTREAM_TASK_TYPES = {
     "quality_control": "diagnostic",
     "report_change": "diagnostic",
     "diagnostic": "diagnostic",
+    "propose_diagnostic_hypothesis": "diagnostic",
     "no_action": "no_action",
 }
 
@@ -298,6 +307,24 @@ def _has_explicit_paper_safe_route(value: Any) -> bool:
     return False
 
 
+def _is_cross_market_researcher_market_key(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    if text == "paper_global_macro":
+        return True
+    return text.startswith(
+        (
+            "paper.cross_market",
+            "paper_cross_market",
+            "paper:cross_market",
+            "paper.cross_market_researcher",
+            "paper_cross_market_researcher",
+            "paper:cross_market_researcher",
+        )
+    )
+
+
 def _execution_route_hunter_fallback(
     reason: str,
     value: Mapping[str, Any],
@@ -387,7 +414,7 @@ def _repair_cross_market_researcher_payload(value: Any) -> Optional[Dict[str, An
         return None
     source_agent = _clean_role(_first(value, ("source_agent", "agent_name", "agent"), ""))
     market_key = str(_first(value, ("market_key", "market"), "") or "").strip()
-    if source_agent != "cross_market_researcher" and market_key != "paper_global_macro":
+    if source_agent != "cross_market_researcher" and not _is_cross_market_researcher_market_key(market_key):
         return None
 
     proposed_change = _first(value, ("proposed_change", "proposed change", "change"))
@@ -395,54 +422,84 @@ def _repair_cross_market_researcher_payload(value: Any) -> Optional[Dict[str, An
     if not _nonempty(proposed_change) and not _nonempty(evidence) and not _nonempty(value.get("rationale")):
         return None
 
-    repaired: Dict[str, Any] = dict(value)
-    action = _clean_action(_first(repaired, ("action", "proposed_action"), "diagnostic"))
-    if action not in {"diagnostic", "no_action"}:
-        action = "diagnostic"
-    repaired["action"] = action
+    strict_candidate = {
+        key: value[key]
+        for key in STRICT_RECOMMENDATION_KEYS
+        if key in value
+    }
+    if len(strict_candidate) == len(STRICT_RECOMMENDATION_KEYS):
+        try:
+            validate_cross_market_researcher_object(strict_candidate)
+            return strict_candidate
+        except ValueError:
+            pass
+
+    repaired: Dict[str, Any] = {}
+    action = _clean_action(
+        _first(repaired or value, ("action", "proposed_action"), "propose_diagnostic_hypothesis")
+    )
+    repaired["action"] = "no_action" if action == "no_action" else "propose_diagnostic_hypothesis"
 
     try:
-        priority = int(repaired.get("priority"))
+        priority = int(value.get("priority"))
     except (TypeError, ValueError):
         priority = 90
     repaired["priority"] = max(1, min(100, priority))
 
-    if not _nonempty(repaired.get("title")):
+    if _nonempty(value.get("title")):
+        repaired["title"] = str(value.get("title")).strip()
+    else:
         repaired["title"] = "Return a single complete paper-trading recommendation object"
-    if not _nonempty(repaired.get("rationale")):
+    if _nonempty(value.get("rationale")):
+        repaired["rationale"] = str(value.get("rationale")).strip()
+    else:
         repaired["rationale"] = (
             "Preserve parser compatibility by requiring cross_market_researcher to emit "
             "exactly one schema-complete paper-only recommendation object."
         )
-    if not _nonempty(repaired.get("market_key")):
-        repaired["market_key"] = "paper_global_macro"
+    repaired["market_key"] = market_key or "paper.cross_market_researcher.schema_fallback"
 
     default_evidence: Dict[str, Any] = {
         "issue": "Incomplete cross_market_researcher recommendation object prevented strict downstream parsing.",
         "impact": "No actionable paper-trading recommendation reached the paper-only decision flow.",
         "constraint": "Output must remain paper-only and contain exactly one JSON object.",
+        "schema_violation": "missing_required_fields_or_explicit_cross_market_support_facts",
         "market_recommendation_blocked": True,
         "insufficient_structured_evidence": True,
         "paper_only": True,
     }
-    current_evidence = repaired.get("evidence")
+    current_evidence = evidence
     if not _nonempty(current_evidence):
         repaired["evidence"] = default_evidence
     elif isinstance(current_evidence, Mapping):
         repaired["evidence"] = {**default_evidence, **dict(current_evidence)}
+    else:
+        repaired["evidence"] = default_evidence
 
     default_proposed_change: Dict[str, Any] = {
         "format_rule": "No markdown, no commentary, no arrays, valid JSON only.",
         "goal": "Enforce a strict single-object schema for all cross_market_researcher responses.",
-        "required_fields": "action, priority, title, rationale, market_key, evidence, proposed_change",
+        "required_fields": ", ".join(STRICT_RECOMMENDATION_KEYS),
         "safety_rule": "Paper-trading only; do not imply live execution.",
-        "next_step": "Keep the output as a paper-only diagnostic until explicit cross-market support facts are supplied in-schema.",
+        "next_step": "Keep the output as a paper-only diagnostic hypothesis until explicit cross-market support facts are supplied in-schema.",
+        "paper_only": True,
+        "live_trading": "disabled",
     }
-    current_proposed_change = repaired.get("proposed_change")
+    current_proposed_change = proposed_change
     if not _nonempty(current_proposed_change):
         repaired["proposed_change"] = default_proposed_change
     elif isinstance(current_proposed_change, Mapping):
         repaired["proposed_change"] = {**default_proposed_change, **dict(current_proposed_change)}
+    else:
+        repaired["proposed_change"] = default_proposed_change
+    try:
+        validate_cross_market_researcher_object(repaired)
+    except ValueError:
+        repaired["evidence"] = {
+            **default_evidence,
+            "schema_violation": "repaired_payload_still_blocked_without_strict_support_facts",
+        }
+        repaired["proposed_change"] = dict(default_proposed_change)
     return repaired
 
 
@@ -744,6 +801,17 @@ def _canonical_evidence(value: Any) -> Any:
     return str(value)
 
 
+def _inferred_agent_role(payload: Mapping[str, Any], agent_role: Optional[str]) -> str:
+    role = _clean_role(_first(payload, ("agent_role", "role"), agent_role))
+    if role in ALLOWED_ROLES:
+        return role
+    source_agent = _clean_role(_first(payload, ("source_agent", "agent_name", "agent"), ""))
+    market_key = _first(payload, ("market_key", "market"), "")
+    if source_agent == "cross_market_researcher" or _is_cross_market_researcher_market_key(market_key):
+        return "market_researcher"
+    return role
+
+
 def _normalize_payload(
     payload: Mapping[str, Any],
     *,
@@ -755,9 +823,7 @@ def _normalize_payload(
     parent_recommendation_id: Optional[str],
 ) -> Tuple[Optional[Dict[str, Any]], str, Optional[str]]:
     action = _clean_action(_first(payload, ("action", "proposed_action", "type")))
-    role = _clean_role(
-        _first(payload, ("agent_role", "role"), agent_role)
-    )
+    role = _inferred_agent_role(payload, agent_role)
     if action not in ALLOWED_ACTIONS:
         return None, "invalid_schema", "invalid_action"
     if role not in ALLOWED_ROLES:
