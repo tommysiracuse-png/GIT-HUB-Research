@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
 from llm_state_packet import build_route_intelligence_packet_fragment  # noqa: E402
 from llm_bridge import (  # noqa: E402
     _compact_frontier_crypto,
+    _compact_frontier_gap_summary,
     build_paper_route_requirement_summaries,
 )
 
@@ -94,6 +95,68 @@ class LLMStatePacketTests(unittest.TestCase):
         )
 
         self.assertEqual(diagnostics, {key: packet["candidates"][0][key] for key in diagnostics})
+
+    def test_frontier_gap_summary_prioritizes_quote_and_health_infrastructure_gaps(self) -> None:
+        packet = _compact_frontier_gap_summary(
+            {
+                "summary": {
+                    "candidate_count": 40,
+                    "active_paper_review_candidate_count": 9,
+                    "candidate_activity": {
+                        "active_paper_review_candidates": 9,
+                        "regional_admitted_candidates": 0,
+                        "route_feasibility_shadow_candidates": 3,
+                        "marketability_conservative_route_candidates": 2,
+                    },
+                    "by_quote_normalization": {
+                        "unsupported_quote": 4,
+                        "external_fx_reference": 47,
+                        "missing_same_venue_stablecoin_reference": 162,
+                    },
+                    "blocked_venues": ["BITSO"],
+                    "degraded_venues": ["MEXC", "OKX_SPOT"],
+                    "expansion_map": {
+                        "depth_enriched_rate": 0.3009,
+                        "unknown_quality_count": 11,
+                        "starved_venue_coverage": {"LUNO": {"status": "starved"}},
+                    },
+                }
+            }
+        )
+
+        self.assertTrue(packet["paper_only"])
+        self.assertTrue(packet["read_only"])
+        self.assertEqual(40, packet["frontier_candidates"])
+        self.assertEqual(9, packet["active_paper_review_candidates"])
+        self.assertEqual(0, packet["regional_admissions"])
+        self.assertEqual(30.09, packet["depth_enrichment_rate_pct"])
+        self.assertEqual(4, packet["quote_gap_counts"]["unsupported_quote_paths"])
+        self.assertEqual(47, packet["quote_gap_counts"]["needs_external_fx_reference"])
+        self.assertEqual(162, packet["quote_gap_counts"]["needs_same_venue_stablecoin_reference"])
+        self.assertEqual(1, packet["venue_health_gap_counts"]["blocked_venues"])
+        self.assertEqual(2, packet["venue_health_gap_counts"]["degraded_venues"])
+        self.assertEqual(11, packet["venue_health_gap_counts"]["unknown_quality_observations"])
+        self.assertEqual("quote_adapter", packet["priority_gaps"][0]["gap_type"])
+        self.assertEqual(
+            "missing_same_venue_stablecoin_reference",
+            packet["priority_gaps"][0]["reason"],
+        )
+        self.assertEqual(
+            "request_venue_health_check",
+            next(
+                item["recommended_request"]
+                for item in packet["priority_gaps"]
+                if item["gap_type"] == "venue_health_check"
+            ),
+        )
+        self.assertEqual(
+            "request_directive_cleanup",
+            next(
+                item["recommended_request"]
+                for item in packet["priority_gaps"]
+                if item["gap_type"] == "directive_cleanup"
+            ),
+        )
 
     def test_route_playbooks_are_nested_in_packet_without_credentials(self) -> None:
         opportunities = [

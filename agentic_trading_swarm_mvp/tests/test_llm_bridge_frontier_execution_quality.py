@@ -77,6 +77,59 @@ class FrontierExecutionQualityPacketTests(unittest.TestCase):
         self.assertEqual(2, route_summaries["candidate_count"])
         self.assertEqual(0.0, route_summaries["candidates"][0]["ranking_annotation"]["score_adjustment"])
 
+    def test_state_packet_exposes_frontier_gap_summary_to_market_scout(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        with tempfile.TemporaryDirectory() as tmp:
+            old_json, old_md = llm_bridge.STATE_JSON, llm_bridge.STATE_MD
+            state_json = pathlib.Path(tmp) / "state.json"
+            state_md = pathlib.Path(tmp) / "state.md"
+            llm_bridge.STATE_JSON = state_json
+            llm_bridge.STATE_MD = state_md
+            try:
+                packet = llm_bridge.write_llm_state_packet(
+                    conn,
+                    {
+                        "frontier_crypto_venues": {
+                            "summary": {
+                                "candidate_count": 40,
+                                "active_paper_review_candidate_count": 9,
+                                "candidate_activity": {
+                                    "active_paper_review_candidates": 9,
+                                    "regional_admitted_candidates": 0,
+                                    "route_feasibility_shadow_candidates": 3,
+                                },
+                                "by_quote_normalization": {
+                                    "unsupported_quote": 4,
+                                    "external_fx_reference": 47,
+                                    "missing_same_venue_stablecoin_reference": 162,
+                                },
+                                "blocked_venues": ["BITSO"],
+                                "degraded_venues": ["MEXC"],
+                                "expansion_map": {
+                                    "depth_enriched_rate": 0.3009,
+                                    "unknown_quality_count": 11,
+                                },
+                            }
+                        }
+                    },
+                    DEFAULT_SETTINGS,
+                )
+                markdown = state_md.read_text(encoding="utf-8")
+            finally:
+                llm_bridge.STATE_JSON, llm_bridge.STATE_MD = old_json, old_md
+
+        gap_summary = packet["frontier_gap_summary"]
+        self.assertTrue(gap_summary["paper_only"])
+        self.assertTrue(gap_summary["read_only"])
+        self.assertEqual(40, gap_summary["frontier_candidates"])
+        self.assertEqual(9, gap_summary["active_paper_review_candidates"])
+        self.assertEqual(30.09, gap_summary["depth_enrichment_rate_pct"])
+        self.assertEqual(162, gap_summary["quote_gap_counts"]["needs_same_venue_stablecoin_reference"])
+        self.assertEqual("request_quote_adapter", gap_summary["priority_gaps"][0]["recommended_request"])
+        self.assertIn("Frontier gap summary", markdown)
+
     def test_compact_frontier_execution_quality_counts_route_and_quote_failures(self):
         research_worker = {
             "candidates": [

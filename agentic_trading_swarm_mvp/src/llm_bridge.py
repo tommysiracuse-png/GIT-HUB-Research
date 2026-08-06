@@ -1484,6 +1484,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
     )
     allowed_actions = list(dict.fromkeys([*settings.get("llm_bridge", {}).get("allowed_actions", []), "no_action"]))
     crypto_venue_health = payload.get("crypto_venue_health", [])
+    frontier_gap_summary = _compact_frontier_gap_summary(payload.get("frontier_crypto_venues", {}))
     packet = {
         "purpose": "Read-only state packet for LLM agents. Recommend actions through llm_recommendations_inbox.jsonl only.",
         "mode": settings.get("mode"),
@@ -1519,6 +1520,7 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
         "horizon_outcomes": payload.get("horizon_outcomes", []),
         "crypto_venue_health": crypto_venue_health,
         "crypto_venue_health_gaps": _crypto_venue_health_gaps(crypto_venue_health),
+        "frontier_gap_summary": frontier_gap_summary,
         "frontier_crypto_venues": _compact_frontier_crypto(payload.get("frontier_crypto_venues", {})),
         "signal_redesign": _compact_signal_redesign(payload.get("signal_redesign", {})),
         "okx_signal_research": _compact_okx_signal_research(payload.get("okx_signal_research", {})),
@@ -1708,6 +1710,119 @@ def _compact_frontier_crypto(report: dict) -> dict:
         "observations": observations,
         "candidates": candidates,
         "report": str(RUNS_DIR / "frontier_crypto_venues_report.md"),
+    }
+
+
+def _compact_frontier_gap_summary(report: dict) -> dict:
+    """Project frontier infrastructure gaps into a scout-sized paper-only summary."""
+
+    if not report:
+        return {}
+    summary = report.get("summary") or {}
+    expansion = summary.get("expansion_map") or {}
+    candidate_activity = (
+        summary.get("candidate_activity")
+        or expansion.get("candidate_activity")
+        or {}
+    )
+    by_quote_normalization = (
+        summary.get("by_quote_normalization")
+        or expansion.get("by_quote_normalization")
+        or {}
+    )
+    depth_enriched_rate = expansion.get("depth_enriched_rate")
+    if isinstance(depth_enriched_rate, (int, float)):
+        depth_enrichment_rate_pct = round(float(depth_enriched_rate) * 100.0, 2)
+    else:
+        depth_enrichment_rate_pct = None
+
+    quote_gap_counts = {
+        "unsupported_quote_paths": int(by_quote_normalization.get("unsupported_quote") or 0),
+        "needs_external_fx_reference": int(by_quote_normalization.get("external_fx_reference") or 0),
+        "needs_same_venue_stablecoin_reference": int(
+            by_quote_normalization.get("missing_same_venue_stablecoin_reference") or 0
+        ),
+    }
+    venue_health_gap_counts = {
+        "blocked_venues": len(summary.get("blocked_venues") or []),
+        "degraded_venues": len(summary.get("degraded_venues") or []),
+        "unknown_quality_observations": int(expansion.get("unknown_quality_count") or 0),
+        "starved_venue_count": len(expansion.get("starved_venue_coverage") or {}),
+    }
+    directive_hygiene_gap_counts = {
+        "route_feasibility_shadow_candidates": int(
+            candidate_activity.get("route_feasibility_shadow_candidates") or 0
+        ),
+        "marketability_conservative_route_candidates": int(
+            candidate_activity.get("marketability_conservative_route_candidates") or 0
+        ),
+    }
+
+    priority_gaps = []
+    if quote_gap_counts["needs_same_venue_stablecoin_reference"]:
+        priority_gaps.append(
+            {
+                "gap_type": "quote_adapter",
+                "reason": "missing_same_venue_stablecoin_reference",
+                "count": quote_gap_counts["needs_same_venue_stablecoin_reference"],
+                "recommended_request": "request_quote_adapter",
+            }
+        )
+    if quote_gap_counts["needs_external_fx_reference"]:
+        priority_gaps.append(
+            {
+                "gap_type": "quote_adapter",
+                "reason": "external_fx_reference",
+                "count": quote_gap_counts["needs_external_fx_reference"],
+                "recommended_request": "request_quote_adapter",
+            }
+        )
+    if quote_gap_counts["unsupported_quote_paths"]:
+        priority_gaps.append(
+            {
+                "gap_type": "quote_adapter",
+                "reason": "unsupported_quote_path",
+                "count": quote_gap_counts["unsupported_quote_paths"],
+                "recommended_request": "request_quote_adapter",
+            }
+        )
+    venue_health_gap_total = sum(venue_health_gap_counts.values())
+    if venue_health_gap_total:
+        priority_gaps.append(
+            {
+                "gap_type": "venue_health_check",
+                "reason": "frontier_depth_or_health_backlog",
+                "count": venue_health_gap_total,
+                "recommended_request": "request_venue_health_check",
+            }
+        )
+    directive_gap_total = sum(directive_hygiene_gap_counts.values())
+    if directive_gap_total:
+        priority_gaps.append(
+            {
+                "gap_type": "directive_cleanup",
+                "reason": "shadow_only_or_conservative_frontier_theses",
+                "count": directive_gap_total,
+                "recommended_request": "request_directive_cleanup",
+            }
+        )
+    priority_gaps.sort(key=lambda item: (-int(item["count"]), item["gap_type"], item["reason"]))
+
+    return {
+        "paper_only": True,
+        "read_only": True,
+        "frontier_candidates": int(summary.get("candidate_count") or expansion.get("candidate_count") or 0),
+        "active_paper_review_candidates": int(
+            candidate_activity.get("active_paper_review_candidates")
+            or summary.get("active_paper_review_candidate_count")
+            or 0
+        ),
+        "regional_admissions": int(candidate_activity.get("regional_admitted_candidates") or 0),
+        "depth_enrichment_rate_pct": depth_enrichment_rate_pct,
+        "quote_gap_counts": quote_gap_counts,
+        "venue_health_gap_counts": venue_health_gap_counts,
+        "directive_hygiene_gap_counts": directive_hygiene_gap_counts,
+        "priority_gaps": priority_gaps[:5],
     }
 
 
@@ -1979,6 +2094,7 @@ def _packet_to_markdown(packet: dict) -> str:
         f"- Expansion map: `{packet.get('expansion_map', {})}`",
         f"- Global market discovery: `{packet.get('global_market_discovery', {})}`",
         f"- Hunter allocation: `{packet.get('hunter_allocation', {})}`",
+        f"- Frontier gap summary: `{packet.get('frontier_gap_summary', {})}`",
         f"- Frontier crypto venues: `{packet.get('frontier_crypto_venues', {})}`",
         f"- Signal redesign: `{packet.get('signal_redesign', {})}`",
         f"- OKX signal research: `{packet.get('okx_signal_research', {})}`",

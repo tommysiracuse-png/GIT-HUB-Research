@@ -354,6 +354,34 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(rec["parse_status"], "recovered_valid")
         self.assertEqual(rec["priority"], 81)
 
+    def test_market_scout_prompt_includes_frontier_gap_summary(self) -> None:
+        packet = {
+            "allowed_recommendation_actions": ["propose_hunter_directive"],
+            "frontier_gap_summary": {
+                "paper_only": True,
+                "frontier_candidates": 40,
+                "active_paper_review_candidates": 9,
+                "quote_gap_counts": {
+                    "needs_same_venue_stablecoin_reference": 162,
+                },
+                "priority_gaps": [
+                    {
+                        "gap_type": "quote_adapter",
+                        "reason": "missing_same_venue_stablecoin_reference",
+                        "count": 162,
+                        "recommended_request": "request_quote_adapter",
+                    }
+                ],
+            },
+        }
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "market_scout")
+
+        prompt = llm_swarm_runner.agent_prompt(agent, packet, [])
+
+        self.assertIn("frontier_gap_summary", prompt)
+        self.assertIn("missing_same_venue_stablecoin_reference", prompt)
+        self.assertIn("request_quote_adapter", prompt)
+
     def test_non_planner_code_request_preserves_string_evidence_without_crashing(self) -> None:
         packet = {
             "allowed_recommendation_actions": [

@@ -451,6 +451,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "horizon_outcomes": packet.get("horizon_outcomes", [])[:20],
         "contextual_stats": packet.get("contextual_stats", [])[:20],
         "crypto_venue_health": packet.get("crypto_venue_health", [])[:10],
+        "frontier_gap_summary": packet.get("frontier_gap_summary", {}),
         "frontier_crypto_venues": packet.get("frontier_crypto_venues", {}),
         "expansion_map": packet.get("expansion_map", {}),
         "route_intelligence": (packet.get("expansion_map", {}) or {}).get("route_intelligence", {}),
