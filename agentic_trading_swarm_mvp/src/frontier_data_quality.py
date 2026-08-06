@@ -4619,8 +4619,9 @@ def _normalize_bitso_symbol(symbol: str) -> str:
         while len(parts) >= 3 and parts[-1] == parts[-2]:
             parts = parts[:-1]
         return "_".join(parts)
-    if len(value) > 3 and value.endswith("mxn"):
-        return f"{value[:-3]}_mxn"
+    for quote in ("usdt", "usdc", "mxn", "brl", "ars", "usd"):
+        if len(value) > len(quote) and value.endswith(quote):
+            return f"{value[:-len(quote)]}_{quote}"
     return value
 
 
@@ -4632,9 +4633,9 @@ def _format_symbol(venue: str, symbol: str) -> str:
         return symbol.replace("_SPBL", "")
     if venue == "BITSO":
         # Bitso depth endpoints expect lowercase book ids like ``btc_mxn``.
-        # Frontier observations may carry slash, dash, or compact MXN pairs
-        # after venue-map normalization, so normalize them here before URL
-        # construction to keep paper-only depth enrichment active for MXN books.
+        # Frontier observations can reach the scanner as slash, dash, compact,
+        # or duplicated quote forms, so normalize them here before URL
+        # construction to keep paper-only depth enrichment active.
         return _normalize_bitso_symbol(symbol)
     if venue == "INDODAX":
         # INDODAX depth paths use compact lowercase pairs (for example

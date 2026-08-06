@@ -51,6 +51,12 @@ class BitsoSymbolNormalizationTests(unittest.TestCase):
     def test_normalize_compact_mxn_symbol(self) -> None:
         self.assertEqual(_normalize_bitso_symbol("BTCMXN"), "btc_mxn")
 
+    def test_normalize_compact_usdt_symbol(self) -> None:
+        self.assertEqual(_normalize_bitso_symbol("BTCUSDT"), "btc_usdt")
+
+    def test_normalize_compact_brl_symbol(self) -> None:
+        self.assertEqual(_normalize_bitso_symbol("BTCBRL"), "btc_brl")
+
     def test_normalize_ccxt_style_mxn_symbol(self) -> None:
         self.assertEqual(_normalize_bitso_symbol("BTC/MXN:MXN"), "btc_mxn")
 
@@ -59,6 +65,9 @@ class BitsoSymbolNormalizationTests(unittest.TestCase):
 
     def test_format_symbol_uses_bitso_normalization(self) -> None:
         self.assertEqual(_format_symbol("BITSO", "BTC/MXN:MXN"), "btc_mxn")
+
+    def test_format_symbol_uses_bitso_normalization_for_compact_usdt(self) -> None:
+        self.assertEqual(_format_symbol("BITSO", "BTCUSDT"), "btc_usdt")
 
 
 if __name__ == "__main__":

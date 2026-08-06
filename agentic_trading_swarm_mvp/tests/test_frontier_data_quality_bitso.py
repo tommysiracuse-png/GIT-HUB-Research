@@ -70,6 +70,23 @@ class BitsoDepthNormalizationTests(unittest.TestCase):
             "https://api.bitso.com/v3/order_book/?book=btc_mxn&aggregate=false",
         )
 
+    def test_build_depth_url_uses_normalized_compact_bitso_book_symbol(self):
+        observation = {
+            "venue": "BITSO",
+            "symbol": "BTCUSDT",
+        }
+        depth_config = {
+            "url_template": "https://api.bitso.com/v3/order_book/?book={symbol}&aggregate=false",
+            "max_levels": 20,
+        }
+
+        url = fdq._build_depth_url(observation, depth_config, levels=50)
+
+        self.assertEqual(
+            url,
+            "https://api.bitso.com/v3/order_book/?book=btc_usdt&aggregate=false",
+        )
+
     def test_extract_depth_reads_bitso_exchange_timestamp(self):
         payload = {
             "payload": {
