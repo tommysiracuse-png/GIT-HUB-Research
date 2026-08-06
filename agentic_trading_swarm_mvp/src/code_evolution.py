@@ -408,7 +408,14 @@ def validate_paper_only_recommendation_payload(payload: Any) -> tuple[bool, str]
     if not isinstance(market_key, str) or not market_key.strip():
         return False, "invalid_market_key"
     normalized_market_key = market_key.strip().lower()
-    if not normalized_market_key.startswith(PAPER_MARKET_KEY_PREFIX):
+    if not (
+        normalized_market_key == "paper"
+        or (
+            normalized_market_key.startswith("paper")
+            and len(normalized_market_key) > len("paper")
+            and not normalized_market_key[len("paper")].isalnum()
+        )
+    ):
         return False, "market_key_not_paper_scoped"
     execution_mode = payload.get("paper_only")
     if execution_mode is None:
@@ -865,7 +872,14 @@ def _has_meaningful_value(value: Any) -> bool:
 
 
 def _is_paper_scoped_market_key(value: Any) -> bool:
-    return isinstance(value, str) and value.strip().startswith(PAPER_MARKET_KEY_PREFIX)
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return normalized == "paper" or (
+        normalized.startswith("paper")
+        and len(normalized) > len("paper")
+        and not normalized[len("paper")].isalnum()
+    )
 
 
 def _contains_exactly_one_json_object(value: Any) -> bool:
@@ -1240,6 +1254,15 @@ def _extract_single_json_object(text: str) -> dict[str, Any] | None:
 def _contains_exactly_one_json_object(candidate: Any) -> bool:
     """Return True only when the payload is a single JSON object."""
 
+    if isinstance(candidate, str):
+        text = candidate.strip()
+        if not text or text[0] != "{" or text[-1] != "}":
+            return False
+        try:
+            parsed, end_index = json.JSONDecoder().raw_decode(text)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(parsed, dict) and not text[end_index:].strip()
     if not isinstance(candidate, dict):
         return False
     serialized = json.dumps(candidate, separators=STRICT_RECOMMENDATION_JSON_SEPARATORS, sort_keys=True)
@@ -1404,6 +1427,8 @@ def _recommendation_schema_error(value: Any) -> str | None:
     for required_key in STRICT_REQUIRED_RECOMMENDATION_FIELDS:
         if not _has_meaningful_value(value.get(required_key)):
             return f"{required_key} must contain a non-empty value"
+    if not _is_paper_scoped_market_key(value.get("market_key")):
+        return "market_key_out_of_scope"
     if not isinstance(value.get("evidence"), dict) or not value["evidence"]:
         return "evidence must be a JSON object"
     if not isinstance(value.get("proposed_change"), dict) or not value["proposed_change"]:

@@ -19,7 +19,11 @@ from collections import Counter
 from typing import Any
 
 from adapter_runtime import REPORT_JSON as ADAPTER_REPORT_JSON
-from code_evolution import process_code_change_recommendation
+from code_evolution import (
+    preflight_proposal,
+    process_code_change_recommendation,
+    validate_strict_recommendation_schema,
+)
 from market_admission import STAGE_INDEX
 from storage import RUNS_DIR, add_llm_recommendation
 from strategy_implementation_owner import enqueue_recommendation as enqueue_strategy_recommendation
@@ -400,6 +404,98 @@ def _runtime_adapter(task: dict[str, Any]) -> dict[str, Any]:
     return adapter if isinstance(adapter, dict) else {}
 
 
+def _paper_diagnostic_pass(
+    task: dict[str, Any],
+    metrics: dict[str, Any],
+    settings: dict,
+    recent_trades: list[dict[str, Any]],
+    recommendation_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cfg = _cfg(settings)
+    adapter = _runtime_adapter(task)
+    evidence = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
+    report_generated_at = _parse_time(evidence.get("runtime_report_generated_at"))
+    now = dt.datetime.now(dt.timezone.utc)
+    age_seconds = (
+        round((now - report_generated_at).total_seconds(), 3)
+        if report_generated_at is not None
+        else None
+    )
+    freshness_threshold_seconds = max(
+        300,
+        int(cfg.get("retry_backoff_seconds", 300)),
+        int(cfg.get("runtime_verification_scans", 3)) * 60,
+    )
+    matched_trades = _matching_trades(task, recent_trades)
+    schema_valid = False
+    schema_reason = "not_evaluated"
+    preflight: dict[str, Any] = {}
+    if isinstance(recommendation_payload, dict):
+        schema_valid, schema_reason = validate_strict_recommendation_schema(recommendation_payload)
+        preflight = preflight_proposal(recommendation_payload, settings)
+    price_observation_count = int(adapter.get("price_observation_count") or 0)
+    observation_count = int(adapter.get("observation_count") or 0)
+    candidate_count = int(adapter.get("candidate_count") or 0)
+    paper_trade_count = int(metrics.get("paper_trade_count") or 0)
+    reliable_outcome_count = int(metrics.get("reliable_outcome_count") or 0)
+    telemetry_complete = all(
+        (
+            report_generated_at is not None,
+            observation_count >= 0,
+            price_observation_count >= 0,
+            candidate_count >= 0,
+            schema_valid,
+        )
+    )
+    return {
+        "captured_at": _utc_now(),
+        "paper_only": True,
+        "telemetry_complete": telemetry_complete,
+        "data_freshness": {
+            "runtime_report_generated_at": evidence.get("runtime_report_generated_at"),
+            "age_seconds": age_seconds,
+            "freshness_threshold_seconds": freshness_threshold_seconds,
+            "status": (
+                "fresh"
+                if age_seconds is not None and age_seconds <= freshness_threshold_seconds
+                else "stale" if age_seconds is not None else "unknown"
+            ),
+            "source_status": adapter.get("source_status"),
+        },
+        "signal_values": {
+            "observation_count": observation_count,
+            "price_observation_count": price_observation_count,
+            "candidate_count": candidate_count,
+            "priceable_count": int((metrics.get("admission") or {}).get("priceable_count") or 0),
+            "strategy_candidate_count": int((metrics.get("admission") or {}).get("strategy_candidate_count") or 0),
+            "paper_trade_count": paper_trade_count,
+            "reliable_outcome_count": reliable_outcome_count,
+        },
+        "decision_thresholds": {
+            "minimum_price_observations": int(cfg.get("minimum_price_observations", 1)),
+            "runtime_verification_scans": int(cfg.get("runtime_verification_scans", 3)),
+            "required_chain": list((task.get("acceptance") or {}).get("required_chain") or []),
+        },
+        "simulated_positions": {
+            "paper_trade_count": paper_trade_count,
+            "open_paper_trade_count": int(metrics.get("open_paper_trade_count") or 0),
+            "closed_paper_trade_count": sum(str(item.get("status") or "") == "closed" for item in matched_trades),
+            "reliable_outcome_count": reliable_outcome_count,
+            "strategy_lab_ids": list(metrics.get("strategy_lab_ids") or []),
+            "recent_trade_ids": [int(item["id"]) for item in matched_trades[:10] if item.get("id") is not None],
+        },
+        "json_schema_validation": {
+            "valid": schema_valid,
+            "reason": schema_reason,
+            "quality_scorecard": (
+                (preflight.get("quality_scorecard") or {})
+                if isinstance(preflight, dict)
+                else {}
+            ),
+        },
+    }
+
+
 def _desired_status(task: dict[str, Any], metrics: dict[str, Any]) -> str:
     if int(metrics["reliable_outcome_count"]) > 0:
         return "completed_paper_evaluated"
@@ -648,7 +744,13 @@ def _select_code_task(conn: sqlite3.Connection) -> dict[str, Any] | None:
     return None
 
 
-def _code_recommendation(task: dict[str, Any], metrics: dict[str, Any], attempt: int) -> dict[str, Any]:
+def _code_recommendation(
+    task: dict[str, Any],
+    metrics: dict[str, Any],
+    settings: dict,
+    recent_trades: list[dict[str, Any]],
+    attempt: int,
+) -> dict[str, Any]:
     adapter = _runtime_adapter(task)
     rec_id = f"market-activation:{task['task_id']}:code:{attempt}"
     acceptance = task.get("acceptance") or _acceptance(task["adapter_id"], task["venue"], task["market_surface"])
@@ -659,7 +761,9 @@ def _code_recommendation(task: dict[str, Any], metrics: dict[str, Any], attempt:
         "normalize the emitted fields, and connect the surface to the existing market-admission and Strategy Lab systems. "
         "If route execution is unavailable, use the existing synthetic research paper path. If the source is genuinely "
         "reference-only, either find a public priceable companion/proxy or wire the reference fields into a named Strategy "
-        "Lab feature; never fabricate a price. Add focused tests and leave unrelated strategies unchanged."
+        "Lab feature; never fabricate a price. If the runtime evidence is still incomplete, first preserve a paper-only "
+        "diagnostic pass that records data freshness, signal values, decision thresholds, simulated positions, and JSON-schema "
+        "validation results before changing the paper strategy. Add focused tests and leave unrelated strategies unchanged."
     )
     code_change = {
         "change_category": "runtime_pipeline_integration",
@@ -716,6 +820,13 @@ def _code_recommendation(task: dict[str, Any], metrics: dict[str, Any], attempt:
         "implementation_mode": code_change["implementation_mode"],
         "code_change": code_change,
     }
+    payload["evidence"]["paper_diagnostic_pass"] = _paper_diagnostic_pass(
+        task,
+        metrics,
+        settings,
+        recent_trades,
+        recommendation_payload=payload,
+    )
     return {
         "recommendation_id": rec_id,
         "title": payload["title"],
@@ -738,14 +849,34 @@ def _run_code_turn(
     if task["status"] == "implementation_paused" and isinstance(stored_rec, dict):
         recommendation = stored_rec
         attempt = int(task.get("attempt_count") or 1)
+        payload = recommendation.get("payload") if isinstance(recommendation.get("payload"), dict) else {}
+        if payload:
+            payload = dict(payload)
+            payload.setdefault("evidence", {})
+            if isinstance(payload["evidence"], dict):
+                payload["evidence"]["paper_diagnostic_pass"] = _paper_diagnostic_pass(
+                    task,
+                    metrics,
+                    settings,
+                    recent_trades,
+                    recommendation_payload=payload,
+                )
+            recommendation = {**recommendation, "payload": payload}
     else:
         attempt = int(task.get("attempt_count") or 0) + 1
-        recommendation = _code_recommendation(task, metrics, attempt)
+        recommendation = _code_recommendation(task, metrics, settings, recent_trades, attempt)
+    diagnostic = (
+        (((recommendation.get("payload") or {}).get("evidence") or {}).get("paper_diagnostic_pass"))
+        if isinstance(recommendation, dict)
+        else None
+    )
     started = _utc_now()
     run_id = str(uuid.uuid4())
     lease = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=int(cfg["lease_seconds"]))).isoformat()
     last_result["active_code_recommendation"] = recommendation
     last_result["runtime_metrics"] = metrics
+    if isinstance(diagnostic, dict):
+        last_result["paper_diagnostic_pass"] = diagnostic
     conn.execute(
         """
         update market_activation_tasks
@@ -793,6 +924,7 @@ def _run_code_turn(
             "artifacts": artifacts,
             "proposal_status": proposal_status,
             "runtime_metrics": metrics,
+            "paper_diagnostic_pass": diagnostic if isinstance(diagnostic, dict) else None,
             "active_code_recommendation": recommendation if status == "implementation_paused" else None,
         }
         conn.execute(

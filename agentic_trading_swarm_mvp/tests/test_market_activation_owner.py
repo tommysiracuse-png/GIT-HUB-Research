@@ -3,9 +3,15 @@ from __future__ import annotations
 import json
 import pathlib
 import sqlite3
+import sys
 import tempfile
 import unittest
 from unittest import mock
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 import market_activation_owner as owner
 from code_evolution import preflight_proposal
@@ -160,6 +166,38 @@ class MarketActivationOwnerTests(unittest.TestCase):
         self.assertIn("never fabricate a price", captured["proposed_change"])
         preflight = preflight_proposal(captured, self.settings)
         self.assertFalse(preflight["quality_scorecard"]["reject_before_model_call"])
+
+    def test_paused_code_turn_records_paper_only_diagnostic_pass(self) -> None:
+        self._write_adapter_report(price_observations=4, candidates=0)
+        captured = {}
+
+        def fake_process(conn, recommendation, settings):
+            captured.update(recommendation["payload"])
+            return [{"proposal_id": "activation-proposal", "status": "implementation_paused"}]
+
+        with self._patch_paths(), mock.patch.object(owner, "process_code_change_recommendation", side_effect=fake_process):
+            owner.run_once(self.conn, self.settings, execute_turn=True, cycle_id="cycle-paused")
+
+        task = self._task()
+        self.assertEqual("implementation_paused", task["status"])
+        last_result = json.loads(task["last_result_json"])
+        diagnostic = captured["evidence"]["paper_diagnostic_pass"]
+        self.assertTrue(diagnostic["paper_only"])
+        self.assertIn("data_freshness", diagnostic)
+        self.assertIn("signal_values", diagnostic)
+        self.assertIn("decision_thresholds", diagnostic)
+        self.assertIn("simulated_positions", diagnostic)
+        self.assertIn("json_schema_validation", diagnostic)
+        self.assertEqual(4, diagnostic["signal_values"]["price_observation_count"])
+        self.assertEqual(0, diagnostic["signal_values"]["candidate_count"])
+        self.assertEqual(
+            diagnostic,
+            last_result["paper_diagnostic_pass"],
+        )
+        self.assertEqual(
+            diagnostic,
+            last_result["active_code_recommendation"]["payload"]["evidence"]["paper_diagnostic_pass"],
+        )
 
     def test_task_completes_only_after_matching_paper_trade_has_reliable_outcome(self) -> None:
         self._write_adapter_report(price_observations=4, candidates=1)

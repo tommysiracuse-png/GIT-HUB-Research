@@ -4,12 +4,16 @@ from src.code_evolution import (
     _contains_exactly_one_json_object,
     _is_paper_scoped_market_key,
     _recommendation_schema_error,
+    normalize_recommendation_response,
+    validate_strict_recommendation_schema,
 )
 
 
 class CodeEvolutionRecommendationSchemaTests(unittest.TestCase):
     def test_market_key_must_be_paper_scoped(self) -> None:
         self.assertTrue(_is_paper_scoped_market_key("paper_cross_market_default"))
+        self.assertTrue(_is_paper_scoped_market_key("paper.cross_market_default"))
+        self.assertTrue(_is_paper_scoped_market_key("paper:cross_market_default"))
         self.assertFalse(_is_paper_scoped_market_key("live_cross_market_default"))
 
     def test_schema_rejects_non_paper_market_key(self) -> None:
@@ -28,16 +32,7 @@ class CodeEvolutionRecommendationSchemaTests(unittest.TestCase):
         self.assertFalse(_contains_exactly_one_json_object('{"a":1} trailing commentary'))
         self.assertTrue(_contains_exactly_one_json_object('{"a":1}'))
 
-
-if __name__ == "__main__":
-    unittest.main()
-import unittest
-
-from src.code_evolution import normalize_recommendation_response, validate_strict_recommendation_schema
-
-
-class CodeEvolutionRecommendationSchemaTests(unittest.TestCase):
-    def test_normalize_recommendation_response_returns_valid_object_for_json_string(self):
+    def test_normalize_recommendation_response_returns_valid_object_for_json_string(self) -> None:
         payload = (
             '{"action":"monitor_only","priority":1,"title":"Safe paper-only recommendation",'
             '"rationale":"Valid schema should pass through.","market_key":"paper_only_execution_route_hunter",'
@@ -50,7 +45,7 @@ class CodeEvolutionRecommendationSchemaTests(unittest.TestCase):
         self.assertTrue(valid, reason)
         self.assertEqual(normalized["action"], "monitor_only")
 
-    def test_normalize_recommendation_response_falls_back_on_invalid_text(self):
+    def test_normalize_recommendation_response_falls_back_on_invalid_text(self) -> None:
         normalized = normalize_recommendation_response("not valid json")
 
         valid, reason = validate_strict_recommendation_schema(normalized)
