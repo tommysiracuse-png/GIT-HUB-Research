@@ -561,6 +561,14 @@ LINEAGE_SOURCE_SIGNAL_KEY_FIELDS = (
     "upstream_signal_key",
     "origin_signal_key",
 )
+YAHOO_PROXY_TRANSFER_SOURCE_PREFIX = "YAHOO_PROXY|global_proxy_momentum"
+YAHOO_PROXY_TRANSFER_OKX_SURFACES = {"OKX_SPOT", "OKX_PERP"}
+YAHOO_PROXY_TRANSFER_DELAY_BUCKETS = (
+    (60.0, "under_1m"),
+    (300.0, "1m_to_5m"),
+    (900.0, "5m_to_15m"),
+    (float("inf"), "over_15m"),
+)
 
 COVERED_IMPROVEMENT_TASK_IDS = [
     68036,
@@ -5144,6 +5152,9 @@ def _cleanup_manual_tasks(conn: Any | None) -> dict:
 
 def _report_markdown(report: dict) -> str:
     summary = report.get("summary", {})
+    yahoo_proxy_transfer = report.get("yahoo_proxy_transfer_friction_diagnostic", {})
+    native_surface = yahoo_proxy_transfer.get("native_surface", {})
+    transferred_routes = yahoo_proxy_transfer.get("transferred_routes", {})
     lines = [
         "# Strategy Reliability Report",
         "",
@@ -5180,13 +5191,25 @@ def _report_markdown(report: dict) -> str:
             "",
             f"- Improvement tasks: `{report.get('covered_improvement_task_ids', [])}`",
             f"- Growth experiments: `{report.get('covered_growth_experiment_ids', [])}`",
-            f"- Task cleanup: `{report.get('task_cleanup', {})}`",
-            "",
-            "## Hard Limits",
-            "",
-            "- Paper-only candidate annotation.",
-            "- No live trading, credentials, broker writes, dependency installation, or startup changes.",
-            "- Promotions still require the existing reliable-label gates.",
+        f"- Task cleanup: `{report.get('task_cleanup', {})}`",
+        "",
+        "## Yahoo Proxy Transfer Friction",
+        "",
+        f"- Current-cycle candidates tagged: `{yahoo_proxy_transfer.get('current_cycle_candidate_count', 0)}`",
+        f"- Current-cycle mapping status: `{yahoo_proxy_transfer.get('current_cycle_mapping_status', {})}`",
+        f"- Closed trade count: `{yahoo_proxy_transfer.get('closed_trade_count', 0)}`",
+        f"- Native proxy avg PnL / win rate: `{native_surface.get('avg_pnl_bps')}` bps / `{native_surface.get('win_rate')}`",
+        f"- OKX route deltas vs native: `{yahoo_proxy_transfer.get('route_vs_native_pnl_delta_bps', {})}`",
+        f"- Transferred route stats: `{transferred_routes}`",
+        f"- Delay segments: `{(yahoo_proxy_transfer.get('segments') or {}).get('delay_bucket', {})}`",
+        f"- Liquidity segments: `{(yahoo_proxy_transfer.get('segments') or {}).get('liquidity_tier', {})}`",
+        f"- Spread segments: `{(yahoo_proxy_transfer.get('segments') or {}).get('spread_regime', {})}`",
+        "",
+        "## Hard Limits",
+        "",
+        "- Paper-only candidate annotation.",
+        "- No live trading, credentials, broker writes, dependency installation, or startup changes.",
+        "- Promotions still require the existing reliable-label gates.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -5251,6 +5274,434 @@ def _hydrate_portability_paper_evidence(candidates: list[dict], conn: Any | None
             }
 
 
+def _yahoo_proxy_transfer_source_signal_key(candidate: Mapping[str, Any]) -> str | None:
+    for field in (
+        "source_signal_key",
+        "strategy_lab_source_signal_key",
+        "parent_signal_key",
+        "origin_signal_key",
+        "lineage_source_signal_key",
+        "market_key",
+        "signal_key",
+    ):
+        value = str(candidate.get(field) or "").strip()
+        if value.startswith(YAHOO_PROXY_TRANSFER_SOURCE_PREFIX):
+            return value
+    if (
+        str(candidate.get("venue") or "").strip().upper() == "YAHOO_PROXY"
+        and str(candidate.get("trade_type") or "").strip() == "global_proxy_momentum"
+    ):
+        fallback = str(candidate.get("signal_key") or candidate.get("market_key") or "").strip()
+        if fallback:
+            return fallback
+        try:
+            return signal_key(dict(candidate))
+        except Exception:  # noqa: BLE001 - diagnostic-only fallback
+            return None
+    return None
+
+
+def _yahoo_proxy_transfer_target_surface(candidate: Mapping[str, Any]) -> str | None:
+    venue = str(candidate.get("venue") or "").strip().upper()
+    inst_id = str(candidate.get("inst_id") or "").strip().upper()
+    for field in ("target_surface", "paper_target_surface", "execution_surface", "market_surface"):
+        value = str(candidate.get(field) or "").strip().upper()
+        if value in YAHOO_PROXY_TRANSFER_OKX_SURFACES | {"YAHOO_PROXY"}:
+            return value
+    if venue == "YAHOO_PROXY":
+        return "YAHOO_PROXY"
+    if venue == "OKX_SPOT":
+        return "OKX_SPOT"
+    if venue == "OKX":
+        return "OKX_PERP" if "SWAP" in inst_id or "PERP" in inst_id else "OKX_SPOT"
+    return None
+
+
+def _yahoo_proxy_transfer_target_route_key(
+    candidate: Mapping[str, Any],
+    target_surface: str | None,
+) -> str | None:
+    if target_surface not in YAHOO_PROXY_TRANSFER_OKX_SURFACES:
+        return None
+    for field in ("inst_id", "route_id", "instrument_id", "symbol"):
+        value = str(candidate.get(field) or "").strip()
+        if value:
+            return value
+    return target_surface
+
+
+def _yahoo_proxy_transfer_delay_seconds(
+    candidate: Mapping[str, Any],
+    *,
+    opened_at: Any = None,
+) -> float | None:
+    for field in ("source_quote_age_seconds", "proxy_quote_age_seconds", "source_age_seconds"):
+        delay = _maybe_float(candidate.get(field))
+        if delay is not None:
+            return max(0.0, delay)
+    source_at = _parse_timestamp(
+        candidate.get("source_quote_timestamp")
+        or candidate.get("last_trade_timestamp")
+        or candidate.get("source_observed_at")
+    )
+    destination_at = _parse_timestamp(opened_at or candidate.get("opened_at") or candidate.get("seen_at"))
+    if source_at is None or destination_at is None:
+        return None
+    return max(0.0, (destination_at - source_at).total_seconds())
+
+
+def _yahoo_proxy_transfer_delay_bucket(delay_seconds: float | None) -> str:
+    if delay_seconds is None:
+        return "unknown"
+    for limit, label in YAHOO_PROXY_TRANSFER_DELAY_BUCKETS:
+        if delay_seconds <= limit:
+            return label
+    return "unknown"
+
+
+def _yahoo_proxy_liquidity_tier(liquidity_score: float | None) -> str:
+    if liquidity_score is None:
+        return "unknown"
+    if liquidity_score <= 0.35:
+        return "low"
+    if liquidity_score <= 0.65:
+        return "mid"
+    if liquidity_score <= 0.85:
+        return "high"
+    return "elite"
+
+
+def _yahoo_proxy_spread_regime(spread_bps: float | None) -> str:
+    if spread_bps is None:
+        return "unknown"
+    if spread_bps <= 3.0:
+        return "tight"
+    if spread_bps <= 8.0:
+        return "normal"
+    if spread_bps <= 20.0:
+        return "wide"
+    return "extreme"
+
+
+def _paper_expectancy_snapshot(evidence: Mapping[str, Any] | None) -> tuple[int | None, float | None]:
+    if not isinstance(evidence, Mapping):
+        return None, None
+    closed_count = _as_int(
+        evidence.get(
+            "closed_count",
+            evidence.get("closed_trades", evidence.get("paper_observation_count")),
+        ),
+        0,
+    )
+    expectancy = _maybe_float(
+        evidence.get(
+            "expectancy_net_bps",
+            evidence.get(
+                "after_cost_expectancy_bps",
+                evidence.get(
+                    "avg_pnl_bps",
+                    evidence.get("destination_expectancy_net_bps"),
+                ),
+            ),
+        )
+    )
+    return (closed_count if closed_count > 0 else None), expectancy
+
+
+def _aggregate_yahoo_proxy_transfer_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    pnls = [float(item["pnl_bps"]) for item in rows if item.get("pnl_bps") is not None]
+    delays = [float(item["transfer_delay_seconds"]) for item in rows if item.get("transfer_delay_seconds") is not None]
+    scores = [float(item["native_proxy_score"]) for item in rows if item.get("native_proxy_score") is not None]
+    basis = [float(item["basis_snapshot_bps"]) for item in rows if item.get("basis_snapshot_bps") is not None]
+    spreads = [float(item["spread_snapshot_bps"]) for item in rows if item.get("spread_snapshot_bps") is not None]
+    liquidity = [float(item["liquidity_score"]) for item in rows if item.get("liquidity_score") is not None]
+    return {
+        "closed_count": len(rows),
+        "avg_pnl_bps": round(sum(pnls) / len(pnls), 3) if pnls else None,
+        "win_rate": round(sum(1 for value in pnls if value > 0.0) / len(pnls), 3) if pnls else None,
+        "avg_transfer_delay_seconds": round(sum(delays) / len(delays), 3) if delays else None,
+        "avg_native_proxy_score": round(sum(scores) / len(scores), 3) if scores else None,
+        "avg_basis_snapshot_bps": round(sum(basis) / len(basis), 3) if basis else None,
+        "avg_spread_bps": round(sum(spreads) / len(spreads), 3) if spreads else None,
+        "avg_liquidity_score": round(sum(liquidity) / len(liquidity), 3) if liquidity else None,
+    }
+
+
+def _segment_yahoo_proxy_transfer_rows(
+    rows: list[dict[str, Any]],
+    field: str,
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(field) or "unknown")].append(row)
+    return {
+        key: {
+            **_aggregate_yahoo_proxy_transfer_rows(items),
+            "routes": dict(collections.Counter(str(item.get("route") or "unknown") for item in items)),
+        }
+        for key, items in sorted(grouped.items())
+    }
+
+
+def _hydrate_yahoo_proxy_transfer_diagnostics(
+    candidates: list[dict[str, Any]],
+    conn: Any | None,
+) -> None:
+    requested_signal_stats: dict[str, list[tuple[str, dict[str, Any]]]] = collections.defaultdict(list)
+    for candidate in candidates:
+        source_signal_key = _yahoo_proxy_transfer_source_signal_key(candidate)
+        if source_signal_key and not isinstance(candidate.get("native_yahoo_proxy_paper_evidence"), Mapping):
+            requested_signal_stats[source_signal_key].append(("native", candidate))
+        target_surface = _yahoo_proxy_transfer_target_surface(candidate)
+        if (
+            target_surface in YAHOO_PROXY_TRANSFER_OKX_SURFACES
+            and not isinstance(candidate.get("target_surface_paper_evidence"), Mapping)
+        ):
+            requested_signal_stats[signal_key(candidate)].append(("target", candidate))
+        if (
+            source_signal_key
+            and not isinstance(candidate.get("native_yahoo_proxy_paper_evidence"), Mapping)
+            and isinstance(candidate.get("lineage_source_health"), Mapping)
+        ):
+            candidate["native_yahoo_proxy_paper_evidence"] = dict(candidate["lineage_source_health"])
+
+    if conn is not None and requested_signal_stats:
+        placeholders = ",".join("?" for _ in requested_signal_stats)
+        try:
+            rows = conn.execute(
+                f"""
+                select signal_key, closed_count, avg_pnl_bps, win_rate, updated_at
+                from signal_stats
+                where signal_key in ({placeholders})
+                """,
+                tuple(requested_signal_stats),
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - optional read-only runtime evidence
+            rows = []
+        for raw in rows:
+            try:
+                stats = dict(raw)
+            except (TypeError, ValueError):
+                stats = {
+                    "signal_key": raw[0],
+                    "closed_count": raw[1],
+                    "avg_pnl_bps": raw[2],
+                    "win_rate": raw[3],
+                    "updated_at": raw[4],
+                }
+            signal_key_value = str(stats.get("signal_key") or "")
+            for kind, candidate in requested_signal_stats.get(signal_key_value, []):
+                if kind == "native":
+                    candidate["native_yahoo_proxy_paper_evidence"] = {
+                        "source_signal_key": signal_key_value,
+                        "closed_count": stats.get("closed_count"),
+                        "expectancy_net_bps": stats.get("avg_pnl_bps"),
+                        "win_rate": stats.get("win_rate"),
+                        "updated_at": stats.get("updated_at"),
+                        "evidence_source": "persisted_paper_signal_stats",
+                        "cost_basis": "realized_paper_pnl_bps",
+                    }
+                    continue
+                if kind == "target" and not isinstance(candidate.get("target_surface_paper_evidence"), Mapping):
+                    target_surface = _yahoo_proxy_transfer_target_surface(candidate)
+                    target_route_key = _yahoo_proxy_transfer_target_route_key(candidate, target_surface)
+                    source_signal_key = _yahoo_proxy_transfer_source_signal_key(candidate)
+                    candidate["target_surface_paper_evidence"] = {
+                        "paper_only": True,
+                        "target_surface": target_surface,
+                        "target_venue": str(candidate.get("venue") or "").strip(),
+                        "target_route_key": target_route_key,
+                        "source_signal_key": source_signal_key,
+                        "closed_count": stats.get("closed_count"),
+                        "expectancy_net_bps": stats.get("avg_pnl_bps"),
+                        "win_rate": stats.get("win_rate"),
+                        "quality_pass_rate": stats.get("win_rate"),
+                        "updated_at": stats.get("updated_at"),
+                        "evidence_source": "persisted_paper_signal_stats",
+                        "cost_basis": "realized_paper_pnl_bps",
+                        "transfer_mapping_key": (
+                            f"{source_signal_key}->{target_route_key}"
+                            if source_signal_key and target_route_key
+                            else None
+                        ),
+                    }
+
+    for candidate in candidates:
+        source_signal_key = _yahoo_proxy_transfer_source_signal_key(candidate)
+        target_surface = _yahoo_proxy_transfer_target_surface(candidate)
+        if not source_signal_key and target_surface != "YAHOO_PROXY":
+            continue
+        target_route_key = _yahoo_proxy_transfer_target_route_key(candidate, target_surface)
+        expected_mapping_key = (
+            f"{source_signal_key}->{target_route_key}"
+            if source_signal_key and target_route_key
+            else None
+        )
+        target_evidence = candidate.get("target_surface_paper_evidence")
+        evidence_mapping_key = None
+        if isinstance(target_evidence, Mapping):
+            evidence_mapping_key = str(
+                target_evidence.get("transfer_mapping_key")
+                or target_evidence.get("source_target_mapping_key")
+                or target_evidence.get("mapping_key")
+                or ""
+            ).strip() or None
+        if target_surface == "YAHOO_PROXY":
+            mapping_status = "native_surface"
+        elif expected_mapping_key and evidence_mapping_key:
+            mapping_status = "matched" if evidence_mapping_key == expected_mapping_key else "mismatch"
+        elif expected_mapping_key:
+            mapping_status = "expected_unverified"
+        else:
+            mapping_status = "unknown"
+        liquidity_score = _maybe_float(candidate.get("liquidity_score"))
+        spread_bps = _maybe_float(candidate.get("spread_bps"))
+        basis_snapshot_bps = _maybe_float(candidate.get("basis_bps"))
+        native_closed_count, native_expectancy = _paper_expectancy_snapshot(
+            candidate.get("native_yahoo_proxy_paper_evidence")
+        )
+        route_closed_count, route_expectancy = _paper_expectancy_snapshot(target_evidence)
+        transfer_delay_seconds = _yahoo_proxy_transfer_delay_seconds(candidate)
+        candidate["yahoo_proxy_transfer_diagnostic"] = {
+            "paper_only": True,
+            "applies": True,
+            "source_signal_key": source_signal_key,
+            "native_surface": "YAHOO_PROXY",
+            "mapped_okx_route": target_surface if target_surface in YAHOO_PROXY_TRANSFER_OKX_SURFACES else None,
+            "target_route_key": target_route_key,
+            "expected_transfer_mapping_key": expected_mapping_key,
+            "evidence_transfer_mapping_key": evidence_mapping_key,
+            "mapping_status": mapping_status,
+            "native_proxy_score": (
+                _maybe_float(candidate.get("score_before_proxy_momentum_context"))
+                if _maybe_float(candidate.get("score_before_proxy_momentum_context")) is not None
+                else _maybe_float(candidate.get("score"))
+            ),
+            "source_quote_timestamp": (
+                candidate.get("source_quote_timestamp")
+                or candidate.get("last_trade_timestamp")
+            ),
+            "transfer_delay_seconds": round(transfer_delay_seconds, 3) if transfer_delay_seconds is not None else None,
+            "delay_bucket": _yahoo_proxy_transfer_delay_bucket(transfer_delay_seconds),
+            "basis_snapshot_bps": basis_snapshot_bps,
+            "spread_snapshot_bps": spread_bps,
+            "spread_regime": _yahoo_proxy_spread_regime(spread_bps),
+            "liquidity_score": liquidity_score,
+            "liquidity_tier": _yahoo_proxy_liquidity_tier(liquidity_score),
+            "estimated_round_trip_cost_bps": _maybe_float(candidate.get("estimated_round_trip_cost_bps")),
+            "native_surface_closed_count": native_closed_count,
+            "native_surface_paper_pnl_bps": native_expectancy,
+            "mapped_route_closed_count": route_closed_count,
+            "mapped_route_paper_pnl_bps": route_expectancy,
+            "route_vs_native_pnl_delta_bps": (
+                round(route_expectancy - native_expectancy, 3)
+                if route_expectancy is not None and native_expectancy is not None
+                else None
+            ),
+        }
+
+
+def _build_yahoo_proxy_transfer_friction_diagnostic(
+    candidates: list[dict[str, Any]],
+    conn: Any | None,
+) -> dict[str, Any]:
+    current_cycle = [
+        dict(candidate["yahoo_proxy_transfer_diagnostic"], inst_id=candidate.get("inst_id"))
+        for candidate in candidates
+        if isinstance(candidate.get("yahoo_proxy_transfer_diagnostic"), Mapping)
+    ]
+    historical_rows: list[dict[str, Any]] = []
+    if conn is not None:
+        try:
+            rows = conn.execute(
+                """
+                select opened_at, venue, inst_id, signal_key, pnl_bps, candidate_json
+                from paper_trades
+                where status = 'closed'
+                  and pnl_bps is not null
+                """
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - diagnostic-only report
+            rows = []
+        for row in rows:
+            try:
+                candidate = json.loads(row["candidate_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                candidate = {}
+            if not isinstance(candidate, dict):
+                candidate = {}
+            candidate.setdefault("venue", row["venue"])
+            candidate.setdefault("inst_id", row["inst_id"])
+            candidate.setdefault("signal_key", row["signal_key"])
+            source_signal_key = _yahoo_proxy_transfer_source_signal_key(candidate)
+            target_surface = _yahoo_proxy_transfer_target_surface(candidate)
+            if target_surface not in YAHOO_PROXY_TRANSFER_OKX_SURFACES | {"YAHOO_PROXY"}:
+                continue
+            if not source_signal_key and target_surface != "YAHOO_PROXY":
+                continue
+            transfer_delay_seconds = _yahoo_proxy_transfer_delay_seconds(candidate, opened_at=row["opened_at"])
+            liquidity_score = _maybe_float(candidate.get("liquidity_score"))
+            spread_bps = _maybe_float(candidate.get("spread_bps"))
+            historical_rows.append(
+                {
+                    "route": "native_proxy" if target_surface == "YAHOO_PROXY" else target_surface,
+                    "pnl_bps": _maybe_float(row["pnl_bps"]),
+                    "native_proxy_score": (
+                        _maybe_float(candidate.get("score_before_proxy_momentum_context"))
+                        if _maybe_float(candidate.get("score_before_proxy_momentum_context")) is not None
+                        else _maybe_float(candidate.get("score"))
+                    ),
+                    "transfer_delay_seconds": transfer_delay_seconds,
+                    "delay_bucket": _yahoo_proxy_transfer_delay_bucket(transfer_delay_seconds),
+                    "basis_snapshot_bps": _maybe_float(candidate.get("basis_bps")),
+                    "spread_snapshot_bps": spread_bps,
+                    "spread_regime": _yahoo_proxy_spread_regime(spread_bps),
+                    "liquidity_score": liquidity_score,
+                    "liquidity_tier": _yahoo_proxy_liquidity_tier(liquidity_score),
+                }
+            )
+
+    routes: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for row in historical_rows:
+        routes[str(row.get("route") or "unknown")].append(row)
+    native_summary = _aggregate_yahoo_proxy_transfer_rows(routes.get("native_proxy", []))
+    route_summaries = {
+        route: _aggregate_yahoo_proxy_transfer_rows(items)
+        for route, items in sorted(routes.items())
+        if route != "native_proxy"
+    }
+    native_avg = native_summary.get("avg_pnl_bps")
+    route_deltas = {
+        route: (
+            round(summary["avg_pnl_bps"] - native_avg, 3)
+            if summary.get("avg_pnl_bps") is not None and native_avg is not None
+            else None
+        )
+        for route, summary in route_summaries.items()
+    }
+    return {
+        "current_cycle_candidate_count": len(current_cycle),
+        "current_cycle_mapping_status": dict(
+            collections.Counter(str(item.get("mapping_status") or "unknown") for item in current_cycle)
+        ),
+        "current_cycle_routes": dict(
+            collections.Counter(
+                str(item.get("mapped_okx_route") or item.get("native_surface") or "unknown")
+                for item in current_cycle
+            )
+        ),
+        "closed_trade_count": len(historical_rows),
+        "native_surface": native_summary,
+        "transferred_routes": route_summaries,
+        "route_vs_native_pnl_delta_bps": route_deltas,
+        "segments": {
+            "delay_bucket": _segment_yahoo_proxy_transfer_rows(historical_rows, "delay_bucket"),
+            "liquidity_tier": _segment_yahoo_proxy_transfer_rows(historical_rows, "liquidity_tier"),
+            "spread_regime": _segment_yahoo_proxy_transfer_rows(historical_rows, "spread_regime"),
+        },
+    }
+
+
 def apply_strategy_reliability(
     candidates: list[dict],
     settings: dict | None = None,
@@ -5262,6 +5713,7 @@ def apply_strategy_reliability(
     _hydrate_portability_paper_evidence(candidates, conn)
     hydrate_paper_context_loss_statistics(candidates, conn, settings)
     hydrate_paper_context_prior_statistics(candidates, conn, settings)
+    _hydrate_yahoo_proxy_transfer_diagnostics(candidates, conn)
     for candidate in candidates:
         _remove_invalid_proxy_confirmation(candidate)
         _record_proxy_short_quality(candidate, settings)
@@ -5289,11 +5741,16 @@ def apply_strategy_reliability(
             if record is not None:
                 quarantined.append(record)
         candidates.sort(key=lambda row: row.get("score", 0), reverse=True)
+        yahoo_proxy_transfer_friction_diagnostic = _build_yahoo_proxy_transfer_friction_diagnostic(
+            candidates,
+            conn,
+        )
         return candidates, {
             "enabled": False,
             "paper_family_quarantine_enabled": paper_family_quarantine_enabled(config=settings),
             "generated_at": _utc_now(),
             "summary": _summarize(quarantined, candidates),
+            "yahoo_proxy_transfer_friction_diagnostic": yahoo_proxy_transfer_friction_diagnostic,
         }
 
     adjusted = []
@@ -5325,6 +5782,10 @@ def apply_strategy_reliability(
         "covered_improvement_task_ids": COVERED_IMPROVEMENT_TASK_IDS,
         "covered_growth_experiment_ids": COVERED_GROWTH_EXPERIMENT_IDS,
         "task_cleanup": _cleanup_manual_tasks(conn),
+        "yahoo_proxy_transfer_friction_diagnostic": _build_yahoo_proxy_transfer_friction_diagnostic(
+            candidates,
+            conn,
+        ),
         "hard_limits": [
             "paper_only",
             "no_live_trading",

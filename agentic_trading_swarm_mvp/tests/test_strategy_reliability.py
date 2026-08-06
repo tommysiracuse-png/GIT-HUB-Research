@@ -510,6 +510,173 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(0, report["summary"]["family_quarantine_count"])
         self.assertTrue(row["paper_yahoo_proxy_freshness_gate"]["eligible"])
 
+    def test_yahoo_proxy_transfer_diagnostic_tags_translated_okx_route(self) -> None:
+        candidate = base_candidate(
+            seen_at="2026-08-06T14:05:00+00:00",
+            venue="OKX",
+            inst_id="OKX:BTC-USDT-SWAP",
+            trade_type="frontier_crypto_venue_map",
+            direction="long_frontier_perp",
+            score=79.0,
+            score_before_proxy_momentum_context=83.0,
+            source_signal_key="YAHOO_PROXY|global_proxy_momentum|long_proxy|standard",
+            signal_family="global_proxy_momentum",
+            source_family="yahoo_proxy",
+            source_quote_timestamp="2026-08-06T13:55:00+00:00",
+            spread_bps=7.0,
+            liquidity_score=0.58,
+            basis_bps=12.0,
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        try:
+            conn.execute(
+                """
+                insert into signal_stats(
+                    signal_key, closed_count, wins, avg_pnl_bps,
+                    win_rate, score_adjustment, updated_at
+                ) values
+                    ('YAHOO_PROXY|global_proxy_momentum|long_proxy|standard', 18, 8, -1.5, 0.444, -2.0, '2026-08-06T13:50:00+00:00'),
+                    (?, 11, 3, -6.0, 0.273, -3.0, '2026-08-06T13:59:00+00:00')
+                """,
+                (storage.signal_key(candidate),),
+            )
+            conn.commit()
+
+            rows, _ = strategy_reliability.apply_strategy_reliability([candidate], {"mode": "paper"}, conn=conn)
+        finally:
+            conn.close()
+
+        diagnostic = rows[0]["yahoo_proxy_transfer_diagnostic"]
+        self.assertTrue(diagnostic["applies"])
+        self.assertEqual("OKX_PERP", diagnostic["mapped_okx_route"])
+        self.assertEqual("matched", diagnostic["mapping_status"])
+        self.assertEqual(600.0, diagnostic["transfer_delay_seconds"])
+        self.assertEqual("5m_to_15m", diagnostic["delay_bucket"])
+        self.assertEqual("mid", diagnostic["liquidity_tier"])
+        self.assertEqual("normal", diagnostic["spread_regime"])
+        self.assertEqual(83.0, diagnostic["native_proxy_score"])
+        self.assertEqual(-1.5, diagnostic["native_surface_paper_pnl_bps"])
+        self.assertEqual(-6.0, diagnostic["mapped_route_paper_pnl_bps"])
+        self.assertEqual(-4.5, diagnostic["route_vs_native_pnl_delta_bps"])
+
+    def test_yahoo_proxy_transfer_report_segments_native_vs_okx_routes(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        source_key = "YAHOO_PROXY|global_proxy_momentum|long_proxy|standard"
+        try:
+            def insert_trade(
+                *,
+                opened_at: str,
+                venue: str,
+                inst_id: str,
+                direction: str,
+                signal_key_value: str,
+                pnl_bps: float,
+                candidate_payload: dict,
+            ) -> None:
+                conn.execute(
+                    """
+                    insert into paper_trades (
+                        opened_at, closed_at, venue, inst_id, direction, trade_type,
+                        signal_key, base_score, learned_score, entry, exit, pnl_bps,
+                        status, thesis, candidate_json, review_json
+                    ) values (?, ?, ?, ?, ?, ?, ?, 80, 80, 100, 101, ?, 'closed', 'test', ?, '{}')
+                    """,
+                    (
+                        opened_at,
+                        "2026-08-05T15:00:00+00:00",
+                        venue,
+                        inst_id,
+                        direction,
+                        candidate_payload["trade_type"],
+                        signal_key_value,
+                        pnl_bps,
+                        json.dumps(candidate_payload),
+                    ),
+                )
+
+            insert_trade(
+                opened_at="2026-08-05T14:00:00+00:00",
+                venue="YAHOO_PROXY",
+                inst_id="YAHOO_PROXY:EWZ",
+                direction="long_proxy",
+                signal_key_value=source_key,
+                pnl_bps=4.0,
+                candidate_payload={
+                    "venue": "YAHOO_PROXY",
+                    "inst_id": "YAHOO_PROXY:EWZ",
+                    "trade_type": "global_proxy_momentum",
+                    "direction": "long_proxy",
+                    "signal_key": source_key,
+                    "score": 84.0,
+                    "source_quote_timestamp": "2026-08-05T14:00:00+00:00",
+                    "spread_bps": 2.0,
+                    "liquidity_score": 0.9,
+                    "basis_bps": 0.0,
+                },
+            )
+            insert_trade(
+                opened_at="2026-08-05T14:10:00+00:00",
+                venue="OKX_SPOT",
+                inst_id="OKX_SPOT:BTC-USDT",
+                direction="long_frontier_spot",
+                signal_key_value="OKX_SPOT|frontier_crypto_venue_map|long_frontier_spot|standard",
+                pnl_bps=-6.0,
+                candidate_payload={
+                    "venue": "OKX_SPOT",
+                    "inst_id": "OKX_SPOT:BTC-USDT",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "direction": "long_frontier_spot",
+                    "score": 78.0,
+                    "source_signal_key": source_key,
+                    "source_quote_timestamp": "2026-08-05T14:00:00+00:00",
+                    "spread_bps": 7.0,
+                    "liquidity_score": 0.55,
+                    "basis_bps": 0.0,
+                },
+            )
+            insert_trade(
+                opened_at="2026-08-05T14:20:00+00:00",
+                venue="OKX",
+                inst_id="OKX:BTC-USDT-SWAP",
+                direction="long_frontier_perp",
+                signal_key_value="OKX|frontier_crypto_venue_map|long_frontier_perp|standard",
+                pnl_bps=-10.0,
+                candidate_payload={
+                    "venue": "OKX",
+                    "inst_id": "OKX:BTC-USDT-SWAP",
+                    "trade_type": "frontier_crypto_venue_map",
+                    "direction": "long_frontier_perp",
+                    "score": 75.0,
+                    "source_signal_key": source_key,
+                    "source_quote_timestamp": "2026-08-05T14:00:00+00:00",
+                    "spread_bps": 11.0,
+                    "liquidity_score": 0.25,
+                    "basis_bps": 18.0,
+                },
+            )
+            conn.commit()
+
+            _, report = strategy_reliability.apply_strategy_reliability([], {"mode": "paper"}, conn=conn)
+        finally:
+            conn.close()
+
+        diagnostic = report["yahoo_proxy_transfer_friction_diagnostic"]
+        self.assertEqual(3, diagnostic["closed_trade_count"])
+        self.assertEqual(4.0, diagnostic["native_surface"]["avg_pnl_bps"])
+        self.assertEqual(-6.0, diagnostic["transferred_routes"]["OKX_SPOT"]["avg_pnl_bps"])
+        self.assertEqual(-10.0, diagnostic["transferred_routes"]["OKX_PERP"]["avg_pnl_bps"])
+        self.assertEqual(-10.0, diagnostic["route_vs_native_pnl_delta_bps"]["OKX_SPOT"])
+        self.assertEqual(-14.0, diagnostic["route_vs_native_pnl_delta_bps"]["OKX_PERP"])
+        self.assertEqual(-6.0, diagnostic["segments"]["delay_bucket"]["5m_to_15m"]["avg_pnl_bps"])
+        self.assertEqual(-10.0, diagnostic["segments"]["delay_bucket"]["over_15m"]["avg_pnl_bps"])
+        self.assertEqual(1, diagnostic["segments"]["liquidity_tier"]["low"]["routes"]["OKX_PERP"])
+        self.assertEqual(-10.0, diagnostic["segments"]["spread_regime"]["wide"]["avg_pnl_bps"])
+        self.assertIn("## Yahoo Proxy Transfer Friction", strategy_reliability.REPORT_MD.read_text(encoding="utf-8"))
+
     def test_distinct_proxy_shock_reversal_uses_its_own_quality_profile(self) -> None:
         candidate = base_candidate(
             venue="YAHOO_PROXY",
