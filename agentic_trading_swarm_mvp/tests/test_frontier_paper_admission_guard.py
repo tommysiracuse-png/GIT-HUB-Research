@@ -164,6 +164,7 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
 
         self.assertFalse(weak["frontier_paper_admission"]["admitted"])
         self.assertLessEqual(float(weak["paper_ranking_score"]), 59.999)
+        self.assertIn("paper_frontier_score", weak)
 
     def test_verified_standard_route_positive_net_candidate_is_not_suppressed(self) -> None:
         guarded = apply_frontier_paper_admission_guard(

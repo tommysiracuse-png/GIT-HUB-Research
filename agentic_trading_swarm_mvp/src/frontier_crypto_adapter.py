@@ -10546,6 +10546,28 @@ DEFAULT_FRONTIER_QUOTE_CONTEXT_POLICY = {
     "total_penalty_points_cap": 16.0,
 }
 
+# Paper exploration keeps every priceable candidate visible, but the paper
+# ranking should still prefer dislocations with credible execution context.
+DEFAULT_FRONTIER_PAPER_SCORE_POLICY = {
+    "enabled": True,
+    "paper_only": True,
+    "min_liquidity_score": 0.35,
+    "target_liquidity_score": 0.75,
+    "max_spread_bps": 12.0,
+    "freshness_target_seconds": 30.0,
+    "freshness_max_age_seconds": 90.0,
+    "missing_freshness_term": 0.35,
+    "minimum_freshness_term": 0.1,
+    "execution_quality_floor": 0.2,
+    "execution_quality_ceiling": 1.0,
+    "liquidity_weight": 0.35,
+    "spread_weight": 0.25,
+    "quality_weight": 0.20,
+    "context_weight": 0.20,
+    "context_multiplier_floor": 0.5,
+    "context_multiplier_ceiling": 1.0,
+}
+
 
 def _frontier_dislocation_quality_policy(settings: dict) -> dict:
     policy = dict(DEFAULT_FRONTIER_DISLOCATION_QUALITY_POLICY)
@@ -10588,6 +10610,24 @@ def _frontier_short_market_context_policy(settings: dict) -> dict:
 def _frontier_quote_context_policy(settings: dict) -> dict:
     policy = dict(DEFAULT_FRONTIER_QUOTE_CONTEXT_POLICY)
     configured = settings.get("frontier_crypto_adapter", {}).get("paper_quote_context", {})
+    if isinstance(configured, dict):
+        policy.update({key: value for key, value in configured.items() if value is not None})
+    if configured is False:
+        policy["enabled"] = False
+    return policy
+
+
+def _frontier_paper_score_policy(settings: dict) -> dict:
+    policy = dict(DEFAULT_FRONTIER_PAPER_SCORE_POLICY)
+    effective_edge_policy = _frontier_effective_edge_policy(settings)
+    quote_context_policy = _frontier_quote_context_policy(settings)
+    policy["min_liquidity_score"] = float(
+        effective_edge_policy.get("min_liquidity_score", policy["min_liquidity_score"])
+    )
+    policy["max_spread_bps"] = float(
+        quote_context_policy.get("wide_spread_bps", policy["max_spread_bps"])
+    )
+    configured = settings.get("frontier_crypto_adapter", {}).get("paper_frontier_score", {})
     if isinstance(configured, dict):
         policy.update({key: value for key, value in configured.items() if value is not None})
     if configured is False:
@@ -11548,6 +11588,141 @@ def _apply_frontier_short_market_context(
     return candidate
 
 
+def _frontier_paper_score_review(
+    candidate: dict,
+    settings: dict,
+    *,
+    ranking_edge: float | None,
+    ranking_edge_source: str,
+    base_score: float,
+    context_score: float | None,
+) -> dict:
+    policy = _frontier_paper_score_policy(settings)
+    applicable = bool(
+        policy.get("enabled", True)
+        and policy.get("paper_only", True)
+        and settings.get("mode", "paper") == "paper"
+        and not settings.get("allow_live_trading", False)
+    )
+    if not applicable:
+        return {
+            "enabled": bool(policy.get("enabled", True)),
+            "paper_only": True,
+            "applicable": False,
+            "hard_gate_applied": False,
+            "score": round(max(0.0, ranking_edge if ranking_edge is not None else base_score), 3),
+        }
+
+    expected_edge_value = max(0.0, ranking_edge if ranking_edge is not None else base_score)
+    quality_basis = None
+    for key in ("dislocation_quality_score", "venue_score", "venue_health_score", "quality_score"):
+        quality_basis = as_float(candidate.get(key), None)
+        if quality_basis is not None:
+            break
+    quality_component = max(
+        0.0,
+        min(1.0, (quality_basis or 0.0) / 100.0 if (quality_basis or 0.0) > 1.0 else (quality_basis or 0.0)),
+    )
+    effective_edge_model = candidate.get("effective_edge_model") or {}
+    observed_liquidity = as_float(effective_edge_model.get("liquidity_score"), None)
+    if observed_liquidity is None:
+        observed_liquidity = as_float(candidate.get("liquidity_score"), None)
+    depth_liquidity = as_float(candidate.get("depth_liquidity_score"), None)
+    if observed_liquidity is None:
+        observed_liquidity = depth_liquidity
+    elif depth_liquidity is not None:
+        observed_liquidity = max(observed_liquidity, depth_liquidity)
+    spread_bps_value = as_float(candidate.get("spread_bps"), None)
+    if spread_bps_value is None:
+        spread_bps_value = as_float(candidate.get("best_bid_ask_spread_bps"), None)
+    observed_liquidity = max(0.0, min(1.0, observed_liquidity)) if observed_liquidity is not None else None
+    spread_bps_value = max(0.0, spread_bps_value) if spread_bps_value is not None else None
+    min_liquidity = max(0.0, min(1.0, float(policy["min_liquidity_score"])))
+    liquidity_target = max(min_liquidity, min(1.0, float(policy["target_liquidity_score"])))
+    max_spread_bps = max(0.001, float(policy["max_spread_bps"]))
+    liquidity_component = (
+        max(0.0, min(1.0, observed_liquidity / liquidity_target))
+        if observed_liquidity is not None
+        else 0.35
+    )
+    spread_component = (
+        max(0.0, min(1.0, max_spread_bps / max(max_spread_bps, spread_bps_value)))
+        if spread_bps_value is not None
+        else 0.35
+    )
+    context_component = (
+        max(0.0, min(1.0, context_score / 100.0))
+        if context_score is not None
+        else 1.0
+    )
+    execution_context = (
+        float(policy["liquidity_weight"]) * liquidity_component
+        + float(policy["spread_weight"]) * spread_component
+        + float(policy["quality_weight"]) * quality_component
+        + float(policy["context_weight"]) * context_component
+    )
+    execution_quality_term = max(
+        float(policy["execution_quality_floor"]),
+        min(float(policy["execution_quality_ceiling"]), execution_context),
+    )
+    freshness_age = as_float(candidate.get("freshness_age_seconds"), None)
+    freshness_target = max(0.001, float(policy["freshness_target_seconds"]))
+    freshness_max_age = max(freshness_target, float(policy["freshness_max_age_seconds"]))
+    freshness_min_term = max(0.0, min(1.0, float(policy["minimum_freshness_term"])))
+    if freshness_age is None:
+        freshness_term = max(
+            freshness_min_term,
+            min(1.0, float(policy["missing_freshness_term"])),
+        )
+    elif freshness_age <= freshness_target:
+        freshness_term = 1.0
+    else:
+        freshness_term = max(
+            freshness_min_term,
+            min(1.0, freshness_target / max(freshness_target, freshness_age)),
+        )
+        if freshness_age >= freshness_max_age:
+            freshness_term = freshness_min_term
+    context_multiplier = (
+        max(
+            float(policy["context_multiplier_floor"]),
+            min(float(policy["context_multiplier_ceiling"]), context_score / 100.0),
+        )
+        if context_score is not None
+        else 1.0
+    )
+    hard_gate_reasons = []
+    if observed_liquidity is not None and observed_liquidity < min_liquidity:
+        hard_gate_reasons.append("liquidity_below_minimum")
+    if spread_bps_value is not None and spread_bps_value > max_spread_bps:
+        hard_gate_reasons.append("spread_above_maximum")
+    score = expected_edge_value * execution_quality_term * freshness_term * context_multiplier
+    if hard_gate_reasons:
+        score = 0.0
+    return {
+        "enabled": True,
+        "paper_only": True,
+        "applicable": True,
+        "expected_edge_value": round(expected_edge_value, 6),
+        "expected_edge_source": ranking_edge_source,
+        "execution_quality_term": round(execution_quality_term, 6),
+        "freshness_term": round(freshness_term, 6),
+        "context_multiplier": round(context_multiplier, 6),
+        "quality_component": round(quality_component, 6),
+        "liquidity_component": round(liquidity_component, 6),
+        "spread_component": round(spread_component, 6),
+        "context_component": round(context_component, 6),
+        "observed_liquidity_score": round(observed_liquidity, 6) if observed_liquidity is not None else None,
+        "observed_spread_bps": round(spread_bps_value, 6) if spread_bps_value is not None else None,
+        "minimum_liquidity_score": round(min_liquidity, 6),
+        "maximum_spread_bps": round(max_spread_bps, 6),
+        "hard_gate_applied": bool(hard_gate_reasons),
+        "hard_gate_reasons": hard_gate_reasons,
+        "gating_mode": "ranking_only",
+        "score": round(max(0.0, score), 3),
+    }
+
+
 def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> list[dict]:
     """Rank the paper cohort while retaining every emitted, priceable candidate."""
 
@@ -11619,20 +11794,19 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             if isinstance(context_review, dict) and context_review.get("applicable")
             else None
         )
+        paper_frontier_score = _frontier_paper_score_review(
+            candidate,
+            settings,
+            ranking_edge=ranking_edge,
+            ranking_edge_source=ranking_edge_source,
+            base_score=base_score,
+            context_score=context_score,
+        )
+        candidate["paper_frontier_score"] = paper_frontier_score
         paper_ranking_score = round(
-            effective_edge_score
-            + quality_weight * quality_score
-            + context_weight * ((context_score - 100.0) if context_score is not None else 0.0)
+            max(0.0, float(paper_frontier_score.get("score", effective_edge_score or base_score)))
             - local_quote_penalty
-            - quote_context_penalty
-            if ranking_edge is not None
-            else (
-                (1.0 - quality_weight) * base_score
-                + quality_weight * quality_score
-                + context_weight * ((context_score - 100.0) if context_score is not None else 0.0)
-                - local_quote_penalty
-                - quote_context_penalty
-            ),
+            - quote_context_penalty,
             3,
         )
         cost_diagnostic = candidate.get("paper_cost_diagnostic") or {}
@@ -11653,6 +11827,16 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             paper_ranking_score = min(
                 paper_ranking_score,
                 as_float(frontier_paper_admission.get("score_cap"), 59.999) or 59.999,
+            )
+        if paper_frontier_score.get("hard_gate_applied"):
+            paper_ranking_score = 0.0
+            candidate["paper_active_scoring_eligible"] = False
+            candidate["paper_ineligible"] = True
+            candidate["paper_frontier_score_gate_shadow_label"] = True
+            candidate["paper_ineligible_reason"] = (
+                candidate.get("paper_ineligible_reason")
+                or "+".join(paper_frontier_score.get("hard_gate_reasons") or [])
+                or "frontier_score_gate"
             )
         quote_ranking_eligible = bool(candidate.get("quote_ranking_eligible", True))
         if not quote_ranking_eligible:
@@ -11683,6 +11867,8 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
             if route_feasibility_gate.get("shadow_label", False)
             else "stale_fx_reference_shadow_only"
             if not quote_ranking_eligible
+            else "frontier_score_gate_shadow_only"
+            if paper_frontier_score.get("hard_gate_applied")
             else "ranked_not_blocked"
             if paper_only_active
             else "paper_only_ranking_inactive"

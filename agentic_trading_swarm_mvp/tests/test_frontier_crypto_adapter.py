@@ -1318,6 +1318,67 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
 
         self.assertEqual("EXECUTABLE-LEADER", ranked[0]["inst_id"])
 
+    def test_context_aware_frontier_score_penalizes_weaker_execution_context(self) -> None:
+        cfg = settings()
+        degraded_context = {
+            "inst_id": "DEGRADED-CONTEXT",
+            "score": 99.0,
+            "dislocation_quality_score": 95.0,
+            "effective_edge_bps": 18.0,
+            "liquidity_score": 0.5,
+            "spread_bps": 11.0,
+            "freshness_age_seconds": 80.0,
+            "frontier_short_market_context": {"applicable": True, "score": 62.0},
+        }
+        healthy_context = {
+            "inst_id": "HEALTHY-CONTEXT",
+            "score": 40.0,
+            "dislocation_quality_score": 88.0,
+            "effective_edge_bps": 14.0,
+            "liquidity_score": 0.92,
+            "spread_bps": 2.0,
+            "freshness_age_seconds": 4.0,
+            "frontier_short_market_context": {"applicable": True, "score": 94.0},
+        }
+
+        ranked = frontier.rank_frontier_paper_candidates([degraded_context, healthy_context], cfg)
+
+        self.assertEqual("HEALTHY-CONTEXT", ranked[0]["inst_id"])
+        degraded_review = degraded_context["paper_frontier_score"]
+        healthy_review = healthy_context["paper_frontier_score"]
+        self.assertLess(
+            degraded_review["execution_quality_term"] * degraded_review["freshness_term"],
+            healthy_review["execution_quality_term"] * healthy_review["freshness_term"],
+        )
+        self.assertLess(degraded_context["paper_ranking_score"], healthy_context["paper_ranking_score"])
+
+    def test_frontier_score_gate_zeroes_ranking_without_blocking_paper_candidate(self) -> None:
+        cfg = settings()
+        candidate = {
+            "inst_id": "THIN-WIDE",
+            "venue": "TEST",
+            "direction": "long_frontier_spot",
+            "score": 75.0,
+            "dislocation_quality_score": 90.0,
+            "effective_edge_bps": 20.0,
+            "liquidity_score": 0.2,
+            "spread_bps": 20.0,
+            "freshness_age_seconds": 5.0,
+        }
+
+        ranked = frontier.rank_frontier_paper_candidates([candidate], cfg)
+
+        self.assertEqual([candidate], ranked)
+        self.assertEqual(0.0, candidate["paper_ranking_score"])
+        self.assertFalse(candidate["paper_active_scoring_eligible"])
+        self.assertFalse(candidate.get("paper_entry_blocked", False))
+        self.assertEqual("frontier_score_gate_shadow_only", candidate["paper_quality_filter_status"])
+        self.assertTrue(candidate["paper_frontier_score"]["hard_gate_applied"])
+        self.assertEqual(
+            ["liquidity_below_minimum", "spread_above_maximum"],
+            candidate["paper_frontier_score"]["hard_gate_reasons"],
+        )
+
     def test_quote_context_records_real_book_diagnostics_and_only_penalizes_ranking(self) -> None:
         cfg = settings()
         cfg["frontier_crypto_adapter"]["paper_quote_context"] = {
