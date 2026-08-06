@@ -5398,7 +5398,7 @@ def _finite_preliminary_spread_bps(row: dict) -> float | None:
     return spread_bps
 
 
-def _blind_under_sampled_quality_coverage(
+def _data_gap_quality_coverage(
     observations: list[dict],
     snapshot_state: dict[str, dict],
     min_observation_count: int,
@@ -5416,15 +5416,21 @@ def _blind_under_sampled_quality_coverage(
             grouped[bucket]["total_observations"] += 1
             if row.get("data_status") == "reachable":
                 grouped[bucket]["reachable_observations"] += 1
-            if int((snapshot_state.get(inst_id) or {}).get("consecutive_verified_count") or 0) > 0:
+            if (
+                row.get("data_status") == "reachable"
+                and int((snapshot_state.get(inst_id) or {}).get("consecutive_verified_count") or 0) > 0
+            ):
                 grouped[bucket]["known_quality_count"] += 1
         coverage: dict[str, dict] = {}
         for bucket, counts in sorted(grouped.items()):
             total_observations = int(counts["total_observations"])
             reachable_observations = int(counts["reachable_observations"])
-            known_quality_count = int(counts["known_quality_count"])
+            known_quality_count = min(
+                int(counts["known_quality_count"]),
+                reachable_observations,
+            )
             known_quality_rate = (
-                known_quality_count / total_observations if total_observations else 0.0
+                known_quality_count / reachable_observations if reachable_observations else 0.0
             )
             coverage[bucket] = {
                 "total_observations": total_observations,
@@ -5432,7 +5438,7 @@ def _blind_under_sampled_quality_coverage(
                 "known_quality_count": known_quality_count,
                 "known_quality_rate": round(known_quality_rate, 4),
                 "eligible": (
-                    total_observations >= min_observation_count
+                    reachable_observations >= min_observation_count
                     and reachable_observations > 0
                     and known_quality_rate < max_known_quality_rate
                 ),
@@ -5445,14 +5451,15 @@ def _blind_under_sampled_quality_coverage(
     }
 
 
-def _blind_under_sampled_quota_report(
+def _data_gap_quota_report(
     observations: list[dict],
     baseline_selected: list[dict],
     final_selected: list[dict],
     quota_selected: list[dict],
     coverage: dict[str, dict[str, dict]],
     reserved_slot_cap: int,
-    preserved_baseline_slots: int,
+    known_quality_rate_threshold: float,
+    configured_fraction: float,
 ) -> dict:
     eligible_venues = {
         venue: dict(item)
@@ -5521,8 +5528,9 @@ def _blind_under_sampled_quota_report(
         )
     return {
         "enabled": reserved_slot_cap > 0,
+        "configured_fraction": round(configured_fraction, 4),
         "reserved_slot_cap": int(reserved_slot_cap),
-        "preserved_baseline_slots": int(preserved_baseline_slots),
+        "known_quality_rate_threshold": round(known_quality_rate_threshold, 4),
         "eligible_reachable_instrument_count": int(eligible_reachable_instrument_count),
         "eligible_venue_count": len(eligible_venues),
         "eligible_quote_count": len(eligible_quotes),
@@ -5696,23 +5704,44 @@ def select_enrichment_observations(
     )
     if not math.isfinite(zero_quality_probe_max_spread_bps) or zero_quality_probe_max_spread_bps <= 0.0:
         zero_quality_probe_max_spread_bps = 50.0
-    blind_quota_max = max(
-        0, int(cfg.get("blind_under_sampled_quota_max_per_cycle", 20) or 0)
+    data_gap_quota_fraction = float(
+        cfg.get("data_gap_depth_quota_fraction", 0.2) or 0.0
     )
-    blind_quota_top_selection_minimum = max(
-        0, int(cfg.get("blind_under_sampled_quota_top_selection_minimum", 40) or 0)
+    if not math.isfinite(data_gap_quota_fraction) or data_gap_quota_fraction < 0.0:
+        data_gap_quota_fraction = 0.2
+    data_gap_quota_fraction = min(1.0, max(0.0, data_gap_quota_fraction))
+    data_gap_quota_max = max(
+        0,
+        int(
+            cfg.get(
+                "data_gap_depth_quota_max_per_cycle",
+                cfg.get("blind_under_sampled_quota_max_per_cycle", 12),
+            )
+            or 0
+        ),
     )
-    blind_quota_min_observations = max(
-        1, int(cfg.get("blind_under_sampled_quota_min_observation_count", 5) or 0)
+    data_gap_quota_min_observations = max(
+        1,
+        int(
+            cfg.get(
+                "data_gap_depth_quota_min_observation_count",
+                cfg.get("blind_under_sampled_quota_min_observation_count", 1),
+            )
+            or 0
+        ),
     )
-    blind_quota_max_known_quality_rate = float(
-        cfg.get("blind_under_sampled_quota_max_known_quality_rate", 0.05) or 0.0
+    data_gap_known_quality_rate_threshold = float(
+        cfg.get(
+            "data_gap_known_quality_rate_threshold",
+            cfg.get("blind_under_sampled_quota_max_known_quality_rate", 0.02),
+        )
+        or 0.0
     )
     if (
-        not math.isfinite(blind_quota_max_known_quality_rate)
-        or blind_quota_max_known_quality_rate <= 0.0
+        not math.isfinite(data_gap_known_quality_rate_threshold)
+        or data_gap_known_quality_rate_threshold <= 0.0
     ):
-        blind_quota_max_known_quality_rate = 0.05
+        data_gap_known_quality_rate_threshold = 0.02
     active_variant_top = int(cfg.get("active_variant_enrichment_top", 10))
     shadow_variant_top = int(cfg.get("shadow_variant_enrichment_top", 2))
     shadow_variant_cap = int(cfg.get("shadow_variant_enrichment_variant_cap", 8))
@@ -5941,120 +5970,172 @@ def select_enrichment_observations(
         ],
         "rotation_fill",
     )
-    blind_quota_reserved_slots = min(
-        blind_quota_max,
-        max(0, max_total - min(max_total, blind_quota_top_selection_minimum)),
+    data_gap_quota_reserved_slots = min(
+        data_gap_quota_max,
+        int(math.floor(max_total * data_gap_quota_fraction)),
     )
-    blind_quota_preserved_baseline_slots = min(
-        max_total,
-        max(
-            min(max_total, blind_quota_top_selection_minimum),
-            sum(1 for row in selected if row.get("depth_selection_bucket") == "open_paper_trade"),
-        ),
-    )
-    blind_quota_coverage = _blind_under_sampled_quality_coverage(
+    data_gap_coverage = _data_gap_quality_coverage(
         observations,
         snapshot_state,
-        blind_quota_min_observations,
-        blind_quota_max_known_quality_rate,
+        data_gap_quota_min_observations,
+        data_gap_known_quality_rate_threshold,
     )
-    blind_eligible_venues = {
+    data_gap_eligible_venues = {
         venue
-        for venue, item in (blind_quota_coverage.get("venues") or {}).items()
+        for venue, item in (data_gap_coverage.get("venues") or {}).items()
         if item.get("eligible")
     }
-    blind_eligible_quotes = {
+    data_gap_eligible_quotes = {
         quote
-        for quote, item in (blind_quota_coverage.get("quotes") or {}).items()
+        for quote, item in (data_gap_coverage.get("quotes") or {}).items()
         if item.get("eligible")
     }
     baseline_selected = [dict(row) for row in selected]
-    blind_quota_selected: list[dict] = []
-    if blind_quota_reserved_slots > 0 and (blind_eligible_venues or blind_eligible_quotes):
-        preserved_prefix = baseline_selected[:blind_quota_preserved_baseline_slots]
-        preserved_ids = {str(row.get("instrument_id")) for row in preserved_prefix if row.get("instrument_id")}
+    data_gap_quota_selected: list[dict] = []
+    if data_gap_quota_reserved_slots > 0 and (data_gap_eligible_venues or data_gap_eligible_quotes):
+        protected_buckets = {
+            "open_paper_trade",
+            "exploit_more_or_variant",
+            "largest_dislocation",
+            "rotation_fill",
+        }
+        covered_venue_buckets = {
+            str(row.get("venue") or "unknown").upper()
+            for row in baseline_selected
+            if str(row.get("venue") or "unknown").upper() in data_gap_eligible_venues
+        }
+        covered_quote_buckets = {
+            str(row.get("quote") or "unknown").upper()
+            for row in baseline_selected
+            if row.get("region") and str(row.get("quote") or "unknown").upper() in data_gap_eligible_quotes
+        }
 
-        def blind_quota_sort_key(row: dict) -> tuple:
+        def data_gap_sort_key(row: dict) -> tuple:
             venue = str(row.get("venue") or "unknown").upper()
             quote = str(row.get("quote") or "unknown").upper()
             venue_rate = float(
-                ((blind_quota_coverage.get("venues") or {}).get(venue) or {}).get("known_quality_rate") or 0.0
+                ((data_gap_coverage.get("venues") or {}).get(venue) or {}).get("known_quality_rate") or 0.0
             )
             quote_rate = float(
-                ((blind_quota_coverage.get("quotes") or {}).get(quote) or {}).get("known_quality_rate") or 0.0
+                ((data_gap_coverage.get("quotes") or {}).get(quote) or {}).get("known_quality_rate") or 0.0
             )
             spread_bps = _finite_preliminary_spread_bps(row)
             quote_volume_24h = _finite_quote_volume_24h(row)
-            eligible_reason_count = int(venue in blind_eligible_venues) + int(quote in blind_eligible_quotes)
             return (
-                0 if spread_bps is not None and quote_volume_24h is not None else 1,
-                0 if spread_bps is not None else 1,
-                0 if quote_volume_24h is not None else 1,
-                -eligible_reason_count,
-                min(venue_rate, quote_rate),
-                _snapshot_sort_key(row, snapshot_state, cfg) if adaptive else 0,
+                0 if row.get("data_status") == "reachable" else 1,
+                1 if row.get("data_status") == "degraded" else 0,
+                spread_bps if spread_bps is not None else float("inf"),
                 -(quote_volume_24h or 0.0),
+                0 if row.get("region") else 1,
+                min(venue_rate, quote_rate),
                 str(row.get("instrument_id") or ""),
             )
 
-        blind_ranked = sorted(
+        data_gap_ranked = sorted(
             [
                 row
                 for row in observations
                 if row.get("instrument_id")
                 and row.get("data_status") == "reachable"
-                and (
-                    str(row.get("venue") or "unknown").upper() in blind_eligible_venues
-                    or str(row.get("quote") or "unknown").upper() in blind_eligible_quotes
-                )
-                and str(row.get("instrument_id")) not in preserved_ids
+                and str(row.get("instrument_id"))
+                not in {str(item.get("instrument_id")) for item in baseline_selected if item.get("instrument_id")}
             ],
-            key=blind_quota_sort_key,
+            key=data_gap_sort_key,
         )
-        venue_counts_after_prefix: collections.Counter[str] = collections.Counter(
-            str(row.get("venue") or "unknown").upper() for row in preserved_prefix
+        selected_ids_after_baseline = {
+            str(row.get("instrument_id"))
+            for row in baseline_selected
+            if row.get("instrument_id")
+        }
+        venue_counts_after_baseline: collections.Counter[str] = collections.Counter(
+            str(row.get("venue") or "unknown").upper() for row in baseline_selected
         )
-        blind_selected_ids = set(preserved_ids)
-        for row in blind_ranked:
-            if len(blind_quota_selected) >= blind_quota_reserved_slots:
+        evictable_indexes = [
+            index
+            for index in range(len(selected) - 1, -1, -1)
+            if str(selected[index].get("depth_selection_bucket") or "") not in protected_buckets
+        ]
+        removed_rows: list[dict] = []
+        max_gap_additions = min(
+            data_gap_quota_reserved_slots,
+            len(data_gap_ranked),
+            max_total - len(selected) + len(evictable_indexes),
+        )
+        while len(selected) + max_gap_additions > max_total and evictable_indexes:
+            drop_index = evictable_indexes.pop(0)
+            removed_row = selected.pop(drop_index)
+            removed_id = str(removed_row.get("instrument_id") or "")
+            removed_venue = str(removed_row.get("venue") or "unknown").upper()
+            if removed_id:
+                selected_ids.discard(removed_id)
+                selected_ids_after_baseline.discard(removed_id)
+            venue_counts[removed_venue] -= 1
+            venue_counts_after_baseline[removed_venue] -= 1
+            if venue_counts[removed_venue] <= 0:
+                venue_counts.pop(removed_venue, None)
+            if venue_counts_after_baseline[removed_venue] <= 0:
+                venue_counts_after_baseline.pop(removed_venue, None)
+            removed_rows.append(removed_row)
+            evictable_indexes = [index - 1 if index > drop_index else index for index in evictable_indexes]
+        for row in data_gap_ranked:
+            if len(data_gap_quota_selected) >= max_gap_additions:
                 break
-            inst_id = str(row.get("instrument_id"))
-            if inst_id in blind_selected_ids:
+            inst_id = str(row.get("instrument_id") or "")
+            if not inst_id or inst_id in selected_ids_after_baseline:
                 continue
             venue = str(row.get("venue") or "unknown").upper()
-            if venue_counts_after_prefix[venue] >= max_per_venue:
+            quote = str(row.get("quote") or "unknown").upper()
+            matched_reasons = []
+            if venue in data_gap_eligible_venues and venue not in covered_venue_buckets:
+                matched_reasons.append("venue")
+            if quote in data_gap_eligible_quotes and row.get("region") and quote not in covered_quote_buckets:
+                matched_reasons.append("quote")
+            if not matched_reasons:
+                continue
+            if venue_counts_after_baseline[venue] >= max_per_venue:
                 continue
             output = dict(row)
-            output["depth_selection_bucket"] = "blind_under_sampled_coverage_quota"
-            output["depth_selection_reason"] = "blind_under_sampled_coverage_quota"
+            output["depth_selection_bucket"] = "data_gap_quota"
+            output["depth_selection_reason"] = "data_gap_quota"
             output["starved_venue"] = venue in starved_venues
             output["depth_selection_escalation"] = escalation
-            output["depth_selection_blind_quota_eligible_reasons"] = [
-                reason
-                for reason, eligible in (
-                    ("venue", venue in blind_eligible_venues),
-                    ("quote", str(row.get("quote") or "unknown").upper() in blind_eligible_quotes),
-                )
-                if eligible
-            ]
-            blind_quota_selected.append(output)
-            blind_selected_ids.add(inst_id)
-            venue_counts_after_prefix[venue] += 1
-        trailing_baseline = [
-            dict(row)
-            for row in baseline_selected[blind_quota_preserved_baseline_slots:]
-            if str(row.get("instrument_id")) not in blind_selected_ids
-        ]
-        selected = [*preserved_prefix, *blind_quota_selected, *trailing_baseline][:max_total]
-    blind_quota_report = _blind_under_sampled_quota_report(
+            output["depth_selection_data_gap_eligible_reasons"] = list(matched_reasons)
+            data_gap_quota_selected.append(output)
+            selected.append(output)
+            selected_ids.add(inst_id)
+            selected_ids_after_baseline.add(inst_id)
+            venue_counts[venue] += 1
+            venue_counts_after_baseline[venue] += 1
+            covered_venue_buckets.add(venue)
+            if row.get("region"):
+                covered_quote_buckets.add(quote)
+        for removed_row in removed_rows:
+            if len(selected) >= max_total:
+                break
+            inst_id = str(removed_row.get("instrument_id") or "")
+            if not inst_id or inst_id in selected_ids:
+                continue
+            venue = str(removed_row.get("venue") or "unknown").upper()
+            if venue_counts[venue] >= max_per_venue:
+                continue
+            selected.append(dict(removed_row))
+            selected_ids.add(inst_id)
+            venue_counts[venue] += 1
+    data_gap_quota_report = _data_gap_quota_report(
         observations,
         baseline_selected,
         selected,
-        blind_quota_selected,
-        blind_quota_coverage,
-        blind_quota_reserved_slots,
-        blind_quota_preserved_baseline_slots,
+        data_gap_quota_selected,
+        data_gap_coverage,
+        data_gap_quota_reserved_slots,
+        data_gap_known_quality_rate_threshold,
+        data_gap_quota_fraction,
     )
+    selected_gap_instruments = [
+        str(row.get("instrument_id"))
+        for row in selected
+        if row.get("depth_selection_bucket") == "data_gap_quota" and row.get("instrument_id")
+    ]
     quota_report = _selection_quota_report(
         observations,
         selected,
@@ -6076,17 +6157,19 @@ def select_enrichment_observations(
         "zero_quality_venue_probe_min_observation_count": zero_quality_probe_min_observations,
         "zero_quality_venue_probe_max_known_quality_count": zero_quality_probe_max_known,
         "zero_quality_venue_probe_max_spread_bps": zero_quality_probe_max_spread_bps,
-        "blind_under_sampled_quota_max_per_cycle": blind_quota_max,
-        "blind_under_sampled_quota_top_selection_minimum": blind_quota_top_selection_minimum,
-        "blind_under_sampled_quota_min_observation_count": blind_quota_min_observations,
-        "blind_under_sampled_quota_max_known_quality_rate": blind_quota_max_known_quality_rate,
-        "blind_under_sampled_quota_reserved_slots": blind_quota_reserved_slots,
+        "data_gap_depth_quota_fraction": round(data_gap_quota_fraction, 4),
+        "data_gap_depth_quota_max_per_cycle": data_gap_quota_max,
+        "data_gap_depth_quota_min_observation_count": data_gap_quota_min_observations,
+        "data_gap_known_quality_rate_threshold": round(data_gap_known_quality_rate_threshold, 4),
+        "data_gap_depth_quota_reserved_slots": data_gap_quota_reserved_slots,
     }
     for row in selected:
         row["depth_selection_venue_quota_report"] = quota_report
         row["depth_selection_limits"] = selection_limits
         row["depth_selection_zero_quality_venue_probe_report"] = zero_quality_probe_report
-        row["depth_selection_blind_under_sampled_quota_report"] = blind_quota_report
+        row["depth_selection_data_gap_quota_report"] = data_gap_quota_report
+        row["depth_selection_blind_under_sampled_quota_report"] = data_gap_quota_report
+        row["depth_selection_selected_gap_instruments"] = list(selected_gap_instruments)
     return selected
 
 
@@ -6182,8 +6265,11 @@ def enrich_observations(
             selected[0].get("depth_selection_zero_quality_venue_probe_report", {}) if selected else {}
         ).items()
     }
-    blind_under_sampled_quota_report = dict(
-        selected[0].get("depth_selection_blind_under_sampled_quota_report", {}) if selected else {}
+    data_gap_quota_report = dict(
+        selected[0].get("depth_selection_data_gap_quota_report", {}) if selected else {}
+    )
+    selected_gap_instruments = list(
+        selected[0].get("depth_selection_selected_gap_instruments", []) if selected else []
     )
     starved_venues = {
         str(venue).upper()
@@ -6234,13 +6320,17 @@ def enrich_observations(
         "unknown_count": sum(1 for item in results.values() if item.get("quality_status") == "unknown"),
         "blocked_count": sum(1 for item in results.values() if item.get("quality_status") == "blocked"),
         "selected_instruments": [row.get("instrument_id") for row in selected],
+        "data_gap_depth_quota_applied": bool(selected_gap_instruments),
+        "data_gap_selected_count": len(selected_gap_instruments),
+        "selected_gap_instruments": selected_gap_instruments,
         "selection_escalation": selection_escalation,
         "selection_limits": selection_limits,
         "worker_count": int(cfg.get("workers", 8)),
         "venue_quota_report": selection_quota_report,
         "selection_bucket_counts": dict(bucket_counts),
         "zero_quality_venue_probe": zero_quality_probe_report,
-        "blind_under_sampled_coverage_quota": blind_under_sampled_quota_report,
+        "data_gap_depth_quota": data_gap_quota_report,
+        "blind_under_sampled_coverage_quota": data_gap_quota_report,
         "selected_by_venue": dict(selected_by_venue),
         "starved_venues": sorted(starved_venues),
         "selected_starved_venue_count": sum(

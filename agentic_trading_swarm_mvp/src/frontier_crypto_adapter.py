@@ -13505,12 +13505,14 @@ def summarize(
         "known_quality_rate": known_quality_rate,
         "known_quality_rate_target": known_quality_target,
         "known_quality_rate_target_progress": round(min(1.0, known_quality_rate / known_quality_target), 4),
+        "data_gap_depth_quota_applied": bool(depth_summary.get("data_gap_depth_quota_applied")),
+        "data_gap_selected_count": int(depth_summary.get("data_gap_selected_count", 0) or 0),
+        "selected_gap_instruments": list(depth_summary.get("selected_gap_instruments", []) or []),
+        "data_gap_depth_quota": depth_summary.get("data_gap_depth_quota", {}),
         "quality_target_escalation": depth_summary.get("selection_escalation", {}),
         "depth_selection_buckets": depth_summary.get("selection_bucket_counts", {}),
         "zero_quality_venue_probe": depth_summary.get("zero_quality_venue_probe", {}),
-        "blind_under_sampled_coverage_quota": depth_summary.get(
-            "blind_under_sampled_coverage_quota", {}
-        ),
+        "blind_under_sampled_coverage_quota": depth_summary.get("blind_under_sampled_coverage_quota", {}),
         "market_testing_progress": depth_summary.get("market_testing_progress", {}),
         "selected_by_venue": depth_summary.get("selected_by_venue", {}),
         "starved_selected_by_venue": depth_summary.get("starved_selected_by_venue", {}),
@@ -13801,9 +13803,11 @@ def summarize(
         "blocked_venues": sorted({row["venue"] for row in observations if row.get("data_status") == "blocked"}),
         "degraded_venues": sorted({row["venue"] for row in observations if row.get("data_status") == "degraded"}),
         "depth_enrichment": quality_summary or {},
-        "blind_under_sampled_coverage_quota": depth_summary.get(
-            "blind_under_sampled_coverage_quota", {}
-        ),
+        "data_gap_depth_quota_applied": bool(depth_summary.get("data_gap_depth_quota_applied")),
+        "data_gap_selected_count": int(depth_summary.get("data_gap_selected_count", 0) or 0),
+        "selected_gap_instruments": list(depth_summary.get("selected_gap_instruments", []) or []),
+        "data_gap_depth_quota": depth_summary.get("data_gap_depth_quota", {}),
+        "blind_under_sampled_coverage_quota": depth_summary.get("blind_under_sampled_coverage_quota", {}),
         "market_testing_progress": depth_summary.get("market_testing_progress", {}),
         "by_quality_status": dict(quality_statuses),
         "known_quality_by_region": _quality_rates(observations, "region"),
@@ -13950,11 +13954,12 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Unknown quality count: `{expansion.get('unknown_quality_count')}`")
     lines.append(f"- Depth selected rate: `{expansion.get('depth_selected_rate')}`")
     lines.append(f"- Depth enriched rate: `{expansion.get('depth_enriched_rate')}`")
+    lines.append(f"- Data-gap quota applied: `{expansion.get('data_gap_depth_quota_applied')}`")
+    lines.append(f"- Data-gap selected count: `{expansion.get('data_gap_selected_count')}`")
+    lines.append(f"- Data-gap instruments: `{expansion.get('selected_gap_instruments', [])}`")
     lines.append(f"- Depth selection buckets: `{expansion.get('depth_selection_buckets', {})}`")
     lines.append(f"- Zero-quality venue probes: `{expansion.get('zero_quality_venue_probe', {})}`")
-    lines.append(
-        f"- Blind/under-sampled quota: `{expansion.get('blind_under_sampled_coverage_quota', {})}`"
-    )
+    lines.append(f"- Data-gap depth quota: `{expansion.get('data_gap_depth_quota', {})}`")
     lines.append(f"- Markets tested: `{expansion.get('market_testing_progress', {})}`")
     lines.append(f"- Selected by venue: `{expansion.get('selected_by_venue', {})}`")
     lines.append(f"- Venue quota report: `{expansion.get('venue_quota_report', {})}`")

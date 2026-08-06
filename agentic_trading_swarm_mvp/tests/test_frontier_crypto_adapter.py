@@ -900,12 +900,12 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                     quality_summary={
                         "selected_count": 3,
                         "enriched_count": 2,
-                        "selected_by_venue": {"A": 1, "B": 1, "C": 1},
-                        "selection_limits": {"max_symbols_per_cycle": 300, "max_symbols_per_venue": 32},
-                        "worker_count": 16,
-                        "blind_under_sampled_coverage_quota": {
-                            "reserved_slot_cap": 20,
-                            "preserved_baseline_slots": 40,
+                        "data_gap_depth_quota_applied": True,
+                        "data_gap_selected_count": 2,
+                        "selected_gap_instruments": ["B:ABC-USDT", "C:ABC-USDT"],
+                        "data_gap_depth_quota": {
+                            "reserved_slot_cap": 12,
+                            "known_quality_rate_threshold": 0.02,
                             "selected_count": 2,
                             "selected_instruments": [
                                 {"inst_id": "B:ABC-USDT", "eligible_reasons": ["venue"]},
@@ -914,6 +914,9 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                             "before_selection": {"selected_count": 0},
                             "after_selection": {"selected_count": 2},
                         },
+                        "selected_by_venue": {"A": 1, "B": 1, "C": 1},
+                        "selection_limits": {"max_symbols_per_cycle": 300, "max_symbols_per_venue": 32},
+                        "worker_count": 16,
                         "venue_quota_report": {
                             "A": {
                                 "target_selected_this_cycle": 2,
@@ -957,12 +960,15 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertEqual(summary["expansion_map"]["worker_count"], 16)
         self.assertEqual(summary["expansion_map"]["selection_limits"]["max_symbols_per_cycle"], 300)
         self.assertEqual(summary["expansion_map"]["venue_quota_report"]["A"]["status"], "partial")
-        self.assertEqual(summary["blind_under_sampled_coverage_quota"]["selected_count"], 2)
+        self.assertTrue(summary["data_gap_depth_quota_applied"])
+        self.assertEqual(2, summary["data_gap_selected_count"])
+        self.assertEqual(["B:ABC-USDT", "C:ABC-USDT"], summary["selected_gap_instruments"])
+        self.assertEqual(summary["data_gap_depth_quota"]["selected_count"], 2)
         self.assertEqual(
-            summary["expansion_map"]["blind_under_sampled_coverage_quota"]["before_selection"]["selected_count"],
+            summary["expansion_map"]["data_gap_depth_quota"]["before_selection"]["selected_count"],
             0,
         )
-        self.assertIn("Blind/under-sampled quota", report_md)
+        self.assertIn("Data-gap quota applied", report_md)
 
     def test_dislocation_quality_ranks_broad_stable_references_without_blocking_fragile_paper(self) -> None:
         cfg = settings()
