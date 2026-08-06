@@ -399,6 +399,12 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
         candidate = apply_frontier_paper_admission_guard(candidate, settings)
         candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
+        if not candidate.get("shadow_filtered"):
+            # Exploration can substitute a synthetic route, but the fill-time
+            # frontier net-edge guard still decides whether a paper order is
+            # worth turning into a fill versus a shadow observation.
+            candidate = apply_frontier_paper_guard(candidate, settings)
+            candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
     else:
         # Apply the persisted paper-only state before the router recomputes
         # its guard.  This lets a released quarantine re-admit the exact
