@@ -16,7 +16,14 @@ import math
 import sqlite3
 
 from paper_exploration import exploration_enabled
-from storage import RUNS_DIR, add_memory_fact, add_self_improvement_experiment, add_signal_policy, utc_now
+from storage import (
+    RUNS_DIR,
+    add_memory_fact,
+    add_self_improvement_experiment,
+    add_signal_policy,
+    paper_label_eligibility_for_trade_row,
+    utc_now,
+)
 
 
 REPORT_JSON = RUNS_DIR / "signal_safety_governor.json"
@@ -90,7 +97,7 @@ def _closed_metrics(conn: sqlite3.Connection, signal_key: str, *, since: str | N
         clause += " and closed_at >= ?"
         params.append(since)
     sql = f"""
-        select pnl_bps, closed_at
+        select pnl_bps, closed_at, candidate_json, review_json, context_json
         from paper_trades
         where {clause}
         order by closed_at desc
@@ -101,6 +108,8 @@ def _closed_metrics(conn: sqlite3.Connection, signal_key: str, *, since: str | N
     rows = conn.execute(sql, params).fetchall()
     pnls: list[float] = []
     for row in rows:
+        if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
         pnl = _coerce_finite_pnl_bps(row["pnl_bps"])
         if pnl is not None:
             pnls.append(pnl)

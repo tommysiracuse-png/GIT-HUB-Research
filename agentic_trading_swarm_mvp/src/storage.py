@@ -7,6 +7,7 @@ import hashlib
 import json
 import pathlib
 import sqlite3
+from collections.abc import Mapping
 
 from paper_context_cost import realized_paper_cost_audit
 
@@ -14,6 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
 DB_PATH = RUNS_DIR / "radar.sqlite"
 SQLITE_BUSY_TIMEOUT_MS = 60_000
+UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON = "unresolved_route_requirement"
 
 _PAPER_LONG_DIRECTIONS = frozenset(
     {
@@ -71,6 +73,220 @@ def _storage_json_object(value: object) -> dict:
     if value is None:
         return {}
     return {"value": value}
+
+
+def _storage_json_mapping(value: object) -> dict:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if value in (None, ""):
+        return {}
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text[:1] not in "[{":
+            return {}
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _storage_coerce_flag_list(value: object) -> list[str]:
+    if value in (None, "", False):
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text[:1] in "[{":
+            parsed = _storage_json_mapping(text)
+            if parsed:
+                return _storage_coerce_flag_list(parsed)
+        return [text]
+    if isinstance(value, Mapping):
+        return [str(key) for key in value.keys() if str(key or "").strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item or "").strip()]
+    return [str(value)]
+
+
+def _storage_first_present(
+    containers: tuple[Mapping[str, object], ...],
+    *keys: str,
+) -> object:
+    for container in containers:
+        for key in keys:
+            if key not in container:
+                continue
+            value = container.get(key)
+            if isinstance(value, str):
+                if value.strip():
+                    return value.strip()
+                continue
+            if value is not None:
+                return value
+    return None
+
+
+def _normalize_route_status_token(value: object) -> str:
+    token = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return token
+
+
+def _is_conditional_paper_route_id(value: object) -> bool:
+    route_id = str(value or "").strip().lower()
+    return bool(route_id) and route_id.startswith("conditional_") and route_id.endswith("_paper")
+
+
+def paper_label_eligibility(
+    candidate: Mapping[str, object] | None = None,
+    review: Mapping[str, object] | None = None,
+    context: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    candidate = dict(candidate or {})
+    review = dict(review or {})
+    context = dict(context or {})
+    nested_candidate = (
+        candidate,
+        _storage_json_mapping(candidate.get("execution_feasibility")),
+        _storage_json_mapping(candidate.get("execution_route")),
+        _storage_json_mapping(candidate.get("route_requirements")),
+        _storage_json_mapping(candidate.get("paper_route_requirements")),
+    )
+    nested_review = (
+        review,
+        _storage_json_mapping(review.get("route_alternative")),
+    )
+    containers = tuple(
+        container
+        for container in (
+            context,
+            *nested_candidate,
+            *nested_review,
+        )
+        if isinstance(container, Mapping)
+    )
+    explicit_eligible = _storage_first_present(containers, "paper_label_eligible")
+    route_status = _normalize_route_status_token(
+        _storage_first_present(
+            containers,
+            "paper_route_status",
+            "route_status",
+            "feasibility_status",
+            "status",
+        )
+    )
+    route_id = str(
+        _storage_first_present(
+            containers,
+            "effective_route_id",
+            "route_id",
+            "paper_route_id",
+        )
+        or ""
+    ).strip()
+    blockers: list[str] = []
+    for container in containers:
+        for field in (
+            "paper_label_route_blockers",
+            "route_blockers",
+            "missing_requirements",
+            "missing_permissions",
+            "direct_missing_requirements",
+        ):
+            blockers.extend(_storage_coerce_flag_list(container.get(field)))
+    deduped_blockers = sorted(
+        {
+            str(item).strip().lower().replace("-", "_").replace(" ", "_")
+            for item in blockers
+            if str(item).strip()
+        }
+    )
+    conditional_route = route_status == "conditional" or _is_conditional_paper_route_id(route_id)
+    label_eligible = bool(explicit_eligible) or not (conditional_route and deduped_blockers)
+    exclusion_reason = None if label_eligible else UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON
+    return {
+        "paper_label_eligible": label_eligible,
+        "paper_label_explicit_override": bool(explicit_eligible),
+        "paper_label_exclusion_reason": exclusion_reason,
+        "paper_label_route_status": route_status or "unknown",
+        "paper_label_route_id": route_id or None,
+        "paper_label_route_blockers": deduped_blockers,
+        "paper_shadow_observation": not label_eligible,
+    }
+
+
+def paper_label_eligibility_for_trade_row(row: sqlite3.Row | Mapping[str, object]) -> dict[str, object]:
+    if isinstance(row, sqlite3.Row):
+        row_mapping = {key: row[key] for key in row.keys()}
+    else:
+        row_mapping = dict(row)
+    candidate = _storage_json_mapping(row_mapping.get("candidate_json"))
+    review = _storage_json_mapping(row_mapping.get("review_json"))
+    context = _storage_json_mapping(row_mapping.get("context_json"))
+    return paper_label_eligibility(candidate=candidate, review=review, context=context)
+
+
+def unresolved_route_requirement_shadow_summary(conn: sqlite3.Connection) -> dict[str, object]:
+    rows = conn.execute(
+        """
+        select status, pnl_bps, candidate_json, review_json, context_json
+        from paper_trades
+        where coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
+        """
+    ).fetchall()
+    summary: dict[str, object] = {
+        "exclusion_reason": UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON,
+        "open_count": 0,
+        "closed_count": 0,
+        "avg_pnl_bps": None,
+        "win_rate": None,
+        "total_pnl_bps": None,
+        "by_blocker": {},
+    }
+    pnls: list[float] = []
+    by_blocker: dict[str, dict[str, object]] = {}
+    for row in rows:
+        eligibility = paper_label_eligibility_for_trade_row(row)
+        if eligibility["paper_label_exclusion_reason"] != UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON:
+            continue
+        status = str(row["status"] or "").strip().lower()
+        blockers = list(eligibility.get("paper_label_route_blockers") or [])
+        if status == "open":
+            summary["open_count"] = int(summary["open_count"]) + 1
+        elif status == "closed" and row["pnl_bps"] is not None:
+            pnl = float(row["pnl_bps"])
+            pnls.append(pnl)
+            summary["closed_count"] = int(summary["closed_count"]) + 1
+        for blocker in blockers:
+            blocker_bucket = by_blocker.setdefault(
+                blocker,
+                {"open_count": 0, "closed_count": 0, "_pnls": []},
+            )
+            if status == "open":
+                blocker_bucket["open_count"] = int(blocker_bucket["open_count"]) + 1
+            elif status == "closed" and row["pnl_bps"] is not None:
+                blocker_bucket["closed_count"] = int(blocker_bucket["closed_count"]) + 1
+                blocker_bucket["_pnls"].append(float(row["pnl_bps"]))
+    if pnls:
+        summary["avg_pnl_bps"] = round(sum(pnls) / len(pnls), 3)
+        summary["win_rate"] = round(sum(value > 0.0 for value in pnls) / len(pnls), 3)
+        summary["total_pnl_bps"] = round(sum(pnls), 3)
+    rendered_blockers: dict[str, dict[str, object]] = {}
+    for blocker, blocker_bucket in sorted(by_blocker.items()):
+        blocker_pnls = [float(value) for value in blocker_bucket.pop("_pnls", [])]
+        rendered_blockers[blocker] = {
+            "open_count": int(blocker_bucket["open_count"]),
+            "closed_count": int(blocker_bucket["closed_count"]),
+            "avg_pnl_bps": round(sum(blocker_pnls) / len(blocker_pnls), 3) if blocker_pnls else None,
+            "win_rate": round(sum(value > 0.0 for value in blocker_pnls) / len(blocker_pnls), 3)
+            if blocker_pnls
+            else None,
+            "total_pnl_bps": round(sum(blocker_pnls), 3) if blocker_pnls else None,
+        }
+    summary["by_blocker"] = rendered_blockers
+    return summary
 
 
 def _parse_storage_iso(value: str) -> dt.datetime:
@@ -1489,7 +1705,7 @@ def has_open_trade(conn: sqlite3.Connection, inst_id: str, direction: str) -> bo
 def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
     feasibility = candidate.get("execution_feasibility", {})
     route = candidate.get("execution_route") or {}
-    return {
+    context = {
         "venue": candidate.get("venue"),
         "trade_type": candidate.get("trade_type"),
         "direction": candidate.get("direction"),
@@ -1501,6 +1717,13 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "route_id": (review or {}).get("effective_route_id") or (review or {}).get("route_id") or candidate.get("route_id") or route.get("route_id"),
         "route_status": candidate.get("paper_route_status") or (review or {}).get("route_status") or candidate.get("route_status") or route.get("route_status"),
         "missing_requirements": (review or {}).get("missing_requirements") or route.get("missing_permissions", []),
+        "route_blockers": (
+            candidate.get("route_blockers")
+            or (review or {}).get("missing_requirements")
+            or route.get("route_blockers")
+            or route.get("missing_permissions")
+            or []
+        ),
         "signal_stats_scope": candidate.get("signal_stats_scope") or "direct",
         "synthetic_research_paper": bool(candidate.get("synthetic_research_paper")),
         "paper_execution_semantics": candidate.get("paper_execution_semantics"),
@@ -1511,6 +1734,15 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "feasibility_status": (review or {}).get("feasibility_status") or feasibility.get("status"),
         "stale_bucket": _bucket(candidate.get("stale_minutes", 0), [15, 90, 240], reverse=True),
     }
+    if (
+        context["signal_stats_scope"] == "paper_proxy"
+        or bool(candidate.get("paper_proxy_not_live_equivalent"))
+        or bool((review or {}).get("proxy_not_live_equivalent"))
+    ):
+        context["paper_label_eligible"] = True
+    label_eligibility = paper_label_eligibility(candidate=candidate, review=review, context=context)
+    context.update(label_eligibility)
+    return context
 
 
 def _bucket(value: float | int | None, thresholds: list[float], reverse: bool = False) -> str:
@@ -2622,6 +2854,9 @@ def record_due_horizon_outcomes(
                 outcome_context = json.loads(row["context_json"] or "{}")
             except (TypeError, ValueError):
                 outcome_context = {}
+            label_eligibility = paper_label_eligibility(candidate=candidate, context=outcome_context)
+            for field, value in label_eligibility.items():
+                outcome_context.setdefault(field, value)
             if auction_outcome is not None:
                 if auction_outcome.get("kind") == "allowance_price":
                     outcome_context["paper_auction_reference_outcome"] = {
@@ -2685,13 +2920,19 @@ def record_due_horizon_outcomes(
 def performance_summary(conn: sqlite3.Connection) -> dict:
     rows = conn.execute(
         """
-        select pnl_bps
+        select status, pnl_bps, candidate_json, review_json, context_json
         from paper_trades
         where status = 'closed'
           and coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
         """
     ).fetchall()
-    pnls = [float(row["pnl_bps"]) for row in rows if row["pnl_bps"] is not None]
+    pnls = []
+    for row in rows:
+        if row["pnl_bps"] is None:
+            continue
+        eligibility = paper_label_eligibility_for_trade_row(row)
+        if eligibility["paper_label_eligible"]:
+            pnls.append(float(row["pnl_bps"]))
     open_count = int(
         conn.execute(
             """
@@ -2718,8 +2959,16 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
         "closed": int(synthetic_row["closed_count"] or 0),
         "avg_pnl_bps": round(float(synthetic_row["avg_pnl_bps"]), 3) if synthetic_row["avg_pnl_bps"] is not None else None,
     }
+    unresolved_shadow = unresolved_route_requirement_shadow_summary(conn)
     if not pnls:
-        return {"closed": 0, "open": open_count, "avg_pnl_bps": None, "win_rate": None, "synthetic_research": synthetic}
+        return {
+            "closed": 0,
+            "open": open_count,
+            "avg_pnl_bps": None,
+            "win_rate": None,
+            "synthetic_research": synthetic,
+            "unresolved_route_requirement_shadow": unresolved_shadow,
+        }
     wins = sum(1 for pnl in pnls if pnl > 0)
     return {
         "closed": len(pnls),
@@ -2729,6 +2978,7 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
         "best_bps": round(max(pnls), 3),
         "worst_bps": round(min(pnls), 3),
         "synthetic_research": synthetic,
+        "unresolved_route_requirement_shadow": unresolved_shadow,
     }
 
 

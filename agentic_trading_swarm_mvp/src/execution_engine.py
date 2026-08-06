@@ -22,6 +22,7 @@ from paper_context_cost import enforce_paper_context_cost_gate
 from paper_decay_quarantine import apply_quarantine as apply_okx_basis_decay_quarantine
 from paper_exploration import exploration_enabled, prepare_candidate_for_exploration
 from storage import (
+    paper_label_eligibility,
     save_execution_fill,
     save_execution_order,
     save_frontier_paper_shadow_observation,
@@ -153,6 +154,13 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         status = "blocked_invalid_paper_proxy_metadata"
     if mode == "live":
         status = "blocked_live_not_enabled"
+    label_candidate = dict(candidate)
+    if (
+        str(candidate.get("signal_stats_scope") or review.get("signal_stats_scope") or "").strip().lower() == "paper_proxy"
+        or proxy_not_live_equivalent
+    ):
+        label_candidate["paper_label_eligible"] = True
+    label_eligibility = paper_label_eligibility(candidate=label_candidate, review=review)
 
     return {
         "mode": mode,
@@ -178,6 +186,9 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         "signal_stats_scope": candidate.get("signal_stats_scope") or review.get("signal_stats_scope") or (
             "paper_proxy" if proxy_not_live_equivalent else "direct"
         ),
+        "paper_label_eligible": bool(label_eligibility.get("paper_label_eligible")),
+        "paper_label_exclusion_reason": label_eligibility.get("paper_label_exclusion_reason"),
+        "paper_label_route_blockers": list(label_eligibility.get("paper_label_route_blockers") or []),
         "signal_key": review.get("signal_key"),
         "direct_signal_key": candidate.get("direct_signal_key"),
         "direct_route_id": candidate.get("paper_proxy_source_route_id"),

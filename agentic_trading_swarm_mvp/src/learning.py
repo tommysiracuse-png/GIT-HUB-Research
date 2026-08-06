@@ -6,7 +6,14 @@ import pathlib
 import json
 import sqlite3
 
-from storage import RUNS_DIR, add_growth_experiment, add_improvement_task, open_experiments, open_tasks
+from storage import (
+    RUNS_DIR,
+    add_growth_experiment,
+    add_improvement_task,
+    open_experiments,
+    open_tasks,
+    paper_label_eligibility_for_trade_row,
+)
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -48,14 +55,23 @@ def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, d
 
     rows = conn.execute(
         """
-        select signal_key, pnl_bps
+        select signal_key, pnl_bps, candidate_json, review_json, context_json
         from paper_trades
         where status = 'closed' and pnl_bps is not null
         """
     ).fetchall()
     grouped: dict[str, list[float]] = {}
     for row in rows:
+        if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
         grouped.setdefault(row["signal_key"], []).append(float(row["pnl_bps"]))
+
+    existing_keys = {
+        str(row["signal_key"])
+        for row in conn.execute("select signal_key from signal_stats").fetchall()
+    }
+    for stale_key in existing_keys.difference(grouped):
+        conn.execute("delete from signal_stats where signal_key = ?", (stale_key,))
 
     stats = {}
     for key, pnls in grouped.items():
@@ -106,13 +122,15 @@ def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, d
 def update_contextual_stats(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
-        select pnl_bps, context_json
+        select pnl_bps, candidate_json, review_json, context_json
         from paper_trades
         where status = 'closed' and pnl_bps is not null and context_json is not null
         """
     ).fetchall()
     grouped: dict[str, list[float]] = {}
     for row in rows:
+        if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
         try:
             context = json.loads(row["context_json"] or "{}")
         except json.JSONDecodeError:
@@ -136,6 +154,14 @@ def update_contextual_stats(conn: sqlite3.Connection) -> None:
         ]
         for key in keys:
             grouped.setdefault(key, []).append(float(row["pnl_bps"]))
+
+    existing_keys = {
+        str(row["context_key"])
+        for row in conn.execute("select context_key from contextual_stats").fetchall()
+    }
+    retained_keys = {key for key in grouped if key and not key.endswith(":None")}
+    for stale_key in existing_keys.difference(retained_keys):
+        conn.execute("delete from contextual_stats where context_key = ?", (stale_key,))
 
     for key, pnls in grouped.items():
         if not key or key.endswith(":None"):

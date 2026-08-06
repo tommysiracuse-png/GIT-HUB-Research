@@ -34,6 +34,7 @@ from storage import (
     record_policy_open,
     update_experiment_evaluation,
     update_llm_recommendation_status,
+    paper_label_eligibility_for_trade_row,
 )
 from signal_redesign import create_proposed_variant
 from strategy_lab import (
@@ -1544,13 +1545,17 @@ def _closed_metrics_since(conn: sqlite3.Connection, signal_key: str, since: str 
         params.append(since)
     rows = conn.execute(
         f"""
-        select pnl_bps
+        select pnl_bps, candidate_json, review_json, context_json
         from paper_trades
         where {clause}
         """,
         params,
     ).fetchall()
-    pnls = [float(row["pnl_bps"]) for row in rows]
+    pnls = [
+        float(row["pnl_bps"])
+        for row in rows
+        if paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]
+    ]
     if not pnls:
         return {"closed_count": 0, "avg_pnl_bps": None, "win_rate": None, "best_bps": None, "worst_bps": None}
     wins = sum(1 for pnl in pnls if pnl > 0)
@@ -1571,13 +1576,17 @@ def _overall_metrics(conn: sqlite3.Connection, since: str | None = None) -> dict
         params.append(since)
     rows = conn.execute(
         f"""
-        select pnl_bps
+        select pnl_bps, candidate_json, review_json, context_json
         from paper_trades
         where {clause}
         """,
         params,
     ).fetchall()
-    pnls = [float(row["pnl_bps"]) for row in rows]
+    pnls = [
+        float(row["pnl_bps"])
+        for row in rows
+        if paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]
+    ]
     if not pnls:
         return {"closed_count": 0, "avg_pnl_bps": None, "win_rate": None, "best_bps": None, "worst_bps": None}
     wins = sum(1 for pnl in pnls if pnl > 0)

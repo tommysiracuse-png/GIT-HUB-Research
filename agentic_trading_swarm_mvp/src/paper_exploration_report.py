@@ -8,7 +8,7 @@ import re
 import sqlite3
 from collections import Counter, defaultdict
 
-from storage import RUNS_DIR
+from storage import RUNS_DIR, unresolved_route_requirement_shadow_summary
 from paper_decay_quarantine import (
     REASON as OKX_BASIS_DECAY_QUARANTINE_REASON,
     matches_reason as okx_basis_decay_matches_reason,
@@ -567,6 +567,7 @@ def build_paper_exploration_report(
                 guard_pnls[reason].append(float(row["horizon_pnl_bps"]))
 
     frontier_short_diagnostics = _frontier_short_diagnostic_report(rows, horizon)
+    unresolved_route_shadow = unresolved_route_requirement_shadow_summary(conn)
 
     guard_value = []
     for reason, count in guard_trade_counts.most_common():
@@ -678,6 +679,13 @@ def build_paper_exploration_report(
             "frontier_short_diagnostic_market_structure_misclassification_likely": int(
                 bool(frontier_short_diagnostics.get("market_structure_misclassification_likely"))
             ),
+            "unresolved_route_requirement_shadow_open_count": int(
+                unresolved_route_shadow.get("open_count", 0)
+            ),
+            "unresolved_route_requirement_shadow_closed_count": int(
+                unresolved_route_shadow.get("closed_count", 0)
+            ),
+            "unresolved_route_requirement_shadow_avg_pnl_bps": unresolved_route_shadow.get("avg_pnl_bps"),
         },
         "decisions_24h": dict(decisions),
         "true_rejection_reasons_24h": dict(true_rejections.most_common()),
@@ -689,6 +697,7 @@ def build_paper_exploration_report(
         "admission_zero_streaks": zero_streaks,
         "okx_basis_decay_quarantine": decay_quarantine,
         "frontier_short_diagnostics": frontier_short_diagnostics,
+        "unresolved_route_requirement_shadow": unresolved_route_shadow,
     }
 
 
@@ -714,6 +723,8 @@ def write_paper_exploration_report(
         "",
         f"- Direct paper trades: `{summary['direct_paper_trades']}`",
         f"- Synthetic research trades: `{summary['synthetic_paper_trades']}`",
+        f"- Unresolved-route shadow fills: `{summary['unresolved_route_requirement_shadow_closed_count']}` "
+        f"closed / `{summary['unresolved_route_requirement_shadow_open_count']}` open",
         f"- True invalid-data rejections (24h): `{summary['true_invalid_data_rejections_24h']}`",
         f"- Capacity deferrals (24h): `{summary['capacity_deferrals_24h']}`",
         "",
@@ -728,6 +739,27 @@ def write_paper_exploration_report(
             f"{item['valid_outcome_count']} | {item['avg_pnl_bps']} | "
             f"{item['losses_would_have_avoided_bps']} | {item['profits_would_have_missed_bps']} | "
             f"{item['net_guard_value_bps']} |"
+        )
+    unresolved_shadow = report.get("unresolved_route_requirement_shadow") or {}
+    lines.extend(
+        [
+            "",
+            "## Unresolved Route Shadow Fills",
+            "",
+            f"- Exclusion reason: `{unresolved_shadow.get('exclusion_reason')}`",
+            f"- Closed shadow fills: `{unresolved_shadow.get('closed_count', 0)}`",
+            f"- Open shadow fills: `{unresolved_shadow.get('open_count', 0)}`",
+            f"- Avg shadow PnL: `{unresolved_shadow.get('avg_pnl_bps')}` bps",
+            "",
+            "| Blocker | Open | Closed | Avg bps | Win rate | Total bps |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for blocker, blocker_summary in sorted((unresolved_shadow.get("by_blocker") or {}).items()):
+        lines.append(
+            f"| {blocker} | {blocker_summary.get('open_count', 0)} | "
+            f"{blocker_summary.get('closed_count', 0)} | {blocker_summary.get('avg_pnl_bps')} | "
+            f"{blocker_summary.get('win_rate')} | {blocker_summary.get('total_pnl_bps')} |"
         )
     decay_quarantine = report.get("okx_basis_decay_quarantine") or {}
     lines.extend(
@@ -804,6 +836,7 @@ def compact_paper_exploration_report(report: dict, guard_limit: int = 10) -> dic
         "current_cycle_lineages": report.get("current_cycle_lineages") or {},
         "admission_zero_streaks": report.get("admission_zero_streaks") or {},
         "okx_basis_decay_quarantine": report.get("okx_basis_decay_quarantine") or {},
+        "unresolved_route_requirement_shadow": report.get("unresolved_route_requirement_shadow") or {},
         "frontier_short_diagnostics": {
             "evidence": list((report.get("frontier_short_diagnostics") or {}).get("evidence") or []),
             "frontier_short_count": (report.get("frontier_short_diagnostics") or {}).get("frontier_short_count", 0),

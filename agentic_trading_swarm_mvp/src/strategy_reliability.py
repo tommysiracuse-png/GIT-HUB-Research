@@ -22,7 +22,7 @@ from paper_decay_quarantine import (
     quarantine_record as okx_basis_decay_quarantine_record,
 )
 from proxy_signal_quality import PROXY_TRADE_TYPES, proxy_short_quality_review
-from storage import RUNS_DIR, signal_key
+from storage import RUNS_DIR, paper_label_eligibility_for_trade_row, signal_key
 from frontier_data_quality import (
     _paper_only_family_decay_guard_review,
     paper_only_proxy_frontier_target_evidence_review,
@@ -3230,6 +3230,8 @@ def hydrate_paper_family_decay_statistics(
         return
 
     for row in rows:
+        if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
         try:
             raw = dict(row)
         except (TypeError, ValueError):
@@ -4785,6 +4787,8 @@ def hydrate_paper_context_loss_statistics(
     except Exception:  # noqa: BLE001 - optional paper evidence is read-only
         return
     for row in rows:
+        if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
         try:
             raw = dict(row)
         except (TypeError, ValueError):
@@ -4884,6 +4888,8 @@ def hydrate_paper_context_prior_statistics(
     except Exception:  # noqa: BLE001 - optional paper evidence is read-only
         return
     for row in rows:
+        if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
         try:
             raw = dict(row)
         except (TypeError, ValueError):
@@ -6051,6 +6057,8 @@ def _build_yahoo_proxy_transfer_friction_diagnostic(
         except Exception:  # noqa: BLE001 - diagnostic-only report
             rows = []
         for row in rows:
+            if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+                continue
             try:
                 candidate = json.loads(row["candidate_json"] or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
