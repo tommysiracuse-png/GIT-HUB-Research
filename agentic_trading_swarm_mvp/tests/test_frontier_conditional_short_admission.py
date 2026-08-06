@@ -17,6 +17,9 @@ def _candidate(**overrides):
         "symbol": "DOGE/USDT",
         "venue": "GATE",
         "score": 71.0,
+        "edge_bps_estimate": 10.0,
+        "gross_edge_bps_estimate": 30.0,
+        "estimated_round_trip_cost_bps": 20.0,
     }
     candidate.update(overrides)
     return candidate

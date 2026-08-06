@@ -75,18 +75,10 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         self.assertEqual(FRONTIER_SHADOW_REASON, guarded["candidate_reject_reason"])
         self.assertTrue(
             {
-                "route_status_not_standard",
-                "quality_status_not_verified",
-                "quality_action_not_normal",
-                "quality_score_below_80",
-                "non_positive_net_edge",
-                "gross_edge_not_at_least_5bps_above_round_trip_cost",
-                "empty_book",
-                "invalid_best_prices",
-                "ticker_book_midpoint_mismatch",
+                "edge_bps_estimate_not_positive",
+                "net_edge_below_5bps_after_costs",
                 "simulated_slippage_exceeds_edge",
-                "stale_book",
-                "depth_cliff",
+                "quality_action_shadow_only",
             }.issubset(codes)
         )
 
@@ -115,8 +107,14 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         result = execute_order(conn, candidate(edge_bps_estimate=0.0), review, copy.deepcopy(DEFAULT_SETTINGS))
 
         self.assertFalse(result["paper_filled"])
-        self.assertEqual("shadow_filtered", result["order"]["status"])
+        self.assertEqual("shadow_observed", result["order"]["status"])
+        self.assertIsNone(result["order_id"])
         self.assertEqual(FRONTIER_SHADOW_REASON, result["candidate"]["candidate_reject_reason"])
+        self.assertEqual(0, conn.execute("select count(*) from execution_orders").fetchone()[0])
+        observation = conn.execute(
+            "select reject_reason from frontier_paper_shadow_observations"
+        ).fetchone()
+        self.assertEqual(FRONTIER_SHADOW_REASON, observation[0])
 
 
 if __name__ == "__main__":

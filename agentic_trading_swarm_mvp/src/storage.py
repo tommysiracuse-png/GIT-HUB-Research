@@ -219,6 +219,41 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists frontier_paper_shadow_observations (
+            id integer primary key autoincrement,
+            observed_at text not null,
+            venue text not null,
+            inst_id text not null,
+            direction text not null,
+            trade_type text not null,
+            reject_reason text not null,
+            candidate_json text not null,
+            review_json text not null
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists frontier_paper_shadow_outcomes (
+            id integer primary key autoincrement,
+            observation_id integer not null,
+            horizon_minutes integer not null,
+            measured_at text not null,
+            price real,
+            pnl_bps real,
+            context_json text not null,
+            target_at text,
+            observed_at text,
+            delay_seconds real,
+            measurement_status text not null,
+            price_source text,
+            unique(observation_id, horizon_minutes),
+            foreign key(observation_id) references frontier_paper_shadow_observations(id)
+        )
+        """
+    )
+    conn.execute(
+        """
         create table if not exists paper_trade_outcomes (
             id integer primary key autoincrement,
             trade_id integer not null,
@@ -1121,6 +1156,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute("create index if not exists idx_opportunities_seen on opportunities(seen_at)")
     conn.execute("create index if not exists idx_paper_open on paper_trades(status, inst_id, direction)")
+    conn.execute(
+        "create index if not exists idx_frontier_shadow_observation_reason "
+        "on frontier_paper_shadow_observations(reject_reason, observed_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_frontier_shadow_outcome_observation "
+        "on frontier_paper_shadow_outcomes(observation_id, horizon_minutes)"
+    )
     conn.execute("create index if not exists idx_outcomes_trade on paper_trade_outcomes(trade_id)")
     conn.execute("create index if not exists idx_paper_hold_policies_group on paper_hold_policies(group_name, group_value)")
     conn.execute("create index if not exists idx_memory_subject on memory_facts(subject)")
@@ -2228,6 +2271,107 @@ def _auction_reference_outcome(
     }
 
 
+def _record_due_frontier_shadow_outcomes(
+    conn: sqlite3.Connection,
+    latest_by_inst: dict[str, dict],
+    horizons: list[int],
+    max_delay_seconds: float,
+    now: dt.datetime,
+) -> list[dict]:
+    """Label shadowed frontier candidates without making them paper trades.
+
+    These counterfactual labels stay in their own tables, so neither strategy
+    score adjustments nor paper-trade performance aggregates can consume them.
+    """
+    recorded: list[dict] = []
+    rows = conn.execute(
+        """
+        select id, observed_at, inst_id, direction, reject_reason, candidate_json
+        from frontier_paper_shadow_observations
+        """
+    ).fetchall()
+    for row in rows:
+        opened_at = _parse_storage_iso(row["observed_at"])
+        sign = _paper_direction_sign(row["direction"])
+        if sign == 0:
+            continue
+        try:
+            candidate = json.loads(row["candidate_json"] or "{}")
+            entry = float(candidate.get("last"))
+        except (TypeError, ValueError):
+            continue
+        if entry <= 0.0:
+            continue
+        for horizon in horizons:
+            target = opened_at + dt.timedelta(minutes=int(horizon))
+            if now < target:
+                continue
+            exists = conn.execute(
+                """
+                select 1 from frontier_paper_shadow_outcomes
+                where observation_id = ? and horizon_minutes = ? limit 1
+                """,
+                (row["id"], int(horizon)),
+            ).fetchone()
+            if exists:
+                continue
+            latest = latest_by_inst.get(row["inst_id"])
+            if not latest or latest.get("last") in (None, ""):
+                continue
+            raw_observed = latest.get("observed_at") or latest.get("seen_at") or latest.get("last_checked_at")
+            try:
+                observed_at = _parse_storage_iso(raw_observed) if raw_observed else now
+            except (TypeError, ValueError):
+                observed_at = now
+            if observed_at < target:
+                continue
+            delay_seconds = max(0.0, (observed_at - target).total_seconds())
+            measurement_status = "valid" if delay_seconds <= max_delay_seconds else "late"
+            price = float(latest["last"])
+            round_trip_cost = float(candidate.get("estimated_round_trip_cost_bps") or 0.0)
+            pnl_bps = (price / entry - 1.0) * 10_000.0 * sign - round_trip_cost
+            context = {
+                "observation_kind": "frontier_shadow",
+                "reject_reason": row["reject_reason"],
+                "signal_stats_scope": "frontier_shadow_observation",
+                "gross_edge_bps_estimate": candidate.get("gross_edge_bps_estimate"),
+                "estimated_round_trip_cost_bps": candidate.get("estimated_round_trip_cost_bps"),
+                "net_edge_bps": candidate.get("frontier_net_edge_bps"),
+            }
+            price_source = (
+                latest.get("price_source")
+                or (latest.get("data_source") or {}).get("provider")
+                or latest.get("venue")
+                or "scanner"
+            )
+            conn.execute(
+                """
+                insert into frontier_paper_shadow_outcomes (
+                    observation_id, horizon_minutes, measured_at, price, pnl_bps,
+                    context_json, target_at, observed_at, delay_seconds,
+                    measurement_status, price_source
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"], int(horizon), utc_now(), price, round(pnl_bps, 3),
+                    json.dumps(context, sort_keys=True), target.isoformat(),
+                    observed_at.isoformat(), round(delay_seconds, 3),
+                    measurement_status, price_source,
+                ),
+            )
+            recorded.append(
+                {
+                    "shadow_observation_id": row["id"],
+                    "horizon_minutes": int(horizon),
+                    "pnl_bps": round(pnl_bps, 3),
+                    "measurement_status": measurement_status,
+                    "delay_seconds": round(delay_seconds, 3),
+                    "price_source": price_source,
+                }
+            )
+    return recorded
+
+
 def record_due_horizon_outcomes(
     conn: sqlite3.Connection,
     latest_by_inst: dict[str, dict],
@@ -2433,6 +2577,11 @@ def record_due_horizon_outcomes(
                     "paper_realized_cost_audit": cost_audit if pnl_bps is not None else None,
                 }
             )
+    recorded.extend(
+        _record_due_frontier_shadow_outcomes(
+            conn, latest_by_inst, [int(horizon) for horizon in horizons], max_delay_seconds, now
+        )
+    )
     conn.commit()
     return recorded
 
@@ -2490,6 +2639,17 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
 def execution_summary(conn: sqlite3.Connection) -> dict:
     orders = conn.execute("select count(*) as n from execution_orders").fetchone()["n"]
     fills = conn.execute("select count(*) as n from execution_fills").fetchone()["n"]
+    frontier_accepted = conn.execute(
+        """
+        select count(*) as n
+        from execution_orders
+        where status = 'paper_filled'
+          and candidate_json like '%frontier_crypto_venue_map%'
+        """
+    ).fetchone()["n"]
+    frontier_shadowed = conn.execute(
+        "select count(*) as n from frontier_paper_shadow_observations"
+    ).fetchone()["n"]
     latest = conn.execute(
         """
         select id, created_at, mode, route_id, inst_id, direction, status, notional_usd
@@ -2501,6 +2661,14 @@ def execution_summary(conn: sqlite3.Connection) -> dict:
     return {
         "orders": int(orders),
         "fills": int(fills),
+        "frontier_paper_candidates": {
+            "accepted": int(frontier_accepted),
+            "shadowed": int(frontier_shadowed),
+            "accepted_vs_shadowed": {
+                "accepted": int(frontier_accepted),
+                "shadowed": int(frontier_shadowed),
+            },
+        },
         "latest_orders": [dict(row) for row in latest],
     }
 
@@ -3434,6 +3602,34 @@ def save_execution_order(conn: sqlite3.Connection, order: dict, candidate: dict,
             json.dumps(review, sort_keys=True),
             candidate.get("strategy_lab_id"),
             int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def save_frontier_paper_shadow_observation(
+    conn: sqlite3.Connection,
+    candidate: dict,
+    review: dict,
+) -> int:
+    """Persist a rejected frontier candidate without creating an order or fill."""
+    cur = conn.execute(
+        """
+        insert into frontier_paper_shadow_observations (
+            observed_at, venue, inst_id, direction, trade_type, reject_reason,
+            candidate_json, review_json
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now(),
+            str(candidate.get("venue") or "unknown"),
+            str(candidate.get("inst_id") or candidate.get("instrument_id") or "unknown"),
+            str(candidate.get("direction") or "unknown"),
+            str(candidate.get("trade_type") or "unknown"),
+            str(candidate.get("candidate_reject_reason") or "cost_swallowed_or_route_blocked"),
+            json.dumps(candidate, sort_keys=True),
+            json.dumps(review, sort_keys=True),
         ),
     )
     conn.commit()

@@ -11,11 +11,20 @@ from __future__ import annotations
 import math
 import sqlite3
 
-from paper_order_router import apply_frontier_paper_admission_guard, apply_frontier_paper_guard
+from paper_order_router import (
+    FRONTIER_SHADOW_REASON,
+    apply_frontier_cost_or_route_paper_guard,
+    apply_frontier_paper_admission_guard,
+    apply_frontier_paper_guard,
+)
 from paper_context_cost import enforce_paper_context_cost_gate
 from paper_decay_quarantine import apply_quarantine as apply_okx_basis_decay_quarantine
 from paper_exploration import exploration_enabled, prepare_candidate_for_exploration
-from storage import save_execution_fill, save_execution_order
+from storage import (
+    save_execution_fill,
+    save_execution_order,
+    save_frontier_paper_shadow_observation,
+)
 
 
 NAV_REFERENCE_PAPER_ROUTE_ID = "synthetic_nav_reference_paper"
@@ -308,12 +317,19 @@ def _auction_reference_execution(candidate: dict, settings: dict) -> dict:
 
 
 def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
+    paper_mode = settings.get("mode", "paper") == "paper" and not settings.get(
+        "allow_live_trading", False
+    )
+    if paper_mode:
+        # Evaluate the direct candidate before exploration can substitute a
+        # synthetic route and hide direct route blockers from the fill guard.
+        candidate = apply_frontier_cost_or_route_paper_guard(candidate, settings)
     context_loss_quarantine = candidate.get("paper_context_loss_quarantine") or {}
     context_loss_quarantined = bool(
         isinstance(context_loss_quarantine, dict)
         and not context_loss_quarantine.get("paper_fill_allowed", True)
     )
-    if exploration_enabled(settings):
+    if exploration_enabled(settings) and not candidate.get("shadow_filtered"):
         candidate = prepare_candidate_for_exploration(dict(candidate), settings)
         # This explicit paper-only family exception survives exploration's
         # otherwise permissive synthetic-route preparation.
@@ -375,6 +391,22 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         return _auction_reference_execution(candidate, settings)
     order = build_order_ticket(candidate, review, settings)
     if candidate.get("shadow_filtered"):
+        if candidate.get("candidate_reject_reason") == FRONTIER_SHADOW_REASON:
+            observation_id = save_frontier_paper_shadow_observation(conn, candidate, review)
+            order["status"] = "shadow_observed"
+            order["shadow_filter"] = candidate.get("candidate_reject_detail")
+            order["notes"].append(
+                "Frontier candidate recorded as a shadow observation; no paper order or fill was created."
+            )
+            return {
+                "order_id": None,
+                "shadow_observation_id": observation_id,
+                "order": order,
+                "fills": [],
+                "fill_ids": [],
+                "paper_filled": False,
+                "candidate": candidate,
+            }
         order["status"] = "shadow_filtered"
         order["shadow_filter"] = candidate.get("candidate_reject_detail")
         order["notes"].append("Paper fill suppressed by a paper-only candidate guard.")

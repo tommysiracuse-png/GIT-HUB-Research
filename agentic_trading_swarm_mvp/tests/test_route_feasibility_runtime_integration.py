@@ -18,13 +18,16 @@ def _candidate(**overrides):
         "symbol": "PEPE/USDT",
         "venue": "OKX",
         "score": 68.0,
+        "edge_bps_estimate": 10.0,
+        "gross_edge_bps_estimate": 30.0,
+        "estimated_round_trip_cost_bps": 20.0,
     }
     candidate.update(overrides)
     return candidate
 
 
 class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
-    def test_assumption_backed_short_is_capped_but_not_shadow_filtered(self):
+    def test_assumption_backed_short_with_route_blockers_is_shadow_filtered(self):
         candidate = _candidate(
             venue="PAPER_SIM_VENUE",
             score=80.0,
@@ -45,15 +48,14 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
 
         guarded = apply_frontier_paper_guard(candidate)
 
-        self.assertFalse(guarded.get("shadow_filtered", False))
-        self.assertEqual(16.0, guarded["score"])
-        self.assertEqual(0.2, guarded["paper_allocation_multiplier"])
-        self.assertEqual(
-            "simulation_assumption",
-            guarded["paper_execution_semantics"],
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("cost_swallowed_or_route_blocked", guarded["candidate_reject_reason"])
+        self.assertIn(
+            "short_frontier_spot_route_blockers_present",
+            {check["code"] for check in guarded["candidate_reject_detail"]["checks"]},
         )
 
-    def test_pretrade_rechecks_stale_eligible_route_metadata(self):
+    def test_pretrade_route_metadata_remains_diagnostic_without_blockers(self):
         candidate = _candidate(
             paper_route_eligibility={
                 "paper_only": True,
@@ -73,7 +75,7 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
 
         guarded = apply_frontier_paper_guard(candidate)
 
-        self.assertTrue(guarded["shadow_filtered"])
+        self.assertFalse(guarded.get("shadow_filtered", False))
         self.assertEqual("blocked", guarded["execution_eligibility"])
         self.assertEqual(
             "infeasible_for_paper",
@@ -86,12 +88,8 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(0.0, guarded["rank_contribution_cap"])
         self.assertTrue(guarded["required_capabilities"])
         self.assertTrue(guarded["paper_route_notes"])
-        self.assertIn(
-            "venue_spot_short_capability_unconfirmed",
-            guarded["candidate_reject_detail"]["blocker_reasons"],
-        )
 
-    def test_direct_pretrade_path_blocks_short_without_venue_metadata(self):
+    def test_direct_pretrade_path_keeps_missing_venue_metadata_diagnostic(self):
         candidate = _candidate(
             venue="UNKNOWN_FRONTIER",
             paper_short_simulation_allowed=True,
@@ -103,15 +101,7 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
 
         guarded = apply_frontier_paper_guard(candidate)
 
-        self.assertTrue(guarded["shadow_filtered"])
-        self.assertEqual(
-            "paper_route_eligibility_gate",
-            guarded["candidate_reject_detail"]["guard"],
-        )
-        self.assertIn(
-            "venue_capability_metadata_missing",
-            guarded["candidate_reject_detail"]["blocker_reasons"],
-        )
+        self.assertFalse(guarded.get("shadow_filtered", False))
         self.assertEqual("unknown", guarded["route_intelligence_status"])
         self.assertEqual("route_needs_confirmation", guarded["candidate_status"])
         self.assertEqual(0.2, guarded["rank_contribution_cap"])
@@ -172,9 +162,9 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
         self.assertFalse(guarded["paper_fill_allowed_by_route"])
 
         check_codes = {check["code"] for check in reason["checks"]}
-        self.assertIn("route_not_paper_testable", check_codes)
+        self.assertIn("short_frontier_spot_route_blockers_present", check_codes)
 
-    def test_proxy_short_is_allowed_with_reduced_allocation_and_proxy_metadata(self):
+    def test_proxy_short_with_direct_route_blockers_is_shadow_filtered(self):
         candidate = _candidate(
             venue_capabilities={"paper_route_feasible": True},
             route_blockers=["spot_borrow"],
@@ -194,13 +184,8 @@ class RouteFeasibilityRuntimeIntegrationTests(unittest.TestCase):
         guarded = apply_frontier_paper_guard(candidate)
         record = frontier_route_feasibility_record(candidate)
 
-        self.assertFalse(guarded.get("shadow_filtered", False))
-        self.assertEqual(guarded["paper_route_status"], "paper_testable_proxy")
-        self.assertEqual(guarded["paper_route_type"], "proxy")
-        self.assertTrue(guarded["paper_proxy_used"])
-        self.assertTrue(guarded["paper_fill_allowed_by_route"])
-        self.assertEqual(guarded["paper_allocation_multiplier"], 0.4)
-        self.assertEqual(guarded["paper_proxy_route"]["route_id"], "perp_hedge_proxy")
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("cost_swallowed_or_route_blocked", guarded["candidate_reject_reason"])
 
         self.assertTrue(record["paper_proxy_used"])
         self.assertEqual(record["paper_route_status"], "paper_testable_proxy")

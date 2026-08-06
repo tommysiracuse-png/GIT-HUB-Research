@@ -21,6 +21,9 @@ def _base_candidate() -> dict:
         "trade_type": "short_frontier_spot",
         "strategy": "frontier_crypto_venue_map",
         "direction": "short",
+        "edge_bps_estimate": 25.0,
+        "gross_edge_bps_estimate": 35.0,
+        "estimated_round_trip_cost_bps": 20.0,
     }
 
 

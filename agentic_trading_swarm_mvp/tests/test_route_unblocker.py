@@ -33,6 +33,8 @@ def base_candidate(**overrides: object) -> dict:
         "funding_bps": 0.0,
         "basis_bps": 0.0,
         "edge_bps_estimate": 25.0,
+        "gross_edge_bps_estimate": 45.0,
+        "estimated_round_trip_cost_bps": 20.0,
         "liquidity_score": 0.8,
         "spread_bps": 2.0,
         "change_24h_pct": 1.0,
@@ -43,7 +45,7 @@ def base_candidate(**overrides: object) -> dict:
 
 
 class RouteUnblockerTests(unittest.TestCase):
-    def test_inferred_proxy_keeps_spot_short_route_evidence_diagnostic_only(self) -> None:
+    def test_inferred_proxy_with_spot_borrow_blocker_is_shadow_observed(self) -> None:
         cfg = settings()
         enriched = route_resolver.enrich_candidate_with_route(base_candidate(), cfg)
 
@@ -62,12 +64,8 @@ class RouteUnblockerTests(unittest.TestCase):
         )
 
         guarded = paper_order_router.apply_frontier_paper_guard(enriched, cfg)
-        self.assertFalse(guarded.get("shadow_filtered", False))
-        self.assertFalse(guarded.get("paper_entry_blocked", False))
-        self.assertEqual(
-            guarded["paper_route_feasibility_gate"]["action"],
-            "diagnostic_only",
-        )
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual("cost_swallowed_or_route_blocked", guarded["candidate_reject_reason"])
 
     def test_prediction_market_blockers_use_research_paper_route_only(self) -> None:
         cfg = settings()

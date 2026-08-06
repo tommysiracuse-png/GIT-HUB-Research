@@ -96,24 +96,20 @@ class PaperExplorationTests(unittest.TestCase):
         self.assertGreater(review["paper_allocation_multiplier"], 0.0)
         self.assertTrue(signal_key(candidate).startswith("SYNTHETIC_RESEARCH|"))
 
-    def test_synthetic_trade_fills_but_does_not_claim_route_feasibility(self) -> None:
+    def test_cost_swallowed_frontier_candidate_is_shadow_observed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
             candidate = prepare_candidate_for_exploration(self.candidate(), self.settings)
             review = review_candidate(candidate, self.settings, {}, policies=[])
             execution = execute_order(conn, candidate, review, self.settings)
-            self.assertTrue(execution["paper_filled"])
-            self.assertEqual(SYNTHETIC_ROUTE_ID, execution["order"]["route_id"])
-            self.assertEqual("synthetic_research", execution["order"]["signal_stats_scope"])
-            trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=self.settings)
-            row = conn.execute("select signal_key, context_json from paper_trades where id = ?", (trade_id,)).fetchone()
-            self.assertTrue(row["signal_key"].startswith("SYNTHETIC_RESEARCH|"))
-            self.assertIn('"signal_stats_scope": "synthetic_research"', row["context_json"])
-            conn.execute("update paper_trades set status = 'closed', pnl_bps = 25.0 where id = ?", (trade_id,))
-            conn.commit()
-            summary = performance_summary(conn)
-            self.assertEqual(0, summary["closed"])
-            self.assertEqual(1, summary["synthetic_research"]["closed"])
+            self.assertFalse(execution["paper_filled"])
+            self.assertEqual("shadow_observed", execution["order"]["status"])
+            self.assertIsNone(execution["order_id"])
+            self.assertEqual(0, conn.execute("select count(*) from paper_trades").fetchone()[0])
+            self.assertEqual(
+                "cost_swallowed_or_route_blocked",
+                conn.execute("select reject_reason from frontier_paper_shadow_observations").fetchone()[0],
+            )
             conn.close()
 
     def test_invalid_price_and_dangerous_staleness_remain_hard_rejections(self) -> None:

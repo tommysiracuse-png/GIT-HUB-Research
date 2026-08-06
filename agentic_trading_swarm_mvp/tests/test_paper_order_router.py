@@ -48,7 +48,7 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
         self.assertEqual(guarded["candidate_reject_reason"], router.FRONTIER_SHADOW_REASON)
         self.assertEqual(
             {check["code"] for check in guarded["candidate_reject_detail"]["checks"]},
-            {"non_positive_net_edge", "gross_edge_not_above_round_trip_cost"},
+            {"edge_bps_estimate_not_positive", "net_edge_below_5bps_after_costs"},
         )
         self.assertTrue(candidate["paper_filled"])
         self.assertEqual(candidate["status"], "paper_filled")
@@ -122,8 +122,21 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
         )
 
         codes = [check["code"] for check in guarded["candidate_reject_detail"]["checks"]]
-        self.assertIn(router.SPOT_BORROW_SHADOW_CODE, codes)
+        self.assertIn("short_frontier_spot_route_blockers_present", codes)
         self.assertEqual(guarded["paper_fill_status"], "shadow_filtered")
+
+    def test_net_edge_is_computed_from_gross_less_cost_not_quality_score(self) -> None:
+        guarded = router.apply_frontier_paper_guard(
+            frontier_candidate(
+                edge_bps_estimate=1.0,
+                gross_edge_bps_estimate=27.0,
+                estimated_round_trip_cost_bps=22.0,
+                quality_action="conditional",
+                quality_score=10.0,
+            )
+        )
+
+        self.assertNotIn("shadow_filtered", guarded)
 
     def test_confirmed_borrow_keeps_short_spot_eligible(self) -> None:
         guarded = router.apply_frontier_paper_guard(
