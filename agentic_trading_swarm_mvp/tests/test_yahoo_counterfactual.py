@@ -71,6 +71,119 @@ class YahooCounterfactualTests(unittest.TestCase):
         self.assertEqual(report["counterfactuals"]["freshness_gates_60m"]["le_30m"]["count"], 12)
         self.assertEqual(report["counterfactuals"]["next_session_entry"]["status"], "forward_observation_required")
         self.assertTrue(any(item["counterfactual"] == "direction_flip_60m" for item in report["shadow_recommendations"]))
+        attribution = report["diagnostic_attribution"]
+        self.assertEqual(60, attribution["primary_horizon_minutes"])
+        self.assertEqual("horizon_or_sign_mismatch", attribution["leading_hypothesis"])
+        self.assertEqual(-102.0, attribution["cost_summary"]["avg_net_pnl_bps"])
+        self.assertEqual(-100.0, attribution["cost_summary"]["avg_gross_return_bps"])
+        self.assertEqual(2.0, attribution["cost_summary"]["avg_total_realized_cost_bps"])
+        self.assertEqual("long_proxy_standard", attribution["family_leg_outcomes"][0]["family_leg"])
+        self.assertEqual("aging_15m_to_60m", attribution["quote_age_outcomes"][0]["quote_age_bucket"])
+
+    def test_cost_drag_hypothesis_is_confirmed_when_gross_turns_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(pathlib.Path(tmp) / "radar.sqlite")
+            for index in range(10):
+                candidate = {
+                    "provider_age_seconds": 180.0,
+                    "spread_bps": 4.0,
+                    "estimated_slippage_bps": 6.0,
+                    "seen_at": "2026-08-01T12:03:00+00:00",
+                    "source_quote_timestamp": "2026-08-01T12:00:00+00:00",
+                }
+                cur = conn.execute(
+                    """
+                    insert into paper_trades (
+                        opened_at, venue, inst_id, direction, trade_type, signal_key,
+                        base_score, learned_score, entry, status, thesis,
+                        candidate_json, review_json, entry_fee_bps, entry_slippage_bps
+                    ) values (?, 'YAHOO_PROXY', ?, 'long_proxy', 'global_proxy_momentum',
+                              'YAHOO_PROXY|global_proxy_momentum|long_proxy|standard',
+                              70, 70, 100, 'closed', 'test', ?, '{}', 3, 2)
+                    """,
+                    ("2026-08-01T12:03:00+00:00", f"COST{index}", json.dumps(candidate)),
+                )
+                trade_id = cur.lastrowid
+                context = {
+                    "paper_realized_cost_audit": {
+                        "paper_only": True,
+                        "charged_cost_bps": 5.0,
+                        "realized_cost_backfill_bps": 7.0,
+                        "adjusted_pnl_bps": -7.0,
+                    }
+                }
+                conn.execute(
+                    """
+                    insert into paper_trade_outcomes (
+                        trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                        context_json, measurement_status, delay_seconds
+                    ) values (?, 60, '2026-08-01T13:03:00+00:00', 100.05, -7.0, ?, 'valid', 5)
+                    """,
+                    (trade_id, json.dumps(context)),
+                )
+            conn.commit()
+            report = yahoo.build_report(conn)
+            conn.close()
+
+        attribution = report["diagnostic_attribution"]
+        by_hypothesis = {item["hypothesis"]: item for item in attribution["hypothesis_tests"]}
+        self.assertEqual("cost_drag", attribution["leading_hypothesis"])
+        self.assertEqual("confirmed", by_hypothesis["cost_drag"]["status"])
+        self.assertEqual(["long_proxy_standard"], by_hypothesis["cost_drag"]["affected_family_legs"])
+        self.assertEqual(5.0, attribution["cost_summary"]["avg_gross_return_bps"])
+        self.assertEqual(-7.0, attribution["cost_summary"]["avg_net_pnl_bps"])
+        self.assertEqual(12.0, attribution["cost_summary"]["avg_total_realized_cost_bps"])
+        self.assertEqual(4.0, attribution["cost_summary"]["avg_estimated_spread_bps"])
+        self.assertEqual(6.0, attribution["cost_summary"]["avg_estimated_slippage_bps"])
+
+    def test_stale_proxy_hypothesis_is_confirmed_before_direction_flip_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(pathlib.Path(tmp) / "radar.sqlite")
+            for prefix, age_seconds, price, pnl in (
+                ("FRESH", 300.0, 100.08, 8.0),
+                ("STALE", 7200.0, 99.8, -20.0),
+            ):
+                for index in range(8):
+                    candidate = {
+                        "provider_age_seconds": age_seconds,
+                        "seen_at": "2026-08-01T12:00:00+00:00",
+                        "source_quote_timestamp": "2026-08-01T11:00:00+00:00",
+                    }
+                    cur = conn.execute(
+                        """
+                        insert into paper_trades (
+                            opened_at, venue, inst_id, direction, trade_type, signal_key,
+                            base_score, learned_score, entry, status, thesis,
+                            candidate_json, review_json, entry_fee_bps, entry_slippage_bps
+                        ) values (?, 'YAHOO_PROXY', ?, 'long_proxy', 'global_proxy_momentum',
+                                  'YAHOO_PROXY|global_proxy_momentum|long_proxy|standard',
+                                  70, 70, 100, 'closed', 'test', ?, '{}', 0, 0)
+                        """,
+                        ("2026-08-01T12:00:00+00:00", f"{prefix}{index}", json.dumps(candidate)),
+                    )
+                    trade_id = cur.lastrowid
+                    conn.execute(
+                        """
+                        insert into paper_trade_outcomes (
+                            trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                            context_json, measurement_status, delay_seconds
+                        ) values (?, 60, '2026-08-01T13:00:00+00:00', ?, ?, '{}', 'valid', 5)
+                        """,
+                        (trade_id, price, pnl),
+                    )
+            conn.commit()
+            report = yahoo.build_report(conn)
+            conn.close()
+
+        attribution = report["diagnostic_attribution"]
+        by_hypothesis = {item["hypothesis"]: item for item in attribution["hypothesis_tests"]}
+        self.assertEqual("stale_proxy_data", attribution["leading_hypothesis"])
+        self.assertEqual("confirmed", by_hypothesis["stale_proxy_data"]["status"])
+        self.assertEqual("rejected", by_hypothesis["cost_drag"]["status"])
+        self.assertEqual(1.0, by_hypothesis["stale_proxy_data"]["stale_negative_share"])
+        quote_age = {row["quote_age_bucket"]: row for row in attribution["quote_age_outcomes"]}
+        self.assertEqual(8.0, quote_age["fresh_le_15m"]["avg_net_pnl_bps"])
+        self.assertEqual(-20.0, quote_age["stale_gt_60m"]["avg_net_pnl_bps"])
 
     def test_late_and_strategy_lab_labels_are_excluded(self) -> None:
         conn = sqlite3.connect(":memory:")

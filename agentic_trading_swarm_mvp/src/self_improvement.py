@@ -2881,6 +2881,7 @@ def _report_markdown(report: dict) -> str:
 
     yahoo_counterfactual = report.get("yahoo_counterfactual") or {}
     if yahoo_counterfactual:
+        diagnostic_attribution = yahoo_counterfactual.get("diagnostic_attribution") or {}
         lines.extend(["", "## Yahoo Proxy Counterfactuals", ""])
         lines.append(f"- Decision: `{yahoo_counterfactual.get('decision')}`")
         lines.append(f"- Reliable labels: `{yahoo_counterfactual.get('reliable_label_count', 0)}`")
@@ -2889,6 +2890,8 @@ def _report_markdown(report: dict) -> str:
             f"- Direction-flip 60m: "
             f"`{(yahoo_counterfactual.get('counterfactuals') or {}).get('direction_flip_60m', {})}`"
         )
+        lines.append(f"- Leading hypothesis: `{diagnostic_attribution.get('leading_hypothesis')}`")
+        lines.append(f"- Primary attribution: `{diagnostic_attribution.get('cost_summary', {})}`")
         lines.append(f"- Shadow recommendations: `{yahoo_counterfactual.get('shadow_recommendations', [])}`")
 
     reliability_cards = report.get("cross_context_reliability") or {}

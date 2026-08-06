@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import collections
 import datetime as dt
 import json
 import pathlib
@@ -14,6 +15,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
 REPORT_JSON = RUNS_DIR / "yahoo_counterfactual_report.json"
 REPORT_MD = RUNS_DIR / "yahoo_counterfactual_report.md"
+PRIMARY_HORIZON_MINUTES = 60
+MIN_HYPOTHESIS_SAMPLE_COUNT = 8
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
@@ -54,6 +57,44 @@ def _candidate(row: sqlite3.Row) -> dict:
         return {}
 
 
+def _safe_dict(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_timestamp(value: object) -> dt.datetime | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=dt.timezone.utc)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def _lookup_nested(containers: tuple[dict, ...], *keys: str) -> object:
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
 def _provider_age_seconds(candidate: dict) -> float | None:
     for value in (
         candidate.get("provider_age_seconds"),
@@ -64,6 +105,142 @@ def _provider_age_seconds(candidate: dict) -> float | None:
     if candidate.get("stale_minutes") not in (None, ""):
         return max(0.0, _as_float(candidate.get("stale_minutes")) * 60.0)
     return None
+
+
+def _signal_age_seconds(candidate: dict, outcome_context: dict) -> float | None:
+    age_seconds = _provider_age_seconds(candidate)
+    if age_seconds is not None:
+        return age_seconds
+    direct = _lookup_nested(
+        (candidate, outcome_context),
+        "source_quote_age_seconds",
+        "quote_age_seconds",
+        "proxy_quote_age_seconds",
+        "data_age_seconds",
+        "freshness_age_seconds",
+    )
+    if direct not in (None, ""):
+        return max(0.0, _as_float(direct))
+    seen_at = _parse_timestamp(
+        candidate.get("decision_time_utc") or candidate.get("seen_at") or candidate.get("opened_at")
+    )
+    source_at = _parse_timestamp(
+        candidate.get("source_quote_timestamp")
+        or candidate.get("source_bar_end_utc")
+        or candidate.get("last_bar_utc")
+        or candidate.get("last_trade_timestamp")
+    )
+    if seen_at is not None and source_at is not None:
+        return max(0.0, (seen_at - source_at).total_seconds())
+    return None
+
+
+def _quote_age_bucket(age_seconds: float | None) -> str:
+    if age_seconds is None:
+        return "unknown"
+    if age_seconds <= 15.0 * 60.0:
+        return "fresh_le_15m"
+    if age_seconds <= 60.0 * 60.0:
+        return "aging_15m_to_60m"
+    return "stale_gt_60m"
+
+
+def _holding_horizon_bucket(horizon_minutes: int) -> str:
+    if horizon_minutes <= 15:
+        return "scalp_le_15m"
+    if horizon_minutes <= 60:
+        return "intraday_16m_to_60m"
+    if horizon_minutes <= 240:
+        return "swing_61m_to_240m"
+    return "position_gt_240m"
+
+
+def _spread_bps(candidate: dict, outcome_context: dict) -> float | None:
+    value = _lookup_nested(
+        (candidate, outcome_context),
+        "spread_bps",
+        "effective_spread_bps",
+        "best_bid_ask_spread_bps",
+    )
+    return max(0.0, _as_float(value)) if value not in (None, "") else None
+
+
+def _slippage_bps(candidate: dict, outcome_context: dict, row: sqlite3.Row) -> float | None:
+    direct = _lookup_nested(
+        (candidate, outcome_context),
+        "estimated_slippage_bps",
+        "round_trip_slippage_bps_estimate",
+        "slippage_bps_estimate",
+    )
+    if direct not in (None, ""):
+        return max(0.0, _as_float(direct))
+    entry_est = _lookup_nested((candidate, outcome_context), "entry_slippage_bps_estimate", "entry_slippage_bps")
+    exit_est = _lookup_nested((candidate, outcome_context), "exit_slippage_bps_estimate", "exit_slippage_bps")
+    values = [value for value in (_as_float(entry_est, default=None), _as_float(exit_est, default=None)) if value is not None]
+    if values:
+        return round(sum(max(0.0, value) for value in values), 3)
+    if row["entry_slippage_bps"] not in (None, ""):
+        return max(0.0, _as_float(row["entry_slippage_bps"]))
+    return None
+
+
+def _family_leg_label(signal_key: object, direction: object, candidate: dict, outcome_context: dict) -> str:
+    direction_text = str(direction or "unknown").strip().lower() or "unknown"
+    signal_stats_scope = str(
+        candidate.get("signal_stats_scope")
+        or outcome_context.get("signal_stats_scope")
+        or ""
+    ).strip().lower()
+    if signal_stats_scope == "synthetic_research":
+        return f"synthetic_{direction_text}"
+    variant = ""
+    parts = str(signal_key or "").split("|")
+    if parts:
+        variant = str(parts[-1]).strip().lower()
+    if variant in {"standard", "conditional"}:
+        return f"{direction_text}_{variant}"
+    return direction_text
+
+
+def _aggregate_records(rows: list[dict]) -> dict:
+    net_values = [float(item["net_pnl_bps"]) for item in rows if item.get("net_pnl_bps") is not None]
+    gross_values = [float(item["gross_return_bps"]) for item in rows if item.get("gross_return_bps") is not None]
+    realized_costs = [float(item["realized_total_cost_bps"]) for item in rows if item.get("realized_total_cost_bps") is not None]
+    charged_costs = [float(item["charged_cost_bps"]) for item in rows if item.get("charged_cost_bps") is not None]
+    modeled_costs = [float(item["modeled_context_cost_bps"]) for item in rows if item.get("modeled_context_cost_bps") is not None]
+    spreads = [float(item["spread_bps"]) for item in rows if item.get("spread_bps") is not None]
+    slippages = [float(item["slippage_bps"]) for item in rows if item.get("slippage_bps") is not None]
+    ages = [float(item["quote_age_seconds"]) for item in rows if item.get("quote_age_seconds") is not None]
+    return {
+        "count": len(rows),
+        "avg_net_pnl_bps": round(statistics.fmean(net_values), 3) if net_values else None,
+        "avg_gross_return_bps": round(statistics.fmean(gross_values), 3) if gross_values else None,
+        "avg_total_realized_cost_bps": round(statistics.fmean(realized_costs), 3) if realized_costs else None,
+        "avg_charged_cost_bps": round(statistics.fmean(charged_costs), 3) if charged_costs else None,
+        "avg_modeled_context_cost_bps": round(statistics.fmean(modeled_costs), 3) if modeled_costs else None,
+        "avg_estimated_spread_bps": round(statistics.fmean(spreads), 3) if spreads else None,
+        "avg_estimated_slippage_bps": round(statistics.fmean(slippages), 3) if slippages else None,
+        "avg_quote_age_seconds": round(statistics.fmean(ages), 3) if ages else None,
+        "net_win_rate": round(sum(value > 0.0 for value in net_values) / len(net_values), 3) if net_values else None,
+        "gross_win_rate": round(sum(value > 0.0 for value in gross_values) / len(gross_values), 3) if gross_values else None,
+    }
+
+
+def _aggregate_labeled(rows: list[dict], label_field: str) -> list[dict]:
+    grouped: dict[str, list[dict]] = collections.defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(label_field) or "unknown")].append(row)
+    ordered = []
+    for label, items in grouped.items():
+        ordered.append({label_field: label, **_aggregate_records(items)})
+    ordered.sort(
+        key=lambda item: (
+            item.get("avg_net_pnl_bps") is None,
+            item.get("avg_net_pnl_bps") if item.get("avg_net_pnl_bps") is not None else 0.0,
+            str(item.get(label_field) or ""),
+        )
+    )
+    return ordered
 
 
 def _recommendations(horizons: dict[str, dict], inverted_60m: dict, freshness: dict[str, dict]) -> list[dict]:
@@ -127,37 +304,100 @@ def _recommendations(horizons: dict[str, dict], inverted_60m: dict, freshness: d
 
 def build_report(conn: sqlite3.Connection) -> dict:
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        select p.id, p.opened_at, p.inst_id, p.direction, p.entry,
-               p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
-               o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds
-        from paper_trade_outcomes o
-        join paper_trades p on p.id = o.trade_id
-        where p.venue = 'YAHOO_PROXY'
-          and p.trade_type = 'global_proxy_momentum'
-          and (p.strategy_lab_id is null or p.strategy_lab_id = '')
-          and o.measurement_status = 'valid'
-          and o.pnl_bps is not null
-        order by p.id, o.horizon_minutes
-        """
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            select p.id, p.opened_at, p.inst_id, p.direction, p.signal_key, p.entry,
+                   p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
+                   o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds, o.context_json
+            from paper_trade_outcomes o
+            join paper_trades p on p.id = o.trade_id
+            where p.venue = 'YAHOO_PROXY'
+              and p.trade_type = 'global_proxy_momentum'
+              and (p.strategy_lab_id is null or p.strategy_lab_id = '')
+              and o.measurement_status = 'valid'
+              and o.pnl_bps is not null
+            order by p.id, o.horizon_minutes
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = conn.execute(
+            """
+            select p.id, p.opened_at, p.inst_id, p.direction, '' as signal_key, p.entry,
+                   p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
+                   o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds, '{}' as context_json
+            from paper_trade_outcomes o
+            join paper_trades p on p.id = o.trade_id
+            where p.venue = 'YAHOO_PROXY'
+              and p.trade_type = 'global_proxy_momentum'
+              and (p.strategy_lab_id is null or p.strategy_lab_id = '')
+              and o.measurement_status = 'valid'
+              and o.pnl_bps is not null
+            order by p.id, o.horizon_minutes
+            """
+        ).fetchall()
     by_horizon: dict[int, list[float]] = {}
     inverted_60m = []
     freshness_60m: dict[int, list[float]] = {30: [], 60: [], 90: []}
     timing_coverage = {"provider_age_present": 0, "source_bar_end_present": 0, "decision_time_present": 0}
     seen_trades = set()
+    attribution_rows: list[dict] = []
+    horizons_seen: collections.Counter[int] = collections.Counter()
     for row in rows:
         pnl = _as_float(row["pnl_bps"])
         horizon = int(row["horizon_minutes"])
         by_horizon.setdefault(horizon, []).append(pnl)
+        horizons_seen[horizon] += 1
         candidate = _candidate(row)
+        outcome_context = _safe_dict(row["context_json"])
         if row["id"] not in seen_trades:
             seen_trades.add(row["id"])
             provider_age = _provider_age_seconds(candidate)
             timing_coverage["provider_age_present"] += int(provider_age is not None)
             timing_coverage["source_bar_end_present"] += int(bool(candidate.get("source_bar_end_utc") or candidate.get("last_bar_utc")))
             timing_coverage["decision_time_present"] += int(bool(candidate.get("decision_time_utc") or candidate.get("seen_at")))
+        sign = _direction_sign(row["direction"])
+        entry = _as_float(row["entry"])
+        price = _as_float(row["price"])
+        gross = None
+        if sign and entry > 0 and price > 0:
+            gross = (price / entry - 1.0) * 10_000.0 * sign
+        cost_audit = _safe_dict(outcome_context.get("paper_realized_cost_audit"))
+        charged_cost = None
+        modeled_backfill = None
+        if cost_audit:
+            charged_cost = _as_float(cost_audit.get("charged_cost_bps"), default=None)
+            modeled_backfill = _as_float(
+                cost_audit.get("realized_cost_backfill_bps", cost_audit.get("modeled_context_cost_bps")),
+                default=None,
+            )
+        realized_total_cost = None
+        if charged_cost is not None or modeled_backfill is not None:
+            realized_total_cost = max(0.0, (charged_cost or 0.0) + (modeled_backfill or 0.0))
+        if gross is None and realized_total_cost is not None:
+            gross = pnl + realized_total_cost
+        if realized_total_cost is None and gross is not None:
+            realized_total_cost = gross - pnl
+        quote_age_seconds = _signal_age_seconds(candidate, outcome_context)
+        attribution_rows.append(
+            {
+                "trade_id": int(row["id"]),
+                "inst_id": str(row["inst_id"] or ""),
+                "direction": str(row["direction"] or "unknown"),
+                "family_leg": _family_leg_label(row["signal_key"], row["direction"], candidate, outcome_context),
+                "horizon_minutes": horizon,
+                "holding_horizon_bucket": _holding_horizon_bucket(horizon),
+                "net_pnl_bps": pnl,
+                "gross_return_bps": round(gross, 3) if gross is not None else None,
+                "realized_total_cost_bps": round(realized_total_cost, 3) if realized_total_cost is not None else None,
+                "charged_cost_bps": round(charged_cost, 3) if charged_cost is not None else None,
+                "modeled_context_cost_bps": round(modeled_backfill, 3) if modeled_backfill is not None else None,
+                "spread_bps": _spread_bps(candidate, outcome_context),
+                "slippage_bps": _slippage_bps(candidate, outcome_context, row),
+                "quote_age_seconds": round(quote_age_seconds, 3) if quote_age_seconds is not None else None,
+                "quote_age_bucket": _quote_age_bucket(quote_age_seconds),
+            }
+        )
         if horizon != 60:
             continue
         provider_age = _provider_age_seconds(candidate)
@@ -165,9 +405,6 @@ def build_report(conn: sqlite3.Connection) -> dict:
             for threshold in freshness_60m:
                 if provider_age <= threshold * 60.0:
                     freshness_60m[threshold].append(pnl)
-        sign = _direction_sign(row["direction"])
-        entry = _as_float(row["entry"])
-        price = _as_float(row["price"])
         if sign and entry > 0 and price > 0:
             gross = (price / entry - 1.0) * 10_000.0 * sign
             observed_cost = max(0.0, gross - pnl)
@@ -177,6 +414,130 @@ def build_report(conn: sqlite3.Connection) -> dict:
     inverted_metrics = _metrics(inverted_60m)
     freshness_metrics = {f"le_{minutes}m": _metrics(values) for minutes, values in freshness_60m.items()}
     recommendations = _recommendations(horizon_metrics, inverted_metrics, freshness_metrics)
+    primary_horizon = PRIMARY_HORIZON_MINUTES if horizons_seen.get(PRIMARY_HORIZON_MINUTES) else (min(horizons_seen) if horizons_seen else None)
+    primary_rows = [
+        item for item in attribution_rows if primary_horizon is not None and item["horizon_minutes"] == primary_horizon
+    ]
+    forward_return_horizons = {
+        str(horizon): _aggregate_records([item for item in attribution_rows if item["horizon_minutes"] == horizon])
+        for horizon in sorted(horizons_seen)
+    }
+    family_leg_outcomes = _aggregate_labeled(primary_rows, "family_leg")
+    direction_outcomes = _aggregate_labeled(primary_rows, "direction")
+    holding_horizon_bucket_outcomes = _aggregate_labeled(attribution_rows, "holding_horizon_bucket")
+    quote_age_outcomes = _aggregate_labeled(primary_rows, "quote_age_bucket")
+    primary_cost_summary = _aggregate_records(primary_rows)
+    family_leg_primary_map = {row["family_leg"]: row for row in family_leg_outcomes}
+    mature_family_legs = {
+        label: row for label, row in family_leg_primary_map.items() if row.get("count", 0) >= MIN_HYPOTHESIS_SAMPLE_COUNT
+    }
+    cost_drag_legs = sorted(
+        label
+        for label, row in mature_family_legs.items()
+        if row.get("avg_net_pnl_bps") is not None
+        and row.get("avg_net_pnl_bps") < 0.0
+        and row.get("avg_gross_return_bps") is not None
+        and row.get("avg_gross_return_bps") >= 0.0
+    )
+    cost_drag_status = "insufficient_evidence"
+    if primary_cost_summary.get("count", 0) >= MIN_HYPOTHESIS_SAMPLE_COUNT:
+        cost_drag_status = "confirmed" if cost_drag_legs else "rejected"
+    fresh_primary = next((row for row in quote_age_outcomes if row["quote_age_bucket"] == "fresh_le_15m"), {})
+    stale_primary = next((row for row in quote_age_outcomes if row["quote_age_bucket"] == "stale_gt_60m"), {})
+    stale_proxy_status = "insufficient_evidence"
+    stale_negative_share = None
+    negative_primary = [item for item in primary_rows if item.get("net_pnl_bps") is not None and item["net_pnl_bps"] < 0.0]
+    if negative_primary:
+        stale_negative_share = round(
+            sum(1 for item in negative_primary if item.get("quote_age_bucket") == "stale_gt_60m") / len(negative_primary),
+            3,
+        )
+    if fresh_primary.get("count", 0) >= 4 and stale_primary.get("count", 0) >= 4:
+        fresh_avg = fresh_primary.get("avg_net_pnl_bps")
+        stale_avg = stale_primary.get("avg_net_pnl_bps")
+        stale_proxy_status = (
+            "confirmed"
+            if fresh_avg is not None
+            and stale_avg is not None
+            and stale_avg < 0.0
+            and stale_avg + 6.0 <= fresh_avg
+            else "rejected"
+        )
+    adjacent_horizons = []
+    if primary_horizon is not None:
+        adjacent_horizons = [
+            horizon
+            for horizon in sorted(horizons_seen, key=lambda value: (abs(value - primary_horizon), value))
+            if horizon != primary_horizon
+        ][:2]
+    adjacent_metrics = {
+        str(horizon): forward_return_horizons[str(horizon)]
+        for horizon in adjacent_horizons
+        if str(horizon) in forward_return_horizons
+    }
+    baseline_primary_avg = primary_cost_summary.get("avg_net_pnl_bps")
+    best_adjacent = None
+    for horizon in adjacent_horizons:
+        metrics = forward_return_horizons.get(str(horizon)) or {}
+        if metrics.get("count", 0) < 4 or metrics.get("avg_net_pnl_bps") is None:
+            continue
+        if best_adjacent is None or metrics["avg_net_pnl_bps"] > best_adjacent["avg_net_pnl_bps"]:
+            best_adjacent = {"horizon_minutes": horizon, **metrics}
+    sign_mismatch = bool(
+        inverted_metrics.get("count", 0) >= 12
+        and baseline_primary_avg is not None
+        and inverted_metrics.get("avg_pnl_bps") is not None
+        and baseline_primary_avg < 0.0
+        and inverted_metrics["avg_pnl_bps"] > 0.0
+        and inverted_metrics["avg_pnl_bps"] - baseline_primary_avg >= 6.0
+    )
+    horizon_mismatch = bool(
+        best_adjacent
+        and baseline_primary_avg is not None
+        and baseline_primary_avg < 0.0
+        and best_adjacent["avg_net_pnl_bps"] is not None
+        and best_adjacent["avg_net_pnl_bps"] > 0.0
+        and best_adjacent["avg_net_pnl_bps"] - baseline_primary_avg >= 6.0
+    )
+    mismatch_status = "insufficient_evidence"
+    if primary_cost_summary.get("count", 0) >= MIN_HYPOTHESIS_SAMPLE_COUNT:
+        mismatch_status = "confirmed" if (sign_mismatch or horizon_mismatch) else "rejected"
+    hypothesis_tests = [
+        {
+            "hypothesis": "cost_drag",
+            "status": cost_drag_status,
+            "summary": "Net losses disappear in gross terms, implying cost drag.",
+            "primary_horizon_minutes": primary_horizon,
+            "avg_net_pnl_bps": primary_cost_summary.get("avg_net_pnl_bps"),
+            "avg_gross_return_bps": primary_cost_summary.get("avg_gross_return_bps"),
+            "avg_total_realized_cost_bps": primary_cost_summary.get("avg_total_realized_cost_bps"),
+            "affected_family_legs": cost_drag_legs,
+        },
+        {
+            "hypothesis": "stale_proxy_data",
+            "status": stale_proxy_status,
+            "summary": "Losses concentrate when quote age is high.",
+            "primary_horizon_minutes": primary_horizon,
+            "fresh_bucket": fresh_primary,
+            "stale_bucket": stale_primary,
+            "stale_negative_share": stale_negative_share,
+        },
+        {
+            "hypothesis": "horizon_or_sign_mismatch",
+            "status": mismatch_status,
+            "summary": "Adverse outcomes are specific to the current horizon or sign, not nearby alternatives.",
+            "primary_horizon_minutes": primary_horizon,
+            "baseline_primary": primary_cost_summary,
+            "direction_flip_60m": inverted_metrics,
+            "adjacent_horizons": adjacent_metrics,
+            "sign_mismatch": sign_mismatch,
+            "horizon_mismatch": horizon_mismatch,
+        },
+    ]
+    leading_hypothesis = next(
+        (item["hypothesis"] for item in hypothesis_tests if item["status"] == "confirmed"),
+        "broad_negative_edge_without_single_diagnostic_driver",
+    )
     report = {
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "paper_only": True,
@@ -193,6 +554,17 @@ def build_report(conn: sqlite3.Connection) -> dict:
             },
         },
         "timing_metadata_coverage": timing_coverage,
+        "diagnostic_attribution": {
+            "primary_horizon_minutes": primary_horizon,
+            "forward_return_horizons": forward_return_horizons,
+            "cost_summary": primary_cost_summary,
+            "family_leg_outcomes": family_leg_outcomes,
+            "direction_outcomes": direction_outcomes,
+            "holding_horizon_bucket_outcomes": holding_horizon_bucket_outcomes,
+            "quote_age_outcomes": quote_age_outcomes,
+            "hypothesis_tests": hypothesis_tests,
+            "leading_hypothesis": leading_hypothesis,
+        },
         "shadow_recommendations": recommendations,
         "decision": "shadow_candidate_available" if recommendations else "diagnose_only_no_positive_counterfactual",
         "hard_limits": [
@@ -221,6 +593,19 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Direction flip at 60m: `{report.get('counterfactuals', {}).get('direction_flip_60m', {})}`")
     for label, metrics in report.get("counterfactuals", {}).get("freshness_gates_60m", {}).items():
         lines.append(f"- Freshness `{label}`: `{metrics}`")
+    attribution = report.get("diagnostic_attribution") or {}
+    lines.extend(["", "## Diagnostic Attribution", ""])
+    lines.append(f"- Primary horizon: `{attribution.get('primary_horizon_minutes')}`")
+    lines.append(f"- Leading hypothesis: `{attribution.get('leading_hypothesis')}`")
+    lines.append(f"- Primary cost summary: `{attribution.get('cost_summary', {})}`")
+    lines.append(f"- Family leg outcomes: `{attribution.get('family_leg_outcomes', [])}`")
+    lines.append(f"- Direction outcomes: `{attribution.get('direction_outcomes', [])}`")
+    lines.append(f"- Holding horizon buckets: `{attribution.get('holding_horizon_bucket_outcomes', [])}`")
+    lines.append(f"- Quote age buckets: `{attribution.get('quote_age_outcomes', [])}`")
+    for test in attribution.get("hypothesis_tests", []):
+        lines.append(
+            f"- Hypothesis `{test.get('hypothesis')}` status=`{test.get('status')}` details=`{test}`"
+        )
     lines.extend(["", "## Shadow Recommendations", ""])
     recommendations = report.get("shadow_recommendations", [])
     if not recommendations:
