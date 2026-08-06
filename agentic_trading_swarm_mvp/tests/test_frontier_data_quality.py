@@ -381,6 +381,71 @@ class QualityPersistenceTests(unittest.TestCase):
 
 
 class EnrichmentSelectionTests(unittest.TestCase):
+    def test_zero_quality_venue_probe_reserve_is_bounded_and_excludes_bad_preliminary_data(self) -> None:
+        conn = memory_conn()
+        cfg = settings()
+        cfg["frontier_data_quality"].update(
+            {
+                "max_symbols_per_cycle": 12,
+                "max_symbols_per_venue": 12,
+                "quality_target_escalation_enabled": False,
+                "unknown_quality_reserve_per_cycle": 0,
+                "regional_reserve_per_cycle": 0,
+                "exploit_variant_reserve_per_cycle": 0,
+                "zero_quality_venue_probe_reserve_per_cycle": 24,
+                "zero_quality_venue_probe_per_venue": 6,
+                "zero_quality_venue_probe_min_observation_count": 10,
+                "zero_quality_venue_probe_max_known_quality_count": 1,
+                "zero_quality_venue_probe_max_spread_bps": 50.0,
+            }
+        )
+        observations = []
+        for venue, volume in (("BITSO", 10_000.0), ("KRAKEN", 5_000.0), ("GATE", 50_000.0)):
+            for index in range(10):
+                row = observation()
+                row.update(
+                    {
+                        "venue": venue,
+                        "instrument_id": f"{venue}:Q{index}_USDT",
+                        "symbol": f"Q{index}_USDT",
+                        "quote_volume_24h": volume - index,
+                    }
+                )
+                observations.append(row)
+        observations[0]["data_status"] = "unreachable"
+        observations[1]["spread_bps"] = 51.0
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        for index, status in enumerate(("verified", "degraded")):
+            conn.execute(
+                """
+                insert into frontier_quality_snapshots (
+                    bucket_at, observed_at, venue, inst_id, quality_status,
+                    quality_score, latency_ms, freshness_age_seconds, spread_bps,
+                    bid_depth_10bps_usd, ask_depth_10bps_usd,
+                    buy_slippage_1000_bps, sell_slippage_1000_bps,
+                    anomaly_json, metrics_json
+                ) values (?, ?, 'GATE', ?, ?, 80, 10, 1, 2, 1000, 1000, 0, 0, '[]', '{}')
+                """,
+                (f"2026-06-30T00:{index:02d}:00+00:00", now, f"GATE:KNOWN{index}", status),
+            )
+        conn.commit()
+
+        selected = quality.select_enrichment_observations(conn, observations, [], {}, cfg)
+
+        probes = [row for row in selected if row["depth_selection_reason"] == "zero_quality_venue_probe"]
+        probe_counts = collections.Counter(row["venue"] for row in probes)
+        self.assertEqual(len(selected), 12)
+        self.assertEqual(len(probes), 12)
+        self.assertEqual(probe_counts, {"BITSO": 6, "KRAKEN": 6})
+        self.assertNotIn("BITSO:Q0_USDT", {row["instrument_id"] for row in probes})
+        self.assertNotIn("BITSO:Q1_USDT", {row["instrument_id"] for row in probes})
+        self.assertEqual(probes[0]["instrument_id"], "BITSO:Q2_USDT")
+        self.assertTrue(all(row["depth_selection_bucket"] == "zero_quality_venue_probe" for row in probes))
+        report = probes[0]["depth_selection_zero_quality_venue_probe_report"]
+        self.assertEqual(report["BITSO"]["known_quality_count"], 0)
+        self.assertEqual(report["BITSO"]["selected_this_cycle"], 6)
+        self.assertNotIn("GATE", report)
+
     def test_adaptive_selection_prefers_less_sampled_regional_instruments(self) -> None:
         conn = memory_conn()
         cfg = settings()

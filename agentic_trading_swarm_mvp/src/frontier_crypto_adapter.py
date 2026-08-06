@@ -11717,6 +11717,7 @@ def summarize(
         "known_quality_rate_target_progress": round(min(1.0, known_quality_rate / known_quality_target), 4),
         "quality_target_escalation": depth_summary.get("selection_escalation", {}),
         "depth_selection_buckets": depth_summary.get("selection_bucket_counts", {}),
+        "zero_quality_venue_probe": depth_summary.get("zero_quality_venue_probe", {}),
         "market_testing_progress": depth_summary.get("market_testing_progress", {}),
         "selected_by_venue": depth_summary.get("selected_by_venue", {}),
         "starved_selected_by_venue": depth_summary.get("starved_selected_by_venue", {}),
@@ -12081,6 +12082,7 @@ def _markdown(report: dict) -> str:
     lines.append(f"- Depth selected rate: `{expansion.get('depth_selected_rate')}`")
     lines.append(f"- Depth enriched rate: `{expansion.get('depth_enriched_rate')}`")
     lines.append(f"- Depth selection buckets: `{expansion.get('depth_selection_buckets', {})}`")
+    lines.append(f"- Zero-quality venue probes: `{expansion.get('zero_quality_venue_probe', {})}`")
     lines.append(f"- Markets tested: `{expansion.get('market_testing_progress', {})}`")
     lines.append(f"- Selected by venue: `{expansion.get('selected_by_venue', {})}`")
     lines.append(f"- Venue quota report: `{expansion.get('venue_quota_report', {})}`")

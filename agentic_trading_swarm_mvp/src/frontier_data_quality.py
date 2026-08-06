@@ -4843,6 +4843,54 @@ def _venue_count(counts: collections.Counter[str], venue: str) -> int:
     return sum(count for key, count in counts.items() if str(key).upper() == venue_upper)
 
 
+def _zero_quality_venue_probe_coverage(
+    conn: sqlite3.Connection,
+    observations: list[dict],
+    min_observation_count: int,
+    max_known_quality_count: int,
+) -> dict[str, dict]:
+    """Return frontier venues whose historical depth coverage is near zero."""
+
+    observation_counts: collections.Counter[str] = collections.Counter(
+        str(row.get("venue") or "unknown").upper()
+        for row in observations
+        if row.get("instrument_id")
+    )
+    try:
+        rows = conn.execute(
+            """
+            select upper(venue) as venue, count(distinct inst_id) as known_quality_count
+            from frontier_quality_snapshots
+            where quality_status in ('verified', 'degraded')
+            group by upper(venue)
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    known_counts = {
+        str(row["venue"] or "unknown").upper(): int(row["known_quality_count"] or 0)
+        for row in rows
+    }
+    return {
+        venue: {
+            "observation_count": int(observation_count),
+            "known_quality_count": int(known_counts.get(venue, 0)),
+            "eligible": True,
+        }
+        for venue, observation_count in sorted(observation_counts.items())
+        if observation_count >= min_observation_count
+        and int(known_counts.get(venue, 0)) <= max_known_quality_count
+    }
+
+
+def _has_sane_preliminary_spread(row: dict, max_spread_bps: float) -> bool:
+    try:
+        spread_bps = float(row.get("spread_bps"))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(spread_bps) and 0.0 <= spread_bps <= max_spread_bps
+
+
 def _selection_quota_report(
     observations: list[dict],
     selected: list[dict],
@@ -4987,6 +5035,23 @@ def select_enrichment_observations(
     unknown_reserve = int(cfg.get("unknown_quality_reserve_per_cycle", 30))
     regional_reserve = int(cfg.get("regional_reserve_per_cycle", 25))
     exploit_variant_reserve = int(cfg.get("exploit_variant_reserve_per_cycle", 25))
+    zero_quality_probe_reserve = max(
+        0, int(cfg.get("zero_quality_venue_probe_reserve_per_cycle", 24) or 0)
+    )
+    zero_quality_probe_per_venue = max(
+        0, int(cfg.get("zero_quality_venue_probe_per_venue", 6) or 0)
+    )
+    zero_quality_probe_min_observations = max(
+        1, int(cfg.get("zero_quality_venue_probe_min_observation_count", 10) or 0)
+    )
+    zero_quality_probe_max_known = max(
+        0, int(cfg.get("zero_quality_venue_probe_max_known_quality_count", 1) or 0)
+    )
+    zero_quality_probe_max_spread_bps = float(
+        cfg.get("zero_quality_venue_probe_max_spread_bps", 50.0) or 0.0
+    )
+    if not math.isfinite(zero_quality_probe_max_spread_bps) or zero_quality_probe_max_spread_bps <= 0.0:
+        zero_quality_probe_max_spread_bps = 50.0
     active_variant_top = int(cfg.get("active_variant_enrichment_top", 10))
     shadow_variant_top = int(cfg.get("shadow_variant_enrichment_top", 2))
     shadow_variant_cap = int(cfg.get("shadow_variant_enrichment_variant_cap", 8))
@@ -5011,8 +5076,15 @@ def select_enrichment_observations(
     selected_ids: set[str] = set()
     venue_counts: collections.Counter[str] = collections.Counter()
 
-    def add_ids(inst_ids: list[str], bucket: str, bucket_limit: int | None = None) -> None:
+    def add_ids(
+        inst_ids: list[str],
+        bucket: str,
+        bucket_limit: int | None = None,
+        bucket_per_venue_limit: int | None = None,
+        selection_reason: str | None = None,
+    ) -> None:
         added = 0
+        bucket_venue_counts: collections.Counter[str] = collections.Counter()
         for inst_id in inst_ids:
             if len(selected) >= max_total:
                 return
@@ -5021,16 +5093,20 @@ def select_enrichment_observations(
             row = by_id.get(str(inst_id))
             if not row or str(inst_id) in selected_ids or row.get("data_status") != "reachable":
                 continue
-            venue = str(row.get("venue"))
+            venue = str(row.get("venue") or "unknown").upper()
             if venue_counts[venue] >= max_per_venue:
+                continue
+            if bucket_per_venue_limit is not None and bucket_venue_counts[venue] >= bucket_per_venue_limit:
                 continue
             output = dict(row)
             output["depth_selection_bucket"] = bucket
+            output["depth_selection_reason"] = selection_reason or bucket
             output["starved_venue"] = venue.upper() in starved_venues
             output["depth_selection_escalation"] = escalation
             selected.append(output)
             selected_ids.add(str(inst_id))
             venue_counts[venue] += 1
+            bucket_venue_counts[venue] += 1
             added += 1
 
     open_rows = conn.execute(
@@ -5042,6 +5118,47 @@ def select_enrichment_observations(
         """
     ).fetchall()
     add_ids([str(row["inst_id"]) for row in open_rows], "open_paper_trade")
+
+    probe_coverage = _zero_quality_venue_probe_coverage(
+        conn,
+        observations,
+        zero_quality_probe_min_observations,
+        zero_quality_probe_max_known,
+    )
+    probe_ranked = sorted(
+        [
+            row
+            for row in observations
+            if row.get("instrument_id")
+            and row.get("data_status") == "reachable"
+            and str(row.get("venue") or "unknown").upper() in probe_coverage
+            and isinstance(row.get("quote_volume_24h"), (int, float))
+            and not isinstance(row.get("quote_volume_24h"), bool)
+            and math.isfinite(float(row["quote_volume_24h"]))
+            and float(row["quote_volume_24h"]) > 0.0
+            and _has_sane_preliminary_spread(row, zero_quality_probe_max_spread_bps)
+        ],
+        key=lambda row: (-float(row["quote_volume_24h"]), str(row.get("instrument_id"))),
+    )
+    add_ids(
+        [str(row["instrument_id"]) for row in probe_ranked],
+        "zero_quality_venue_probe",
+        zero_quality_probe_reserve,
+        zero_quality_probe_per_venue,
+        "zero_quality_venue_probe",
+    )
+    selected_probe_counts = collections.Counter(
+        str(row.get("venue") or "unknown").upper()
+        for row in selected
+        if row.get("depth_selection_reason") == "zero_quality_venue_probe"
+    )
+    zero_quality_probe_report = {
+        venue: {
+            **coverage,
+            "selected_this_cycle": int(selected_probe_counts.get(venue, 0)),
+        }
+        for venue, coverage in probe_coverage.items()
+    }
 
     exploit_keys = _exploit_more_market_keys(conn) | _open_growth_market_keys(conn)
     active = next((item for item in variants if item.get("status") == "active"), None)
@@ -5179,10 +5296,16 @@ def select_enrichment_observations(
         "unknown_quality_reserve_per_cycle": unknown_reserve,
         "regional_reserve_per_cycle": regional_reserve,
         "exploit_variant_reserve_per_cycle": exploit_variant_reserve,
+        "zero_quality_venue_probe_reserve_per_cycle": zero_quality_probe_reserve,
+        "zero_quality_venue_probe_per_venue": zero_quality_probe_per_venue,
+        "zero_quality_venue_probe_min_observation_count": zero_quality_probe_min_observations,
+        "zero_quality_venue_probe_max_known_quality_count": zero_quality_probe_max_known,
+        "zero_quality_venue_probe_max_spread_bps": zero_quality_probe_max_spread_bps,
     }
     for row in selected:
         row["depth_selection_venue_quota_report"] = quota_report
         row["depth_selection_limits"] = selection_limits
+        row["depth_selection_zero_quality_venue_probe_report"] = zero_quality_probe_report
     return selected
 
 
@@ -5272,6 +5395,12 @@ def enrich_observations(
         for venue, item in (selected[0].get("depth_selection_venue_quota_report", {}) if selected else {}).items()
     }
     selection_limits = selected[0].get("depth_selection_limits", {}) if selected else {}
+    zero_quality_probe_report = {
+        str(venue): dict(item)
+        for venue, item in (
+            selected[0].get("depth_selection_zero_quality_venue_probe_report", {}) if selected else {}
+        ).items()
+    }
     starved_venues = {
         str(venue).upper()
         for venue in cfg.get("starved_venues", [])
@@ -5294,10 +5423,13 @@ def enrich_observations(
     target_venues = {str(venue).upper() for venue in targets}
     result_issues_by_venue: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
     result_quality_by_venue: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
+    probe_quality_by_venue: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
     for row in selected:
         venue = str(row.get("venue") or "unknown").upper()
         quality = results.get(str(row.get("instrument_id"))) or {}
         result_quality_by_venue[venue][str(quality.get("quality_status") or "missing")] += 1
+        if row.get("depth_selection_reason") == "zero_quality_venue_probe":
+            probe_quality_by_venue[venue][str(quality.get("quality_status") or "missing")] += 1
         for flag in quality.get("anomaly_flags") or []:
             if str(flag).startswith("depth_") or flag in {"depth_endpoint_not_configured", "depth_result_missing"}:
                 result_issues_by_venue[venue][str(flag)] += 1
@@ -5308,6 +5440,9 @@ def enrich_observations(
         if not item["depth_endpoint_configured"] and item.get("observed_count", 0) > 0:
             item["status"] = "missed"
             item["missed_reason"] = "no_depth_endpoint"
+    for venue, item in zero_quality_probe_report.items():
+        item["selected_quality_status_counts"] = dict(probe_quality_by_venue.get(str(venue).upper(), {}))
+        item["depth_endpoint_configured"] = str(venue).upper() in target_venues
     return enriched, {
         "enabled": True,
         "selected_count": len(selected),
@@ -5320,6 +5455,7 @@ def enrich_observations(
         "worker_count": int(cfg.get("workers", 8)),
         "venue_quota_report": selection_quota_report,
         "selection_bucket_counts": dict(bucket_counts),
+        "zero_quality_venue_probe": zero_quality_probe_report,
         "selected_by_venue": dict(selected_by_venue),
         "starved_venues": sorted(starved_venues),
         "selected_starved_venue_count": sum(
