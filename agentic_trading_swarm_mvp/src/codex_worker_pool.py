@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import pathlib
-import re
 import sqlite3
 import subprocess
 import sys
@@ -28,7 +27,7 @@ from typing import Any
 
 from adapter_implementation_owner import run_once as run_adapter_owner
 from autonomous_builder import run_autonomous_builder
-from code_evolution import process_code_change_recommendation
+from code_evolution import backfill_code_evolution_work_registry, process_code_change_recommendation
 from codex_coordination import (
     ACTIVE_TASK_STATUSES,
     CLAIMABLE_TASK_STATUSES,
@@ -50,18 +49,13 @@ from codex_coordination import (
     requeue_task,
     set_task_work_identity,
 )
+from codex_work_identity import proposal_work_identity
 from evolution.contracts import CandidateRelease
 from evolution.worktree import cleanup_worktree, current_commit, repo_root, run_git, update_champion_latest
 from market_activation_owner import run_once as run_activation_owner
 from self_improvement import run_auto_improvement
 from settings import load_settings
-from storage import (
-    RUNS_DIR,
-    code_evolution_by_status,
-    connect,
-    get_code_evolution_proposal,
-    update_code_evolution_proposal,
-)
+from storage import RUNS_DIR, code_evolution_by_status, connect, get_code_evolution_proposal, update_code_evolution_proposal
 from strategy_implementation_owner import run_once as run_strategy_owner
 
 
@@ -196,92 +190,10 @@ def _proposal_lane(row: dict[str, Any]) -> str:
     return "general"
 
 
-_WORK_STOPWORDS = {
-    "a", "add", "an", "and", "as", "at", "candidate", "candidates", "change",
-    "for", "from", "in", "into", "of", "on", "only", "paper", "spot", "spots",
-    "the", "through", "to", "with", "fill", "fills", "trade", "trades",
-}
-
-
-def _nested(payload: dict[str, Any], key: str) -> Any:
-    if key in payload and payload.get(key) not in (None, ""):
-        return payload.get(key)
-    code_change = payload.get("code_change")
-    if isinstance(code_change, dict) and code_change.get(key) not in (None, ""):
-        return code_change.get(key)
-    return None
-
-
-def _flatten_work_text(value: Any) -> str:
-    if isinstance(value, dict):
-        return " ".join(_flatten_work_text(item) for item in value.values())
-    if isinstance(value, (list, tuple, set)):
-        return " ".join(_flatten_work_text(item) for item in value)
-    return str(value or "")
-
-
-def _normalize_work_tokens(value: Any) -> list[str]:
-    text = _flatten_work_text(value).lower()
-    replacements = (
-        (r"\b(?:cost[-_\s]*(?:swallowed|negative)|non[-_\s]*positive[-_\s]*net[-_\s]*edge|net[-_\s]*edge[-_\s]*(?:after[-_\s]*)?costs?)\b", " net_edge_cost "),
-        (r"\bmean[-_\s]*reversion\b", " mean_reversion "),
-        (r"\b(?:gate|gated|guard|guardrail|shadow|stop|quarantine|exclude|block|filter|cap|tighten)(?:d|ing|s)?\b", " admission_policy "),
-        (r"\b(?:decayed|decaying|decay)\b", " decay "),
-        (r"\b(?:paper[-_\s]*)?(?:filled|fills?|candidates?)\b", " "),
-    )
-    for pattern, replacement in replacements:
-        text = re.sub(pattern, replacement, text)
-    tokens = re.findall(r"[a-z0-9]+(?:_[a-z0-9]+)*", text)
-    normalized = {token for token in tokens if token not in _WORK_STOPWORDS and len(token) > 1}
-    if "okx" in normalized and "basis" in normalized and "decay" in normalized:
-        normalized.difference_update({"basis", "decay", "mean_reversion", "regime"})
-        normalized.add("okx_basis_decay")
-    if "frontier" in normalized and (
-        "net_edge_cost" in normalized or {"cost", "edge"}.issubset(normalized)
-    ):
-        normalized.difference_update({"cost", "edge", "negative", "swallowed", "nonpositive"})
-        normalized.add("frontier_net_edge_cost")
-    return sorted(normalized)
-
-
 def _proposal_work_identity(
     row: dict[str, Any], radar: sqlite3.Connection | None = None
 ) -> tuple[str, str]:
-    """Return a stable, readable identity for semantically equivalent code work."""
-
-    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-    code_change = payload.get("code_change") if isinstance(payload.get("code_change"), dict) else {}
-    proposal_id = str(row.get("proposal_id") or "")
-
-    activation = code_change.get("activation_contract")
-    if isinstance(activation, dict):
-        adapter_id = str(activation.get("adapter_id") or "unknown").lower()
-        surface = str(activation.get("market_surface") or payload.get("market_key") or "unknown").lower()
-        scope = f"market_activation:{adapter_id}:{surface}"
-        return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24], scope
-
-    if radar is not None and proposal_id and _table_exists(radar, "strategy_owner_tasks"):
-        owner = radar.execute(
-            "select task_id from strategy_owner_tasks where code_proposal_id=? limit 1",
-            (proposal_id,),
-        ).fetchone()
-        if owner:
-            scope = f"strategy_owner:{str(owner['task_id']).lower()}"
-            return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24], scope
-
-    adapter_spec_id = _nested(payload, "adapter_spec_id")
-    if adapter_spec_id not in (None, ""):
-        scope = f"adapter_spec:{adapter_spec_id}"
-        return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24], scope
-
-    market_key = str(payload.get("market_key") or payload.get("signal_key") or "").lower()
-    target_tokens = _normalize_work_tokens(market_key)
-    target = "_".join(target_tokens[:10]) or str(row.get("category") or "general").lower()
-    title_tokens = _normalize_work_tokens(row.get("title") or payload.get("title"))
-    if len(title_tokens) < 2:
-        title_tokens = _normalize_work_tokens(payload.get("proposed_change") or payload.get("rationale"))[:12]
-    scope = f"semantic:{target}:{'_'.join(title_tokens[:14]) or 'unspecified'}"
-    return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24], scope
+    return proposal_work_identity(row, radar)
 
 
 def _owner_work_identity(source_kind: str, row: sqlite3.Row) -> tuple[str, str]:
@@ -467,6 +379,7 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
 
     cfg = _cfg(settings)
     reconciliation = _reconcile_promoted_commits(radar, coord, settings)
+    registry_backfill = backfill_code_evolution_work_registry(radar)
     identities_backfilled = _backfill_work_identities(radar, coord)
     queued: list[dict[str, Any]] = []
     duplicate_proposals: list[dict[str, Any]] = []
@@ -623,6 +536,7 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
             "checked_at": _utc_now(),
             "queued_or_refreshed": len(queued),
             "identities_backfilled": identities_backfilled,
+            "work_registry_backfill": registry_backfill,
             "duplicates_suppressed": len(duplicate_proposals),
         },
     )
@@ -630,6 +544,7 @@ def sync_available_work(radar: sqlite3.Connection, coord: sqlite3.Connection, se
         "queued_or_refreshed": len(queued),
         "tasks": queued,
         "identities_backfilled": identities_backfilled,
+        "work_registry_backfill": registry_backfill,
         "duplicates_suppressed": len(duplicate_proposals),
         "duplicate_tasks": duplicate_proposals[:50],
         "promotion_reconciliation": reconciliation,
@@ -640,9 +555,13 @@ def _worker_settings(
     settings: dict,
     worker_id: str,
     coordination_context: dict[str, Any] | None = None,
+    *,
+    execute_code_changes: bool = False,
 ) -> dict:
     output = copy.deepcopy(settings)
-    output["_codex_worker_execute"] = True
+    # Owner lanes may create durable proposals, but only a claimed proposal task
+    # may start paid repository implementation.
+    output["_codex_worker_execute"] = bool(execute_code_changes)
     output["_codex_worker_id"] = worker_id
     output.setdefault("codex_repo_agent", {})["parallel_sessions_enabled"] = True
     output["codex_repo_agent"]["coordination_context"] = coordination_context or {}
@@ -685,6 +604,7 @@ def _run_code_proposal(radar: sqlite3.Connection, task: dict, settings: dict) ->
     if coordination_context:
         proposal_payload["coordination_context"] = coordination_context
     rec = {
+        "proposal_id": proposal_id,
         "recommendation_id": row.get("source_recommendation_id") or f"coordination:{proposal_id}",
         "title": row.get("title"),
         "priority": row.get("priority"),
@@ -792,7 +712,13 @@ def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
     try:
         result = _dispatch(
             task,
-            _worker_settings(settings, worker_id, task.get("coordination_context")),
+            _worker_settings(
+                settings,
+                worker_id,
+                task.get("coordination_context"),
+                execute_code_changes=str(task.get("source_kind") or "")
+                == "code_evolution_proposal",
+            ),
         )
         status, proposal_id = _proposal_result(result)
         elapsed = round(time.monotonic() - started, 3)

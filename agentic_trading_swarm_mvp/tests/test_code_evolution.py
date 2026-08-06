@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 
@@ -62,6 +63,109 @@ def settings(**overrides: object) -> dict:
 
 
 class CodeEvolutionGovernorTests(unittest.TestCase):
+    def test_work_registry_atomic_claim_has_exactly_one_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = pathlib.Path(tmp) / "radar.sqlite"
+            with storage.connect(db) as conn:
+                storage.init_db(conn)
+
+            def claim(proposal_id: str) -> bool:
+                with storage.connect(db, initialize=False) as conn:
+                    result = storage.claim_code_evolution_work(
+                        conn,
+                        proposal_id,
+                        "same-objective-fingerprint",
+                        "same-objective-scope:revision:1",
+                    )
+                    return bool(result["owned"])
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                owners = list(pool.map(claim, ("proposal-a", "proposal-b")))
+            with storage.connect(db, initialize=False) as conn:
+                registry_count = conn.execute("select count(*) from code_evolution_work_registry").fetchone()[0]
+
+        self.assertEqual(1, sum(owners))
+        self.assertEqual(1, registry_count)
+
+    def test_duplicate_objective_is_reserved_before_a_second_model_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "repo"
+            root.mkdir()
+            (root / "README.md").write_text("hello\n", encoding="utf-8")
+            (root / "src").mkdir()
+            (root / "src" / "llm_bridge.py").write_text("# bridge\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "config").mkdir()
+            conn = sqlite3.connect(pathlib.Path(tmp) / "radar.sqlite")
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            first_payload = proposal(
+                "",
+                title="Repair repeated OKX basis decay",
+                expected_files=["src/llm_bridge.py"],
+                change_category="llm_prompt_state_packet",
+                _recommendation_topic_key="topic-okx-basis-decay",
+            )
+            second_payload = proposal(
+                "",
+                title="Quarantine repeated OKX basis decay",
+                expected_files=["src/llm_bridge.py"],
+                change_category="llm_prompt_state_packet",
+                _recommendation_topic_key="topic-okx-basis-decay",
+            )
+            try:
+                with mock.patch.object(
+                    code_evolution,
+                    "generate_patch_with_frontier_model",
+                    return_value=("", {"status": "model_call:responses"}),
+                ) as generate:
+                    first = code_evolution.process_code_change_recommendation(
+                        conn,
+                        {"recommendation_id": "rec-first", "title": first_payload["title"], "payload": first_payload},
+                        settings(generate_patch_when_missing=True),
+                        root=root,
+                    )
+                    second = code_evolution.process_code_change_recommendation(
+                        conn,
+                        {"recommendation_id": "rec-second", "title": second_payload["title"], "payload": second_payload},
+                        settings(generate_patch_when_missing=True),
+                        root=root,
+                    )
+                rows = storage.code_evolution_recent(conn, limit=10)
+            finally:
+                conn.close()
+
+        self.assertEqual(1, generate.call_count)
+        self.assertNotEqual("superseded_duplicate", first[0]["status"])
+        self.assertEqual("superseded_duplicate", second[0]["status"])
+        duplicate = next(row for row in rows if row["status"] == "superseded_duplicate")
+        self.assertTrue(duplicate["canonical_proposal_id"])
+
+    def test_explicit_work_revision_can_follow_a_completed_objective(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = sqlite3.connect(pathlib.Path(tmp) / "radar.sqlite")
+            conn.row_factory = sqlite3.Row
+            storage.init_db(conn)
+            base = proposal("", _recommendation_topic_key="topic-revision", work_revision=1)
+            revised = proposal("", _recommendation_topic_key="topic-revision", work_revision=2)
+            first_id = code_evolution._proposal_id("rec-revision-1", base)
+            second_id = code_evolution._proposal_id("rec-revision-2", revised)
+            for proposal_id, payload in ((first_id, base), (second_id, revised)):
+                fingerprint, scope = code_evolution.proposal_work_identity(
+                    {"proposal_id": proposal_id, "category": "report_dashboard", "title": payload["title"], "payload": payload}
+                )
+                storage.add_code_evolution_proposal(
+                    conn, proposal_id, None, "test", "openai/test", "standard", None,
+                    payload["title"], "report_dashboard", 90, payload, {},
+                    status="proposed", work_fingerprint=fingerprint, work_scope=scope,
+                )
+            summary = code_evolution.backfill_code_evolution_work_registry(conn)
+            registry_count = conn.execute("select count(*) from code_evolution_work_registry").fetchone()[0]
+            conn.close()
+
+        self.assertEqual(2, registry_count)
+        self.assertEqual(0, summary["duplicates_superseded"])
+
     def test_scan_allows_safe_report_patch(self) -> None:
         diff = """diff --git a/README.md b/README.md
 --- a/README.md

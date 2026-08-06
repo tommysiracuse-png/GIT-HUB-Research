@@ -31,6 +31,7 @@ from codex_coordination import (
     release_resource_lease,
 )
 from codex_repo_agent import codex_repo_agent_config, codex_write_lock, run_codex_repo_agent
+from codex_work_identity import proposal_work_identity
 from cost_router import complete, completion_preflight_status
 from evolution.archive import write_candidate_archive
 from evolution.builder_context import build_builder_context, render_builder_context, resolve_repo_targets
@@ -52,10 +53,12 @@ from evolution.worktree import (
 from storage import (
     RUNS_DIR,
     add_code_evolution_proposal,
+    claim_code_evolution_work,
     code_evolution_by_status,
     code_evolution_recent,
     get_code_evolution_proposal,
     link_recommendation_artifact,
+    set_code_evolution_work_identity,
     update_code_evolution_proposal,
 )
 
@@ -1873,6 +1876,30 @@ POOL_SUCCESS_STATUSES = {"promoted_pending_verification", "verified"}
 RELEASE_SUCCESS_STATUSES.update(POOL_SUCCESS_STATUSES)
 SUCCESS_STATUSES = {LEGACY_PROBATION_STATUS, LEGACY_KEPT_STATUS, WORKSPACE_PROBATION_STATUS, WORKSPACE_KEPT_STATUS, *RELEASE_SUCCESS_STATUSES}
 
+WORK_REGISTRY_RETRYABLE_STATUSES = {
+    "proposed",
+    "queued_concurrent_worker",
+    "implementation_paused",
+    "patch_generation_timeout",
+    "patch_generation_failed",
+    "patch_generation_unavailable_retry_later",
+    "blocked_model_quota",
+    "queued_probation_limit",
+    "promotion_overlap_requires_repair",
+    "main_promotion_lease_timeout",
+    "repairing_post_promotion",
+}
+WORK_REGISTRY_ACTIVE_STATUSES = {
+    "claimed",
+    "coding",
+    "focused_tests",
+    "repairing",
+    "candidate_committed",
+    "canary_running",
+    "promoted_pending_verification",
+    "verifying",
+}
+
 
 def _pool_cfg(settings: dict) -> dict[str, Any]:
     return dict(settings.get("codex_worker_pool") or {})
@@ -1884,6 +1911,157 @@ def _pool_enabled(settings: dict) -> bool:
 
 def _pool_worker(settings: dict) -> bool:
     return bool(settings.get("_codex_worker_execute", False))
+
+
+def _canonical_work_rank(row: dict[str, Any]) -> tuple[int, str, str]:
+    status = str(row.get("status") or "")
+    if status in SUCCESS_STATUSES or status == "verified":
+        rank = 0
+    elif row.get("candidate_commit") or status in {
+        "candidate_committed", "canary_running", "promoted_pending_verification", "verifying",
+    }:
+        rank = 1
+    elif status in WORK_REGISTRY_ACTIVE_STATUSES:
+        rank = 2
+    elif status in WORK_REGISTRY_RETRYABLE_STATUSES:
+        rank = 3
+    else:
+        rank = 4
+    return rank, str(row.get("created_at") or row.get("updated_at") or ""), str(row.get("proposal_id") or "")
+
+
+def backfill_code_evolution_work_registry(
+    conn: Any,
+    *,
+    only_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Create durable objective ownership for legacy proposals.
+
+    Successful work wins over retries, then active work, then queued work.  All
+    historical rows remain auditable; only inactive retry duplicates are closed.
+    """
+
+    if not only_fingerprint:
+        pending = conn.execute(
+            """
+            select 1
+            from code_evolution_proposals p
+            left join code_evolution_work_registry r
+              on r.work_fingerprint=p.work_fingerprint
+            where p.work_fingerprint is null or p.work_fingerprint=''
+               or p.canonical_proposal_id is null or r.work_fingerprint is null
+            limit 1
+            """
+        ).fetchone()
+        if pending is None:
+            return {
+                "groups": 0,
+                "registered": 0,
+                "identities_updated": 0,
+                "duplicates_superseded": 0,
+                "duplicates": [],
+                "already_complete": True,
+            }
+    raw_rows = conn.execute(
+        """
+        select proposal_id,created_at,updated_at,title,category,status,payload_json,
+               evaluation_json,candidate_commit,work_fingerprint,work_scope,
+               canonical_proposal_id
+        from code_evolution_proposals
+        order by updated_at desc
+        """
+    ).fetchall()
+    rows: list[dict[str, Any]] = []
+    for raw_row in raw_rows:
+        row = dict(raw_row)
+        try:
+            row["payload"] = json.loads(row.pop("payload_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            row["payload"] = {}
+        try:
+            row["evaluation"] = json.loads(row.pop("evaluation_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            row["evaluation"] = {}
+        rows.append(row)
+    groups: dict[str, list[tuple[dict[str, Any], str]]] = {}
+    identities_updated = 0
+    for row in rows:
+        fingerprint, scope = proposal_work_identity(row, conn)
+        if only_fingerprint and fingerprint != only_fingerprint:
+            continue
+        groups.setdefault(fingerprint, []).append((row, scope))
+        if row.get("work_fingerprint") != fingerprint or row.get("work_scope") != scope:
+            identities_updated += 1
+
+    registered = 0
+    superseded: list[dict[str, str]] = []
+    for fingerprint, members in groups.items():
+        canonical_row, canonical_scope = min(members, key=lambda item: _canonical_work_rank(item[0]))
+        reservation_row = conn.execute(
+            "select * from code_evolution_work_registry where work_fingerprint=?",
+            (fingerprint,),
+        ).fetchone()
+        if reservation_row is None:
+            reservation = claim_code_evolution_work(
+                conn,
+                str(canonical_row["proposal_id"]),
+                fingerprint,
+                canonical_scope,
+                status=str(canonical_row.get("status") or "reserved"),
+            )
+            registered += 1
+        else:
+            reservation = {**dict(reservation_row), "owned": False}
+        canonical_id = str(reservation["canonical_proposal_id"])
+        for row, scope in members:
+            proposal_id = str(row["proposal_id"])
+            if (
+                row.get("work_fingerprint") != fingerprint
+                or row.get("work_scope") != scope
+                or row.get("canonical_proposal_id") != canonical_id
+            ):
+                conn.execute(
+                    """
+                    update code_evolution_proposals
+                    set work_fingerprint=?, work_scope=?, canonical_proposal_id=?, updated_at=updated_at
+                    where proposal_id=?
+                    """,
+                    (fingerprint, scope, canonical_id, proposal_id),
+                )
+            if proposal_id == canonical_id or str(row.get("status") or "") not in WORK_REGISTRY_RETRYABLE_STATUSES:
+                continue
+            evaluation = dict(row.get("evaluation") or {})
+            evaluation["deduplication"] = {
+                "at": _utc_now(),
+                "reason": "historical_work_registry_backfill",
+                "work_fingerprint": fingerprint,
+                "work_scope": scope,
+                "canonical_proposal_id": canonical_id,
+            }
+            conn.execute(
+                """
+                update code_evolution_proposals
+                set status='superseded_duplicate', canonical_proposal_id=?,
+                    evaluation_json=?, updated_at=?
+                where proposal_id=?
+                """,
+                (canonical_id, json.dumps(evaluation, sort_keys=True), _utc_now(), proposal_id),
+            )
+            superseded.append(
+                {
+                    "proposal_id": proposal_id,
+                    "canonical_proposal_id": canonical_id,
+                    "work_fingerprint": fingerprint,
+                }
+            )
+        conn.commit()
+    return {
+        "groups": len(groups),
+        "registered": registered,
+        "identities_updated": identities_updated,
+        "duplicates_superseded": len(superseded),
+        "duplicates": superseded[:100],
+    }
 
 
 def _coordination_db_path(settings: dict) -> pathlib.Path:
@@ -1911,7 +2089,21 @@ def enqueue_code_evolution_work(
     priority: int,
     category: str,
     reactivate_terminal: bool = True,
+    work_fingerprint: str | None = None,
+    work_scope: str | None = None,
 ) -> dict[str, Any]:
+    fingerprint, scope = (
+        (work_fingerprint, work_scope)
+        if work_fingerprint and work_scope
+        else proposal_work_identity(
+            {
+                "proposal_id": proposal_id,
+                "category": category,
+                "title": payload.get("title"),
+                "payload": payload,
+            }
+        )
+    )
     with closing(connect_coordination(_coordination_db_path(settings))) as coordination:
         return enqueue_coordination_task(
             coordination,
@@ -1919,8 +2111,15 @@ def enqueue_code_evolution_work(
             proposal_id,
             lane=_proposal_lane(payload, category),
             priority=int(priority),
-            payload={"proposal_id": proposal_id, "category": category, "title": payload.get("title")},
+            payload={
+                "proposal_id": proposal_id,
+                "category": category,
+                "title": payload.get("title"),
+                "work_scope": scope,
+            },
             reactivate_terminal=reactivate_terminal,
+            work_fingerprint=fingerprint,
+            work_scope=scope,
         )
 
 
@@ -5683,8 +5882,83 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
     priority = int(payload.get("priority", rec.get("priority", 50)) or 50)
     title = str(payload.get("title") or rec.get("title") or "LLM code evolution proposal")[:180]
     evidence = _proposal_evidence(payload)
-    proposal_id = _proposal_id(rec.get("recommendation_id"), payload)
+    proposal_id = str(rec.get("proposal_id") or _proposal_id(rec.get("recommendation_id"), payload))
+    work_fingerprint, work_scope = proposal_work_identity(
+        {
+            "proposal_id": proposal_id,
+            "category": category or "unknown",
+            "title": title,
+            "payload": payload,
+        },
+        conn,
+    )
+    payload["_work_fingerprint"] = work_fingerprint
+    payload["_work_scope"] = work_scope
     existing = get_code_evolution_proposal(conn, proposal_id)
+    if not existing:
+        add_code_evolution_proposal(
+            conn,
+            proposal_id,
+            rec.get("recommendation_id"),
+            payload.get("agent_name"),
+            _model_name(payload),
+            _model_tier(payload),
+            _frontier_reason(payload),
+            title,
+            category or "unknown",
+            priority,
+            payload,
+            evidence,
+            work_fingerprint=work_fingerprint,
+            work_scope=work_scope,
+        )
+        existing = get_code_evolution_proposal(conn, proposal_id)
+    else:
+        set_code_evolution_work_identity(
+            conn,
+            proposal_id,
+            work_fingerprint=work_fingerprint,
+            work_scope=work_scope,
+        )
+
+    backfill_code_evolution_work_registry(conn, only_fingerprint=work_fingerprint)
+    reservation = claim_code_evolution_work(
+        conn,
+        proposal_id,
+        work_fingerprint,
+        work_scope,
+        status=str((existing or {}).get("status") or "reserved"),
+    )
+    if not reservation["owned"]:
+        canonical_proposal_id = str(reservation["canonical_proposal_id"])
+        update_code_evolution_proposal(
+            conn,
+            proposal_id,
+            status="superseded_duplicate",
+            canonical_proposal_id=canonical_proposal_id,
+            evaluation={
+                **dict((existing or {}).get("evaluation") or {}),
+                "deduplication": {
+                    "at": _utc_now(),
+                    "reason": "canonical_work_already_reserved",
+                    "work_fingerprint": work_fingerprint,
+                    "work_scope": work_scope,
+                    "canonical_proposal_id": canonical_proposal_id,
+                },
+            },
+        )
+        link_recommendation_artifact(
+            conn,
+            rec.get("recommendation_id"),
+            "code_evolution_proposal",
+            canonical_proposal_id,
+            "deduplicated_into",
+            {"work_fingerprint": work_fingerprint, "work_scope": work_scope},
+        )
+        conn.commit()
+        _append_ledger(conn, proposal_id, "superseded_duplicate")
+        return [_artifact(proposal_id, "already_exists", "superseded_duplicate")]
+
     if existing and str(existing.get("status") or "") in SUCCESS_STATUSES:
         link_recommendation_artifact(
             conn,
@@ -5699,20 +5973,17 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
         )
         conn.commit()
         return [_artifact(proposal_id, "already_exists", str(existing.get("status")))]
-    add_code_evolution_proposal(
-        conn,
-        proposal_id,
-        rec.get("recommendation_id"),
-        payload.get("agent_name"),
-        _model_name(payload),
-        _model_tier(payload),
-        _frontier_reason(payload),
-        title,
-        category or "unknown",
-        priority,
-        payload,
-        evidence,
-    )
+    if existing and str(existing.get("status") or "") not in WORK_REGISTRY_RETRYABLE_STATUSES:
+        link_recommendation_artifact(
+            conn,
+            rec.get("recommendation_id"),
+            "code_evolution_proposal",
+            proposal_id,
+            "already_materialized_as",
+            {"status": existing.get("status"), "work_fingerprint": work_fingerprint},
+        )
+        conn.commit()
+        return [_artifact(proposal_id, "already_exists", str(existing.get("status") or "terminal"))]
     link_recommendation_artifact(
         conn,
         rec.get("recommendation_id"),
@@ -5740,6 +6011,8 @@ def process_code_change_recommendation(conn: Any, rec: dict, settings: dict, roo
             settings,
             priority=priority,
             category=category or "unknown",
+            work_fingerprint=work_fingerprint,
+            work_scope=work_scope,
         )
         update_code_evolution_proposal(
             conn,

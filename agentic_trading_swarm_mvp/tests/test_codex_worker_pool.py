@@ -52,12 +52,16 @@ class CodexWorkerPoolTests(unittest.TestCase):
         configured = codex_worker_pool._worker_settings(
             self.settings, "strategy-codex", peer_context
         )
-        self.assertTrue(configured["_codex_worker_execute"])
+        self.assertFalse(configured["_codex_worker_execute"])
         self.assertEqual("strategy-codex", configured["_codex_worker_id"])
         self.assertFalse(configured["code_evolution"]["run_full_regression"])
         self.assertTrue(configured["codex_repo_agent"]["parallel_sessions_enabled"])
         self.assertEqual(peer_context, configured["codex_repo_agent"]["coordination_context"])
         self.assertTrue(self.settings["code_evolution"]["run_full_regression"])
+        proposal_worker = codex_worker_pool._worker_settings(
+            self.settings, "strategy-codex", peer_context, execute_code_changes=True
+        )
+        self.assertTrue(proposal_worker["_codex_worker_execute"])
 
     def test_semantic_work_identity_collapses_action_word_variants(self) -> None:
         base = {
@@ -88,6 +92,58 @@ class CodexWorkerPoolTests(unittest.TestCase):
             "payload": {"adapter_spec_id": 102},
         })
         self.assertNotEqual(first[0], second[0])
+
+    def test_explicit_revision_is_the_only_new_identity_for_same_topic(self) -> None:
+        base = {
+            "category": "paper_scoring_logic",
+            "title": "Repair OKX basis decay",
+            "payload": {"_recommendation_topic_key": "okx-basis-decay"},
+        }
+        first = codex_worker_pool._proposal_work_identity(base)
+        repeated = codex_worker_pool._proposal_work_identity({**base, "title": "Quarantine OKX basis decay"})
+        revised = codex_worker_pool._proposal_work_identity(
+            {**base, "payload": {"_recommendation_topic_key": "okx-basis-decay", "work_revision": 2}}
+        )
+
+        self.assertEqual(first[0], repeated[0])
+        self.assertNotEqual(first[0], revised[0])
+
+    def test_strategy_owner_identity_exists_before_proposal_is_linked_back(self) -> None:
+        identity = codex_worker_pool._proposal_work_identity(
+            {
+                "category": "strategy_lab_promotion",
+                "title": "Implement a strategy",
+                "payload": {"evidence": {"strategy_owner_task_id": "strategy-task-123"}},
+            }
+        )
+
+        self.assertEqual("strategy_owner:strategy-task-123:revision:1", identity[1])
+
+    def test_registry_backfill_prefers_promoted_work_and_closes_only_retry_duplicates(self) -> None:
+        with closing(self._radar_connect()) as radar:
+            for proposal_id, status in (
+                ("proposal-old-promoted", "promoted"),
+                ("proposal-paused-duplicate", "implementation_paused"),
+                ("proposal-historical-failure", "discarded_test_failure"),
+            ):
+                storage.add_code_evolution_proposal(
+                    radar, proposal_id, None, "red_team", "openai/test", "standard", None,
+                    "Paper-quarantine OKX basis mean-reversion decay", "paper_scoring_logic", 94,
+                    {"title": "Paper-quarantine OKX basis mean-reversion decay", "market_key": "OKX|perp_funding_basis"},
+                    {}, status=status,
+                )
+            summary = codex_worker_pool.backfill_code_evolution_work_registry(radar)
+            rows = {
+                row["proposal_id"]: row
+                for row in storage.code_evolution_recent(radar, limit=10)
+            }
+            registry = radar.execute("select * from code_evolution_work_registry").fetchone()
+
+        self.assertEqual("proposal-old-promoted", registry["canonical_proposal_id"])
+        self.assertEqual("superseded_duplicate", rows["proposal-paused-duplicate"]["status"])
+        self.assertEqual("discarded_test_failure", rows["proposal-historical-failure"]["status"])
+        self.assertEqual("proposal-old-promoted", rows["proposal-paused-duplicate"]["canonical_proposal_id"])
+        self.assertEqual(1, summary["duplicates_superseded"])
 
     def test_legacy_adapter_owner_task_receives_canonical_work_identity(self) -> None:
         with closing(self._radar_connect()) as radar:
@@ -152,10 +208,11 @@ class CodexWorkerPoolTests(unittest.TestCase):
                 for proposal_id in ("proposal-cost-a", "proposal-cost-b")
             }
 
-        self.assertEqual(1, result["duplicates_suppressed"])
+        self.assertEqual(1, result["work_registry_backfill"]["duplicates_superseded"])
         self.assertIsNotNone(claim)
         self.assertIsNone(second_claim)
-        self.assertEqual(1, list(statuses.values()).count("superseded_duplicate"))
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(0, list(statuses.values()).count("superseded_duplicate"))
         self.assertEqual(1, list(proposal_statuses.values()).count("superseded_duplicate"))
 
     def test_sync_migrates_paused_proposal_to_preferred_lane(self) -> None:
@@ -201,6 +258,29 @@ class CodexWorkerPoolTests(unittest.TestCase):
         self.assertEqual("promoted_pending_verification", result["status"])
         self.assertEqual("promoted_pending_verification", saved[0])
         self.assertEqual("queued", verification[0])
+
+    def test_worker_peer_context_does_not_rehash_the_stored_proposal_id(self) -> None:
+        with closing(self._radar_connect()) as radar:
+            storage.add_code_evolution_proposal(
+                radar, "stable-proposal-id", "source-rec", "test", "openai/test", "standard", None,
+                "Stable queued work", "runtime_pipeline_integration", 90,
+                {"title": "Stable queued work"}, {}, status="proposed",
+            )
+            task = {
+                "source_id": "stable-proposal-id",
+                "payload": {"proposal_id": "stable-proposal-id"},
+            }
+            worker_settings = {
+                "codex_repo_agent": {
+                    "coordination_context": {"active_peer_work": [{"work_scope": "peer-work"}]}
+                }
+            }
+            with mock.patch.object(codex_worker_pool, "process_code_change_recommendation", return_value=[]) as process:
+                codex_worker_pool._run_code_proposal(radar, task, worker_settings)
+
+        submitted = process.call_args.args[1]
+        self.assertEqual("stable-proposal-id", submitted["proposal_id"])
+        self.assertIn("coordination_context", submitted["payload"])
 
     def test_failed_async_verification_keeps_code_active_and_requeues_same_task(self) -> None:
         worktree = self.root / "candidate"

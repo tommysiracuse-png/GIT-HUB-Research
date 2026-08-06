@@ -768,7 +768,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             canary_json text not null default '{}',
             promotion_reason text,
             applied_at text,
-            probation_loops_observed integer not null default 0
+            probation_loops_observed integer not null default 0,
+            work_fingerprint text,
+            work_scope text,
+            canonical_proposal_id text
         )
         """
     )
@@ -778,6 +781,30 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "code_evolution_proposals", "worktree_path", "text")
     _ensure_column(conn, "code_evolution_proposals", "canary_json", "text not null default '{}'")
     _ensure_column(conn, "code_evolution_proposals", "promotion_reason", "text")
+    _ensure_column(conn, "code_evolution_proposals", "work_fingerprint", "text")
+    _ensure_column(conn, "code_evolution_proposals", "work_scope", "text")
+    _ensure_column(conn, "code_evolution_proposals", "canonical_proposal_id", "text")
+    conn.execute(
+        "create index if not exists idx_code_evolution_work on "
+        "code_evolution_proposals(work_fingerprint, status, updated_at)"
+    )
+    conn.execute(
+        """
+        create table if not exists code_evolution_work_registry (
+            work_fingerprint text primary key,
+            work_scope text not null,
+            canonical_proposal_id text not null,
+            status text not null,
+            candidate_commit text,
+            created_at text not null,
+            updated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_code_evolution_work_registry_proposal "
+        "on code_evolution_work_registry(canonical_proposal_id)"
+    )
     conn.execute(
         """
         create table if not exists memory_facts (
@@ -3702,6 +3729,10 @@ def add_code_evolution_proposal(
     payload: dict,
     evidence: dict,
     status: str = "proposed",
+    *,
+    work_fingerprint: str | None = None,
+    work_scope: str | None = None,
+    canonical_proposal_id: str | None = None,
 ) -> bool:
     try:
         conn.execute(
@@ -3709,8 +3740,9 @@ def add_code_evolution_proposal(
             insert into code_evolution_proposals (
                 proposal_id, created_at, updated_at, source_recommendation_id,
                 source_agent, model_name, model_tier, frontier_escalation_reason,
-                title, category, priority, status, payload_json, evidence_json
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                title, category, priority, status, payload_json, evidence_json,
+                work_fingerprint, work_scope, canonical_proposal_id
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 proposal_id,
@@ -3727,6 +3759,9 @@ def add_code_evolution_proposal(
                 status,
                 json.dumps(payload, sort_keys=True),
                 json.dumps(evidence, sort_keys=True),
+                work_fingerprint,
+                work_scope,
+                canonical_proposal_id,
             ),
         )
         conn.commit()
@@ -3734,6 +3769,68 @@ def add_code_evolution_proposal(
     except sqlite3.IntegrityError:
         conn.rollback()
         return False
+
+
+def claim_code_evolution_work(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    work_fingerprint: str,
+    work_scope: str,
+    *,
+    status: str = "reserved",
+) -> dict:
+    """Atomically reserve one canonical proposal for a repository objective."""
+
+    now = utc_now()
+    conn.execute(
+        """
+        insert or ignore into code_evolution_work_registry (
+            work_fingerprint, work_scope, canonical_proposal_id, status,
+            created_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?)
+        """,
+        (work_fingerprint, work_scope, proposal_id, status, now, now),
+    )
+    row = conn.execute(
+        "select * from code_evolution_work_registry where work_fingerprint = ?",
+        (work_fingerprint,),
+    ).fetchone()
+    if row is None:
+        conn.rollback()
+        raise sqlite3.OperationalError("code evolution work reservation disappeared")
+    owned = str(row["canonical_proposal_id"]) == str(proposal_id)
+    if owned:
+        conn.execute(
+            """
+            update code_evolution_work_registry
+            set work_scope = ?, updated_at = ?
+            where work_fingerprint = ? and canonical_proposal_id = ?
+            """,
+            (work_scope, now, work_fingerprint, proposal_id),
+        )
+    conn.commit()
+    return {**dict(row), "owned": owned}
+
+
+def set_code_evolution_work_identity(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    *,
+    work_fingerprint: str,
+    work_scope: str,
+    canonical_proposal_id: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        update code_evolution_proposals
+        set work_fingerprint = ?, work_scope = ?,
+            canonical_proposal_id = coalesce(?, canonical_proposal_id),
+            updated_at = ?
+        where proposal_id = ?
+        """,
+        (work_fingerprint, work_scope, canonical_proposal_id, utc_now(), proposal_id),
+    )
+    conn.commit()
 
 
 def update_code_evolution_proposal(
@@ -3753,6 +3850,7 @@ def update_code_evolution_proposal(
     promotion_reason: str | None = None,
     applied_at: str | None = None,
     probation_loops_observed: int | None = None,
+    canonical_proposal_id: str | None = None,
 ) -> None:
     row = conn.execute(
         "select * from code_evolution_proposals where proposal_id = ?",
@@ -3781,7 +3879,8 @@ def update_code_evolution_proposal(
             canary_json = ?,
             promotion_reason = ?,
             applied_at = ?,
-            probation_loops_observed = ?
+            probation_loops_observed = ?,
+            canonical_proposal_id = coalesce(?, canonical_proposal_id)
         where proposal_id = ?
         """,
         (
@@ -3803,9 +3902,20 @@ def update_code_evolution_proposal(
             int(probation_loops_observed)
             if probation_loops_observed is not None
             else int(current["probation_loops_observed"] or 0),
+            canonical_proposal_id,
             proposal_id,
         ),
     )
+    if status or candidate_commit:
+        conn.execute(
+            """
+            update code_evolution_work_registry
+            set status = coalesce(?, status),
+                candidate_commit = coalesce(?, candidate_commit), updated_at = ?
+            where canonical_proposal_id = ?
+            """,
+            (status, candidate_commit, utc_now(), proposal_id),
+        )
     conn.commit()
 
 

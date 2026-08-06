@@ -2470,16 +2470,31 @@ def run_auto_improvement(
             evidence=payload.get("evidence"),
             source_ref=f"llm_recommendations:{rec['recommendation_id']}",
         )
-        if topic.duplicate and topic.canonical_row_id:
-            update_llm_recommendation_status(conn, rec["recommendation_id"], "auto_deduplicated")
+        payload["_recommendation_topic_key"] = topic.topic_key
+        code_change = payload.get("code_change") if isinstance(payload.get("code_change"), dict) else {}
+        explicit_revision = payload.get("work_revision") or payload.get("implementation_revision") or code_change.get("work_revision") or code_change.get("implementation_revision")
+        if topic.reopened and not explicit_revision:
+            topic_row = conn.execute(
+                "select reopen_count from recommendation_topics where topic_key=?",
+                (topic.topic_key,),
+            ).fetchone()
+            payload["work_revision"] = 1 + int((topic_row or {"reopen_count": 1})["reopen_count"] or 1)
+            explicit_revision = payload["work_revision"]
+        if topic.duplicate and not explicit_revision:
+            duplicate_status = "linked_existing_task" if topic.canonical_row_id else "auto_deduplicated"
+            update_llm_recommendation_status(conn, rec["recommendation_id"], duplicate_status)
             consumed.append(
                 {
                     "recommendation_id": rec["recommendation_id"],
                     "task_type": task_type,
                     "title": rec["title"],
-                    "status": "auto_deduplicated",
+                    "status": duplicate_status,
                     "topic_key": topic.topic_key,
-                    "canonical_artifact": f"{topic.canonical_table}:{topic.canonical_row_id}",
+                    "canonical_artifact": (
+                        f"{topic.canonical_table}:{topic.canonical_row_id}"
+                        if topic.canonical_row_id
+                        else None
+                    ),
                 }
             )
             continue
