@@ -109,6 +109,48 @@ class PaperOnlyFamilyDecayGuardTests(unittest.TestCase):
         self.assertEqual("family_decay_suppressed", review["reason"])
         self.assertEqual(["long", "short"], review["failed_legs"])
 
+    def test_flat_runtime_leg_metrics_drive_bilateral_decay_review(self):
+        review = _paper_only_family_decay_guard_review(
+            {
+                "market_key": "YAHOO_PROXY",
+                "strategy_family": "global_proxy_momentum",
+                "execution_mode": "paper",
+                "long_closed_count": 24,
+                "long_after_cost_expectancy_bps": -1.4,
+                "long_win_rate": 0.46,
+                "short_sample_count": 21,
+                "short_realized_edge_bps": -0.9,
+                "short_positive_rate": 0.43,
+                "rolling_realized_edge_bps": -1.16,
+            }
+        )
+
+        self.assertTrue(review["blocked"])
+        self.assertTrue(review["bilateral_failure"])
+        self.assertEqual(-1.16, review["rolling_realized_edge_bps"])
+        self.assertEqual(45, review["family_closed_count"])
+        self.assertEqual("runtime_leg_metrics", review["latest_family_paper"]["long_proxy_standard"]["evidence_source"])
+        self.assertEqual("runtime_leg_metrics", review["latest_family_paper"]["short_proxy_conditional"]["evidence_source"])
+
+    def test_positive_explicit_rolling_edge_prevents_decay_block(self):
+        review = _paper_only_family_decay_guard_review(
+            {
+                "market_key": "YAHOO_PROXY",
+                "strategy_family": "global_proxy_momentum",
+                "execution_mode": "paper",
+                "long_closed_count": 22,
+                "long_expectancy_bps": -0.5,
+                "short_closed_count": 23,
+                "short_expectancy_bps": -0.25,
+                "rolling_expectancy_bps": 0.05,
+            }
+        )
+
+        self.assertFalse(review["blocked"])
+        self.assertFalse(review["bilateral_failure"])
+        self.assertEqual("family_decay_not_confirmed", review["reason"])
+        self.assertFalse(review["recovery_status"]["current_recovered"])
+
     def test_recovery_evidence_can_release_static_decay_snapshot(self):
         passing_window = {
             "sample_count": 12,

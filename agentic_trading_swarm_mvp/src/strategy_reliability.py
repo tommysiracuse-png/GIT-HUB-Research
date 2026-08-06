@@ -3124,13 +3124,16 @@ def paper_family_quarantine_record(
     matched_on = _paper_family_quarantine_match(candidate)
     if matched_on is None:
         return None
-    review_candidate = dict(candidate)
-    review_candidate.setdefault("market_key", "YAHOO_PROXY")
-    review_candidate.setdefault("strategy_family", QUARANTINED_PAPER_STRATEGY_FAMILY)
-    family_decay_review = _paper_only_family_decay_guard_review(
-        review_candidate,
-        config if isinstance(config, Mapping) else None,
-    )
+    existing_review = candidate.get("paper_family_decay_guard_review")
+    family_decay_review = dict(existing_review) if isinstance(existing_review, Mapping) else {}
+    if not family_decay_review:
+        review_candidate = dict(candidate)
+        review_candidate.setdefault("market_key", "YAHOO_PROXY")
+        review_candidate.setdefault("strategy_family", QUARANTINED_PAPER_STRATEGY_FAMILY)
+        family_decay_review = _paper_only_family_decay_guard_review(
+            review_candidate,
+            config if isinstance(config, Mapping) else None,
+        )
     if not family_decay_review.get("blocked"):
         return None
     recovery = dict(family_decay_review.get("recovery_status") or {})
@@ -3201,15 +3204,30 @@ def hydrate_paper_family_decay_statistics(
     if not targets:
         return
 
+    def _family_decay_policy(value: Mapping[str, Any] | bool | None) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            return {}
+        for key in (
+            "paper_family_decay_guard",
+            "paper_only_family_decay_guard",
+            "family_decay_guard_policy",
+            "yahoo_proxy_momentum_source_veto",
+        ):
+            policy = value.get(key)
+            if isinstance(policy, Mapping):
+                return policy
+        for scope in ("strategy_reliability", "strategy_lab", "paper", "paper_policy"):
+            nested = value.get(scope)
+            if isinstance(nested, Mapping):
+                nested_policy = _family_decay_policy(nested)
+                if nested_policy:
+                    return nested_policy
+        return {}
+
     window = 30
-    if isinstance(config, Mapping):
-        policy = config.get("paper_family_decay_guard")
-        if not isinstance(policy, Mapping):
-            strategy_reliability = config.get("strategy_reliability")
-            if isinstance(strategy_reliability, Mapping):
-                policy = strategy_reliability.get("paper_family_decay_guard")
-        if isinstance(policy, Mapping):
-            window = max(1, _as_int(policy.get("rolling_window_closed_trades"), 30))
+    policy = _family_decay_policy(config)
+    if isinstance(policy, Mapping):
+        window = max(1, _as_int(policy.get("rolling_window_closed_trades"), 30))
 
     grouped: dict[str, list[float]] = {
         "long_proxy_standard": [],
@@ -3277,10 +3295,51 @@ def hydrate_paper_family_decay_statistics(
     if not latest_family_paper:
         return
 
+    weighted_expectancy_numerator = 0.0
+    weighted_expectancy_denominator = 0
+    for metrics in latest_family_paper.values():
+        if not isinstance(metrics, Mapping):
+            continue
+        expectancy = _as_float(metrics.get("avg_pnl_bps"))
+        closed_count = _as_int(metrics.get("closed_count"), 0)
+        if expectancy is None or closed_count <= 0:
+            continue
+        weighted_expectancy_numerator += expectancy * closed_count
+        weighted_expectancy_denominator += closed_count
+    rolling_expectancy_bps = (
+        round(weighted_expectancy_numerator / weighted_expectancy_denominator, 6)
+        if weighted_expectancy_denominator > 0
+        else None
+    )
+
     for candidate in targets:
         candidate["latest_family_paper"] = {
             leg_key: dict(metrics) for leg_key, metrics in latest_family_paper.items()
         }
+        candidate["paper_family_decay_latest_family_paper"] = {
+            leg_key: dict(metrics) for leg_key, metrics in latest_family_paper.items()
+        }
+        candidate["paper_family_decay_rolling_expectancy_bps"] = rolling_expectancy_bps
+        candidate["paper_family_decay_rolling_realized_edge_bps"] = rolling_expectancy_bps
+
+
+def hydrate_paper_family_decay_diagnostics(
+    candidates: list[dict],
+    config: Mapping[str, Any] | bool | None = None,
+) -> None:
+    """Attach the current family decay review even when recovery keeps entries active."""
+    config_mapping = config if isinstance(config, Mapping) else None
+    for candidate in candidates:
+        if _paper_family_quarantine_match(candidate) is None:
+            continue
+        review_candidate = dict(candidate)
+        review_candidate.setdefault("market_key", "YAHOO_PROXY")
+        review_candidate.setdefault("strategy_family", QUARANTINED_PAPER_STRATEGY_FAMILY)
+        review = _paper_only_family_decay_guard_review(review_candidate, config_mapping)
+        if not review.get("applies"):
+            continue
+        candidate["paper_family_decay_guard_review"] = dict(review)
+        candidate["paper_family_decay_recovery"] = dict(review.get("recovery_status") or {})
 
 
 def _venue(candidate: dict) -> str:
@@ -5458,6 +5517,18 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
     blocked = sum(1 for item in items if item["action"].startswith("shadow") or "shadow" in item["action"])
     protected = sum(1 for item in items if item.get("protect_working_slice"))
     quarantined = sum(1 for item in items if item.get("profile") == "yahoo_proxy_family_quarantine")
+    family_decay_reviews = sum(
+        1
+        for candidate in candidates
+        if isinstance(candidate.get("paper_family_decay_guard_review"), Mapping)
+        and candidate["paper_family_decay_guard_review"].get("applies")
+    )
+    family_decay_recovered = sum(
+        1
+        for candidate in candidates
+        if isinstance(candidate.get("paper_family_decay_guard_review"), Mapping)
+        and candidate["paper_family_decay_guard_review"].get("recovery_status", {}).get("recovered")
+    )
     portability_quarantined = sum(
         1 for item in items if item.get("profile") == "cross_family_portability_quarantine"
     )
@@ -5496,6 +5567,8 @@ def _summarize(items: list[dict], candidates: list[dict]) -> dict:
         "annotated_count": len(items),
         "shadow_or_blocked_count": blocked,
         "family_quarantine_count": quarantined,
+        "family_decay_review_count": family_decay_reviews,
+        "family_decay_recovered_count": family_decay_recovered,
         "portability_quarantine_count": portability_quarantined,
         "lineage_source_health_guard_count": lineage_source_health_guarded,
         "context_loss_quarantine_count": context_loss_quarantined,
@@ -5594,6 +5667,7 @@ def _report_markdown(report: dict) -> str:
         f"- Candidates reviewed: `{summary.get('candidate_count', 0)}`",
         f"- Annotated candidates: `{summary.get('annotated_count', 0)}`",
         f"- Shadow/blocked by reliability layer: `{summary.get('shadow_or_blocked_count', 0)}`",
+        f"- Family decay reviews / recovered: `{summary.get('family_decay_review_count', 0)}` / `{summary.get('family_decay_recovered_count', 0)}`",
         f"- Lineage source-health guards: `{summary.get('lineage_source_health_guard_count', 0)}`",
         f"- Cross-family portability quarantines: `{summary.get('portability_quarantine_count', 0)}`",
         f"- Protected working slices: `{summary.get('protected_working_slice_count', 0)}`",
@@ -6149,6 +6223,7 @@ def apply_strategy_reliability(
     hydrate_paper_context_loss_statistics(candidates, conn, settings)
     hydrate_paper_context_prior_statistics(candidates, conn, settings)
     hydrate_paper_family_decay_statistics(candidates, conn, settings)
+    hydrate_paper_family_decay_diagnostics(candidates, settings)
     _hydrate_yahoo_proxy_transfer_diagnostics(candidates, conn)
     for candidate in candidates:
         _remove_invalid_proxy_confirmation(candidate)

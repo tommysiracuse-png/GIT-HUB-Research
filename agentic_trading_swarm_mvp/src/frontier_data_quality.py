@@ -416,6 +416,12 @@ def _paper_only_family_decay_guard_review(record, config=None):
             copied[str(leg_name)] = dict(metrics) if isinstance(metrics, dict) else metrics
         return copied
 
+    def _first_present(*values):
+        for value in values:
+            if value not in (None, "", [], {}, ()):
+                return value
+        return None
+
     def _market_root(value):
         text = str(value or "").strip().upper().replace("/", "|").replace(":", "|")
         if not text:
@@ -520,6 +526,58 @@ def _paper_only_family_decay_guard_review(record, config=None):
     freshness_state = _token(
         _lookup("freshness_state", "signal_freshness", "proxy_freshness_state", "freshness")
     ) or "unknown"
+
+    def _flat_leg_metrics(direction):
+        if direction not in {"long", "short"}:
+            return {}
+        aliases = {
+            "closed_count": (
+                f"{direction}_closed_count",
+                f"{direction}_sample_count",
+                f"{direction}_count",
+                f"{direction}_rolling_closed_count",
+                f"{direction}_closed_trades",
+                f"{direction}_paper_closed_count",
+                f"{direction}_paper_count",
+            ),
+            "expectancy_bps": (
+                f"{direction}_after_cost_expectancy_bps",
+                f"{direction}_expectancy_bps",
+                f"{direction}_realized_edge_bps",
+                f"{direction}_rolling_expectancy_bps",
+                f"{direction}_rolling_realized_edge_bps",
+                f"{direction}_avg_pnl_bps",
+                f"{direction}_paper_expectancy_bps",
+            ),
+            "win_rate": (
+                f"{direction}_win_rate",
+                f"{direction}_positive_rate",
+                f"{direction}_paper_win_rate",
+            ),
+        }
+        closed_count = _first_present(*(_lookup(alias) for alias in aliases["closed_count"]))
+        expectancy = _first_present(*(_lookup(alias) for alias in aliases["expectancy_bps"]))
+        win_rate = _first_present(*(_lookup(alias) for alias in aliases["win_rate"]))
+        if closed_count in (None, "", [], {}, ()) and expectancy in (None, "", [], {}, ()) and win_rate in (None, "", [], {}, ()):
+            return {}
+        metrics = {"direction": direction, "evidence_source": "runtime_leg_metrics"}
+        if closed_count not in (None, "", [], {}, ()):
+            metrics["closed_count"] = closed_count
+        if expectancy not in (None, "", [], {}, ()):
+            metrics["after_cost_expectancy_bps"] = expectancy
+            metrics["avg_pnl_bps"] = expectancy
+        if win_rate not in (None, "", [], {}, ()):
+            metrics["win_rate"] = win_rate
+        return metrics
+
+    def _merge_leg_metrics(leg_name, metrics):
+        merged = dict(metrics) if isinstance(metrics, dict) else {}
+        direction = _leg_direction(leg_name)
+        flat_metrics = _flat_leg_metrics(direction)
+        if flat_metrics:
+            merged.update(flat_metrics)
+        return merged
+
     latest_family_paper = _lookup(
         "latest_family_paper",
         "family_decay_latest_family_paper",
@@ -530,6 +588,15 @@ def _paper_only_family_decay_guard_review(record, config=None):
     if not isinstance(latest_family_paper, dict):
         latest_family_paper = _PAPER_ONLY_FAMILY_DECAY_TARGET["latest_family_paper"]
     latest_family_paper = _copy_latest_family_paper(latest_family_paper)
+    normalized_latest_family_paper = {}
+    for leg_name in ("long_proxy_standard", "short_proxy_conditional"):
+        merged = _merge_leg_metrics(leg_name, latest_family_paper.get(leg_name))
+        if merged:
+            normalized_latest_family_paper[leg_name] = merged
+    for leg_name, metrics in latest_family_paper.items():
+        if leg_name not in normalized_latest_family_paper:
+            normalized_latest_family_paper[leg_name] = dict(metrics) if isinstance(metrics, dict) else metrics
+    latest_family_paper = normalized_latest_family_paper
 
     min_closed_count = max(
         1,
@@ -618,11 +685,19 @@ def _paper_only_family_decay_guard_review(record, config=None):
             continue
         weighted_expectancy_numerator += expectancy_bps * closed_count
         weighted_expectancy_denominator += closed_count
-    rolling_expectancy_bps = (
-        round(weighted_expectancy_numerator / weighted_expectancy_denominator, 6)
-        if weighted_expectancy_denominator > 0
-        else None
+    explicit_rolling_expectancy_bps = _float_value(
+        _lookup(
+            "rolling_realized_edge_bps",
+            "rolling_expectancy_bps",
+            "family_decay_rolling_realized_edge_bps",
+            "family_decay_rolling_expectancy_bps",
+            "paper_family_decay_rolling_realized_edge_bps",
+            "paper_family_decay_rolling_expectancy_bps",
+        )
     )
+    rolling_expectancy_bps = explicit_rolling_expectancy_bps
+    if rolling_expectancy_bps is None and weighted_expectancy_denominator > 0:
+        rolling_expectancy_bps = round(weighted_expectancy_numerator / weighted_expectancy_denominator, 6)
     bilateral_failure = bool(
         isinstance(long_leg, dict)
         and isinstance(short_leg, dict)
@@ -729,8 +804,11 @@ def _paper_only_family_decay_guard_review(record, config=None):
         "max_expectancy_bps": max_expectancy_bps,
         "recovery_expectancy_bps": recovery_expectancy_bps,
         "rolling_expectancy_bps": rolling_expectancy_bps,
+        "rolling_realized_edge_bps": rolling_expectancy_bps,
+        "family_closed_count": weighted_expectancy_denominator,
         "bilateral_failure": bilateral_failure,
         "failed_legs": failed_legs,
+        "independent_leg_failures": len(failed_legs),
         "recovery_status": {
             "recovered": bool(recovered_by_windows or current_recovered),
             "recovered_by_windows": recovered_by_windows,

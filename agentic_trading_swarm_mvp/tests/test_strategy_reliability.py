@@ -678,6 +678,10 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertFalse(row.get("paper_entry_blocked", False))
         self.assertEqual("long_proxy_context_tracking", row["strategy_reliability_action"])
         self.assertEqual(0, report["summary"]["family_quarantine_count"])
+        self.assertEqual(1, report["summary"]["family_decay_review_count"])
+        self.assertEqual(1, report["summary"]["family_decay_recovered_count"])
+        self.assertEqual("family_decay_recovered", row["paper_family_decay_guard_review"]["reason"])
+        self.assertTrue(row["paper_family_decay_recovery"]["recovered"])
 
     def test_yahoo_proxy_runtime_family_recovery_releases_family_quarantine(self) -> None:
         candidate = base_candidate(
@@ -753,6 +757,67 @@ class StrategyReliabilityTests(unittest.TestCase):
             "runtime_closed_paper_trades",
             row["latest_family_paper"]["long_proxy_standard"]["evidence_source"],
         )
+        self.assertEqual("family_decay_recovered", row["paper_family_decay_guard_review"]["reason"])
+
+    def test_nested_strategy_lab_family_decay_policy_controls_runtime_window(self) -> None:
+        candidate = base_candidate(
+            venue="YAHOO_PROXY",
+            inst_id="YAHOO_PROXY:EWT",
+            trade_type="global_proxy_momentum",
+            direction="long_proxy",
+            score=81.0,
+            edge_bps_estimate=9.0,
+            quality_score=None,
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        try:
+            for index in range(12):
+                conn.execute(
+                    """
+                    insert into paper_trades (
+                        opened_at, closed_at, venue, inst_id, direction, trade_type,
+                        signal_key, base_score, learned_score, entry, exit, pnl_bps,
+                        status, thesis, candidate_json, review_json
+                    ) values (?, ?, 'YAHOO_PROXY', 'YAHOO_PROXY:EWT', 'long_proxy', 'global_proxy_momentum',
+                              ?, 80, 80, 100, 101, ?, 'closed', 'test', ?, '{}')
+                    """,
+                    (
+                        f"2026-08-05T00:{index:02d}:00+00:00",
+                        f"2026-08-05T01:{index:02d}:00+00:00",
+                        f"YAHOO_PROXY|global_proxy_momentum|long_proxy|window_{index}",
+                        float(index + 1),
+                        json.dumps(
+                            {
+                                "venue": "YAHOO_PROXY",
+                                "inst_id": "YAHOO_PROXY:EWT",
+                                "trade_type": "global_proxy_momentum",
+                                "direction": "long_proxy",
+                            }
+                        ),
+                    ),
+                )
+            conn.commit()
+            rows, _ = strategy_reliability.apply_strategy_reliability(
+                [candidate],
+                {
+                    "mode": "paper",
+                    "strategy_lab": {
+                        "yahoo_proxy_momentum_source_veto": {
+                            "rolling_window_closed_trades": 5,
+                        }
+                    },
+                },
+                conn=conn,
+            )
+        finally:
+            conn.close()
+
+        row = rows[0]
+        self.assertEqual(5, row["latest_family_paper"]["long_proxy_standard"]["closed_count"])
+        self.assertEqual(10.0, row["latest_family_paper"]["long_proxy_standard"]["avg_pnl_bps"])
+        self.assertEqual(10.0, row["paper_family_decay_rolling_expectancy_bps"])
 
     def test_yahoo_proxy_source_lineage_descendant_is_quarantined(self) -> None:
         candidate = base_candidate(
