@@ -152,6 +152,19 @@ class FrontierPaperAdmissionGuardTests(unittest.TestCase):
         )
         self.assertLessEqual(float(weak["score"]), 59.999)
 
+    def test_ranked_shadow_candidate_keeps_paper_ranking_score_capped(self) -> None:
+        weak = candidate(
+            quality_score=79.0,
+            effective_edge_bps=125.0,
+            dislocation_quality_score=95.0,
+            score=99.0,
+        )
+
+        rank_frontier_paper_candidates([weak], copy.deepcopy(DEFAULT_SETTINGS))
+
+        self.assertFalse(weak["frontier_paper_admission"]["admitted"])
+        self.assertLessEqual(float(weak["paper_ranking_score"]), 59.999)
+
     def test_verified_standard_route_positive_net_candidate_is_not_suppressed(self) -> None:
         guarded = apply_frontier_paper_admission_guard(
             candidate(

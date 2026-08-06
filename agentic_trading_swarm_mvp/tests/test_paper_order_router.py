@@ -77,6 +77,30 @@ class PaperOrderRouterFrontierGuardTests(unittest.TestCase):
         self.assertIn("quality_action_shadow_only", codes)
         self.assertEqual(guarded["paper_action"], "shadow_filtered")
 
+    def test_scanner_scoped_candidate_uses_explicit_admission_reasoning(self) -> None:
+        guarded = router.apply_frontier_paper_guard(
+            frontier_candidate(
+                frontier_paper_admission_guard_applies=True,
+                quality_action="shadow_only",
+                quality_status="degraded",
+                quality_score=79.0,
+                route_status="conditional",
+                execution_feasibility={"status": "conditional", "route_status": "conditional"},
+                anomaly_flags=["simulated_slippage_exceeds_edge"],
+            )
+        )
+
+        self.assertTrue(guarded["shadow_filtered"])
+        self.assertEqual(
+            f"{router.FRONTIER_PAPER_ADMISSION_REASON_PREFIX}:data_quality+cost+route_feasibility",
+            guarded["candidate_reject_reason"],
+        )
+        self.assertEqual("shadow_only", guarded["paper_action"])
+        self.assertEqual(
+            "frontier_paper_admission_guard",
+            guarded["candidate_reject_detail"]["guard"],
+        )
+
     def test_verified_positive_net_frontier_candidate_remains_eligible(self) -> None:
         candidate = frontier_candidate(
             edge_bps_estimate=16.0,

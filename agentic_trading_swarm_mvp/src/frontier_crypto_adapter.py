@@ -11595,6 +11595,16 @@ def rank_frontier_paper_candidates(candidates: list[dict], settings: dict) -> li
                 * _multiplier(route_feasibility_gate.get("score_multiplier", 1.0)),
                 3,
             )
+        frontier_paper_admission = candidate.get("frontier_paper_admission") or {}
+        if (
+            paper_only_active
+            and isinstance(frontier_paper_admission, dict)
+            and not frontier_paper_admission.get("admitted", True)
+        ):
+            paper_ranking_score = min(
+                paper_ranking_score,
+                as_float(frontier_paper_admission.get("score_cap"), 59.999) or 59.999,
+            )
         candidate["paper_ranking_score"] = paper_ranking_score
         candidate["paper_ranking_edge_bps"] = round(ranking_edge, 6) if ranking_edge is not None else None
         candidate["paper_ranking_edge_source"] = ranking_edge_source

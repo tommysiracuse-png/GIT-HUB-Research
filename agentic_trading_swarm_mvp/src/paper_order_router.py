@@ -1969,7 +1969,12 @@ def apply_frontier_paper_guard(
 ) -> dict[str, Any]:
     """Return a copy of ``candidate`` annotated as shadow-filtered when needed."""
     route_guard_enabled = frontier_route_feasibility_guard_enabled(config)
-    guarded = annotate_frontier_paper_cost_diagnostic(candidate)
+    guarded = apply_frontier_paper_admission_guard(candidate, config)
+    if guarded.get("shadow_filtered") and (
+        (guarded.get("candidate_reject_detail") or {}).get("guard") == FRONTIER_PAPER_ADMISSION_GUARD
+    ):
+        return guarded
+    guarded = annotate_frontier_paper_cost_diagnostic(guarded)
     net_edge_reason = frontier_paper_net_edge_guard_reason(guarded, config)
     if net_edge_reason is not None:
         return _annotate_shadow_filtered_candidate(
