@@ -45,6 +45,7 @@ DERIVATIVES_FEE_SCHEDULE_URL = (
     "adx-fee-schedule_public_eng_202501.pdf"
 )
 DERIVATIVES_MARKET_SURFACE = "adx_equity_and_index_futures_contract_catalog"
+TRADINGVIEW_ADX_QUOTE_URL = "https://www.tradingview.com/symbols/ADX-{symbol}/"
 
 SSF_UNDERLYINGS = (
     ("ADNOC_GAS", "ADNOC Gas", "energy"),
@@ -54,6 +55,14 @@ SSF_UNDERLYINGS = (
     ("SHARJAH_ISLAMIC_BANK", "Sharjah Islamic Bank", "financial_services"),
     ("TWO_POINT_ZERO_GROUP", "Two Point Zero Group", "diversified_holdings"),
 )
+SSF_COMPANION_QUOTES = {
+    "ADNOC_GAS": "ADNOCGAS",
+    "ADNOC_DRILLING": "ADNOCDRILL",
+    "ADNOC_LOGISTICS_SERVICES": "ADNOCLS",
+    "PRESIGHT_AI": "PRESIGHT",
+    "SHARJAH_ISLAMIC_BANK": "SIB",
+    "TWO_POINT_ZERO_GROUP": "2POINTZERO",
+}
 
 FACTSHEETS = (
     {
@@ -645,6 +654,92 @@ def parse_adx_derivatives_clearing(document: str) -> dict[str, str]:
     return {"clearing_house": "Abu Dhabi Clear (AD Clear)", "clearing_model": "central_counterparty"}
 
 
+def parse_tradingview_adx_quote(
+    document: str,
+    *,
+    symbol: str,
+    source_url: str,
+    received_at: str | None = None,
+) -> dict[str, Any]:
+    """Parse a public TradingView ADX quote page used as a paper-only companion price."""
+
+    text = str(document or "").strip()
+    quote_symbol = str(symbol or "").strip().upper()
+    if not text:
+        raise AdxDerivativesParseError("TradingView ADX quote page is empty")
+    if not quote_symbol:
+        raise AdxDerivativesParseError("TradingView ADX quote symbol is missing")
+    match = re.search(
+        rf"The current price of {re.escape(quote_symbol)} is ([0-9]+(?:\.[0-9]+)?)\s*AED",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise AdxDerivativesParseError(
+            f"TradingView ADX quote page missing current price for {quote_symbol}"
+        )
+    try:
+        last = float(match.group(1))
+    except ValueError as exc:
+        raise AdxDerivativesParseError(
+            f"TradingView ADX quote page has invalid current price for {quote_symbol}"
+        ) from exc
+    if last <= 0:
+        raise AdxDerivativesParseError(
+            f"TradingView ADX quote page current price must be positive for {quote_symbol}"
+        )
+    fetched_at = _derivatives_received_time(received_at)
+    return {
+        "last": last,
+        "price_available": True,
+        "price_basis": "public_companion_underlying_spot_quote",
+        "quality_status": "verified_proxy",
+        "proxy_quality_status": "verified_proxy",
+        "proxy_symbol": f"ADX:{quote_symbol}",
+        "companion_quote_symbol": quote_symbol,
+        "companion_quote_url": source_url,
+        "freshness_state": "fresh",
+        "freshness_basis": "public_quote_page_fetch",
+        "freshness_age_seconds": 0.0,
+        "session_status": "unknown",
+        "session_basis": "public_quote_page_has_no_session_clock",
+        "price_source": "TradingView public ADX companion quote",
+        "source_record_type": "tradingview_public_symbol_faq",
+        "observed_at": fetched_at.isoformat(),
+        "fetched_at": fetched_at.isoformat(),
+    }
+
+
+def _apply_companion_quote(
+    observation: dict[str, Any],
+    quote: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve ADX contract provenance while attaching a public companion quote."""
+
+    updated = dict(observation)
+    updated["last"] = float(quote["last"])
+    updated["price_available"] = True
+    updated["price_basis"] = str(quote["price_basis"])
+    updated["quality_status"] = str(quote["quality_status"])
+    updated["proxy_quality_status"] = str(quote["proxy_quality_status"])
+    updated["proxy_symbol"] = str(quote["proxy_symbol"])
+    updated["freshness_state"] = str(quote["freshness_state"])
+    updated["freshness_basis"] = str(quote["freshness_basis"])
+    updated["freshness_age_seconds"] = float(quote["freshness_age_seconds"])
+    updated["session_status"] = str(quote["session_status"])
+    updated["session_basis"] = str(quote["session_basis"])
+    updated["price_source"] = str(quote["price_source"])
+    updated["source_record_type"] = str(quote["source_record_type"])
+    updated["source_contract_url"] = updated.get("source_url")
+    updated["source_url"] = str(quote["companion_quote_url"])
+    updated["companion_quote_symbol"] = str(quote["companion_quote_symbol"])
+    updated["companion_quote_url"] = str(quote["companion_quote_url"])
+    updated["observed_at"] = str(quote["observed_at"])
+    updated["fetched_at"] = str(quote["fetched_at"])
+    updated["candidate_reject_reason"] = "public_companion_price_requires_strategy_logic"
+    return updated
+
+
 def _derivatives_fetch_evidence(result: dict[str, Any], source_url: str) -> dict[str, Any]:
     return {
         "source_url": source_url,
@@ -738,6 +833,7 @@ class AbuDhabiSecuritiesExchangeAdxDerivativesAdapter:
         observations: list[dict[str, Any]] = []
         parser_failures: list[dict[str, str]] = []
         fetch_status: dict[str, dict[str, Any]] = {}
+        companion_fetch_status: dict[str, dict[str, Any]] = {}
         usable_sources = 0
 
         for source_key, source_url, parser in sources:
@@ -774,10 +870,50 @@ class AbuDhabiSecuritiesExchangeAdxDerivativesAdapter:
                     _derivatives_failure_observation(source_key, source_url, result, message)
                 )
 
+        companion_failures: list[dict[str, str]] = []
+        enriched_observations: list[dict[str, Any]] = []
+        for observation in observations:
+            base = str(observation.get("base") or "")
+            quote_symbol = SSF_COMPANION_QUOTES.get(base)
+            if not quote_symbol:
+                enriched_observations.append(observation)
+                continue
+            companion_url = TRADINGVIEW_ADX_QUOTE_URL.format(symbol=quote_symbol)
+            result = fetch_text(companion_url, timeout)
+            companion_fetch_status[base] = _derivatives_fetch_evidence(result, companion_url)
+            if not result.get("ok"):
+                companion_failures.append(
+                    {
+                        "base": base,
+                        "source_url": companion_url,
+                        "error": str(result.get("error") or "public companion quote unavailable")[:300],
+                    }
+                )
+                enriched_observations.append(observation)
+                continue
+            try:
+                quote = parse_tradingview_adx_quote(
+                    str(result.get("text") or ""),
+                    symbol=quote_symbol,
+                    source_url=companion_url,
+                    received_at=result.get("received_at"),
+                )
+                enriched_observations.append(_apply_companion_quote(observation, quote))
+            except (AdxDerivativesParseError, TypeError, ValueError) as exc:
+                companion_failures.append(
+                    {
+                        "base": base,
+                        "source_url": companion_url,
+                        "error": f"ADX derivatives companion quote parser failed: {exc}"[:300],
+                    }
+                )
+                enriched_observations.append(observation)
+        observations = enriched_observations
+
         statuses = [item["fetch_status"] for item in fetch_status.values()]
-        if usable_sources == len(sources) and not parser_failures:
+        if usable_sources == len(sources) and not parser_failures and not companion_failures:
             source_status = "reachable"
-        elif usable_sources or parser_failures:
+        elif usable_sources or parser_failures or companion_failures:
             source_status = "degraded"
         elif statuses and all(status == "blocked" for status in statuses):
             source_status = "blocked"
@@ -803,11 +939,13 @@ class AbuDhabiSecuritiesExchangeAdxDerivativesAdapter:
                 ],
                 "supplemental_reference_urls": [DERIVATIVES_FEE_SCHEDULE_URL],
                 "fetch_status": fetch_status,
+                "companion_fetch_status": companion_fetch_status,
                 "freshness_state": freshness_states[0] if len(freshness_states) == 1 else "mixed" if freshness_states else "unknown",
                 "freshness_states": freshness_states,
                 "session_state": session_states[0] if len(session_states) == 1 else "mixed" if session_states else "unknown",
                 "session_states": session_states,
                 "parser_failures": parser_failures,
+                "companion_failures": companion_failures,
                 "observation_count": len(observations),
                 "real_observation_count": len(real_rows),
                 "capability_gap": "public_entry_quality_quotes_and_order_book",

@@ -260,6 +260,74 @@ def adx_nav_reference_logic() -> dict:
     }
 
 
+def adx_derivatives_companion_observation(
+    price: float,
+    observed_at: str,
+    *,
+    inst_id: str = "ADX:FUTURES:SSF_ADNOC_GAS",
+    base: str = "ADNOC_GAS",
+    symbol: str = "SSF_ADNOC_GAS",
+    **overrides: object,
+) -> dict:
+    row = {
+        "inst_id": inst_id,
+        "venue": "ADX",
+        "trade_type": "official_derivatives_contract_reference",
+        "market_type": "futures",
+        "asset_class": "single_stock_futures",
+        "quote": "AED",
+        "base": base,
+        "symbol": symbol,
+        "last": price,
+        "spread_bps": 3.0,
+        "liquidity_score": 0.7,
+        "quality_score": 80.0,
+        "quality_status": "verified_proxy",
+        "proxy_quality_status": "verified_proxy",
+        "price_available": True,
+        "price_basis": "public_companion_underlying_spot_quote",
+        "market_surface": "adx_equity_and_index_futures_contract_catalog",
+        "freshness_state": "fresh",
+        "candidate_reject_reason": "public_companion_price_requires_strategy_logic",
+        "stale_minutes": 1.0,
+        "session_status": "unknown",
+        "observed_at": observed_at,
+        "price_source": "TradingView public ADX companion quote",
+        "source_url": "https://www.tradingview.com/symbols/ADX-ADNOCGAS/",
+        "source_contract_url": "https://www.adx.ae/about-adx/media/adx-news/adx-lists-six-new-single-stock-futures-bloomberg-collaboration",
+        "companion_quote_symbol": "ADNOCGAS",
+        "proxy_symbol": "ADX:ADNOCGAS",
+    }
+    row.update(overrides)
+    return row
+
+
+def adx_derivatives_companion_logic() -> dict:
+    return {
+        "type": "observation_program",
+        "universe": {
+            "venues": ["ADX"],
+            "trade_types": ["official_derivatives_contract_reference"],
+            "market_surfaces": ["adx_equity_and_index_futures_contract_catalog"],
+        },
+        "calculated_features": {
+            "companion_return_strength_bps": "abs(return_5m_bps)",
+        },
+        "entry_expression": (
+            "market_surface == 'adx_equity_and_index_futures_contract_catalog' "
+            "and price_basis == 'public_companion_underlying_spot_quote' "
+            "and quality_status == 'verified_proxy' and freshness_state == 'fresh' "
+            "and last > 0"
+        ),
+        "invalidation_expression": "freshness_state != 'fresh' or last <= 0",
+        "long_expression": "return_5m_bps > 0",
+        "short_expression": "return_5m_bps < 0",
+        "edge_expression": "companion_return_strength_bps",
+        "score_expression": "clip(45 + companion_return_strength_bps / 4, 0, 100)",
+        "route_surface": "proxy",
+    }
+
+
 def boc_auction_observation(
     price: float,
     auction_at: dt.datetime,
@@ -1067,6 +1135,55 @@ class StrategyProgramTests(unittest.TestCase):
             self.assertTrue(execution["paper_filled"])
             self.assertEqual("synthetic_research_paper", execution["order"]["route_id"])
             self.assertEqual("paper", execution["order"]["mode"])
+
+    def test_adx_derivatives_companion_program_generates_same_surface_proxy_candidate(self) -> None:
+        cfg = settings()
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        recommendation = lab_recommendation(
+            "adx_derivatives_companion_quote_v1",
+            adx_derivatives_companion_logic(),
+        )
+        experiment = recommendation["payload"]["strategy_lab_experiment"]
+        experiment["hypothesis"] = (
+            "Fresh public companion quotes for ADX single-stock futures underlyings support same-surface paper proxy testing."
+        )
+        experiment["source_surface"] = "adx_equity_and_index_futures_contract_catalog"
+        experiment["permitted_target_surface"] = ["adx_equity_and_index_futures_contract_catalog"]
+
+        with memory_db() as conn:
+            ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            record_feature_snapshots(
+                conn,
+                [adx_derivatives_companion_observation(3.30, (now - dt.timedelta(minutes=5)).isoformat())],
+                cfg,
+            )
+            generated, report = generate_strategy_lab_candidates(
+                conn,
+                cfg,
+                [],
+                [adx_derivatives_companion_observation(3.37, now.isoformat())],
+            )
+
+            self.assertEqual(1, len(generated), report)
+            candidate = generated[0]
+            self.assertEqual("adx_equity_and_index_futures_contract_catalog", candidate["target_surface"])
+            self.assertEqual("global_market_discovery_proxy", candidate["trade_type"])
+            self.assertEqual("official_derivatives_contract_reference", candidate["strategy_lab_source_trade_type"])
+            self.assertEqual("public_companion_underlying_spot_quote", candidate["price_basis"])
+            self.assertEqual("https://www.tradingview.com/symbols/ADX-ADNOCGAS/", candidate["source_url"])
+            self.assertEqual("standard", candidate["execution_route"]["route_status"])
+            self.assertEqual("equity_proxy_paper", candidate["execution_route"]["route_id"])
+
+            execution = execute_order(
+                conn,
+                candidate,
+                {"learned_score": candidate["score"], "paper_allocation_multiplier": 1.0},
+                cfg,
+            )
+            self.assertTrue(execution["paper_filled"])
+            self.assertEqual("paper_filled", execution["order"]["status"])
+            self.assertEqual("equity_proxy_paper", execution["order"]["route_id"])
 
     def test_boc_auction_reference_uses_feature_snapshots_and_next_same_tenor_label(self) -> None:
         cfg = settings()

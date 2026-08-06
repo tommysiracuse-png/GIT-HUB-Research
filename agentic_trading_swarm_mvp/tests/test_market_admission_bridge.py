@@ -101,6 +101,35 @@ class MarketAdmissionBridgeTests(unittest.TestCase):
         self.assertEqual("proxy", logic["route_surface"])
         self.assertTrue(json.loads(row["risk_gates_json"])["synthetic_research_only"])
 
+    def test_adx_quality_verified_companion_quotes_create_canonical_program(self) -> None:
+        adx_state = state(
+            "quality_verified",
+            venue="ADX",
+            inst_id="ADX:FUTURES:SSF_ADNOC_GAS",
+            market_surface="adx_equity_and_index_futures_contract_catalog",
+            session_status="unknown",
+            details={"quality_status": "verified_proxy", "route_status": "unknown"},
+        )
+        result = market_admission_bridge.run_market_admission_bridge(
+            self.conn, self.settings, {"states": [adx_state]}
+        )
+        row = self.conn.execute(
+            "select strategy_lab_id, strategy_logic_json, data_requirements_json, risk_gates_json from strategy_lab_experiments"
+        ).fetchone()
+
+        self.assertEqual(1, result["summary"]["actions_created"])
+        self.assertEqual("strategy_lab_adx_derivatives_program", result["actions"][0]["action"])
+        self.assertEqual("adx_derivatives_companion_quote_v1", row["strategy_lab_id"])
+        logic = json.loads(row["strategy_logic_json"])
+        self.assertEqual("observation_program", logic["type"])
+        self.assertEqual("proxy", logic["route_surface"])
+        self.assertIn("price_basis == 'public_companion_underlying_spot_quote'", logic["entry_expression"])
+        self.assertEqual("companion_return_strength_bps", logic["edge_expression"])
+        self.assertEqual("abs(return_5m_bps)", logic["calculated_features"]["companion_return_strength_bps"])
+        requirements = json.loads(row["data_requirements_json"])
+        self.assertIn("source_contract_url", requirements["required_fields"])
+        self.assertFalse(json.loads(row["risk_gates_json"])["require_route_feasible"])
+
     def test_spot_borrow_user_constraint_suppresses_route_task(self) -> None:
         item = state(
             "strategy_candidate",

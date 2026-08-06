@@ -25,6 +25,8 @@ RESOLVABLE_TABLES = {
 }
 EEX_SECONDARY_SPOT_SURFACE = "eex_eu_ets_secondary_spot_trades"
 EEX_SECONDARY_SPOT_LAB_ID = "eex_eu_ets_secondary_spot_reported_trade_v1"
+ADX_DERIVATIVES_SURFACE = "adx_equity_and_index_futures_contract_catalog"
+ADX_DERIVATIVES_LAB_ID = "adx_derivatives_companion_quote_v1"
 
 
 def _strategy_lab_id(state: dict[str, Any]) -> str:
@@ -281,6 +283,110 @@ def _create_eex_secondary_spot_program(
     }
 
 
+def _create_adx_derivatives_companion_program(
+    conn: sqlite3.Connection,
+    settings: dict,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Create the canonical paper-only program for ADX derivatives companion quotes.
+
+    ADX's public derivatives surface identifies contracts but does not publish a
+    futures quote or execution route. The adapter repairs this by attaching a
+    defensible public companion quote for the SSF underlyings. This program
+    turns those same-surface observations into paper proxy experiments on the
+    existing equity proxy route without implying a live ADX futures order path.
+    """
+
+    claim = _claim(conn, state, "activate_adx_derivatives_companion_program", 90)
+    if claim.duplicate and claim.canonical_row_id:
+        return {
+            "action": "strategy_lab_adx_derivatives_program",
+            "status": "deduplicated",
+            "topic_key": claim.topic_key,
+        }
+    evidence = _evidence(state)
+    rec = {
+        "recommendation_id": f"market_admission:{state['admission_key']}:adx_derivatives_program",
+        "source_agent": "market_admission_bridge",
+        "payload": {
+            "agent_name": "market_admission_bridge",
+            "title": "Paper-test ADX derivatives via public companion quotes",
+            "rationale": (
+                "ADX's public derivatives catalog is reference-only, but the repaired adapter now attaches "
+                "fresh public companion prices for the listed SSF underlyings. Those prices can support "
+                "same-surface paper proxy experiments without claiming a futures order route."
+            ),
+            "strategy_lab_experiment": {
+                "strategy_lab_id": ADX_DERIVATIVES_LAB_ID,
+                "experiment_type": "market_strategy",
+                "hypothesis": (
+                    "Fresh public companion quotes for ADX single-stock futures underlyings support "
+                    "same-surface paper continuation experiments until a direct futures quote path exists."
+                ),
+                "source_surface": ADX_DERIVATIVES_SURFACE,
+                "permitted_target_surface": [ADX_DERIVATIVES_SURFACE],
+                "strategy_logic": {
+                    "type": "observation_program",
+                    "universe": {
+                        "venues": ["ADX"],
+                        "trade_types": ["official_derivatives_contract_reference"],
+                        "market_surfaces": [ADX_DERIVATIVES_SURFACE],
+                    },
+                    "calculated_features": {
+                        "companion_return_strength_bps": "abs(return_5m_bps)",
+                    },
+                    "entry_expression": (
+                        "market_surface == 'adx_equity_and_index_futures_contract_catalog' "
+                        "and price_basis == 'public_companion_underlying_spot_quote' "
+                        "and quality_status == 'verified_proxy' and freshness_state == 'fresh' "
+                        "and last > 0"
+                    ),
+                    "invalidation_expression": (
+                        "freshness_state != 'fresh' or last <= 0"
+                    ),
+                    "long_expression": "return_5m_bps > 0",
+                    "short_expression": "return_5m_bps < 0",
+                    "edge_expression": "companion_return_strength_bps",
+                    "score_expression": (
+                        "clip(45 + companion_return_strength_bps / 4, 0, 100)"
+                    ),
+                    "route_surface": "proxy",
+                },
+                "data_requirements": {
+                    "admission_key": state.get("admission_key"),
+                    "market_surface": ADX_DERIVATIVES_SURFACE,
+                    "required_fields": [
+                        "last",
+                        "price_basis",
+                        "quality_status",
+                        "freshness_state",
+                        "price_source",
+                        "source_url",
+                        "source_contract_url",
+                        "companion_quote_symbol",
+                    ],
+                    "requires_independent_signal_logic": True,
+                    "paper_only_reference": True,
+                },
+                "risk_gates": {
+                    "require_route_feasible": False,
+                    "paper_allocation_multiplier": 0.25,
+                },
+            },
+            "evidence": evidence,
+        },
+    }
+    result = ingest_strategy_lab_recommendation(conn, rec, settings)[0]
+    if result.get("strategy_lab_id"):
+        bind_artifact(conn, claim.topic_key, "strategy_lab_experiments", result["strategy_lab_id"])
+    return {
+        "action": "strategy_lab_adx_derivatives_program",
+        "status": "created" if result.get("created") else "updated",
+        "strategy_lab_id": result.get("strategy_lab_id"),
+        "topic_key": claim.topic_key,
+    }
+
+
 def _create_strategy_discovery(
     conn: sqlite3.Connection,
     settings: dict,
@@ -403,7 +509,13 @@ def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admiss
             else:
                 actions.append(_create_enrichment(conn, state))
         elif stage == "quality_verified" and str(state.get("strategy_lineage") or "") == "adapter_observation":
-            actions.append(_create_strategy_discovery(conn, settings, state))
+            if (
+                str(state.get("venue") or "").upper() == "ADX"
+                and str(state.get("market_surface") or "") == ADX_DERIVATIVES_SURFACE
+            ):
+                actions.append(_create_adx_derivatives_companion_program(conn, settings, state))
+            else:
+                actions.append(_create_strategy_discovery(conn, settings, state))
         elif stage == "strategy_candidate":
             actions.append(_create_route_action(conn, settings, state))
         elif stage == "route_feasible":

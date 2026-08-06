@@ -51,6 +51,25 @@ counterparty to both buyers and sellers. Clearing Members deposit collateral.
 """
 
 
+def tradingview_quote(symbol: str, price: str) -> str:
+    return f"""
+    <html><body>
+    <script type="application/ld+json">{{
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [{{
+        "@type": "Question",
+        "name": "What is {symbol} stock price today?",
+        "acceptedAnswer": {{
+          "@type": "Answer",
+          "text": "The current price of {symbol} is {price} AED — it has increased by 0.16% in the past 24 hours."
+        }}
+      }}]
+    }}</script>
+    </body></html>
+    """
+
+
 def fetch_result(text: str, received_at: str = "2026-08-04T08:30:00+00:00") -> dict:
     return {
         "ok": True,
@@ -108,6 +127,12 @@ class AdxDerivativesAdapterTests(unittest.TestCase):
                 fetch_result(CATALOG_TEXT),
                 fetch_result(ANNOUNCEMENT_TEXT),
                 fetch_result(CLEARING_TEXT),
+                fetch_result(tradingview_quote("ADNOCGAS", "3.37")),
+                fetch_result(tradingview_quote("ADNOCDRILL", "6.06")),
+                fetch_result(tradingview_quote("ADNOCLS", "6.24")),
+                fetch_result(tradingview_quote("PRESIGHT", "3.58")),
+                fetch_result(tradingview_quote("SIB", "2.96")),
+                fetch_result(tradingview_quote("2POINTZERO", "2.00")),
             ],
         ) as fetch:
             batch = AbuDhabiSecuritiesExchangeAdxDerivativesAdapter().scan({})
@@ -116,10 +141,19 @@ class AdxDerivativesAdapterTests(unittest.TestCase):
         self.assertEqual("reachable", batch.metadata["source_status"])
         self.assertEqual(7, batch.metadata["real_observation_count"])
         self.assertEqual([], batch.metadata["parser_failures"])
+        self.assertEqual([], batch.metadata["companion_failures"])
         self.assertTrue(batch.metadata["paper_only"])
         self.assertEqual("reachable", batch.metadata["fetch_status"]["catalog"]["fetch_status"])
         self.assertEqual("mixed", batch.metadata["freshness_state"])
-        self.assertEqual("mixed", batch.metadata["session_state"])
+        self.assertEqual("unknown", batch.metadata["session_state"])
+        priced = {row["symbol"]: row for row in batch.observations if row["symbol"].startswith("SSF_")}
+        self.assertEqual(3.37, priced["SSF_ADNOC_GAS"]["last"])
+        self.assertEqual(2.0, priced["SSF_TWO_POINT_ZERO_GROUP"]["last"])
+        self.assertTrue(all(row["price_available"] is True for row in priced.values()))
+        self.assertTrue(all(row["quality_status"] == "verified_proxy" for row in priced.values()))
+        self.assertTrue(all(row["price_basis"] == "public_companion_underlying_spot_quote" for row in priced.values()))
+        self.assertTrue(all(row["source_url"].startswith("https://www.tradingview.com/symbols/ADX-") for row in priced.values()))
+        self.assertTrue(all(row["source_contract_url"] == DERIVATIVES_NEWS_URL for row in priced.values()))
         self.assertEqual(DERIVATIVES_URL, fetch.call_args_list[0].args[0])
         self.assertEqual(DERIVATIVES_NEWS_URL, fetch.call_args_list[1].args[0])
         self.assertEqual(DERIVATIVES_CLEARING_URL, fetch.call_args_list[2].args[0])
@@ -141,6 +175,12 @@ class AdxDerivativesAdapterTests(unittest.TestCase):
                 fetch_result(CATALOG_TEXT),
                 fetch_result(ANNOUNCEMENT_TEXT),
                 fetch_result(CLEARING_TEXT),
+                fetch_result(tradingview_quote("ADNOCGAS", "3.37")),
+                fetch_result(tradingview_quote("ADNOCDRILL", "6.06")),
+                fetch_result(tradingview_quote("ADNOCLS", "6.24")),
+                fetch_result(tradingview_quote("PRESIGHT", "3.58")),
+                fetch_result(tradingview_quote("SIB", "2.96")),
+                fetch_result(tradingview_quote("2POINTZERO", "2.00")),
             ],
         ), mock.patch.object(adapter_runtime, "RUNS_DIR", pathlib.Path(tmp)), mock.patch.object(
             adapter_runtime, "CACHE_DIR", pathlib.Path(tmp) / "cache"
@@ -164,6 +204,7 @@ class AdxDerivativesAdapterTests(unittest.TestCase):
         report = batch.metadata["public_market_adapters"]
         self.assertEqual(adapter_id, report["adapters"][0]["adapter_id"])
         self.assertEqual("reachable", report["adapters"][0]["source_status"])
+        self.assertEqual(6, report["adapters"][0]["price_observation_count"])
 
     def test_runtime_keeps_unavailable_source_as_watch_only_health_evidence(self) -> None:
         blocked = {
