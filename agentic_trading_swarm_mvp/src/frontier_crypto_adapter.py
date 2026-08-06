@@ -3133,13 +3133,22 @@ def paper_only_mercado_bitcoin_observation_from_public_payloads(
         route_quality=route_quality,
     )
 
-    return {
+    observation = {
         "venue": "MERCADO_BITCOIN",
         "market": f"MERCADO_BITCOIN:{display_symbol}",
         "symbol": display_symbol,
         "venue_symbol": venue_symbol,
+        "instrument_id": f"MERCADO_BITCOIN:{venue_symbol}",
         "base_asset": spec["base"],
         "quote_asset": spec["quote"],
+        "instrument_metadata": {
+            "venue": "MERCADO_BITCOIN",
+            "venue_symbol": venue_symbol,
+            "base_asset": spec["base"],
+            "quote_asset": spec["quote"],
+            "market_type": "spot",
+            "public_read_only": True,
+        },
         "paper_only": True,
         "observation_type": "spot",
         "last_price": last_price,
@@ -3178,6 +3187,8 @@ def paper_only_mercado_bitcoin_observation_from_public_payloads(
         "paper_ineligible_reason": paper_ineligible_reason,
         "simulated_slippage_tier": simulated_slippage_tier,
     }
+    observation.update(native_spot_surface_fields(observation))
+    return observation
 
 
 def paper_only_valr_observation_from_public_payloads(
@@ -12082,6 +12093,7 @@ def _candidate_from_observation(
         "depth_concentration_25bps": observation.get("depth_concentration_25bps"),
         "anomaly_flags": anomaly_flags,
         "critical_anomaly_flags": critical_anomalies,
+        "quality_flags": observation.get("quality_flags") or {},
         "risk_notes": [
             "paper-trade only",
             "public endpoint data may be delayed, blocked, or venue-specific",

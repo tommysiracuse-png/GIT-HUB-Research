@@ -160,6 +160,33 @@ class QualityMathTests(unittest.TestCase):
         self.assertIn("stale_book", result["anomaly_flags"])
         self.assertIn("high_latency", result["anomaly_flags"])
         self.assertIn("invalid_level_value", result["anomaly_flags"])
+        self.assertTrue(result["quality_flags"]["crossed_book"])
+
+    def test_quality_flags_surface_halted_sparse_and_depth_jump_diagnostics(self) -> None:
+        row = observation()
+        row["market_status"] = "halted"
+        result = quality.analyze_book(
+            row,
+            {
+                "bids": [["99.99", "25"]],
+                "asks": [["100.01", "25"]],
+                "book_timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "freshness_basis": "exchange_timestamp",
+                "update_gap_seconds": 120.0,
+                "previous_top_of_book_depth_usd": 100.0,
+            },
+            latency_ms=25.0,
+            received_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+
+        self.assertIn("halted_market", result["anomaly_flags"])
+        self.assertIn("sparse_updates", result["anomaly_flags"])
+        self.assertIn("suspicious_depth_jump", result["anomaly_flags"])
+        self.assertTrue(result["quality_flags"]["halted_market"])
+        self.assertTrue(result["quality_flags"]["sparse_updates"])
+        self.assertTrue(result["quality_flags"]["suspicious_depth_jump"])
+        self.assertEqual("halted", result["quality_flags"]["session_status"])
+        self.assertGreater(result["quality_flags"]["depth_jump_ratio"], 5.0)
 
     def test_regional_depth_is_converted_to_usd_before_quality_scoring(self) -> None:
         row = observation()

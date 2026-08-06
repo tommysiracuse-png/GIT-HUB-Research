@@ -33,6 +33,92 @@ def _coerce_float(value: object) -> float | None:
         return None
 
 
+def _decimal_places(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "e" in text.lower():
+        number = _coerce_float(value)
+        if number is None:
+            return None
+        text = f"{number:.12f}".rstrip("0").rstrip(".")
+    if "." not in text:
+        return 0
+    return len(text.split(".", 1)[1].rstrip("0"))
+
+
+def _increment_from_precision(precision: object) -> float | None:
+    try:
+        digits = int(precision)
+    except (TypeError, ValueError):
+        return None
+    if digits < 0:
+        return None
+    return round(10.0 ** (-digits), digits) if digits > 0 else 1.0
+
+
+def _merge_venue_constraints(source: Mapping[str, object]) -> dict[str, object]:
+    metadata = source.get("instrument_metadata")
+    metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+    existing = metadata.get("venue_constraints")
+    existing = dict(existing) if isinstance(existing, Mapping) else {}
+    top_level = source.get("venue_constraints")
+    top_level = dict(top_level) if isinstance(top_level, Mapping) else {}
+    merged = {**existing, **top_level}
+
+    price_precision = merged.get("price_precision")
+    if price_precision is None:
+        price_samples = [
+            source.get("best_bid"),
+            source.get("best_ask"),
+            source.get("bid"),
+            source.get("ask"),
+            source.get("last"),
+            source.get("last_price"),
+            source.get("mid_price"),
+        ]
+        precisions = [value for value in (_decimal_places(sample) for sample in price_samples) if value is not None]
+        if precisions:
+            price_precision = max(precisions)
+
+    quantity_precision = merged.get("quantity_precision")
+    if quantity_precision is None:
+        quantity_samples = [source.get("bid_size"), source.get("ask_size")]
+        shallow = source.get("shallow_order_book")
+        if isinstance(shallow, Mapping):
+            for side in ("bids", "asks"):
+                levels = shallow.get(side)
+                if isinstance(levels, Sequence):
+                    for level in levels[:2]:
+                        if isinstance(level, Sequence) and len(level) >= 2:
+                            quantity_samples.append(level[1])
+        precisions = [value for value in (_decimal_places(sample) for sample in quantity_samples) if value is not None]
+        if precisions:
+            quantity_precision = max(precisions)
+
+    normalized = {
+        "price_precision": price_precision,
+        "price_increment": merged.get("price_increment")
+        if merged.get("price_increment") is not None
+        else _increment_from_precision(price_precision),
+        "quantity_precision": quantity_precision,
+        "quantity_increment": merged.get("quantity_increment")
+        if merged.get("quantity_increment") is not None
+        else _increment_from_precision(quantity_precision),
+        "min_order_quantity": _coerce_float(merged.get("min_order_quantity")),
+        "min_order_notional_quote": _coerce_float(merged.get("min_order_notional_quote")),
+        "constraint_source": merged.get("constraint_source") or "observed_public_payload",
+    }
+    normalized["complete"] = bool(
+        normalized["price_increment"] is not None
+        and normalized["quantity_increment"] is not None
+        and normalized["min_order_quantity"] is not None
+    )
+    return normalized
+
+
 def native_spot_surface_fields(observation: Mapping[str, object]) -> dict[str, object]:
     """Return portable read-only public-spot fields for frontier candidates.
 
@@ -48,6 +134,7 @@ def native_spot_surface_fields(observation: Mapping[str, object]) -> dict[str, o
     venue_symbol = str(source.get("venue_symbol") or symbol or "").upper() or None
     metadata = source.get("instrument_metadata")
     metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+    venue_constraints = _merge_venue_constraints(source)
     metadata.update(
         {
             "venue": venue,
@@ -56,6 +143,7 @@ def native_spot_surface_fields(observation: Mapping[str, object]) -> dict[str, o
             "quote_asset": quote,
             "market_type": "spot",
             "public_read_only": True,
+            "venue_constraints": venue_constraints,
         }
     )
     shallow_order_book = source.get("shallow_order_book")
@@ -72,6 +160,7 @@ def native_spot_surface_fields(observation: Mapping[str, object]) -> dict[str, o
         "market_data_origin": "native_public_spot",
         "synthetic_research": False,
         "instrument_metadata": metadata,
+        "venue_constraints": venue_constraints,
         "best_bid": _coerce_float(source.get("best_bid") if source.get("best_bid") is not None else source.get("bid")),
         "best_ask": _coerce_float(source.get("best_ask") if source.get("best_ask") is not None else source.get("ask")),
         "last_trade_timestamp": source.get("last_trade_timestamp") or source.get("exchange_timestamp"),

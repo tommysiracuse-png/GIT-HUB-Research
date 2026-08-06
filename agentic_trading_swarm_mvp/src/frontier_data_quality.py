@@ -4493,6 +4493,13 @@ def simulate_fill(
     }
 
 
+def _status_flag(value: object, enabled_tokens: set[str]) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return bool(text and text in enabled_tokens)
+
+
 def _quality_score(
     observation: dict,
     depth: dict,
@@ -4603,6 +4610,36 @@ def analyze_book(
         fills["sell"][str(int(notional))] = simulate_fill(bids, "sell", notional, depth_multiplier)
     if not fills["buy"]["1000"]["filled"] or not fills["sell"]["1000"]["filled"]:
         anomalies.append("depth_cliff")
+    halted_market = _status_flag(
+        raw_book.get("halted")
+        or observation.get("halted")
+        or raw_book.get("market_halted")
+        or observation.get("market_halted"),
+        {"1", "true", "yes", "halted", "suspended", "paused", "auction_only"},
+    )
+    session_status = str(
+        raw_book.get("session_status")
+        or observation.get("session_status")
+        or raw_book.get("market_status")
+        or observation.get("market_status")
+        or ""
+    ).strip().lower().replace("-", "_").replace(" ", "_")
+    if session_status in {"halted", "suspended", "paused", "auction_only"}:
+        halted_market = True
+    if halted_market:
+        anomalies.append("halted_market")
+    update_gap_seconds = _as_float(
+        raw_book.get("update_gap_seconds")
+        if raw_book.get("update_gap_seconds") is not None
+        else observation.get("update_gap_seconds")
+    )
+    sparse_updates = False
+    if _status_flag(raw_book.get("sparse_updates") or observation.get("sparse_updates"), {"1", "true", "yes"}):
+        sparse_updates = True
+    elif update_gap_seconds is not None and update_gap_seconds > max(fresh_seconds, 0.0):
+        sparse_updates = True
+    if sparse_updates:
+        anomalies.append("sparse_updates")
     total_10 = depth_usd["bid"]["10"] + depth_usd["ask"]["10"]
     imbalance = (
         (depth_usd["bid"]["10"] - depth_usd["ask"]["10"]) / total_10
@@ -4623,6 +4660,20 @@ def analyze_book(
         depth_usd["bid"]["25"], depth_usd["ask"]["25"]
     ) < 100.0:
         anomalies.append("reported_volume_depth_mismatch")
+    previous_top_depth_usd = _as_float(
+        raw_book.get("previous_top_of_book_depth_usd")
+        if raw_book.get("previous_top_of_book_depth_usd") is not None
+        else observation.get("previous_top_of_book_depth_usd")
+    )
+    current_depth_levels = [value for value in (depth_usd["bid"]["10"], depth_usd["ask"]["10"]) if value > 0]
+    current_top_depth_usd = min(current_depth_levels) if current_depth_levels else 0.0
+    depth_jump_ratio = None
+    suspicious_depth_jump = False
+    if previous_top_depth_usd is not None and previous_top_depth_usd > 0 and current_top_depth_usd > 0:
+        depth_jump_ratio = current_top_depth_usd / previous_top_depth_usd
+        suspicious_depth_jump = depth_jump_ratio >= 5.0 or depth_jump_ratio <= 0.2
+    if suspicious_depth_jump:
+        anomalies.append("suspicious_depth_jump")
 
     depth = {
         "bids": bids,
@@ -4641,6 +4692,15 @@ def analyze_book(
     anomaly_flags = sorted(set(anomalies))
     critical = sorted(CRITICAL_ANOMALIES.intersection(anomaly_flags))
     status = "unknown" if quote_to_usd is None else "verified" if not anomaly_flags else "degraded"
+    quality_flags = {
+        "halted_market": halted_market,
+        "crossed_book": "crossed_book" in anomaly_flags,
+        "sparse_updates": sparse_updates,
+        "suspicious_depth_jump": suspicious_depth_jump,
+        "session_status": session_status or None,
+        "update_gap_seconds": round(update_gap_seconds, 3) if update_gap_seconds is not None else None,
+        "depth_jump_ratio": round(depth_jump_ratio, 6) if depth_jump_ratio is not None else None,
+    }
     return {
         "quality_status": status,
         "quality_score": score,
@@ -4662,6 +4722,7 @@ def analyze_book(
         "quote_to_usd_multiplier": round(quote_to_usd, 12) if quote_to_usd is not None else None,
         "anomaly_flags": anomaly_flags,
         "critical_anomaly_flags": critical,
+        "quality_flags": quality_flags,
     }
 
 

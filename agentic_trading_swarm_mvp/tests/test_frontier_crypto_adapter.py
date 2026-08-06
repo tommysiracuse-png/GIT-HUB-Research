@@ -254,6 +254,8 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertFalse(candidate["paper_entry_blocked"])
         self.assertEqual(candidate["market_data_origin"], "native_public_spot")
         self.assertEqual(candidate["instrument_metadata"]["venue"], "VALR")
+        self.assertEqual(candidate["venue_constraints"]["price_precision"], 0)
+        self.assertEqual(candidate["instrument_metadata"]["venue_constraints"]["constraint_source"], "observed_public_payload")
 
         short_valr = copy.deepcopy(valr)
         short_valr.update(

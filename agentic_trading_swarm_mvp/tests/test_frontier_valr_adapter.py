@@ -65,6 +65,9 @@ class ValrPaperAdapterTests(unittest.TestCase):
         self.assertEqual(observation["last_trade_timestamp"], "2026-07-21T23:45:30+00:00")
         self.assertEqual(observation["observed_at"], "2026-07-21T23:46:00+00:00")
         self.assertEqual(observation["instrument_metadata"]["market_type"], "spot")
+        self.assertEqual(observation["venue_constraints"]["price_precision"], 0)
+        self.assertEqual(observation["venue_constraints"]["quantity_precision"], 2)
+        self.assertEqual(observation["instrument_metadata"]["venue_constraints"]["constraint_source"], "observed_public_payload")
         self.assertEqual(observation["shallow_order_book"]["bids"], [[1234400.0, 0.75]])
         self.assertEqual(observation["market_data_origin"], "native_public_spot")
 

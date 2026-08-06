@@ -57,6 +57,9 @@ class TestMercadoBitcoinAdapter(unittest.TestCase):
         self.assertIsNotNone(observation["depth_liquidity_score"])
         self.assertGreaterEqual(observation["depth_liquidity_score"], 0.0)
         self.assertLessEqual(observation["depth_liquidity_score"], 1.0)
+        self.assertEqual(observation["market_data_origin"], "native_public_spot")
+        self.assertEqual(observation["venue_constraints"]["price_precision"], 0)
+        self.assertEqual(observation["venue_constraints"]["quantity_precision"], 2)
         self.assertEqual(observation["venue_quality"]["route_status"], "reachable")
 
     def test_observation_respects_blocked_route_status(self):
