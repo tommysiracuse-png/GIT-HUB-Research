@@ -50,7 +50,7 @@ PAPER_CONTEXT_PRIOR_DEFAULTS = {
     "paper_only": True,
     "exceptional_base_signal_score": 85.0,
     "feasibility_standard_prior": 6.0,
-    "feasibility_conditional_prior": -8.0,
+    "feasibility_conditional_prior": -10.0,
     "realized_context_window_closed_trades": 30,
     "realized_context_min_closed_trades": 6,
     "realized_context_positive_scale": 0.2,
@@ -58,21 +58,25 @@ PAPER_CONTEXT_PRIOR_DEFAULTS = {
     "realized_context_max_positive_prior": 12.0,
     "realized_context_max_negative_prior": -18.0,
     "realized_context_persistent_negative_closed_trades": 8,
-    "realized_context_conditional_penalty_multiplier": 1.5,
-    "realized_context_persistent_negative_multiplier": 1.25,
+    "realized_context_conditional_penalty_multiplier": 1.75,
+    "realized_context_persistent_negative_multiplier": 1.5,
     "strong_liquidity_score": 0.70,
     "strong_liquidity_prior": 4.0,
     "weak_liquidity_score": 0.45,
     "weak_liquidity_prior": -8.0,
-    "carry_strategy_prior": 8.0,
-    "convergence_strategy_prior": -10.0,
-    "venue_direction_priors": {
-        "OKX_SPOT|long": 8.0,
-        "BYBIT_SPOT|long": 6.0,
-        "GATE|short": 3.0,
-        "GATE|long": -7.0,
-        "KRAKEN|long": -4.0,
-        "MEXC|long": -12.0,
+    "venue_direction_feasibility_priors": {
+        "OKX_SPOT|long|standard": 8.0,
+        "OKX_SPOT|long|conditional": 1.0,
+        "BYBIT_SPOT|long|standard": 6.0,
+        "BYBIT_SPOT|long|conditional": -3.0,
+        "GATE|short|standard": 3.0,
+        "GATE|short|conditional": -2.0,
+        "GATE|long|standard": -7.0,
+        "GATE|long|conditional": -10.0,
+        "KRAKEN|long|standard": -4.0,
+        "KRAKEN|long|conditional": -7.0,
+        "MEXC|long|standard": -12.0,
+        "MEXC|long|conditional": -15.0,
     },
 }
 CRITICAL_ANOMALY_TERMS = {"crossed_book", "locked_book", "one_sided_book", "empty_book", "stale_book", "critical"}
@@ -3204,14 +3208,23 @@ def _set_score(candidate: dict, delta: float) -> None:
 def _paper_context_prior_policy(config: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return the paper-only context-prior policy without enabling live use."""
     policy = dict(PAPER_CONTEXT_PRIOR_DEFAULTS)
-    policy["venue_direction_priors"] = dict(PAPER_CONTEXT_PRIOR_DEFAULTS["venue_direction_priors"])
+    policy["venue_direction_feasibility_priors"] = dict(
+        PAPER_CONTEXT_PRIOR_DEFAULTS["venue_direction_feasibility_priors"]
+    )
     if not isinstance(config, Mapping):
         return policy
     configured = config.get("paper_context_priors")
     if isinstance(configured, Mapping):
         for key, value in configured.items():
-            if key == "venue_direction_priors" and isinstance(value, Mapping):
+            if key == "venue_direction_feasibility_priors" and isinstance(value, Mapping):
                 policy[key].update(value)
+            elif key == "venue_direction_priors" and isinstance(value, Mapping):
+                for slice_key, prior in value.items():
+                    normalized_key = str(slice_key or "").strip()
+                    if not normalized_key:
+                        continue
+                    policy["venue_direction_feasibility_priors"][f"{normalized_key}|standard"] = prior
+                    policy["venue_direction_feasibility_priors"][f"{normalized_key}|conditional"] = prior
             else:
                 policy[key] = value
     return policy
@@ -3274,16 +3287,16 @@ def _paper_context_venue(candidate: Mapping[str, Any]) -> str:
     return venue
 
 
-def _paper_context_strategy_prior(candidate: Mapping[str, Any], policy: Mapping[str, Any]) -> tuple[float, str | None]:
+def _paper_context_strategy_family(candidate: Mapping[str, Any]) -> str | None:
     family = " ".join(
         str(candidate.get(field) or "").lower()
         for field in ("strategy_family", "signal_family", "trade_type", "direction", "signal_key")
     )
     if any(token in family for token in ("mean_reversion", "convergence", "long_perp_short_spot")):
-        return _as_float(policy.get("convergence_strategy_prior"), -10.0), "convergence_or_mean_reversion"
+        return "convergence_or_mean_reversion"
     if any(token in family for token in ("funding_capture", "short_perp_long_spot", "carry")):
-        return _as_float(policy.get("carry_strategy_prior"), 8.0), "carry_or_funding_capture"
-    return 0.0, None
+        return "carry_or_funding_capture"
+    return None
 
 
 def _paper_context_feasibility_status(candidate: Mapping[str, Any]) -> str:
@@ -3305,6 +3318,20 @@ def _paper_context_realized_key(
 ) -> str:
     status = str(feasibility_status or _paper_context_feasibility_status(candidate) or "unknown").strip().lower()
     return f"{_paper_context_venue(candidate)}|{_paper_context_direction(candidate)}|{status or 'unknown'}"
+
+
+def _paper_context_slice_prior(
+    candidate: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    *,
+    feasibility_status: str,
+) -> tuple[float, str]:
+    key = _paper_context_realized_key(candidate, feasibility_status=feasibility_status)
+    priors = policy.get("venue_direction_feasibility_priors")
+    if not isinstance(priors, Mapping):
+        return 0.0, key
+    prior = _as_float(priors.get(key), 0.0)
+    return round(prior, 3), key
 
 
 def _paper_context_realized_stats(
@@ -3430,11 +3457,10 @@ def apply_paper_context_priors(
         if feasibility_status == "conditional"
         else 0.0
     )
-    venue = _paper_context_venue(candidate)
-    direction = _paper_context_direction(candidate)
-    venue_direction_key = f"{venue}|{direction}"
-    venue_direction_prior = _as_float(
-        (policy.get("venue_direction_priors") or {}).get(venue_direction_key), 0.0
+    context_slice_prior, context_slice_key = _paper_context_slice_prior(
+        candidate,
+        policy,
+        feasibility_status=feasibility_status,
     )
     liquidity_raw = _maybe_float(candidate.get("liquidity_score"))
     liquidity_score = _normalize_fraction(liquidity_raw) if liquidity_raw is not None else None
@@ -3449,7 +3475,7 @@ def apply_paper_context_priors(
             liquidity_bucket = "weak"
         else:
             liquidity_bucket = "normal"
-    strategy_family_prior, strategy_family = _paper_context_strategy_prior(candidate, policy)
+    strategy_family = _paper_context_strategy_family(candidate)
     realized_context_prior, realized_context = _paper_context_realized_prior(
         candidate,
         policy,
@@ -3458,10 +3484,9 @@ def apply_paper_context_priors(
     )
     terms = {
         "feasibility_prior": round(feasibility_prior, 3),
-        "venue_direction_prior": round(venue_direction_prior, 3),
+        "context_slice_prior": round(context_slice_prior, 3),
         "realized_context_prior": round(realized_context_prior, 3),
         "liquidity_prior": round(liquidity_prior, 3),
-        "strategy_family_prior": round(strategy_family_prior, 3),
     }
     raw_total_prior = round(sum(terms.values()), 3)
     exceptional = base_score >= _as_float(policy.get("exceptional_base_signal_score"), 85.0)
@@ -3482,7 +3507,7 @@ def apply_paper_context_priors(
         "exceptional_signal_override": exceptional and raw_total_prior < 0.0,
         "existing_safety_state_preserved": existing_safety_state,
         "feasibility_status": feasibility_status,
-        "venue_direction_key": venue_direction_key,
+        "context_slice_key": context_slice_key,
         "realized_context_key": realized_context["key"],
         "realized_context_closed_count": realized_context["closed_count"],
         "realized_context_avg_pnl_bps": realized_context["avg_pnl_bps"],

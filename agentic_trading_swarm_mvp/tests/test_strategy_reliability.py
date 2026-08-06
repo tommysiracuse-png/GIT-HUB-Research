@@ -120,10 +120,11 @@ class StrategyReliabilityTests(unittest.TestCase):
             [candidate], {"mode": "paper", "allow_live_trading": False}
         )
 
-        self.assertEqual(rows[0]["score"], 84.0)
-        self.assertEqual(rows[0]["final_paper_score"], 84.0)
-        self.assertEqual(rows[0]["paper_context_prior"]["venue_direction_prior"], 6.0)
-        self.assertEqual(report["paper_context_prior_adjustments"][0]["final_paper_score"], 84.0)
+        self.assertEqual(rows[0]["score"], 76.0)
+        self.assertEqual(rows[0]["final_paper_score"], 76.0)
+        self.assertEqual(rows[0]["paper_context_prior"]["context_slice_key"], "BYBIT_SPOT|long|standard")
+        self.assertEqual(rows[0]["paper_context_prior"]["context_slice_prior"], 6.0)
+        self.assertEqual(report["paper_context_prior_adjustments"][0]["final_paper_score"], 76.0)
 
     def test_runtime_hydrates_realized_context_by_venue_direction_and_feasibility(self) -> None:
         standard = {
@@ -191,8 +192,10 @@ class StrategyReliabilityTests(unittest.TestCase):
 
         self.assertEqual(standard_row["paper_context_prior"]["realized_context_key"], "BYBIT_SPOT|long|standard")
         self.assertEqual(conditional_row["paper_context_prior"]["realized_context_key"], "BYBIT_SPOT|long|conditional")
+        self.assertEqual(standard_row["paper_context_prior"]["context_slice_key"], "BYBIT_SPOT|long|standard")
+        self.assertEqual(conditional_row["paper_context_prior"]["context_slice_key"], "BYBIT_SPOT|long|conditional")
         self.assertEqual(standard_row["paper_context_prior"]["realized_context_prior"], 4.0)
-        self.assertEqual(conditional_row["paper_context_prior"]["realized_context_prior"], -11.25)
+        self.assertEqual(conditional_row["paper_context_prior"]["realized_context_prior"], -15.75)
         self.assertGreater(standard_row["score"], conditional_row["score"])
         report_keys = {item["realized_context_key"] for item in report["paper_context_prior_adjustments"]}
         self.assertIn("BYBIT_SPOT|long|standard", report_keys)
