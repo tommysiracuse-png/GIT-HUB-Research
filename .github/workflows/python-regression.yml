@@ -1,0 +1,47 @@
+name: Python regression
+
+on:
+  pull_request:
+    paths:
+      - "agentic_trading_swarm_mvp/**"
+      - ".github/workflows/python-regression.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-regression-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: agentic_trading_swarm_mvp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            agentic_trading_swarm_mvp/requirements-autonomous.txt
+            agentic_trading_swarm_mvp/requirements-llm.txt
+      - name: Install test dependencies
+        run: >-
+          python -m pip install
+          pytest==7.4.4
+          psutil
+          pypdf
+          PyYAML
+          truststore
+          websocket-client
+      - name: Run complete regression suite
+        env:
+          RADAR_MODELS_DISABLED: "1"
+          RADAR_MODEL_CREDENTIAL_LOCK: "1"
+          RADAR_USE_LITELLM: "0"
+        run: python -m pytest -q
