@@ -121,6 +121,15 @@ class AutonomousCostGuardTests(unittest.TestCase):
             ):
                 with mock.patch.object(cost_router, "load_llm_config", return_value=model_cfg), mock.patch.object(
                     cost_router, "_log"
+                ), mock.patch.object(
+                    cost_router,
+                    "_reserve_model_call",
+                    side_effect=[
+                        {"allowed": True, "event_id": "event-1", "created_at": "2026-08-07T00:00:00+00:00"},
+                        {"allowed": True, "event_id": "event-2", "created_at": "2026-08-07T00:00:01+00:00"},
+                    ],
+                ), mock.patch.object(
+                    cost_router, "_cancel_model_reservation"
                 ), mock.patch.dict(
                     os.environ,
                     {

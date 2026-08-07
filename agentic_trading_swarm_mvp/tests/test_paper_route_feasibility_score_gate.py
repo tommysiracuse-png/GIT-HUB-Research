@@ -171,7 +171,7 @@ class PaperRouteFeasibilityScoreGateTests(unittest.TestCase):
             enriched["execution_feasibility"]["route_feasibility_score"],
         )
 
-    def test_execution_boundary_uses_synthetic_research_when_route_score_is_low(self) -> None:
+    def test_execution_boundary_rejects_one_leg_synthetic_paired_proxy(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         init_db(conn)
@@ -194,12 +194,15 @@ class PaperRouteFeasibilityScoreGateTests(unittest.TestCase):
             copy.deepcopy(DEFAULT_SETTINGS),
         )
 
-        self.assertTrue(result["paper_filled"])
-        self.assertEqual(1, len(result["fills"]))
-        self.assertEqual("paper_filled", result["order"]["status"])
-        self.assertEqual("synthetic_research_paper", result["order"]["route_id"])
+        self.assertFalse(result["paper_filled"])
+        self.assertEqual([], result["fills"])
+        self.assertEqual(
+            "blocked_paired_direct_requires_bounded_queue",
+            result["order"]["status"],
+        )
+        self.assertEqual("generic_paper_route", result["order"]["route_id"])
         row = conn.execute("select status from execution_orders").fetchone()
-        self.assertEqual("paper_filled", row["status"])
+        self.assertIsNone(row)
 
     def test_enriched_conditional_short_stays_diagnostic_only_at_execution_boundary(self) -> None:
         candidate = enrich_candidate_with_route(

@@ -13,9 +13,13 @@ Loop:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
+import math
+import os
 import pathlib
 import re
+import sqlite3
 import sys
 import time
 from types import SimpleNamespace
@@ -43,7 +47,7 @@ from llm_bridge import (
     route_requirement_candidate_inputs,
     write_llm_state_packet,
 )
-from market_admission import run_market_admission_monitor
+from market_admission import admission_key_for, run_market_admission_monitor
 from market_admission_bridge import run_market_admission_bridge
 from llm_swarm_runner import run_once as run_llm_swarm_once
 from market_hunter import run_market_hunter
@@ -51,6 +55,15 @@ from memory_graph import ingest_radar_memory, memory_summary
 from okx_perp_scanner import build_scan_batch as build_okx_scan_batch
 from paper_context_cost import paper_context_cost_report
 from paper_context_drag import apply_context_drag_overlay, context_drag_report, context_drag_statistics
+from paper_admission_queue import (
+    enqueue_paper_admission_candidates,
+    paper_admission_queue_config,
+    paper_admission_queue_summary,
+    reconcile_paper_admission_queue,
+    select_paper_admission_candidates,
+)
+from due_outcome_collector import collect_due_outcome_prices
+from paper_expansion_campaign import apply_campaign_controls, record_campaign_cycle
 from okx_signal_research import run_okx_signal_research
 from paper_exploration import exploration_enabled, fair_lineage_order, prepare_candidate_for_exploration
 from paper_exploration_report import compact_paper_exploration_report, write_paper_exploration_report
@@ -69,13 +82,16 @@ from signal_safety import run_signal_safety_governor
 from signal_redesign import run_frontier_redesign
 from settings import load_settings
 from strategy_lab import (
+    RECOVERY_CANARY_STRATEGY_LAB_ID,
     evaluate_strategy_lab,
     generate_strategy_lab_candidates,
+    recovery_canary_direct_label_eligible,
     strategy_lab_surface_activation_eligible,
     write_strategy_lab_reports,
 )
 from strategy_reliability import apply_strategy_reliability
 from storage import (
+    DB_PATH,
     RUNS_DIR,
     active_signal_policies,
     close_due_trades,
@@ -93,10 +109,16 @@ from storage import (
     open_tasks,
     perform_maintenance,
     performance_summary,
+    load_due_paper_outcome_targets,
+    mark_due_paper_outcome_windows_attempted,
     reconcile_pending_opportunities,
     record_due_horizon_outcomes,
+    record_paper_funding_coverage,
+    record_paper_price_observations,
+    reliable_paper_label_eligibility_for_trade_row,
     save_opportunity,
     update_opportunity_decision,
+    utc_now,
 )
 from yahoo_counterfactual import run_yahoo_counterfactual_analysis
 
@@ -203,6 +225,22 @@ def _strategy_lab_lineage_root_id(candidate: dict) -> str:
         previous = current
         current = re.sub(r"__relaxed_r\d+$", "", current)
     return current
+
+
+def _is_recovery_canary_candidate(candidate: dict) -> bool:
+    """Identify the one Strategy Lab lineage allowed during canary recovery."""
+
+    return bool(
+        str(candidate.get("strategy_lab_id") or "").strip()
+        == RECOVERY_CANARY_STRATEGY_LAB_ID
+        and _strategy_lab_lineage_root_id(candidate)
+        == RECOVERY_CANARY_STRATEGY_LAB_ID
+        and str(candidate.get("venue") or "").strip().upper() == "OKX"
+        and str(candidate.get("trade_type") or "").strip().lower()
+        == "perp_funding_basis"
+        and str(candidate.get("direction") or "").strip().lower()
+        == "short_perp_long_spot"
+    )
 
 
 def _strategy_lab_runtime_selection_summary(
@@ -348,6 +386,677 @@ def _pending_execution_review(review: dict) -> dict:
     }
 
 
+def _not_queued_execution_review(review: dict) -> dict:
+    """Persist a review that was not admitted to the bounded execution queue."""
+
+    intended = str(review.get("decision") or "unknown")
+    return {
+        **review,
+        "decision": "reviewed_not_queued",
+        "intended_decision": intended,
+        "execution_status": "not_selected_for_bounded_paper_queue",
+    }
+
+
+def _paper_lane_limits(total: int) -> dict[str, int]:
+    """Split a bounded quota evenly, with a single odd slot favoring evidence."""
+
+    total = max(0, int(total))
+    return {"evidence": (total + 1) // 2, "discovery": total // 2}
+
+
+def _paper_queue_identity(candidate: dict) -> str:
+    return str(candidate.get("admission_key") or admission_key_for(candidate))
+
+
+def _paper_queue_claim_identity(candidate: dict) -> tuple[str, str, str, str]:
+    metadata = candidate.get("paper_admission")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return (
+        str(candidate.get("_paper_admission_queue_id") or metadata.get("queue_id") or ""),
+        str(candidate.get("admission_key") or metadata.get("admission_key") or ""),
+        str(
+            candidate.get("admission_episode_id")
+            or candidate.get("episode_id")
+            or metadata.get("episode_id")
+            or ""
+        ),
+        str(
+            candidate.get("_paper_admission_claim_token")
+            or candidate.get("paper_admission_claim_token")
+            or metadata.get("claim_token")
+            or ""
+        ),
+    )
+
+
+def _reviewed_for_accounting(reviewed: list[dict]) -> list[dict]:
+    """Exclude unqueued approvals while retaining queued admission intent."""
+
+    output = []
+    for item in reviewed:
+        intended = item.get("review") if isinstance(item.get("review"), dict) else {}
+        execution_review = (
+            item.get("execution_review")
+            if isinstance(item.get("execution_review"), dict)
+            else {}
+        )
+        effective = (
+            execution_review
+            if str(execution_review.get("decision") or "") == "reviewed_not_queued"
+            else intended
+        )
+        output.append({**item, "intended_review": intended, "review": effective})
+    return output
+
+
+def _current_peak_rss_mb() -> float | None:
+    try:
+        import psutil  # type: ignore
+
+        info = psutil.Process().memory_info()
+        rss = max(int(getattr(info, "rss", 0) or 0), int(getattr(info, "peak_wset", 0) or 0))
+        return round(rss / (1024.0 * 1024.0), 3)
+    except Exception:
+        return None
+
+
+def _database_storage_footprint(path) -> int:
+    """Measure SQLite main + WAL bytes so uncheckpointed writes are visible."""
+
+    main = int(path.stat().st_size) if path.exists() else 0
+    wal_path = path.with_name(path.name + "-wal")
+    wal = int(wal_path.stat().st_size) if wal_path.exists() else 0
+    return main + wal
+
+
+def _sqlite_logical_footprint_bytes(conn) -> int:
+    page_count = int(conn.execute("pragma page_count").fetchone()[0] or 0)
+    page_size = int(conn.execute("pragma page_size").fetchone()[0] or 0)
+    return max(0, page_count) * max(0, page_size)
+
+
+def _database_logical_footprint(path) -> int:
+    """Read committed SQLite page allocation without counting transient WAL duplication."""
+
+    if not path.exists():
+        return 0
+    read_only = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        return _sqlite_logical_footprint_bytes(read_only)
+    finally:
+        read_only.close()
+
+
+def _lineage_coverage(
+    conn,
+    table: str,
+    time_column: str,
+    started_at: str,
+    *,
+    extra_where: str = "",
+    queue_link_column: str | None = None,
+) -> tuple[int, float]:
+    artifact_link = (
+        f"and queue.{queue_link_column} = artifact.id" if queue_link_column else ""
+    )
+    row = conn.execute(
+        f"""
+        select count(*) as total,
+               sum(case when exists (
+                              select 1 from paper_admission_queue queue
+                              where queue.admission_key = artifact.admission_key
+                                and queue.episode_id = artifact.admission_episode_id
+                                {artifact_link}
+                            )
+                         then 1 else 0 end) as linked
+        from {table} artifact
+        where julianday(artifact.{time_column}) >= julianday(?)
+          {extra_where}
+        """,
+        (started_at,),
+    ).fetchone()
+    total = int(row["total"] or 0)
+    linked = int(row["linked"] or 0)
+    return total, 1.0 if total == 0 else linked / total
+
+
+def _exact_queue_lineage_exists(
+    conn,
+    admission_key: object,
+    episode_id: object,
+    *,
+    paper_trade_id: int | None = None,
+    route_status: str | None = None,
+) -> bool:
+    key = str(admission_key or "").strip()
+    episode = str(episode_id or "").strip()
+    if not key or not episode:
+        return False
+    sql = "select 1 from paper_admission_queue where admission_key=? and episode_id=?"
+    params: list[object] = [key, episode]
+    if paper_trade_id is not None:
+        sql += " and paper_trade_id=?"
+        params.append(int(paper_trade_id))
+    if route_status is not None:
+        sql += " and lower(trim(route_status))=?"
+        params.append(str(route_status).strip().lower())
+    return (
+        conn.execute(sql + " limit 1", params).fetchone()
+        is not None
+    )
+
+
+def _parse_metric_timestamp(value: object) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _finite_number(value: object) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _exact_primary_phase_trades(
+    conn,
+    *,
+    phase_started_at: str,
+    captured_at: str,
+    default_hold_minutes: int,
+) -> list:
+    """Return the exact standard-route direct cohort opened in this phase."""
+
+    rows = conn.execute(
+        """
+        select trade.*,
+               exists (
+                   select 1
+                   from paper_trade_outcomes outcome
+                   where outcome.trade_id=trade.id
+                     and outcome.horizon_minutes=coalesce(
+                         trade.selected_hold_minutes, ?
+                     )
+                     and julianday(outcome.measured_at) <= julianday(?)
+               ) as selected_hold_outcome_present
+        from paper_trades trade
+        where julianday(trade.opened_at) >= julianday(?)
+          and julianday(trade.opened_at) <= julianday(?)
+          and exists (
+              select 1
+              from paper_admission_queue queue
+              where queue.paper_trade_id=trade.id
+                and queue.admission_key=trade.admission_key
+                and queue.episode_id=trade.admission_episode_id
+                and lower(trim(coalesce(queue.route_status,'')))='standard'
+          )
+        order by trade.id
+        """,
+        (default_hold_minutes, captured_at, phase_started_at, captured_at),
+    ).fetchall()
+    exact = []
+    for row in rows:
+        eligibility = reliable_paper_label_eligibility_for_trade_row(row)
+        scope = str(eligibility.get("paper_signal_stats_scope") or "").lower()
+        signal = str(row["signal_key"] or "").upper()
+        if scope == "direct" and not signal.startswith(
+            ("SYNTHETIC_RESEARCH|", "PAPER_PROXY|")
+        ):
+            exact.append(row)
+    return exact
+
+
+def _reliable_recovery_canary_pnls(
+    conn,
+    measured_since: str,
+    *,
+    opened_since: str,
+    captured_at: str,
+) -> list[float]:
+    rows = conn.execute(
+        """
+        select trade.id,trade.status,trade.signal_key,trade.candidate_json,
+               trade.review_json,trade.context_json,trade.close_measurement_status,
+               trade.strategy_lab_id,trade.strategy_lab_version,
+               trade.strategy_lineage_root_id,trade.admission_key,
+               trade.admission_episode_id,outcome.measurement_status,
+               outcome.pnl_bps,outcome.context_json as outcome_context_json,
+               outcome.admission_key as outcome_admission_key,
+               outcome.admission_episode_id as outcome_admission_episode_id
+        from paper_trades trade
+        join paper_trade_outcomes outcome
+          on outcome.trade_id=trade.id and outcome.horizon_minutes=60
+        where trade.strategy_lab_id=? and trade.strategy_lab_version=1
+          and julianday(outcome.measured_at) >= julianday(?)
+          and julianday(outcome.measured_at) <= julianday(?)
+          and julianday(trade.opened_at) >= julianday(?)
+          and julianday(trade.opened_at) <= julianday(?)
+          and exists (
+              select 1
+              from paper_admission_queue queue
+              where queue.paper_trade_id=trade.id
+                and queue.admission_key=trade.admission_key
+                and queue.episode_id=trade.admission_episode_id
+                and lower(trim(coalesce(queue.route_status,'')))='standard'
+          )
+        """,
+        (
+            RECOVERY_CANARY_STRATEGY_LAB_ID,
+            measured_since,
+            captured_at,
+            opened_since,
+            captured_at,
+        ),
+    ).fetchall()
+    return [
+        float(row["pnl_bps"])
+        for row in rows
+        if recovery_canary_direct_label_eligible(conn, row, expected_version=1)
+    ]
+
+
+def _bounded_campaign_metrics(
+    conn,
+    cycle_state: dict,
+    *,
+    settings: dict,
+    reviewed: list[dict],
+    frontier_crypto_venues: dict,
+    runtime_seconds: float,
+    db_size_before: int,
+    captured_at: str | None = None,
+) -> dict:
+    """Build current-cycle diagnostics and authoritative phase gate cohorts."""
+
+    if not cycle_state.get("enabled"):
+        return {}
+    started_at = str(cycle_state["cycle_started_at"])
+    phase_started_at = str(cycle_state.get("phase_started_at") or started_at)
+    captured_at = str(captured_at or utc_now())
+    captured_dt = _parse_metric_timestamp(captured_at) or dt.datetime.now(dt.timezone.utc)
+    started_dt = _parse_metric_timestamp(started_at) or captured_dt
+    learning_cfg = settings.get("learning") or {}
+    scanner_cfg = settings.get("scanner") or {}
+    try:
+        max_outcome_delay_seconds = max(
+            0.0, float(learning_cfg.get("max_outcome_delay_seconds", 300.0))
+        )
+    except (TypeError, ValueError):
+        max_outcome_delay_seconds = 300.0
+    try:
+        default_hold_minutes = max(1, int(scanner_cfg.get("hold_minutes", 60) or 60))
+    except (TypeError, ValueError):
+        default_hold_minutes = 60
+    phase_trade_rows = _exact_primary_phase_trades(
+        conn,
+        phase_started_at=phase_started_at,
+        captured_at=captured_at,
+        default_hold_minutes=default_hold_minutes,
+    )
+    direct_closes = []
+    timely_direct_closes = []
+    reliable_direct_closes = []
+    phase_due_direct_closes = 0
+    phase_reliable_direct_closes = 0
+    phase_timely_direct_closes = 0
+    reliable_phase_trade_ids: set[int] = set()
+    for row in phase_trade_rows:
+        closed_at = _parse_metric_timestamp(row["closed_at"])
+        final_close_present = closed_at is not None and closed_at <= captured_dt
+        try:
+            selected_hold_minutes = max(
+                1, int(row["selected_hold_minutes"] or default_hold_minutes)
+            )
+        except (TypeError, ValueError):
+            selected_hold_minutes = default_hold_minutes
+        opened_at = _parse_metric_timestamp(row["opened_at"])
+        close_deadline = (
+            opened_at
+            + dt.timedelta(
+                minutes=selected_hold_minutes,
+                seconds=max_outcome_delay_seconds,
+            )
+            if opened_at is not None
+            else None
+        )
+        close_due = (
+            final_close_present
+            or bool(row["selected_hold_outcome_present"])
+            or (close_deadline is not None and close_deadline <= captured_dt)
+        )
+        if close_due:
+            phase_due_direct_closes += 1
+        eligibility = reliable_paper_label_eligibility_for_trade_row(row)
+        reliable_close = bool(
+            final_close_present
+            and str(row["status"] or "").lower() == "closed"
+            and _finite_number(row["pnl_bps"])
+            and eligibility.get("paper_label_eligible")
+        )
+        if reliable_close:
+            reliable_phase_trade_ids.add(int(row["id"]))
+            phase_reliable_direct_closes += 1
+            phase_timely_direct_closes += 1
+        if final_close_present and closed_at >= started_dt:
+            direct_closes.append(row)
+            if reliable_close:
+                reliable_direct_closes.append(row)
+                timely_direct_closes.append(row)
+
+    # Query the full phase so an early horizon recorded in a prior cycle can
+    # become reliable once its trade later obtains a valid final close.
+    phase_horizon_rows = conn.execute(
+        """
+        select outcome.id,outcome.trade_id,outcome.horizon_minutes,
+               outcome.measured_at,outcome.target_at,outcome.observed_at,
+               outcome.delay_seconds,outcome.pnl_bps,outcome.measurement_status,
+               outcome.context_json as outcome_context_json,
+               outcome.admission_key as outcome_admission_key,
+               outcome.admission_episode_id as outcome_admission_episode_id,
+               trade.opened_at,trade.closed_at,trade.pnl_bps as trade_pnl_bps,
+               trade.selected_hold_minutes,trade.signal_key,trade.candidate_json,
+               trade.review_json,trade.context_json,trade.close_measurement_status,
+               trade.status,trade.strategy_lab_id,trade.strategy_lab_version,
+               trade.strategy_lineage_root_id,trade.admission_key,
+               trade.admission_episode_id
+        from paper_trade_outcomes outcome
+        join paper_trades trade on trade.id = outcome.trade_id
+        where julianday(outcome.measured_at) >= julianday(?)
+          and julianday(outcome.measured_at) <= julianday(?)
+          and julianday(trade.opened_at) >= julianday(?)
+          and julianday(trade.opened_at) <= julianday(?)
+        """,
+        (phase_started_at, captured_at, phase_started_at, captured_at),
+    ).fetchall()
+    exact_phase_trade_ids = {int(row["id"]) for row in phase_trade_rows}
+    horizon_rows = [
+        row
+        for row in phase_horizon_rows
+        if (_parse_metric_timestamp(row["measured_at"]) or captured_dt) >= started_dt
+    ]
+    direct_horizons = []
+    valid_direct_horizons = []
+    synthetic_primary = 0
+    synthetic_diagnostic_outcomes = 0
+    for row in horizon_rows:
+        eligibility = reliable_paper_label_eligibility_for_trade_row(row)
+        scope = str(eligibility.get("paper_signal_stats_scope") or "").lower()
+        signal = str(row["signal_key"] or "").upper()
+        non_direct = scope in {
+            "synthetic_research",
+            "paper_proxy",
+            "frontier_shadow_observation",
+        } or signal.startswith(("SYNTHETIC_RESEARCH|", "PAPER_PROXY|"))
+        if non_direct:
+            valid_measurement = str(row["measurement_status"] or "").lower() == "valid"
+            synthetic_diagnostic_outcomes += int(valid_measurement)
+            # Diagnostic observations are expected and are excluded by the
+            # shared label contract.  Only a non-direct row that somehow
+            # becomes eligible for a primary consumer is a campaign breach.
+            synthetic_primary += int(
+                valid_measurement and bool(eligibility.get("paper_label_eligible"))
+            )
+            continue
+        exact_primary_lineage = (
+            scope == "direct"
+            and int(row["trade_id"]) in exact_phase_trade_ids
+            and row["outcome_admission_key"] == row["admission_key"]
+            and row["outcome_admission_episode_id"] == row["admission_episode_id"]
+        )
+        if not exact_primary_lineage:
+            continue
+        direct_horizons.append(row)
+        if (
+            str(row["measurement_status"] or "").lower() == "valid"
+            and _finite_number(row["pnl_bps"])
+            and int(row["trade_id"]) in reliable_phase_trade_ids
+        ):
+            valid_direct_horizons.append(row)
+
+    configured_horizons = sorted(
+        {
+            int(value)
+            for value in (learning_cfg.get("horizon_minutes") or [])
+            if str(value).strip().lstrip("-").isdigit() and int(value) > 0
+        }
+    )
+    phase_outcomes_by_pair = {
+        (int(row["trade_id"]), int(row["horizon_minutes"])): row
+        for row in phase_horizon_rows
+        if int(row["trade_id"]) in exact_phase_trade_ids
+        and int(row["horizon_minutes"]) in configured_horizons
+    }
+    phase_due_horizon_outcomes = 0
+    phase_timely_horizon_outcomes = 0
+    for trade in phase_trade_rows:
+        opened_at = _parse_metric_timestamp(trade["opened_at"])
+        if opened_at is None:
+            continue
+        trade_id = int(trade["id"])
+        for horizon in configured_horizons:
+            outcome = phase_outcomes_by_pair.get((trade_id, horizon))
+            deadline = opened_at + dt.timedelta(
+                minutes=horizon,
+                seconds=max_outcome_delay_seconds,
+            )
+            if outcome is None and deadline > captured_dt:
+                continue
+            phase_due_horizon_outcomes += 1
+            if outcome is None:
+                continue
+            exact_outcome = (
+                outcome["outcome_admission_key"] == outcome["admission_key"]
+                and outcome["outcome_admission_episode_id"]
+                == outcome["admission_episode_id"]
+            )
+            if (
+                exact_outcome
+                and trade_id in reliable_phase_trade_ids
+                and str(outcome["measurement_status"] or "").lower() == "valid"
+                and _finite_number(outcome["pnl_bps"])
+            ):
+                phase_timely_horizon_outcomes += 1
+
+    canary_new = _reliable_recovery_canary_pnls(
+        conn,
+        started_at,
+        opened_since=phase_started_at,
+        captured_at=captured_at,
+    )
+
+    admission_keys_evaluated = int(
+        conn.execute(
+            """
+            select count(distinct transition.admission_key)
+            from market_admission_transitions transition
+            join paper_admission_queue queue
+              on queue.admission_key = transition.admission_key
+             and queue.episode_id = transition.episode_id
+            where julianday(transition.occurred_at) >= julianday(?)
+              and julianday(transition.occurred_at) <= julianday(?)
+              and transition.to_stage in ('paper_evaluated','queue:completed_valid')
+            """,
+            (phase_started_at, captured_at),
+        ).fetchone()[0]
+        or 0
+    )
+    opportunity_total, opportunity_coverage = _lineage_coverage(
+        conn,
+        "opportunities",
+        "seen_at",
+        started_at,
+        extra_where="and artifact.decision <> 'reviewed_not_queued'",
+        queue_link_column="opportunity_id",
+    )
+    order_total, order_coverage = _lineage_coverage(
+        conn,
+        "execution_orders",
+        "created_at",
+        started_at,
+        queue_link_column="execution_order_id",
+    )
+    trade_total, trade_coverage = _lineage_coverage(
+        conn,
+        "paper_trades",
+        "opened_at",
+        started_at,
+        queue_link_column="paper_trade_id",
+    )
+    opportunity_complete = round(opportunity_total * opportunity_coverage)
+    order_complete = round(order_total * order_coverage)
+    trade_complete = round(trade_total * trade_coverage)
+    lineage_corruption = int(
+        conn.execute(
+            """
+            select count(*)
+            from paper_trade_outcomes outcome
+            join paper_trades trade on trade.id = outcome.trade_id
+            where julianday(outcome.measured_at) >= julianday(?)
+              and julianday(outcome.measured_at) <= julianday(?)
+              and (coalesce(outcome.admission_key,'') <> coalesce(trade.admission_key,'')
+                   or coalesce(outcome.admission_episode_id,'') <>
+                      coalesce(trade.admission_episode_id,''))
+            """,
+            (started_at, captured_at),
+        ).fetchone()[0]
+        or 0
+    )
+    terminal = sum(
+        str((item.get("execution_review") or item.get("review") or {}).get("decision") or "")
+        != "pending_execution"
+        for item in reviewed
+    )
+    terminal_rate = 1.0 if not reviewed else terminal / len(reviewed)
+
+    canary_pnls = _reliable_recovery_canary_pnls(
+        conn,
+        phase_started_at,
+        opened_since=phase_started_at,
+        captured_at=captured_at,
+    )
+    sorted_canary = sorted(canary_pnls)
+    worst_count = max(1, int(len(sorted_canary) * 0.1)) if sorted_canary else 0
+    active_canary_count = int(
+        conn.execute(
+            """
+            select count(*) from strategy_lab_experiments
+            where strategy_lab_id=?
+              and parent_strategy_lab_id is null
+              and experiment_type='market_strategy'
+              and compile_status='compiled'
+              and status in (
+                  'active_testing','needs_more_evidence','needs_contract_revision'
+              )
+            """,
+            (RECOVERY_CANARY_STRATEGY_LAB_ID,),
+        ).fetchone()[0]
+        or 0
+    )
+    frontier_summary = frontier_crypto_venues.get("summary") or {}
+    db_physical_size_after = _database_storage_footprint(DB_PATH)
+    db_size_after = _sqlite_logical_footprint_bytes(conn)
+    artifact_names = ((cycle_state.get("campaign_config") or {}).get("health") or {}).get(
+        "max_artifact_bytes", {}
+    )
+    artifact_sizes = {
+        name: int((RUNS_DIR / name).stat().st_size) if (RUNS_DIR / name).exists() else 0
+        for name in artifact_names
+    }
+    def countish(value) -> int:
+        if isinstance(value, (list, tuple, set, dict)):
+            return len(value)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    metrics = {
+        "cycle_success": True,
+        "exit_code": 0,
+        "runtime_seconds": round(float(runtime_seconds), 3),
+        "peak_rss_mb": _current_peak_rss_mb(),
+        "db_growth_bytes": max(0, int(db_size_after) - int(db_size_before)),
+        "db_footprint_start_bytes": int(db_size_before),
+        "db_footprint_start_at": started_at,
+        "db_footprint_bytes": int(db_size_after),
+        "db_physical_footprint_bytes": int(db_physical_size_after),
+        "artifact_sizes": artifact_sizes,
+        "terminal_opportunity_rate": terminal_rate,
+        "new_admission_keys_paper_evaluated": admission_keys_evaluated,
+        "new_exact_attributed_admission_keys_paper_evaluated": admission_keys_evaluated,
+        "phase_distinct_exact_attributed_admission_keys_paper_evaluated": (
+            admission_keys_evaluated
+        ),
+        "new_direct_closes": len(direct_closes),
+        "new_valid_direct_closes": len(reliable_direct_closes),
+        "new_reliable_direct_closes": len(reliable_direct_closes),
+        "new_timely_direct_closes": len(timely_direct_closes),
+        "phase_due_direct_closes": phase_due_direct_closes,
+        "phase_reliable_direct_closes": phase_reliable_direct_closes,
+        "phase_timely_direct_closes": phase_timely_direct_closes,
+        "new_horizon_outcomes": len(direct_horizons),
+        "new_valid_horizon_outcomes": len(valid_direct_horizons),
+        "new_timely_horizon_outcomes": len(valid_direct_horizons),
+        "phase_due_horizon_outcomes": phase_due_horizon_outcomes,
+        "phase_timely_horizon_outcomes": phase_timely_horizon_outcomes,
+        "opportunity_lineage_total": opportunity_total,
+        "opportunity_lineage_coverage": opportunity_coverage,
+        "new_opportunity_lineage_records": opportunity_total,
+        "new_opportunity_lineage_complete": opportunity_complete,
+        "execution_order_lineage_total": order_total,
+        "execution_order_lineage_coverage": order_coverage,
+        "new_order_lineage_records": order_total,
+        "new_order_lineage_complete": order_complete,
+        "paper_trade_lineage_total": trade_total,
+        "paper_trade_lineage_coverage": trade_coverage,
+        "new_trade_lineage_records": trade_total,
+        "new_trade_lineage_complete": trade_complete,
+        "lineage_corruption_count": lineage_corruption,
+        "synthetic_or_proxy_primary_labels": synthetic_primary,
+        "new_synthetic_proxy_primary": synthetic_primary,
+        "new_synthetic_proxy_diagnostic_outcomes": synthetic_diagnostic_outcomes,
+        "new_canary_valid_labels": len(canary_new),
+        "new_canary_reliable_direct_labels": len(canary_new),
+        "phase_canary_reliable_direct_labels": len(canary_pnls),
+        "active_canary_count": active_canary_count,
+        "canary_reliable_labels": len(canary_pnls),
+        "canary_avg_net_pnl_bps": (
+            sum(canary_pnls) / len(canary_pnls) if canary_pnls else None
+        ),
+        "canary_win_rate": (
+            sum(value > 0 for value in canary_pnls) / len(canary_pnls) if canary_pnls else None
+        ),
+        "canary_worst_decile_bps": (
+            sum(sorted_canary[:worst_count]) / worst_count if worst_count else None
+        ),
+        "frontier_observation_count": countish(
+            frontier_summary.get("observation_count")
+            or frontier_summary.get("observations")
+            or 0
+        ),
+        "reachable_venue_count": countish(
+            frontier_summary.get("reachable_venue_count")
+            or frontier_summary.get("reachable_venues")
+            or 0
+        ),
+    }
+    for env_name, metric_name in (
+        ("RADAR_BOUNDED_SUPERVISOR_COUNT", "supervisor_count"),
+        ("RADAR_BOUNDED_CHILD_COUNT", "child_count"),
+        ("RADAR_FORBIDDEN_WORKER_COUNT", "forbidden_worker_count"),
+    ):
+        raw = os.environ.get(env_name)
+        if raw is not None:
+            metrics[metric_name] = int(raw)
+    return metrics
+
+
 def _terminal_execution_review(review: dict, execution: dict, decision: str) -> dict:
     order = execution.get("order") if isinstance(execution.get("order"), dict) else {}
     return {
@@ -461,15 +1170,144 @@ def _required_global_proxy_instruments(required: dict[str, set[str]]) -> set[str
     return instruments
 
 
-def run_once(settings: dict) -> dict:
-    auxiliary_policy = _auxiliary_runtime_policy(settings)
-    capabilities = settings["account_capabilities"]
-    scan_cfg = settings["scanner"]
-    risk_cfg = settings["risk"]
-    allow_short_spot = bool(capabilities.get("spot_borrow", False))
+class _StorageDueOutcomeProvider:
+    """Small adapter that keeps the collector independent from SQLite."""
 
+    def __init__(self, conn: sqlite3.Connection, settings: dict):
+        self.conn = conn
+        self.settings = settings
+        self.loaded_targets: list[dict[str, object]] = []
+
+    def load_due_instruments(self, *, limit: int) -> list[dict[str, object]]:
+        self.loaded_targets = load_due_paper_outcome_targets(
+            self.conn,
+            self.settings,
+            limit=limit,
+        )
+        return list(self.loaded_targets)
+
+
+def _collect_and_persist_due_outcomes(
+    conn: sqlite3.Connection,
+    settings: dict,
+    *,
+    collector=collect_due_outcome_prices,
+) -> dict[str, object]:
+    """Collect credential-free historical labels and journal them atomically.
+
+    The due-window cursor advances for a public fetch success or failure, but
+    only in the same commit as any accepted observations.  A local persistence
+    failure rolls everything back so the evidence is fetched again rather
+    than silently skipped.
+    """
+
+    provider = _StorageDueOutcomeProvider(conn, settings)
+    try:
+        report = collector(provider, settings=settings)
+    except Exception as exc:  # noqa: BLE001 - collection must fail closed per cycle
+        return {
+            "enabled": bool(
+                (settings.get("paper_due_outcome_collection") or {}).get(
+                    "enabled", False
+                )
+            ),
+            "status": "collector_failed",
+            "error": type(exc).__name__,
+            "loaded_due_count": len(provider.loaded_targets),
+            "record_count": 0,
+            "funding_coverage_count": 0,
+            "attempted_window_count": 0,
+        }
+
+    records = list(report.get("records") or [])
+    complete_funding = [
+        item
+        for item in list(report.get("funding_coverage") or [])
+        if isinstance(item, dict) and item.get("coverage_status") == "complete"
+    ]
+    attempted_keys = {
+        str(value)
+        for value in list(report.get("attempted_window_keys") or [])
+        if str(value or "").strip()
+    }
+    attempted_targets = [
+        target
+        for target in provider.loaded_targets
+        if str(target.get("due_window_key") or "") in attempted_keys
+    ]
+    price_persistence: dict[str, object] = {
+        "accepted": 0,
+        "duplicates": 0,
+        "rejected": 0,
+    }
+    funding_persistence: dict[str, object] = {
+        "accepted": 0,
+        "duplicates": 0,
+        "rejected": 0,
+    }
+    attempted_window_count = 0
+    persistence_error: str | None = None
+    try:
+        price_persistence = record_paper_price_observations(
+            conn,
+            records,
+            commit=False,
+        )
+        if int(price_persistence.get("rejected") or 0):
+            raise ValueError("price_observation_persistence_rejected")
+        funding_persistence = record_paper_funding_coverage(
+            conn,
+            complete_funding,
+            commit=False,
+        )
+        if int(funding_persistence.get("rejected") or 0):
+            raise ValueError("funding_coverage_persistence_rejected")
+        attempted_window_count = mark_due_paper_outcome_windows_attempted(
+            conn,
+            attempted_targets,
+            attempted_at=dt.datetime.now(dt.timezone.utc),
+            commit=False,
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 - retry the same window next cycle
+        conn.rollback()
+        persistence_error = type(exc).__name__
+        attempted_window_count = 0
+
+    return {
+        "enabled": bool(report.get("enabled")),
+        "status": "persisted" if persistence_error is None else "persistence_failed",
+        "error": persistence_error,
+        "loaded_due_count": int(report.get("loaded_due_count") or 0),
+        "unique_instrument_count": int(report.get("unique_instrument_count") or 0),
+        "fetched_instrument_count": int(report.get("fetched_instrument_count") or 0),
+        "funding_fetch_count": int(report.get("funding_fetch_count") or 0),
+        "total_public_request_count": int(report.get("total_public_request_count") or 0),
+        "record_count": len(records),
+        "funding_event_count": len(list(report.get("funding_events") or [])),
+        "funding_coverage_count": len(complete_funding),
+        "attempted_window_count": attempted_window_count,
+        "rejection_count": len(list(report.get("rejections") or [])),
+        "deferred_outcome_count": len(list(report.get("deferred_outcome_keys") or [])),
+        "price_persistence": price_persistence,
+        "funding_persistence": funding_persistence,
+        "limits": report.get("limits") or {},
+    }
+
+
+def run_once(settings: dict) -> dict:
+    cycle_started = time.perf_counter()
+    db_size_before = _database_logical_footprint(DB_PATH)
     with connect() as conn:
+        settings, campaign_cycle = apply_campaign_controls(conn, settings)
+        bounded_recovery = bool(campaign_cycle.get("enabled"))
+        auxiliary_policy = _auxiliary_runtime_policy(settings)
+        capabilities = settings["account_capabilities"]
+        scan_cfg = settings["scanner"]
+        risk_cfg = settings["risk"]
+        allow_short_spot = bool(capabilities.get("spot_borrow", False))
         pending_opportunity_reconciliation = reconcile_pending_opportunities(conn)
+        paper_queue_reconciliation_before = reconcile_paper_admission_queue(conn, settings)
         required = open_trade_instruments(conn)
         required_okx = set(required.get("perp_funding_basis", set()))
         required_okx.update(open_signal_trial_instruments(conn, "OKX|perp_funding_basis"))
@@ -655,14 +1493,22 @@ def run_once(settings: dict) -> dict:
             public_market_adapters,
             adapter_capabilities,
         )
-        self_improvement_open_pack = build_open_pack_report(
-            conn,
-            settings,
-            candidates=candidates[:250],
-            prediction_summary=prediction_summary,
-            expansion_map=expansion_map,
-        )
-        write_open_pack_reports(self_improvement_open_pack)
+        if bounded_recovery:
+            self_improvement_open_pack = {
+                "enabled": False,
+                "reason": "bounded_recovery_profile",
+                "summary": {"candidate_count": len(candidates)},
+            }
+        else:
+            self_improvement_open_pack = build_open_pack_report(
+                conn,
+                settings,
+                candidates=candidates[:250],
+                prediction_summary=prediction_summary,
+                expansion_map=expansion_map,
+            )
+            write_open_pack_reports(self_improvement_open_pack)
+        due_outcome_collection = _collect_and_persist_due_outcomes(conn, settings)
         horizon_outcomes = record_due_horizon_outcomes(conn, price_observations, settings)
         closed = close_due_trades(
             conn,
@@ -671,36 +1517,161 @@ def run_once(settings: dict) -> dict:
             settings=settings,
         )
         stats = update_signal_stats(conn, settings) if settings["learning"]["enabled"] else {}
-        yahoo_counterfactual = run_yahoo_counterfactual_analysis(conn, settings)
-        reliability_cards = cross_context_reliability(conn)
-        strategy_lab_evaluation = evaluate_strategy_lab(conn, settings)
-        strategy_lab_report = write_strategy_lab_reports(conn, strategy_lab_generation, strategy_lab_evaluation)
+        yahoo_counterfactual = (
+            {"enabled": False, "reason": "bounded_crypto_recovery_profile"}
+            if bounded_recovery
+            else run_yahoo_counterfactual_analysis(conn, settings)
+        )
+        reliability_cards = (
+            {"enabled": False, "reason": "bounded_recovery_profile"}
+            if bounded_recovery
+            else cross_context_reliability(conn)
+        )
+        if settings.get("strategy_lab", {}).get("enabled", False):
+            strategy_lab_evaluation = evaluate_strategy_lab(conn, settings)
+            strategy_lab_report = write_strategy_lab_reports(
+                conn, strategy_lab_generation, strategy_lab_evaluation
+            )
+        else:
+            strategy_lab_evaluation = {
+                "enabled": False,
+                "reason": "strategy_lab_disabled",
+                "evaluated": [],
+            }
+            strategy_lab_report = {
+                "enabled": False,
+                "reason": "strategy_lab_disabled",
+                "summary": {"enabled": False},
+            }
         adjustments = load_adjustments(conn)
-        llm_recommendations_ingested = ingest_llm_recommendations(conn, settings)
-        auto_improvement = run_auto_improvement(conn, settings, include_code_changes=False)
-        signal_safety_governor = run_signal_safety_governor(conn, settings)
-        contextual_failure_filters = run_contextual_failure_filters(conn, settings)
+        llm_recommendations_ingested = (
+            [] if bounded_recovery else ingest_llm_recommendations(conn, settings)
+        )
+        auto_improvement = (
+            {"enabled": False, "reason": "bounded_recovery_profile"}
+            if bounded_recovery
+            else run_auto_improvement(conn, settings, include_code_changes=False)
+        )
+        signal_safety_governor = (
+            {"enabled": False, "reason": "bounded_exact_queue_contract"}
+            if bounded_recovery
+            else run_signal_safety_governor(conn, settings)
+        )
+        contextual_failure_filters = (
+            {
+                "enabled": False,
+                "reason": "bounded_exact_queue_contract",
+                "cross_context_observations": [],
+            }
+            if bounded_recovery
+            else run_contextual_failure_filters(conn, settings)
+        )
         candidates = annotate_candidates_with_cross_context_diagnostics(
             candidates,
             contextual_failure_filters.get("cross_context_observations", []),
             settings,
         )
-        context_drag_stats = context_drag_statistics(conn, settings)
-        candidates = apply_context_drag_overlay(candidates, context_drag_stats, settings)
-        paper_context_drag = context_drag_report(context_drag_stats, candidates)
-        policies = active_signal_policies(conn)
+        if bounded_recovery:
+            context_drag_stats = {}
+            paper_context_drag = {
+                "enabled": False,
+                "reason": "bounded_exact_queue_contract",
+            }
+            policies = []
+        else:
+            context_drag_stats = context_drag_statistics(conn, settings)
+            candidates = apply_context_drag_overlay(candidates, context_drag_stats, settings)
+            paper_context_drag = context_drag_report(context_drag_stats, candidates)
+            policies = active_signal_policies(conn)
         review_limit = int(scan_cfg["review_top"])
-        reserved_lab_candidates, strategy_lab_review_reserve = _reserve_strategy_lab_review_candidates(
-            candidates,
-            settings,
-            review_limit,
+        canary_review_isolation = bool(
+            bounded_recovery
+            and str(
+                (settings.get("paper_expansion") or {}).get("runtime_phase") or ""
+            )
+            == "strategy_lab_canary"
         )
+        review_source_candidates = (
+            [
+                candidate
+                for candidate in candidates
+                if _is_recovery_canary_candidate(candidate)
+            ][:1]
+            if canary_review_isolation
+            else candidates
+        )
+        paper_queue_cfg = paper_admission_queue_config(settings)
+        queue_new_work_allowed = not campaign_cycle.get("enabled") or str(
+            campaign_cycle.get("run_status") or "running"
+        ) == "running"
+        paper_queue_enqueue = (
+            enqueue_paper_admission_candidates(
+                conn, settings, review_source_candidates
+            )
+            if queue_new_work_allowed and review_limit > 0
+            else {
+                "enabled": paper_queue_cfg["enabled"],
+                "considered": len(review_source_candidates),
+                "enqueued": 0,
+                "status": "new_work_paused",
+            }
+        )
+        queued_review_candidates = (
+            select_paper_admission_candidates(
+                conn,
+                settings,
+                limit=review_limit,
+                paper_fill_slots_by_lane=_paper_lane_limits(
+                    int(scan_cfg["max_new_paper_trades"])
+                ),
+                required_lineage_root=(
+                    RECOVERY_CANARY_STRATEGY_LAB_ID
+                    if canary_review_isolation
+                    else None
+                ),
+            )
+            if queue_new_work_allowed and review_limit > 0
+            else []
+        )
+        for candidate in queued_review_candidates:
+            candidate.setdefault("_hunter_bucket", "paper_admission_queue")
+            candidate.setdefault("_hunter_directive_id", None)
+            candidate.setdefault("_hunter_allocation_reason", "bounded_paper_admission_queue")
+        queued_identities = {
+            _paper_queue_identity(candidate) for candidate in queued_review_candidates
+        }
+        selected_queue_claims = {
+            claim
+            for candidate in queued_review_candidates
+            if all(claim := _paper_queue_claim_identity(candidate))
+        }
+        remaining_candidates = [
+            candidate
+            for candidate in review_source_candidates
+            if _paper_queue_identity(candidate) not in queued_identities
+        ]
+        reserved_lab_candidates, strategy_lab_review_reserve = _reserve_strategy_lab_review_candidates(
+            remaining_candidates,
+            settings,
+            max(0, review_limit - len(queued_review_candidates)),
+        )
+        reserved_lab_identities = {
+            _paper_queue_identity(candidate) for candidate in reserved_lab_candidates
+        }
         non_lab_candidates = fair_lineage_order(
-            [candidate for candidate in candidates if not candidate.get("strategy_lab_id")],
+            [
+                candidate
+                for candidate in remaining_candidates
+                if not candidate.get("strategy_lab_id")
+                and _paper_queue_identity(candidate) not in reserved_lab_identities
+            ],
             int(time.time() // 60),
             settings,
         )
-        hunter_review_slots = max(0, review_limit - len(reserved_lab_candidates))
+        hunter_review_slots = max(
+            0,
+            review_limit - len(queued_review_candidates) - len(reserved_lab_candidates),
+        )
         hunter_cfg = settings.get("hunter_allocation", {})
         if hunter_cfg.get("enabled", True) and hunter_cfg.get("apply_to_candidate_review", True):
             hunter_review_candidates, hunter_allocation = allocate_candidate_review(
@@ -722,25 +1693,71 @@ def run_once(settings: dict) -> dict:
                 "directive_counts": {},
                 "minimum_exploration_floor": 0,
             }
-        review_candidates = reserved_lab_candidates + hunter_review_candidates
+        review_candidates = (
+            queued_review_candidates + reserved_lab_candidates + hunter_review_candidates
+        )[:review_limit]
         hunter_allocation["selected_count"] = len(review_candidates)
+        hunter_allocation["canary_review_isolation"] = {
+            "enabled": canary_review_isolation,
+            "allowed_strategy_lab_id": (
+                RECOVERY_CANARY_STRATEGY_LAB_ID
+                if canary_review_isolation
+                else None
+            ),
+            "eligible_candidate_count": len(review_source_candidates),
+        }
         hunter_allocation["strategy_lab_review_reserve"] = strategy_lab_review_reserve
+        hunter_allocation["paper_admission_queue_reserve"] = {
+            "configured_slots": min(30, int(paper_queue_cfg["max_select_per_cycle"])),
+            "reserved_count": len(queued_review_candidates),
+            "by_lane": {
+                lane: sum(
+                    candidate.get("_paper_admission_lane") == lane
+                    for candidate in queued_review_candidates
+                )
+                for lane in ("evidence", "discovery")
+            },
+        }
         hunter_allocation = write_hunter_allocation_report(hunter_allocation, review_candidates, candidates, settings)
 
         reviewed = []
         opened = []
         for candidate in review_candidates:
             review = review_candidate(candidate, settings, adjustments, policies=policies)
-            opportunity_id = save_opportunity(conn, candidate, _pending_execution_review(review))
+            queued_for_execution = (
+                _paper_queue_claim_identity(candidate) in selected_queue_claims
+            )
+            persisted_review = (
+                _pending_execution_review(review)
+                if not paper_queue_cfg["enabled"] or queued_for_execution
+                else _not_queued_execution_review(review)
+            )
+            opportunity_id = save_opportunity(conn, candidate, persisted_review)
             record_review_policy_effects(conn, review)
-            reviewed.append({"candidate": candidate, "review": review, "opportunity_id": opportunity_id})
+            item = {
+                "candidate": candidate,
+                "review": review,
+                "opportunity_id": opportunity_id,
+                "paper_queue_claim_verified": queued_for_execution,
+            }
+            if paper_queue_cfg["enabled"] and not queued_for_execution:
+                _attach_execution_review(item, persisted_review)
+            reviewed.append(item)
 
-        execution_queue = reviewed
-        if exploration_enabled(settings) and reviewed:
+        execution_queue = (
+            [
+                item
+                for item in reviewed
+                if item.get("paper_queue_claim_verified")
+            ]
+            if paper_queue_cfg["enabled"]
+            else reviewed
+        )
+        if exploration_enabled(settings) and execution_queue and not paper_queue_cfg["enabled"]:
             # Rotate the starting lineage each minute so a stable top-ranked set
             # cannot permanently monopolize a bounded paper-execution budget.
-            offset = int(time.time() // 60) % len(reviewed)
-            execution_queue = reviewed[offset:] + reviewed[:offset]
+            offset = int(time.time() // 60) % len(execution_queue)
+            execution_queue = execution_queue[offset:] + execution_queue[:offset]
 
         paper_fill_count = 0
         paper_observation_count = 0
@@ -749,17 +1766,26 @@ def run_once(settings: dict) -> dict:
             0,
             int(scan_cfg.get("max_new_paper_observations", paper_fill_limit)),
         )
+        paper_fill_lane_limits = _paper_lane_limits(paper_fill_limit)
+        paper_observation_lane_limits = _paper_lane_limits(paper_observation_limit)
+        paper_fill_count_by_lane = {"evidence": 0, "discovery": 0}
+        paper_observation_count_by_lane = {"evidence": 0, "discovery": 0}
         for item in execution_queue:
             candidate = item["candidate"]
             review = item["review"]
             if review["decision"] not in _PAPER_APPROVAL_DECISIONS:
                 continue
+            paper_lane = str(candidate.get("_paper_admission_lane") or "discovery")
+            if paper_lane not in paper_fill_count_by_lane:
+                paper_lane = "discovery"
             open_trade_capacity_available = count_open_trades(conn) < int(
                 risk_cfg["max_open_paper_trades"]
             )
             fill_capacity_reason = (
                 "max_new_paper_trades"
                 if paper_fill_count >= paper_fill_limit
+                else f"max_new_paper_trades_{paper_lane}"
+                if paper_fill_count_by_lane[paper_lane] >= paper_fill_lane_limits[paper_lane]
                 else "max_open_paper_trades"
                 if not open_trade_capacity_available
                 else None
@@ -797,6 +1823,8 @@ def run_once(settings: dict) -> dict:
                     opportunity_id=item["opportunity_id"],
                     record_shadow_observation=(
                         paper_observation_count < paper_observation_limit
+                        and paper_observation_count_by_lane[paper_lane]
+                        < paper_observation_lane_limits[paper_lane]
                     ),
                     allow_paper_fill=fill_capacity_reason is None,
                 )
@@ -819,6 +1847,7 @@ def run_once(settings: dict) -> dict:
 
             if execution.get("shadow_observation_recorded"):
                 paper_observation_count += 1
+                paper_observation_count_by_lane[paper_lane] += 1
                 terminal_status = str((execution.get("order") or {}).get("status") or "shadow_observed")
                 terminal = _terminal_execution_review(review, execution, terminal_status)
                 terminal["shadow_observation_id"] = execution.get("shadow_observation_id")
@@ -873,10 +1902,13 @@ def run_once(settings: dict) -> dict:
                 if (
                     paper_observation_ready
                     and paper_observation_count < paper_observation_limit
+                    and paper_observation_count_by_lane[paper_lane]
+                    < paper_observation_lane_limits[paper_lane]
                     and open_trade_capacity_available
                 ):
                     trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=settings)
                     paper_observation_count += 1
+                    paper_observation_count_by_lane[paper_lane] += 1
                     terminal = _terminal_execution_review(
                         review,
                         execution,
@@ -951,9 +1983,18 @@ def run_once(settings: dict) -> dict:
                     )
                     _attach_execution_review(item, terminal)
                 continue
-            trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=settings)
+            trade_id = execution.get("paper_trade_id")
+            if trade_id is None:
+                trade_id = open_paper_trade(
+                    conn,
+                    candidate,
+                    review,
+                    execution=execution,
+                    settings=settings,
+                )
             record_open_policy_effects(conn, review)
             paper_fill_count += 1
+            paper_fill_count_by_lane[paper_lane] += 1
             terminal = _terminal_execution_review(review, execution, "paper_filled")
             update_opportunity_decision(
                 conn,
@@ -989,20 +2030,44 @@ def run_once(settings: dict) -> dict:
                 }
             )
 
-        signal_safety_governor = run_signal_safety_governor(conn, settings)
-        paper_exploration = write_paper_exploration_report(conn, settings, reviewed=reviewed)
-        paper_exploration_packet = compact_paper_exploration_report(paper_exploration)
+        paper_queue_reconciliation_after = reconcile_paper_admission_queue(conn, settings)
+        paper_queue_report = {
+            "enabled": paper_queue_cfg["enabled"],
+            "enqueue": paper_queue_enqueue,
+            "reconciliation_before": paper_queue_reconciliation_before,
+            "reconciliation_after": paper_queue_reconciliation_after,
+            "selected_for_review": len(queued_review_candidates),
+            "fills_by_lane": dict(paper_fill_count_by_lane),
+            "shadows_by_lane": dict(paper_observation_count_by_lane),
+            "summary": paper_admission_queue_summary(conn, settings),
+        }
+        accounting_reviewed = _reviewed_for_accounting(reviewed)
+        if bounded_recovery:
+            paper_exploration = {
+                "enabled": False,
+                "reason": "bounded_queue_replaces_legacy_exploration",
+            }
+            paper_exploration_packet = dict(paper_exploration)
+        else:
+            paper_exploration = write_paper_exploration_report(
+                conn,
+                settings,
+                reviewed=accounting_reviewed,
+            )
+            paper_exploration_packet = compact_paper_exploration_report(paper_exploration)
         market_admission = run_market_admission_monitor(
             conn,
             settings,
             candidates,
-            reviewed,
+            accounting_reviewed,
             admission_observations,
         )
         market_admission_bridge = run_market_admission_bridge(conn, settings, market_admission)
         market_admission["bridge"] = market_admission_bridge
+        market_admission["paper_admission_queue"] = paper_queue_report
         expansion_map["market_admission"] = market_admission.get("summary", {})
         expansion_map["market_admission_bridge"] = market_admission_bridge.get("summary", {})
+        expansion_map["paper_admission_queue"] = paper_queue_report.get("summary", {})
         auto_improvement["signal_safety_governor"] = signal_safety_governor
         auto_improvement["contextual_failure_filters"] = contextual_failure_filters
         auto_improvement["signal_redesign"] = signal_redesign
@@ -1017,7 +2082,8 @@ def run_once(settings: dict) -> dict:
         auto_improvement["self_improvement_open_pack"] = self_improvement_open_pack
         auto_improvement["paper_exploration"] = paper_exploration_packet
         auto_improvement["paper_context_drag"] = paper_context_drag
-        auto_improvement = write_self_improvement_reports(conn, auto_improvement)
+        if not bounded_recovery:
+            auto_improvement = write_self_improvement_reports(conn, auto_improvement)
         summary = performance_summary(conn)
         maintenance = {
             **perform_maintenance(conn, settings),
@@ -1027,6 +2093,7 @@ def run_once(settings: dict) -> dict:
             "mode": settings["mode"],
             "closed": closed,
             "horizon_outcomes": horizon_outcomes,
+            "due_outcome_collection": due_outcome_collection,
             "crypto_venue_health": venue_health,
             "frontier_crypto_venues": frontier_crypto_venues,
             "global_market_discovery_scan": global_market_discovery_scan,
@@ -1040,6 +2107,7 @@ def run_once(settings: dict) -> dict:
             "strategy_lab": strategy_lab_report.get("summary", {}),
             "market_admission": market_admission,
             "market_admission_bridge": market_admission_bridge,
+            "paper_admission_queue": paper_queue_report,
             "opened": opened,
             "paper_exploration": paper_exploration_packet,
             "summary": summary,
@@ -1122,25 +2190,48 @@ def run_once(settings: dict) -> dict:
             }
         payload["llm_inbox"] = llm_inbox_summary()
         payload["llm_cost_summary"] = llm_cost_summary(conn)
+        payload["paper_expansion_campaign"] = {
+            "enabled": bool(campaign_cycle.get("enabled")),
+            "status": "inflight_artifacts_complete",
+            "cycle_id": campaign_cycle.get("cycle_id"),
+            "phase": campaign_cycle.get("phase"),
+            "run_status": campaign_cycle.get("run_status"),
+        }
+        # All report/artifact work must finish before campaign success is
+        # persisted.  If any write below fails, the in-flight token remains for
+        # the supervisor/next cycle to finalize as a failure.
         write_llm_state_packet(conn, payload, settings)
-
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    latest_path = RUNS_DIR / "radar_state_latest.json"
-    latest_snapshot = compact_json_value(
-        payload,
-        max_depth=5,
-        list_limit=10,
-        dict_limit=60,
-        string_limit=800,
-    )
-    latest_snapshot = {
-        "state_snapshot_compaction": {
-            "enabled": True,
-            "policy": "representative_evidence_with_explicit_omission_counts",
-        },
-        **latest_snapshot,
-    }
-    latest_path.write_text(json.dumps(latest_snapshot, indent=2), encoding="utf-8")
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        latest_path = RUNS_DIR / "radar_state_latest.json"
+        latest_snapshot = compact_json_value(
+            payload,
+            max_depth=5,
+            list_limit=10,
+            dict_limit=60,
+            string_limit=800,
+        )
+        latest_snapshot = {
+            "state_snapshot_compaction": {
+                "enabled": True,
+                "policy": "representative_evidence_with_explicit_omission_counts",
+            },
+            **latest_snapshot,
+        }
+        latest_path.write_text(json.dumps(latest_snapshot, indent=2), encoding="utf-8")
+        campaign_metrics = _bounded_campaign_metrics(
+            conn,
+            campaign_cycle,
+            settings=settings,
+            reviewed=reviewed,
+            frontier_crypto_venues=frontier_crypto_venues,
+            runtime_seconds=time.perf_counter() - cycle_started,
+            db_size_before=db_size_before,
+        )
+        payload["paper_expansion_campaign"] = record_campaign_cycle(
+            conn,
+            campaign_cycle,
+            campaign_metrics,
+        )
     return payload
 
 

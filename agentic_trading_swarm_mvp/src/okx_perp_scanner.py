@@ -22,6 +22,13 @@ import urllib.request
 
 from scan_batch import ScanBatch
 from paper_context_cost import annotate_paper_context_cost
+from paired_direct_contract import (
+    ACCOUNTING_CONVENTION as PAIRED_DIRECT_ACCOUNTING_CONVENTION,
+    CONTRACT_VERSION as PAIRED_DIRECT_CONTRACT_VERSION,
+    DECLARED_GROSS_NOTIONAL_USD as PAIRED_DIRECT_GROSS_NOTIONAL_USD,
+    STRATEGY_FAMILY as PAIRED_DIRECT_STRATEGY_FAMILY,
+    validate_paired_direct_entry,
+)
 
 
 BASE_URL = "https://www.okx.com"
@@ -48,6 +55,9 @@ STRATEGY_OBSERVATION_FIELDS = {
     "quote_volume_24h",
     "change_24h_pct",
 }
+PAIRED_DIRECT_EXCLUSION_REASON = "paired_direct_contract_invalid_or_incomplete"
+OKX_TICKER_SOURCE_NAME = "OKX public REST market tickers"
+OKX_TICKER_SOURCE_PARSER = "okx_v5_market_tickers"
 
 
 def fetch_json(path: str, params: dict[str, str] | None = None, timeout: int = 12) -> dict:
@@ -86,9 +96,37 @@ def unix_ms_to_iso(value: str | int | None) -> str | None:
         return None
     try:
         stamp = int(value) / 1000.0
-    except (TypeError, ValueError):
+    except (OSError, OverflowError, TypeError, ValueError):
         return None
-    return dt.datetime.fromtimestamp(stamp, tz=dt.timezone.utc).isoformat()
+    try:
+        return dt.datetime.fromtimestamp(stamp, tz=dt.timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _ticker_event_provenance(row: dict, received_at: str) -> dict:
+    """Keep exchange event time distinct from the local scan receipt time."""
+
+    event_at = unix_ms_to_iso(row.get("ts"))
+    timestamp_ms = as_float(row.get("ts"), None)
+    provenance = {"received_at": received_at}
+    if (
+        event_at is None
+        or timestamp_ms is None
+        or not math.isfinite(timestamp_ms)
+        or timestamp_ms <= 0.0
+    ):
+        return provenance
+    provenance.update(
+        {
+            "ticker_timestamp_ms": int(timestamp_ms),
+            "exchange_timestamp": event_at,
+            "ticker_timestamp": event_at,
+            "source_observed_at": event_at,
+            "observed_at": event_at,
+        }
+    )
+    return provenance
 
 
 def liquidity_score(quote_volume: float) -> float:
@@ -114,25 +152,43 @@ def classify_direction(funding_bps: float, basis_bps: float) -> tuple[str, str]:
 
 def execution_feasibility(direction: str, allow_short_spot: bool) -> dict:
     """Describe whether the trade can be executed without hard-to-source legs."""
-    if direction in {"short_perp_long_spot", "funding_capture_short_perp", "basis_mean_reversion_short_perp"}:
+    if direction == "short_perp_long_spot":
         return {
             "status": "standard",
             "requires_short_spot": False,
-            "legs": ["short perpetual", "optionally buy spot/index hedge"],
+            "legs": ["short perpetual", "long spot"],
             "notes": [
-                "Perp shorting is generally supported on derivatives venues.",
-                "Long spot hedge is operationally simple if the asset is listed and liquid.",
+                "Both legs are mandatory; an index reference can never replace the spot fill.",
+                "Direct, fresh, timestamp-aligned SWAP and SPOT quotes are required before paper execution.",
             ],
         }
-    if direction in {"long_perp_short_spot", "funding_capture_long_perp", "basis_mean_reversion_long_perp"}:
+    if direction in {"funding_capture_short_perp", "basis_mean_reversion_short_perp"}:
+        return {
+            "status": "standard",
+            "requires_short_spot": False,
+            "legs": ["short perpetual"],
+            "notes": [
+                "This is an unhedged single-perpetual paper strategy, not a paired basis strategy."
+            ],
+        }
+    if direction == "long_perp_short_spot":
         status = "standard" if allow_short_spot else "conditional"
         return {
             "status": status,
             "requires_short_spot": True,
-            "legs": ["long perpetual", "borrow and short spot if hedge is required"],
+            "legs": ["long perpetual", "borrow and short spot"],
             "notes": [
                 "Reverse cash-and-carry requires confirmed spot borrow or a margin venue.",
                 "Without spot borrow, this becomes a directional long-perp trade, not a hedged arb.",
+            ],
+        }
+    if direction in {"funding_capture_long_perp", "basis_mean_reversion_long_perp"}:
+        return {
+            "status": "standard",
+            "requires_short_spot": False,
+            "legs": ["long perpetual"],
+            "notes": [
+                "This is an unhedged single-perpetual paper strategy, not a paired basis strategy."
             ],
         }
     return {
@@ -196,6 +252,312 @@ def instrument_asset_context(inst_id: str, instrument: dict | None = None) -> di
     }
 
 
+def _parse_utc(value: object) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _paired_direct_limits(settings: dict | None) -> tuple[float, float, float]:
+    settings = settings or {}
+    outcome_cfg = settings.get("paper_due_outcome_collection") or {}
+    queue_cfg = (settings.get("market_admission") or {}).get("paper_queue") or {}
+    try:
+        max_skew = max(
+            0.0,
+            float(outcome_cfg.get("paired_max_entry_timestamp_skew_seconds", 2.0)),
+        )
+    except (TypeError, ValueError):
+        max_skew = 2.0
+    try:
+        notional_tolerance = max(
+            0.0,
+            float(outcome_cfg.get("paired_notional_tolerance_fraction", 0.01)),
+        )
+    except (TypeError, ValueError):
+        notional_tolerance = 0.01
+    try:
+        max_age = max(
+            1.0,
+            float(queue_cfg.get("max_freshness_age_seconds", 90.0)),
+        )
+    except (TypeError, ValueError):
+        max_age = 90.0
+    return max_skew, notional_tolerance, max_age
+
+
+def _paired_direct_costs(settings: dict | None) -> tuple[float, float]:
+    risk = (settings or {}).get("risk") or {}
+    try:
+        fee_bps = max(0.0, float(risk.get("taker_fee_bps_per_leg", 5.0)))
+    except (TypeError, ValueError):
+        fee_bps = 5.0
+    try:
+        slippage_bps = max(0.0, float(risk.get("slippage_bps_per_leg", 3.0)))
+    except (TypeError, ValueError):
+        slippage_bps = 3.0
+    return fee_bps, slippage_bps
+
+
+def _paired_direct_component(
+    *,
+    role: str,
+    inst_id: str,
+    row: dict,
+    quote_asset: str,
+    notional_usd: float,
+    fee_bps: float,
+    slippage_bps: float,
+) -> dict:
+    is_perp = role == "perp"
+    side = "short" if is_perp else "long"
+    venue = "OKX" if is_perp else "OKX_SPOT"
+    surface = "perp" if is_perp else "spot"
+    executable_field = "bidPx" if is_perp else "askPx"
+    price = as_float(row.get(executable_field), None)
+    event_at = unix_ms_to_iso(row.get("ts"))
+    endpoint = f"/api/v5/market/tickers?instType={'SWAP' if is_perp else 'SPOT'}"
+    event_id = (
+        f"OKX|{surface}|{inst_id}|{event_at}"
+        if event_at and inst_id
+        else ""
+    )
+    return {
+        "side": side,
+        "venue": venue,
+        "inst_id": inst_id,
+        "market_surface": surface,
+        "quote_asset": quote_asset,
+        "event_at": event_at,
+        "price": price if price is not None and price > 0.0 else None,
+        "notional_usd": notional_usd,
+        "entry_fee_bps": fee_bps,
+        "entry_slippage_bps": slippage_bps,
+        "exit_fee_bps": fee_bps,
+        "exit_slippage_bps": slippage_bps,
+        "source": {
+            "name": OKX_TICKER_SOURCE_NAME,
+            "endpoint": endpoint,
+            "parser": OKX_TICKER_SOURCE_PARSER,
+            "event_id": event_id,
+        },
+    }
+
+
+def apply_paired_direct_entry_contract(
+    candidate: dict,
+    perp_ticker: dict,
+    spot_ticker: dict | None,
+    settings: dict | None,
+    *,
+    decision_time: dt.datetime,
+) -> dict:
+    """Attach a directly quoted, two-leg OKX entry contract or fail closed."""
+
+    output = dict(candidate)
+    quote_asset = str(output.get("quote_asset") or "").strip().upper()
+    base_asset = str(output.get("base_asset") or "").strip().upper()
+    perp_inst_id = str(output.get("inst_id") or "").strip().upper()
+    spot_inst_id = f"{base_asset}-{quote_asset}" if base_asset and quote_asset else ""
+    spot_ticker = dict(spot_ticker or {})
+    max_skew, notional_tolerance, max_age = _paired_direct_limits(settings)
+    fee_bps, slippage_bps = _paired_direct_costs(settings)
+    leg_notional = PAIRED_DIRECT_GROSS_NOTIONAL_USD / 2.0
+    perp = _paired_direct_component(
+        role="perp",
+        inst_id=perp_inst_id,
+        row=perp_ticker,
+        quote_asset=quote_asset,
+        notional_usd=leg_notional,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+    spot = _paired_direct_component(
+        role="spot",
+        inst_id=spot_inst_id,
+        row=spot_ticker,
+        quote_asset=quote_asset,
+        notional_usd=leg_notional,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+
+    producer_reasons: list[str] = []
+    if str(perp_ticker.get("instId") or "").strip().upper() != perp_inst_id:
+        producer_reasons.append("direct_perp_ticker_identity_mismatch")
+    if str(spot_ticker.get("instId") or "").strip().upper() != spot_inst_id:
+        producer_reasons.append("direct_spot_ticker_missing")
+    event_times = {
+        "perp": _parse_utc(perp.get("event_at")),
+        "spot": _parse_utc(spot.get("event_at")),
+    }
+    for name, component in (("perp", perp), ("spot", spot)):
+        if component.get("price") is None:
+            producer_reasons.append(f"{name}_executable_price_missing")
+        event_at = event_times[name]
+        if event_at is None:
+            producer_reasons.append(f"{name}_event_at_missing")
+            continue
+        age_seconds = (decision_time - event_at).total_seconds()
+        component["freshness_age_seconds"] = round(max(0.0, age_seconds), 3)
+        if age_seconds < 0.0:
+            producer_reasons.append(f"{name}_event_at_in_future")
+        elif age_seconds > max_age:
+            producer_reasons.append(f"{name}_quote_stale")
+    if event_times["perp"] is not None and event_times["spot"] is not None:
+        skew = abs((event_times["perp"] - event_times["spot"]).total_seconds())
+        if skew > max_skew:
+            producer_reasons.append("entry_timestamp_skew")
+    else:
+        skew = None
+
+    contract = {
+        "contract_version": PAIRED_DIRECT_CONTRACT_VERSION,
+        "strategy_family": PAIRED_DIRECT_STRATEGY_FAMILY,
+        "accounting_convention": PAIRED_DIRECT_ACCOUNTING_CONVENTION,
+        "status": "entry_complete" if not producer_reasons else "invalid_or_incomplete",
+        "quote_asset": quote_asset,
+        "max_entry_timestamp_skew_seconds": max_skew,
+        "max_entry_freshness_age_seconds": max_age,
+        "entry_timestamp_skew_seconds": round(skew, 3) if skew is not None else None,
+        "notional_match_tolerance_fraction": notional_tolerance,
+        "declared_gross_notional_usd": PAIRED_DIRECT_GROSS_NOTIONAL_USD,
+        "return_denominator_usd": PAIRED_DIRECT_GROSS_NOTIONAL_USD,
+        "entry_components": {"perp": perp, "spot": spot},
+        "funding_requirement": {
+            "required": True,
+            "venue": "OKX",
+            "inst_id": perp_inst_id,
+            "source_endpoint": "/api/v5/public/funding-rate-history",
+            "source_parser": "okx_realized_funding_history",
+            "allow_estimates": False,
+            "rate_field": "realizedRate",
+            "event_time_field": "fundingTime",
+            "window_semantics": "entry_exclusive_exit_inclusive",
+        },
+        "cost_accounting": {
+            "version": "reference_prices_plus_explicit_costs_v1",
+            "price_basis": "direct_executable_top_of_book_reference",
+            "fees_deducted_once": True,
+            "slippage_deducted_once": True,
+            "modeled_fill_price_audit_only": True,
+        },
+        "producer_validation_reasons": sorted(set(producer_reasons)),
+    }
+    output[PAIRED_DIRECT_CONTRACT_VERSION] = contract
+    validation = validate_paired_direct_entry(
+        output,
+        settings=settings,
+        now=decision_time,
+    )
+    validation_reasons = sorted(set(producer_reasons + list(validation["reasons"])))
+    valid = bool(validation["valid"] and not producer_reasons)
+    if not valid:
+        contract["status"] = "invalid_or_incomplete"
+        contract["validation_reasons"] = validation_reasons
+
+    output.update(
+        {
+            "contract_version": PAIRED_DIRECT_CONTRACT_VERSION,
+            "strategy_family": PAIRED_DIRECT_STRATEGY_FAMILY,
+            "paired_direct_contract_status": (
+                "entry_complete" if valid else "invalid_or_incomplete"
+            ),
+            "execution_structure": "perpetual_spot_pair",
+            "hedge_venue": "OKX_SPOT",
+            "hedge_instrument": spot_inst_id,
+            "fee_model": "paired_direct_reference_costs_v1",
+            "fees_modeled": True,
+            "paper_leg_mapping_valid": valid,
+            "perp_last": as_float(perp_ticker.get("last"), None),
+            "spot_last": as_float(spot_ticker.get("last"), None),
+            "paper_label_eligible": valid,
+            "paper_label_exclusion_reason": (
+                None if valid else PAIRED_DIRECT_EXCLUSION_REASON
+            ),
+            "paper_execution_semantics": (
+                PAIRED_DIRECT_CONTRACT_VERSION
+                if valid
+                else "paired_direct_incomplete_shadow"
+            ),
+            "signal_stats_scope": "direct" if valid else "shadow",
+            "paper_fill_allowed": valid,
+        }
+    )
+    complete_event_times = [value for value in event_times.values() if value is not None]
+    if complete_event_times:
+        oldest_entry_event = min(complete_event_times)
+        latest_entry_event = max(complete_event_times)
+        # Admission freshness must be anchored to the oldest required leg, not
+        # the later quote that would make a stale pair look fresh.
+        output["source_observed_at"] = oldest_entry_event.isoformat()
+        output["observed_at"] = latest_entry_event.isoformat()
+        output["signal_age_seconds"] = round(
+            max(0.0, (decision_time - latest_entry_event).total_seconds()),
+            3,
+        )
+        output["freshness_age_seconds"] = max(
+            float(component.get("freshness_age_seconds") or 0.0)
+            for component in (perp, spot)
+        )
+        output["stale_minutes"] = round(
+            float(output["freshness_age_seconds"]) / 60.0,
+            3,
+        )
+    if valid:
+        output["execution_venue"] = "OKX"
+        output["venue_capabilities"] = {
+            "supports_perpetuals": True,
+            "supports_basis_path": True,
+            "supports_basis_carry": True,
+            "supports_spot_long": True,
+            "supports_spot_short": False,
+            "capability_profile": "OKX_PAIRED_DIRECT_V1",
+        }
+        output["paper_legs"] = [dict(perp), dict(spot)]
+        output["execution_feasibility"] = {
+            "status": "standard",
+            "route_status": "standard",
+            "requires_short_spot": False,
+            "legs": ["short perpetual", "long spot"],
+            "missing_requirements": [],
+            "notes": [
+                "Both OKX legs are directly quoted under paired_direct_v1.",
+                "Realized funding history remains mandatory for any reliable outcome.",
+            ],
+        }
+    else:
+        output.update(
+            {
+                "paper_entry_blocked": True,
+                "shadow_filtered": True,
+                "paper_observation_only": True,
+                "paper_shadow_excluded_from_learning": True,
+                "paper_shadow_exclusion_reason": PAIRED_DIRECT_EXCLUSION_REASON,
+                "candidate_reject_reason": PAIRED_DIRECT_EXCLUSION_REASON,
+                "candidate_reject_detail": {
+                    "guard": PAIRED_DIRECT_CONTRACT_VERSION,
+                    "reasons": validation_reasons,
+                },
+            }
+        )
+        output["execution_feasibility"] = {
+            "status": "conditional",
+            "route_status": "conditional",
+            "requires_short_spot": False,
+            "legs": ["short perpetual", "long spot"],
+            "missing_requirements": ["paired_direct_v1_entry_complete"],
+            "notes": [
+                "Paired paper execution is shadow-only until both direct entry quotes satisfy paired_direct_v1."
+            ],
+        }
+    return output
+
+
 def get_funding(inst_id: str) -> dict:
     data = fetch_json("/api/v5/public/funding-rate", {"instId": inst_id})
     return data["data"][0] if data.get("data") else {}
@@ -229,7 +591,12 @@ def _safe_public_map(path: str, params: dict[str, str], key: str, value_keys: tu
         inst_id = str(row.get(key) or "")
         if not inst_id:
             continue
-        output[inst_id] = {name: row.get(name) for name in value_keys}
+        # Preserve the identity used to key the response so downstream paired
+        # contracts can verify the payload row instead of trusting lookup state.
+        output[inst_id] = {
+            key: inst_id,
+            **{name: row.get(name) for name in value_keys},
+        }
     return output
 
 
@@ -306,7 +673,7 @@ def _strategy_observation(row: dict, candidate: dict | None, instrument: dict | 
         "trade_type": "perp_funding_basis",
         **instrument_asset_context(str(row.get("instId") or ""), instrument),
         "last": as_float(row.get("last")),
-        "observed_at": seen_at,
+        **_ticker_event_provenance(row, seen_at),
         "price_source": "OKX public REST market tickers",
     }
     if not candidate:
@@ -350,6 +717,12 @@ def build_scan_batch(
             "ctVal", "ctValCcy", "settleCcy", "state", "tickSz", "lotSz", "minSz",
             "baseCcy", "quoteCcy", "instFamily", "uly", "ctType",
         ),
+    )
+    spot_ticker_by_inst = _safe_public_map(
+        "/api/v5/market/tickers",
+        {"instType": "SPOT"},
+        "instId",
+        ("last", "bidPx", "askPx", "volCcy24h", "ts"),
     )
 
     usdt_swaps = []
@@ -446,6 +819,7 @@ def build_scan_batch(
 
         candidate = {
             "seen_at": seen_at,
+            **_ticker_event_provenance(row, seen_at),
             "venue": "OKX",
             "inst_id": inst_id,
             "trade_type": "perp_funding_basis",
@@ -492,6 +866,14 @@ def build_scan_batch(
         }
         if signal_age_seconds is not None:
             candidate["signal_age_seconds"] = round(signal_age_seconds, 3)
+        if direction == "short_perp_long_spot":
+            candidate = apply_paired_direct_entry_contract(
+                candidate,
+                row,
+                spot_ticker_by_inst.get(index_id),
+                settings,
+                decision_time=decision_time,
+            )
         candidate["score"] = score_candidate(candidate)
         candidates.append(annotate_paper_context_cost(candidate, settings or {"mode": "paper"}))
         direction_counts[direction] += 1
@@ -519,6 +901,17 @@ def build_scan_batch(
             "enriched_history_count": len(history_by_inst),
             "open_interest_count": len(open_interest_by_inst),
             "mark_price_count": len(mark_by_inst),
+            "spot_ticker_count": len(spot_ticker_by_inst),
+            "paired_direct_entry_complete_count": sum(
+                1
+                for item in candidates
+                if item.get("paired_direct_contract_status") == "entry_complete"
+            ),
+            "paired_direct_incomplete_count": sum(
+                1
+                for item in candidates
+                if item.get("paired_direct_contract_status") == "invalid_or_incomplete"
+            ),
             "required_inst_id_count": len(required_inst_ids),
             "selected_instrument_count": len(selected),
         },

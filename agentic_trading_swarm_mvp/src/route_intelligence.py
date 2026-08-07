@@ -1913,11 +1913,27 @@ def build_candidate_route_requirement_summary(
 
 def build_route_requirements_report(
     opportunities: Iterable[dict[str, Any]],
+    *,
+    representative_row_limit: int | None = 100,
 ) -> dict[str, Any]:
     """Return a JSON-serializable paper-only route requirements report."""
 
     opportunities = list(opportunities)
-    routes = build_route_requirements_matrix(opportunities)
+    all_routes = build_route_requirements_matrix(opportunities)
+    if representative_row_limit is None:
+        route_limit = len(all_routes)
+        effective_row_limit = len(all_routes) * 2
+    else:
+        effective_row_limit = max(0, min(100, int(representative_row_limit)))
+        # Each route is intentionally paired with its concise compatibility
+        # summary, so the two embedded lists share one detail-row budget.
+        route_limit = effective_row_limit // 2
+    routes = all_routes[:route_limit]
+    route_summaries = [
+        dict(row["route_requirement_summary"])
+        for row in routes
+        if isinstance(row.get("route_requirement_summary"), dict)
+    ]
     return {
         "paper_only": True,
         "read_only": True,
@@ -1946,14 +1962,23 @@ def build_route_requirements_report(
         # A stable, concise view for report consumers.  It repeats no routing
         # decision and is deliberately suitable only for paper ranking and
         # counterfactual guard-value measurement.
-        "candidate_route_requirement_summaries": [
-            dict(row["route_requirement_summary"])
-            for row in routes
-            if isinstance(row.get("route_requirement_summary"), dict)
-        ],
-        "route_friction_summary": summarize_route_friction(routes),
+        "candidate_route_requirement_summaries": route_summaries,
+        "route_friction_summary": summarize_route_friction(all_routes),
         "playbook_summary": build_route_playbook_summary(opportunities),
         "paper_feasibility_summary": build_route_feasibility_summary(opportunities),
+        "artifact_compaction": {
+            "enabled": representative_row_limit is not None,
+            "policy": "complete_aggregates_plus_paired_bounded_route_rows",
+            "representative_row_limit": effective_row_limit,
+            "route_count": len(all_routes),
+            "route_count_stored": len(routes),
+            "route_count_omitted": len(all_routes) - len(routes),
+            "representative_row_count_available": len(all_routes) * 2,
+            "representative_row_count_stored": len(routes) + len(route_summaries),
+            "representative_row_count_omitted": (
+                len(all_routes) * 2 - len(routes) - len(route_summaries)
+            ),
+        },
     }
 
 

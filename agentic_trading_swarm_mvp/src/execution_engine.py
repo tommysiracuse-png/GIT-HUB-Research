@@ -8,6 +8,7 @@ routes.
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 import sqlite3
 
@@ -22,8 +23,21 @@ from paper_order_router import (
 from paper_context_cost import enforce_paper_context_cost_gate
 from paper_decay_quarantine import apply_quarantine as apply_okx_basis_decay_quarantine
 from paper_exploration import exploration_enabled, prepare_candidate_for_exploration
+from paper_measurement_sleeve import apply_bounded_measurement_probe
+from paired_direct_contract import (
+    ACCOUNTING_CONVENTION as PAIRED_DIRECT_ACCOUNTING_CONVENTION,
+    CONTRACT_VERSION as PAIRED_DIRECT_CONTRACT_VERSION,
+    DECLARED_GROSS_NOTIONAL_USD as PAIRED_DIRECT_GROSS_NOTIONAL_USD,
+    STRATEGY_FAMILY as PAIRED_DIRECT_STRATEGY_FAMILY,
+    is_paired_direction,
+    validate_paired_direct_entry,
+)
 from storage import (
+    bounded_paper_queue_claim_valid,
+    consume_bounded_paper_queue_claim,
+    open_paper_trade,
     paper_label_eligibility,
+    paper_queue_claim_required,
     save_execution_fill,
     save_execution_order,
     save_frontier_paper_shadow_observation,
@@ -32,6 +46,7 @@ from storage import (
 
 NAV_REFERENCE_PAPER_ROUTE_ID = "synthetic_nav_reference_paper"
 AUCTION_REFERENCE_PAPER_ROUTE_ID = "synthetic_auction_reference_paper"
+PAIRED_DIRECT_EXCLUSION_REASON = "paired_direct_contract_invalid_or_incomplete"
 
 
 def _side_for_direction(direction: str) -> str:
@@ -83,6 +98,142 @@ def _route_for_candidate(candidate: dict, review: dict) -> str:
     return "generic_paper_route"
 
 
+def _parse_execution_event_at(value: object) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _paired_direct_order_legs(
+    candidate: dict,
+    settings: dict,
+    *,
+    available_paper_notional_usd: float,
+) -> tuple[list[dict], dict, list[str]]:
+    """Return two canonical paper legs only for a still-fresh shared contract."""
+
+    validation = validate_paired_direct_entry(
+        candidate,
+        settings=settings,
+        now=dt.datetime.now(dt.timezone.utc),
+    )
+    contract = dict(validation.get("contract") or {})
+    reasons = list(validation.get("reasons") or [])
+    if candidate.get("paired_direct_contract_status") != "entry_complete":
+        reasons.append("paired_direct_contract_status")
+    if candidate.get("paper_fill_allowed") is False:
+        reasons.append("paper_fill_not_allowed")
+
+    try:
+        declared_gross = float(contract.get("declared_gross_notional_usd"))
+        denominator = float(contract.get("return_denominator_usd"))
+    except (TypeError, ValueError):
+        declared_gross = 0.0
+        denominator = 0.0
+    if not math.isclose(
+        declared_gross,
+        PAIRED_DIRECT_GROSS_NOTIONAL_USD,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        reasons.append("paired_gross_notional_must_equal_100_usd")
+    if not math.isclose(
+        denominator,
+        PAIRED_DIRECT_GROSS_NOTIONAL_USD,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        reasons.append("paired_return_denominator_must_equal_100_usd")
+    if available_paper_notional_usd + 1e-9 < PAIRED_DIRECT_GROSS_NOTIONAL_USD:
+        reasons.append("paper_risk_notional_below_paired_contract")
+
+    queue_cfg = (settings.get("market_admission") or {}).get("paper_queue") or {}
+    try:
+        configured_max_age = max(
+            1.0,
+            float(queue_cfg.get("max_freshness_age_seconds", 90.0)),
+        )
+    except (TypeError, ValueError):
+        configured_max_age = 90.0
+    try:
+        declared_max_age = float(contract.get("max_entry_freshness_age_seconds"))
+    except (TypeError, ValueError):
+        declared_max_age = -1.0
+    if not math.isclose(
+        declared_max_age,
+        configured_max_age,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        reasons.append("max_entry_freshness_age_seconds")
+
+    now = dt.datetime.now(dt.timezone.utc)
+    components = contract.get("entry_components") or {}
+    canonical: list[tuple[str, str]] = [("perp", "sell"), ("spot", "buy")]
+    legs: list[dict] = []
+    for leg_index, (name, order_side) in enumerate(canonical):
+        component = components.get(name) if isinstance(components, dict) else None
+        component = dict(component) if isinstance(component, dict) else {}
+        event_at = _parse_execution_event_at(component.get("event_at"))
+        if event_at is None:
+            reasons.append(f"entry_components.{name}.event_at")
+        else:
+            age_seconds = (now - event_at).total_seconds()
+            if age_seconds < 0.0:
+                reasons.append(f"entry_components.{name}.event_at_in_future")
+            elif age_seconds > configured_max_age:
+                reasons.append(f"entry_components.{name}.stale")
+        try:
+            price = float(component.get("price"))
+            notional_usd = float(component.get("notional_usd"))
+        except (TypeError, ValueError):
+            price = 0.0
+            notional_usd = 0.0
+        if price <= 0.0 or notional_usd <= 0.0:
+            continue
+        source = component.get("source") or {}
+        quantity = notional_usd / price
+        legs.append(
+            {
+                "leg_index": leg_index,
+                "leg_role": name,
+                "strategy_family": PAIRED_DIRECT_STRATEGY_FAMILY,
+                "contract_version": PAIRED_DIRECT_CONTRACT_VERSION,
+                "symbol": component.get("inst_id"),
+                "inst_id": component.get("inst_id"),
+                "venue": component.get("venue"),
+                "market_surface": component.get("market_surface"),
+                "quote_asset": component.get("quote_asset"),
+                "position_side": component.get("side"),
+                "side": order_side,
+                "order_type": "market_paper",
+                "quantity": round(quantity, 12),
+                "price": price,
+                "reference_price": price,
+                "event_at": component.get("event_at"),
+                "notional_usd": notional_usd,
+                "estimated_fee_bps": component.get("entry_fee_bps"),
+                "estimated_slippage_bps": component.get("entry_slippage_bps"),
+                "entry_fee_bps": component.get("entry_fee_bps"),
+                "entry_slippage_bps": component.get("entry_slippage_bps"),
+                "exit_fee_bps": component.get("exit_fee_bps"),
+                "exit_slippage_bps": component.get("exit_slippage_bps"),
+                "source": dict(source) if isinstance(source, dict) else {},
+                "source_identity": (
+                    source.get("event_id") if isinstance(source, dict) else None
+                ),
+            }
+        )
+    if len(legs) != 2:
+        reasons.append("paired_direct_two_legs_required")
+    unique_reasons = sorted(set(str(reason) for reason in reasons if reason))
+    return ([] if unique_reasons else legs), contract, unique_reasons
+
+
 def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
     risk = settings["risk"]
     mode = settings.get("mode", "paper")
@@ -132,25 +283,45 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         and review.get("effective_route_id") == "okx_derivatives_paper"
     )
 
-    side = _side_for_direction(candidate["direction"])
-    price = float(candidate["last"])
-    quantity = 0.0 if price <= 0 else notional / price
-    leg = {
-        "leg_index": 0,
-        "symbol": candidate["inst_id"],
-        "venue": candidate.get("venue"),
-        "side": side,
-        "order_type": "market_paper" if mode == "paper" else "market",
-        "quantity": round(quantity, 8),
-        "reference_price": price,
-        "notional_usd": notional,
-        "estimated_slippage_bps": candidate.get("entry_slippage_bps_estimate"),
-        "estimated_fee_bps": candidate.get("estimated_fee_bps_per_side"),
-    }
-
-    status = "ready_for_paper_execution"
-    if side == "hold":
-        status = "blocked_no_side"
+    paired_direction = is_paired_direction(candidate.get("direction"))
+    paired_contract: dict = {}
+    paired_validation_reasons: list[str] = []
+    if paired_direction:
+        legs, paired_contract, paired_validation_reasons = _paired_direct_order_legs(
+            candidate,
+            settings,
+            available_paper_notional_usd=notional,
+        )
+        side = "paired"
+        if not paired_validation_reasons:
+            notional = float(paired_contract["declared_gross_notional_usd"])
+            status = "ready_for_paper_execution"
+        else:
+            notional = 0.0
+            status = "blocked_invalid_or_incomplete_paired_direct_contract"
+    else:
+        side = _side_for_direction(candidate["direction"])
+        price = float(candidate["last"])
+        quantity = 0.0 if price <= 0 else notional / price
+        legs = [
+            {
+                "leg_index": 0,
+                "symbol": candidate["inst_id"],
+                "inst_id": candidate["inst_id"],
+                "venue": candidate.get("venue"),
+                "side": side,
+                "order_type": "market_paper" if mode == "paper" else "market",
+                "quantity": round(quantity, 8),
+                "price": price,
+                "reference_price": price,
+                "notional_usd": notional,
+                "estimated_slippage_bps": candidate.get("entry_slippage_bps_estimate"),
+                "estimated_fee_bps": candidate.get("estimated_fee_bps_per_side"),
+            }
+        ]
+        status = "ready_for_paper_execution"
+        if side == "hold":
+            status = "blocked_no_side"
     if proxy_route_requested and not proxy_not_live_equivalent:
         status = "blocked_invalid_paper_proxy_metadata"
     if mode == "live":
@@ -162,12 +333,48 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
     ):
         label_candidate["paper_label_eligible"] = True
     label_eligibility = paper_label_eligibility(candidate=label_candidate, review=review)
+    if paired_direction and paired_validation_reasons:
+        label_eligibility = {
+            **label_eligibility,
+            "paper_label_eligible": False,
+            "paper_label_exclusion_reason": PAIRED_DIRECT_EXCLUSION_REASON,
+            "paper_shadow_excluded_from_learning": True,
+            "paper_shadow_exclusion_triggers": list(paired_validation_reasons),
+        }
 
     return {
         "mode": mode,
         "route_id": _route_for_candidate(candidate, review),
         "status": status,
         "notional_usd": notional,
+        "declared_gross_notional_usd": (
+            paired_contract.get("declared_gross_notional_usd")
+            if paired_direction
+            else None
+        ),
+        "return_denominator_usd": (
+            paired_contract.get("return_denominator_usd")
+            if paired_direction
+            else None
+        ),
+        "contract_version": (
+            PAIRED_DIRECT_CONTRACT_VERSION if paired_direction else None
+        ),
+        "strategy_family": (
+            PAIRED_DIRECT_STRATEGY_FAMILY if paired_direction else None
+        ),
+        "accounting_convention": (
+            PAIRED_DIRECT_ACCOUNTING_CONVENTION if paired_direction else None
+        ),
+        "paired_direct_contract_status": (
+            "entry_complete"
+            if paired_direction and not paired_validation_reasons
+            else "invalid_or_incomplete"
+            if paired_direction
+            else None
+        ),
+        "paired_direct_validation_reasons": list(paired_validation_reasons),
+        PAIRED_DIRECT_CONTRACT_VERSION: paired_contract if paired_direction else None,
         "direction": candidate["direction"],
         "trade_type": candidate.get("trade_type", "unknown"),
         "feasibility_status": review.get("feasibility_status"),
@@ -217,7 +424,7 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
         "signal_key": review.get("signal_key"),
         "direct_signal_key": candidate.get("direct_signal_key"),
         "direct_route_id": candidate.get("paper_proxy_source_route_id"),
-        "legs": [leg],
+        "legs": legs,
         "risk": {
             "confidence": review.get("confidence"),
             "net_edge_bps_estimate": review.get("net_edge_bps_estimate"),
@@ -227,6 +434,17 @@ def build_order_ticket(candidate: dict, review: dict, settings: dict) -> dict:
             "Paper order ticket generated from approved opportunity.",
             "Live execution is blocked until explicit mode, route, credentials, and limits are configured.",
         ] + (
+            [
+                "paired_direct_v1: two directly quoted, matched-notional legs totaling $100 gross.",
+                "Modeled fill prices are audit-only; paired PnL uses direct reference prices and deducts declared costs once.",
+            ]
+            if paired_direction and not paired_validation_reasons
+            else [
+                "Paired paper execution failed closed because the shared paired_direct_v1 entry contract is incomplete or invalid."
+            ]
+            if paired_direction
+            else []
+        ) + (
             [
                 "proxy_not_live_equivalent: OKX derivatives paper exposure replaces a borrow-blocked direct short-spot attempt.",
                 "Proxy outcomes use an isolated paper-proxy signal statistics scope.",
@@ -262,14 +480,32 @@ def _paper_fill_for_leg(leg: dict, settings: dict) -> dict:
     fill_price = reference * (1.0 + sign * slippage_bps / 10_000.0)
     return {
         "leg_index": leg["leg_index"],
+        "leg_role": leg.get("leg_role"),
+        "strategy_family": leg.get("strategy_family"),
+        "contract_version": leg.get("contract_version"),
         "symbol": leg["symbol"],
+        "inst_id": leg.get("inst_id") or leg["symbol"],
+        "venue": leg.get("venue"),
+        "market_surface": leg.get("market_surface"),
+        "quote_asset": leg.get("quote_asset"),
+        "position_side": leg.get("position_side"),
         "side": side,
         "quantity": leg["quantity"],
+        "price": reference,
         "fill_price": round(fill_price, 10),
         "reference_price": reference,
+        "event_at": leg.get("event_at"),
         "notional_usd": leg["notional_usd"],
         "fee_bps": fee_bps,
         "slippage_bps": slippage_bps,
+        "entry_fee_bps": fee_bps,
+        "entry_slippage_bps": slippage_bps,
+        "exit_fee_bps": leg.get("exit_fee_bps"),
+        "exit_slippage_bps": leg.get("exit_slippage_bps"),
+        "source": dict(leg.get("source") or {}),
+        "source_identity": leg.get("source_identity"),
+        "cost_accounting": "reference_prices_plus_explicit_costs_once",
+        "modeled_fill_price_audit_only": bool(leg.get("contract_version")),
     }
 
 
@@ -442,6 +678,47 @@ def execute_order(
     paper_mode = settings.get("mode", "paper") == "paper" and not settings.get(
         "allow_live_trading", False
     )
+    bounded_queue_claim_required = paper_mode and paper_queue_claim_required(settings)
+    if (
+        paper_mode
+        and is_paired_direction(candidate.get("direction"))
+        and not bounded_queue_claim_required
+    ):
+        order = build_order_ticket(candidate, review, settings)
+        order["status"] = "blocked_paired_direct_requires_bounded_queue"
+        order["notes"].append(
+            "paired_direct_v1 is executable only through the bounded queue transaction that atomically owns both fills and the paper trade."
+        )
+        return {
+            "order_id": None,
+            "order": order,
+            "fills": [],
+            "fill_ids": [],
+            "paper_filled": False,
+            "queue_claim_valid": False,
+            "candidate": candidate,
+            "opportunity_id": opportunity_id,
+        }
+    if bounded_queue_claim_required and not bounded_paper_queue_claim_valid(
+        conn,
+        candidate,
+        settings,
+    ):
+        order = build_order_ticket(candidate, review, settings)
+        order["status"] = "blocked_invalid_paper_queue_claim"
+        order["notes"].append(
+            "Bounded paper execution requires an exact, unexpired queue claim."
+        )
+        return {
+            "order_id": None,
+            "order": order,
+            "fills": [],
+            "fill_ids": [],
+            "paper_filled": False,
+            "queue_claim_valid": False,
+            "candidate": candidate,
+            "opportunity_id": opportunity_id,
+        }
     if paper_mode:
         # Evaluate the direct candidate before exploration can substitute a
         # synthetic route and hide direct route blockers from the fill guard.
@@ -544,6 +821,7 @@ def execute_order(
         return result
     if paper_mode:
         candidate = apply_frontier_paper_fill_gate(candidate, settings)
+        candidate = apply_bounded_measurement_probe(candidate, review, settings)
     order = build_order_ticket(candidate, review, settings)
     if candidate.get("shadow_filtered"):
         yahoo_proxy_freshness_shadow = (
@@ -716,8 +994,12 @@ def execute_order(
         order["notes"].append(
             "Paper fill deferred before fill creation because the cycle or open-trade capacity is exhausted."
         )
-        order_id = save_execution_order(
-            conn, order, candidate, review, opportunity_id=opportunity_id
+        order_id = (
+            None
+            if bounded_queue_claim_required
+            else save_execution_order(
+                conn, order, candidate, review, opportunity_id=opportunity_id
+            )
         )
         return {
             "order_id": order_id,
@@ -732,6 +1014,71 @@ def execute_order(
 
     fills = [_paper_fill_for_leg(leg, settings) for leg in order["legs"]]
     order["status"] = "paper_filled"
+    if bounded_queue_claim_required:
+        savepoint = "bounded_paper_fill_bundle"
+        conn.execute(f"savepoint {savepoint}")
+        try:
+            if not consume_bounded_paper_queue_claim(conn, candidate, settings):
+                conn.execute(f"rollback to savepoint {savepoint}")
+                conn.execute(f"release savepoint {savepoint}")
+                order["status"] = "blocked_invalid_paper_queue_claim"
+                order["notes"].append(
+                    "The bounded paper queue claim was already consumed or expired."
+                )
+                return {
+                    "order_id": None,
+                    "order": order,
+                    "fills": [],
+                    "fill_ids": [],
+                    "paper_filled": False,
+                    "queue_claim_valid": False,
+                    "candidate": candidate,
+                    "opportunity_id": opportunity_id,
+                }
+            order_id = save_execution_order(
+                conn,
+                order,
+                candidate,
+                review,
+                opportunity_id=opportunity_id,
+                commit=False,
+                settings=settings,
+            )
+            fill_ids = []
+            for fill in fills:
+                fill_id = save_execution_fill(
+                    conn,
+                    order_id,
+                    fill,
+                    commit=False,
+                )
+                fill["fill_id"] = fill_id
+                fill_ids.append(fill_id)
+            execution = {
+                "order_id": order_id,
+                "order": order,
+                "fills": fills,
+                "fill_ids": fill_ids,
+                "paper_filled": True,
+                "queue_claim_valid": True,
+                "candidate": candidate,
+                "opportunity_id": opportunity_id,
+            }
+            execution["paper_trade_id"] = open_paper_trade(
+                conn,
+                candidate,
+                review,
+                execution=execution,
+                settings=settings,
+                commit=False,
+            )
+            conn.execute(f"release savepoint {savepoint}")
+            return execution
+        except Exception:
+            conn.execute(f"rollback to savepoint {savepoint}")
+            conn.execute(f"release savepoint {savepoint}")
+            raise
+
     order_id = save_execution_order(
         conn, order, candidate, review, opportunity_id=opportunity_id
     )

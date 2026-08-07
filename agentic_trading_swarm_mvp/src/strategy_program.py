@@ -81,6 +81,8 @@ BASE_FEATURES = {
     "return_60m_bps",
     "return_4h_bps",
     "return_1d_bps",
+    "feature_history_contiguous_points",
+    "feature_history_latest_age_minutes",
     "momentum_15m_bps",
     "momentum_60m_bps",
     "momentum_4h_bps",
@@ -152,6 +154,26 @@ BASE_FEATURES = {
     "years_since_gofx_launch",
     "years_since_gofx_micro_launch",
     "years_since_crude_oil_contract_launch",
+}
+HISTORY_FEATURE_PERIODS = {
+    "return_5m_bps": 1,
+    "return_15m_bps": 3,
+    "momentum_15m_bps": 3,
+    "return_60m_bps": 12,
+    "momentum_60m_bps": 12,
+    "volatility_60m_bps": 12,
+    "price_zscore_60m": 12,
+    "relative_strength_60m_bps": 12,
+    "basis_zscore_60m": 12,
+    "basis_volatility_60m_bps": 12,
+    "basis_change_5m_bps": 12,
+    "basis_history_ready": 12,
+    "return_4h_bps": 48,
+    "momentum_4h_bps": 48,
+    "volatility_4h_bps": 48,
+    "price_zscore_4h": 48,
+    "relative_strength_4h_bps": 48,
+    "return_1d_bps": 288,
 }
 PERP_FUNDING_CAPTURE_REQUIRED_FEATURES = {
     "funding_bps",
@@ -329,9 +351,72 @@ def _json(value: Any, default: Any) -> Any:
         return default
 
 
-def _observation_rows(observations: dict[str, dict] | Iterable[dict] | None) -> list[dict]:
+RECOVERY_OBSERVATION_TIMESTAMP_FIELDS = (
+    "exchange_timestamp",
+    "source_timestamp",
+    "ticker_timestamp",
+    "ticker_timestamp_ms",
+    "source_event_at",
+    "source_observed_at",
+    "book_timestamp",
+    "book_observed_at",
+    "observed_at",
+    "seen_at",
+    "detected_at",
+    "as_of",
+    "updated_at",
+    "timestamp",
+)
+
+
+def _strict_utc_time(value: Any) -> dt.datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, (int, float)) or str(value).strip().isdigit():
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                return None
+            if abs(numeric) >= 100_000_000_000:
+                numeric /= 1000.0
+            parsed = dt.datetime.fromtimestamp(numeric, tz=dt.timezone.utc)
+        else:
+            parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _recovery_observation_max_age_seconds(settings: dict | None) -> float | None:
+    settings = settings or {}
+    if not bool(
+        (settings.get("operations") or {}).get("fail_closed_recovery_profile", False)
+    ):
+        return None
+    admission = settings.get("market_admission") or {}
+    nested_queue = admission.get("paper_queue") or {}
+    top_queue = settings.get("paper_admission_queue") or {}
+    raw = nested_queue.get(
+        "max_freshness_age_seconds",
+        top_queue.get("max_freshness_age_seconds", 90.0),
+    )
+    try:
+        maximum = float(raw)
+    except (TypeError, ValueError):
+        return 90.0
+    return maximum if math.isfinite(maximum) and maximum > 0.0 else 90.0
+
+
+def _observation_rows(
+    observations: dict[str, dict] | Iterable[dict] | None,
+    settings: dict | None = None,
+) -> list[dict]:
     raw_rows = observations.values() if isinstance(observations, dict) else (observations or [])
     rows: list[dict] = []
+    recovery_max_age = _recovery_observation_max_age_seconds(settings)
+    captured_at = dt.datetime.now(dt.timezone.utc)
     for raw in raw_rows:
         if not isinstance(raw, dict):
             continue
@@ -342,15 +427,106 @@ def _observation_rows(observations: dict[str, dict] | Iterable[dict] | None) -> 
         last = _float(row.get("last", row.get("price")), math.nan)
         if not inst_id or not math.isfinite(last) or last <= 0:
             continue
+        observed_at: dt.datetime | None = None
+        if recovery_max_age is not None:
+            for field in RECOVERY_OBSERVATION_TIMESTAMP_FIELDS:
+                if row.get(field) in (None, ""):
+                    continue
+                observed_at = _strict_utc_time(row.get(field))
+                # The highest-priority supplied event-time field is
+                # authoritative.  A malformed exchange timestamp must not be
+                # hidden by a newer local receipt timestamp.
+                break
+            if observed_at is None:
+                continue
+            age_seconds = (captured_at - observed_at).total_seconds()
+            if age_seconds > recovery_max_age or age_seconds < -5.0:
+                continue
+        else:
+            observed_at = _strict_utc_time(
+                row.get("observed_at") or row.get("seen_at")
+            ) or captured_at
         row["inst_id"] = inst_id
         row["venue"] = venue
         row["last"] = last
-        row["observed_at"] = str(
-            row.get("observed_at") or row.get("seen_at") or dt.datetime.now(dt.timezone.utc).isoformat()
-        )
+        row["observed_at"] = observed_at.isoformat()
         row["price_source"] = str(row.get("price_source") or venue or "scanner")
         rows.append(row)
     return rows
+
+
+def _configured_limit(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bounded_observation_rows(rows: list[dict], settings: dict) -> tuple[list[dict], dict]:
+    """Apply deterministic, venue-balanced per-cycle snapshot bounds.
+
+    A value of zero keeps the historical unlimited behavior.  Recovery
+    profiles can set both limits to make snapshot cost independent of scanner
+    fan-out while still giving every venue a chance to contribute.
+    """
+
+    cfg = settings.get("strategy_lab", {})
+    max_inputs = _configured_limit(cfg.get("snapshot_max_inputs_per_loop", 0))
+    max_instruments = _configured_limit(cfg.get("snapshot_max_instruments_per_loop", 0))
+    if not max_inputs and not max_instruments:
+        return rows, {
+            "input_rows_seen": len(rows),
+            "input_rows_selected": len(rows),
+            "input_rows_dropped_for_cap": 0,
+            "instruments_seen": len({_instrument_key(row) for row in rows}),
+            "instruments_selected": len({_instrument_key(row) for row in rows}),
+            "max_inputs_per_loop": 0,
+            "max_instruments_per_loop": 0,
+        }
+
+    by_venue: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        by_venue[str(row.get("venue") or "UNKNOWN")].append(row)
+    venue_offsets = {venue: 0 for venue in by_venue}
+    selected: list[dict] = []
+    selected_instruments: set[tuple[str, str]] = set()
+    input_limit = max_inputs or len(rows)
+    while len(selected) < input_limit:
+        progressed = False
+        for venue in sorted(by_venue):
+            venue_rows = by_venue[venue]
+            offset = venue_offsets[venue]
+            while offset < len(venue_rows):
+                row = venue_rows[offset]
+                offset += 1
+                key = _instrument_key(row)
+                if (
+                    max_instruments
+                    and key not in selected_instruments
+                    and len(selected_instruments) >= max_instruments
+                ):
+                    continue
+                venue_offsets[venue] = offset
+                selected.append(row)
+                selected_instruments.add(key)
+                progressed = True
+                break
+            venue_offsets[venue] = offset
+            if len(selected) >= input_limit:
+                break
+        if not progressed:
+            break
+
+    seen_instruments = {_instrument_key(row) for row in rows}
+    return selected, {
+        "input_rows_seen": len(rows),
+        "input_rows_selected": len(selected),
+        "input_rows_dropped_for_cap": max(0, len(rows) - len(selected)),
+        "instruments_seen": len(seen_instruments),
+        "instruments_selected": len(selected_instruments),
+        "max_inputs_per_loop": max_inputs,
+        "max_instruments_per_loop": max_instruments,
+    }
 
 
 def _instrument_key(row: dict) -> tuple[str, str]:
@@ -389,6 +565,48 @@ def _load_history(
             item["features"] = _json(item.pop("features_json"), {})
             history[(str(item["venue"]), str(item["inst_id"]))].append(item)
     return history
+
+
+def _strict_time(value: Any) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _contiguous_history_tail(
+    history: list[dict],
+    current_bucket: str,
+    snapshot_minutes: int,
+) -> tuple[list[dict], float | None]:
+    """Return only the exact bucket-by-bucket tail preceding this observation."""
+
+    current_at = _strict_time(current_bucket)
+    if current_at is None:
+        return [], None
+    step = dt.timedelta(minutes=max(1, int(snapshot_minutes)))
+    expected = current_at - step
+    contiguous_reversed: list[dict] = []
+    for item in reversed(history):
+        bucket_at = _strict_time(item.get("bucket_at"))
+        if bucket_at is None:
+            break
+        if bucket_at > expected:
+            continue
+        if bucket_at != expected:
+            break
+        contiguous_reversed.append(item)
+        expected -= step
+    contiguous = list(reversed(contiguous_reversed))
+    latest_age_minutes = (
+        (current_at - _strict_time(contiguous[-1].get("bucket_at"))).total_seconds() / 60.0
+        if contiguous and _strict_time(contiguous[-1].get("bucket_at")) is not None
+        else None
+    )
+    return contiguous, latest_age_minutes
 
 
 def _return_bps(current: float, history: list[dict], periods: int) -> float:
@@ -758,12 +976,11 @@ def _feature_frame(row: dict, history: list[dict], peer_prices: list[float]) -> 
     }
 
 
-def build_feature_frames(
+def _build_feature_frames_from_rows(
     conn: sqlite3.Connection,
-    observations: dict[str, dict] | Iterable[dict] | None,
+    rows: list[dict],
     settings: dict,
 ) -> list[dict]:
-    rows = _observation_rows(observations)
     if not rows:
         return []
     cfg = settings.get("strategy_lab", {})
@@ -779,18 +996,29 @@ def build_feature_frames(
     peers: dict[str, list[float]] = defaultdict(list)
     for row in rows:
         peers[_base_symbol(row)].append(_float(row.get("last")))
-    frames = [
-        _feature_frame(
+    frames = []
+    for row in rows:
+        current_bucket = _bucket_time(row.get("observed_at"), snapshot_minutes)
+        prior_history = [
+            item
+            for item in history.get(_instrument_key(row), [])
+            if str(item.get("bucket_at") or "") < current_bucket
+        ]
+        contiguous_history, latest_age_minutes = _contiguous_history_tail(
+            prior_history,
+            current_bucket,
+            snapshot_minutes,
+        )
+        frame = _feature_frame(
             row,
-            [
-                item
-                for item in history.get(_instrument_key(row), [])
-                if str(item.get("bucket_at") or "") < _bucket_time(row.get("observed_at"), snapshot_minutes)
-            ],
+            contiguous_history,
             peers.get(_base_symbol(row), []),
         )
-        for row in rows
-    ]
+        frame["feature_history_contiguous_points"] = len(contiguous_history)
+        frame["feature_history_latest_age_minutes"] = (
+            float(latest_age_minutes) if latest_age_minutes is not None else 0.0
+        )
+        frames.append(frame)
     allowance_discount_history = _load_allowance_auction_discount_history(
         conn,
         frames,
@@ -809,13 +1037,27 @@ def build_feature_frames(
     return frames
 
 
+def build_feature_frames(
+    conn: sqlite3.Connection,
+    observations: dict[str, dict] | Iterable[dict] | None,
+    settings: dict,
+) -> list[dict]:
+    rows, _bounds = _bounded_observation_rows(
+        _observation_rows(observations, settings), settings
+    )
+    return _build_feature_frames_from_rows(conn, rows, settings)
+
+
 def record_feature_snapshots(
     conn: sqlite3.Connection,
     observations: dict[str, dict] | Iterable[dict] | None,
     settings: dict,
 ) -> tuple[list[dict], dict]:
     cfg = settings.get("strategy_lab", {})
-    frames = build_feature_frames(conn, observations, settings)
+    rows, bounds = _bounded_observation_rows(
+        _observation_rows(observations, settings), settings
+    )
+    frames = _build_feature_frames_from_rows(conn, rows, settings)
     snapshot_minutes = max(1, int(cfg.get("feature_snapshot_minutes", 5)))
     inserted = 0
     for frame in frames:
@@ -862,6 +1104,8 @@ def record_feature_snapshots(
         )
     conn.commit()
     return frames, {
+        "enabled": True,
+        **bounds,
         "snapshot_minutes": snapshot_minutes,
         "feature_frames": len(frames),
         "rows_written": inserted,
@@ -1360,6 +1604,36 @@ def _program_values(frame: dict, program: dict) -> dict:
     return values
 
 
+def _required_contiguous_history_points(program: dict) -> int:
+    calculated = program.get("calculated_features") or {}
+    calculated = calculated if isinstance(calculated, dict) else {}
+    referenced: set[str] = set()
+    for name in (
+        "entry_expression",
+        "invalidation_expression",
+        "long_expression",
+        "short_expression",
+        "edge_expression",
+        "score_expression",
+    ):
+        referenced.update(expression_names(str(program.get(name) or "")))
+    pending = [name for name in calculated if name in referenced]
+    visited: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        dependencies = expression_names(str(calculated.get(name) or ""))
+        referenced.update(dependencies)
+        pending.extend(
+            dependency
+            for dependency in dependencies
+            if dependency in calculated and dependency not in visited
+        )
+    return max((HISTORY_FEATURE_PERIODS.get(name, 0) for name in referenced), default=0)
+
+
 def generate_program_candidates(
     experiment: dict,
     frames: list[dict],
@@ -1385,6 +1659,7 @@ def generate_program_candidates(
     rejects: dict[str, int] = defaultdict(int)
     lifecycle_diagnostics: dict[str, int] = defaultdict(int)
     limit = max_candidates or int(settings.get("strategy_lab", {}).get("max_candidates_per_experiment", 10))
+    required_history_points = _required_contiguous_history_points(program)
     for frame in frames:
         if len(generated) >= limit:
             break
@@ -1401,6 +1676,14 @@ def generate_program_candidates(
         )
         if not _universe_matches(frame, universe):
             rejects["universe_mismatch"] += 1
+            continue
+        contiguous_points = frame.get("feature_history_contiguous_points")
+        if (
+            required_history_points > 0
+            and contiguous_points is not None
+            and _float(contiguous_points) < required_history_points
+        ):
+            rejects["feature_history_not_contiguous"] += 1
             continue
         if (
             str(frame.get("session_status") or "").lower() in {"closed", "stale", "unavailable"}
@@ -1763,6 +2046,7 @@ def generate_program_candidates(
     return generated[:limit], {
         **diagnostic,
         "source_observation_count": len(frames),
+        "required_contiguous_history_points": required_history_points,
         "generated_candidate_count": min(len(generated), limit),
         "reject_reasons": dict(rejects),
         "lifecycle_diagnostic_counts": dict(lifecycle_diagnostics),

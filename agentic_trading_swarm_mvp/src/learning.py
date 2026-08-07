@@ -10,6 +10,7 @@ from storage import (
     RUNS_DIR,
     add_growth_experiment,
     add_improvement_task,
+    bounded_paper_trade_lineage_valid,
     open_experiments,
     open_tasks,
     reliable_paper_label_eligibility_for_trade_row,
@@ -55,8 +56,8 @@ def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, d
 
     rows = conn.execute(
         """
-        select signal_key, pnl_bps, candidate_json, review_json, context_json,
-               close_measurement_status
+        select id, signal_key, pnl_bps, candidate_json, review_json, context_json,
+               close_measurement_status, admission_key, admission_episode_id
         from paper_trades
         where status = 'closed' and pnl_bps is not null
         """
@@ -64,6 +65,8 @@ def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, d
     grouped: dict[str, list[float]] = {}
     for row in rows:
         if not reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
+        if not bounded_paper_trade_lineage_valid(conn, row, settings):
             continue
         grouped.setdefault(row["signal_key"], []).append(float(row["pnl_bps"]))
 
@@ -112,19 +115,24 @@ def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, d
             ),
         }
     conn.commit()
-    update_contextual_stats(conn)
-    generate_improvement_tasks(conn, stats, settings)
-    generate_growth_experiments(conn, stats, settings)
+    update_contextual_stats(conn, settings)
+    if bool(learning_cfg.get("task_emission_enabled", True)):
+        generate_improvement_tasks(conn, stats, settings)
+    if bool(learning_cfg.get("growth_experiment_emission_enabled", True)):
+        generate_growth_experiments(conn, stats, settings)
     write_backlog(conn)
     write_growth_plan(conn)
     return stats
 
 
-def update_contextual_stats(conn: sqlite3.Connection) -> None:
+def update_contextual_stats(
+    conn: sqlite3.Connection,
+    settings: dict | None = None,
+) -> None:
     rows = conn.execute(
         """
-        select signal_key, pnl_bps, candidate_json, review_json, context_json,
-               close_measurement_status
+        select id, signal_key, pnl_bps, candidate_json, review_json, context_json,
+               close_measurement_status, admission_key, admission_episode_id
         from paper_trades
         where status = 'closed' and pnl_bps is not null and context_json is not null
         """
@@ -132,6 +140,8 @@ def update_contextual_stats(conn: sqlite3.Connection) -> None:
     grouped: dict[str, list[float]] = {}
     for row in rows:
         if not reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
+        if not bounded_paper_trade_lineage_valid(conn, row, settings):
             continue
         try:
             context = json.loads(row["context_json"] or "{}")

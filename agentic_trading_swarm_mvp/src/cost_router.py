@@ -9,10 +9,13 @@ verbosity, structured JSON, and prompt caching are explicit.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
+import math
 import os
 import pathlib
 import sqlite3
+import uuid
 from dataclasses import dataclass
 
 from autonomous_cost_guard import autonomous_paid_attempt_status, claim_autonomous_paid_attempt
@@ -23,6 +26,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config" / "llm_config.example.yaml"
 COST_LOG_DEFERRED_PATH = ROOT / "runs" / "llm_cost_events_deferred.jsonl"
 QUOTA_STATE_PATH = ROOT / "runs" / "llm_quota_state.json"
+MAX_GLOBAL_BUDGET_USD = 25.0
+MAX_GLOBAL_CALLS = 10
 
 PROVIDER_KEY_ENV = {
     "openai": "OPENAI_API_KEY",
@@ -57,6 +62,8 @@ class ModelResult:
     structured_json: bool = False
     max_output_tokens: int | None = None
     stop_reason: str | None = None
+    event_id: str | None = None
+    created_at: str | None = None
 
 
 def load_llm_config(path: pathlib.Path = CONFIG_PATH) -> dict:
@@ -130,6 +137,22 @@ def _provider_ready(model_name: str) -> tuple[bool, str]:
     return False, f"fallback_missing_provider_key:{key_name}"
 
 
+def _model_credentials_locked() -> bool:
+    """Return True when operations deliberately prohibit all provider calls."""
+
+    values = {
+        str(os.environ.get("RADAR_MODEL_CREDENTIAL_LOCK") or "").strip().lower(),
+        str(os.environ.get("RADAR_MODELS_DISABLED") or "").strip().lower(),
+    }
+    locked = bool(values & {"1", "true", "yes", "locked", "disabled"})
+    research_override = (
+        str(os.environ.get("RADAR_PROCESS_ROLE") or "").strip().lower() == "research_one_shot"
+        and str(os.environ.get("RADAR_RESEARCH_MODEL_OVERRIDE") or "").strip().lower()
+        in {"1", "true", "yes"}
+    )
+    return locked and not research_override
+
+
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -201,65 +224,647 @@ def _needs_schema_init(exc: BaseException) -> bool:
     return "no such table" in str(exc).lower()
 
 
+def _paid_attempt_sql() -> str:
+    return """
+        (
+            status = 'model_call'
+            or status like 'model_call:%'
+            or status = 'model_call_reserved'
+            or (event_id is not null and status like 'fallback_error:%')
+        )
+    """
+
+
+def _normalise_event_timestamp(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc).isoformat()
+
+
+def _deferred_event_id(path: pathlib.Path, line_number: int, raw: str) -> str:
+    material = f"{path.resolve()}:{line_number}:{raw}".encode("utf-8")
+    return "deferred-" + hashlib.sha256(material).hexdigest()
+
+
+def _cost_payload_values(payload: dict, *, event_id: str, created_at: str) -> tuple:
+    if "estimated_cost_usd" not in payload:
+        raise ValueError("deferred cost is missing")
+    prompt_tokens = int(payload.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(payload.get("completion_tokens", 0) or 0)
+    estimated_cost = float(payload["estimated_cost_usd"])
+    status = str(payload.get("status") or "").strip()
+    if prompt_tokens < 0 or completion_tokens < 0:
+        raise ValueError("deferred token count is negative")
+    if not math.isfinite(estimated_cost) or estimated_cost < 0:
+        raise ValueError("deferred cost is invalid")
+    if not status:
+        raise ValueError("deferred status is missing")
+    return (
+        event_id,
+        created_at,
+        str(payload.get("agent_name") or "unknown"),
+        str(payload.get("model_tier") or "unknown"),
+        str(payload.get("model_name") or "unknown"),
+        str(payload.get("provider") or ""),
+        str(payload.get("api") or ""),
+        payload.get("reasoning_effort"),
+        payload.get("verbosity"),
+        payload.get("operation"),
+        payload.get("prompt_cache_key"),
+        payload.get("frontier_escalation_reason"),
+        1 if bool(payload.get("structured_json", False)) else 0,
+        prompt_tokens,
+        completion_tokens,
+        estimated_cost,
+        status,
+    )
+
+
+def replay_deferred_cost_events(
+    conn: sqlite3.Connection | None = None,
+    path: pathlib.Path | None = None,
+) -> dict:
+    """Replay the append-only fallback ledger without duplicating events.
+
+    Old rows predate event IDs and timestamps.  Their IDs are derived from the
+    immutable file location/line and their timestamps from the file mtime, so
+    replays are deterministic and conservatively remain in the relevant cost
+    window.  The source file is intentionally never truncated.
+    """
+
+    source = pathlib.Path(path) if path is not None else COST_LOG_DEFERRED_PATH
+    report = {
+        "status": "deferred_cost_log_missing",
+        "read": 0,
+        "inserted": 0,
+        "finalized": 0,
+        "skipped": 0,
+        "invalid": 0,
+        "inferred_timestamps": 0,
+    }
+    if not source.exists():
+        return report
+    try:
+        file_mtime = dt.datetime.fromtimestamp(source.stat().st_mtime, tz=dt.timezone.utc)
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        report["status"] = "deferred_cost_log_unreadable"
+        report["invalid"] = 1
+        return report
+
+    owns_connection = conn is None
+    working = conn
+    try:
+        if working is None:
+            working = connect(initialize=False)
+        columns = {str(row[1]) for row in working.execute("pragma table_info(llm_cost_events)").fetchall()}
+        if "event_id" not in columns:
+            report["status"] = "cost_event_id_schema_missing"
+            report["invalid"] = 1
+            return report
+        for line_number, raw in enumerate(lines, start=1):
+            if not raw.strip():
+                continue
+            report["read"] += 1
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError("event is not an object")
+                event_id = str(payload.get("event_id") or "").strip()
+                if not event_id:
+                    event_id = _deferred_event_id(source, line_number, raw)
+                created_at = _normalise_event_timestamp(payload.get("created_at"))
+                if created_at is None:
+                    created_at = (file_mtime + dt.timedelta(microseconds=line_number)).isoformat()
+                    report["inferred_timestamps"] += 1
+                values = _cost_payload_values(payload, event_id=event_id, created_at=created_at)
+            except (TypeError, ValueError, json.JSONDecodeError, OverflowError):
+                report["invalid"] += 1
+                continue
+
+            existing = working.execute(
+                "select status from llm_cost_events where event_id=?",
+                (event_id,),
+            ).fetchone()
+            if existing is None:
+                working.execute(
+                    """
+                    insert into llm_cost_events (
+                        event_id,created_at,agent_name,model_tier,model_name,provider,api,
+                        reasoning_effort,verbosity,operation,prompt_cache_key,
+                        frontier_escalation_reason,structured_json,prompt_tokens,
+                        completion_tokens,estimated_cost_usd,status
+                    ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    values,
+                )
+                report["inserted"] += 1
+                continue
+            existing_status = str(existing["status"] if isinstance(existing, sqlite3.Row) else existing[0])
+            if existing_status != "model_call_reserved":
+                report["skipped"] += 1
+                continue
+            working.execute(
+                """
+                update llm_cost_events set
+                    agent_name=?,model_tier=?,model_name=?,provider=?,api=?,
+                    reasoning_effort=?,verbosity=?,operation=?,prompt_cache_key=?,
+                    frontier_escalation_reason=?,structured_json=?,prompt_tokens=?,
+                    completion_tokens=?,estimated_cost_usd=?,status=?
+                where event_id=? and status='model_call_reserved'
+                """,
+                (
+                    values[2], values[3], values[4], values[5], values[6], values[7],
+                    values[8], values[9], values[10], values[11], values[12], values[13],
+                    values[14], values[15], values[16], values[0],
+                ),
+            )
+            report["finalized"] += 1
+        working.commit()
+        report["status"] = "deferred_cost_log_replayed" if report["invalid"] == 0 else "deferred_cost_log_invalid"
+        return report
+    except (OSError, sqlite3.Error):
+        if working is not None:
+            try:
+                working.rollback()
+            except sqlite3.Error:
+                pass
+        report["status"] = "deferred_cost_replay_failed"
+        report["invalid"] = max(1, int(report["invalid"]))
+        return report
+    finally:
+        if owns_connection and working is not None:
+            working.close()
+
+
+def _window_usage(
+    conn: sqlite3.Connection,
+    *,
+    now: dt.datetime,
+    agent_name: str | None = None,
+) -> dict:
+    day_utc = now.date().isoformat()
+    rolling_start = (now - dt.timedelta(hours=24)).isoformat()
+    agent_clause = " and agent_name = ?" if agent_name else ""
+    day_params: tuple[object, ...] = (day_utc, agent_name) if agent_name else (day_utc,)
+    rolling_params: tuple[object, ...] = (rolling_start, agent_name) if agent_name else (rolling_start,)
+    paid_attempt = _paid_attempt_sql()
+    utc_row = conn.execute(
+        f"""
+        select coalesce(sum(estimated_cost_usd), 0) as cost,
+               coalesce(sum(case when {paid_attempt} then 1 else 0 end), 0) as calls
+        from llm_cost_events
+        where date(created_at) = ?{agent_clause}
+        """,
+        day_params,
+    ).fetchone()
+    rolling_row = conn.execute(
+        f"""
+        select coalesce(sum(estimated_cost_usd), 0) as cost,
+               coalesce(sum(case when {paid_attempt} then 1 else 0 end), 0) as calls
+        from llm_cost_events
+        where julianday(created_at) >= julianday(?){agent_clause}
+        """,
+        rolling_params,
+    ).fetchone()
+    return {
+        "utc_day": {"cost_usd": float(utc_row["cost"] or 0.0), "calls": int(utc_row["calls"] or 0)},
+        "rolling_24h": {
+            "cost_usd": float(rolling_row["cost"] or 0.0),
+            "calls": int(rolling_row["calls"] or 0),
+        },
+    }
+
+
 def _spent_today(agent_name: str | None = None) -> float:
     try:
         with connect(initialize=False) as conn:
-            if agent_name:
-                row = conn.execute(
-                    """
-                    select coalesce(sum(estimated_cost_usd), 0) as cost
-                    from llm_cost_events
-                    where agent_name = ? and substr(created_at, 1, 10) = date('now')
-                    """,
-                    (agent_name,),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    """
-                    select coalesce(sum(estimated_cost_usd), 0) as cost
-                    from llm_cost_events
-                    where substr(created_at, 1, 10) = date('now')
-                    """
-                ).fetchone()
+            usage = _window_usage(conn, now=_utc_now(), agent_name=agent_name)
     except sqlite3.OperationalError as exc:
         if _is_sqlite_locked(exc):
             return float("inf")
         if not _needs_schema_init(exc):
             raise
         with connect() as conn:
-            if agent_name:
-                row = conn.execute(
-                    """
-                    select coalesce(sum(estimated_cost_usd), 0) as cost
-                    from llm_cost_events
-                    where agent_name = ? and substr(created_at, 1, 10) = date('now')
-                    """,
-                    (agent_name,),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    """
-                    select coalesce(sum(estimated_cost_usd), 0) as cost
-                    from llm_cost_events
-                    where substr(created_at, 1, 10) = date('now')
-                    """
-                ).fetchone()
-    return float(row["cost"] or 0.0)
+            usage = _window_usage(conn, now=_utc_now(), agent_name=agent_name)
+    return float(usage["utc_day"]["cost_usd"])
 
 
-def _budget_allows_call(agent_name: str, cfg: dict, agent_cfg: dict, tier_cfg: dict, prompt_tokens: int) -> tuple[bool, str]:
-    agent_budget = float(agent_cfg.get("daily_budget_usd", cfg.get("daily_budget_usd", 0.0)))
-    global_budget = float(cfg.get("daily_budget_usd", 0.0))
-    estimated_completion_tokens = int(tier_cfg.get("estimated_completion_tokens", 1000))
-    estimated_call_cost = _cost_usd(prompt_tokens, estimated_completion_tokens, tier_cfg)
-    agent_spent = _spent_today(agent_name)
-    global_spent = _spent_today()
+def _locked_budget_limit(
+    cfg: dict,
+    key: str,
+    default: float | int,
+    maximum: float,
+) -> float:
+    raw = cfg.get(key, default)
+    if raw is None:
+        raise ValueError(f"{key} cannot be null in the bounded paid profile")
+    value = float(raw)
+    if not math.isfinite(value) or value < 0 or value > maximum:
+        raise ValueError(f"{key} must be within 0..{maximum}")
+    return value
 
-    if agent_budget > 0 and agent_spent + estimated_call_cost > agent_budget:
-        return False, f"agent_budget_guard:{agent_spent:.6f}+{estimated_call_cost:.6f}>{agent_budget:.6f}"
-    if global_budget > 0 and global_spent + estimated_call_cost > global_budget:
-        return False, f"global_budget_guard:{global_spent:.6f}+{estimated_call_cost:.6f}>{global_budget:.6f}"
-    return True, "budget_ok"
+
+def _locked_call_limit(cfg: dict, key: str, default: int, maximum: int) -> int:
+    raw = cfg.get(key, default)
+    if raw is None:
+        raise ValueError(f"{key} cannot be null in the bounded paid profile")
+    numeric = float(raw)
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"{key} must be a whole number")
+    value = int(numeric)
+    if value < 0 or value > maximum:
+        raise ValueError(f"{key} must be within 0..{maximum}")
+    return value
+
+
+def cost_budget_status(
+    cfg: dict | None = None,
+    *,
+    agent_name: str | None = None,
+    replay_deferred: bool = True,
+) -> dict:
+    """Return authoritative UTC-day and rolling-24h usage without calling a model."""
+
+    effective_cfg = cfg or load_llm_config()
+    try:
+        with connect(initialize=False) as conn:
+            replay = replay_deferred_cost_events(conn) if replay_deferred else {"status": "not_requested"}
+            if int(replay.get("invalid", 0) or 0) > 0:
+                return {
+                    "allowed": False,
+                    "status": "cost_budget_unavailable",
+                    "reason": str(replay.get("status") or "deferred_cost_replay_invalid"),
+                    "deferred_replay": replay,
+                }
+            now = _utc_now()
+            global_usage = _window_usage(conn, now=now)
+            agent_usage = _window_usage(conn, now=now, agent_name=agent_name)
+    except (OSError, sqlite3.Error) as exc:
+        return {
+            "allowed": False,
+            "status": "cost_budget_unavailable",
+            "reason": f"cost_budget_unavailable:{type(exc).__name__}",
+        }
+    agent_cfg = (
+        (effective_cfg.get("agents") or {}).get(agent_name, {})
+        if agent_name
+        else {}
+    )
+    usage = {"global": global_usage, "agent": agent_usage}
+    reason = _budget_reason(
+        usage,
+        cfg=effective_cfg,
+        agent_cfg=agent_cfg,
+        estimated_call_cost=0.0,
+        require_positive_headroom=True,
+    )
+    try:
+        day_budget = _locked_budget_limit(
+            effective_cfg,
+            "daily_budget_usd",
+            MAX_GLOBAL_BUDGET_USD,
+            MAX_GLOBAL_BUDGET_USD,
+        )
+        rolling_budget = _locked_budget_limit(
+            effective_cfg,
+            "rolling_24h_budget_usd",
+            day_budget,
+            MAX_GLOBAL_BUDGET_USD,
+        )
+        day_calls = _locked_call_limit(
+            effective_cfg,
+            "daily_call_limit",
+            MAX_GLOBAL_CALLS,
+            MAX_GLOBAL_CALLS,
+        )
+        rolling_calls = _locked_call_limit(
+            effective_cfg,
+            "rolling_24h_call_limit",
+            day_calls,
+            MAX_GLOBAL_CALLS,
+        )
+        agent_day_budget = _locked_budget_limit(
+            agent_cfg,
+            "daily_budget_usd",
+            day_budget,
+            day_budget,
+        )
+        agent_rolling_budget = _locked_budget_limit(
+            agent_cfg,
+            "rolling_24h_budget_usd",
+            min(agent_day_budget, rolling_budget),
+            rolling_budget,
+        )
+        agent_day_calls = _locked_call_limit(
+            agent_cfg,
+            "daily_call_limit",
+            day_calls,
+            day_calls,
+        )
+        agent_rolling_calls = _locked_call_limit(
+            agent_cfg,
+            "rolling_24h_call_limit",
+            min(agent_day_calls, rolling_calls),
+            rolling_calls,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {
+            "allowed": False,
+            "status": "cost_budget_unavailable",
+            "reason": f"cost_limit_config_invalid:{type(exc).__name__}",
+            "usage": global_usage,
+            "agent_usage": agent_usage,
+            "deferred_replay": replay,
+        }
+    return {
+        "allowed": reason is None,
+        "status": "cost_budget_available" if reason is None else "cost_budget_exhausted",
+        "reason": reason,
+        "usage": global_usage,
+        "agent_usage": agent_usage,
+        "limits": {
+            "utc_day_cost_usd": day_budget,
+            "rolling_24h_cost_usd": rolling_budget,
+            "utc_day_calls": day_calls,
+            "rolling_24h_calls": rolling_calls,
+            "agent_utc_day_cost_usd": agent_day_budget,
+            "agent_rolling_24h_cost_usd": agent_rolling_budget,
+            "agent_utc_day_calls": agent_day_calls,
+            "agent_rolling_24h_calls": agent_rolling_calls,
+        },
+        "deferred_replay": replay,
+    }
+
+
+def _budget_reason(
+    usage: dict,
+    *,
+    cfg: dict,
+    agent_cfg: dict,
+    estimated_call_cost: float,
+    require_positive_headroom: bool = False,
+) -> str | None:
+    try:
+        estimated_call_cost = float(estimated_call_cost)
+    except (TypeError, ValueError, OverflowError):
+        return "estimated_call_cost_invalid"
+    if not math.isfinite(estimated_call_cost) or estimated_call_cost < 0:
+        return "estimated_call_cost_invalid"
+    try:
+        global_day_budget = _locked_budget_limit(
+            cfg,
+            "daily_budget_usd",
+            MAX_GLOBAL_BUDGET_USD,
+            MAX_GLOBAL_BUDGET_USD,
+        )
+        global_rolling_budget = _locked_budget_limit(
+            cfg,
+            "rolling_24h_budget_usd",
+            global_day_budget,
+            MAX_GLOBAL_BUDGET_USD,
+        )
+        day_call_limit = _locked_call_limit(
+            cfg,
+            "daily_call_limit",
+            MAX_GLOBAL_CALLS,
+            MAX_GLOBAL_CALLS,
+        )
+        rolling_call_limit = _locked_call_limit(
+            cfg,
+            "rolling_24h_call_limit",
+            day_call_limit,
+            MAX_GLOBAL_CALLS,
+        )
+        agent_day_budget = _locked_budget_limit(
+            agent_cfg,
+            "daily_budget_usd",
+            global_day_budget,
+            global_day_budget,
+        )
+        agent_rolling_budget = _locked_budget_limit(
+            agent_cfg,
+            "rolling_24h_budget_usd",
+            min(agent_day_budget, global_rolling_budget),
+            global_rolling_budget,
+        )
+        agent_day_call_limit = _locked_call_limit(
+            agent_cfg,
+            "daily_call_limit",
+            day_call_limit,
+            day_call_limit,
+        )
+        agent_rolling_call_limit = _locked_call_limit(
+            agent_cfg,
+            "rolling_24h_call_limit",
+            min(agent_day_call_limit, rolling_call_limit),
+            rolling_call_limit,
+        )
+    except (TypeError, ValueError, OverflowError):
+        return "cost_limit_config_invalid"
+    day = usage["global"]["utc_day"]
+    rolling = usage["global"]["rolling_24h"]
+    if day["calls"] + 1 > day_call_limit:
+        return f"global_utc_call_guard:{day['calls']}+1>{day_call_limit}"
+    if rolling["calls"] + 1 > rolling_call_limit:
+        return f"global_rolling_24h_call_guard:{rolling['calls']}+1>{rolling_call_limit}"
+    if (
+        global_day_budget == 0
+        or day["cost_usd"] + estimated_call_cost > global_day_budget
+        or require_positive_headroom and day["cost_usd"] >= global_day_budget
+    ):
+        return (
+            f"global_utc_budget_guard:{day['cost_usd']:.6f}+"
+            f"{estimated_call_cost:.6f}>{global_day_budget:.6f}"
+        )
+    if (
+        global_rolling_budget == 0
+        or rolling["cost_usd"] + estimated_call_cost > global_rolling_budget
+        or require_positive_headroom and rolling["cost_usd"] >= global_rolling_budget
+    ):
+        return (
+            f"global_rolling_24h_budget_guard:{rolling['cost_usd']:.6f}+"
+            f"{estimated_call_cost:.6f}>{global_rolling_budget:.6f}"
+        )
+    agent_day = usage["agent"]["utc_day"]
+    agent_rolling = usage["agent"]["rolling_24h"]
+    if agent_day["calls"] + 1 > agent_day_call_limit:
+        return f"agent_utc_call_guard:{agent_day['calls']}+1>{agent_day_call_limit}"
+    if agent_rolling["calls"] + 1 > agent_rolling_call_limit:
+        return (
+            f"agent_rolling_24h_call_guard:{agent_rolling['calls']}+1>"
+            f"{agent_rolling_call_limit}"
+        )
+    if (
+        agent_day_budget == 0
+        or agent_day["cost_usd"] + estimated_call_cost > agent_day_budget
+        or require_positive_headroom and agent_day["cost_usd"] >= agent_day_budget
+    ):
+        return (
+            f"agent_utc_budget_guard:{agent_day['cost_usd']:.6f}+"
+            f"{estimated_call_cost:.6f}>{agent_day_budget:.6f}"
+        )
+    if (
+        agent_rolling_budget == 0
+        or agent_rolling["cost_usd"] + estimated_call_cost > agent_rolling_budget
+        or require_positive_headroom
+        and agent_rolling["cost_usd"] >= agent_rolling_budget
+    ):
+        return (
+            f"agent_rolling_24h_budget_guard:{agent_rolling['cost_usd']:.6f}+"
+            f"{estimated_call_cost:.6f}>{agent_rolling_budget:.6f}"
+        )
+    return None
+
+
+def _budget_usage_for_call(conn: sqlite3.Connection, agent_name: str, now: dt.datetime) -> dict:
+    return {
+        "global": _window_usage(conn, now=now),
+        "agent": _window_usage(conn, now=now, agent_name=agent_name),
+    }
+
+
+def _budget_allows_call(
+    agent_name: str,
+    cfg: dict,
+    agent_cfg: dict,
+    tier_cfg: dict,
+    prompt_tokens: int,
+    *,
+    max_output_tokens: int | None = None,
+) -> tuple[bool, str]:
+    completion_tokens = int(
+        max_output_tokens
+        if max_output_tokens is not None
+        else tier_cfg.get("estimated_completion_tokens", 1000)
+    )
+    estimated_call_cost = _cost_usd(prompt_tokens, completion_tokens, tier_cfg)
+    try:
+        with connect(initialize=False) as conn:
+            replay = replay_deferred_cost_events(conn)
+            if int(replay.get("invalid", 0) or 0) > 0:
+                return False, str(replay.get("status") or "deferred_cost_replay_invalid")
+            usage = _budget_usage_for_call(conn, agent_name, _utc_now())
+    except (OSError, sqlite3.Error) as exc:
+        return False, f"cost_budget_unavailable:{type(exc).__name__}"
+    reason = _budget_reason(usage, cfg=cfg, agent_cfg=agent_cfg, estimated_call_cost=estimated_call_cost)
+    return (False, reason) if reason else (True, "budget_ok")
+
+
+def _reserve_model_call(
+    *,
+    agent_name: str,
+    cfg: dict,
+    agent_cfg: dict,
+    tier_name: str,
+    tier_cfg: dict,
+    model_name: str,
+    prompt_tokens: int,
+    max_output_tokens: int,
+    provider: str,
+    api: str,
+    reasoning_effort: str | None,
+    verbosity: str | None,
+    operation: str,
+    prompt_cache_key: str | None,
+    frontier_escalation_reason: str | None,
+    structured_json: bool,
+) -> dict:
+    """Atomically reserve one paid attempt under both cost windows."""
+
+    now = _utc_now()
+    event_id = str(uuid.uuid4())
+    estimated_call_cost = _cost_usd(prompt_tokens, max_output_tokens, tier_cfg)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = connect(initialize=False)
+        replay = replay_deferred_cost_events(conn)
+        if int(replay.get("invalid", 0) or 0) > 0:
+            return {
+                "allowed": False,
+                "status": str(replay.get("status") or "deferred_cost_replay_invalid"),
+            }
+        columns = {str(row[1]) for row in conn.execute("pragma table_info(llm_cost_events)").fetchall()}
+        if "event_id" not in columns:
+            return {"allowed": False, "status": "cost_event_id_schema_missing"}
+        conn.execute("begin immediate")
+        usage = _budget_usage_for_call(conn, agent_name, now)
+        reason = _budget_reason(usage, cfg=cfg, agent_cfg=agent_cfg, estimated_call_cost=estimated_call_cost)
+        if reason:
+            conn.commit()
+            return {"allowed": False, "status": reason, "usage": usage}
+        conn.execute(
+            """
+            insert into llm_cost_events (
+                event_id,created_at,agent_name,model_tier,model_name,provider,api,
+                reasoning_effort,verbosity,operation,prompt_cache_key,
+                frontier_escalation_reason,structured_json,prompt_tokens,
+                completion_tokens,estimated_cost_usd,status
+            ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                event_id,
+                now.isoformat(),
+                agent_name,
+                tier_name,
+                model_name,
+                provider,
+                api,
+                reasoning_effort,
+                verbosity,
+                operation,
+                prompt_cache_key,
+                frontier_escalation_reason,
+                1 if structured_json else 0,
+                int(prompt_tokens),
+                int(max_output_tokens),
+                float(estimated_call_cost),
+                "model_call_reserved",
+            ),
+        )
+        conn.commit()
+        return {
+            "allowed": True,
+            "status": "model_call_reserved",
+            "event_id": event_id,
+            "created_at": now.isoformat(),
+            "reserved_cost_usd": estimated_call_cost,
+            "usage": usage,
+        }
+    except (OSError, sqlite3.Error) as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        return {"allowed": False, "status": f"cost_budget_unavailable:{type(exc).__name__}"}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _cancel_model_reservation(event_id: str, status: str) -> None:
+    try:
+        with connect(initialize=False) as conn:
+            conn.execute(
+                """
+                update llm_cost_events
+                set estimated_cost_usd=0, completion_tokens=0, status=?
+                where event_id=? and status='model_call_reserved'
+                """,
+                (status, event_id),
+            )
+            conn.commit()
+    except (OSError, sqlite3.Error):
+        # A stranded reservation remains charged and counted, which is the
+        # deliberate fail-closed behavior when cancellation cannot persist.
+        return
 
 
 def completion_preflight_status(
@@ -267,6 +872,8 @@ def completion_preflight_status(
     prompt: str,
     system: str = "",
     tier_override: str | None = None,
+    *,
+    max_output_tokens_override: int | None = None,
 ) -> dict:
     """Return model-call availability without making the model call."""
 
@@ -279,6 +886,17 @@ def completion_preflight_status(
     prompt_tokens = estimate_tokens(system + prompt[:max_prompt_chars])
     provider = _provider_name(model_name)
     api = str(tier_cfg.get("api") or ("responses" if provider == "openai" else "litellm"))
+
+    if _model_credentials_locked():
+        return {
+            "ok": False,
+            "status": "credential_model_lock",
+            "model_name": model_name,
+            "model_tier": tier_name,
+            "provider": provider,
+            "api": api,
+            "prompt_tokens": prompt_tokens,
+        }
 
     if cfg.get("require_env_to_call_models", True) and os.environ.get("RADAR_USE_LITELLM") != "1":
         return {
@@ -315,7 +933,14 @@ def completion_preflight_status(
             "prompt_tokens": prompt_tokens,
         }
 
-    allowed, budget_status = _budget_allows_call(agent_name, cfg, agent_cfg, tier_cfg, prompt_tokens)
+    allowed, budget_status = _budget_allows_call(
+        agent_name,
+        cfg,
+        agent_cfg,
+        tier_cfg,
+        prompt_tokens,
+        max_output_tokens=max_output_tokens_override,
+    )
     if allowed:
         autonomous_status = autonomous_paid_attempt_status()
         if not autonomous_status.get("allowed", False):
@@ -369,6 +994,31 @@ def complete(
         or tier_cfg.get("max_output_tokens", tier_cfg.get("estimated_completion_tokens", 4000))
     )
     operation = operation or "llm_completion"
+
+    if _model_credentials_locked():
+        text = _fallback_response(agent_name, prompt)
+        completion_tokens = estimate_tokens(text)
+        result = ModelResult(
+            text,
+            model_name,
+            tier_name,
+            prompt_tokens,
+            completion_tokens,
+            0.0,
+            "credential_model_lock",
+            provider=provider,
+            api=api,
+            reasoning_effort=reasoning_effort,
+            reasoning_mode=reasoning_mode,
+            verbosity=verbosity,
+            operation=operation,
+            prompt_cache_key=prompt_cache_key,
+            frontier_escalation_reason=frontier_escalation_reason,
+            structured_json=structured_json_enabled,
+            max_output_tokens=max_output_tokens,
+        )
+        _log(agent_name, result)
+        return result
 
     use_litellm = os.environ.get("RADAR_USE_LITELLM") == "1"
     if cfg.get("require_env_to_call_models", True) and not use_litellm:
@@ -448,8 +1098,25 @@ def complete(
         _log(agent_name, result)
         return result
 
-    allowed, budget_status = _budget_allows_call(agent_name, cfg, agent_cfg, tier_cfg, prompt_tokens)
-    if not allowed:
+    reservation = _reserve_model_call(
+        agent_name=agent_name,
+        cfg=cfg,
+        agent_cfg=agent_cfg,
+        tier_name=tier_name,
+        tier_cfg=tier_cfg,
+        model_name=model_name,
+        prompt_tokens=prompt_tokens,
+        max_output_tokens=max_output_tokens,
+        provider=provider,
+        api=api,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        operation=operation,
+        prompt_cache_key=prompt_cache_key,
+        frontier_escalation_reason=frontier_escalation_reason,
+        structured_json=structured_json_enabled,
+    )
+    if not reservation.get("allowed", False):
         text = _fallback_response(agent_name, prompt)
         completion_tokens = estimate_tokens(text)
         result = ModelResult(
@@ -459,7 +1126,7 @@ def complete(
             prompt_tokens,
             completion_tokens,
             0.0,
-            budget_status,
+            str(reservation.get("status") or "cost_budget_unavailable"),
             provider=provider,
             api=api,
             reasoning_effort=reasoning_effort,
@@ -474,6 +1141,8 @@ def complete(
         _log(agent_name, result)
         return result
 
+    event_id = str(reservation["event_id"])
+    event_created_at = str(reservation["created_at"])
     autonomous_attempt = claim_autonomous_paid_attempt(
         agent_name=agent_name,
         operation=operation,
@@ -486,6 +1155,10 @@ def complete(
         },
     )
     if not autonomous_attempt.get("allowed", False):
+        _cancel_model_reservation(
+            event_id,
+            "model_call_cancelled_autonomous_guard",
+        )
         text = _fallback_response(agent_name, prompt)
         completion_tokens = estimate_tokens(text)
         result = ModelResult(
@@ -506,6 +1179,8 @@ def complete(
             frontier_escalation_reason=frontier_escalation_reason,
             structured_json=structured_json_enabled,
             max_output_tokens=max_output_tokens,
+            event_id=event_id,
+            created_at=event_created_at,
         )
         _log(agent_name, result)
         return result
@@ -568,6 +1243,8 @@ def complete(
             structured_json=structured_json_enabled,
             max_output_tokens=max_output_tokens,
             stop_reason=stop_reason,
+            event_id=event_id,
+            created_at=event_created_at,
         )
         _log(agent_name, result)
         return result
@@ -581,7 +1258,7 @@ def complete(
             tier_name,
             prompt_tokens,
             completion_tokens,
-            0.0,
+            float(reservation.get("reserved_cost_usd", 0.0) or 0.0),
             f"fallback_error:{exc}",
             provider=provider,
             api=api,
@@ -593,6 +1270,9 @@ def complete(
             frontier_escalation_reason=frontier_escalation_reason,
             structured_json=structured_json_enabled,
             max_output_tokens=max_output_tokens,
+            stop_reason="provider_error_cost_reserved_upper_bound",
+            event_id=event_id,
+            created_at=event_created_at,
         )
         _log(agent_name, result)
         return result
@@ -730,6 +1410,102 @@ def _complete_litellm(
     return text, estimate_tokens(text), finish_reason
 
 
+def _persist_cost_result(conn: sqlite3.Connection, agent_name: str, result: ModelResult) -> None:
+    if not result.event_id:
+        record_llm_cost_event(
+            conn,
+            agent_name,
+            result.model_tier,
+            result.model_name,
+            result.prompt_tokens,
+            result.completion_tokens,
+            result.estimated_cost_usd,
+            result.status,
+            provider=result.provider,
+            api=result.api,
+            reasoning_effort=result.reasoning_effort,
+            verbosity=result.verbosity,
+            operation=result.operation,
+            prompt_cache_key=result.prompt_cache_key,
+            frontier_escalation_reason=result.frontier_escalation_reason,
+            structured_json=result.structured_json,
+        )
+        return
+
+    event_id = str(result.event_id)
+    updated = conn.execute(
+        """
+        update llm_cost_events set
+            agent_name=?,model_tier=?,model_name=?,provider=?,api=?,
+            reasoning_effort=?,verbosity=?,operation=?,prompt_cache_key=?,
+            frontier_escalation_reason=?,structured_json=?,prompt_tokens=?,
+            completion_tokens=?,estimated_cost_usd=?,status=?
+        where event_id=? and status='model_call_reserved'
+        """,
+        (
+            agent_name,
+            result.model_tier,
+            result.model_name,
+            result.provider,
+            result.api,
+            result.reasoning_effort,
+            result.verbosity,
+            result.operation,
+            result.prompt_cache_key,
+            result.frontier_escalation_reason,
+            1 if result.structured_json else 0,
+            int(result.prompt_tokens),
+            int(result.completion_tokens),
+            float(result.estimated_cost_usd),
+            result.status,
+            event_id,
+        ),
+    )
+    if updated.rowcount:
+        conn.commit()
+        return
+    existing = conn.execute(
+        "select 1 from llm_cost_events where event_id=?",
+        (event_id,),
+    ).fetchone()
+    if existing is not None:
+        # An already-finalized event or an explicitly cancelled reservation is
+        # immutable.  This makes retries and deferred replays idempotent.
+        conn.commit()
+        return
+    created_at = _normalise_event_timestamp(result.created_at) or _utc_now().isoformat()
+    conn.execute(
+        """
+        insert into llm_cost_events (
+            event_id,created_at,agent_name,model_tier,model_name,provider,api,
+            reasoning_effort,verbosity,operation,prompt_cache_key,
+            frontier_escalation_reason,structured_json,prompt_tokens,
+            completion_tokens,estimated_cost_usd,status
+        ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            event_id,
+            created_at,
+            agent_name,
+            result.model_tier,
+            result.model_name,
+            result.provider,
+            result.api,
+            result.reasoning_effort,
+            result.verbosity,
+            result.operation,
+            result.prompt_cache_key,
+            result.frontier_escalation_reason,
+            1 if result.structured_json else 0,
+            int(result.prompt_tokens),
+            int(result.completion_tokens),
+            float(result.estimated_cost_usd),
+            result.status,
+        ),
+    )
+    conn.commit()
+
+
 def _log(agent_name: str, result: ModelResult) -> None:
     try:
         conn_ctx = connect(initialize=False)
@@ -740,54 +1516,26 @@ def _log(agent_name: str, result: ModelResult) -> None:
         conn_ctx = connect()
     try:
         with conn_ctx as conn:
-            record_llm_cost_event(
-                conn,
-                agent_name,
-                result.model_tier,
-                result.model_name,
-                result.prompt_tokens,
-                result.completion_tokens,
-                result.estimated_cost_usd,
-                result.status,
-                provider=result.provider,
-                api=result.api,
-                reasoning_effort=result.reasoning_effort,
-                verbosity=result.verbosity,
-                operation=result.operation,
-                prompt_cache_key=result.prompt_cache_key,
-                frontier_escalation_reason=result.frontier_escalation_reason,
-                structured_json=result.structured_json,
-            )
+            _persist_cost_result(conn, agent_name, result)
     except sqlite3.OperationalError as exc:
         if not _is_sqlite_locked(exc):
             if not _needs_schema_init(exc):
                 raise
             with connect() as conn:
-                record_llm_cost_event(
-                    conn,
-                    agent_name,
-                    result.model_tier,
-                    result.model_name,
-                    result.prompt_tokens,
-                    result.completion_tokens,
-                    result.estimated_cost_usd,
-                    result.status,
-                    provider=result.provider,
-                    api=result.api,
-                    reasoning_effort=result.reasoning_effort,
-                    verbosity=result.verbosity,
-                    operation=result.operation,
-                    prompt_cache_key=result.prompt_cache_key,
-                    frontier_escalation_reason=result.frontier_escalation_reason,
-                    structured_json=result.structured_json,
-                )
+                _persist_cost_result(conn, agent_name, result)
             return
         _defer_cost_log(agent_name, result, reason="database_locked_on_insert")
 
 
 def _defer_cost_log(agent_name: str, result: ModelResult, *, reason: str) -> None:
     COST_LOG_DEFERRED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not result.event_id:
+        result.event_id = str(uuid.uuid4())
+    if not _normalise_event_timestamp(result.created_at):
+        result.created_at = _utc_now().isoformat()
     payload = {
+        "event_id": result.event_id,
+        "created_at": result.created_at,
         "agent_name": agent_name,
         "model_tier": result.model_tier,
         "model_name": result.model_name,

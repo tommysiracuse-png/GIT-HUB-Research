@@ -73,7 +73,7 @@ class ProxyRouteActivationTests(unittest.TestCase):
         self.assertTrue(candidate["signal_key"].startswith("PAPER_PROXY|okx_derivatives_paper|"))
         self.assertEqual("okx_reverse_basis_signal", candidate["direct_source_signal_key"])
 
-    def test_active_pipeline_fills_only_labeled_reduced_paper_proxy(self) -> None:
+    def test_active_pipeline_rejects_legacy_one_leg_paired_proxy(self) -> None:
         settings = copy.deepcopy(DEFAULT_SETTINGS)
         candidate = enrich_candidates([proxy_candidate()], settings)[0]
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,14 +99,20 @@ class ProxyRouteActivationTests(unittest.TestCase):
         init_db(conn)
         execution = execute_order(conn, candidate, review, settings)
 
-        self.assertTrue(execution["paper_filled"])
+        self.assertFalse(execution["paper_filled"])
+        self.assertEqual([], execution["fills"])
         order = execution["order"]
         self.assertEqual("okx_derivatives_paper", order["route_id"])
         self.assertEqual("proxy_not_live_equivalent", order["execution_semantics"])
         self.assertTrue(order["proxy_not_live_equivalent"])
         self.assertTrue(order["paper_proxy_not_live_equivalent"])
         self.assertEqual("paper_proxy", order["signal_stats_scope"])
-        self.assertEqual(250.0, order["notional_usd"])
+        self.assertEqual(0.0, order["notional_usd"])
+        self.assertEqual(
+            "blocked_paired_direct_requires_bounded_queue",
+            order["status"],
+        )
+        self.assertEqual("invalid_or_incomplete", order["paired_direct_contract_status"])
 
     def test_proxy_activation_is_paper_only_and_requires_only_borrow_to_be_missing(self) -> None:
         live_settings = copy.deepcopy(DEFAULT_SETTINGS)

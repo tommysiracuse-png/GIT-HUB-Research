@@ -6545,6 +6545,143 @@ def apply_strategy_reliability(
 ) -> tuple[list[dict], dict]:
     """Annotate candidates with bounded paper-only reliability controls."""
 
+    reliability_cfg = (
+        (settings or {}).get("strategy_reliability", {})
+        if isinstance(settings, dict)
+        else {}
+    )
+    if bool(reliability_cfg.get("bypass_all_overlays", False)):
+        queue_cfg = (
+            (((settings or {}).get("market_admission") or {}).get("paper_queue") or {})
+            if isinstance(settings, dict)
+            else {}
+        )
+        minimum_labels = max(1, int(queue_cfg.get("poor_cohort_min_labels", 20)))
+        maximum_avg_pnl_bps = float(
+            queue_cfg.get("poor_cohort_max_avg_pnl_bps", -8.0)
+        )
+        maximum_win_rate = float(queue_cfg.get("poor_cohort_max_win_rate", 0.43))
+        keys = sorted({signal_key(candidate) for candidate in candidates})
+        pnl_by_key: dict[str, list[float]] = {key: [] for key in keys}
+        history_available = conn is not None
+        if conn is not None and keys:
+            for start in range(0, len(keys), 400):
+                chunk = keys[start : start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    select p.id,p.signal_key,p.pnl_bps,p.candidate_json,p.review_json,
+                           p.context_json,p.close_measurement_status,
+                           p.admission_key,p.admission_episode_id,
+                           sum(case when o.measurement_status='valid' then 1 else 0 end)
+                               as valid_outcomes
+                    from paper_trades p
+                    left join paper_trade_outcomes o on o.trade_id=p.id
+                    where p.signal_key in ({placeholders}) and p.status='closed'
+                      and p.pnl_bps is not null
+                      and (p.admission_key is null or o.admission_key=p.admission_key)
+                      and (p.admission_episode_id is null
+                           or o.admission_episode_id=p.admission_episode_id)
+                    group by p.id
+                    """,
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    if int(row["valid_outcomes"] or 0) <= 0:
+                        continue
+                    if not reliable_paper_label_eligibility_for_trade_row(row).get(
+                        "paper_label_eligible", False
+                    ):
+                        continue
+                    try:
+                        pnl = float(row["pnl_bps"])
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(pnl):
+                        pnl_by_key.setdefault(str(row["signal_key"]), []).append(pnl)
+
+        known_losing_count = 0
+        unavailable_count = 0
+        for candidate in candidates:
+            pnls = pnl_by_key.get(signal_key(candidate), [])
+            reliable_labels = len(pnls)
+            avg_pnl_bps = sum(pnls) / reliable_labels if reliable_labels else None
+            win_rate = (
+                sum(value > 0 for value in pnls) / reliable_labels
+                if reliable_labels
+                else None
+            )
+            known_losing = bool(
+                history_available
+                and reliable_labels >= minimum_labels
+                and (
+                    (
+                        avg_pnl_bps is not None
+                        and avg_pnl_bps <= maximum_avg_pnl_bps
+                    )
+                    or (win_rate is not None and win_rate <= maximum_win_rate)
+                )
+            )
+            history = {
+                "status": "ready" if history_available else "unavailable",
+                "scope": "all_reliable_direct_paper_history",
+                "signal_key": signal_key(candidate),
+                "reliable_labels": reliable_labels,
+                "avg_pnl_bps": avg_pnl_bps,
+                "win_rate": win_rate,
+                "minimum_labels": minimum_labels,
+                "maximum_avg_pnl_bps": maximum_avg_pnl_bps,
+                "maximum_win_rate": maximum_win_rate,
+                "known_losing_cohort": known_losing,
+            }
+            candidate["bounded_historical_cohort"] = history
+            if not history_available:
+                unavailable_count += 1
+                candidate.setdefault(
+                    "candidate_reject_reason",
+                    "bounded_historical_cohort_evidence_unavailable",
+                )
+                candidate["paper_entry_blocked"] = True
+                candidate["promotion_eligible"] = False
+                continue
+            if not known_losing:
+                continue
+            known_losing_count += 1
+            candidate.setdefault("candidate_reject_reason", "known_losing_cohort")
+            detail = candidate.get("candidate_reject_detail")
+            detail = dict(detail) if isinstance(detail, Mapping) else {}
+            detail.setdefault("guard", "strategy_reliability")
+            detail["bounded_historical_cohort"] = history
+            candidate["candidate_reject_detail"] = detail
+            reliability = candidate.get("strategy_reliability")
+            reliability = dict(reliability) if isinstance(reliability, Mapping) else {}
+            reliability.update(
+                {
+                    "action": "quarantine_known_losing_cohort",
+                    "reason": "known_losing_cohort",
+                    "bounded_historical_cohort": history,
+                }
+            )
+            candidate["strategy_reliability"] = reliability
+            candidate["strategy_reliability_action"] = (
+                "quarantine_known_losing_cohort"
+            )
+            candidate["paper_entry_blocked"] = True
+            candidate["promotion_eligible"] = False
+            candidate["strategy_reliability_allocation_multiplier"] = 0.0
+        return candidates, {
+            "enabled": False,
+            "bypass_all_overlays": True,
+            "reason": "bounded_historical_guard_plus_exact_queue_contract",
+            "generated_at": _utc_now(),
+            "summary": {
+                "candidate_count": len(candidates),
+                "adjusted_count": known_losing_count + unavailable_count,
+                "known_losing_cohort_count": known_losing_count,
+                "historical_evidence_unavailable_count": unavailable_count,
+            },
+        }
+
     hydrate_paper_lineage_source_health(candidates, conn)
     _hydrate_portability_paper_evidence(candidates, conn)
     hydrate_paper_context_loss_statistics(candidates, conn, settings)

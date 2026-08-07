@@ -21,6 +21,14 @@ def settings() -> dict:
     return copy.deepcopy(DEFAULT_SETTINGS)
 
 
+def mapping_detail_row_count(value: object) -> int:
+    if isinstance(value, dict):
+        return sum(mapping_detail_row_count(item) for item in value.values())
+    if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+        return len(value)
+    return 0
+
+
 class RouteResolverTests(unittest.TestCase):
     def test_standard_short_proxy_receives_refreshed_route_report_and_paper_sizing(self) -> None:
         enriched = route_resolver.enrich_candidate_with_route(
@@ -645,6 +653,71 @@ class RouteResolverTests(unittest.TestCase):
         self.assertIn("freshness", summary)
         self.assertIn("Candidate Route Requirement Summary", primary_markdown)
         self.assertIn("Candidate Route Requirement Summary", intelligence_markdown)
+
+    def test_large_report_aggregates_every_candidate_but_bounds_all_detail_rows(self) -> None:
+        cfg = settings()
+        cfg["route_resolver"]["report_max_representative_rows"] = 100
+        candidates = [
+            {
+                "venue": "OKX",
+                "inst_id": f"ASSET-{index}-USDT-SWAP",
+                "market_key": "OKX",
+                "trade_type": "perp_funding_basis",
+                "asset_class": "crypto",
+                "direction": "short_perp_long_spot",
+                "score": float(1000 - index),
+                "execution_route": {
+                    "route_id": "okx_perp_spot_basis",
+                    "route_status": "standard",
+                    "missing_permissions": [],
+                    "requirements": [],
+                    "route_alternatives": [],
+                },
+            }
+            for index in range(600)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_json = route_resolver.REPORT_JSON
+            old_md = route_resolver.REPORT_MD
+            old_intel_json = route_resolver.ROUTE_INTELLIGENCE_JSON
+            old_intel_md = route_resolver.ROUTE_INTELLIGENCE_MD
+            route_resolver.REPORT_JSON = pathlib.Path(tmp) / "route_report.json"
+            route_resolver.REPORT_MD = pathlib.Path(tmp) / "route_report.md"
+            route_resolver.ROUTE_INTELLIGENCE_JSON = pathlib.Path(tmp) / "route_intel.json"
+            route_resolver.ROUTE_INTELLIGENCE_MD = pathlib.Path(tmp) / "route_intel.md"
+            try:
+                report = route_resolver.write_route_resolver_report(candidates, cfg)
+                persisted = json.loads(route_resolver.REPORT_JSON.read_text(encoding="utf-8"))
+                sidecar = json.loads(
+                    route_resolver.ROUTE_INTELLIGENCE_JSON.read_text(encoding="utf-8")
+                )
+            finally:
+                route_resolver.REPORT_JSON = old_json
+                route_resolver.REPORT_MD = old_md
+                route_resolver.ROUTE_INTELLIGENCE_JSON = old_intel_json
+                route_resolver.ROUTE_INTELLIGENCE_MD = old_intel_md
+
+        self.assertEqual(600, report["summary"]["total_candidates"])
+        self.assertEqual(
+            600,
+            report["route_requirements_intel"]["artifact_compaction"]["route_count"],
+        )
+        self.assertLessEqual(mapping_detail_row_count(report), 100)
+        self.assertEqual(
+            mapping_detail_row_count(report),
+            report["artifact_compaction"]["representative_row_count_stored"],
+        )
+        self.assertGreater(
+            report["artifact_compaction"]["representative_row_count_omitted"],
+            1000,
+        )
+        self.assertLessEqual(mapping_detail_row_count(sidecar), 100)
+        self.assertEqual(
+            mapping_detail_row_count(sidecar),
+            sidecar["artifact_compaction"]["representative_row_count_stored"],
+        )
+        self.assertEqual(report, persisted)
 
     def test_route_intelligence_is_read_only_and_ranks_blockers(self) -> None:
         candidates = route_resolver.enrich_candidates(

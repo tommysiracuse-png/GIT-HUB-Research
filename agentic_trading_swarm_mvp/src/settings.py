@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import os
 import pathlib
 
 
@@ -15,6 +17,130 @@ LOCAL_SETTINGS_PATH = ROOT / "config" / "settings.local.json"
 DEFAULT_SETTINGS = {
     "mode": "paper",
     "allow_live_trading": False,
+    "operations": {
+        "profile": "default",
+        "require_explicit_config": False,
+        "fail_closed_recovery_profile": False,
+        "model_credentials_enabled": True,
+        "crypto_only": False,
+    },
+    "paper_expansion": {
+        "enabled": False,
+        "campaign_id": "bounded_crypto_paper_v1",
+        "resume_healthy_cycles": 3,
+        "direct_queue_allocation_multiplier": 1.0,
+        "reviewer_allocation_multiplier": 1.0,
+        "runtime_allocation_multiplier": 1.0,
+        "phases": {
+            "burn_in": {
+                "scan_universe": 100,
+                "review_top": 50,
+                "paper_queue_max_select_per_cycle": 0,
+                "max_new_paper_trades": 0,
+                "max_new_paper_observations": 20,
+                "max_open_paper_trades": 100,
+                "strategy_lab_enabled": False,
+                "promoted_signal_plugins_enabled": False,
+                "min_healthy_cycles": 90,
+                "min_elapsed_hours": 24,
+                "max_runtime_p95_seconds": 480,
+                "max_memory_p95_mb": 750,
+                "max_memory_mb": 1024,
+                "max_db_growth_bytes_per_day": 262144000,
+            },
+            "measurement": {
+                "scan_universe": 100,
+                "review_top": 50,
+                "paper_queue_max_select_per_cycle": 30,
+                "max_new_paper_trades": 10,
+                "max_new_paper_observations": 20,
+                "max_open_paper_trades": 100,
+                "strategy_lab_enabled": False,
+                "promoted_signal_plugins_enabled": False,
+                "min_elapsed_hours": 168,
+                "min_exact_attributed_admission_keys": 100,
+                "min_reliable_direct_closes": 250,
+                "min_timely_close_rate": 0.90,
+                "min_timely_horizon_rate": 0.90,
+                "required_lineage_rate": 1.0,
+                "max_synthetic_proxy_primary": 0,
+            },
+            "canary": {
+                "scan_universe": 100,
+                "review_top": 1,
+                "paper_queue_max_select_per_cycle": 1,
+                "max_new_paper_trades": 1,
+                "max_new_paper_observations": 0,
+                "max_open_paper_trades": 100,
+                "strategy_lab_enabled": True,
+                "promoted_signal_plugins_enabled": False,
+                "strategy_lab_max_candidates_per_loop": 1,
+                "strategy_lab_max_candidates_per_experiment": 1,
+                "strategy_lab_runtime_review_reserved_slots": 1,
+                "max_active_strategy_roots": 1,
+                "bootstrap_recovery_canary_enabled": True,
+                "experiment_root_allowlist": ["recovery_okx_short_perp_long_spot_v1"],
+                "snapshot_warmup_enabled": True,
+                "runtime_generation_enabled": True,
+                "evaluation_enabled": True,
+                "lifecycle_mutations_enabled": False,
+                "region_splits_enabled": False,
+                "recommendation_emission_enabled": False,
+                "promotion_enabled": False,
+                "adaptive_relaxation_enabled": False,
+                "min_elapsed_hours": 48,
+                "min_reliable_direct_labels": 30,
+                "required_active_canaries": 1,
+            },
+            "research": {
+                "scan_universe": 100,
+                "review_top": 50,
+                "paper_queue_max_select_per_cycle": 30,
+                "max_new_paper_trades": 10,
+                "max_new_paper_observations": 20,
+                "max_open_paper_trades": 100,
+                "strategy_lab_enabled": True,
+                "promoted_signal_plugins_enabled": False,
+                "max_active_strategy_roots": 6,
+                "bootstrap_recovery_canary_enabled": False,
+                "snapshot_warmup_enabled": True,
+                "runtime_generation_enabled": True,
+                "evaluation_enabled": True,
+                "lifecycle_mutations_enabled": True,
+                "region_splits_enabled": False,
+                "recommendation_emission_enabled": False,
+                "promotion_enabled": False,
+                "adaptive_relaxation_enabled": False,
+            },
+        },
+        "discovery_promotion": {
+            "min_training_labels": 100,
+            "min_holdout_labels": 50,
+            "min_elapsed_hours": 168,
+            "min_avg_net_pnl_bps": 10.0,
+            "min_win_rate": 0.53,
+            "min_worst_decile_bps": -45.0,
+            "min_timely_label_rate": 0.90,
+            "min_consecutive_passes": 2,
+        },
+        "health": {
+            "runtime_warn_seconds": 480,
+            "runtime_halt_seconds": 720,
+            "peak_rss_warn_mb": 750,
+            "peak_rss_halt_mb": 1024,
+            "min_terminal_opportunity_rate": 1.0,
+            "min_frontier_observations": 6000,
+            "min_reachable_venues": 16,
+            "max_db_growth_bytes_per_day": 262144000,
+            "max_artifact_bytes": {
+                "frontier_crypto_venues_latest.json": 8388608,
+                "radar_state_latest.json": 8388608,
+                "route_resolver_report.json": 36700160,
+                "route_intelligence_report.json": 36700160,
+                "self_improvement_report.json": 20971520,
+            },
+        },
+    },
     "account_capabilities": {
         "crypto_derivatives": True,
         "crypto_spot": True,
@@ -323,8 +449,9 @@ DEFAULT_SETTINGS = {
         "intraday_feature_workers": 6,
         "intraday_feature_max_observations": 24,
         "intraday_feature_max_per_venue": 6,
-        "report_max_observations": 250,
-        "report_max_candidates": 100,
+        "report_max_representative_rows": 100,
+        "report_max_observations": 50,
+        "report_max_candidates": 50,
         "marketability_gates": {
             "enabled": True,
             "paper_only": True,
@@ -598,6 +725,18 @@ DEFAULT_SETTINGS = {
         "horizon_minutes": [5, 15, 60, 240, 1440],
         "max_outcome_delay_seconds": 300,
     },
+    "paper_due_outcome_collection": {
+        "enabled": False,
+        "candle_interval_seconds": 60,
+        "max_instruments_per_cycle": 100,
+        "max_workers": 4,
+        "request_timeout_seconds": 8,
+        "okx_max_requests_per_second": 8,
+        "allow_latest_ticker_fallback": False,
+        "paired_max_entry_timestamp_skew_seconds": 2.0,
+        "paired_max_exit_timestamp_skew_seconds": 1.0,
+        "paired_notional_tolerance_fraction": 0.01,
+    },
     "agent_memory": {
         "enabled": True,
         "retrieval_mode": "hybrid_temporal_fts_graph",
@@ -797,6 +936,9 @@ DEFAULT_SETTINGS = {
         "latency_backoff_seconds": 120,
         "memory_backoff_percent": 85,
         "report_limit": 100,
+    },
+    "route_resolver": {
+        "report_max_representative_rows": 100,
     },
     "evolution_worker": {
         "enabled": False,
@@ -1040,17 +1182,368 @@ def deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def load_settings(path: str | pathlib.Path | None = None) -> dict:
-    if path is None:
-        path = DEFAULT_SETTINGS_PATH
-    config_path = pathlib.Path(path)
+class SettingsError(RuntimeError):
+    """Raised when a fail-closed runtime configuration is not safe to use."""
+
+
+def config_fingerprint(path: str | pathlib.Path) -> str:
+    config_path = pathlib.Path(path).resolve()
+    return hashlib.sha256(config_path.read_bytes()).hexdigest()
+
+
+def validate_recovery_settings(settings: dict, *, config_path: pathlib.Path | None = None) -> None:
+    """Validate the tracked bounded-paper profile before any runtime work starts."""
+
+    operations = settings.get("operations") or {}
+    if not operations.get("fail_closed_recovery_profile", False):
+        return
+
+    errors: list[str] = []
+    if str(settings.get("mode") or "").lower() != "paper":
+        errors.append("mode_must_be_paper")
+    if bool(settings.get("allow_live_trading", False)):
+        errors.append("live_trading_must_be_disabled")
+    if float((settings.get("risk") or {}).get("max_live_notional_usd", 0.0) or 0.0) != 0.0:
+        errors.append("max_live_notional_usd_must_be_zero")
+    if float((settings.get("risk") or {}).get("paper_notional_usd", 0.0) or 0.0) != 100.0:
+        errors.append("paper_notional_usd_must_equal_100")
+    if not bool(operations.get("require_explicit_config", False)):
+        errors.append("explicit_config_must_be_required")
+    if bool(operations.get("model_credentials_enabled", True)):
+        errors.append("model_credentials_must_be_disabled")
+    if not bool(operations.get("crypto_only", False)):
+        errors.append("crypto_only_must_be_enabled")
+    if not bool((settings.get("paper_expansion") or {}).get("enabled", False)):
+        errors.append("paper_expansion_campaign_must_be_enabled")
+    for key in (
+        "direct_queue_allocation_multiplier",
+        "reviewer_allocation_multiplier",
+        "runtime_allocation_multiplier",
+    ):
+        if float((settings.get("paper_expansion") or {}).get(key, 0.0) or 0.0) != 1.0:
+            errors.append(f"paper_expansion.{key}_must_equal_1")
+    expansion = settings.get("paper_expansion") or {}
+    if int(expansion.get("resume_healthy_cycles", 0) or 0) != 3:
+        errors.append("paper_expansion.resume_healthy_cycles_must_equal_3")
+    health = expansion.get("health") or {}
+    locked_health = {
+        "runtime_warn_seconds": 480,
+        "runtime_halt_seconds": 720,
+        "peak_rss_warn_mb": 750,
+        "peak_rss_halt_mb": 1024,
+        "min_terminal_opportunity_rate": 1.0,
+        "min_frontier_observations": 6000,
+        "min_reachable_venues": 16,
+        "max_db_growth_bytes_per_day": 262144000,
+    }
+    for key, expected in locked_health.items():
+        if health.get(key) != expected:
+            errors.append(f"paper_expansion.health.{key}_must_equal_{expected}")
+    locked_artifact_sizes = {
+        "frontier_crypto_venues_latest.json": 8388608,
+        "radar_state_latest.json": 8388608,
+        "route_resolver_report.json": 36700160,
+        "route_intelligence_report.json": 36700160,
+        "self_improvement_report.json": 20971520,
+    }
+    if health.get("max_artifact_bytes") != locked_artifact_sizes:
+        errors.append("paper_expansion.health.max_artifact_bytes_must_match_tracked_profile")
+    locked_phase_values = {
+        "burn_in": {
+            "scan_universe": 100,
+            "review_top": 50,
+            "paper_queue_max_select_per_cycle": 0,
+            "max_new_paper_trades": 0,
+            "max_new_paper_observations": 20,
+            "max_open_paper_trades": 100,
+            "strategy_lab_enabled": False,
+            "promoted_signal_plugins_enabled": False,
+            "min_healthy_cycles": 90,
+            "min_elapsed_hours": 24,
+            "max_runtime_p95_seconds": 480,
+            "max_memory_p95_mb": 750,
+            "max_memory_mb": 1024,
+            "max_db_growth_bytes_per_day": 262144000,
+        },
+        "measurement": {
+            "scan_universe": 100,
+            "review_top": 50,
+            "paper_queue_max_select_per_cycle": 30,
+            "max_new_paper_trades": 10,
+            "max_new_paper_observations": 20,
+            "max_open_paper_trades": 100,
+            "strategy_lab_enabled": False,
+            "promoted_signal_plugins_enabled": False,
+            "min_elapsed_hours": 168,
+            "min_exact_attributed_admission_keys": 100,
+            "min_reliable_direct_closes": 250,
+            "min_timely_close_rate": 0.90,
+            "min_timely_horizon_rate": 0.90,
+            "required_lineage_rate": 1.0,
+            "max_synthetic_proxy_primary": 0,
+        },
+        "canary": {
+            "scan_universe": 100,
+            "review_top": 1,
+            "paper_queue_max_select_per_cycle": 1,
+            "max_new_paper_trades": 1,
+            "max_new_paper_observations": 0,
+            "max_open_paper_trades": 100,
+            "strategy_lab_enabled": True,
+            "promoted_signal_plugins_enabled": False,
+            "strategy_lab_max_candidates_per_loop": 1,
+            "strategy_lab_max_candidates_per_experiment": 1,
+            "strategy_lab_runtime_review_reserved_slots": 1,
+            "max_active_strategy_roots": 1,
+            "bootstrap_recovery_canary_enabled": True,
+            "experiment_root_allowlist": ["recovery_okx_short_perp_long_spot_v1"],
+            "snapshot_warmup_enabled": True,
+            "runtime_generation_enabled": True,
+            "evaluation_enabled": True,
+            "lifecycle_mutations_enabled": False,
+            "region_splits_enabled": False,
+            "recommendation_emission_enabled": False,
+            "promotion_enabled": False,
+            "adaptive_relaxation_enabled": False,
+            "min_elapsed_hours": 48,
+            "min_reliable_direct_labels": 30,
+            "required_active_canaries": 1,
+        },
+        "research": {
+            "scan_universe": 100,
+            "review_top": 50,
+            "paper_queue_max_select_per_cycle": 30,
+            "max_new_paper_trades": 10,
+            "max_new_paper_observations": 20,
+            "max_open_paper_trades": 100,
+            "strategy_lab_enabled": True,
+            "promoted_signal_plugins_enabled": False,
+            "max_active_strategy_roots": 6,
+            "bootstrap_recovery_canary_enabled": False,
+            "snapshot_warmup_enabled": True,
+            "runtime_generation_enabled": True,
+            "evaluation_enabled": True,
+            "lifecycle_mutations_enabled": True,
+            "region_splits_enabled": False,
+            "recommendation_emission_enabled": False,
+            "promotion_enabled": False,
+            "adaptive_relaxation_enabled": False,
+        },
+    }
+    phase_settings = expansion.get("phases") or {}
+    for phase, locked in locked_phase_values.items():
+        actual = phase_settings.get(phase) or {}
+        for key, expected in locked.items():
+            if actual.get(key) != expected:
+                errors.append(f"paper_expansion.phases.{phase}.{key}_must_equal_{expected}")
+    locked_promotion = {
+        "min_training_labels": 100,
+        "min_holdout_labels": 50,
+        "min_elapsed_hours": 168,
+        "min_avg_net_pnl_bps": 10.0,
+        "min_win_rate": 0.53,
+        "min_worst_decile_bps": -45.0,
+        "min_timely_label_rate": 0.90,
+        "min_consecutive_passes": 2,
+    }
+    promotion = expansion.get("discovery_promotion") or {}
+    for key, expected in locked_promotion.items():
+        if promotion.get(key) != expected:
+            errors.append(f"paper_expansion.discovery_promotion.{key}_must_equal_{expected}")
+
+    capabilities = settings.get("account_capabilities") or {}
+    allowed_capabilities = {"crypto_derivatives", "crypto_spot"}
+    unsafe_capabilities = sorted(
+        name for name, enabled in capabilities.items() if bool(enabled) and name not in allowed_capabilities
+    )
+    if unsafe_capabilities:
+        errors.append("non_crypto_capabilities_enabled:" + ",".join(unsafe_capabilities))
+
+    scanner = settings.get("scanner") or {}
+    for name in (
+        "enable_global_proxy_scan",
+        "enable_global_market_discovery_scan",
+        "enable_prediction_market_scan",
+        "enable_public_market_adapter_scan",
+    ):
+        if bool(scanner.get(name, False)):
+            errors.append(f"scanner_must_be_disabled:{name}")
+    for name in (
+        "enable_crypto_venue_health_scan",
+        "enable_frontier_crypto_adapter_scan",
+    ):
+        if scanner.get(name) is not True:
+            errors.append(f"scanner_must_be_enabled:{name}")
+    if int(scanner.get("hold_minutes", 0) or 0) != 60:
+        errors.append("scanner.hold_minutes_must_equal_60")
+
+    frontier_report = settings.get("frontier_crypto_adapter") or {}
+    if frontier_report.get("enabled") is not True:
+        errors.append("frontier_crypto_adapter.enabled_must_be_enabled")
+    for key, expected in {
+        "report_max_representative_rows": 100,
+        "report_max_observations": 50,
+        "report_max_candidates": 50,
+    }.items():
+        if frontier_report.get(key) != expected:
+            errors.append(f"frontier_crypto_adapter.{key}_must_equal_{expected}")
+    if int((settings.get("route_resolver") or {}).get("report_max_representative_rows", 0) or 0) != 100:
+        errors.append("route_resolver.report_max_representative_rows_must_equal_100")
+
+    disabled_paths = (
+        ("strategy_lab", "enabled"),
+        ("strategy_lab", "promoted_signal_plugins_enabled"),
+        ("signal_redesign", "enabled"),
+        ("hunter", "enabled"),
+        ("self_improvement", "enabled"),
+        ("self_improvement", "process_code_changes_in_radar_loop"),
+        ("llm_bridge", "enabled"),
+        ("llm_bridge", "ingest_recommendations"),
+        ("llm_swarm", "enabled"),
+        ("llm_swarm", "auto_run"),
+        ("llm_swarm", "run_in_radar_loop"),
+        ("dynamic_agents", "enabled"),
+        ("research_worker", "enabled"),
+        ("research_worker", "run_every_evolution_cycle"),
+        ("autonomous_builder", "enabled"),
+        ("autonomous_builder", "auto_run"),
+        ("autonomous_builder", "run_in_radar_loop"),
+        ("codex_repo_agent", "enabled"),
+        ("codex_repo_agent", "parallel_sessions_enabled"),
+        ("codex_repo_agent", "network_access"),
+        ("codex_repo_agent", "chatgpt_account_fallback_enabled"),
+        ("codex_repo_agent", "fallback_on_api_quota"),
+        ("adapter_implementation_owner", "enabled"),
+        ("market_activation_owner", "enabled"),
+        ("strategy_implementation_owner", "enabled"),
+        ("strategy_implementation_owner", "contract_intake_enabled"),
+        ("codex_worker_pool", "enabled"),
+        ("code_evolution", "enabled"),
+        ("code_evolution", "git_release_enabled"),
+        ("code_evolution", "auto_merge_paper_only"),
+        ("evolution_worker", "enabled"),
+        ("agent_memory", "enabled"),
+        ("okx_signal_research", "enabled"),
+        ("paper_exploration", "enabled"),
+        ("signal_safety", "enabled"),
+        ("contextual_failure_filters", "enabled"),
+        ("contextual_failure_filters", "create_policies"),
+        ("okx_perp_funding_basis_decay_quarantine", "enabled"),
+        ("paper_context_drag", "enabled"),
+        ("paper_context_priors", "enabled"),
+        ("paper_context_loss_quarantine", "enabled"),
+    )
+    for section, key in disabled_paths:
+        if bool((settings.get(section) or {}).get(key, False)):
+            errors.append(f"runtime_must_be_disabled:{section}.{key}")
+    reliability = settings.get("strategy_reliability") or {}
+    if bool(reliability.get("enabled", True)):
+        errors.append("strategy_reliability.enabled_must_be_disabled")
+    if not bool(reliability.get("bypass_all_overlays", False)):
+        errors.append("strategy_reliability.bypass_all_overlays_must_be_enabled")
+    learning = settings.get("learning") or {}
+    if not bool(learning.get("enabled", False)):
+        errors.append("learning.enabled_must_be_enabled")
+    for key in ("task_emission_enabled", "growth_experiment_emission_enabled"):
+        if bool(learning.get(key, True)):
+            errors.append(f"learning.{key}_must_be_disabled")
+    if learning.get("horizon_minutes") != [15, 60, 240, 1440]:
+        errors.append("learning.horizon_minutes_must_equal_15_60_240_1440")
+    if float(learning.get("max_outcome_delay_seconds", -1) or 0) != 300.0:
+        errors.append("learning.max_outcome_delay_seconds_must_equal_300")
+    due_collection = settings.get("paper_due_outcome_collection") or {}
+    locked_due_collection = {
+        "enabled": True,
+        "candle_interval_seconds": 60,
+        "max_instruments_per_cycle": 100,
+        "max_workers": 4,
+        "request_timeout_seconds": 8,
+        "okx_max_requests_per_second": 8,
+        "allow_latest_ticker_fallback": False,
+        "paired_max_entry_timestamp_skew_seconds": 2.0,
+        "paired_max_exit_timestamp_skew_seconds": 1.0,
+        "paired_notional_tolerance_fraction": 0.01,
+    }
+    for key, expected in locked_due_collection.items():
+        if due_collection.get(key) != expected:
+            errors.append(f"paper_due_outcome_collection.{key}_must_equal_{expected}")
+    hold_optimizer = settings.get("paper_hold_optimizer") or {}
+    if not bool(hold_optimizer.get("enabled", False)):
+        errors.append("paper_hold_optimizer.enabled_must_be_enabled")
+    if int(hold_optimizer.get("default_hold_minutes", 0) or 0) != 60:
+        errors.append("paper_hold_optimizer.default_hold_minutes_must_equal_60")
+    if hold_optimizer.get("candidate_horizons_minutes") != [15, 60, 240, 1440]:
+        errors.append(
+            "paper_hold_optimizer.candidate_horizons_minutes_must_equal_15_60_240_1440"
+        )
+
+    admission = settings.get("market_admission") or {}
+    if not bool(admission.get("enabled", False)):
+        errors.append("market_admission_monitor_must_be_enabled")
+    if not bool(admission.get("monitor_enabled", False)):
+        errors.append("market_admission.monitor_enabled_must_be_enabled")
+    if not bool(admission.get("paper_queue_enabled", False)):
+        errors.append("market_admission.paper_queue_enabled_must_be_enabled")
+    for key in ("bridge_enabled", "diagnostics_enabled", "actions_enabled"):
+        if bool(admission.get(key, False)):
+            errors.append(f"market_admission.{key}_must_be_disabled")
+    if int(admission.get("report_state_limit", 0) or 0) != 100:
+        errors.append("market_admission.report_state_limit_must_equal_100")
+    queue = admission.get("paper_queue") or {}
+    locked_queue = {
+        "max_active": 200,
+        "max_enqueue_per_cycle": 30,
+        "max_select_per_cycle": 30,
+        "max_terminal_audit_per_cycle": 30,
+        "selection_lease_seconds": 900,
+        "retry_backoff_seconds": 300,
+        "max_freshness_age_seconds": 90.0,
+        "poor_cohort_min_labels": 20,
+        "poor_cohort_max_avg_pnl_bps": -8.0,
+        "poor_cohort_max_win_rate": 0.43,
+    }
+    for key, expected in locked_queue.items():
+        if queue.get(key) != expected:
+            errors.append(f"market_admission.paper_queue.{key}_must_equal_{expected}")
+
+    strategy_lab = settings.get("strategy_lab") or {}
+    for key, expected in {
+        "snapshot_max_inputs_per_loop": 200,
+        "snapshot_max_instruments_per_loop": 50,
+        "feature_history_max_points": 288,
+    }.items():
+        if strategy_lab.get(key) != expected:
+            errors.append(f"strategy_lab.{key}_must_equal_{expected}")
+
+    if config_path is None:
+        errors.append("explicit_config_path_missing")
+    if errors:
+        raise SettingsError("unsafe recovery configuration: " + "; ".join(errors))
+
+
+def load_settings(
+    path: str | pathlib.Path | None = None,
+    *,
+    require_explicit: bool = False,
+) -> dict:
+    explicit_path = path is not None
+    if (require_explicit or os.environ.get("RADAR_REQUIRE_EXPLICIT_CONFIG") == "1") and not explicit_path:
+        raise SettingsError("an explicit --config path is required")
+    config_path = pathlib.Path(path).expanduser() if explicit_path else DEFAULT_SETTINGS_PATH
     if not config_path.exists():
-        settings = copy.deepcopy(DEFAULT_SETTINGS)
-    else:
+        raise FileNotFoundError(f"settings file does not exist: {config_path}")
+    try:
         loaded = json.loads(config_path.read_text(encoding="utf-8-sig"))
-        settings = deep_merge(DEFAULT_SETTINGS, loaded)
-    if path == DEFAULT_SETTINGS_PATH and LOCAL_SETTINGS_PATH.exists():
+    except json.JSONDecodeError as exc:
+        raise SettingsError(f"invalid settings JSON in {config_path}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise SettingsError(f"settings root must be an object: {config_path}")
+    settings = deep_merge(DEFAULT_SETTINGS, loaded)
+    if not explicit_path and LOCAL_SETTINGS_PATH.exists():
         local_loaded = json.loads(LOCAL_SETTINGS_PATH.read_text(encoding="utf-8-sig"))
+        if not isinstance(local_loaded, dict):
+            raise SettingsError(f"settings root must be an object: {LOCAL_SETTINGS_PATH}")
         settings = deep_merge(settings, local_loaded)
+    validate_recovery_settings(settings, config_path=config_path.resolve() if explicit_path else None)
     return settings
 

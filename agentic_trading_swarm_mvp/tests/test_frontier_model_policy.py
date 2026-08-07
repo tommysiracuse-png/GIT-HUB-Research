@@ -168,7 +168,15 @@ class FrontierModelPolicyTests(unittest.TestCase):
         ):
             with mock.patch.object(cost_router, "_spent_today", return_value=0.0):
                 with mock.patch.object(cost_router, "_log", lambda _agent, result: captured.append(result)):
-                    with mock.patch.object(cost_router, "_complete_openai_responses", return_value=('{"ok": true}', 10, 20)) as call:
+                    with mock.patch.object(
+                        cost_router,
+                        "_reserve_model_call",
+                        return_value={
+                            "allowed": True,
+                            "event_id": "frontier-test-event",
+                            "created_at": "2026-08-07T00:00:00+00:00",
+                        },
+                    ), mock.patch.object(cost_router, "_complete_openai_responses", return_value=('{"ok": true}', 10, 20)) as call:
                         result = cost_router.complete(
                             "red_team",
                             "Return JSON.",
@@ -208,6 +216,14 @@ class FrontierModelPolicyTests(unittest.TestCase):
             cost_router, "_spent_today", return_value=0.0
         ), mock.patch.object(
             cost_router, "_log"
+        ), mock.patch.object(
+            cost_router,
+            "_reserve_model_call",
+            return_value={
+                "allowed": True,
+                "event_id": "quota-test-event",
+                "created_at": "2026-08-07T00:00:00+00:00",
+            },
         ), mock.patch.object(
             cost_router,
             "_complete_openai_responses",

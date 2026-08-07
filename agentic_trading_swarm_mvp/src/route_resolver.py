@@ -10,6 +10,7 @@ tracking what would be required to make them real.
 from __future__ import annotations
 
 import collections
+import copy
 import datetime as dt
 import json
 import math
@@ -3500,13 +3501,130 @@ def _route_intelligence_markdown(report: dict, requirements_intel: dict | None =
     return "\n".join(lines) + "\n"
 
 
-def write_route_resolver_report(candidates: list[dict], settings: dict, limit: int = 250) -> dict:
+def _report_mapping_row_streams(value: object, *, path: str = "") -> list[dict]:
+    """Find mutable list-of-object detail streams without counting nested row fields."""
+
+    streams: list[dict] = []
+    if not isinstance(value, dict):
+        return streams
+    for key, child in value.items():
+        child_path = f"{path}.{key}" if path else str(key)
+        if child_path.endswith(
+            "route_requirements_intel.candidate_route_requirement_summaries"
+        ):
+            # These are regenerated from the retained route rows below.  A
+            # route + its compatibility summary therefore consumes two rows.
+            continue
+        if isinstance(child, list) and child and all(isinstance(item, dict) for item in child):
+            streams.append(
+                {
+                    "path": child_path,
+                    "rows": child,
+                    "weight": (
+                        2 if child_path.endswith("route_requirements_intel.routes") else 1
+                    ),
+                }
+            )
+        elif isinstance(child, dict):
+            streams.extend(_report_mapping_row_streams(child, path=child_path))
+    return streams
+
+
+def _compact_route_report_rows(report: dict, row_limit: int) -> dict:
+    """Apply one shared, fair detail-row budget to a route artifact."""
+
+    effective_limit = max(0, min(100, int(row_limit)))
+    requirements = report.get("route_requirements_intel") or {}
+    original_route_count = len(requirements.get("routes") or [])
+    streams = _report_mapping_row_streams(report)
+    for stream in streams:
+        stream["available"] = len(stream["rows"])
+        stream["stored_rows"] = []
+        stream["index"] = 0
+    remaining = effective_limit
+    while remaining > 0:
+        progressed = False
+        for stream in streams:
+            index = int(stream["index"])
+            rows = stream["rows"]
+            weight = int(stream["weight"])
+            if index >= len(rows) or weight > remaining:
+                continue
+            stream["stored_rows"].append(rows[index])
+            stream["index"] = index + 1
+            remaining -= weight
+            progressed = True
+            if remaining <= 0:
+                break
+        if not progressed:
+            break
+
+    counts: dict[str, dict[str, int]] = {}
+    available_rows = stored_rows = 0
+    for stream in streams:
+        retained = stream["stored_rows"]
+        stream["rows"][:] = retained
+        weight = int(stream["weight"])
+        available = int(stream["available"]) * weight
+        stored = len(retained) * weight
+        available_rows += available
+        stored_rows += stored
+        counts[str(stream["path"])] = {
+            "available": available,
+            "stored": stored,
+            "omitted": available - stored,
+            "row_weight": weight,
+        }
+
+    retained_routes = list(requirements.get("routes") or [])
+    requirements["candidate_route_requirement_summaries"] = [
+        dict(row["route_requirement_summary"])
+        for row in retained_routes
+        if isinstance(row.get("route_requirement_summary"), dict)
+    ]
+    requirements_compaction = requirements.setdefault("artifact_compaction", {})
+    requirements_compaction.update(
+        {
+            "enabled": True,
+            "policy": "complete_aggregates_plus_paired_bounded_route_rows",
+            "representative_row_limit": effective_limit,
+            "route_count": original_route_count,
+            "route_count_stored": len(retained_routes),
+            "route_count_omitted": original_route_count - len(retained_routes),
+            "representative_row_count_available": original_route_count * 2,
+            "representative_row_count_stored": len(retained_routes) * 2,
+            "representative_row_count_omitted": (
+                original_route_count - len(retained_routes)
+            )
+            * 2,
+        }
+    )
+    return {
+        "enabled": True,
+        "policy": "complete_aggregates_plus_shared_bounded_representative_rows",
+        "representative_row_limit": effective_limit,
+        "representative_row_count_available": available_rows,
+        "representative_row_count_stored": stored_rows,
+        "representative_row_count_omitted": available_rows - stored_rows,
+        "detail_row_counts_by_path": counts,
+    }
+
+
+def write_route_resolver_report(candidates: list[dict], settings: dict, limit: int = 100) -> dict:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    considered = candidates[:limit]
+    considered = list(candidates)
+    configured_limit = (settings.get("route_resolver") or {}).get(
+        "report_max_representative_rows", limit
+    )
+    representative_row_limit = max(0, min(100, int(configured_limit)))
     summary = summarize_routes(considered)
-    requirements_intel = build_route_requirements_report(considered)
+    route_intelligence = summarize_route_intelligence(considered)
+    requirements_intel = build_route_requirements_report(
+        considered,
+        representative_row_limit=None,
+    )
     paper_context_ranking = (
-        paper_context_cost_report(considered)
+        paper_context_cost_report(considered, limit=representative_row_limit)
         if str(settings.get("mode") or "paper").strip().lower() == "paper"
         else {"paper_only": True, "enabled": False, "candidate_count": 0, "candidates": []}
     )
@@ -3515,7 +3633,7 @@ def write_route_resolver_report(candidates: list[dict], settings: dict, limit: i
         "mode": settings.get("mode"),
         "live_trading_allowed": bool(settings.get("allow_live_trading", False)),
         "summary": summary,
-        "route_intelligence": summarize_route_intelligence(considered),
+        "route_intelligence": route_intelligence,
         "route_requirements_intel": requirements_intel,
         # Context evidence only orders paper review.  It is deliberately kept
         # separate from route status so weak transport assumptions remain
@@ -3528,15 +3646,28 @@ def write_route_resolver_report(candidates: list[dict], settings: dict, limit: i
             "Live execution is still blocked unless the global live-trading gates are explicitly enabled elsewhere.",
         ],
     }
+    report = copy.deepcopy(report)
+    report["artifact_compaction"] = _compact_route_report_rows(
+        report,
+        representative_row_limit,
+    )
     REPORT_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
     REPORT_MD.write_text(_markdown(report), encoding="utf-8")
     intelligence_sidecar = {
-        **report["route_intelligence"],
-        "route_requirements_intel": requirements_intel,
+        **copy.deepcopy(route_intelligence),
+        "route_requirements_intel": copy.deepcopy(requirements_intel),
     }
+    intelligence_sidecar = copy.deepcopy(intelligence_sidecar)
+    intelligence_sidecar["artifact_compaction"] = _compact_route_report_rows(
+        intelligence_sidecar,
+        representative_row_limit,
+    )
     ROUTE_INTELLIGENCE_JSON.write_text(json.dumps(intelligence_sidecar, indent=2), encoding="utf-8")
     ROUTE_INTELLIGENCE_MD.write_text(
-        _route_intelligence_markdown(report["route_intelligence"], requirements_intel),
+        _route_intelligence_markdown(
+            intelligence_sidecar,
+            intelligence_sidecar["route_requirements_intel"],
+        ),
         encoding="utf-8",
     )
     return report

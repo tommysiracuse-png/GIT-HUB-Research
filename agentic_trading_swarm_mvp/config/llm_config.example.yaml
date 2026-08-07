@@ -1,5 +1,8 @@
 ﻿{
   "daily_budget_usd": 25.0,
+  "rolling_24h_budget_usd": 25.0,
+  "daily_call_limit": 10,
+  "rolling_24h_call_limit": 10,
   "default_mode": "paid_when_key_available",
   "require_env_to_call_models": true,
   "fallback_to_litellm_for_non_openai": true,

@@ -17,15 +17,18 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from horizon_selection import candidate_horizons, prior_selected_horizon, select_sticky_horizon
+from market_admission import admission_key_for
 from paper_exploration import exploration_enabled
 from route_resolver import enrich_candidate_with_route, evaluate_route_intelligence
 from paper_context_cost import realized_paper_cost_audit
+from paired_direct_contract import CONTRACT_VERSION as PAIRED_DIRECT_CONTRACT_VERSION
 from frontier_data_quality import paper_only_yahoo_proxy_cross_surface_alignment_guard
 from signals.registry import discover_signals, known_strategy_signatures, promoted_strategy_lab_ids
 from storage import (
     RUNS_DIR,
     add_llm_recommendation,
     link_recommendation_artifact,
+    reliable_paper_label_eligibility_for_trade_row,
     signal_key,
     utc_now,
 )
@@ -52,6 +55,7 @@ from strategy_feasibility import (
 
 REPORT_JSON = RUNS_DIR / "strategy_lab_report.json"
 REPORT_MD = RUNS_DIR / "strategy_lab_report.md"
+RECOVERY_CANARY_STRATEGY_LAB_ID = "recovery_okx_short_perp_long_spot_v1"
 
 ACTIVE_STATUSES = {"active_testing"}
 TRACKED_STATUSES = {
@@ -61,6 +65,7 @@ TRACKED_STATUSES = {
     "needs_route",
     "needs_more_evidence",
     "split_into_children",
+    "promotion_candidate",
     "promote_candidate",
     "promotion_queued",
     "promoted_to_code",
@@ -130,6 +135,148 @@ SURFACE_TARGET_FIELDS = (
     "asset_surface",
 )
 YAHOO_PROXY_SURFACE = "yahoo_proxy"
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = value.replace(";", ",").split(",")
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return sorted({str(item).strip() for item in value if str(item).strip()})
+
+
+def _strategy_lab_controls(settings: dict | None) -> dict:
+    cfg = (settings or {}).get("strategy_lab", {}) if isinstance(settings, dict) else {}
+    operations = (settings or {}).get("operations", {}) if isinstance(settings, dict) else {}
+    expansion = (settings or {}).get("paper_expansion", {}) if isinstance(settings, dict) else {}
+    master_enabled = bool(cfg.get("enabled", True))
+    observation_programs_enabled = bool(cfg.get("observation_programs_enabled", True))
+    lifecycle_mutations_enabled = master_enabled and bool(
+        cfg.get("lifecycle_mutations_enabled", True)
+    )
+    recommendation_emission_enabled = lifecycle_mutations_enabled and bool(
+        cfg.get("recommendation_emission_enabled", True)
+    )
+    promotion_enabled = lifecycle_mutations_enabled and bool(cfg.get("promotion_enabled", True))
+    adaptive_cfg = cfg.get("adaptive_relaxation", {})
+    adaptive_cfg = adaptive_cfg if isinstance(adaptive_cfg, dict) else {}
+    raw_root_cap = cfg.get("max_active_strategy_roots")
+    max_active_strategy_roots = (
+        max(0, int(raw_root_cap)) if raw_root_cap is not None else None
+    )
+    recovery_restrictions_enabled = bool(
+        operations.get("fail_closed_recovery_profile", False)
+        or expansion.get("enabled", False)
+        or cfg.get("bootstrap_recovery_canary_enabled", False)
+    )
+    return {
+        "master_enabled": master_enabled,
+        "promoted_signal_plugins_enabled": master_enabled
+        and bool(cfg.get("promoted_signal_plugins_enabled", True)),
+        "snapshot_warmup_enabled": master_enabled
+        and observation_programs_enabled
+        and bool(cfg.get("snapshot_warmup_enabled", True)),
+        "runtime_generation_enabled": master_enabled
+        and bool(cfg.get("runtime_generation_enabled", True)),
+        "evaluation_enabled": master_enabled and bool(cfg.get("evaluation_enabled", True)),
+        "lifecycle_mutations_enabled": lifecycle_mutations_enabled,
+        "recommendation_emission_enabled": recommendation_emission_enabled,
+        "promotion_enabled": promotion_enabled,
+        "adaptive_relaxation_enabled": lifecycle_mutations_enabled
+        and bool(cfg.get("adaptive_relaxation_enabled", adaptive_cfg.get("enabled", True))),
+        "region_splits_enabled": lifecycle_mutations_enabled
+        and bool(cfg.get("region_splits_enabled", True)),
+        "bootstrap_recovery_canary_enabled": master_enabled
+        and bool(cfg.get("bootstrap_recovery_canary_enabled", False)),
+        "observation_programs_enabled": observation_programs_enabled,
+        "experiment_root_allowlist": _string_list(
+            cfg.get("experiment_root_allowlist", cfg.get("root_allowlist", []))
+        ),
+        # Recovery roots are deliberately terminal selections.  Historical
+        # relaxed/region-split descendants must not be revived merely because
+        # their parent root is allowlisted.
+        "experiment_root_only": recovery_restrictions_enabled
+        or bool(cfg.get("experiment_root_only", False)),
+        "recovery_restrictions_enabled": recovery_restrictions_enabled,
+        "max_active_strategy_roots": max_active_strategy_roots,
+    }
+
+
+def _strategy_lab_lineage_root_map(conn: sqlite3.Connection) -> dict[str, str]:
+    rows = conn.execute(
+        "select strategy_lab_id, parent_strategy_lab_id from strategy_lab_experiments"
+    ).fetchall()
+    parents = {
+        str(row["strategy_lab_id"]): str(row["parent_strategy_lab_id"] or "").strip()
+        for row in rows
+        if str(row["strategy_lab_id"] or "").strip()
+    }
+    roots: dict[str, str] = {}
+    for strategy_lab_id in parents:
+        current = strategy_lab_id
+        seen: set[str] = set()
+        cycle = False
+        while current:
+            if current in seen:
+                cycle = True
+                break
+            seen.add(current)
+            parent = parents.get(current, "")
+            if not parent:
+                break
+            current = parent
+        roots[strategy_lab_id] = min(seen) if cycle else (current or strategy_lab_id)
+    return roots
+
+
+def _allowlisted_experiment_ids(
+    conn: sqlite3.Connection,
+    root_allowlist: list[str],
+    max_active_roots: int | None = None,
+    *,
+    include_descendants: bool = True,
+    empty_allowlist_means_none: bool = False,
+) -> tuple[set[str] | None, dict[str, str]]:
+    roots = _strategy_lab_lineage_root_map(conn)
+    if empty_allowlist_means_none and not root_allowlist:
+        return set(), roots
+    if not root_allowlist and max_active_roots is None:
+        return None, roots
+    if root_allowlist:
+        root_order = list(root_allowlist)
+    else:
+        rows = conn.execute(
+            """
+            select strategy_lab_id from strategy_lab_experiments
+            where status in (
+                'active_testing','needs_more_evidence','needs_contract_revision',
+                'needs_data','needs_route','promotion_candidate','promote_candidate'
+            )
+            order by case when strategy_lab_id=? then 0 else 1 end,
+                     created_at asc,strategy_lab_id asc
+            """,
+            (RECOVERY_CANARY_STRATEGY_LAB_ID,),
+        ).fetchall()
+        root_order = []
+        for row in rows:
+            experiment_id = str(row["strategy_lab_id"])
+            root_id = roots.get(experiment_id, experiment_id)
+            if root_id not in root_order:
+                root_order.append(root_id)
+    if max_active_roots is not None:
+        root_order = root_order[: max(0, int(max_active_roots))]
+    if not include_descendants:
+        return {
+            root_id
+            for root_id in root_order
+            if root_id in roots and roots.get(root_id) == root_id
+        }, roots
+    allowed_roots = set(root_order)
+    return {
+        strategy_lab_id
+        for strategy_lab_id, root_id in roots.items()
+        if root_id in allowed_roots
+    }, roots
 PROGRAM_OBSERVATION_ENRICHMENT_FIELDS = PROGRAM_CANDIDATE_PASSTHROUGH_FIELDS | {
     "spread_bps",
     "liquidity_score",
@@ -1249,11 +1396,243 @@ def _validate_contract(payload: dict) -> tuple[dict | None, str | None]:
     }, None
 
 
+def bootstrap_recovery_canary(conn: sqlite3.Connection, settings: dict) -> dict:
+    """Materialize one deterministic, paper-only recovery canary.
+
+    The explicit bootstrap switch is the only authority for this narrow
+    upsert.  It does not create a recommendation, child, or code-change task.
+    """
+
+    controls = _strategy_lab_controls(settings)
+    if not controls["bootstrap_recovery_canary_enabled"]:
+        return {
+            "enabled": False,
+            "strategy_lab_id": RECOVERY_CANARY_STRATEGY_LAB_ID,
+            "status": "disabled",
+        }
+    payload = {
+        "title": "Bounded OKX short-perp long-spot recovery canary",
+        "rationale": (
+            "Test one exact OKX short-perp/long-spot basis route under bounded "
+            "paper-only recovery controls."
+        ),
+        "strategy_lab_experiment": {
+            "strategy_lab_id": RECOVERY_CANARY_STRATEGY_LAB_ID,
+            "version": 1,
+            "experiment_type": "market_strategy",
+            "hypothesis": (
+                "A route-confirmed OKX short-perp/long-spot basis setup can retain "
+                "positive post-cost paper edge."
+            ),
+            "source_surface": "perp_funding_basis",
+            "permitted_target_surface": ["perp_funding_basis"],
+            "strategy_logic": {
+                "type": "candidate_filter",
+                "venues": ["OKX"],
+                "trade_types": ["perp_funding_basis"],
+                "directions": ["short_perp_long_spot"],
+                "required_fields": [
+                    "edge_bps_estimate",
+                    "funding_bps",
+                    "basis_bps",
+                    "hedge_venue",
+                    "hedge_instrument",
+                ],
+                "min_edge_bps": 0.01,
+                "min_liquidity_score": 0.35,
+                "max_spread_bps": 12.0,
+                "max_candidates_per_loop": 1,
+            },
+            "data_requirements": {
+                "paper_only": True,
+                "route_status": "standard",
+                "deterministic_recovery_canary": True,
+            },
+            "risk_gates": {
+                "min_edge_bps": 0.01,
+                "min_liquidity_score": 0.35,
+                "max_spread_bps": 12.0,
+                "paper_allocation_multiplier": 1.0,
+            },
+            "promotion_rules": {},
+        },
+    }
+    contract, error = _validate_contract(payload)
+    if contract is None or contract.get("status") in {
+        "rejected_invalid",
+        "quarantined_surface_policy",
+    }:
+        raise ValueError(f"invalid_recovery_canary_contract:{error or contract.get('status')}")
+
+    now = _utc()
+    logic_json = json.dumps(contract["strategy_logic"], sort_keys=True)
+    compile_diagnostic = json.dumps(
+        {
+            "compiled_at": now,
+            "compile_status": "compiled",
+            "reason": "deterministic_recovery_canary_bootstrap",
+            "logic_type": "candidate_filter",
+            "recommendation_emitted": False,
+        },
+        sort_keys=True,
+    )
+    existing = conn.execute(
+        """
+        select version, parent_strategy_lab_id, experiment_type, status, hypothesis,
+               strategy_logic_json, data_requirements_json, risk_gates_json,
+               promotion_rules_json,
+               compiled_strategy_logic_json, compile_status, source_surface,
+               permitted_target_surfaces_json, surface_policy_json, source_agent
+        from strategy_lab_experiments where strategy_lab_id = ?
+        """,
+        (RECOVERY_CANARY_STRATEGY_LAB_ID,),
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            """
+            insert into strategy_lab_experiments (
+                strategy_lab_id, version, parent_strategy_lab_id, experiment_type,
+                status, hypothesis, strategy_logic_json, original_strategy_logic_json,
+                compiled_strategy_logic_json, compile_status, compile_diagnostics_json,
+                data_requirements_json, risk_gates_json, promotion_rules_json,
+                source_surface, permitted_target_surfaces_json, surface_policy_json,
+                source_agent, source_recommendation_id, created_at, updated_at,
+                last_compiled_at, novelty_status, novelty_details_json
+            ) values (?, 1, null, 'market_strategy', 'active_testing', ?, ?, ?, ?,
+                      'compiled', ?, ?, ?, ?, ?, ?, ?,
+                      'deterministic_recovery_bootstrap', null, ?, ?, ?,
+                      'not_applicable', ?)
+            """,
+            (
+                RECOVERY_CANARY_STRATEGY_LAB_ID,
+                contract["hypothesis"],
+                logic_json,
+                logic_json,
+                logic_json,
+                compile_diagnostic,
+                json.dumps(contract["data_requirements"], sort_keys=True),
+                json.dumps(contract["risk_gates"], sort_keys=True),
+                json.dumps(contract["promotion_rules"], sort_keys=True),
+                contract["source_surface"],
+                json.dumps(contract["permitted_target_surface"], sort_keys=True),
+                json.dumps(contract["surface_policy"], sort_keys=True),
+                now,
+                now,
+                now,
+                json.dumps({"reason": "deterministic_recovery_canary"}, sort_keys=True),
+            ),
+        )
+        action = "created"
+    elif (
+        int(existing["version"] or 0) == 1
+        and not str(existing["parent_strategy_lab_id"] or "").strip()
+        and str(existing["experiment_type"] or "") == "market_strategy"
+        and str(existing["status"] or "") in {
+            "active_testing",
+            "needs_more_evidence",
+            "needs_contract_revision",
+            "promotion_queued",
+            "promoted_to_code",
+            "retired_bad_evidence",
+            "retired_no_activity",
+            "split_into_children",
+        }
+        and str(existing["hypothesis"] or "") == contract["hypothesis"]
+        and json.dumps(_json_loads(existing["strategy_logic_json"], {}), sort_keys=True)
+        == logic_json
+        and json.dumps(
+            _json_loads(existing["data_requirements_json"], {}), sort_keys=True
+        )
+        == json.dumps(contract["data_requirements"], sort_keys=True)
+        and json.dumps(_json_loads(existing["risk_gates_json"], {}), sort_keys=True)
+        == json.dumps(contract["risk_gates"], sort_keys=True)
+        and json.dumps(
+            _json_loads(existing["promotion_rules_json"], {}), sort_keys=True
+        )
+        == json.dumps(contract["promotion_rules"], sort_keys=True)
+        and json.dumps(
+            _json_loads(existing["compiled_strategy_logic_json"], {}), sort_keys=True
+        )
+        == logic_json
+        and str(existing["compile_status"] or "") == "compiled"
+        and str(existing["source_surface"] or "") == str(contract["source_surface"] or "")
+        and json.dumps(
+            _json_loads(existing["permitted_target_surfaces_json"], []), sort_keys=True
+        )
+        == json.dumps(contract["permitted_target_surface"], sort_keys=True)
+        and json.dumps(_json_loads(existing["surface_policy_json"], {}), sort_keys=True)
+        == json.dumps(contract["surface_policy"], sort_keys=True)
+        and str(existing["source_agent"] or "") == "deterministic_recovery_bootstrap"
+    ):
+        action = "existing"
+    else:
+        conn.execute(
+            """
+            update strategy_lab_experiments
+            set version = 1, parent_strategy_lab_id = null,
+                experiment_type = 'market_strategy', hypothesis = ?,
+                strategy_logic_json = ?, original_strategy_logic_json = ?,
+                compiled_strategy_logic_json = ?, compile_status = 'compiled',
+                compile_diagnostics_json = ?, data_requirements_json = ?,
+                risk_gates_json = ?, promotion_rules_json = ?, source_surface = ?,
+                permitted_target_surfaces_json = ?, surface_policy_json = ?,
+                source_agent = 'deterministic_recovery_bootstrap',
+                source_recommendation_id = null, updated_at = ?, last_compiled_at = ?,
+                novelty_status = 'not_applicable', novelty_details_json = ?,
+                status = case
+                    when status in ('promotion_candidate', 'promote_candidate',
+                                    'promotion_queued', 'promoted_to_code',
+                                    'retired_bad_evidence', 'retired_no_activity',
+                                    'split_into_children') then status
+                    else 'active_testing'
+                end
+            where strategy_lab_id = ?
+            """,
+            (
+                contract["hypothesis"],
+                logic_json,
+                logic_json,
+                logic_json,
+                compile_diagnostic,
+                json.dumps(contract["data_requirements"], sort_keys=True),
+                json.dumps(contract["risk_gates"], sort_keys=True),
+                json.dumps(contract["promotion_rules"], sort_keys=True),
+                contract["source_surface"],
+                json.dumps(contract["permitted_target_surface"], sort_keys=True),
+                json.dumps(contract["surface_policy"], sort_keys=True),
+                now,
+                now,
+                json.dumps({"reason": "deterministic_recovery_canary"}, sort_keys=True),
+                RECOVERY_CANARY_STRATEGY_LAB_ID,
+            ),
+        )
+        action = "updated"
+    conn.commit()
+    return {
+        "enabled": True,
+        "strategy_lab_id": RECOVERY_CANARY_STRATEGY_LAB_ID,
+        "version": 1,
+        "status": action,
+        "recommendation_emitted": False,
+        "child_created": False,
+    }
+
+
 def ingest_strategy_lab_recommendation(
     conn: sqlite3.Connection,
     rec: dict,
     settings: dict | None = None,
 ) -> list[dict]:
+    controls = _strategy_lab_controls(settings)
+    if settings is not None and not controls["lifecycle_mutations_enabled"]:
+        return [
+            {
+                "action_status": "skipped",
+                "artifact": "strategy_lab_experiment",
+                "reason": "strategy_lab_lifecycle_mutations_disabled",
+                "controls": controls,
+            }
+        ]
     payload = dict(rec.get("payload") or {})
     contract, error = _validate_contract(payload)
     if contract is None:
@@ -1296,8 +1675,9 @@ def ingest_strategy_lab_recommendation(
             """,
             (signature, contract["strategy_lab_id"]),
         ).fetchone()
-        discover_signals()
-        promoted_match = known_strategy_signatures().get(signature)
+        if controls["promoted_signal_plugins_enabled"]:
+            discover_signals()
+            promoted_match = known_strategy_signatures().get(signature)
         if (duplicate or promoted_match) and contract["status"] != "quarantined_surface_policy":
             contract["status"] = "rejected_invalid"
     novelty_status = (
@@ -1422,7 +1802,8 @@ def ingest_strategy_lab_recommendation(
                 update strategy_lab_experiments
                 set updated_at = ?, status = case
                         when ? = 'quarantined_surface_policy' then ?
-                        when status in ('promoted_to_code', 'promotion_queued') then status
+                        when status in ('promotion_candidate', 'promote_candidate',
+                                        'promoted_to_code', 'promotion_queued') then status
                         else ?
                     end,
                     hypothesis = ?,
@@ -1523,10 +1904,20 @@ def ingest_strategy_lab_recommendation(
 def _active_experiments(
     conn: sqlite3.Connection,
     include_retired_for_evaluation: bool = False,
+    allowed_strategy_lab_ids: set[str] | None = None,
+    lifecycle_mutations_enabled: bool = True,
 ) -> list[dict]:
+    if allowed_strategy_lab_ids is not None and not allowed_strategy_lab_ids:
+        return []
     statuses = "'active_testing', 'needs_more_evidence', 'needs_contract_revision'"
     if include_retired_for_evaluation:
         statuses += ", 'retired_bad_evidence'"
+    params: list[Any] = []
+    allowlist_clause = ""
+    if allowed_strategy_lab_ids is not None:
+        placeholders = ",".join("?" for _ in allowed_strategy_lab_ids)
+        allowlist_clause = f" and strategy_lab_id in ({placeholders})"
+        params.extend(sorted(allowed_strategy_lab_ids))
     rows = conn.execute(
         f"""
         select *
@@ -1534,9 +1925,11 @@ def _active_experiments(
         where status in ({statuses})
           and experiment_type = 'market_strategy'
           and compile_status = 'compiled'
+          {allowlist_clause}
         order by updated_at desc
         limit 100
-        """
+        """,
+        params,
     ).fetchall()
     output = []
     quarantined = False
@@ -1564,21 +1957,22 @@ def _active_experiments(
         surface_contract = _surface_contract({}, item, item["data_requirements"])
         yahoo_review = surface_contract["yahoo_proxy_same_surface_review"]
         if yahoo_review["applies"] and not surface_contract["eligible"]:
-            conn.execute(
-                """
-                update strategy_lab_experiments
-                set status = 'quarantined_surface_policy',
-                    compile_status = 'surface_quarantined',
-                    surface_policy_json = ?, updated_at = ?
-                where strategy_lab_id = ?
-                """,
-                (
-                    json.dumps(surface_contract, sort_keys=True),
-                    _utc(),
-                    item["strategy_lab_id"],
-                ),
-            )
-            quarantined = True
+            if lifecycle_mutations_enabled:
+                conn.execute(
+                    """
+                    update strategy_lab_experiments
+                    set status = 'quarantined_surface_policy',
+                        compile_status = 'surface_quarantined',
+                        surface_policy_json = ?, updated_at = ?
+                    where strategy_lab_id = ?
+                    """,
+                    (
+                        json.dumps(surface_contract, sort_keys=True),
+                        _utc(),
+                        item["strategy_lab_id"],
+                    ),
+                )
+                quarantined = True
             continue
         item["risk_gates"] = _json_loads(item.pop("risk_gates_json"), {})
         item["promotion_rules"] = _json_loads(item.pop("promotion_rules_json"), {})
@@ -2084,6 +2478,10 @@ def _compile_strategy_lab_contracts(
     conn: sqlite3.Connection,
     candidates: list[dict],
     observation_frames: list[dict] | None = None,
+    *,
+    allowed_strategy_lab_ids: set[str] | None = None,
+    recommendation_emission_enabled: bool = True,
+    promoted_signal_plugins_enabled: bool = True,
 ) -> dict:
     """Compile model intent against the actual runtime candidate schema.
 
@@ -2104,15 +2502,30 @@ def _compile_strategy_lab_contracts(
     schema_fingerprint = hashlib.sha256(
         json.dumps(schema_payload, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
+    if allowed_strategy_lab_ids is not None and not allowed_strategy_lab_ids:
+        return {
+            "enabled": True,
+            "runtime_schema_fingerprint": schema_fingerprint,
+            "by_compile_status": {},
+            "diagnostics": {},
+        }
+    params: list[Any] = []
+    allowlist_clause = ""
+    if allowed_strategy_lab_ids is not None:
+        placeholders = ",".join("?" for _ in allowed_strategy_lab_ids)
+        allowlist_clause = f" and strategy_lab_id in ({placeholders})"
+        params.extend(sorted(allowed_strategy_lab_ids))
     rows = conn.execute(
-        """
+        f"""
         select *
         from strategy_lab_experiments
         where experiment_type = 'market_strategy'
           and status in ('proposed', 'active_testing', 'needs_data', 'needs_route', 'needs_more_evidence')
+          {allowlist_clause}
         order by updated_at desc
         limit 500
-        """
+        """,
+        params,
     ).fetchall()
     summary = Counter()
     diagnostics: dict[str, dict] = {}
@@ -2175,8 +2588,14 @@ def _compile_strategy_lab_contracts(
                 """,
                 (signature, row["strategy_lab_id"]),
             ).fetchone() if signature else None
-            discover_signals()
-            promoted_match = known_strategy_signatures().get(str(signature)) if signature else None
+            promoted_match = None
+            if promoted_signal_plugins_enabled:
+                discover_signals()
+                promoted_match = (
+                    known_strategy_signatures().get(str(signature))
+                    if signature
+                    else None
+                )
             missing_features = list(program_diagnostic.get("missing_features") or [])
             feature_proposal_id = None
             if program_diagnostic.get("status") == "compiled" and not duplicate and not promoted_match:
@@ -2194,11 +2613,12 @@ def _compile_strategy_lab_contracts(
                 status = "needs_data"
                 reason = "missing_program_features"
                 novelty_status = "unassessed"
-                feature_proposal_id = _queue_missing_feature_proposal(
-                    conn,
-                    {**row, "strategy_logic": original},
-                    missing_features,
-                )
+                if recommendation_emission_enabled:
+                    feature_proposal_id = _queue_missing_feature_proposal(
+                        conn,
+                        {**row, "strategy_logic": original},
+                        missing_features,
+                    )
             else:
                 compile_status = "invalid"
                 status = "rejected_invalid"
@@ -2697,18 +3117,43 @@ def generate_strategy_lab_candidates(
     runtime_diagnostics: dict | None = None,
 ) -> tuple[list[dict], dict]:
     cfg = settings.get("strategy_lab", {})
+    controls = _strategy_lab_controls(settings)
     runtime_diagnostics = dict(runtime_diagnostics or {})
-    if not cfg.get("enabled", True):
-        return [], {"enabled": False, "generated_candidates": 0}
+    if not controls["master_enabled"]:
+        return [], {
+            "enabled": False,
+            "controls": controls,
+            "generated_candidates": 0,
+            "feature_snapshots": {"enabled": False, "reason": "strategy_lab_disabled"},
+        }
 
-    discover_signals()
-    promoted_plugins = promoted_strategy_lab_ids()
-    if promoted_plugins:
+    recovery_canary_bootstrap = bootstrap_recovery_canary(conn, settings)
+    allowed_experiment_ids, lineage_roots = _allowlisted_experiment_ids(
+        conn,
+        controls["experiment_root_allowlist"],
+        controls["max_active_strategy_roots"],
+        include_descendants=not controls["experiment_root_only"],
+        empty_allowlist_means_none=controls["recovery_restrictions_enabled"],
+    )
+
+    promoted_plugins: list[str] = []
+    if controls["promoted_signal_plugins_enabled"] and (
+        controls["runtime_generation_enabled"] or controls["lifecycle_mutations_enabled"]
+    ):
+        discover_signals()
+        promoted_plugins = promoted_strategy_lab_ids()
+    if (
+        promoted_plugins
+        and controls["lifecycle_mutations_enabled"]
+        and controls["promotion_enabled"]
+    ):
         conn.executemany(
             """
             update strategy_lab_experiments
             set status = 'promoted_to_code', updated_at = ?
-            where strategy_lab_id = ? and status in ('promote_candidate', 'promotion_queued')
+            where strategy_lab_id = ? and status in (
+                'promotion_candidate', 'promote_candidate', 'promotion_queued'
+            )
             """,
             [(_utc(), strategy_lab_id) for strategy_lab_id in promoted_plugins],
         )
@@ -2804,20 +3249,89 @@ def generate_strategy_lab_candidates(
                 "paper_execution_mode": "synthetic_paper",
                 "promotion_eligible": False,
             }
+        if (
+            controls["bootstrap_recovery_canary_enabled"]
+            and controls["experiment_root_allowlist"]
+            == [RECOVERY_CANARY_STRATEGY_LAB_ID]
+            and str(candidate.get("venue") or "").upper() == "OKX"
+            and str(candidate.get("trade_type") or "") == "perp_funding_basis"
+            and str(candidate.get("direction") or "") == "short_perp_long_spot"
+        ):
+            candidate = {
+                **candidate,
+                "strategy_lab_source_market_key": candidate.get("market_key"),
+                # The route resolver otherwise mistakes the paired direction's
+                # `long_spot` suffix for an OKX_SPOT-only capability profile.
+                "market_key": "OKX",
+            }
         source_rank_candidates.append(candidate)
     eligible_candidates, route_blocked, route_missing_counts, route_blocker_counts = (
         _paper_route_eligible_candidates(source_rank_candidates, settings)
     )
-    if cfg.get("observation_programs_enabled", True):
+    if controls["snapshot_warmup_enabled"]:
         observation_frames, snapshot_summary = record_feature_snapshots(
             conn,
             _observation_program_inputs(price_observations, eligible_candidates),
             settings,
         )
     else:
-        observation_frames, snapshot_summary = [], {"enabled": False}
-    compilation = _compile_strategy_lab_contracts(conn, eligible_candidates, observation_frames)
-    all_experiments = _active_experiments(conn)
+        observation_frames, snapshot_summary = [], {
+            "enabled": False,
+            "reason": (
+                "snapshot_warmup_disabled"
+                if controls["observation_programs_enabled"]
+                else "observation_programs_disabled"
+            ),
+        }
+    if controls["lifecycle_mutations_enabled"]:
+        compilation = _compile_strategy_lab_contracts(
+            conn,
+            eligible_candidates,
+            observation_frames,
+            allowed_strategy_lab_ids=allowed_experiment_ids,
+            recommendation_emission_enabled=controls["recommendation_emission_enabled"],
+            promoted_signal_plugins_enabled=controls["promoted_signal_plugins_enabled"],
+        )
+    else:
+        compilation = {
+            "enabled": False,
+            "reason": "strategy_lab_lifecycle_mutations_disabled",
+            "runtime_schema_fingerprint": None,
+            "by_compile_status": {},
+            "diagnostics": {},
+        }
+    if not controls["runtime_generation_enabled"]:
+        return [], {
+            "enabled": True,
+            "controls": controls,
+            "generated_at": _utc(),
+            "runtime_generation_enabled": False,
+            "active_experiments": 0,
+            "source_candidate_count": len(candidates),
+            "route_eligible_source_candidate_count": len(eligible_candidates),
+            "route_ineligible_candidate_count": len(route_blocked),
+            "route_ineligible_missing_prerequisite_counts": dict(route_missing_counts),
+            "route_ineligible_blocker_counts": dict(route_blocker_counts),
+            "price_observation_count": len(price_observations or []),
+            "generated_candidates": 0,
+            "generated_by_experiment": {},
+            "contract_compilation": compilation,
+            "feature_snapshots": snapshot_summary,
+            "experiment_root_allowlist": controls["experiment_root_allowlist"],
+            "allowlisted_experiment_count": (
+                len(allowed_experiment_ids)
+                if allowed_experiment_ids is not None
+                else len(lineage_roots)
+            ),
+            "runtime_coverage_diagnostics": runtime_diagnostics,
+            "promoted_signal_plugins": promoted_plugins,
+            "recovery_canary_bootstrap": recovery_canary_bootstrap,
+        }
+    all_experiments = _active_experiments(
+        conn,
+        allowed_strategy_lab_ids=allowed_experiment_ids,
+        lifecycle_mutations_enabled=controls["lifecycle_mutations_enabled"],
+    )
     source_vetoed_experiments: list[dict] = []
     experiments: list[dict] = []
     for experiment in all_experiments:
@@ -2878,12 +3392,16 @@ def generate_strategy_lab_candidates(
         if str(raw_logic.get("type") or "") == OBSERVATION_PROGRAM:
             experiment_id = experiment["strategy_lab_id"]
             feasibility = profile_observation_program(experiment, observation_frames, settings)
-            record_contract_evaluation(conn, experiment, feasibility)
+            if controls["lifecycle_mutations_enabled"]:
+                record_contract_evaluation(conn, experiment, feasibility)
             feasibility_by_experiment[experiment_id] = {
                 key: value for key, value in feasibility.items() if key != "program"
             }
             relaxed_child = None
-            if len(relaxed_children) < max_relaxations:
+            if (
+                controls["adaptive_relaxation_enabled"]
+                and len(relaxed_children) < max_relaxations
+            ):
                 relaxed_child = maybe_create_relaxed_child(
                     conn, experiment, feasibility, settings
                 )
@@ -3002,6 +3520,10 @@ def generate_strategy_lab_candidates(
             route_blocker_counts.update(program_blocker_counts)
             for reason, count in program_blocker_counts.items():
                 rejects[experiment_id][f"paper_route:{reason}"] += int(count)
+            lineage_root_id = lineage_roots.get(experiment_id, experiment_id)
+            for candidate in program_candidates:
+                candidate["strategy_lab_lineage_root_id"] = lineage_root_id
+                candidate["parent_strategy_lab_id"] = experiment.get("parent_strategy_lab_id")
             generated.extend(program_candidates)
             per_experiment[experiment_id] += len(program_candidates)
             for reason, count in (program_diagnostic.get("reject_reasons") or {}).items():
@@ -3042,20 +3564,21 @@ def generate_strategy_lab_candidates(
                 "runtime_coverage_diagnostics": runtime_diagnostics,
             }
             prior_evaluation = experiment.get("evaluation") or {}
-            conn.execute(
-                """
-                update strategy_lab_experiments
-                set status = ?, updated_at = ?, last_evaluated_at = ?, evaluation_json = ?
-                where strategy_lab_id = ?
-                """,
-                (
-                    diagnostic_status,
-                    _utc(),
-                    _utc(),
-                    json.dumps({**prior_evaluation, "generation_diagnostic": generation_diagnostic}, sort_keys=True),
-                    experiment_id,
-                ),
-            )
+            if controls["lifecycle_mutations_enabled"]:
+                conn.execute(
+                    """
+                    update strategy_lab_experiments
+                    set status = ?, updated_at = ?, last_evaluated_at = ?, evaluation_json = ?
+                    where strategy_lab_id = ?
+                    """,
+                    (
+                        diagnostic_status,
+                        _utc(),
+                        _utc(),
+                        json.dumps({**prior_evaluation, "generation_diagnostic": generation_diagnostic}, sort_keys=True),
+                        experiment_id,
+                    ),
+                )
             continue
         logic = _normalize_strategy_logic(raw_logic, runtime_vocabulary)
         risk_gates = experiment.get("risk_gates") or {}
@@ -3128,6 +3651,21 @@ def generate_strategy_lab_candidates(
         for candidate in surface_rank_pool:
             if len(generated) >= max_total or per_experiment[experiment["strategy_lab_id"]] >= local_limit:
                 break
+            if experiment["strategy_lab_id"] == RECOVERY_CANARY_STRATEGY_LAB_ID:
+                route_verdict = candidate.get("paper_route_eligibility")
+                route_verdict = route_verdict if isinstance(route_verdict, dict) else {}
+                if (
+                    candidate.get("paper_route_would_block")
+                    or route_verdict.get("suppressed")
+                    or str(candidate.get("signal_stats_scope") or "direct") != "direct"
+                    or candidate.get("synthetic_research_paper")
+                    or candidate.get("paper_proxy_not_live_equivalent")
+                    or str(candidate.get("candidate_status") or "").startswith("shadow")
+                ):
+                    rejects[experiment["strategy_lab_id"]][
+                        "recovery_canary_requires_direct_route_eligible_source"
+                    ] += 1
+                    continue
             ok, reasons = _matches_logic(candidate, logic, risk_gates, settings)
             if not ok:
                 for reason in reasons[:3]:
@@ -3147,6 +3685,14 @@ def generate_strategy_lab_candidates(
             lab_candidate = dict(candidate)
             lab_candidate["strategy_lab_id"] = experiment["strategy_lab_id"]
             lab_candidate["strategy_lab_version"] = int(experiment["version"])
+            canonical_lineage = (
+                f"STRATEGY_LAB|{experiment['strategy_lab_id']}|v{int(experiment['version'])}"
+            )
+            lab_candidate["signal_lineage_key"] = canonical_lineage
+            lab_candidate["strategy_lab_lineage_root_id"] = lineage_roots.get(
+                experiment["strategy_lab_id"], experiment["strategy_lab_id"]
+            )
+            lab_candidate["parent_strategy_lab_id"] = experiment.get("parent_strategy_lab_id")
             lab_candidate["strategy_lab_experiment_type"] = experiment.get("experiment_type", DEFAULT_EXPERIMENT_TYPE)
             lab_candidate["strategy_lab_hypothesis"] = experiment["hypothesis"]
             lab_candidate["strategy_lab_logic_type"] = logic.get("type", "candidate_filter")
@@ -3155,6 +3701,19 @@ def generate_strategy_lab_candidates(
                 candidate.get("signal_key") or signal_key(candidate)
             )
             lab_candidate["strategy_lab_candidate"] = True
+            if experiment["strategy_lab_id"] == RECOVERY_CANARY_STRATEGY_LAB_ID:
+                lab_candidate["signal_stats_scope"] = "direct"
+                lab_candidate["paper_allocation_multiplier"] = 1.0
+                lab_candidate["admission_episode_id"] = (
+                    f"{RECOVERY_CANARY_STRATEGY_LAB_ID}:v1:direct"
+                )
+                lab_candidate["admission_key"] = admission_key_for(lab_candidate)
+                lab_candidate["paper_admission"] = {
+                    "admission_key": lab_candidate["admission_key"],
+                    "episode_id": lab_candidate["admission_episode_id"],
+                    "strategy_lineage": canonical_lineage,
+                    "signal_stats_scope": "direct",
+                }
             lab_candidate["source_surface"] = experiment.get("source_surface")
             lab_candidate["permitted_target_surface"] = list(
                 experiment.get("permitted_target_surface") or []
@@ -3190,6 +3749,8 @@ def generate_strategy_lab_candidates(
             if ranked_lab_candidate is None:
                 rejects[experiment["strategy_lab_id"]]["lineage_source_negative_edge"] += 1
                 continue
+            if experiment["strategy_lab_id"] == RECOVERY_CANARY_STRATEGY_LAB_ID:
+                ranked_lab_candidate["paper_allocation_multiplier"] = 1.0
             generated.append(ranked_lab_candidate)
             per_experiment[experiment["strategy_lab_id"]] += 1
 
@@ -3240,20 +3801,21 @@ def generate_strategy_lab_candidates(
             },
         }
         prior_evaluation = experiment.get("evaluation") or {}
-        conn.execute(
-            """
-            update strategy_lab_experiments
-            set status = ?, updated_at = ?, last_evaluated_at = ?, evaluation_json = ?
-            where strategy_lab_id = ?
-            """,
-            (
-                diagnostic_status,
-                _utc(),
-                _utc(),
-                json.dumps({**prior_evaluation, "generation_diagnostic": generation_diagnostic}, sort_keys=True),
-                experiment_id,
-            ),
-        )
+        if controls["lifecycle_mutations_enabled"]:
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set status = ?, updated_at = ?, last_evaluated_at = ?, evaluation_json = ?
+                where strategy_lab_id = ?
+                """,
+                (
+                    diagnostic_status,
+                    _utc(),
+                    _utc(),
+                    json.dumps({**prior_evaluation, "generation_diagnostic": generation_diagnostic}, sort_keys=True),
+                    experiment_id,
+                ),
+            )
     conn.commit()
 
     proxy_frontier_quarantine_diagnostics = list(
@@ -3269,6 +3831,7 @@ def generate_strategy_lab_candidates(
     )
     report = {
         "enabled": True,
+        "controls": controls,
         "generated_at": _utc(),
         "active_experiments": len(experiments),
         "source_candidate_count": len(candidates),
@@ -3317,11 +3880,18 @@ def generate_strategy_lab_candidates(
         "strategy_feasibility": feasibility_by_experiment,
         "adaptive_relaxed_children": relaxed_children,
         "feature_snapshots": snapshot_summary,
+        "experiment_root_allowlist": controls["experiment_root_allowlist"],
+        "allowlisted_experiment_count": (
+            len(allowed_experiment_ids)
+            if allowed_experiment_ids is not None
+            else len(lineage_roots)
+        ),
         "runtime_coverage_diagnostics": runtime_diagnostics,
         "observation_program_count": sum(
             1 for experiment in experiments if str((experiment.get("strategy_logic") or {}).get("type")) == OBSERVATION_PROGRAM
         ),
         "promoted_signal_plugins": promoted_plugins,
+        "recovery_canary_bootstrap": recovery_canary_bootstrap,
     }
     return generated, report
 
@@ -3331,10 +3901,13 @@ def _pnl_stats(values: list[float]) -> dict:
         return {
             "count": 0,
             "avg_pnl_bps": None,
+            "raw_avg_pnl_bps": None,
             "median_pnl_bps": None,
             "trimmed_mean_bps": None,
             "win_rate": None,
+            "raw_win_rate": None,
             "worst_decile_pnl_bps": None,
+            "raw_worst_decile_pnl_bps": None,
             "min_pnl_bps": None,
             "max_pnl_bps": None,
         }
@@ -3344,16 +3917,126 @@ def _pnl_stats(values: list[float]) -> dict:
     trim_n = int(len(ordered) * 0.1)
     trimmed = ordered[trim_n : len(ordered) - trim_n] if trim_n and len(ordered) > trim_n * 2 else ordered
     wins = sum(1 for value in values if value > 0)
+    raw_avg = sum(values) / len(values)
+    raw_win_rate = wins / len(values)
+    raw_worst_decile = sum(worst_decile) / len(worst_decile)
     return {
         "count": len(values),
-        "avg_pnl_bps": round(sum(values) / len(values), 3),
+        "avg_pnl_bps": round(raw_avg, 3),
+        "raw_avg_pnl_bps": raw_avg,
         "median_pnl_bps": round(statistics.median(values), 3),
         "trimmed_mean_bps": round(sum(trimmed) / len(trimmed), 3),
-        "win_rate": round(wins / len(values), 3),
-        "worst_decile_pnl_bps": round(sum(worst_decile) / len(worst_decile), 3),
+        "win_rate": round(raw_win_rate, 3),
+        "raw_win_rate": raw_win_rate,
+        "worst_decile_pnl_bps": round(raw_worst_decile, 3),
+        "raw_worst_decile_pnl_bps": raw_worst_decile,
         "min_pnl_bps": round(min(values), 3),
         "max_pnl_bps": round(max(values), 3),
     }
+
+
+def _recovery_canary_direct_admission_lineage_eligible(
+    item: dict,
+    candidate: dict,
+    expected_version: int,
+    eligibility: dict,
+) -> bool:
+    expected_lineage = (
+        f"STRATEGY_LAB|{RECOVERY_CANARY_STRATEGY_LAB_ID}|v{expected_version}"
+    )
+    admission = candidate.get("paper_admission")
+    admission = admission if isinstance(admission, dict) else {}
+    candidate_admission_key = str(candidate.get("admission_key") or "").strip()
+    # The admission queue owns the canonical episode and storage intentionally
+    # prefers ``episode_id``.  Use the same precedence here, while requiring
+    # every populated alias to agree so a stale pre-queue canary episode cannot
+    # be credited to the queued measurement.
+    candidate_episode_id = str(
+        candidate.get("episode_id")
+        or candidate.get("admission_episode_id")
+        or admission.get("episode_id")
+        or ""
+    ).strip()
+    admission_episode_alias = str(candidate.get("admission_episode_id") or "").strip()
+    return bool(
+        str(candidate.get("signal_lineage_key") or "") == expected_lineage
+        and str(candidate.get("strategy_lab_lineage_root_id") or "")
+        == RECOVERY_CANARY_STRATEGY_LAB_ID
+        and str(admission.get("strategy_lineage") or "") == expected_lineage
+        and str(admission.get("signal_stats_scope") or "") == "direct"
+        and eligibility.get("paper_signal_stats_scope") == "direct"
+        and candidate_admission_key
+        and candidate_admission_key == admission_key_for(candidate)
+        and candidate_admission_key == str(admission.get("admission_key") or "").strip()
+        and candidate_admission_key == str(item.get("admission_key") or "").strip()
+        and candidate_episode_id
+        and (
+            not admission_episode_alias
+            or candidate_episode_id == admission_episode_alias
+        )
+        and candidate_episode_id == str(admission.get("episode_id") or "").strip()
+        and candidate_episode_id == str(item.get("admission_episode_id") or "").strip()
+        and str(item.get("strategy_lineage_root_id") or "")
+        == RECOVERY_CANARY_STRATEGY_LAB_ID
+    )
+
+
+def recovery_canary_direct_label_eligible(
+    conn: sqlite3.Connection,
+    row: dict | sqlite3.Row,
+    *,
+    expected_version: int = 1,
+) -> bool:
+    """Apply the canary's exact direct-label contract, including queue lineage."""
+
+    item = dict(row)
+    if (
+        str(item.get("strategy_lab_id") or "") != RECOVERY_CANARY_STRATEGY_LAB_ID
+        or int(item.get("strategy_lab_version") or 0) != int(expected_version)
+        or str(item.get("measurement_status") or "").lower() != "valid"
+        or item.get("pnl_bps") is None
+    ):
+        return False
+    try:
+        pnl = float(item["pnl_bps"])
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(pnl):
+        return False
+    candidate = _json_loads(item.get("candidate_json"), {})
+    eligibility = reliable_paper_label_eligibility_for_trade_row(item)
+    if not eligibility.get("paper_label_eligible"):
+        return False
+    if not _recovery_canary_direct_admission_lineage_eligible(
+        item,
+        candidate,
+        int(expected_version),
+        eligibility,
+    ):
+        return False
+    trade_key = str(item.get("admission_key") or "").strip()
+    trade_episode = str(item.get("admission_episode_id") or "").strip()
+    outcome_key = str(item.get("outcome_admission_key") or trade_key).strip()
+    outcome_episode = str(
+        item.get("outcome_admission_episode_id") or trade_episode
+    ).strip()
+    if (
+        not trade_key
+        or not trade_episode
+        or outcome_key != trade_key
+        or outcome_episode != trade_episode
+    ):
+        return False
+    return (
+        conn.execute(
+            """
+            select 1 from paper_admission_queue
+            where admission_key=? and episode_id=? and paper_trade_id=? limit 1
+            """,
+            (trade_key, trade_episode, int(item.get("id") or 0)),
+        ).fetchone()
+        is not None
+    )
 
 
 def _experiment_outcomes(
@@ -3363,17 +4046,29 @@ def _experiment_outcomes(
     experiment: dict | None = None,
     settings: dict | None = None,
 ) -> dict:
+    expected_version = int(experiment.get("version") or 1) if experiment is not None else None
+    version_clause = " and p.strategy_lab_version = ?" if expected_version is not None else ""
+    params: list[Any] = [int(horizon), strategy_lab_id]
+    if expected_version is not None:
+        params.append(expected_version)
     rows = conn.execute(
-        """
+        f"""
         select p.id, p.opened_at, p.closed_at, p.venue, p.inst_id, p.direction, p.trade_type,
                p.candidate_json, p.review_json, p.entry_fee_bps, p.entry_slippage_bps,
-               o.pnl_bps, o.measurement_status, o.context_json as outcome_context_json
+               p.strategy_lab_id, p.strategy_lab_version, p.signal_key, p.context_json,
+               p.close_measurement_status, p.strategy_lineage_root_id,
+               p.admission_key, p.admission_episode_id,
+               o.id as outcome_id,o.measured_at,o.pnl_bps,o.measurement_status,
+               o.context_json as outcome_context_json,
+               o.admission_key as outcome_admission_key,
+               o.admission_episode_id as outcome_admission_episode_id
         from paper_trades p
         left join paper_trade_outcomes o
           on o.trade_id = p.id and o.horizon_minutes = ?
         where p.strategy_lab_id = ?
+          {version_clause}
         """,
-        (int(horizon), strategy_lab_id),
+        params,
     ).fetchall()
     valid = []
     status_counts: Counter = Counter()
@@ -3384,12 +4079,80 @@ def _experiment_outcomes(
     examples = []
     cost_audits = []
     surface_quarantined = []
+    valid_records: list[tuple[str, int, float]] = []
+    bounded_lineage_required = bool(
+        ((settings or {}).get("paper_expansion") or {}).get("enabled", False)
+    )
+    recovery_restrictions_enabled = _strategy_lab_controls(settings)[
+        "recovery_restrictions_enabled"
+    ] or strategy_lab_id == RECOVERY_CANARY_STRATEGY_LAB_ID
     for row in rows:
         item = dict(row)
         status = str(item.get("measurement_status") or "missing")
         candidate = _json_loads(item.get("candidate_json"), {})
-        if str(candidate.get("signal_stats_scope") or "direct") == "synthetic_research":
-            status_counts["synthetic_research_excluded"] += 1
+        if (
+            str(candidate.get("strategy_lab_id") or "") != strategy_lab_id
+            or (
+                expected_version is not None
+                and _as_int(candidate.get("strategy_lab_version"), -1) != expected_version
+            )
+        ):
+            status_counts["strategy_lab_attribution_mismatch"] += 1
+            continue
+        if bounded_lineage_required:
+            trade_key = str(item.get("admission_key") or "").strip()
+            trade_episode = str(item.get("admission_episode_id") or "").strip()
+            if (
+                not trade_key
+                or not trade_episode
+                or str(item.get("outcome_admission_key") or "").strip() != trade_key
+                or str(item.get("outcome_admission_episode_id") or "").strip()
+                != trade_episode
+                or conn.execute(
+                    """
+                    select 1 from paper_admission_queue
+                    where admission_key=? and episode_id=? and paper_trade_id=?
+                    limit 1
+                    """,
+                    (trade_key, trade_episode, int(item.get("id") or 0)),
+                ).fetchone()
+                is None
+            ):
+                status_counts["exact_admission_lineage_mismatch"] += 1
+                continue
+        eligibility = reliable_paper_label_eligibility_for_trade_row(item)
+        if not eligibility["paper_label_eligible"]:
+            reason = str(
+                eligibility.get("paper_label_exclusion_reason")
+                or "paper_label_ineligible"
+            )
+            status_counts[f"paper_label_ineligible:{reason}"] += 1
+            continue
+        if (
+            recovery_restrictions_enabled
+            and str(eligibility.get("paper_label_route_status") or "") != "standard"
+        ):
+            status_counts["paper_label_ineligible:recovery_route_not_standard"] += 1
+            continue
+        if (
+            strategy_lab_id == RECOVERY_CANARY_STRATEGY_LAB_ID
+            and expected_version is not None
+            and not (
+                recovery_canary_direct_label_eligible(
+                    conn,
+                    item,
+                    expected_version=expected_version,
+                )
+                if bounded_lineage_required
+                else _recovery_canary_direct_admission_lineage_eligible(
+                    item,
+                    candidate,
+                    expected_version,
+                    eligibility,
+                )
+            )
+        ):
+            status_counts["canary_direct_admission_lineage_mismatch"] += 1
             continue
         if experiment is not None:
             compatibility = _surface_compatibility(experiment, candidate)
@@ -3412,6 +4175,22 @@ def _experiment_outcomes(
             raw_pnl = _as_float(item["pnl_bps"])
             outcome_context = _json_loads(item.get("outcome_context_json"), {})
             prior_cost_audit = outcome_context.get("paper_realized_cost_audit") if isinstance(outcome_context, dict) else None
+            paired_outcome = (
+                outcome_context.get("paired_direct_v1_outcome")
+                if isinstance(outcome_context, dict)
+                else None
+            )
+            paired_accounting = (
+                paired_outcome.get("accounting")
+                if isinstance(paired_outcome, dict)
+                else None
+            )
+            paired_direct_net_label = bool(
+                isinstance(outcome_context, dict)
+                and outcome_context.get("paper_outcome_measurement_contract")
+                == PAIRED_DIRECT_CONTRACT_VERSION
+                and isinstance(paired_accounting, dict)
+            )
             has_entry_cost_model = bool(
                 isinstance(candidate.get("paper_context_cost_gate"), dict)
                 or candidate.get("estimated_round_trip_cost_bps") is not None
@@ -3441,13 +4220,27 @@ def _experiment_outcomes(
                 raw_pnl,
                 charged_cost_bps=charged_cost,
                 settings=settings,
-                already_backfilled=bool(prior_cost_audit and prior_cost_audit.get("cost_basis") == "after_modeled_context_cost")
+                already_backfilled=paired_direct_net_label
+                or bool(prior_cost_audit and prior_cost_audit.get("cost_basis") == "after_modeled_context_cost")
                 or not has_entry_cost_model,
             )
+            if paired_direct_net_label:
+                cost_audit = {
+                    **cost_audit,
+                    "paired_direct_contract": PAIRED_DIRECT_CONTRACT_VERSION,
+                    "paired_direct_reconciliation": dict(paired_accounting),
+                }
             pnl = _as_float(cost_audit.get("adjusted_pnl_bps"), raw_pnl)
             if cost_audit.get("backfill_applied"):
                 cost_audits.append({"trade_id": item["id"], **cost_audit})
             valid.append(pnl)
+            valid_records.append(
+                (
+                    str(item.get("measured_at") or item.get("closed_at") or ""),
+                    int(item.get("outcome_id") or item["id"]),
+                    pnl,
+                )
+            )
             by_region[str(candidate.get("region") or "unknown")].append(pnl)
             by_venue[str(item.get("venue") or "unknown")].append(pnl)
             by_direction[str(item.get("direction") or candidate.get("direction") or "unknown")].append(pnl)
@@ -3463,13 +4256,44 @@ def _experiment_outcomes(
                         "realized_cost_backfill_bps": cost_audit.get("realized_cost_backfill_bps"),
                     }
                 )
+    promotion_defaults = (settings or {}).get("strategy_lab", {})
+    promotion_custom = (experiment or {}).get("promotion_rules") or {}
+    training_min = int(
+        promotion_custom.get(
+            "promote_min_training_labels",
+            promotion_defaults.get("promote_min_training_labels", 0),
+        )
+        or 0
+    )
+    holdout_min = int(
+        promotion_custom.get(
+            "promote_min_holdout_labels",
+            promotion_defaults.get("promote_min_holdout_labels", 0),
+        )
+        or 0
+    )
+    ordered_records = sorted(valid_records, key=lambda value: (value[0], value[1]))
+    if training_min > 0 or holdout_min > 0:
+        training_values = [value[2] for value in ordered_records[:training_min]]
+        holdout_values = [value[2] for value in ordered_records[training_min:]]
+    else:
+        training_values = list(valid)
+        holdout_values = []
     return {
         "trade_count": len(rows),
         "valid_count": len(valid),
         "label_status_counts": dict(status_counts),
         "route_status_counts": dict(route_counts),
         "valid_label_rate": round(len(valid) / len(rows), 3) if rows else 0.0,
+        "valid_label_rate_raw": len(valid) / len(rows) if rows else 0.0,
         "metrics": _pnl_stats(valid),
+        "promotion_split": {
+            "chronological": True,
+            "training_min_labels": training_min,
+            "holdout_min_labels": holdout_min,
+            "training": _pnl_stats(training_values),
+            "holdout": _pnl_stats(holdout_values),
+        },
         "by_region": {key: _pnl_stats(value) for key, value in by_region.items()},
         "by_venue": {key: _pnl_stats(value) for key, value in by_venue.items()},
         "by_direction": {key: _pnl_stats(value) for key, value in by_direction.items()},
@@ -3500,6 +4324,21 @@ def _rules(settings: dict, experiment: dict) -> dict:
         "expand_min_avg_pnl_bps": float(custom.get("expand_min_avg_pnl_bps", defaults.get("expand_min_avg_pnl_bps", 6.0))),
         "expand_min_win_rate": float(custom.get("expand_min_win_rate", defaults.get("expand_min_win_rate", 0.52))),
         "promote_min_labels": int(custom.get("promote_min_labels", defaults.get("promote_min_labels", 30))),
+        "promote_min_training_labels": int(
+            custom.get(
+                "promote_min_training_labels",
+                defaults.get(
+                    "promote_min_training_labels",
+                    custom.get("promote_min_labels", defaults.get("promote_min_labels", 30)),
+                ),
+            )
+        ),
+        "promote_min_holdout_labels": int(
+            custom.get(
+                "promote_min_holdout_labels",
+                defaults.get("promote_min_holdout_labels", 0),
+            )
+        ),
         "promote_min_active_hours": float(custom.get("promote_min_active_hours", defaults.get("promote_min_active_hours", 48.0))),
         "promote_min_avg_pnl_bps": float(custom.get("promote_min_avg_pnl_bps", defaults.get("promote_min_avg_pnl_bps", 10.0))),
         "promote_min_win_rate": float(custom.get("promote_min_win_rate", defaults.get("promote_min_win_rate", 0.53))),
@@ -3575,13 +4414,15 @@ def _direction_promotion_gate(experiment: dict, outcomes: dict, rules: dict) -> 
         if thresholds["min_labels"] is not None and int(metrics.get("count") or 0) < int(thresholds["min_labels"]):
             failures.append("min_labels")
         if thresholds["min_avg_pnl_bps"] is not None and (
-            metrics.get("avg_pnl_bps") is None
-            or float(metrics["avg_pnl_bps"]) < float(thresholds["min_avg_pnl_bps"])
+            metrics.get("raw_avg_pnl_bps", metrics.get("avg_pnl_bps")) is None
+            or float(metrics.get("raw_avg_pnl_bps", metrics.get("avg_pnl_bps")))
+            < float(thresholds["min_avg_pnl_bps"])
         ):
             failures.append("min_avg_pnl_bps")
         if thresholds["min_win_rate"] is not None and (
-            metrics.get("win_rate") is None
-            or float(metrics["win_rate"]) < float(thresholds["min_win_rate"])
+            metrics.get("raw_win_rate", metrics.get("win_rate")) is None
+            or float(metrics.get("raw_win_rate", metrics.get("win_rate")))
+            < float(thresholds["min_win_rate"])
         ):
             failures.append("min_win_rate")
         checks[direction] = {
@@ -3616,18 +4457,38 @@ def _evaluate_strategy_horizons(
         )
         metrics = outcomes["metrics"]
         count = int(metrics.get("count") or 0)
-        avg = metrics.get("avg_pnl_bps")
-        win_rate = metrics.get("win_rate")
-        worst_decile = metrics.get("worst_decile_pnl_bps")
+        promotion_split = outcomes.get("promotion_split") or {}
+        training_metrics = promotion_split.get("training") or _pnl_stats([])
+        holdout_metrics = promotion_split.get("holdout") or _pnl_stats([])
+        holdout_required = int(rules.get("promote_min_holdout_labels") or 0) > 0
+        promotion_metrics = holdout_metrics if holdout_required else metrics
+        avg = promotion_metrics.get(
+            "raw_avg_pnl_bps", promotion_metrics.get("avg_pnl_bps")
+        )
+        win_rate = promotion_metrics.get(
+            "raw_win_rate", promotion_metrics.get("win_rate")
+        )
+        worst_decile = promotion_metrics.get(
+            "raw_worst_decile_pnl_bps",
+            promotion_metrics.get("worst_decile_pnl_bps"),
+        )
         blocked_routes = int(outcomes.get("route_status_counts", {}).get("blocked", 0))
         direction_promotion = _direction_promotion_gate(experiment, outcomes, rules)
         promote_ready = (
             count >= rules["promote_min_labels"]
+            and int(training_metrics.get("count") or 0)
+            >= int(rules["promote_min_training_labels"])
+            and int(holdout_metrics.get("count") or 0)
+            >= int(rules["promote_min_holdout_labels"])
             and active_hours >= rules["promote_min_active_hours"]
             and (avg is not None and avg >= rules["promote_min_avg_pnl_bps"])
             and (win_rate is not None and win_rate >= rules["promote_min_win_rate"])
-            and (worst_decile is not None and worst_decile > rules["promote_worst_decile_floor_bps"])
-            and outcomes["valid_label_rate"] >= rules["promote_min_valid_label_rate"]
+            and (
+                worst_decile is not None
+                and worst_decile >= rules["promote_worst_decile_floor_bps"]
+            )
+            and outcomes.get("valid_label_rate_raw", outcomes["valid_label_rate"])
+            >= rules["promote_min_valid_label_rate"]
             and blocked_routes == 0
             and direction_promotion["passed"]
         )
@@ -3644,22 +4505,63 @@ def _evaluate_strategy_horizons(
             and (win_rate is not None and win_rate >= rules["expand_min_win_rate"])
             and (worst_decile is None or worst_decile > rules["promote_worst_decile_floor_bps"])
         )
+        # Horizon choice is a model-selection decision.  It may use only the
+        # chronological training partition; otherwise the later holdout gate
+        # is no longer untouched.  Holdout metrics remain available solely on
+        # the selected horizon's promotion decision.
+        selection_metrics = training_metrics if holdout_required else metrics
+        selection_count = int(selection_metrics.get("count") or 0)
+        selection_avg = selection_metrics.get(
+            "raw_avg_pnl_bps", selection_metrics.get("avg_pnl_bps")
+        )
+        selection_win_rate = selection_metrics.get(
+            "raw_win_rate", selection_metrics.get("win_rate")
+        )
+        selection_worst_decile = selection_metrics.get(
+            "raw_worst_decile_pnl_bps",
+            selection_metrics.get("worst_decile_pnl_bps"),
+        )
+        training_selection_passed = (
+            selection_count >= int(rules["promote_min_training_labels"])
+            and active_hours >= rules["promote_min_active_hours"]
+            and (
+                selection_avg is not None
+                and selection_avg >= rules["promote_min_avg_pnl_bps"]
+            )
+            and (
+                selection_win_rate is not None
+                and selection_win_rate >= rules["promote_min_win_rate"]
+            )
+            and (
+                selection_worst_decile is not None
+                and selection_worst_decile
+                >= rules["promote_worst_decile_floor_bps"]
+            )
+        )
         robust_values = [
             value
-            for value in (metrics.get("avg_pnl_bps"), metrics.get("trimmed_mean_bps"))
+            for value in (
+                selection_metrics.get("avg_pnl_bps"),
+                selection_metrics.get("trimmed_mean_bps"),
+            )
             if value is not None
         ]
         horizon_evaluations[int(horizon)] = {
             "horizon_minutes": int(horizon),
-            "ready": count >= rules["expand_min_labels"],
-            "passed": promote_ready,
+            "ready": selection_count >= rules["expand_min_labels"],
+            "passed": training_selection_passed,
             "regressed": retire_ready,
             "promote_ready": promote_ready,
             "expand_ready": expand_ready,
             "retire_ready": retire_ready,
             "selection_score_bps": min(float(value) for value in robust_values) if robust_values else None,
-            "evidence_count": count,
+            "evidence_count": selection_count,
             "outcomes": outcomes,
+            "promotion_gate_metrics": promotion_metrics,
+            "horizon_selection_metrics": selection_metrics,
+            "horizon_selection_partition": (
+                "chronological_training" if holdout_required else "all_valid"
+            ),
             "direction_promotion": direction_promotion,
         }
 
@@ -3826,6 +4728,9 @@ def _maybe_split_children(
     settings: dict | None = None,
 ) -> list[str]:
     created = []
+    controls = _strategy_lab_controls(settings)
+    if not controls["region_splits_enabled"]:
+        return created
     if paper_source_veto_record(experiment, settings) is not None:
         return created
     good_regions = [
@@ -3896,10 +4801,24 @@ def _maybe_split_children(
 
 
 def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
-    cfg = settings.get("strategy_lab", {})
-    if not cfg.get("enabled", True):
-        return {"enabled": False}
-    experiments = _active_experiments(conn, include_retired_for_evaluation=True)
+    controls = _strategy_lab_controls(settings)
+    if not controls["master_enabled"]:
+        return {"enabled": False, "reason": "strategy_lab_disabled", "controls": controls}
+    if not controls["evaluation_enabled"]:
+        return {"enabled": False, "reason": "strategy_lab_evaluation_disabled", "controls": controls}
+    allowed_experiment_ids, _lineage_roots = _allowlisted_experiment_ids(
+        conn,
+        controls["experiment_root_allowlist"],
+        controls["max_active_strategy_roots"],
+        include_descendants=not controls["experiment_root_only"],
+        empty_allowlist_means_none=controls["recovery_restrictions_enabled"],
+    )
+    experiments = _active_experiments(
+        conn,
+        include_retired_for_evaluation=True,
+        allowed_strategy_lab_ids=allowed_experiment_ids,
+        lifecycle_mutations_enabled=controls["lifecycle_mutations_enabled"],
+    )
     evaluations = []
     for experiment in experiments:
         source_veto = paper_source_veto_record(experiment, settings)
@@ -3943,18 +4862,43 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
         retire_ready = bool(horizon_selection["all_horizons_retire_ready"])
         expand_ready = bool(selected_evaluation["expand_ready"])
 
-        if promote_ready:
+        if not controls["lifecycle_mutations_enabled"]:
+            status = str(experiment.get("status") or status)
+            decision = (
+                "promotion_gate_passed_read_only"
+                if promote_ready
+                else "retirement_gate_passed_read_only"
+                if retire_ready
+                else "expansion_gate_passed_read_only"
+                if expand_ready
+                else "evaluation_read_only"
+            )
+        elif promote_ready:
             if was_retired:
                 status = "active_testing"
             passes = passes + 1 if previous_horizon == selected_horizon else 1
             decision = "promotion_gate_passed"
             if passes >= rules["consecutive_passes_to_promote"]:
-                selected_rules = {**rules, "horizon_minutes": selected_horizon}
-                promotion_id = _queue_promotion(
-                    conn, experiment, outcomes, selected_rules, settings
-                )
-                status = "promotion_queued"
-                decision = "promotion_queued" if promotion_id else "promotion_already_queued"
+                if (
+                    controls["promotion_enabled"]
+                    and controls["recommendation_emission_enabled"]
+                ):
+                    selected_rules = {**rules, "horizon_minutes": selected_horizon}
+                    promotion_id = _queue_promotion(
+                        conn, experiment, outcomes, selected_rules, settings
+                    )
+                    if promotion_id:
+                        status = "promotion_queued"
+                        decision = "promotion_queued"
+                    else:
+                        status = "promotion_candidate"
+                        decision = "promotion_candidate"
+                else:
+                    # Passing the evidence gates is an independently useful,
+                    # persisted lifecycle state.  Queue/recommendation/code
+                    # promotion switches govern the next mutation only.
+                    status = "promotion_candidate"
+                    decision = "promotion_candidate"
         elif retire_ready:
             status = "retired_bad_evidence"
             passes = 0
@@ -3995,25 +4939,26 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
             "horizon_selection_reason": horizon_selection.get("selection_reason"),
             "horizon_evaluations": horizon_selection["horizon_evaluations"],
         }
-        conn.execute(
-            """
-            update strategy_lab_experiments
-            set status = ?, updated_at = ?, last_evaluated_at = ?,
-                evaluation_json = ?, consecutive_passes = ?,
-                promoted_proposal_id = coalesce(?, promoted_proposal_id)
-            where strategy_lab_id = ?
-            """,
-            (
-                status,
-                _utc(),
-                _utc(),
-                json.dumps(evaluation, sort_keys=True),
-                passes,
-                promotion_id,
-                experiment["strategy_lab_id"],
-            ),
-        )
-        conn.commit()
+        if controls["lifecycle_mutations_enabled"]:
+            conn.execute(
+                """
+                update strategy_lab_experiments
+                set status = ?, updated_at = ?, last_evaluated_at = ?,
+                    evaluation_json = ?, consecutive_passes = ?,
+                    promoted_proposal_id = coalesce(?, promoted_proposal_id)
+                where strategy_lab_id = ?
+                """,
+                (
+                    status,
+                    _utc(),
+                    _utc(),
+                    json.dumps(evaluation, sort_keys=True),
+                    passes,
+                    promotion_id,
+                    experiment["strategy_lab_id"],
+                ),
+            )
+            conn.commit()
         evaluations.append(
             {
                 "strategy_lab_id": experiment["strategy_lab_id"],
@@ -4028,11 +4973,22 @@ def evaluate_strategy_lab(conn: sqlite3.Connection, settings: dict) -> dict:
                 "promotion_recommendation_id": promotion_id,
             }
         )
-    return {"enabled": True, "evaluated": evaluations}
+    return {
+        "enabled": True,
+        "controls": controls,
+        "experiment_root_allowlist": controls["experiment_root_allowlist"],
+        "evaluated": evaluations,
+    }
 
 
-def strategy_lab_summary(conn: sqlite3.Connection, limit: int = 20) -> dict:
-    _backfill_experiment_types(conn)
+def strategy_lab_summary(
+    conn: sqlite3.Connection,
+    limit: int = 20,
+    *,
+    allow_mutations: bool = True,
+) -> dict:
+    if allow_mutations:
+        _backfill_experiment_types(conn)
     rows = conn.execute(
         """
         select strategy_lab_id, version, parent_strategy_lab_id, status, hypothesis,
@@ -4187,12 +5143,24 @@ def _backfill_experiment_types(conn: sqlite3.Connection) -> int:
 
 def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None = None, evaluation: dict | None = None) -> dict:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    backfilled_experiment_type_count = _backfill_experiment_types(conn)
-    summary = strategy_lab_summary(conn)
+    controls = dict(
+        (generation or {}).get("controls")
+        or (evaluation or {}).get("controls")
+        or {}
+    )
+    allow_mutations = bool(controls.get("lifecycle_mutations_enabled", True))
+    backfilled_experiment_type_count = (
+        _backfill_experiment_types(conn) if allow_mutations else 0
+    )
+    summary = strategy_lab_summary(conn, allow_mutations=False)
+    if controls:
+        summary["enabled"] = bool(controls.get("master_enabled"))
+        summary["controls"] = controls
     if generation is not None:
         summary["generated_candidates_last_cycle"] = int(generation.get("generated_candidates") or 0)
     report = {
         "generated_at": _utc(),
+        "controls": controls,
         "summary": summary,
         "generation": generation or {},
         "evaluation": evaluation or {},
@@ -4205,6 +5173,8 @@ def write_strategy_lab_reports(conn: sqlite3.Connection, generation: dict | None
         "Paper-only R&D strategies invented by the LLM swarm and tested through the normal radar loop.",
         "",
         f"- Generated: `{report['generated_at']}`",
+        f"- Master enabled: `{summary.get('enabled', False)}`",
+        f"- Runtime controls: `{controls}`",
         f"- Total experiments: `{summary.get('total_experiments', 0)}`",
         f"- Status counts: `{summary.get('status_counts', {})}`",
         f"- Experiment types: `{summary.get('by_experiment_type', {})}`",

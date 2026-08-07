@@ -97,10 +97,91 @@ def insert_outcome(
             now.isoformat(),
         ),
     )
+    conn.execute(
+        "update paper_trades set close_measurement_status='valid' where id=?",
+        (trade_id,),
+    )
     conn.commit()
 
 
 class PaperHoldOptimizerTests(unittest.TestCase):
+    def test_bounded_mode_ignores_legacy_unversioned_sticky_policy(self) -> None:
+        conn = memory_conn()
+        cfg = settings(min_samples=3, recency_weighting_enabled=False)
+        trade_id = open_trade(
+            conn,
+            "LEGACY-POLICY",
+            dt.datetime.now(dt.timezone.utc).isoformat(),
+            cfg,
+        )
+        trade = conn.execute("select * from paper_trades where id=?", (trade_id,)).fetchone()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        conn.execute(
+            """
+            insert into paper_hold_policies (
+                created_at,updated_at,group_name,group_value,selected_hold_minutes,
+                previous_hold_minutes,source,evidence_json
+            ) values (?,?,?,?,?,?,?,?)
+            """,
+            (
+                now,
+                now,
+                "signal_key",
+                trade["signal_key"],
+                240,
+                60,
+                "legacy_optimizer",
+                json.dumps({"metrics": [], "source": "legacy_unreliable"}),
+            ),
+        )
+        conn.commit()
+        bounded = copy.deepcopy(cfg)
+        bounded["market_admission"]["enabled"] = True
+        bounded["market_admission"]["paper_queue_enabled"] = True
+
+        decision = storage.select_paper_hold_minutes(conn, trade, 60, bounded)
+
+        self.assertEqual(60, decision["hold_minutes"])
+        self.assertEqual("default_insufficient_evidence", decision["source"])
+
+    def test_synthetic_fallback_evidence_cannot_steer_unseen_direct_signal(self) -> None:
+        conn = memory_conn()
+        now = dt.datetime.now(dt.timezone.utc)
+        cfg = settings(min_samples=3, recency_weighting_enabled=False)
+        for index in range(3):
+            synthetic = {
+                **candidate(f"SYNTHETIC-{index}"),
+                "signal_stats_scope": "synthetic_research",
+                "synthetic_research_paper": True,
+            }
+            trade_id = storage.open_paper_trade(
+                conn,
+                synthetic,
+                {"learned_score": 80.0, "route_status": "standard"},
+            )
+            insert_outcome(conn, trade_id, 15, 50.0, now)
+            insert_outcome(conn, trade_id, 60, -50.0, now)
+            conn.execute(
+                "update paper_trades set status='closed',close_measurement_status='valid' where id=?",
+                (trade_id,),
+            )
+        conn.commit()
+
+        current_id = open_trade(
+            conn,
+            "UNSEEN-DIRECT",
+            (now - dt.timedelta(minutes=1)).isoformat(),
+            cfg,
+        )
+        row = conn.execute(
+            "select selected_hold_minutes,hold_decision_json from paper_trades where id=?",
+            (current_id,),
+        ).fetchone()
+        decision = json.loads(row["hold_decision_json"])
+        self.assertEqual(60, row["selected_hold_minutes"])
+        self.assertEqual("default_insufficient_evidence", decision["source"])
+        self.assertEqual([], decision["metrics"])
+
     def test_selects_shorter_horizon_when_signal_evidence_is_better(self) -> None:
         conn = memory_conn()
         now = dt.datetime.now(dt.timezone.utc)

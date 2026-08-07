@@ -1,0 +1,274 @@
+{
+  "mode": "paper",
+  "allow_live_trading": false,
+  "operations": {
+    "profile": "bounded_crypto_paper_v1",
+    "require_explicit_config": true,
+    "fail_closed_recovery_profile": true,
+    "model_credentials_enabled": false,
+    "crypto_only": true
+  },
+  "account_capabilities": {
+    "crypto_derivatives": true,
+    "crypto_spot": true,
+    "spot_borrow": false,
+    "equities": false,
+    "options": false,
+    "futures": false,
+    "fx": false,
+    "commodities": false,
+    "international_markets": false,
+    "prediction_markets": false
+  },
+  "scanner": {
+    "scan_universe": 100,
+    "review_top": 50,
+    "max_new_paper_trades": 0,
+    "max_new_paper_observations": 20,
+    "hold_minutes": 60,
+    "enable_global_proxy_scan": false,
+    "enable_global_market_discovery_scan": false,
+    "enable_prediction_market_scan": false,
+    "enable_crypto_venue_health_scan": true,
+    "enable_frontier_crypto_adapter_scan": true,
+    "enable_public_market_adapter_scan": false,
+    "frontier_crypto_review_top": 40
+  },
+  "frontier_crypto_adapter": {
+    "enabled": true,
+    "report_max_representative_rows": 100,
+    "report_max_observations": 50,
+    "report_max_candidates": 50
+  },
+  "route_resolver": {
+    "report_max_representative_rows": 100
+  },
+  "risk": {
+    "max_open_paper_trades": 100,
+    "paper_notional_usd": 100.0,
+    "max_live_notional_usd": 0.0
+  },
+  "paper_expansion": {
+    "enabled": true,
+    "campaign_id": "bounded_crypto_paper_v1",
+    "resume_healthy_cycles": 3,
+    "direct_queue_allocation_multiplier": 1.0,
+    "reviewer_allocation_multiplier": 1.0,
+    "runtime_allocation_multiplier": 1.0,
+    "runtime_phase": "burn_in",
+    "measurement_probe_enabled": false,
+    "measurement_probe_allocation_multiplier": 1.0,
+    "measurement_probe_min_net_edge_bps": 2.0,
+    "discovery_retire_min_labels": 20,
+    "measurement_probe_allowed_guards": [
+      "paper_strategy_family_quarantine",
+      "paper_lineage_source_health",
+      "strategy_reliability"
+    ],
+    "phases": {
+      "burn_in": {
+        "scan_universe": 100,
+        "review_top": 50,
+        "paper_queue_max_select_per_cycle": 0,
+        "max_new_paper_trades": 0,
+        "max_new_paper_observations": 20,
+        "max_open_paper_trades": 100,
+        "strategy_lab_enabled": false,
+        "promoted_signal_plugins_enabled": false,
+        "min_healthy_cycles": 90,
+        "min_elapsed_hours": 24,
+        "max_runtime_p95_seconds": 480,
+        "max_memory_p95_mb": 750,
+        "max_memory_mb": 1024,
+        "max_db_growth_bytes_per_day": 262144000
+      },
+      "measurement": {
+        "scan_universe": 100,
+        "review_top": 50,
+        "paper_queue_max_select_per_cycle": 30,
+        "max_new_paper_trades": 10,
+        "max_new_paper_observations": 20,
+        "max_open_paper_trades": 100,
+        "strategy_lab_enabled": false,
+        "promoted_signal_plugins_enabled": false,
+        "min_elapsed_hours": 168,
+        "min_exact_attributed_admission_keys": 100,
+        "min_reliable_direct_closes": 250,
+        "min_timely_close_rate": 0.9,
+        "min_timely_horizon_rate": 0.9,
+        "required_lineage_rate": 1.0,
+        "max_synthetic_proxy_primary": 0
+      },
+      "canary": {
+        "scan_universe": 100,
+        "review_top": 1,
+        "paper_queue_max_select_per_cycle": 1,
+        "max_new_paper_trades": 1,
+        "max_new_paper_observations": 0,
+        "max_open_paper_trades": 100,
+        "strategy_lab_enabled": true,
+        "promoted_signal_plugins_enabled": false,
+        "strategy_lab_max_candidates_per_loop": 1,
+        "strategy_lab_max_candidates_per_experiment": 1,
+        "strategy_lab_runtime_review_reserved_slots": 1,
+        "max_active_strategy_roots": 1,
+        "bootstrap_recovery_canary_enabled": true,
+        "experiment_root_allowlist": ["recovery_okx_short_perp_long_spot_v1"],
+        "snapshot_warmup_enabled": true,
+        "runtime_generation_enabled": true,
+        "evaluation_enabled": true,
+        "lifecycle_mutations_enabled": false,
+        "region_splits_enabled": false,
+        "recommendation_emission_enabled": false,
+        "promotion_enabled": false,
+        "adaptive_relaxation_enabled": false,
+        "min_elapsed_hours": 48,
+        "min_reliable_direct_labels": 30,
+        "required_active_canaries": 1
+      },
+      "research": {
+        "scan_universe": 100,
+        "review_top": 50,
+        "paper_queue_max_select_per_cycle": 30,
+        "max_new_paper_trades": 10,
+        "max_new_paper_observations": 20,
+        "max_open_paper_trades": 100,
+        "strategy_lab_enabled": true,
+        "promoted_signal_plugins_enabled": false,
+        "max_active_strategy_roots": 6,
+        "bootstrap_recovery_canary_enabled": false,
+        "snapshot_warmup_enabled": true,
+        "runtime_generation_enabled": true,
+        "evaluation_enabled": true,
+        "lifecycle_mutations_enabled": true,
+        "region_splits_enabled": false,
+        "recommendation_emission_enabled": false,
+        "promotion_enabled": false,
+        "adaptive_relaxation_enabled": false
+      }
+    },
+    "discovery_promotion": {
+      "min_training_labels": 100,
+      "min_holdout_labels": 50,
+      "min_elapsed_hours": 168,
+      "min_avg_net_pnl_bps": 10.0,
+      "min_win_rate": 0.53,
+      "min_worst_decile_bps": -45.0,
+      "min_timely_label_rate": 0.9,
+      "min_consecutive_passes": 2
+    },
+    "health": {
+      "runtime_warn_seconds": 480,
+      "runtime_halt_seconds": 720,
+      "peak_rss_warn_mb": 750,
+      "peak_rss_halt_mb": 1024,
+      "min_terminal_opportunity_rate": 1.0,
+      "min_frontier_observations": 6000,
+      "min_reachable_venues": 16,
+      "max_db_growth_bytes_per_day": 262144000,
+      "max_artifact_bytes": {
+        "frontier_crypto_venues_latest.json": 8388608,
+        "radar_state_latest.json": 8388608,
+        "route_resolver_report.json": 36700160,
+        "route_intelligence_report.json": 36700160,
+        "self_improvement_report.json": 20971520
+      }
+    }
+  },
+  "market_admission": {
+    "enabled": true,
+    "monitor_enabled": true,
+    "paper_queue_enabled": true,
+    "bridge_enabled": false,
+    "diagnostics_enabled": false,
+    "actions_enabled": false,
+    "report_state_limit": 100,
+    "paper_queue": {
+      "max_active": 200,
+      "max_enqueue_per_cycle": 30,
+      "max_select_per_cycle": 30,
+      "max_terminal_audit_per_cycle": 30,
+      "selection_lease_seconds": 900,
+      "retry_backoff_seconds": 300,
+      "max_freshness_age_seconds": 90.0,
+      "poor_cohort_min_labels": 20,
+      "poor_cohort_max_avg_pnl_bps": -8.0,
+      "poor_cohort_max_win_rate": 0.43
+    }
+  },
+  "contextual_failure_filters": {
+    "enabled": false,
+    "create_policies": false
+  },
+  "signal_safety": {"enabled": false},
+  "strategy_reliability": {"enabled": false, "bypass_all_overlays": true},
+  "learning": {
+    "enabled": true,
+    "task_emission_enabled": false,
+    "growth_experiment_emission_enabled": false,
+    "horizon_minutes": [15, 60, 240, 1440],
+    "max_outcome_delay_seconds": 300
+  },
+  "paper_due_outcome_collection": {
+    "enabled": true,
+    "candle_interval_seconds": 60,
+    "max_instruments_per_cycle": 100,
+    "max_workers": 4,
+    "request_timeout_seconds": 8,
+    "okx_max_requests_per_second": 8,
+    "allow_latest_ticker_fallback": false,
+    "paired_max_entry_timestamp_skew_seconds": 2.0,
+    "paired_max_exit_timestamp_skew_seconds": 1.0,
+    "paired_notional_tolerance_fraction": 0.01
+  },
+  "paper_hold_optimizer": {
+    "enabled": true,
+    "default_hold_minutes": 60,
+    "candidate_horizons_minutes": [15, 60, 240, 1440]
+  },
+  "okx_perp_funding_basis_decay_quarantine": {"enabled": false},
+  "paper_context_drag": {"enabled": false},
+  "paper_context_priors": {"enabled": false},
+  "paper_context_loss_quarantine": {"enabled": false},
+  "okx_signal_research": {"enabled": false},
+  "paper_exploration": {"enabled": false},
+  "strategy_lab": {
+    "enabled": false,
+    "promoted_signal_plugins_enabled": false,
+    "snapshot_max_inputs_per_loop": 200,
+    "snapshot_max_instruments_per_loop": 50,
+    "feature_history_max_points": 288,
+    "adaptive_relaxation": {
+      "enabled": false
+    }
+  },
+  "signal_redesign": {"enabled": false},
+  "hunter": {"enabled": false},
+  "self_improvement": {
+    "enabled": false,
+    "process_code_changes_in_radar_loop": false
+  },
+  "llm_bridge": {"enabled": false, "ingest_recommendations": false},
+  "llm_swarm": {"enabled": false, "auto_run": false, "run_in_radar_loop": false},
+  "dynamic_agents": {"enabled": false},
+  "research_worker": {"enabled": false, "run_every_evolution_cycle": false},
+  "autonomous_builder": {"enabled": false, "auto_run": false, "run_in_radar_loop": false},
+  "adapter_implementation_owner": {"enabled": false},
+  "market_activation_owner": {"enabled": false},
+  "strategy_implementation_owner": {"enabled": false, "contract_intake_enabled": false},
+  "codex_worker_pool": {"enabled": false},
+  "codex_repo_agent": {
+    "enabled": false,
+    "parallel_sessions_enabled": false,
+    "network_access": false,
+    "chatgpt_account_fallback_enabled": false,
+    "fallback_on_api_quota": false
+  },
+  "code_evolution": {
+    "enabled": false,
+    "git_release_enabled": false,
+    "auto_merge_paper_only": false
+  },
+  "evolution_worker": {"enabled": false},
+  "agent_memory": {"enabled": false}
+}

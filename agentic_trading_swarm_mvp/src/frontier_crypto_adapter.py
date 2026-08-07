@@ -13868,8 +13868,8 @@ def build_scan_batch(
     candidates = _annotate_secondary_cex_candidate_context(candidates, secondary_cex_snapshot)
     candidates = rank_frontier_paper_candidates(candidates, settings)
     secondary_cex_snapshot = _secondary_cex_spot_strength_snapshot(observations, candidates, settings)
-    if limit:
-        candidates = candidates[: int(limit)]
+    if limit is not None:
+        candidates = candidates[: max(0, int(limit))]
     preliminary_report = {}
     if write_preliminary_report:
         preliminary_report = write_outputs(observations, candidates, settings)
@@ -14490,6 +14490,72 @@ def summarize(
     }
 
 
+def _mapping_row_streams(value: object, *, path: str = "") -> list[dict]:
+    """Return mutable list-of-object report streams without descending into rows."""
+
+    streams: list[dict] = []
+    if not isinstance(value, dict):
+        return streams
+    for key, child in value.items():
+        child_path = f"{path}.{key}" if path else str(key)
+        if isinstance(child, list) and child and all(isinstance(item, dict) for item in child):
+            streams.append({"path": child_path, "rows": child})
+        elif isinstance(child, dict):
+            streams.extend(_mapping_row_streams(child, path=child_path))
+    return streams
+
+
+def _compact_mapping_row_streams(report: dict, row_limit: int) -> dict:
+    """Share one hard row budget fairly across every detail stream in an artifact."""
+
+    streams = _mapping_row_streams(report)
+    for stream in streams:
+        stream["available"] = len(stream["rows"])
+        stream["stored_rows"] = []
+        stream["index"] = 0
+    remaining = max(0, min(100, int(row_limit)))
+    while remaining > 0:
+        progressed = False
+        for stream in streams:
+            index = int(stream["index"])
+            rows = stream["rows"]
+            if index >= len(rows):
+                continue
+            stream["stored_rows"].append(rows[index])
+            stream["index"] = index + 1
+            remaining -= 1
+            progressed = True
+            if remaining <= 0:
+                break
+        if not progressed:
+            break
+    counts: dict[str, dict[str, int]] = {}
+    for stream in streams:
+        stored_rows = stream["stored_rows"]
+        stream["rows"][:] = stored_rows
+        available = int(stream["available"])
+        stored = len(stored_rows)
+        counts[str(stream["path"])] = {
+            "available": available,
+            "stored": stored,
+            "omitted": available - stored,
+        }
+    return {
+        "representative_row_limit": max(0, min(100, int(row_limit))),
+        "representative_row_count_available": sum(
+            int(stream["available"]) for stream in streams
+        ),
+        "representative_row_count_stored": sum(
+            len(stream["stored_rows"]) for stream in streams
+        ),
+        "representative_row_count_omitted": sum(
+            int(stream["available"]) - len(stream["stored_rows"])
+            for stream in streams
+        ),
+        "detail_row_counts_by_path": counts,
+    }
+
+
 def write_outputs(
     observations: list[dict],
     candidates: list[dict],
@@ -14498,8 +14564,12 @@ def write_outputs(
 ) -> dict:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     adapter_cfg = (settings or {}).get("frontier_crypto_adapter", {})
-    observation_limit = max(0, int(adapter_cfg.get("report_max_observations", 250)))
-    candidate_limit = max(0, int(adapter_cfg.get("report_max_candidates", 100)))
+    representative_row_limit = max(
+        0,
+        min(100, int(adapter_cfg.get("report_max_representative_rows", 100))),
+    )
+    observation_limit = max(0, int(adapter_cfg.get("report_max_observations", 50)))
+    candidate_limit = max(0, int(adapter_cfg.get("report_max_candidates", 50)))
     stored_observations = observations[:observation_limit]
     stored_candidates = candidates[:candidate_limit]
     report = {
@@ -14507,18 +14577,6 @@ def write_outputs(
         "mode": (settings or {}).get("mode", "paper"),
         "live_trading_allowed": bool((settings or {}).get("allow_live_trading", False)),
         "summary": summarize(observations, candidates, quality_summary=quality_summary),
-        "artifact_compaction": {
-            "enabled": True,
-            "observation_limit": observation_limit,
-            "observation_count": len(observations),
-            "observation_count_stored": len(stored_observations),
-            "observation_count_omitted": len(observations) - len(stored_observations),
-            "candidate_limit": candidate_limit,
-            "candidate_count": len(candidates),
-            "candidate_count_stored": len(stored_candidates),
-            "candidate_count_omitted": len(candidates) - len(stored_candidates),
-            "policy": "aggregate_summary_plus_bounded_detail_sample",
-        },
         "observations": stored_observations,
         "candidates": stored_candidates,
         "hard_limits": [
@@ -14526,6 +14584,32 @@ def write_outputs(
             "No credentials, account APIs, order APIs, or live trading.",
             "Blocked venues are captured as evidence and do not create executable candidates.",
         ],
+    }
+    report = copy.deepcopy(report)
+    compaction = _compact_mapping_row_streams(report, representative_row_limit)
+    path_counts = compaction["detail_row_counts_by_path"]
+    for path, total in (("observations", len(observations)), ("candidates", len(candidates))):
+        stored = len(report[path])
+        prior_available = int((path_counts.get(path) or {}).get("available", 0))
+        compaction["representative_row_count_available"] += total - prior_available
+        compaction["representative_row_count_omitted"] += total - prior_available
+        path_counts[path] = {
+            "available": total,
+            "stored": stored,
+            "omitted": total - stored,
+        }
+    report["artifact_compaction"] = {
+        "enabled": True,
+        "policy": "complete_aggregates_plus_shared_bounded_representative_rows",
+        "observation_limit": observation_limit,
+        "observation_count": len(observations),
+        "observation_count_stored": len(report["observations"]),
+        "observation_count_omitted": len(observations) - len(report["observations"]),
+        "candidate_limit": candidate_limit,
+        "candidate_count": len(candidates),
+        "candidate_count_stored": len(report["candidates"]),
+        "candidate_count_omitted": len(candidates) - len(report["candidates"]),
+        **compaction,
     }
     REPORT_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
     REPORT_MD.write_text(_markdown(report), encoding="utf-8")

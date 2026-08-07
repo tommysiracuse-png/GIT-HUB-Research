@@ -421,6 +421,16 @@ class StrategyLabSurfacePolicyTests(unittest.TestCase):
                 trade_id = open_paper_trade(conn, row, review, settings=self.settings())
                 conn.execute(
                     """
+                    update paper_trades
+                    set status = 'closed', closed_at = ?, close_observed_at = ?,
+                        target_close_at = ?, close_delay_seconds = 0,
+                        close_measurement_status = 'valid'
+                    where id = ?
+                    """,
+                    (now, now, now, trade_id),
+                )
+                conn.execute(
+                    """
                     insert into paper_trade_outcomes (
                         trade_id, horizon_minutes, measured_at, price, pnl_bps,
                         context_json, target_at, observed_at, delay_seconds,

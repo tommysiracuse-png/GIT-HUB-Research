@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import pathlib
 import sys
 import tempfile
@@ -35,6 +36,14 @@ def result(payload: object) -> dict:
         "latency_ms": 12.3,
         "payload": payload,
     }
+
+
+def mapping_detail_row_count(value: object) -> int:
+    if isinstance(value, dict):
+        return sum(mapping_detail_row_count(item) for item in value.values())
+    if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+        return len(value)
+    return 0
 
 
 class FrontierCryptoAdapterTests(unittest.TestCase):
@@ -154,6 +163,26 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             write_outputs.assert_called_once()
             self.assertEqual([observation], immediate.metadata["report_observation_sample"])
             self.assertEqual([candidate], immediate.metadata["report_candidate_sample"])
+
+    def test_zero_candidate_limit_keeps_health_observations_only(self) -> None:
+        cfg = settings()
+        observation = self._obs("A", "ABC-USDT", "ABC", "USDT", 100, 100000)
+        candidate = frontier._candidate_from_observation(observation, cfg, 95, 3)
+        with (
+            mock.patch.object(frontier, "scan_venues", return_value=[observation]),
+            mock.patch.object(frontier, "_select_observations", return_value=[observation]),
+            mock.patch.object(frontier, "_reference_prices", return_value={"ABC": 95.0}),
+            mock.patch.object(frontier, "_candidate_from_observation", return_value=candidate),
+        ):
+            batch = frontier.build_scan_batch(
+                cfg,
+                conn=object(),
+                limit=0,
+                write_preliminary_report=False,
+            )
+
+        self.assertEqual([], batch.candidates)
+        self.assertGreater(len(batch.observations), 0)
 
     def test_scan_batch_adds_active_program_universe_for_bounded_intraday_coverage(self) -> None:
         cfg = settings()
@@ -1005,6 +1034,74 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
         self.assertIn("Data-gap quota applied", report_md)
         self.assertIn("Shadow depth-probe observations", report_md)
         self.assertIn("Regional shadow depth probe", report_md)
+
+    def test_report_uses_complete_aggregates_and_one_hundred_total_detail_rows(self) -> None:
+        cfg = settings()
+        cfg["frontier_crypto_adapter"]["report_max_representative_rows"] = 100
+        cfg["frontier_crypto_adapter"]["report_max_observations"] = 600
+        cfg["frontier_crypto_adapter"]["report_max_candidates"] = 600
+        observations = [
+            {
+                "venue": f"VENUE_{index % 20}",
+                "instrument_id": f"VENUE_{index % 20}:ASSET_{index}-USDT",
+                "symbol": f"ASSET_{index}-USDT",
+                "comparison_key": f"ASSET_{index}",
+                "base": f"ASSET_{index}",
+                "quote": "USDT",
+                "region": "global",
+                "market_type": "spot",
+                "data_status": "reachable",
+                "http_status": "200",
+                "latency_ms": 10.0,
+                "quality_status": "unknown",
+                "quote_volume_24h": float(10_000 + index),
+            }
+            for index in range(600)
+        ]
+        candidates = [
+            {
+                "venue": f"VENUE_{index % 20}",
+                "inst_id": f"VENUE_{index % 20}:ASSET_{index}-USDT",
+                "base": f"ASSET_{index}",
+                "quote": "USDT",
+                "region": "global",
+                "trade_type": "frontier_crypto_venue_map",
+                "direction": "long_frontier_spot",
+                "score": float(1000 - index),
+                "gross_edge_bps_estimate": 20.0,
+                "edge_bps_estimate": 0.0,
+                "execution_feasibility": {
+                    "status": "standard",
+                    "route_blockers": [],
+                },
+            }
+            for index in range(600)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old_json = frontier.REPORT_JSON
+            old_md = frontier.REPORT_MD
+            frontier.REPORT_JSON = pathlib.Path(tmp) / "frontier.json"
+            frontier.REPORT_MD = pathlib.Path(tmp) / "frontier.md"
+            try:
+                report = frontier.write_outputs(observations, candidates, cfg)
+                persisted = json.loads(frontier.REPORT_JSON.read_text(encoding="utf-8"))
+            finally:
+                frontier.REPORT_JSON = old_json
+                frontier.REPORT_MD = old_md
+
+        self.assertEqual(600, report["summary"]["observation_count"])
+        self.assertEqual(600, report["summary"]["candidate_count"])
+        self.assertLessEqual(mapping_detail_row_count(report), 100)
+        self.assertEqual(
+            mapping_detail_row_count(report),
+            report["artifact_compaction"]["representative_row_count_stored"],
+        )
+        self.assertGreater(
+            report["artifact_compaction"]["representative_row_count_omitted"],
+            1000,
+        )
+        self.assertEqual(report, persisted)
 
     def test_dislocation_quality_ranks_broad_stable_references_without_blocking_fragile_paper(self) -> None:
         cfg = settings()

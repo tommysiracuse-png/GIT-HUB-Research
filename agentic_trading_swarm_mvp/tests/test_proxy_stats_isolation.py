@@ -73,7 +73,7 @@ class ProxyStatsIsolationTests(unittest.TestCase):
 
         self.assertEqual(0, summary["open"])
 
-    def test_proxy_outcome_has_separate_signal_and_context_stats(self) -> None:
+    def test_legacy_one_leg_pair_outcomes_never_enter_learning_stats(self) -> None:
         proxy = enrich_candidates([proxy_candidate()], self.settings)[0]
         direct = proxy_candidate()
         direct["execution_feasibility"] = {"status": "conditional"}
@@ -107,8 +107,8 @@ class ProxyStatsIsolationTests(unittest.TestCase):
         ), patch.object(learning, "write_backlog"), patch.object(learning, "write_growth_plan"):
             stats = learning.update_signal_stats(self.conn, self.settings)
 
-        self.assertEqual(12.0, stats[signal_key(proxy)]["avg_pnl_bps"])
-        self.assertEqual(-8.0, stats[signal_key(direct)]["avg_pnl_bps"])
+        self.assertNotIn(signal_key(proxy), stats)
+        self.assertNotIn(signal_key(direct), stats)
         proxy_context = self.conn.execute(
             "select closed_count, avg_pnl_bps from contextual_stats where context_key = ?",
             ("paper_proxy|direction:long_perp_short_spot",),
@@ -117,8 +117,8 @@ class ProxyStatsIsolationTests(unittest.TestCase):
             "select closed_count, avg_pnl_bps from contextual_stats where context_key = ?",
             ("direction:long_perp_short_spot",),
         ).fetchone()
-        self.assertEqual((1, 12.0), tuple(proxy_context))
-        self.assertEqual((1, -8.0), tuple(direct_context))
+        self.assertIsNone(proxy_context)
+        self.assertIsNone(direct_context)
 
 
 if __name__ == "__main__":

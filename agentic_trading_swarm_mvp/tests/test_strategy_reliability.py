@@ -1261,6 +1261,91 @@ class StrategyReliabilityTests(unittest.TestCase):
             )
         )
 
+    def test_bounded_bypass_still_quarantines_mature_reliable_historical_loser(self) -> None:
+        losing = base_candidate(inst_id="GATE:LOSER_USDT")
+        unreliable = base_candidate(
+            venue="KRAKEN",
+            inst_id="KRAKEN:UNRELIABLE_USDT",
+        )
+        settings = {
+            "strategy_reliability": {
+                "enabled": False,
+                "bypass_all_overlays": True,
+            },
+            "market_admission": {
+                "paper_queue": {
+                    "poor_cohort_min_labels": 20,
+                    "poor_cohort_max_avg_pnl_bps": -8.0,
+                    "poor_cohort_max_win_rate": 0.43,
+                }
+            },
+        }
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        storage.init_db(conn)
+        try:
+            for source, close_status in ((losing, "valid"), (unreliable, "late")):
+                for index in range(20):
+                    trade_id = storage.open_paper_trade(
+                        conn,
+                        dict(source),
+                        {
+                            "decision": "approve_paper_trade",
+                            "learned_score": 70.0,
+                            "route_status": "standard",
+                            "hard_blocks": [],
+                        },
+                    )
+                    measured_at = f"2026-08-01T00:{index:02d}:00+00:00"
+                    conn.execute(
+                        """
+                        update paper_trades
+                        set status='closed',closed_at=?,exit=?,pnl_bps=-10.0,
+                            close_measurement_status=?
+                        where id=?
+                        """,
+                        (measured_at, 99.9, close_status, trade_id),
+                    )
+                    conn.execute(
+                        """
+                        insert into paper_trade_outcomes(
+                            trade_id,horizon_minutes,measured_at,price,pnl_bps,
+                            context_json,target_at,observed_at,delay_seconds,
+                            measurement_status,price_source
+                        ) values(?,60,?,99.9,-10.0,'{}',?,?,0,'valid','test')
+                        """,
+                        (trade_id, measured_at, measured_at, measured_at),
+                    )
+            conn.commit()
+
+            rows, report = strategy_reliability.apply_strategy_reliability(
+                [losing, unreliable],
+                settings,
+                conn=conn,
+            )
+        finally:
+            conn.close()
+
+        by_inst = {row["inst_id"]: row for row in rows}
+        losing_history = by_inst["GATE:LOSER_USDT"]["bounded_historical_cohort"]
+        self.assertEqual(20, losing_history["reliable_labels"])
+        self.assertEqual(-10.0, losing_history["avg_pnl_bps"])
+        self.assertTrue(losing_history["known_losing_cohort"])
+        self.assertEqual(
+            "known_losing_cohort",
+            by_inst["GATE:LOSER_USDT"]["candidate_reject_reason"],
+        )
+        self.assertTrue(by_inst["GATE:LOSER_USDT"]["paper_entry_blocked"])
+        unreliable_history = by_inst["KRAKEN:UNRELIABLE_USDT"][
+            "bounded_historical_cohort"
+        ]
+        self.assertEqual(0, unreliable_history["reliable_labels"])
+        self.assertFalse(unreliable_history["known_losing_cohort"])
+        self.assertNotIn(
+            "candidate_reject_reason", by_inst["KRAKEN:UNRELIABLE_USDT"]
+        )
+        self.assertEqual(1, report["summary"]["known_losing_cohort_count"])
+
     def test_task_cleanup_marks_bybit_and_kucoin_items_implemented(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

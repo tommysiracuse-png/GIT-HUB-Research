@@ -5,9 +5,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import pathlib
 import re
 import sqlite3
+import urllib.parse
 from collections.abc import Mapping
 
 from paper_context_cost import realized_paper_cost_audit
@@ -16,15 +18,47 @@ try:  # pragma: no cover - import fallback for package/script execution
     from paper_order_router import frontier_paper_fill_hard_fail_review
 except ImportError:  # pragma: no cover
     from src.paper_order_router import frontier_paper_fill_hard_fail_review
+try:  # pragma: no cover - import fallback for package/script execution
+    from paired_direct_contract import (
+        CONTRACT_VERSION as PAIRED_DIRECT_CONTRACT_VERSION,
+        calculate_paired_direct_outcome,
+        is_paired_direction,
+        validate_paired_direct_entry,
+        validate_paired_direct_outcome_provenance,
+    )
+except ImportError:  # pragma: no cover
+    from src.paired_direct_contract import (
+        CONTRACT_VERSION as PAIRED_DIRECT_CONTRACT_VERSION,
+        calculate_paired_direct_outcome,
+        is_paired_direction,
+        validate_paired_direct_entry,
+        validate_paired_direct_outcome_provenance,
+    )
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
 DB_PATH = RUNS_DIR / "radar.sqlite"
 SQLITE_BUSY_TIMEOUT_MS = 60_000
+PAPER_PRICE_OBSERVATION_SOURCE_KIND = "exchange_candle_1m_close"
+PAPER_PRICE_OBSERVATION_MAX_BATCH = 1_000
+PAPER_PRICE_OBSERVATION_MAX_ROWS = 50_000
+PAPER_FUNDING_COVERAGE_MAX_BATCHES = 10_000
+QUALIFIED_PAPER_CANDLE_SOURCES = frozenset(
+    {
+        ("OKX", "perpetual_swap", "okx_1m_candles", "/api/v5/market/history-candles"),
+        ("OKX_SPOT", "spot", "okx_1m_candles", "/api/v5/market/history-candles"),
+        ("GATE", "spot", "gate_1m_candles", "/api/v4/spot/candlesticks"),
+        ("MEXC", "spot", "binance_style_1m_klines", "/api/v3/klines"),
+        ("BINANCE_US", "spot", "binance_style_1m_klines", "/api/v3/klines"),
+        ("BYBIT_SPOT", "spot", "bybit_v5_1m_klines", "/v5/market/kline"),
+        ("BYBIT", "perpetual_swap", "bybit_v5_1m_klines", "/v5/market/kline"),
+    }
+)
 UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON = "unresolved_route_requirement"
 SHADOW_EXCLUDED_FROM_LEARNING_REASON = "shadow_excluded_from_learning"
 UNRELIABLE_CLOSE_MEASUREMENT_REASON = "unreliable_close_measurement"
 NON_DIRECT_SIGNAL_SCOPE_REASON = "non_direct_signal_scope"
+PAIRED_DIRECT_PROXY_EXCLUSION_REASON = "short_perp_only_proxy"
 RELIABLE_CLOSE_MEASUREMENT_STATUSES = frozenset({"valid"})
 NON_DIRECT_SIGNAL_STATS_SCOPES = frozenset(
     {"synthetic_research", "shadow", "reference", "observation_only"}
@@ -349,6 +383,35 @@ def paper_label_eligibility(
     if frontier_shadow_exclusion["paper_shadow_excluded_from_learning"]:
         label_eligible = False
         exclusion_reason = SHADOW_EXCLUDED_FROM_LEARNING_REASON
+    paired_direction = any(
+        is_paired_direction(container.get("direction")) for container in containers
+    )
+    paired_entry_validation = (
+        validate_paired_direct_entry(candidate) if paired_direction else None
+    )
+    paired_outcome_required = paired_direction and (
+        _storage_normalize_token(context.get("status")) == "closed"
+        or "paired_direct_v1_outcome" in context
+        or "paper_outcome_measurement_contract" in context
+    )
+    paired_outcome_validation = (
+        validate_paired_direct_outcome_provenance(candidate, context)
+        if paired_outcome_required
+        else None
+    )
+    paired_entry_valid = bool(
+        not paired_direction
+        or (paired_entry_validation and paired_entry_validation.get("valid"))
+    )
+    paired_outcome_valid = bool(
+        not paired_outcome_required
+        or (paired_outcome_validation and paired_outcome_validation.get("valid"))
+    )
+    if paired_direction and (not paired_entry_valid or not paired_outcome_valid):
+        # Explicit paper-label flags are never allowed to turn the historical
+        # one-leg basis proxy into a direct two-leg training label.
+        label_eligible = False
+        exclusion_reason = PAIRED_DIRECT_PROXY_EXCLUSION_REASON
     return {
         "paper_label_eligible": label_eligible,
         "paper_label_explicit_override": explicit_override,
@@ -357,6 +420,20 @@ def paper_label_eligibility(
         "paper_label_route_id": route_id or None,
         "paper_label_route_blockers": deduped_blockers,
         "paper_shadow_observation": not label_eligible,
+        "paired_direct_label": paired_direction,
+        "paired_direct_entry_valid": paired_entry_valid,
+        "paired_direct_entry_reasons": (
+            list(paired_entry_validation.get("reasons") or [])
+            if paired_entry_validation
+            else []
+        ),
+        "paired_direct_outcome_required": paired_outcome_required,
+        "paired_direct_outcome_valid": paired_outcome_valid,
+        "paired_direct_outcome_reasons": (
+            list(paired_outcome_validation.get("reasons") or [])
+            if paired_outcome_validation
+            else []
+        ),
         **frontier_shadow_exclusion,
     }
 
@@ -369,6 +446,14 @@ def paper_label_eligibility_for_trade_row(row: sqlite3.Row | Mapping[str, object
     candidate = _storage_json_mapping(row_mapping.get("candidate_json"))
     review = _storage_json_mapping(row_mapping.get("review_json"))
     context = _storage_json_mapping(row_mapping.get("context_json"))
+    outcome_context = _storage_json_mapping(row_mapping.get("outcome_context_json"))
+    for key in (
+        "paper_outcome_measurement_contract",
+        "paired_direct_v1_outcome",
+        "paper_price_observations",
+    ):
+        if key in outcome_context:
+            context[key] = outcome_context[key]
     row_context = dict(row_mapping)
     row_context.update(context)
     return paper_label_eligibility(candidate=candidate, review=review, context=row_context)
@@ -392,6 +477,14 @@ def reliable_paper_label_eligibility_for_trade_row(
     eligibility = paper_label_eligibility_for_trade_row(row_mapping)
     candidate = _storage_json_mapping(row_mapping.get("candidate_json"))
     context = _storage_json_mapping(row_mapping.get("context_json"))
+    outcome_context = _storage_json_mapping(row_mapping.get("outcome_context_json"))
+    for key in (
+        "paper_outcome_measurement_contract",
+        "paired_direct_v1_outcome",
+        "paper_price_observations",
+    ):
+        if key in outcome_context:
+            context[key] = outcome_context[key]
     signal_scope = str(
         row_mapping.get("signal_stats_scope")
         or context.get("signal_stats_scope")
@@ -408,19 +501,73 @@ def reliable_paper_label_eligibility_for_trade_row(
         signal_scope in NON_DIRECT_SIGNAL_STATS_SCOPES
         or signal_key_value.startswith("SYNTHETIC_RESEARCH|")
     )
+    direction = str(
+        row_mapping.get("direction")
+        or context.get("direction")
+        or candidate.get("direction")
+        or ""
+    ).strip().lower()
+    paired_direction = is_paired_direction(direction)
+    paired_validation = (
+        validate_paired_direct_outcome_provenance(candidate, context)
+        if paired_direction
+        else None
+    )
+    paired_validation_reasons = (
+        list(paired_validation.get("reasons") or []) if paired_validation else []
+    )
+    paired_row_pnl_valid = True
+    if paired_direction:
+        paired_outcome = context.get("paired_direct_v1_outcome")
+        paired_outcome = paired_outcome if isinstance(paired_outcome, Mapping) else {}
+        paired_accounting = paired_outcome.get("accounting")
+        paired_accounting = (
+            paired_accounting if isinstance(paired_accounting, Mapping) else {}
+        )
+        row_pnl = _storage_float(row_mapping.get("pnl_bps"))
+        accounting_pnl = _storage_float(paired_accounting.get("pnl_bps"))
+        paired_row_pnl_valid = bool(
+            row_pnl is not None
+            and accounting_pnl is not None
+            and math.isfinite(row_pnl)
+            and math.isfinite(accounting_pnl)
+            and abs(row_pnl - accounting_pnl) <= 0.0005 + 1e-12
+        )
+        if not paired_row_pnl_valid:
+            paired_validation_reasons.append("row.pnl_bps_mismatch")
+    paired_reliable = bool(
+        not paired_direction
+        or (
+            paired_validation
+            and paired_validation.get("valid")
+            and paired_row_pnl_valid
+        )
+    )
     if "close_measurement_status" not in row_mapping:
+        schema_label_eligible = (
+            bool(eligibility.get("paper_label_eligible"))
+            and not non_direct_scope
+            and paired_reliable
+        )
         return {
             **eligibility,
-            "paper_label_eligible": bool(eligibility.get("paper_label_eligible"))
-            and not non_direct_scope,
+            "paper_label_eligible": schema_label_eligible,
             "paper_label_exclusion_reason": (
                 eligibility.get("paper_label_exclusion_reason")
                 if not eligibility.get("paper_label_eligible")
-                else NON_DIRECT_SIGNAL_SCOPE_REASON if non_direct_scope else None
+                else NON_DIRECT_SIGNAL_SCOPE_REASON
+                if non_direct_scope
+                else PAIRED_DIRECT_PROXY_EXCLUSION_REASON
+                if not paired_reliable
+                else None
             ),
-            "paper_outcome_reliable": not non_direct_scope,
+            "paper_outcome_reliable": not non_direct_scope and paired_reliable,
             "paper_outcome_measurement_status": "schema_unavailable",
             "paper_signal_stats_scope": signal_scope or "direct_or_legacy",
+            "paired_direct_outcome_valid": paired_reliable,
+            "paired_direct_outcome_reasons": (
+                sorted(set(paired_validation_reasons))
+            ),
         }
     measurement_status = str(row_mapping.get("close_measurement_status") or "").strip().lower()
     reliable = measurement_status in RELIABLE_CLOSE_MEASUREMENT_STATUSES
@@ -428,6 +575,7 @@ def reliable_paper_label_eligibility_for_trade_row(
         bool(eligibility.get("paper_label_eligible"))
         and reliable
         and not non_direct_scope
+        and paired_reliable
     )
     return {
         **eligibility,
@@ -437,13 +585,19 @@ def reliable_paper_label_eligibility_for_trade_row(
             if not eligibility.get("paper_label_eligible")
             else NON_DIRECT_SIGNAL_SCOPE_REASON
             if non_direct_scope
+            else PAIRED_DIRECT_PROXY_EXCLUSION_REASON
+            if not paired_reliable
             else None
             if reliable
             else UNRELIABLE_CLOSE_MEASUREMENT_REASON
         ),
-        "paper_outcome_reliable": reliable and not non_direct_scope,
+        "paper_outcome_reliable": reliable and not non_direct_scope and paired_reliable,
         "paper_outcome_measurement_status": measurement_status or "missing",
         "paper_signal_stats_scope": signal_scope or "direct_or_legacy",
+        "paired_direct_outcome_valid": paired_reliable,
+        "paired_direct_outcome_reasons": (
+            sorted(set(paired_validation_reasons))
+        ),
     }
 
 
@@ -645,6 +799,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     _ensure_column(conn, "opportunities", "strategy_lab_id", "text")
     _ensure_column(conn, "opportunities", "strategy_lab_version", "integer")
+    _ensure_column(conn, "opportunities", "admission_key", "text")
+    _ensure_column(conn, "opportunities", "admission_episode_id", "text")
     _ensure_column(conn, "paper_trades", "execution_order_id", "integer")
     _ensure_column(conn, "paper_trades", "route_id", "text")
     _ensure_column(conn, "paper_trades", "entry_fee_bps", "real default 0")
@@ -663,6 +819,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "paper_trades", "strategy_lab_version", "integer")
     _ensure_column(conn, "paper_trades", "opportunity_id", "integer")
     _ensure_column(conn, "paper_trades", "strategy_lineage_root_id", "text")
+    _ensure_column(conn, "paper_trades", "admission_key", "text")
+    _ensure_column(conn, "paper_trades", "admission_episode_id", "text")
     conn.execute(
         """
         create table if not exists execution_orders (
@@ -735,6 +893,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             delay_seconds real,
             measurement_status text not null,
             price_source text,
+            admission_key text,
+            admission_episode_id text,
             unique(observation_id, horizon_minutes),
             foreign key(observation_id) references frontier_paper_shadow_observations(id)
         )
@@ -755,7 +915,114 @@ def init_db(conn: sqlite3.Connection) -> None:
             delay_seconds real,
             measurement_status text not null default 'legacy_unverified',
             price_source text,
+            admission_key text,
+            admission_episode_id text,
+            price_observation_id text,
             unique(trade_id, horizon_minutes)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists paper_price_observations (
+            observation_id text primary key,
+            venue text not null,
+            inst_id text not null,
+            market_surface text not null,
+            candle_open_at text not null,
+            event_at text not null,
+            received_at text not null,
+            price real not null,
+            source_kind text not null,
+            source_name text not null,
+            source_parser text not null,
+            source_endpoint text not null,
+            source_event_id text not null,
+            source_identity text not null,
+            payload_hash text not null,
+            context_json text not null default '{}',
+            unique(source_identity, inst_id, source_event_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists paper_outcome_due_cursors (
+            venue text not null,
+            inst_id text not null,
+            last_window_key text not null,
+            last_attempted_at text not null,
+            attempt_count integer not null default 0,
+            primary key(venue, inst_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists paper_funding_coverage_batches (
+            batch_id text primary key,
+            venue text not null,
+            inst_id text not null,
+            complete_from text not null,
+            complete_through text not null,
+            requested_from text not null,
+            requested_through text not null,
+            query_id text not null,
+            query_request_url text not null,
+            received_at text not null,
+            http_status integer not null,
+            request_succeeded integer not null,
+            page_count integer not null,
+            pagination_complete integer not null,
+            range_complete integer not null,
+            coverage_status text not null,
+            allow_estimates integer not null,
+            source_name text not null,
+            source_parser text not null,
+            source_endpoint text not null,
+            source_payload_hash text not null,
+            payload_hash text not null,
+            context_json text not null default '{}'
+        )
+        """
+    )
+    _ensure_column(conn, "paper_funding_coverage_batches", "query_id", "text")
+    _ensure_column(conn, "paper_funding_coverage_batches", "source_payload_hash", "text")
+    conn.execute(
+        """
+        create table if not exists paper_realized_funding_events (
+            batch_id text not null,
+            source_event_id text not null,
+            event_at text not null,
+            realized_rate real not null,
+            method text not null,
+            formula_type text not null,
+            estimated integer not null default 0,
+            primary key(batch_id, source_event_id),
+            foreign key(batch_id) references paper_funding_coverage_batches(batch_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists paper_trade_outcome_price_observations (
+            outcome_id integer not null,
+            observation_id text not null,
+            component text not null,
+            primary key(outcome_id, observation_id),
+            foreign key(outcome_id) references paper_trade_outcomes(id),
+            foreign key(observation_id) references paper_price_observations(observation_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists paper_trade_outcome_funding_batches (
+            outcome_id integer not null,
+            batch_id text not null,
+            primary key(outcome_id, batch_id),
+            foreign key(outcome_id) references paper_trade_outcomes(id),
+            foreign key(batch_id) references paper_funding_coverage_batches(batch_id)
         )
         """
     )
@@ -763,6 +1030,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "execution_orders", "strategy_lab_version", "integer")
     _ensure_column(conn, "execution_orders", "opportunity_id", "integer")
     _ensure_column(conn, "execution_orders", "strategy_lineage_root_id", "text")
+    _ensure_column(conn, "execution_orders", "admission_key", "text")
+    _ensure_column(conn, "execution_orders", "admission_episode_id", "text")
+    _ensure_column(conn, "frontier_paper_shadow_observations", "admission_key", "text")
+    _ensure_column(conn, "frontier_paper_shadow_observations", "admission_episode_id", "text")
+    _ensure_column(conn, "frontier_paper_shadow_outcomes", "admission_key", "text")
+    _ensure_column(conn, "frontier_paper_shadow_outcomes", "admission_episode_id", "text")
     _migrate_paper_trade_outcomes(conn)
     conn.execute(
         """
@@ -855,6 +1128,11 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "llm_cost_events", "prompt_cache_key", "text")
     _ensure_column(conn, "llm_cost_events", "frontier_escalation_reason", "text")
     _ensure_column(conn, "llm_cost_events", "structured_json", "integer not null default 0")
+    _ensure_column(conn, "llm_cost_events", "event_id", "text")
+    conn.execute(
+        "create unique index if not exists idx_llm_cost_events_event_id "
+        "on llm_cost_events(event_id) where event_id is not null"
+    )
     conn.execute(
         """
         create table if not exists code_evolution_proposals (
@@ -1528,12 +1806,162 @@ def init_db(conn: sqlite3.Connection) -> None:
             first_seen_at text not null,
             last_seen_at text not null,
             last_advanced_at text not null,
+            last_observation_at text,
+            last_evidence_fingerprint text,
+            fresh_evidence_scans integer not null default 0,
+            stage_entered_at text,
+            current_episode_id text,
+            last_review_opportunity_id integer,
+            last_paper_trade_id integer,
+            terminal_class text,
             details_json text not null default '{}'
         )
         """
     )
+    _ensure_column(conn, "market_admission_states", "last_observation_at", "text")
+    _ensure_column(conn, "market_admission_states", "last_evidence_fingerprint", "text")
+    _ensure_column(conn, "market_admission_states", "fresh_evidence_scans", "integer not null default 0")
+    _ensure_column(conn, "market_admission_states", "stage_entered_at", "text")
+    _ensure_column(conn, "market_admission_states", "current_episode_id", "text")
+    _ensure_column(conn, "market_admission_states", "last_review_opportunity_id", "integer")
+    _ensure_column(conn, "market_admission_states", "last_paper_trade_id", "integer")
+    _ensure_column(conn, "market_admission_states", "terminal_class", "text")
     conn.execute(
         "create index if not exists idx_market_admission_stage on market_admission_states(current_stage, health_status)"
+    )
+    conn.execute(
+        "create index if not exists idx_market_admission_highest "
+        "on market_admission_states(highest_stage, last_advanced_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_market_admission_cohort "
+        "on market_admission_states(venue, market_surface, current_stage, blocker_code)"
+    )
+    conn.execute(
+        """
+        create table if not exists market_admission_transitions (
+            id integer primary key autoincrement,
+            admission_key text not null,
+            episode_id text,
+            occurred_at text not null,
+            from_stage text,
+            to_stage text not null,
+            transition_kind text not null,
+            reason_code text,
+            evidence_fingerprint text,
+            details_json text not null default '{}',
+            foreign key(admission_key) references market_admission_states(admission_key)
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_market_admission_transitions_key "
+        "on market_admission_transitions(admission_key, occurred_at desc)"
+    )
+    conn.execute(
+        "create index if not exists idx_market_admission_transitions_kind "
+        "on market_admission_transitions(transition_kind, occurred_at desc)"
+    )
+    conn.execute(
+        """
+        create table if not exists paper_admission_queue (
+            queue_id text primary key,
+            admission_key text not null,
+            episode_id text not null unique,
+            evidence_fingerprint text not null,
+            evidence_observed_at text not null,
+            lane text not null,
+            status text not null,
+            priority real not null default 0,
+            venue text not null,
+            inst_id text not null,
+            market_surface text not null,
+            lineage_root text not null,
+            direction text not null,
+            route_status text not null,
+            candidate_json text not null,
+            eligibility_json text not null default '{}',
+            enqueued_at text not null,
+            updated_at text not null,
+            next_eligible_at text,
+            selected_at text,
+            claimed_by text,
+            claim_token text,
+            consumed_claim_token text,
+            claim_consumed_at text,
+            lease_expires_at text,
+            attempt_count integer not null default 0,
+            selection_count integer not null default 0,
+            dedupe_count integer not null default 0,
+            opportunity_id integer,
+            execution_order_id integer,
+            paper_trade_id integer,
+            last_decision text,
+            last_reason text,
+            completed_at text,
+            unique(admission_key, evidence_fingerprint),
+            foreign key(admission_key) references market_admission_states(admission_key)
+        )
+        """
+    )
+    _ensure_column(conn, "paper_admission_queue", "evidence_observed_at", "text")
+    _ensure_column(conn, "paper_admission_queue", "consumed_claim_token", "text")
+    _ensure_column(conn, "paper_admission_queue", "claim_consumed_at", "text")
+    conn.execute(
+        """
+        update paper_admission_queue
+        set evidence_observed_at=coalesce(evidence_observed_at,enqueued_at,updated_at)
+        where evidence_observed_at is null
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_paper_admission_queue_due "
+        "on paper_admission_queue(status, lane, next_eligible_at, priority desc, enqueued_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_paper_admission_queue_artifacts "
+        "on paper_admission_queue(opportunity_id, execution_order_id, paper_trade_id)"
+    )
+    conn.execute("drop index if exists idx_paper_admission_queue_one_active")
+    conn.execute(
+        "create unique index idx_paper_admission_queue_one_active "
+        "on paper_admission_queue(admission_key) "
+        "where status in ('queued_review','approved_waiting_capacity','paper_open','waiting_outcome','retry_wait')"
+    )
+    _install_bounded_paper_artifact_guards(conn)
+    conn.execute(
+        """
+        create table if not exists paper_expansion_campaign_state (
+            campaign_id text primary key,
+            phase text not null,
+            run_status text not null,
+            healthy_streak integer not null default 0,
+            phase_cycle_count integer not null default 0,
+            total_cycle_count integer not null default 0,
+            phase_started_at text not null,
+            updated_at text not null,
+            state_json text not null default '{}'
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists paper_expansion_campaign_cycles (
+            cycle_id text primary key,
+            campaign_id text not null,
+            phase text not null,
+            started_at text not null,
+            completed_at text not null,
+            health_status text not null,
+            metrics_json text not null default '{}',
+            reasons_json text not null default '[]',
+            foreign key(campaign_id) references paper_expansion_campaign_state(campaign_id)
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_paper_expansion_campaign_cycles "
+        "on paper_expansion_campaign_cycles(campaign_id, completed_at desc)"
     )
     conn.execute(
         """
@@ -1680,6 +2108,18 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("create index if not exists idx_execution_orders_opportunity on execution_orders(opportunity_id)")
     conn.execute("create index if not exists idx_paper_trades_opportunity on paper_trades(opportunity_id)")
     conn.execute(
+        "create index if not exists idx_opportunities_admission "
+        "on opportunities(admission_key, admission_episode_id, id)"
+    )
+    conn.execute(
+        "create index if not exists idx_execution_orders_admission "
+        "on execution_orders(admission_key, admission_episode_id, id)"
+    )
+    conn.execute(
+        "create index if not exists idx_paper_trades_admission "
+        "on paper_trades(admission_key, admission_episode_id, id)"
+    )
+    conn.execute(
         "create index if not exists idx_paper_lineage_open "
         "on paper_trades(status, strategy_lineage_root_id, inst_id, direction)"
     )
@@ -1696,6 +2136,30 @@ def init_db(conn: sqlite3.Connection) -> None:
         "on frontier_paper_shadow_outcomes(observation_id, horizon_minutes)"
     )
     conn.execute("create index if not exists idx_outcomes_trade on paper_trade_outcomes(trade_id)")
+    conn.execute(
+        "create index if not exists idx_paper_outcomes_price_observation "
+        "on paper_trade_outcomes(price_observation_id)"
+    )
+    conn.execute(
+        "create index if not exists idx_paper_price_observation_target "
+        "on paper_price_observations(venue, inst_id, market_surface, event_at, received_at, observation_id)"
+    )
+    conn.execute(
+        "create index if not exists idx_paper_funding_coverage_select "
+        "on paper_funding_coverage_batches(venue,inst_id,complete_from,complete_through,received_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_paper_realized_funding_event_time "
+        "on paper_realized_funding_events(batch_id,event_at,source_event_id)"
+    )
+    conn.execute(
+        "create index if not exists idx_paper_outcomes_admission "
+        "on paper_trade_outcomes(admission_key, admission_episode_id, trade_id)"
+    )
+    conn.execute(
+        "create index if not exists idx_frontier_shadow_outcomes_admission "
+        "on frontier_paper_shadow_outcomes(admission_key, admission_episode_id, observation_id)"
+    )
     conn.execute("create index if not exists idx_paper_hold_policies_group on paper_hold_policies(group_name, group_value)")
     conn.execute("create index if not exists idx_memory_subject on memory_facts(subject)")
     conn.execute(
@@ -1783,6 +2247,420 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
         conn.execute(f"alter table {table} add column {column} {ddl}")
 
 
+def _create_unique_index_if_clean(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    table: str,
+    columns: str,
+    where: str,
+) -> bool:
+    """Install a forward uniqueness constraint without rewriting legacy rows."""
+
+    duplicate = conn.execute(
+        f"select 1 from {table} where {where} "
+        f"group by {columns} having count(*) > 1 limit 1"
+    ).fetchone()
+    if duplicate is not None:
+        return False
+    conn.execute(
+        f"create unique index if not exists {name} "
+        f"on {table}({columns}) where {where}"
+    )
+    return True
+
+
+def _install_bounded_paper_artifact_guards(conn: sqlite3.Connection) -> None:
+    """Bind unambiguous legacy artifacts and reject new bounded duplicates.
+
+    Existing duplicate rows are deliberately left untouched.  On a clean
+    lineage the partial unique indexes provide the strongest constraint; on a
+    legacy lineage with duplicates, the insert triggers still prevent any new
+    artifact from making the ambiguity worse.
+    """
+
+    # Failed/transient orders are attempt history, not the one durable fill
+    # binding.  Older builds could attach them during reconciliation and then
+    # make the next valid retry impossible.
+    conn.execute(
+        """
+        update paper_admission_queue as q
+        set execution_order_id=null
+        where q.paper_trade_id is null and q.execution_order_id is not null
+          and exists (
+              select 1 from execution_orders e
+              where e.id=q.execution_order_id
+                and e.admission_key=q.admission_key
+                and e.admission_episode_id=q.episode_id
+                and e.status<>'paper_filled'
+          )
+        """
+    )
+    conn.execute(
+        """
+        update paper_admission_queue as q
+        set execution_order_id=(
+            select min(e.id)
+            from execution_orders e
+            where e.admission_key=q.admission_key
+              and e.admission_episode_id=q.episode_id
+              and e.status='paper_filled'
+        )
+        where q.execution_order_id is null
+          and (
+              select count(*)
+              from execution_orders e
+              where e.admission_key=q.admission_key
+                and e.admission_episode_id=q.episode_id
+                and e.status='paper_filled'
+          )=1
+        """
+    )
+    conn.execute(
+        """
+        update paper_admission_queue as q
+        set paper_trade_id=(
+            select min(p.id)
+            from paper_trades p
+            where p.admission_key=q.admission_key
+              and p.admission_episode_id=q.episode_id
+              and p.execution_order_id=q.execution_order_id
+        )
+        where q.paper_trade_id is null
+          and q.execution_order_id is not null
+          and (
+              select count(*)
+              from paper_trades p
+              where p.admission_key=q.admission_key
+                and p.admission_episode_id=q.episode_id
+                and p.execution_order_id=q.execution_order_id
+          )=1
+        """
+    )
+    # Earlier development builds briefly installed episode-wide uniqueness on
+    # the artifact tables.  That was too broad: non-queue Strategy Lab labels
+    # may intentionally share an experiment episode.  Remove those schema-only
+    # constraints and keep uniqueness on the queue's explicit bindings.
+    conn.execute("drop index if exists idx_bounded_paper_filled_order_episode_unique")
+    conn.execute("drop index if exists idx_bounded_paper_trade_episode_unique")
+    _create_unique_index_if_clean(
+        conn,
+        name="idx_paper_admission_queue_execution_order_unique",
+        table="paper_admission_queue",
+        columns="execution_order_id",
+        where="execution_order_id is not null",
+    )
+    _create_unique_index_if_clean(
+        conn,
+        name="idx_paper_admission_queue_paper_trade_unique",
+        table="paper_admission_queue",
+        columns="paper_trade_id",
+        where="paper_trade_id is not null",
+    )
+    _create_unique_index_if_clean(
+        conn,
+        name="idx_bounded_paper_trade_order_unique",
+        table="paper_trades",
+        columns="execution_order_id",
+        where="execution_order_id is not null",
+    )
+
+    claim_token_sql = """
+        coalesce(
+            nullif(json_extract(new.candidate_json,'$._paper_admission_claim_token'),''),
+            nullif(json_extract(new.candidate_json,'$.paper_admission_claim_token'),''),
+            nullif(json_extract(new.candidate_json,'$.paper_admission.claim_token'),'')
+        )
+    """
+    queue_id_sql = """
+        coalesce(
+            nullif(json_extract(new.candidate_json,'$._paper_admission_queue_id'),''),
+            nullif(json_extract(new.candidate_json,'$.paper_admission.queue_id'),'')
+        )
+    """
+    identity_json_paths = (
+        "$.venue",
+        "$.inst_id",
+        "$.instrument_id",
+        "$.proxy_surface",
+        "$.market_surface",
+        "$.surface_type_classified",
+        "$.trade_type",
+        "$.signal_lineage_key",
+        "$.strategy_lab_id",
+        "$.strategy_lab_version",
+        "$.signal_variant_id",
+        "$.strategy_lineage_root_id",
+        "$.strategy_lab_lineage_root_id",
+        "$.signal_lineage_root_id",
+        "$.strategy_lab_root_id",
+        "$.parent_strategy_lab_id",
+        "$.direction",
+        "$.admission_key",
+        "$.paper_admission_key",
+        "$.episode_id",
+        "$.admission_episode_id",
+        "$.admission_identity_version",
+        "$._paper_admission_queue_id",
+        "$._paper_admission_evidence_observed_at",
+        "$.book_timestamp",
+        "$.exchange_timestamp",
+        "$.source_timestamp",
+        "$.ticker_timestamp",
+        "$.source_observed_at",
+        "$.book_observed_at",
+        "$.observed_at",
+        "$.seen_at",
+        "$.paper_admission_claim_token",
+        "$._paper_admission_claim_token",
+        "$.paper_admission.admission_key",
+        "$.paper_admission.episode_id",
+        "$.paper_admission.identity_version",
+        "$.paper_admission.normalized_direction",
+        "$.paper_admission.legacy_v1_admission_key",
+        "$.paper_admission.strategy_lineage",
+        "$.paper_admission.queue_id",
+        "$.paper_admission.claim_token",
+        "$.paper_admission.evidence_observed_at",
+    )
+    identity_snapshot_sql = "\n".join(
+        "                  and "
+        f"json_extract(new.candidate_json,'{path}') "
+        f"is json_extract(q.candidate_json,'{path}')"
+        for path in identity_json_paths
+    )
+    artifact_identity_sql = """
+                  and upper(trim(new.venue))=upper(trim(q.venue))
+                  and trim(new.inst_id)=trim(q.inst_id)
+                  and lower(trim(new.direction))=lower(trim(q.direction))
+                  and json_extract(new.candidate_json,'$.last')
+                      is json_extract(q.candidate_json,'$.last')
+                  and json_extract(new.candidate_json,'$.bid')
+                      is json_extract(q.candidate_json,'$.bid')
+                  and json_extract(new.candidate_json,'$.ask')
+                      is json_extract(q.candidate_json,'$.ask')
+                  and json_extract(new.candidate_json,'$.mark_price')
+                      is json_extract(q.candidate_json,'$.mark_price')
+                  and json_extract(new.candidate_json,'$.index_price')
+                      is json_extract(q.candidate_json,'$.index_price')
+                  and json_extract(new.candidate_json,'$.spot_price')
+                      is json_extract(q.candidate_json,'$.spot_price')
+                  and json_extract(new.candidate_json,'$.perp_price')
+                      is json_extract(q.candidate_json,'$.perp_price')
+                  and json_extract(new.candidate_json,'$.spot_last')
+                      is json_extract(q.candidate_json,'$.spot_last')
+                  and json_extract(new.candidate_json,'$.perp_last')
+                      is json_extract(q.candidate_json,'$.perp_last')
+                  and trim(new.trade_type)=trim(
+                      coalesce(json_extract(new.candidate_json,'$.trade_type'),'unknown')
+                  )
+                  and trim(q.market_surface)=trim(coalesce(
+                      nullif(json_extract(new.candidate_json,'$.proxy_surface'),''),
+                      nullif(json_extract(new.candidate_json,'$.market_surface'),''),
+                      nullif(json_extract(new.candidate_json,'$.surface_type_classified'),''),
+                      nullif(json_extract(new.candidate_json,'$.trade_type'),''),
+                      'unknown'
+                  ))
+                  and julianday(coalesce(
+                      nullif(json_extract(
+                          new.candidate_json,
+                          '$._paper_admission_evidence_observed_at'
+                      ),''),
+                      nullif(json_extract(
+                          new.candidate_json,
+                          '$.paper_admission.evidence_observed_at'
+                      ),'')
+                  ))=julianday(q.evidence_observed_at)
+    """
+    fresh_entry_sql = """
+                  and julianday(q.evidence_observed_at) is not null
+                  and (
+                      julianday('now')-julianday(q.evidence_observed_at)
+                  )*86400.0 between 0.0 and 90.0
+    """
+    bounded_candidate_sql = f"""
+        (
+            (
+                new.admission_key is not null
+                and new.admission_episode_id is not null
+                and exists (
+                    select 1 from paper_admission_queue q
+                    where q.admission_key=new.admission_key
+                      and q.episode_id=new.admission_episode_id
+                )
+            )
+            or (
+                json_valid(new.candidate_json)=1
+                and exists (
+                    select 1 from paper_admission_queue q
+                    where q.queue_id={queue_id_sql}
+                )
+            )
+        )
+    """
+    for trigger_name in (
+        "trg_bounded_paper_opportunity_guard_insert",
+        "trg_bounded_paper_opportunity_bind_insert",
+        "trg_bounded_paper_order_guard_insert",
+        "trg_bounded_paper_order_bind_insert",
+        "trg_bounded_paper_trade_guard_insert",
+        "trg_bounded_paper_trade_bind_insert",
+    ):
+        conn.execute(f"drop trigger if exists {trigger_name}")
+    conn.execute(
+        f"""
+        create trigger trg_bounded_paper_opportunity_guard_insert
+        before insert on opportunities
+        when {bounded_candidate_sql}
+        begin
+            select case when json_valid(new.candidate_json)<>1 then
+                raise(abort,'bounded_paper_opportunity_invalid_candidate')
+            end;
+            select case when not exists (
+                select 1 from paper_admission_queue q
+                where q.admission_key=new.admission_key
+                  and q.episode_id=new.admission_episode_id
+                  and q.queue_id={queue_id_sql}
+                  and (
+                      q.claim_token={claim_token_sql}
+                      or q.consumed_claim_token={claim_token_sql}
+                  )
+                  and q.opportunity_id is null
+{identity_snapshot_sql}
+{artifact_identity_sql}
+            ) then raise(abort,'bounded_paper_opportunity_not_authorized') end;
+            select case when exists (
+                select 1 from opportunities o
+                where o.admission_key=new.admission_key
+                  and o.admission_episode_id=new.admission_episode_id
+            ) then raise(abort,'bounded_paper_opportunity_already_exists') end;
+        end
+        """
+    )
+    conn.execute(
+        f"""
+        create trigger trg_bounded_paper_opportunity_bind_insert
+        after insert on opportunities
+        when new.admission_key is not null
+          and new.admission_episode_id is not null
+        begin
+            update paper_admission_queue
+            set opportunity_id=new.id,updated_at=new.seen_at
+            where admission_key=new.admission_key
+              and episode_id=new.admission_episode_id
+              and queue_id={queue_id_sql}
+              and opportunity_id is null;
+        end
+        """
+    )
+    conn.execute(
+        f"""
+        create trigger trg_bounded_paper_order_guard_insert
+        before insert on execution_orders
+        when new.status='paper_filled'
+          and {bounded_candidate_sql}
+        begin
+            select case when json_valid(new.candidate_json)<>1 then
+                raise(abort,'bounded_paper_execution_order_invalid_candidate')
+            end;
+            select case when not exists (
+                select 1 from paper_admission_queue q
+                where q.admission_key=new.admission_key
+                  and q.episode_id=new.admission_episode_id
+                  and q.queue_id={queue_id_sql}
+                  and q.status='paper_open'
+                  and q.claim_token is null
+                  and q.consumed_claim_token={claim_token_sql}
+                  and q.claim_consumed_at is not null
+                  and q.execution_order_id is null
+                  and q.paper_trade_id is null
+{identity_snapshot_sql}
+{artifact_identity_sql}
+{fresh_entry_sql}
+            ) then raise(abort,'bounded_paper_execution_order_not_authorized') end;
+            select case when exists (
+                select 1 from execution_orders e
+                where e.admission_key=new.admission_key
+                  and e.admission_episode_id=new.admission_episode_id
+                  and e.status='paper_filled'
+            ) then raise(abort,'bounded_paper_execution_order_already_exists') end;
+        end
+        """
+    )
+    conn.execute(
+        f"""
+        create trigger trg_bounded_paper_order_bind_insert
+        after insert on execution_orders
+        when new.status='paper_filled'
+          and new.admission_key is not null
+          and new.admission_episode_id is not null
+        begin
+            update paper_admission_queue
+            set execution_order_id=new.id,updated_at=new.created_at
+            where admission_key=new.admission_key
+              and episode_id=new.admission_episode_id
+              and queue_id={queue_id_sql}
+              and consumed_claim_token={claim_token_sql}
+              and execution_order_id is null;
+        end
+        """
+    )
+    conn.execute(
+        f"""
+        create trigger trg_bounded_paper_trade_guard_insert
+        before insert on paper_trades
+        when {bounded_candidate_sql}
+        begin
+            select case when json_valid(new.candidate_json)<>1 then
+                raise(abort,'bounded_paper_trade_invalid_candidate')
+            end;
+            select case when new.execution_order_id is null then
+                raise(abort,'bounded_paper_trade_execution_order_required')
+            end;
+            select case when not exists (
+                select 1 from paper_admission_queue q
+                where q.admission_key=new.admission_key
+                  and q.episode_id=new.admission_episode_id
+                  and q.queue_id={queue_id_sql}
+                  and q.status='paper_open'
+                  and q.claim_token is null
+                  and q.consumed_claim_token={claim_token_sql}
+                  and q.claim_consumed_at is not null
+                  and q.execution_order_id=new.execution_order_id
+                  and q.paper_trade_id is null
+{identity_snapshot_sql}
+{artifact_identity_sql}
+{fresh_entry_sql}
+            ) then raise(abort,'bounded_paper_trade_not_authorized') end;
+            select case when exists (
+                select 1 from paper_trades p
+                where (p.admission_key=new.admission_key
+                       and p.admission_episode_id=new.admission_episode_id)
+                   or p.execution_order_id=new.execution_order_id
+            ) then raise(abort,'bounded_paper_trade_already_exists') end;
+        end
+        """
+    )
+    conn.execute(
+        f"""
+        create trigger trg_bounded_paper_trade_bind_insert
+        after insert on paper_trades
+        when new.admission_key is not null
+          and new.admission_episode_id is not null
+        begin
+            update paper_admission_queue
+            set paper_trade_id=new.id,updated_at=new.opened_at
+            where admission_key=new.admission_key
+              and episode_id=new.admission_episode_id
+              and queue_id={queue_id_sql}
+              and consumed_claim_token={claim_token_sql}
+              and execution_order_id=new.execution_order_id
+              and paper_trade_id is null;
+        end
+        """
+    )
+
+
 def _migrate_paper_trade_outcomes(conn: sqlite3.Connection) -> None:
     columns = {row["name"]: row for row in conn.execute("pragma table_info(paper_trade_outcomes)").fetchall()}
     requires_rebuild = bool(columns.get("price") and columns["price"]["notnull"]) or bool(
@@ -1794,6 +2672,9 @@ def _migrate_paper_trade_outcomes(conn: sqlite3.Connection) -> None:
         "delay_seconds": "real",
         "measurement_status": "text not null default 'legacy_unverified'",
         "price_source": "text",
+        "admission_key": "text",
+        "admission_episode_id": "text",
+        "price_observation_id": "text",
     }
     if requires_rebuild:
         conn.execute("drop table if exists paper_trade_outcomes_v2")
@@ -1812,6 +2693,9 @@ def _migrate_paper_trade_outcomes(conn: sqlite3.Connection) -> None:
                 delay_seconds real,
                 measurement_status text not null default 'legacy_unverified',
                 price_source text,
+                admission_key text,
+                admission_episode_id text,
+                price_observation_id text,
                 unique(trade_id, horizon_minutes)
             )
             """
@@ -1832,6 +2716,60 @@ def _migrate_paper_trade_outcomes(conn: sqlite3.Connection) -> None:
     else:
         for column, ddl in required.items():
             _ensure_column(conn, "paper_trade_outcomes", column, ddl)
+
+    has_admission_trades = conn.execute(
+        "select 1 from paper_trades where admission_key is not null or admission_episode_id is not null limit 1"
+    ).fetchone()
+    if has_admission_trades:
+        conn.execute(
+            """
+            update paper_trade_outcomes
+            set admission_key = coalesce(
+                    admission_key,
+                    (select admission_key from paper_trades where paper_trades.id = paper_trade_outcomes.trade_id)
+                ),
+                admission_episode_id = coalesce(
+                    admission_episode_id,
+                    (select admission_episode_id from paper_trades where paper_trades.id = paper_trade_outcomes.trade_id)
+                )
+            where (admission_key is null or admission_episode_id is null)
+              and exists (
+                  select 1 from paper_trades
+                  where paper_trades.id = paper_trade_outcomes.trade_id
+                    and (paper_trades.admission_key is not null
+                         or paper_trades.admission_episode_id is not null)
+              )
+            """
+        )
+    has_admission_shadows = conn.execute(
+        """
+        select 1 from frontier_paper_shadow_observations
+        where admission_key is not null or admission_episode_id is not null limit 1
+        """
+    ).fetchone()
+    if has_admission_shadows:
+        conn.execute(
+            """
+            update frontier_paper_shadow_outcomes
+            set admission_key = coalesce(
+                    admission_key,
+                    (select admission_key from frontier_paper_shadow_observations
+                     where frontier_paper_shadow_observations.id = frontier_paper_shadow_outcomes.observation_id)
+                ),
+                admission_episode_id = coalesce(
+                    admission_episode_id,
+                    (select admission_episode_id from frontier_paper_shadow_observations
+                     where frontier_paper_shadow_observations.id = frontier_paper_shadow_outcomes.observation_id)
+                )
+            where (admission_key is null or admission_episode_id is null)
+              and exists (
+                  select 1 from frontier_paper_shadow_observations
+                  where frontier_paper_shadow_observations.id = frontier_paper_shadow_outcomes.observation_id
+                    and (frontier_paper_shadow_observations.admission_key is not null
+                         or frontier_paper_shadow_observations.admission_episode_id is not null)
+              )
+            """
+        )
 
     needs_backfill = conn.execute(
         """
@@ -1868,6 +2806,761 @@ def _migrate_paper_trade_outcomes(conn: sqlite3.Connection) -> None:
                or price_source is null
             """
         )
+
+
+def _canonical_observation_time(value: object, field: str) -> tuple[dt.datetime, str]:
+    if isinstance(value, dt.datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    else:
+        raise ValueError(f"{field}_required")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field}_timezone_required")
+    parsed = parsed.astimezone(dt.timezone.utc)
+    return parsed, parsed.isoformat()
+
+
+def _normalized_price_observation_text(value: object, *, upper: bool = False) -> str:
+    normalized = str(value or "").strip()
+    return normalized.upper() if upper else normalized
+
+
+def _normalized_source_endpoint(value: object) -> str:
+    raw = _normalized_price_observation_text(value)
+    if not raw:
+        return ""
+    parsed = urllib.parse.urlsplit(raw)
+    path = parsed.path if parsed.scheme or parsed.netloc else raw.split("?", 1)[0]
+    normalized = "/" + path.lstrip("/")
+    return normalized.rstrip("/") or "/"
+
+
+def _paper_price_observation_identity(
+    *,
+    venue: str,
+    inst_id: str,
+    source_parser: str,
+    source_endpoint: str,
+    source_event_id: str,
+) -> tuple[str, str]:
+    source_identity_payload = {
+        "venue": venue,
+        "source_parser": source_parser,
+        "source_endpoint": source_endpoint,
+    }
+    source_identity = hashlib.sha256(
+        json.dumps(source_identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    observation_id = hashlib.sha256(
+        f"{source_identity}|{inst_id}|{source_event_id}".encode("utf-8")
+    ).hexdigest()
+    return source_identity, observation_id
+
+
+def _prune_paper_price_observations(conn: sqlite3.Connection) -> int:
+    total = int(conn.execute("select count(*) from paper_price_observations").fetchone()[0])
+    excess = max(0, total - int(PAPER_PRICE_OBSERVATION_MAX_ROWS))
+    if not excess:
+        return 0
+    removable = conn.execute(
+        """
+        select observation_id
+        from paper_price_observations o
+        where not exists (
+            select 1 from paper_trade_outcomes x
+            where x.price_observation_id=o.observation_id
+        )
+          and not exists (
+            select 1 from paper_trade_outcome_price_observations x
+            where x.observation_id=o.observation_id
+        )
+        order by event_at, received_at, observation_id
+        limit ?
+        """,
+        (excess,),
+    ).fetchall()
+    if removable:
+        conn.executemany(
+            "delete from paper_price_observations where observation_id=?",
+            [(row["observation_id"],) for row in removable],
+        )
+    return len(removable)
+
+
+def record_paper_price_observations(
+    conn: sqlite3.Connection,
+    observations: list[Mapping[str, object]] | tuple[Mapping[str, object], ...],
+    *,
+    received_at: dt.datetime | str | None = None,
+    commit: bool = True,
+) -> dict[str, object]:
+    """Persist verified event-time exchange candle closes without overwriting history."""
+
+    records = list(observations or ())
+    result: dict[str, object] = {
+        "accepted": 0,
+        "duplicates": 0,
+        "rejected": 0,
+        "pruned": 0,
+        "observation_ids": [],
+        "rejections": [],
+    }
+    if len(records) > PAPER_PRICE_OBSERVATION_MAX_BATCH:
+        result["rejected"] = len(records)
+        result["rejections"] = [
+            {
+                "index": None,
+                "reason": "paper_price_observation_batch_limit_exceeded",
+                "limit": PAPER_PRICE_OBSERVATION_MAX_BATCH,
+            }
+        ]
+        return result
+
+    fallback_received = received_at
+    if fallback_received is None:
+        fallback_received = dt.datetime.now(dt.timezone.utc)
+    for index, raw in enumerate(records):
+        rejection_reason = ""
+        try:
+            if not isinstance(raw, Mapping):
+                raise ValueError("observation_mapping_required")
+            source_kind = _normalized_price_observation_text(raw.get("source_kind"))
+            if source_kind != PAPER_PRICE_OBSERVATION_SOURCE_KIND:
+                raise ValueError("unsupported_source_kind")
+            if raw.get("is_closed") is not True:
+                raise ValueError("closed_candle_required")
+            if raw.get("is_partial") is True or raw.get("partial") is True:
+                raise ValueError("partial_candle_rejected")
+            freshness = _normalized_price_observation_text(
+                raw.get("freshness_state") or raw.get("freshness_status")
+            ).lower()
+            if freshness != "fresh":
+                raise ValueError("fresh_candle_required")
+            quality = _normalized_price_observation_text(raw.get("quality_status")).lower()
+            if quality not in {"normal", "verified"}:
+                raise ValueError("verified_candle_quality_required")
+
+            venue = _normalized_price_observation_text(raw.get("venue"), upper=True)
+            inst_id = _normalized_price_observation_text(raw.get("inst_id"), upper=True)
+            market_surface = _normalized_price_observation_text(
+                raw.get("market_surface")
+            ).lower()
+            source_parser = _normalized_price_observation_text(raw.get("source_parser"))
+            source_endpoint = _normalized_source_endpoint(raw.get("source_endpoint"))
+            source_event_id = _normalized_price_observation_text(raw.get("source_event_id"))
+            if not venue:
+                raise ValueError("venue_required")
+            if not inst_id:
+                raise ValueError("inst_id_required")
+            if not market_surface:
+                raise ValueError("market_surface_required")
+            if not source_parser:
+                raise ValueError("source_parser_required")
+            if not source_endpoint:
+                raise ValueError("source_endpoint_required")
+            if not source_event_id:
+                raise ValueError("source_event_id_required")
+            qualified_source = (
+                venue,
+                market_surface,
+                source_parser,
+                source_endpoint,
+            )
+            if qualified_source not in QUALIFIED_PAPER_CANDLE_SOURCES:
+                raise ValueError("unqualified_candle_source_tuple")
+
+            candle_open, candle_open_iso = _canonical_observation_time(
+                raw.get("candle_open_at"), "candle_open_at"
+            )
+            event_at, event_at_iso = _canonical_observation_time(raw.get("event_at"), "event_at")
+            received, received_iso = _canonical_observation_time(
+                raw.get("received_at") or fallback_received, "received_at"
+            )
+            candle_seconds = (event_at - candle_open).total_seconds()
+            if candle_seconds < 59.0 or candle_seconds > 61.0:
+                raise ValueError("invalid_one_minute_candle_window")
+            if received < event_at:
+                raise ValueError("received_before_candle_close")
+            try:
+                price = float(raw.get("price"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("valid_price_required") from exc
+            if not math.isfinite(price) or price <= 0.0:
+                raise ValueError("valid_price_required")
+
+            source_identity, observation_id = _paper_price_observation_identity(
+                venue=venue,
+                inst_id=inst_id,
+                source_parser=source_parser,
+                source_endpoint=source_endpoint,
+                source_event_id=source_event_id,
+            )
+            source_name = _normalized_price_observation_text(raw.get("source_name")) or (
+                f"{venue}:{source_parser}"
+            )
+            payload = {
+                "venue": venue,
+                "inst_id": inst_id,
+                "market_surface": market_surface,
+                "candle_open_at": candle_open_iso,
+                "event_at": event_at_iso,
+                "price": price,
+                "source_kind": source_kind,
+                "source_name": source_name,
+                "source_parser": source_parser,
+                "source_endpoint": source_endpoint,
+                "source_event_id": source_event_id,
+                "source_identity": source_identity,
+            }
+            payload_hash = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            existing = conn.execute(
+                """
+                select observation_id,payload_hash
+                from paper_price_observations
+                where source_identity=? and inst_id=? and source_event_id=?
+                limit 1
+                """,
+                (source_identity, inst_id, source_event_id),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload_hash"]) == payload_hash:
+                    result["duplicates"] = int(result["duplicates"]) + 1
+                    result["observation_ids"].append(str(existing["observation_id"]))
+                    continue
+                raise ValueError("source_event_payload_conflict")
+
+            raw_context = raw.get("context")
+            context = dict(raw_context) if isinstance(raw_context, Mapping) else {}
+            context.update(
+                {
+                    "freshness_state": freshness,
+                    "quality_status": quality,
+                    "is_closed": True,
+                    "is_partial": False,
+                }
+            )
+            conn.execute(
+                """
+                insert into paper_price_observations (
+                    observation_id,venue,inst_id,market_surface,candle_open_at,event_at,
+                    received_at,price,source_kind,source_name,source_parser,source_endpoint,
+                    source_event_id,source_identity,payload_hash,context_json
+                ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    observation_id,
+                    venue,
+                    inst_id,
+                    market_surface,
+                    candle_open_iso,
+                    event_at_iso,
+                    received_iso,
+                    price,
+                    source_kind,
+                    source_name,
+                    source_parser,
+                    source_endpoint,
+                    source_event_id,
+                    source_identity,
+                    payload_hash,
+                    json.dumps(context, sort_keys=True),
+                ),
+            )
+            result["accepted"] = int(result["accepted"]) + 1
+            result["observation_ids"].append(observation_id)
+        except (TypeError, ValueError, OverflowError) as exc:
+            rejection_reason = str(exc) or "invalid_observation"
+        if rejection_reason:
+            result["rejected"] = int(result["rejected"]) + 1
+            result["rejections"].append({"index": index, "reason": rejection_reason})
+
+    result["pruned"] = _prune_paper_price_observations(conn)
+    if commit:
+        conn.commit()
+    return result
+
+
+def select_paper_price_observation(
+    conn: sqlite3.Connection,
+    venue: str,
+    inst_id: str,
+    target_at: dt.datetime | str,
+    max_delay_seconds: float,
+    market_surface: str | None = None,
+) -> dict[str, object] | None:
+    """Return the earliest supported candle close in the target's delay window."""
+
+    target, target_iso = _canonical_observation_time(target_at, "target_at")
+    try:
+        max_delay = float(max_delay_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("valid_max_delay_seconds_required") from exc
+    if not math.isfinite(max_delay) or max_delay < 0.0:
+        raise ValueError("valid_max_delay_seconds_required")
+    latest_iso = (target + dt.timedelta(seconds=max_delay)).isoformat()
+    params: list[object] = [
+        _normalized_price_observation_text(venue, upper=True),
+        _normalized_price_observation_text(inst_id, upper=True),
+        PAPER_PRICE_OBSERVATION_SOURCE_KIND,
+        target_iso,
+        latest_iso,
+    ]
+    surface_clause = ""
+    if market_surface is not None:
+        normalized_surface = _normalized_price_observation_text(market_surface).lower()
+        if not normalized_surface:
+            return None
+        surface_clause = " and market_surface=?"
+        params.append(normalized_surface)
+    row = conn.execute(
+        """
+        select observation_id,venue,inst_id,market_surface,candle_open_at,event_at,
+               received_at,price,source_kind,source_name,source_parser,source_endpoint,
+               source_event_id,source_identity,payload_hash,context_json
+        from paper_price_observations
+        where venue=? and inst_id=? and source_kind=?
+          and event_at>=? and event_at<=?
+        """
+        + surface_clause
+        + " order by event_at,received_at,observation_id limit 1",
+        params,
+    ).fetchone()
+    if row is None:
+        return None
+    selected = dict(row)
+    try:
+        selected["context"] = json.loads(selected.pop("context_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        selected["context"] = {}
+        selected.pop("context_json", None)
+    selected["is_closed"] = selected["context"].get("is_closed") is True
+    selected["is_partial"] = selected["context"].get("is_partial") is True
+    selected["freshness_state"] = selected["context"].get("freshness_state")
+    selected["quality_status"] = selected["context"].get("quality_status")
+    return selected
+
+
+def _prune_paper_funding_coverage(conn: sqlite3.Connection) -> int:
+    total = int(conn.execute("select count(*) from paper_funding_coverage_batches").fetchone()[0])
+    excess = max(0, total - int(PAPER_FUNDING_COVERAGE_MAX_BATCHES))
+    if not excess:
+        return 0
+    rows = conn.execute(
+        """
+        select batch_id
+        from paper_funding_coverage_batches b
+        where not exists (
+            select 1 from paper_trade_outcome_funding_batches x
+            where x.batch_id=b.batch_id
+        )
+        order by received_at,batch_id
+        limit ?
+        """,
+        (excess,),
+    ).fetchall()
+    batch_ids = [str(row["batch_id"]) for row in rows]
+    if batch_ids:
+        conn.executemany(
+            "delete from paper_realized_funding_events where batch_id=?",
+            [(batch_id,) for batch_id in batch_ids],
+        )
+        conn.executemany(
+            "delete from paper_funding_coverage_batches where batch_id=?",
+            [(batch_id,) for batch_id in batch_ids],
+        )
+    return len(batch_ids)
+
+
+def record_paper_funding_coverage(
+    conn: sqlite3.Connection,
+    coverage_batches: Mapping[str, object] | list[Mapping[str, object]],
+    *,
+    received_at: dt.datetime | str | None = None,
+    commit: bool = True,
+) -> dict[str, object]:
+    """Persist complete authoritative OKX realized-funding coverage batches."""
+
+    if isinstance(coverage_batches, Mapping):
+        records = [coverage_batches]
+    else:
+        records = list(coverage_batches or ())
+    result: dict[str, object] = {
+        "accepted": 0,
+        "duplicates": 0,
+        "rejected": 0,
+        "pruned": 0,
+        "batch_ids": [],
+        "rejections": [],
+    }
+    if len(records) > PAPER_PRICE_OBSERVATION_MAX_BATCH:
+        result["rejected"] = len(records)
+        result["rejections"] = [
+            {
+                "index": None,
+                "reason": "paper_funding_coverage_batch_limit_exceeded",
+                "limit": PAPER_PRICE_OBSERVATION_MAX_BATCH,
+            }
+        ]
+        return result
+    fallback_received = received_at or dt.datetime.now(dt.timezone.utc)
+    for index, raw in enumerate(records):
+        try:
+            if not isinstance(raw, Mapping):
+                raise ValueError("funding_coverage_mapping_required")
+            venue = _normalized_price_observation_text(raw.get("venue"), upper=True)
+            inst_id = _normalized_price_observation_text(raw.get("inst_id"), upper=True)
+            if venue != "OKX":
+                raise ValueError("okx_funding_venue_required")
+            if not inst_id.endswith("-SWAP"):
+                raise ValueError("okx_swap_inst_id_required")
+            if str(raw.get("coverage_status") or "") != "complete":
+                raise ValueError("complete_funding_coverage_required")
+            if raw.get("allow_estimates") is not False:
+                raise ValueError("estimated_funding_forbidden")
+            query = raw.get("query")
+            query = query if isinstance(query, Mapping) else {}
+            if query.get("request_succeeded") is not True:
+                raise ValueError("successful_funding_request_required")
+            if query.get("pagination_complete") is not True:
+                raise ValueError("complete_funding_pagination_required")
+            if query.get("range_complete") is not True:
+                raise ValueError("complete_funding_range_required")
+            try:
+                http_status = int(query.get("http_status"))
+                page_count = int(query.get("page_count"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("funding_request_audit_required") from exc
+            if http_status != 200 or page_count < 1 or page_count > 100:
+                raise ValueError("funding_request_audit_invalid")
+
+            complete_from, complete_from_iso = _canonical_observation_time(
+                raw.get("complete_from"), "complete_from"
+            )
+            complete_through, complete_through_iso = _canonical_observation_time(
+                raw.get("complete_through"), "complete_through"
+            )
+            requested_from, requested_from_iso = _canonical_observation_time(
+                query.get("requested_from"), "requested_from"
+            )
+            requested_through, requested_through_iso = _canonical_observation_time(
+                query.get("requested_through"), "requested_through"
+            )
+            received, received_iso = _canonical_observation_time(
+                query.get("received_at") or fallback_received, "received_at"
+            )
+            if complete_from >= complete_through:
+                raise ValueError("funding_complete_interval_invalid")
+            if requested_from > complete_from or requested_through < complete_through:
+                raise ValueError("funding_requested_interval_incomplete")
+            if received < complete_through:
+                raise ValueError("funding_received_before_complete_through")
+
+            source = raw.get("source")
+            source = source if isinstance(source, Mapping) else {}
+            source_name = _normalized_price_observation_text(source.get("name"))
+            source_parser = _normalized_price_observation_text(source.get("parser"))
+            source_endpoint = _normalized_price_observation_text(source.get("endpoint"))
+            if not source_name:
+                raise ValueError("funding_source_name_required")
+            if source_parser != "okx_realized_funding_history":
+                raise ValueError("canonical_funding_parser_required")
+            if source_endpoint != "/api/v5/public/funding-rate-history":
+                raise ValueError("canonical_funding_endpoint_required")
+            if _normalized_price_observation_text(source.get("inst_id"), upper=True) != inst_id:
+                raise ValueError("funding_source_inst_id_mismatch")
+            query_request_url = _normalized_price_observation_text(query.get("request_url"))
+            parsed_request_url = urllib.parse.urlsplit(query_request_url)
+            query_params = urllib.parse.parse_qs(
+                parsed_request_url.query, keep_blank_values=True, strict_parsing=False
+            )
+            if (
+                parsed_request_url.scheme != "https"
+                or parsed_request_url.hostname != "www.okx.com"
+                or parsed_request_url.port is not None
+                or parsed_request_url.username is not None
+                or parsed_request_url.password is not None
+                or parsed_request_url.fragment
+                or parsed_request_url.path != source_endpoint
+            ):
+                raise ValueError("funding_query_request_url_required")
+            query_inst_ids = query_params.get("instId") or []
+            query_limits = query_params.get("limit") or []
+            try:
+                query_limit = int(query_limits[0]) if len(query_limits) == 1 else 0
+            except (TypeError, ValueError):
+                query_limit = 0
+            if query_inst_ids != [inst_id] or query_limit < 1 or query_limit > 400:
+                raise ValueError("funding_query_identity_mismatch")
+            query_id = _normalized_price_observation_text(query.get("query_id"))
+            source_payload_hash = _normalized_price_observation_text(
+                query.get("payload_sha256")
+            ).lower()
+            if not query_id:
+                raise ValueError("funding_query_id_required")
+            if not re.fullmatch(r"[0-9a-f]{64}", source_payload_hash):
+                raise ValueError("funding_source_payload_hash_required")
+            expected_query_identity = {
+                "request_url": query_request_url,
+                "requested_from": requested_from_iso,
+                "requested_through": requested_through_iso,
+                "received_at": received_iso,
+                "payload_sha256": source_payload_hash,
+            }
+            expected_query_id = "okx-funding-query-" + hashlib.sha256(
+                json.dumps(
+                    expected_query_identity, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+            if query_id != expected_query_id:
+                raise ValueError("funding_query_id_mismatch")
+
+            events_raw = raw.get("events")
+            if not isinstance(events_raw, list):
+                raise ValueError("funding_events_list_required")
+            normalized_events: list[dict[str, object]] = []
+            seen_event_ids: set[str] = set()
+            for event_index, raw_event in enumerate(events_raw):
+                event = raw_event if isinstance(raw_event, Mapping) else {}
+                event_id = _normalized_price_observation_text(event.get("source_event_id"))
+                if not event_id or event_id in seen_event_ids:
+                    raise ValueError(f"funding_event_{event_index}_identity_invalid")
+                seen_event_ids.add(event_id)
+                event_at, event_at_iso = _canonical_observation_time(
+                    event.get("event_at"), f"funding_event_{event_index}_event_at"
+                )
+                if event_at < complete_from or event_at > complete_through:
+                    raise ValueError(f"funding_event_{event_index}_outside_complete_range")
+                try:
+                    realized_rate = float(event.get("realized_rate"))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"funding_event_{event_index}_realized_rate_invalid") from exc
+                if not math.isfinite(realized_rate):
+                    raise ValueError(f"funding_event_{event_index}_realized_rate_invalid")
+                method = _normalized_price_observation_text(event.get("method"))
+                formula_type = _normalized_price_observation_text(event.get("formula_type"))
+                if not method or not formula_type:
+                    raise ValueError(f"funding_event_{event_index}_method_formula_required")
+                if event.get("estimated") is not False:
+                    raise ValueError(f"funding_event_{event_index}_estimated_forbidden")
+                normalized_events.append(
+                    {
+                        "source_event_id": event_id,
+                        "event_at": event_at_iso,
+                        "realized_rate": realized_rate,
+                        "method": method,
+                        "formula_type": formula_type,
+                        "estimated": False,
+                    }
+                )
+            normalized_events.sort(key=lambda event: (str(event["event_at"]), str(event["source_event_id"])))
+            payload = {
+                "venue": venue,
+                "inst_id": inst_id,
+                "coverage_status": "complete",
+                "allow_estimates": False,
+                "complete_from": complete_from_iso,
+                "complete_through": complete_through_iso,
+                "requested_from": requested_from_iso,
+                "requested_through": requested_through_iso,
+                "query_id": query_id,
+                "query_request_url": query_request_url,
+                "received_at": received_iso,
+                "http_status": http_status,
+                "request_succeeded": True,
+                "page_count": page_count,
+                "pagination_complete": True,
+                "range_complete": True,
+                "source": {
+                    "name": source_name,
+                    "parser": source_parser,
+                    "endpoint": source_endpoint,
+                    "inst_id": inst_id,
+                },
+                "source_payload_hash": source_payload_hash,
+                "events": normalized_events,
+            }
+            serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            batch_id = "funding-coverage-" + payload_hash[:40]
+            existing = conn.execute(
+                "select payload_hash from paper_funding_coverage_batches where batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload_hash"]) != payload_hash:
+                    raise ValueError("funding_coverage_payload_conflict")
+                result["duplicates"] = int(result["duplicates"]) + 1
+                result["batch_ids"].append(batch_id)
+                continue
+            raw_context = raw.get("context")
+            audit_context = dict(raw_context) if isinstance(raw_context, Mapping) else {}
+            audit_context["request_audit"] = {
+                key: payload[key]
+                for key in (
+                    "requested_from",
+                    "requested_through",
+                    "query_id",
+                    "query_request_url",
+                    "received_at",
+                    "http_status",
+                    "request_succeeded",
+                    "page_count",
+                    "pagination_complete",
+                    "range_complete",
+                )
+            }
+            conn.execute(
+                """
+                insert into paper_funding_coverage_batches (
+                    batch_id,venue,inst_id,complete_from,complete_through,
+                    requested_from,requested_through,query_id,query_request_url,received_at,
+                    http_status,request_succeeded,page_count,pagination_complete,
+                    range_complete,coverage_status,allow_estimates,source_name,
+                    source_parser,source_endpoint,source_payload_hash,payload_hash,context_json
+                ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    batch_id,
+                    venue,
+                    inst_id,
+                    complete_from_iso,
+                    complete_through_iso,
+                    requested_from_iso,
+                    requested_through_iso,
+                    query_id,
+                    query_request_url,
+                    received_iso,
+                    http_status,
+                    1,
+                    page_count,
+                    1,
+                    1,
+                    "complete",
+                    0,
+                    source_name,
+                    source_parser,
+                    source_endpoint,
+                    source_payload_hash,
+                    payload_hash,
+                    json.dumps(audit_context, sort_keys=True),
+                ),
+            )
+            conn.executemany(
+                """
+                insert into paper_realized_funding_events (
+                    batch_id,source_event_id,event_at,realized_rate,method,formula_type,estimated
+                ) values (?,?,?,?,?,?,0)
+                """,
+                [
+                    (
+                        batch_id,
+                        event["source_event_id"],
+                        event["event_at"],
+                        event["realized_rate"],
+                        event["method"],
+                        event["formula_type"],
+                    )
+                    for event in normalized_events
+                ],
+            )
+            result["accepted"] = int(result["accepted"]) + 1
+            result["batch_ids"].append(batch_id)
+        except (TypeError, ValueError, OverflowError) as exc:
+            result["rejected"] = int(result["rejected"]) + 1
+            result["rejections"].append(
+                {"index": index, "reason": str(exc) or "invalid_funding_coverage"}
+            )
+    result["pruned"] = _prune_paper_funding_coverage(conn)
+    if commit:
+        conn.commit()
+    return result
+
+
+def select_paper_funding_coverage(
+    conn: sqlite3.Connection,
+    venue: str,
+    inst_id: str,
+    entry_at: dt.datetime | str,
+    exit_at: dt.datetime | str,
+) -> dict[str, object] | None:
+    """Select complete durable realized-funding coverage through the actual exit event."""
+
+    entry, entry_iso = _canonical_observation_time(entry_at, "entry_at")
+    exit_event, exit_iso = _canonical_observation_time(exit_at, "exit_at")
+    if exit_event <= entry:
+        return None
+    normalized_venue = _normalized_price_observation_text(venue, upper=True)
+    normalized_inst = _normalized_price_observation_text(inst_id, upper=True)
+    row = conn.execute(
+        """
+        select *
+        from paper_funding_coverage_batches
+        where venue=? and inst_id=?
+          and request_succeeded=1 and http_status=200
+          and pagination_complete=1 and range_complete=1
+          and coverage_status='complete' and allow_estimates=0
+          and source_parser='okx_realized_funding_history'
+          and source_endpoint='/api/v5/public/funding-rate-history'
+          and complete_from<=? and complete_through>=?
+        order by (julianday(complete_through)-julianday(complete_from)),
+                 received_at desc,batch_id
+        limit 1
+        """,
+        (normalized_venue, normalized_inst, entry_iso, exit_iso),
+    ).fetchone()
+    if row is None:
+        return None
+    events = conn.execute(
+        """
+        select source_event_id,event_at,realized_rate,method,formula_type,estimated
+        from paper_realized_funding_events
+        where batch_id=? and event_at>? and event_at<=?
+        order by event_at,source_event_id
+        """,
+        (row["batch_id"], entry_iso, exit_iso),
+    ).fetchall()
+    query = {
+        "query_id": str(row["query_id"]),
+        "request_url": str(row["query_request_url"]),
+        "requested_from": str(row["requested_from"]),
+        "requested_through": str(row["requested_through"]),
+        "received_at": str(row["received_at"]),
+        "http_status": int(row["http_status"]),
+        "request_succeeded": bool(row["request_succeeded"]),
+        "page_count": int(row["page_count"]),
+        "pagination_complete": bool(row["pagination_complete"]),
+        "range_complete": bool(row["range_complete"]),
+        "payload_sha256": str(row["source_payload_hash"]),
+    }
+    return {
+        "batch_id": str(row["batch_id"]),
+        "coverage_status": "complete",
+        "allow_estimates": False,
+        "complete_from": str(row["complete_from"]),
+        "complete_through": str(row["complete_through"]),
+        "source": {
+            "name": str(row["source_name"]),
+            "parser": str(row["source_parser"]),
+            "endpoint": str(row["source_endpoint"]),
+            "inst_id": str(row["inst_id"]),
+        },
+        "events": [
+            {
+                "source_event_id": str(event["source_event_id"]),
+                "event_at": str(event["event_at"]),
+                "realized_rate": float(event["realized_rate"]),
+                "method": str(event["method"]),
+                "formula_type": str(event["formula_type"]),
+                "estimated": False,
+            }
+            for event in events
+        ],
+        "query": query,
+        "request_audit": dict(query),
+    }
 
 
 def signal_key(candidate: dict) -> str:
@@ -1942,13 +3635,710 @@ def signal_key(candidate: dict) -> str:
     )
 
 
+def _paper_admission_identity(candidate: dict) -> tuple[str | None, str | None]:
+    metadata = candidate.get("paper_admission")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    admission_key = str(
+        candidate.get("admission_key")
+        or candidate.get("paper_admission_key")
+        or metadata.get("admission_key")
+        or ""
+    ).strip()
+    episode_id = str(
+        candidate.get("admission_episode_id")
+        or candidate.get("episode_id")
+        or metadata.get("episode_id")
+        or ""
+    ).strip()
+    return admission_key or None, episode_id or None
+
+
+def paper_queue_claim_required(settings: dict | None) -> bool:
+    cfg = (settings or {}).get("market_admission") or {}
+    return bool(cfg.get("enabled", True)) and bool(
+        cfg.get("paper_queue_enabled", cfg.get("queue_enabled", False))
+    )
+
+
+def bounded_paper_trade_lineage_valid(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row | Mapping[str, object],
+    settings: dict | None,
+) -> bool:
+    """Require the queue's exact trade artifact for bounded primary consumers."""
+
+    if not paper_queue_claim_required(settings):
+        return True
+    values = {key: row[key] for key in row.keys()} if isinstance(row, sqlite3.Row) else dict(row)
+    trade_id = values.get("id") or values.get("trade_id") or values.get("paper_trade_id")
+    admission_key = str(values.get("admission_key") or "").strip()
+    episode_id = str(
+        values.get("admission_episode_id") or values.get("episode_id") or ""
+    ).strip()
+    if trade_id is None or not admission_key or not episode_id:
+        return False
+    return (
+        conn.execute(
+            """
+            select 1 from paper_admission_queue
+            where paper_trade_id=? and admission_key=? and episode_id=?
+            limit 1
+            """,
+            (int(trade_id), admission_key, episode_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def _paper_queue_claim_identity(
+    candidate: dict,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    metadata = candidate.get("paper_admission")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    queue_id = str(
+        candidate.get("_paper_admission_queue_id") or metadata.get("queue_id") or ""
+    ).strip()
+    admission_key, episode_id = _paper_admission_identity(candidate)
+    claim_token = str(
+        candidate.get("_paper_admission_claim_token")
+        or candidate.get("paper_admission_claim_token")
+        or metadata.get("claim_token")
+        or ""
+    ).strip()
+    return queue_id or None, admission_key, episode_id, claim_token or None
+
+
+_BOUNDED_CLAIM_IDENTITY_FIELDS = (
+    "venue",
+    "inst_id",
+    "instrument_id",
+    "proxy_surface",
+    "market_surface",
+    "surface_type_classified",
+    "trade_type",
+    "signal_lineage_key",
+    "strategy_lab_id",
+    "strategy_lab_version",
+    "signal_variant_id",
+    "strategy_lineage_root_id",
+    "strategy_lab_lineage_root_id",
+    "signal_lineage_root_id",
+    "strategy_lab_root_id",
+    "parent_strategy_lab_id",
+    "direction",
+    "admission_key",
+    "paper_admission_key",
+    "episode_id",
+    "admission_episode_id",
+    "admission_identity_version",
+    "_paper_admission_queue_id",
+)
+# Claim tokens are deliberately not part of the durable identity snapshot.
+# They authorize one selection attempt and legitimately rotate when an
+# approved-capacity or retry episode is reclaimed.  Current-claim validation
+# below still requires the exact token before any new artifact can be written.
+_BOUNDED_CLAIM_NESTED_IDENTITY_FIELDS = (
+    "admission_key",
+    "episode_id",
+    "identity_version",
+    "normalized_direction",
+    "legacy_v1_admission_key",
+    "strategy_lineage",
+    "queue_id",
+)
+_BOUNDED_ENTRY_MAX_AGE_SECONDS = 90.0
+_BOUNDED_CLAIM_QUOTE_FIELDS = (
+    "last",
+    "bid",
+    "ask",
+    "mark_price",
+    "index_price",
+    "spot_price",
+    "perp_price",
+    "spot_last",
+    "perp_last",
+)
+_BOUNDED_ENTRY_EVENT_FIELDS = (
+    "book_timestamp",
+    "exchange_timestamp",
+    "source_timestamp",
+    "ticker_timestamp",
+    "source_observed_at",
+    "book_observed_at",
+    "observed_at",
+    "seen_at",
+)
+
+
+def _bounded_claim_identity_snapshot(candidate: dict) -> dict[str, object]:
+    metadata = candidate.get("paper_admission")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return {
+        "candidate": {
+            key: candidate.get(key)
+            for key in _BOUNDED_CLAIM_IDENTITY_FIELDS
+            if key in candidate
+        },
+        "paper_admission": {
+            key: metadata.get(key)
+            for key in _BOUNDED_CLAIM_NESTED_IDENTITY_FIELDS
+            if key in metadata
+        },
+    }
+
+
+def _bounded_queue_entry_event_time(
+    row: sqlite3.Row | Mapping[str, object],
+    candidate: dict,
+    *,
+    now: str | dt.datetime | None = None,
+) -> dt.datetime | None:
+    """Return the exact fresh queue quote time or fail closed.
+
+    The queue marker is copied into every selected claim.  Source timestamps,
+    when present, must resolve to that same event; scanner receipt time cannot
+    silently replace the quote event that defines the paper entry.
+    """
+
+    values = dict(row)
+    metadata = candidate.get("paper_admission")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    queue_value = values.get("evidence_observed_at")
+    marker_value = candidate.get(
+        "_paper_admission_evidence_observed_at"
+    ) or metadata.get("evidence_observed_at")
+    try:
+        queue_event = _parse_storage_iso(str(queue_value or "")).astimezone(
+            dt.timezone.utc
+        )
+        marker_event = _parse_storage_iso(str(marker_value or "")).astimezone(
+            dt.timezone.utc
+        )
+    except (TypeError, ValueError):
+        return None
+    if marker_event != queue_event:
+        return None
+
+    source_present = False
+    source_event: dt.datetime | None = None
+    for field in _BOUNDED_ENTRY_EVENT_FIELDS:
+        raw = candidate.get(field)
+        if raw in (None, ""):
+            continue
+        source_present = True
+        try:
+            source_event = _parse_storage_iso(str(raw)).astimezone(dt.timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        break
+    if source_present and source_event is None:
+        return None
+    if source_event is not None and source_event != queue_event:
+        return None
+
+    try:
+        current = (
+            now.astimezone(dt.timezone.utc)
+            if isinstance(now, dt.datetime) and now.tzinfo is not None
+            else now.replace(tzinfo=dt.timezone.utc)
+            if isinstance(now, dt.datetime)
+            else _parse_storage_iso(str(now)).astimezone(dt.timezone.utc)
+            if now is not None
+            else dt.datetime.now(dt.timezone.utc)
+        )
+    except (TypeError, ValueError):
+        return None
+    age_seconds = (current - queue_event).total_seconds()
+    if age_seconds < 0.0 or age_seconds > _BOUNDED_ENTRY_MAX_AGE_SECONDS:
+        return None
+    return queue_event
+
+
+def _bounded_queue_candidate_identity_valid(
+    row: sqlite3.Row,
+    candidate: dict,
+    *,
+    require_current_claim: bool = True,
+) -> bool:
+    """Require the claimed candidate to retain the queue's exact identity."""
+
+    try:
+        stored = json.loads(row["candidate_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(stored, dict):
+        return False
+    if _bounded_claim_identity_snapshot(candidate) != _bounded_claim_identity_snapshot(
+        stored
+    ):
+        return False
+
+    queue_id, admission_key, episode_id, claim_token = _paper_queue_claim_identity(
+        candidate
+    )
+    if (
+        queue_id != str(row["queue_id"])
+        or admission_key != str(row["admission_key"])
+        or episode_id != str(row["episode_id"])
+    ):
+        return False
+    if require_current_claim:
+        if any(candidate.get(field) != stored.get(field) for field in _BOUNDED_CLAIM_QUOTE_FIELDS):
+            return False
+        expected_token = str(
+            row["claim_token"] or row["consumed_claim_token"] or ""
+        ).strip()
+        if not expected_token or claim_token != expected_token:
+            return False
+
+    # Recompute the canonical identity as a second, independent check.  The
+    # import is local because market_admission imports storage for reporting.
+    from market_admission import (
+        admission_key_for,
+        admission_lineage_for,
+        admission_surface_for,
+    )
+
+    if str(admission_key_for(candidate)) != str(row["admission_key"]):
+        return False
+    if str(candidate.get("venue") or "").strip().upper() != str(row["venue"]):
+        return False
+    if str(candidate.get("inst_id") or candidate.get("instrument_id") or "").strip() != str(
+        row["inst_id"]
+    ):
+        return False
+    if str(admission_surface_for(candidate)) != str(row["market_surface"]):
+        return False
+    candidate_lineage_root = str(
+        candidate.get("strategy_lineage_root_id")
+        or candidate.get("strategy_lab_lineage_root_id")
+        or candidate.get("signal_lineage_root_id")
+        or admission_lineage_for(candidate)
+    ).strip()
+    if candidate_lineage_root != str(row["lineage_root"]):
+        return False
+    return str(candidate.get("direction") or "").strip().lower() == str(
+        row["direction"] or ""
+    ).strip().lower()
+
+
+def bounded_paper_artifact_identity_valid(
+    queue_row: sqlite3.Row | Mapping[str, object],
+    artifact: sqlite3.Row | Mapping[str, object],
+) -> bool:
+    """Verify an opportunity/order/trade still matches its selected snapshot."""
+
+    queue_values = dict(queue_row)
+    artifact_values = dict(artifact)
+    try:
+        candidate = json.loads(artifact_values["candidate_json"] or "{}")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(candidate, dict):
+        return False
+    if not _bounded_queue_candidate_identity_valid(
+        queue_values,
+        candidate,
+        require_current_claim=False,
+    ):
+        return False
+    admission_key = str(artifact_values.get("admission_key") or "")
+    episode_id = str(artifact_values.get("admission_episode_id") or "")
+    if (
+        admission_key != str(queue_values["admission_key"])
+        or episode_id != str(queue_values["episode_id"])
+    ):
+        return False
+    for field, normalized_artifact, normalized_candidate in (
+        (
+            "venue",
+            str(artifact_values.get("venue") or "").strip().upper(),
+            str(candidate.get("venue") or "").strip().upper(),
+        ),
+        (
+            "inst_id",
+            str(artifact_values.get("inst_id") or "").strip(),
+            str(candidate.get("inst_id") or candidate.get("instrument_id") or "").strip(),
+        ),
+        (
+            "direction",
+            str(artifact_values.get("direction") or "").strip().lower(),
+            str(candidate.get("direction") or "").strip().lower(),
+        ),
+        (
+            "trade_type",
+            str(artifact_values.get("trade_type") or "unknown").strip(),
+            str(candidate.get("trade_type") or "unknown").strip(),
+        ),
+    ):
+        if normalized_artifact != normalized_candidate:
+            return False
+    return True
+
+
+def _bounded_paper_queue_row_for_candidate(
+    conn: sqlite3.Connection,
+    candidate: dict,
+) -> sqlite3.Row | None:
+    queue_id, admission_key, episode_id, _claim_token = _paper_queue_claim_identity(candidate)
+    if not queue_id or not admission_key or not episode_id:
+        return None
+    row = conn.execute(
+        """
+        select * from paper_admission_queue
+        where queue_id=? and admission_key=? and episode_id=?
+        limit 1
+        """,
+        (queue_id, admission_key, episode_id),
+    ).fetchone()
+    if row is None or not _bounded_queue_candidate_identity_valid(row, candidate):
+        return None
+    return row
+
+
+def _bounded_queue_settings() -> dict:
+    """Internal settings used when a candidate already names an exact queue row."""
+
+    return {
+        "market_admission": {
+            "enabled": True,
+            "paper_queue_enabled": True,
+        }
+    }
+
+
+def _prepare_bounded_execution_order_binding(
+    conn: sqlite3.Connection,
+    candidate: dict,
+    settings: dict | None,
+) -> sqlite3.Row:
+    """Validate that an exact claim was consumed and remains artifact-free."""
+
+    row = _bounded_paper_queue_row_for_candidate(conn, candidate)
+    if row is None:
+        raise ValueError("bounded_paper_queue_claim_invalid")
+    if _bounded_queue_entry_event_time(row, candidate) is None:
+        raise ValueError("bounded_paper_queue_entry_event_invalid")
+    _queue_id, admission_key, episode_id, claim_token = _paper_queue_claim_identity(candidate)
+    if not claim_token:
+        raise ValueError("bounded_paper_queue_claim_invalid")
+    if (
+        str(row["status"] or "") != "paper_open"
+        or row["claim_token"] is not None
+        or str(row["consumed_claim_token"] or "") != claim_token
+        or row["claim_consumed_at"] is None
+        or row["execution_order_id"] is not None
+        or row["paper_trade_id"] is not None
+    ):
+        raise ValueError("bounded_paper_execution_order_already_bound")
+    existing = conn.execute(
+        """
+        select 1 from execution_orders
+        where admission_key=? and admission_episode_id=? and status='paper_filled'
+        limit 1
+        """,
+        (admission_key, episode_id),
+    ).fetchone()
+    if existing is not None:
+        raise ValueError("bounded_paper_execution_order_already_exists")
+    return row
+
+
+def _bind_bounded_execution_order(
+    conn: sqlite3.Connection,
+    candidate: dict,
+    execution_order_id: int,
+) -> bool:
+    queue_id, admission_key, episode_id, claim_token = _paper_queue_claim_identity(candidate)
+    if not queue_id or not admission_key or not episode_id or not claim_token:
+        return False
+    conn.execute(
+        """
+        update paper_admission_queue
+        set execution_order_id=?,updated_at=?
+        where queue_id=? and admission_key=? and episode_id=?
+          and status='paper_open' and claim_token is null
+          and consumed_claim_token=? and claim_consumed_at is not null
+          and execution_order_id is null and paper_trade_id is null
+        """,
+        (int(execution_order_id), utc_now(), queue_id, admission_key, episode_id, claim_token),
+    )
+    return (
+        conn.execute(
+            """
+            select 1 from paper_admission_queue
+            where queue_id=? and admission_key=? and episode_id=?
+              and execution_order_id=? and paper_trade_id is null
+            limit 1
+            """,
+            (queue_id, admission_key, episode_id, int(execution_order_id)),
+        ).fetchone()
+        is not None
+    )
+
+
+def _bind_bounded_paper_trade(
+    conn: sqlite3.Connection,
+    candidate: dict,
+    execution_order_id: int,
+    paper_trade_id: int,
+) -> bool:
+    queue_id, admission_key, episode_id, claim_token = _paper_queue_claim_identity(candidate)
+    if not queue_id or not admission_key or not episode_id or not claim_token:
+        return False
+    conn.execute(
+        """
+        update paper_admission_queue
+        set paper_trade_id=?,updated_at=?
+        where queue_id=? and admission_key=? and episode_id=?
+          and status='paper_open' and claim_token is null
+          and consumed_claim_token=? and claim_consumed_at is not null
+          and execution_order_id=? and paper_trade_id is null
+        """,
+        (
+            int(paper_trade_id),
+            utc_now(),
+            queue_id,
+            admission_key,
+            episode_id,
+            claim_token,
+            int(execution_order_id),
+        ),
+    )
+    return (
+        conn.execute(
+            """
+            select 1 from paper_admission_queue
+            where queue_id=? and admission_key=? and episode_id=?
+              and execution_order_id=? and paper_trade_id=?
+            limit 1
+            """,
+            (
+                queue_id,
+                admission_key,
+                episode_id,
+                int(execution_order_id),
+                int(paper_trade_id),
+            ),
+        ).fetchone()
+        is not None
+    )
+
+
+def bounded_paper_queue_claim_valid(
+    conn: sqlite3.Connection,
+    candidate: dict,
+    settings: dict | None,
+) -> bool:
+    """Verify the exact, unexpired queue lease authorizing paper artifacts."""
+
+    if not paper_queue_claim_required(settings):
+        return True
+    queue_id, admission_key, episode_id, claim_token = _paper_queue_claim_identity(candidate)
+    if not queue_id or not admission_key or not episode_id or not claim_token:
+        return False
+    queue_row = _bounded_paper_queue_row_for_candidate(conn, candidate)
+    checked_at = utc_now()
+    if queue_row is None or _bounded_queue_entry_event_time(
+        queue_row,
+        candidate,
+        now=checked_at,
+    ) is None:
+        return False
+    row = conn.execute(
+        """
+        select 1 from paper_admission_queue
+        where queue_id=? and admission_key=? and episode_id=? and claim_token=?
+          and claimed_by is not null and lease_expires_at is not null
+          and julianday(lease_expires_at) > julianday(?)
+          and status in ('queued_review','approved_waiting_capacity','retry_wait')
+        limit 1
+        """,
+        (queue_id, admission_key, episode_id, claim_token, checked_at),
+    ).fetchone()
+    return row is not None
+
+
+def consume_bounded_paper_queue_claim(
+    conn: sqlite3.Connection,
+    candidate: dict,
+    settings: dict | None,
+    *,
+    now: str | None = None,
+) -> bool:
+    """Atomically consume one exact live lease and move its episode to paper-open."""
+
+    if not paper_queue_claim_required(settings):
+        return True
+    queue_id, admission_key, episode_id, claim_token = _paper_queue_claim_identity(candidate)
+    if not queue_id or not admission_key or not episode_id or not claim_token:
+        return False
+    queue_row = _bounded_paper_queue_row_for_candidate(conn, candidate)
+    consumed_at = now or utc_now()
+    if queue_row is None or _bounded_queue_entry_event_time(
+        queue_row,
+        candidate,
+        now=consumed_at,
+    ) is None:
+        return False
+    previous = conn.execute(
+        """
+        select status,lane,evidence_fingerprint from paper_admission_queue
+        where queue_id=? and admission_key=? and episode_id=? and claim_token=?
+          and claimed_by is not null and lease_expires_at is not null
+          and julianday(lease_expires_at) > julianday(?)
+          and status in ('queued_review','approved_waiting_capacity','retry_wait')
+        limit 1
+        """,
+        (queue_id, admission_key, episode_id, claim_token, consumed_at),
+    ).fetchone()
+    if previous is None:
+        return False
+    updated = conn.execute(
+        """
+        update paper_admission_queue
+        set status='paper_open',updated_at=?,last_decision='paper_filled',
+            last_reason='bounded_paper_queue_claim_consumed',
+            consumed_claim_token=claim_token,claim_consumed_at=?,
+            claimed_by=null,claim_token=null,lease_expires_at=null,next_eligible_at=null
+        where queue_id=? and admission_key=? and episode_id=? and claim_token=?
+          and claimed_by is not null and lease_expires_at is not null
+          and julianday(lease_expires_at) > julianday(?)
+          and status in ('queued_review','approved_waiting_capacity','retry_wait')
+        """,
+        (
+            consumed_at,
+            consumed_at,
+            queue_id,
+            admission_key,
+            episode_id,
+            claim_token,
+            consumed_at,
+        ),
+    ).rowcount
+    if updated != 1:
+        return False
+    conn.execute(
+        """
+        insert into market_admission_transitions(
+            admission_key,episode_id,occurred_at,from_stage,to_stage,
+            transition_kind,reason_code,evidence_fingerprint,details_json
+        ) values(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            admission_key,
+            episode_id,
+            consumed_at,
+            f"queue:{previous['status']}",
+            "queue:paper_open",
+            "queue_claim_consumed",
+            "bounded_paper_fill_claim_consumed",
+            previous["evidence_fingerprint"],
+            json.dumps({"queue_id": queue_id, "lane": previous["lane"]}, sort_keys=True),
+        ),
+    )
+    return True
+
+
+def bounded_paper_queue_claim_consumed_for_execution(
+    conn: sqlite3.Connection,
+    candidate: dict,
+    execution_order_id: int | None,
+    settings: dict | None,
+) -> bool:
+    """Authorize the trade insert belonging to the bundle that consumed a lease."""
+
+    if not paper_queue_claim_required(settings):
+        return True
+    if execution_order_id is None:
+        return False
+    queue_id, admission_key, episode_id, claim_token = _paper_queue_claim_identity(candidate)
+    if not queue_id or not admission_key or not episode_id or not claim_token:
+        return False
+    if _bounded_paper_queue_row_for_candidate(conn, candidate) is None:
+        return False
+    return (
+        conn.execute(
+            """
+            select 1
+            from paper_admission_queue q
+            join execution_orders e
+              on e.admission_key=q.admission_key
+             and e.admission_episode_id=q.episode_id
+            where q.queue_id=? and q.admission_key=? and q.episode_id=?
+              and q.status='paper_open' and q.claim_token is null
+              and q.consumed_claim_token=? and q.claim_consumed_at is not null
+              and q.execution_order_id=e.id and q.paper_trade_id is null
+              and e.id=? and e.status='paper_filled'
+            limit 1
+            """,
+            (queue_id, admission_key, episode_id, claim_token, int(execution_order_id)),
+        ).fetchone()
+        is not None
+    )
+
+
 def save_opportunity(conn: sqlite3.Connection, candidate: dict, review: dict) -> int:
+    queue_id, _queue_key, _queue_episode, claim_token = _paper_queue_claim_identity(
+        candidate
+    )
+    queue_row = None
+    if queue_id or claim_token:
+        queue_row = _bounded_paper_queue_row_for_candidate(conn, candidate)
+        if queue_row is None:
+            raise ValueError("bounded_paper_opportunity_identity_invalid")
+    admission_key, admission_episode_id = _paper_admission_identity(candidate)
+    if queue_row is not None and queue_row["opportunity_id"] is not None:
+        existing = conn.execute(
+            "select * from opportunities where id=? and admission_key=? "
+            "and admission_episode_id=? limit 1",
+            (
+                int(queue_row["opportunity_id"]),
+                admission_key,
+                admission_episode_id,
+            ),
+        ).fetchone()
+        if existing is None or not bounded_paper_artifact_identity_valid(
+            queue_row,
+            existing,
+        ):
+            raise ValueError("bounded_paper_opportunity_binding_corrupt")
+        conn.execute(
+            """
+            update opportunities
+            set seen_at=?,venue=?,inst_id=?,direction=?,trade_type=?,
+                base_score=?,learned_score=?,decision=?,candidate_json=?,review_json=?,
+                strategy_lab_id=?,strategy_lab_version=?
+            where id=?
+            """,
+            (
+                candidate.get("seen_at") or utc_now(),
+                candidate["venue"],
+                candidate["inst_id"],
+                candidate["direction"],
+                candidate.get("trade_type", "unknown"),
+                candidate["score"],
+                review["learned_score"],
+                review["decision"],
+                json.dumps(candidate, sort_keys=True),
+                json.dumps(review, sort_keys=True),
+                candidate.get("strategy_lab_id"),
+                int(candidate["strategy_lab_version"])
+                if candidate.get("strategy_lab_version") is not None
+                else None,
+                int(existing["id"]),
+            ),
+        )
+        conn.commit()
+        return int(existing["id"])
     cur = conn.execute(
         """
         insert into opportunities (
             seen_at, venue, inst_id, direction, trade_type, base_score, learned_score,
-            decision, candidate_json, review_json, strategy_lab_id, strategy_lab_version
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            decision, candidate_json, review_json, strategy_lab_id, strategy_lab_version,
+            admission_key, admission_episode_id
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             candidate.get("seen_at") or utc_now(),
@@ -1963,10 +4353,28 @@ def save_opportunity(conn: sqlite3.Connection, candidate: dict, review: dict) ->
             json.dumps(review, sort_keys=True),
             candidate.get("strategy_lab_id"),
             int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
+            admission_key,
+            admission_episode_id,
         ),
     )
+    opportunity_id = int(cur.lastrowid)
+    if queue_row is not None:
+        conn.execute(
+            """
+            update paper_admission_queue
+            set opportunity_id=coalesce(opportunity_id,?),updated_at=?
+            where queue_id=? and admission_key=? and episode_id=?
+            """,
+            (
+                opportunity_id,
+                utc_now(),
+                queue_row["queue_id"],
+                queue_row["admission_key"],
+                queue_row["episode_id"],
+            ),
+        )
     conn.commit()
-    return int(cur.lastrowid)
+    return opportunity_id
 
 
 def update_opportunity_decision(
@@ -2304,84 +4712,327 @@ def open_paper_trade(
     review: dict,
     execution: dict | None = None,
     settings: dict | None = None,
+    *,
+    commit: bool = True,
 ) -> int:
     if execution and isinstance(execution.get("candidate"), dict):
         candidate = execution["candidate"]
-    entry = candidate["last"]
-    execution_order_id = None
-    opportunity_id = None
-    route_id = None
-    entry_fee_bps = 0.0
-    entry_slippage_bps = 0.0
-    if execution:
-        execution_order_id = execution.get("order_id")
-        opportunity_id = execution.get("opportunity_id")
-        route_id = execution.get("order", {}).get("route_id")
-        fills = execution.get("fills") or []
-        if fills:
-            entry = fills[0].get("fill_price", entry)
-            entry_fee_bps = float(fills[0].get("fee_bps", 0.0))
-            entry_slippage_bps = float(fills[0].get("slippage_bps", 0.0))
-    context = _candidate_context(candidate, review)
-    candidate_signal_key = signal_key(candidate)
-    fallback_hold = int(((settings or {}).get("scanner") or {}).get("hold_minutes", 60)) if isinstance(settings, dict) else 60
-    hold_trade_row = {
-        "venue": candidate.get("venue"),
-        "trade_type": candidate.get("trade_type", "unknown"),
-        "direction": candidate.get("direction"),
-        "signal_key": candidate_signal_key,
-    }
-    hold_decision = select_paper_hold_minutes(conn, hold_trade_row, fallback_hold, settings)
-    selected_hold_minutes = int(hold_decision["hold_minutes"])
-    context["selected_hold_minutes"] = selected_hold_minutes
-    diagnostic_tags = proxy_paper_trade_diagnostic_tags(
-        candidate,
-        context=context,
-        review=review,
-        selected_hold_minutes=selected_hold_minutes,
+    execution_order_id = execution.get("order_id") if execution else None
+    queue_id, admission_key, admission_episode_id, claim_token = (
+        _paper_queue_claim_identity(candidate)
     )
-    if diagnostic_tags:
-        context["paper_trade_diagnostic_tags"] = diagnostic_tags
-    cur = conn.execute(
-        """
-        insert into paper_trades (
-            opened_at, venue, inst_id, direction, trade_type, signal_key, base_score,
-            learned_score, entry, status, thesis, candidate_json, review_json,
-            execution_order_id, route_id, entry_fee_bps, entry_slippage_bps, context_json,
-            signal_variant_id, selected_hold_minutes, hold_decision_json,
-            strategy_lab_id, strategy_lab_version, opportunity_id,
-            strategy_lineage_root_id
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            utc_now(),
-            candidate["venue"],
-            candidate["inst_id"],
-            candidate["direction"],
-            candidate.get("trade_type", "unknown"),
-            candidate_signal_key,
-            candidate["score"],
-            review["learned_score"],
-            entry,
-            candidate.get("thesis", ""),
-            json.dumps(candidate, sort_keys=True),
-            json.dumps(review, sort_keys=True),
-            execution_order_id,
-            route_id,
-            entry_fee_bps,
-            entry_slippage_bps,
-            json.dumps(context, sort_keys=True),
-            candidate.get("signal_variant_id"),
-            selected_hold_minutes,
-            json.dumps(hold_decision, sort_keys=True),
-            candidate.get("strategy_lab_id"),
-            int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
-            opportunity_id,
-            strategy_lineage_root_id(candidate),
-        ),
+    claim_required = paper_queue_claim_required(settings) or bool(
+        queue_id and admission_key and admission_episode_id
     )
-    conn.commit()
-    return int(cur.lastrowid)
+    effective_settings = (
+        settings if paper_queue_claim_required(settings) else _bounded_queue_settings()
+    )
+    claim_savepoint = "bounded_paper_trade_binding"
+    started_transaction = False
+    savepoint_active = False
+    bounded_entry_opened_at: str | None = None
+    if claim_required:
+        if not conn.in_transaction:
+            conn.execute("begin immediate")
+            started_transaction = True
+        conn.execute(f"savepoint {claim_savepoint}")
+        savepoint_active = True
+    try:
+        if claim_required:
+            queue_row = _bounded_paper_queue_row_for_candidate(conn, candidate)
+            if queue_row is None or not claim_token:
+                raise ValueError("bounded_paper_queue_claim_invalid")
+
+            bound_trade_id = queue_row["paper_trade_id"]
+            if bound_trade_id is not None:
+                existing = conn.execute(
+                    """
+                    select p.id,p.execution_order_id
+                    from paper_trades p
+                    join execution_orders e on e.id=p.execution_order_id
+                    where p.id=? and p.admission_key=?
+                      and p.admission_episode_id=?
+                      and e.id=? and e.admission_key=p.admission_key
+                      and e.admission_episode_id=p.admission_episode_id
+                      and e.status='paper_filled'
+                    limit 1
+                    """,
+                    (
+                        int(bound_trade_id),
+                        admission_key,
+                        admission_episode_id,
+                        int(queue_row["execution_order_id"]),
+                    ),
+                ).fetchone()
+                if (
+                    existing is None
+                    or str(queue_row["consumed_claim_token"] or "") != claim_token
+                    or (
+                        execution_order_id is not None
+                        and int(execution_order_id)
+                        != int(existing["execution_order_id"])
+                    )
+                ):
+                    raise ValueError("bounded_paper_trade_binding_corrupt")
+                conn.execute(f"release savepoint {claim_savepoint}")
+                savepoint_active = False
+                if commit:
+                    conn.commit()
+                return int(existing["id"])
+
+            bounded_entry_event = _bounded_queue_entry_event_time(
+                queue_row,
+                candidate,
+            )
+            if bounded_entry_event is None:
+                raise ValueError("bounded_paper_queue_entry_event_invalid")
+            bounded_entry_opened_at = str(queue_row["evidence_observed_at"])
+
+            risk_cfg = (
+                (settings or {}).get("risk") or {}
+                if isinstance(settings, dict)
+                else {}
+            )
+            max_open_paper_trades = min(
+                100,
+                max(0, int(risk_cfg.get("max_open_paper_trades", 100))),
+            )
+            open_trade_count = int(
+                conn.execute(
+                    "select count(*) from paper_trades where status='open'"
+                ).fetchone()[0]
+            )
+            if open_trade_count >= max_open_paper_trades:
+                raise ValueError("bounded_paper_open_trade_capacity_exhausted")
+
+            if execution_order_id is None and queue_row["execution_order_id"] is not None:
+                stored_order = conn.execute(
+                    """
+                    select id,order_json,opportunity_id
+                    from execution_orders
+                    where id=? and admission_key=? and admission_episode_id=?
+                      and status='paper_filled'
+                    limit 1
+                    """,
+                    (
+                        int(queue_row["execution_order_id"]),
+                        admission_key,
+                        admission_episode_id,
+                    ),
+                ).fetchone()
+                if stored_order is None:
+                    raise ValueError("bounded_paper_execution_order_binding_corrupt")
+                execution_order_id = int(stored_order["id"])
+                stored_fills = []
+                for fill_row in conn.execute(
+                    "select fill_json from execution_fills where order_id=? order by id",
+                    (execution_order_id,),
+                ).fetchall():
+                    try:
+                        stored_fills.append(json.loads(fill_row["fill_json"]))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                execution = {
+                    "candidate": candidate,
+                    "order_id": execution_order_id,
+                    "opportunity_id": stored_order["opportunity_id"],
+                    "order": json.loads(stored_order["order_json"] or "{}"),
+                    "fills": stored_fills,
+                }
+
+            if execution_order_id is None:
+                if bounded_paper_queue_claim_valid(
+                    conn, candidate, effective_settings
+                ) and not consume_bounded_paper_queue_claim(
+                    conn, candidate, effective_settings
+                ):
+                    raise ValueError("bounded_paper_queue_claim_invalid")
+                queue_row = _bounded_paper_queue_row_for_candidate(conn, candidate)
+                if (
+                    queue_row is None
+                    or str(queue_row["status"] or "") != "paper_open"
+                    or queue_row["claim_token"] is not None
+                    or str(queue_row["consumed_claim_token"] or "") != claim_token
+                    or queue_row["claim_consumed_at"] is None
+                    or queue_row["execution_order_id"] is not None
+                    or queue_row["paper_trade_id"] is not None
+                ):
+                    raise ValueError("bounded_paper_queue_claim_invalid")
+                supplied_order = (
+                    dict(execution.get("order") or {}) if execution else {}
+                )
+                order = {
+                    "mode": "paper",
+                    "route_id": str(
+                        supplied_order.get("route_id")
+                        or review.get("effective_route_id")
+                        or review.get("route_id")
+                        or candidate.get("effective_route_id")
+                        or candidate.get("route_id")
+                        or f"{str(candidate.get('venue') or 'bounded').lower()}_paper"
+                    ),
+                    "status": "paper_filled",
+                    "notional_usd": float(
+                        supplied_order.get(
+                            "notional_usd",
+                            risk_cfg.get("paper_notional_usd", 100.0),
+                        )
+                    ),
+                }
+                supplied_opportunity_id = (
+                    execution.get("opportunity_id") if execution else None
+                )
+                supplied_fills = list(execution.get("fills") or []) if execution else []
+                execution_order_id = save_execution_order(
+                    conn,
+                    order,
+                    candidate,
+                    review,
+                    opportunity_id=supplied_opportunity_id,
+                    commit=False,
+                    settings=effective_settings,
+                )
+                execution = {
+                    "candidate": candidate,
+                    "order_id": execution_order_id,
+                    "opportunity_id": supplied_opportunity_id,
+                    "order": order,
+                    "fills": supplied_fills,
+                }
+            if not bounded_paper_queue_claim_consumed_for_execution(
+                conn,
+                candidate,
+                int(execution_order_id),
+                effective_settings,
+            ):
+                raise ValueError("bounded_paper_execution_order_not_authorized")
+        elif execution_order_id is not None:
+            existing = conn.execute(
+                "select id from paper_trades where execution_order_id=? order by id limit 1",
+                (int(execution_order_id),),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+
+        entry = candidate["last"]
+        opportunity_id = None
+        route_id = None
+        entry_fee_bps = 0.0
+        entry_slippage_bps = 0.0
+        if execution:
+            opportunity_id = execution.get("opportunity_id")
+            route_id = execution.get("order", {}).get("route_id")
+            fills = execution.get("fills") or []
+            if fills:
+                entry = fills[0].get("fill_price", entry)
+                entry_fee_bps = float(fills[0].get("fee_bps", 0.0))
+                entry_slippage_bps = float(fills[0].get("slippage_bps", 0.0))
+        context = _candidate_context(candidate, review)
+        fill_recorded_at = utc_now()
+        opened_at = bounded_entry_opened_at or fill_recorded_at
+        if claim_required:
+            context.update(
+                {
+                    "paper_entry_time_semantics": "queue_evidence_quote_event_time",
+                    "paper_entry_quote_event_at": opened_at,
+                    "paper_fill_recorded_at": fill_recorded_at,
+                }
+            )
+        candidate_signal_key = signal_key(candidate)
+        fallback_hold = (
+            int(((settings or {}).get("scanner") or {}).get("hold_minutes", 60))
+            if isinstance(settings, dict)
+            else 60
+        )
+        hold_trade_row = {
+            "venue": candidate.get("venue"),
+            "trade_type": candidate.get("trade_type", "unknown"),
+            "direction": candidate.get("direction"),
+            "signal_key": candidate_signal_key,
+        }
+        hold_decision = select_paper_hold_minutes(
+            conn, hold_trade_row, fallback_hold, settings
+        )
+        selected_hold_minutes = int(hold_decision["hold_minutes"])
+        context["selected_hold_minutes"] = selected_hold_minutes
+        diagnostic_tags = proxy_paper_trade_diagnostic_tags(
+            candidate,
+            context=context,
+            review=review,
+            selected_hold_minutes=selected_hold_minutes,
+        )
+        if diagnostic_tags:
+            context["paper_trade_diagnostic_tags"] = diagnostic_tags
+        cur = conn.execute(
+            """
+            insert into paper_trades (
+                opened_at, venue, inst_id, direction, trade_type, signal_key, base_score,
+                learned_score, entry, status, thesis, candidate_json, review_json,
+                execution_order_id, route_id, entry_fee_bps, entry_slippage_bps, context_json,
+                signal_variant_id, selected_hold_minutes, hold_decision_json,
+                strategy_lab_id, strategy_lab_version, opportunity_id,
+                strategy_lineage_root_id, admission_key, admission_episode_id
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                opened_at,
+                candidate["venue"],
+                candidate["inst_id"],
+                candidate["direction"],
+                candidate.get("trade_type", "unknown"),
+                candidate_signal_key,
+                candidate["score"],
+                review["learned_score"],
+                entry,
+                candidate.get("thesis", ""),
+                json.dumps(candidate, sort_keys=True),
+                json.dumps(review, sort_keys=True),
+                execution_order_id,
+                route_id,
+                entry_fee_bps,
+                entry_slippage_bps,
+                json.dumps(context, sort_keys=True),
+                candidate.get("signal_variant_id"),
+                selected_hold_minutes,
+                json.dumps(hold_decision, sort_keys=True),
+                candidate.get("strategy_lab_id"),
+                int(candidate["strategy_lab_version"])
+                if candidate.get("strategy_lab_version") is not None
+                else None,
+                opportunity_id,
+                strategy_lineage_root_id(candidate),
+                admission_key,
+                admission_episode_id,
+            ),
+        )
+        trade_id = int(cur.lastrowid)
+        if claim_required and not _bind_bounded_paper_trade(
+            conn, candidate, int(execution_order_id), trade_id
+        ):
+            raise ValueError("bounded_paper_trade_binding_failed")
+        if savepoint_active:
+            conn.execute(f"release savepoint {claim_savepoint}")
+            savepoint_active = False
+        if commit:
+            conn.commit()
+        return trade_id
+    except sqlite3.IntegrityError as exc:
+        if savepoint_active:
+            conn.execute(f"rollback to savepoint {claim_savepoint}")
+            conn.execute(f"release savepoint {claim_savepoint}")
+            savepoint_active = False
+        if started_transaction:
+            conn.rollback()
+        if claim_required:
+            raise ValueError(f"bounded_paper_trade_rejected: {exc}") from exc
+        raise
+    except Exception:
+        if savepoint_active:
+            conn.execute(f"rollback to savepoint {claim_savepoint}")
+            conn.execute(f"release savepoint {claim_savepoint}")
+        if started_transaction:
+            conn.rollback()
+        raise
 
 
 def _hold_optimizer_config(settings: dict | None, fallback_hold_minutes: int) -> dict:
@@ -2512,6 +5163,7 @@ def _horizon_metrics_for_group(
     confidence_adjustment_enabled: bool = True,
     confidence_target_effective_samples: float = 48.0,
     confidence_floor: float = 0.25,
+    require_exact_queue_lineage: bool = False,
 ) -> list[dict]:
     if not horizons:
         return []
@@ -2533,17 +5185,36 @@ def _horizon_metrics_for_group(
         params = parts
     else:
         return []
+    exact_queue_sql = ""
+    if require_exact_queue_lineage:
+        exact_queue_sql = """
+          and p.admission_key is not null
+          and p.admission_episode_id is not null
+          and exists (
+              select 1 from paper_admission_queue q
+              where q.paper_trade_id=p.id
+                and q.admission_key=p.admission_key
+                and q.episode_id=p.admission_episode_id
+          )
+        """
     rows = conn.execute(
         f"""
-        select o.horizon_minutes,
+        select p.id,p.status,p.signal_key,p.candidate_json,p.review_json,
+               p.context_json,p.close_measurement_status,
+               p.admission_key,p.admission_episode_id,
+               o.horizon_minutes,
                o.pnl_bps,
                coalesce(o.observed_at, o.measured_at, o.target_at, p.opened_at) as evidence_at
         from paper_trade_outcomes o
         join paper_trades p on p.id = o.trade_id
         where {where_sql}
+          and p.status='closed'
           and o.horizon_minutes in ({placeholders})
           and o.measurement_status = 'valid'
           and o.pnl_bps is not null
+          and (p.admission_key is null or o.admission_key=p.admission_key)
+          and (p.admission_episode_id is null or o.admission_episode_id=p.admission_episode_id)
+          {exact_queue_sql}
         """,
         (*params, *horizons),
     ).fetchall()
@@ -2553,6 +5224,10 @@ def _horizon_metrics_for_group(
     target_effective = max(float(confidence_target_effective_samples or 0.0), 1.0)
     floor = max(0.0, min(1.0, float(confidence_floor)))
     for row in rows:
+        if not reliable_paper_label_eligibility_for_trade_row(row)[
+            "paper_label_eligible"
+        ]:
+            continue
         pnl = float(row["pnl_bps"])
         weight = 1.0
         if recency_weighting_enabled:
@@ -2616,6 +5291,7 @@ def select_paper_hold_minutes(
     switch_uplift = float(cfg["switch_uplift_bps"])
     tie_bps = float(cfg["prefer_shorter_on_tie_bps"])
     max_steps = int(cfg["max_horizon_steps_per_update"])
+    bounded_exact_contract = paper_queue_claim_required(settings)
     for group_name in cfg["group_hierarchy"]:
         group_value = _hold_group_value(trade_row, str(group_name))
         if not group_value:
@@ -2630,9 +5306,17 @@ def select_paper_hold_minutes(
             confidence_adjustment_enabled=bool(cfg["confidence_adjustment_enabled"]),
             confidence_target_effective_samples=float(cfg["confidence_target_effective_samples"]),
             confidence_floor=float(cfg["confidence_floor"]),
+            require_exact_queue_lineage=paper_queue_claim_required(settings),
         )
         eligible = [item for item in metrics if int(item["count"]) >= min_samples]
         policy = _hold_policy(conn, str(group_name), group_value)
+        if policy is not None and bounded_exact_contract:
+            try:
+                policy_evidence = json.loads(policy["evidence_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                policy_evidence = {}
+            if policy_evidence.get("label_contract") != "bounded_exact_v1":
+                policy = None
         current_hold = int(policy["selected_hold_minutes"]) if policy and int(policy["selected_hold_minutes"]) in horizons else default_hold
         if not eligible:
             if policy and current_hold in horizons:
@@ -2669,6 +5353,9 @@ def select_paper_hold_minutes(
             if chosen != int(best["horizon_minutes"]):
                 source = "optimized_gradual_step"
         evidence = {
+            "label_contract": (
+                "bounded_exact_v1" if bounded_exact_contract else "legacy_reliable_v1"
+            ),
             "metrics": metrics,
             "best": best,
             "anchor_confidence_adjusted_score_bps": anchor_avg,
@@ -2720,9 +5407,21 @@ def close_due_trades(
         """
         select id, opened_at, venue, inst_id, direction, trade_type, signal_key, entry,
                selected_hold_minutes, hold_decision_json, candidate_json,
-               entry_fee_bps, entry_slippage_bps
-        from paper_trades
+               context_json, entry_fee_bps, entry_slippage_bps, status
+        from paper_trades p
         where status = 'open'
+           or (
+                status = 'expired_unpriced'
+                and selected_hold_minutes is not null
+                and exists (
+                    select 1 from paper_trade_outcomes o
+                    where o.trade_id=p.id
+                      and o.horizon_minutes=p.selected_hold_minutes
+                      and o.measurement_status='valid'
+                      and o.price is not null
+                      and o.pnl_bps is not null
+                )
+              )
         """
     ).fetchall()
     for row in rows:
@@ -2733,6 +5432,8 @@ def close_due_trades(
         latest = latest_by_inst.get(row["inst_id"])
         prior_alignment = candidate.get("yahoo_proxy_cross_surface_alignment_guard")
         if (
+            row["status"] == "open"
+            and
             isinstance(latest, dict)
             and isinstance(prior_alignment, dict)
             and prior_alignment.get("eligible")
@@ -2914,7 +5615,7 @@ def close_due_trades(
         outcome = conn.execute(
             """
             select target_at, observed_at, delay_seconds, measurement_status,
-                   price_source, price, pnl_bps
+                   price_source, price, pnl_bps, context_json as outcome_context_json
             from paper_trade_outcomes
             where trade_id = ? and horizon_minutes = ?
             limit 1
@@ -2958,14 +5659,38 @@ def close_due_trades(
             continue
         exit_px = float(outcome["price"])
         pnl_bps = float(outcome["pnl_bps"])
-        conn.execute(
+        updated_context = _storage_json_mapping(row["context_json"])
+        if is_paired_direction(row["direction"]):
+            outcome_context = _storage_json_mapping(outcome["outcome_context_json"])
+            for key in (
+                "paper_outcome_measurement_contract",
+                "paired_direct_v1_outcome",
+                "paper_price_observations",
+            ):
+                if key in outcome_context:
+                    updated_context[key] = outcome_context[key]
+            paired_close_validation = validate_paired_direct_outcome_provenance(
+                candidate,
+                updated_context,
+                settings=settings,
+            )
+            updated_context["paired_direct_close_validation"] = {
+                "contract_version": PAIRED_DIRECT_CONTRACT_VERSION,
+                "valid": bool(paired_close_validation.get("valid")),
+                "reasons": list(paired_close_validation.get("reasons") or []),
+                "observation_ids": list(
+                    paired_close_validation.get("observation_ids") or []
+                ),
+                "funding_batch_id": paired_close_validation.get("funding_batch_id"),
+            }
+        updated = conn.execute(
             """
             update paper_trades
             set closed_at = ?, exit = ?, pnl_bps = ?, status = 'closed',
                 target_close_at = ?, close_observed_at = ?,
                 close_delay_seconds = ?, close_measurement_status = ?,
-                close_price_source = ?
-            where id = ?
+                close_price_source = ?, context_json = ?
+            where id = ? and status in ('open','expired_unpriced')
             """,
             (
                 utc_now(),
@@ -2976,9 +5701,12 @@ def close_due_trades(
                 outcome["delay_seconds"],
                 status,
                 outcome["price_source"],
+                json.dumps(updated_context, sort_keys=True),
                 row["id"],
             ),
         )
+        if updated.rowcount != 1:
+            continue
         closed.append(
             {
                 "id": row["id"],
@@ -3162,7 +5890,8 @@ def _record_due_frontier_shadow_outcomes(
     recorded: list[dict] = []
     rows = conn.execute(
         """
-        select id, observed_at, inst_id, direction, reject_reason, candidate_json
+        select id, observed_at, inst_id, direction, reject_reason, candidate_json,
+               admission_key, admission_episode_id
         from frontier_paper_shadow_observations
         """
     ).fetchall()
@@ -3225,14 +5954,15 @@ def _record_due_frontier_shadow_outcomes(
                 insert into frontier_paper_shadow_outcomes (
                     observation_id, horizon_minutes, measured_at, price, pnl_bps,
                     context_json, target_at, observed_at, delay_seconds,
-                    measurement_status, price_source
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    measurement_status, price_source, admission_key, admission_episode_id
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["id"], int(horizon), utc_now(), price, round(pnl_bps, 3),
                     json.dumps(context, sort_keys=True), target.isoformat(),
                     observed_at.isoformat(), round(delay_seconds, 3),
                     measurement_status, price_source,
+                    row["admission_key"], row["admission_episode_id"],
                 ),
             )
             recorded.append(
@@ -3248,22 +5978,538 @@ def _record_due_frontier_shadow_outcomes(
     return recorded
 
 
+def _bounded_outcome_mode(settings: dict | None) -> bool:
+    settings = settings or {}
+    return bool(
+        paper_queue_claim_required(settings)
+        or (settings.get("operations") or {}).get("fail_closed_recovery_profile", False)
+        or (settings.get("paper_expansion") or {}).get("enabled", False)
+    )
+
+
+def _bounded_trade_outcome_contract(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row | Mapping[str, object],
+    candidate: Mapping[str, object],
+    context: Mapping[str, object],
+) -> dict[str, object] | None:
+    values = dict(row)
+    trade_id = values.get("id") or values.get("trade_id")
+    admission_key = _normalized_price_observation_text(values.get("admission_key"))
+    episode_id = _normalized_price_observation_text(values.get("admission_episode_id"))
+    execution_order_id = values.get("execution_order_id")
+    if trade_id is None or not admission_key or not episode_id or execution_order_id is None:
+        return None
+    queue_row = conn.execute(
+        """
+        select queue_id,venue,inst_id,market_surface,direction,route_status,candidate_json,
+               execution_order_id,paper_trade_id,admission_key,episode_id
+        from paper_admission_queue
+        where paper_trade_id=? and execution_order_id=?
+          and admission_key=? and episode_id=?
+        limit 1
+        """,
+        (int(trade_id), int(execution_order_id), admission_key, episode_id),
+    ).fetchone()
+    if queue_row is None or str(queue_row["route_status"] or "").strip().lower() != "standard":
+        return None
+    if _normalized_price_observation_text(values.get("venue"), upper=True) != (
+        _normalized_price_observation_text(queue_row["venue"], upper=True)
+    ):
+        return None
+    if _normalized_price_observation_text(values.get("inst_id"), upper=True) != (
+        _normalized_price_observation_text(queue_row["inst_id"], upper=True)
+    ):
+        return None
+    if str(values.get("direction") or "").strip().lower() != str(
+        queue_row["direction"] or ""
+    ).strip().lower():
+        return None
+    try:
+        queued_candidate = json.loads(queue_row["candidate_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(queued_candidate, dict):
+        return None
+    if _bounded_claim_identity_snapshot(dict(candidate)) != _bounded_claim_identity_snapshot(
+        queued_candidate
+    ):
+        return None
+    if any(
+        candidate.get(field) != queued_candidate.get(field)
+        for field in _BOUNDED_CLAIM_QUOTE_FIELDS
+    ):
+        return None
+    feasibility = candidate.get("execution_feasibility")
+    feasibility = feasibility if isinstance(feasibility, Mapping) else {}
+    feasibility_status = str(feasibility.get("status") or "").strip().lower()
+    route_status = str(
+        candidate.get("paper_route_status")
+        or candidate.get("route_status")
+        or context.get("route_status")
+        or ""
+    ).strip().lower()
+    if feasibility_status != "standard" or route_status != "standard":
+        return None
+    if str(context.get("signal_stats_scope") or "").strip().lower() != "direct":
+        return None
+    if any(
+        bool(candidate.get(field) or context.get(field))
+        for field in (
+            "synthetic_research_paper",
+            "paper_proxy_activated",
+            "paper_proxy_not_live_equivalent",
+        )
+    ):
+        return None
+    queue_surface = _normalized_price_observation_text(queue_row["market_surface"]).lower()
+    candidate_surface = _normalized_price_observation_text(
+        candidate.get("market_surface") or values.get("trade_type")
+    ).lower()
+    if not queue_surface or queue_surface != candidate_surface:
+        return None
+    return {
+        "queue_id": str(queue_row["queue_id"]),
+        "venue": str(queue_row["venue"]),
+        "inst_id": str(queue_row["inst_id"]),
+        "market_surface": queue_surface,
+    }
+
+
+def load_due_paper_outcome_targets(
+    conn: sqlite3.Connection,
+    settings: dict,
+    *,
+    now: dt.datetime | None = None,
+    limit: int = 1_000,
+) -> list[dict[str, object]]:
+    """Load exact bounded trades that need a canonical candle label or upgrade."""
+
+    if not _bounded_outcome_mode(settings):
+        return []
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    else:
+        now = now.astimezone(dt.timezone.utc)
+    capped_limit = min(5_000, max(1, int(limit)))
+    horizons: list[int] = []
+    for raw_horizon in (settings.get("learning") or {}).get(
+        "horizon_minutes", [5, 15, 60, 240, 1440]
+    ):
+        try:
+            horizon = int(raw_horizon)
+        except (TypeError, ValueError):
+            continue
+        if horizon >= 0 and horizon not in horizons:
+            horizons.append(horizon)
+    horizons.sort()
+    rows = conn.execute(
+        """
+        select id,opened_at,venue,inst_id,direction,trade_type,candidate_json,
+               context_json,status,execution_order_id,admission_key,admission_episode_id
+        from paper_trades
+        where status in ('open','closed','expired_unpriced')
+        order by opened_at,id
+        """
+    ).fetchall()
+    targets: list[dict[str, object]] = []
+    for row in rows:
+        try:
+            candidate = json.loads(row["candidate_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            candidate = {}
+        try:
+            context = json.loads(row["context_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            context = {}
+        contract = _bounded_trade_outcome_contract(conn, row, candidate, context)
+        if contract is None:
+            continue
+        try:
+            opened_at = _parse_storage_iso(row["opened_at"]).astimezone(dt.timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        paired_validation = (
+            validate_paired_direct_entry(candidate, settings=settings)
+            if is_paired_direction(row["direction"])
+            else None
+        )
+        paired_contract = (
+            paired_validation.get("contract")
+            if isinstance(paired_validation, Mapping) and paired_validation.get("valid")
+            else None
+        )
+        if is_paired_direction(row["direction"]) and not isinstance(paired_contract, Mapping):
+            continue
+        for horizon in horizons:
+            target = opened_at + dt.timedelta(minutes=horizon)
+            if target > now:
+                continue
+            existing = conn.execute(
+                """
+                select measurement_status,price_observation_id
+                from paper_trade_outcomes
+                where trade_id=? and horizon_minutes=?
+                limit 1
+                """,
+                (int(row["id"]), horizon),
+            ).fetchone()
+            if existing is not None:
+                existing_status = str(existing["measurement_status"] or "").strip().lower()
+                if existing_status == "valid" and existing["price_observation_id"]:
+                    continue
+                if existing_status == "valid_auction_event":
+                    continue
+            outcome_identity = {
+                "trade_id": int(row["id"]),
+                "horizon_minutes": horizon,
+                "target_at": target.isoformat(),
+                "admission_key": str(row["admission_key"]),
+                "admission_episode_id": str(row["admission_episode_id"]),
+            }
+            outcome_key = "paper-outcome-" + hashlib.sha256(
+                json.dumps(outcome_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:32]
+            if isinstance(paired_contract, Mapping):
+                components = paired_contract.get("entry_components")
+                components = components if isinstance(components, Mapping) else {}
+                perp_component = components.get("perp")
+                spot_component = components.get("spot")
+                if not isinstance(perp_component, Mapping) or not isinstance(
+                    spot_component, Mapping
+                ):
+                    continue
+                for component_name, component, collector_surface in (
+                    ("perp", perp_component, "perpetual_swap"),
+                    ("spot", spot_component, "spot"),
+                ):
+                    leg_identity = {
+                        "parent_outcome_key": outcome_key,
+                        "component": component_name,
+                        "venue": str(component.get("venue") or ""),
+                        "inst_id": str(component.get("inst_id") or ""),
+                    }
+                    leg_outcome_key = outcome_key + "-" + component_name + "-" + hashlib.sha256(
+                        json.dumps(
+                            leg_identity, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8")
+                    ).hexdigest()[:12]
+                    targets.append(
+                        {
+                            "trade_id": int(row["id"]),
+                            "horizon": horizon,
+                            "venue": str(component.get("venue") or ""),
+                            "inst_id": str(component.get("inst_id") or ""),
+                            "market_surface": collector_surface,
+                            "target_at": target.isoformat(),
+                            "outcome_key": leg_outcome_key,
+                            "parent_outcome_key": outcome_key,
+                            "due_attempt_key": outcome_key,
+                            "paired_component": component_name,
+                            "requires_funding_events": component_name == "perp",
+                            "funding_window_start_at": (
+                                str(perp_component.get("event_at") or "")
+                                if component_name == "perp"
+                                else None
+                            ),
+                        }
+                    )
+            else:
+                targets.append(
+                    {
+                        "trade_id": int(row["id"]),
+                        "horizon": horizon,
+                        "venue": contract["venue"],
+                        "inst_id": contract["inst_id"],
+                        "market_surface": contract["market_surface"],
+                        "target_at": target.isoformat(),
+                        "outcome_key": outcome_key,
+                        "due_attempt_key": outcome_key,
+                    }
+                )
+    targets.sort(
+        key=lambda item: (
+            str(item["venue"]),
+            str(item["inst_id"]),
+            str(item["target_at"]),
+            int(item["trade_id"]),
+            int(item["horizon"]),
+        )
+    )
+    grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for target_row in targets:
+        group_key = (
+            _normalized_price_observation_text(target_row["venue"], upper=True),
+            _normalized_price_observation_text(target_row["inst_id"], upper=True),
+        )
+        grouped.setdefault(group_key, []).append(target_row)
+
+    selected_targets: list[dict[str, object]] = []
+    # One candle before the target plus the five-minute delay allowance leaves
+    # a 93-minute target span inside the collector's hard 100-candle request.
+    max_window_seconds = 93 * 60
+    for group_key in sorted(grouped):
+        windows: list[list[dict[str, object]]] = []
+        for target_row in grouped[group_key]:
+            target_time = _parse_storage_iso(str(target_row["target_at"]))
+            if not windows:
+                windows.append([target_row])
+                continue
+            window_start = _parse_storage_iso(str(windows[-1][0]["target_at"]))
+            if (target_time - window_start).total_seconds() > max_window_seconds:
+                windows.append([target_row])
+            else:
+                windows[-1].append(target_row)
+        rendered_windows: list[tuple[str, list[dict[str, object]]]] = []
+        for window in windows:
+            identity = {
+                "venue": group_key[0],
+                "inst_id": group_key[1],
+                "first_outcome_key": window[0]["outcome_key"],
+                "last_outcome_key": window[-1]["outcome_key"],
+            }
+            window_key = "paper-due-window-" + hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:24]
+            rendered_windows.append((window_key, window))
+        cursor = conn.execute(
+            """
+            select last_window_key
+            from paper_outcome_due_cursors
+            where venue=? and inst_id=?
+            limit 1
+            """,
+            group_key,
+        ).fetchone()
+        selected_index = 0
+        if cursor is not None:
+            window_keys = [window_key for window_key, _window in rendered_windows]
+            try:
+                selected_index = (window_keys.index(str(cursor["last_window_key"])) + 1) % len(
+                    rendered_windows
+                )
+            except ValueError:
+                selected_index = 0
+        window_key, selected_window = rendered_windows[selected_index]
+        window_start_at = str(selected_window[0]["target_at"])
+        window_end_at = str(selected_window[-1]["target_at"])
+        for target_row in selected_window:
+            selected_targets.append(
+                {
+                    **target_row,
+                    "due_window_key": window_key,
+                    "due_window_start_at": window_start_at,
+                    "due_window_end_at": window_end_at,
+                    "due_window_max_candles": 100,
+                }
+            )
+    selected_targets.sort(
+        key=lambda item: (
+            str(item["venue"]),
+            str(item["inst_id"]),
+            str(item["target_at"]),
+            str(item["outcome_key"]),
+        )
+    )
+    if len(selected_targets) <= capped_limit:
+        return selected_targets
+    # Do not split a paired trade/horizon merely because it straddles the
+    # caller's row cap.  The cap applies to complete logical due attempts.
+    bundles: dict[str, list[dict[str, object]]] = {}
+    for target_row in selected_targets:
+        bundles.setdefault(str(target_row.get("due_attempt_key") or target_row["outcome_key"]), []).append(
+            target_row
+        )
+    capped: list[dict[str, object]] = []
+    for bundle_key in sorted(
+        bundles,
+        key=lambda key: (
+            min(str(item["target_at"]) for item in bundles[key]),
+            key,
+        ),
+    ):
+        bundle = bundles[bundle_key]
+        if capped and len(capped) + len(bundle) > capped_limit:
+            continue
+        capped.extend(bundle)
+        if len(capped) >= capped_limit:
+            break
+    return capped
+
+
+def mark_due_paper_outcome_windows_attempted(
+    conn: sqlite3.Connection,
+    targets: list[Mapping[str, object]] | tuple[Mapping[str, object], ...],
+    *,
+    attempted_at: dt.datetime | str | None = None,
+    commit: bool = True,
+) -> int:
+    """Advance fair due-window cursors after fetch success or failure."""
+
+    attempted, attempted_iso = _canonical_observation_time(
+        attempted_at or dt.datetime.now(dt.timezone.utc), "attempted_at"
+    )
+    del attempted
+    windows: dict[tuple[str, str], str] = {}
+    for target in targets or ():
+        if not isinstance(target, Mapping):
+            continue
+        venue = _normalized_price_observation_text(target.get("venue"), upper=True)
+        inst_id = _normalized_price_observation_text(target.get("inst_id"), upper=True)
+        window_key = _normalized_price_observation_text(target.get("due_window_key"))
+        if venue and inst_id and window_key:
+            windows[(venue, inst_id)] = window_key
+    for (venue, inst_id), window_key in sorted(windows.items()):
+        conn.execute(
+            """
+            insert into paper_outcome_due_cursors (
+                venue,inst_id,last_window_key,last_attempted_at,attempt_count
+            ) values (?,?,?,?,1)
+            on conflict(venue,inst_id) do update set
+                last_window_key=excluded.last_window_key,
+                last_attempted_at=excluded.last_attempted_at,
+                attempt_count=paper_outcome_due_cursors.attempt_count+1
+            """,
+            (venue, inst_id, window_key, attempted_iso),
+        )
+    if commit:
+        conn.commit()
+    return len(windows)
+
+
+def _select_bounded_outcome_measurement(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row | Mapping[str, object],
+    candidate: Mapping[str, object],
+    context: Mapping[str, object],
+    contract: Mapping[str, object],
+    target: dt.datetime,
+    max_delay_seconds: float,
+    settings: Mapping[str, object] | None = None,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Isolated boundary for single-leg and future paired-direct composition."""
+
+    direction = str(dict(row).get("direction") or "").strip().lower()
+    if is_paired_direction(direction):
+        entry_validation = validate_paired_direct_entry(candidate, settings=settings)
+        if not entry_validation.get("valid"):
+            reasons = entry_validation.get("reasons") or []
+            return None, "paired_direct_v1_entry_invalid:" + ",".join(str(reason) for reason in reasons)
+        paired = entry_validation["contract"]
+        components = paired.get("entry_components")
+        components = components if isinstance(components, Mapping) else {}
+        exit_components: dict[str, dict[str, object]] = {}
+        for component_name, required_surface in (
+            ("perp", "perpetual_swap"),
+            ("spot", "spot"),
+        ):
+            entry_component = components.get(component_name)
+            entry_component = entry_component if isinstance(entry_component, Mapping) else {}
+            observation = select_paper_price_observation(
+                conn,
+                str(entry_component.get("venue") or ""),
+                str(entry_component.get("inst_id") or ""),
+                target,
+                max_delay_seconds,
+                required_surface,
+            )
+            if observation is None:
+                return None, f"paired_direct_v1_{component_name}_candle_unavailable"
+            exit_components[component_name] = observation
+        actual_exit_at = max(
+            _parse_storage_iso(str(exit_components[name]["event_at"]))
+            for name in ("perp", "spot")
+        )
+        perp_entry = components.get("perp")
+        perp_entry = perp_entry if isinstance(perp_entry, Mapping) else {}
+        funding_coverage = select_paper_funding_coverage(
+            conn,
+            "OKX",
+            str(perp_entry.get("inst_id") or ""),
+            str(perp_entry.get("event_at") or ""),
+            actual_exit_at,
+        )
+        if funding_coverage is None:
+            return None, "paired_direct_v1_complete_funding_coverage_unavailable"
+        paired_outcome = calculate_paired_direct_outcome(
+            candidate,
+            exit_components,
+            funding_coverage,
+            target,
+            max_delay_seconds=max_delay_seconds,
+            settings=settings,
+        )
+        if not paired_outcome.get("valid"):
+            reasons = paired_outcome.get("reasons") or []
+            return None, "paired_direct_v1_outcome_invalid:" + ",".join(
+                str(reason) for reason in reasons
+            )
+        observed_at = _parse_storage_iso(str(paired_outcome["observed_at"]))
+        return (
+            {
+                "price": float(paired_outcome["price"]),
+                "pnl_bps": float(paired_outcome["pnl_bps"]),
+                "observed_at": observed_at,
+                "delay_seconds": float(paired_outcome["delay_seconds"]),
+                "price_source": str(paired_outcome["price_source"]),
+                "price_observation_id": str(exit_components["perp"]["observation_id"]),
+                "observation": exit_components["perp"],
+                "price_observations": exit_components,
+                "funding_batch_id": str(funding_coverage["batch_id"]),
+                "paired_context": paired_outcome["context"],
+            },
+            None,
+        )
+
+    observation = select_paper_price_observation(
+        conn,
+        str(contract["venue"]),
+        str(contract["inst_id"]),
+        target,
+        max_delay_seconds,
+        str(contract["market_surface"]),
+    )
+    if observation is None:
+        return None, "canonical_candle_unavailable"
+    observed_at = _parse_storage_iso(str(observation["event_at"])).astimezone(dt.timezone.utc)
+    return (
+        {
+            "price": float(observation["price"]),
+            "observed_at": observed_at,
+            "delay_seconds": max(0.0, (observed_at - target).total_seconds()),
+            "price_source": str(observation["source_name"]),
+            "price_observation_id": str(observation["observation_id"]),
+            "observation": observation,
+        },
+        None,
+    )
+
+
 def record_due_horizon_outcomes(
     conn: sqlite3.Connection,
     latest_by_inst: dict[str, dict],
     settings: dict,
+    *,
+    now: dt.datetime | None = None,
 ) -> list[dict]:
     horizons = settings.get("learning", {}).get("horizon_minutes", [5, 15, 60, 240, 1440])
     max_delay_seconds = float(settings.get("learning", {}).get("max_outcome_delay_seconds", 300))
-    now = dt.datetime.now(dt.timezone.utc)
+    bounded_mode = _bounded_outcome_mode(settings)
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    else:
+        now = now.astimezone(dt.timezone.utc)
     recorded = []
     rows = conn.execute(
         """
-        select id, opened_at, inst_id, direction, entry, context_json,
+        select id, opened_at, venue, inst_id, direction, entry, context_json,
                entry_fee_bps, entry_slippage_bps, status, closed_at,
-               trade_type, candidate_json
+               trade_type, candidate_json, execution_order_id,
+               admission_key, admission_episode_id
         from paper_trades
-        where status in ('open', 'closed')
+        where status in ('open', 'closed', 'expired_unpriced')
         """
     ).fetchall()
     cutoff_rows = conn.execute(
@@ -3288,12 +6534,36 @@ def record_due_horizon_outcomes(
         )
         family_cutoffs[trade_type] = _parse_storage_iso(cutoff_row["tracking_started_at"])
     for row in rows:
-        opened_at = _parse_storage_iso(row["opened_at"])
+        try:
+            opened_at = _parse_storage_iso(row["opened_at"]).astimezone(dt.timezone.utc)
+        except (TypeError, ValueError):
+            continue
         sign = _paper_direction_sign(row["direction"])
         if sign == 0:
             continue
+        try:
+            candidate = json.loads(row["candidate_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            candidate = {}
+        try:
+            trade_context = json.loads(row["context_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            trade_context = {}
+        bounded_contract = (
+            _bounded_trade_outcome_contract(conn, row, candidate, trade_context)
+            if bounded_mode
+            else None
+        )
+        if bounded_mode and bounded_contract is None:
+            continue
         for horizon in horizons:
-            target = opened_at + dt.timedelta(minutes=int(horizon))
+            try:
+                horizon_minutes = int(horizon)
+            except (TypeError, ValueError):
+                continue
+            if horizon_minutes < 0:
+                continue
+            target = opened_at + dt.timedelta(minutes=horizon_minutes)
             if now < target:
                 continue
             if (
@@ -3303,16 +6573,23 @@ def record_due_horizon_outcomes(
                 and _parse_storage_iso(row["closed_at"]) < family_cutoffs[str(row["trade_type"])]
             ):
                 continue
-            exists = conn.execute(
-                "select 1 from paper_trade_outcomes where trade_id = ? and horizon_minutes = ? limit 1",
-                (row["id"], int(horizon)),
+            existing = conn.execute(
+                """
+                select id,context_json,measurement_status,price_observation_id
+                from paper_trade_outcomes
+                where trade_id=? and horizon_minutes=?
+                limit 1
+                """,
+                (row["id"], horizon_minutes),
             ).fetchone()
-            if exists:
+            if existing is not None and not bounded_mode:
                 continue
-            try:
-                candidate = json.loads(row["candidate_json"] or "{}")
-            except (TypeError, ValueError):
-                candidate = {}
+            if existing is not None and bounded_mode:
+                existing_status = str(existing["measurement_status"] or "").strip().lower()
+                if existing_status == "valid" and existing["price_observation_id"]:
+                    continue
+                if existing_status == "valid_auction_event":
+                    continue
             auction_outcome = (
                 _auction_reference_outcome(candidate, latest_by_inst)
                 if candidate.get("paper_auction_reference")
@@ -3322,9 +6599,16 @@ def record_due_horizon_outcomes(
                 # Await the next official same-tenor result rather than
                 # converting unavailable research evidence into a bad label.
                 continue
-            latest = latest_by_inst.get(row["inst_id"])
+            latest = None if bounded_mode else latest_by_inst.get(row["inst_id"])
             observed_at = None
             cost_audit = None
+            price_observation_id = None
+            price_observation = None
+            price_observations: dict[str, dict[str, object]] = {}
+            funding_batch_id = None
+            paired_context = None
+            bounded_measurement = None
+            measurement_reason = None
             if auction_outcome is not None:
                 observed_at = auction_outcome["auction_at"]
                 delay_seconds = 0.0
@@ -3344,18 +6628,94 @@ def record_due_horizon_outcomes(
                         * sign
                     )
                 price_source = auction_outcome["price_source"]
+            elif bounded_mode:
+                bounded_measurement, measurement_reason = _select_bounded_outcome_measurement(
+                    conn,
+                    row,
+                    candidate,
+                    trade_context,
+                    bounded_contract or {},
+                    target,
+                    max_delay_seconds,
+                    settings,
+                )
+                if bounded_measurement is not None:
+                    observed_at = bounded_measurement["observed_at"]
+                    delay_seconds = float(bounded_measurement["delay_seconds"])
+                    measurement_status = "valid"
+                    price = float(bounded_measurement["price"])
+                    price_source = str(bounded_measurement["price_source"])
+                    price_observation_id = str(bounded_measurement["price_observation_id"])
+                    price_observation = bounded_measurement["observation"]
+                    raw_observations = bounded_measurement.get("price_observations")
+                    if isinstance(raw_observations, Mapping):
+                        price_observations = {
+                            str(name): dict(observation)
+                            for name, observation in raw_observations.items()
+                            if isinstance(observation, Mapping)
+                        }
+                    funding_batch_id = bounded_measurement.get("funding_batch_id")
+                    paired_context = bounded_measurement.get("paired_context")
             elif latest:
                 raw_observed = latest.get("observed_at") or latest.get("seen_at") or latest.get("last_checked_at")
                 try:
                     observed_at = _parse_storage_iso(raw_observed) if raw_observed else now
                 except (TypeError, ValueError):
                     observed_at = now
-            if auction_outcome is None and observed_at and observed_at < target:
+            if not bounded_mode and auction_outcome is None and observed_at and observed_at < target:
                 latest = None
                 observed_at = None
 
             if auction_outcome is not None:
                 pass
+            elif bounded_mode and price_observation is not None:
+                if bounded_measurement is not None and bounded_measurement.get("pnl_bps") is not None:
+                    # Paired-direct accounting already includes both legs,
+                    # declared fees/slippage, and realized funding exactly once.
+                    pnl_bps = float(bounded_measurement["pnl_bps"])
+                else:
+                    pnl_bps = (price / float(row["entry"]) - 1.0) * 10_000.0 * sign
+                    risk = settings.get("risk", {})
+                    charged_cost_bps = float(row["entry_fee_bps"] or 0) + float(
+                        row["entry_slippage_bps"] or 0
+                    )
+                    if (
+                        row["trade_type"] == "frontier_crypto_venue_map"
+                        and candidate.get("frontier_cost_source")
+                    ):
+                        pnl_bps -= float(row["entry_fee_bps"] or 0)
+                        exit_fee_bps = float(
+                            candidate.get(
+                                "estimated_fee_bps_per_side",
+                                settings.get("frontier_data_quality", {}).get(
+                                    "conservative_fee_bps_per_side", 10.0
+                                ),
+                            )
+                        )
+                        exit_slippage_bps = float(
+                            candidate.get(
+                                "exit_slippage_bps_estimate",
+                                risk.get("slippage_bps_per_leg", 0),
+                            )
+                        )
+                        pnl_bps -= exit_fee_bps
+                        pnl_bps -= exit_slippage_bps
+                        charged_cost_bps += exit_fee_bps + exit_slippage_bps
+                    else:
+                        pnl_bps -= float(row["entry_fee_bps"] or 0)
+                        pnl_bps -= float(row["entry_slippage_bps"] or 0)
+                        pnl_bps -= float(risk.get("taker_fee_bps_per_leg", 0))
+                        pnl_bps -= float(risk.get("slippage_bps_per_leg", 0))
+                        charged_cost_bps += float(risk.get("taker_fee_bps_per_leg", 0))
+                        charged_cost_bps += float(risk.get("slippage_bps_per_leg", 0))
+                    cost_audit = realized_paper_cost_audit(
+                        candidate,
+                        pnl_bps,
+                        charged_cost_bps=charged_cost_bps,
+                        settings=settings,
+                        already_backfilled=not isinstance(candidate.get("paper_context_cost_gate"), dict),
+                    )
+                    pnl_bps = float(cost_audit["adjusted_pnl_bps"])
             elif latest and latest.get("last") not in (None, ""):
                 delay_seconds = max(0.0, (observed_at - target).total_seconds()) if observed_at else 0.0
                 measurement_status = "valid" if delay_seconds <= max_delay_seconds else "late"
@@ -3416,10 +6776,13 @@ def record_due_horizon_outcomes(
                 price_source = None
             else:
                 continue
-            try:
-                outcome_context = json.loads(row["context_json"] or "{}")
-            except (TypeError, ValueError):
-                outcome_context = {}
+            outcome_context = dict(trade_context)
+            if existing is not None:
+                try:
+                    existing_context = json.loads(existing["context_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_context = {}
+                outcome_context.update(existing_context)
             label_eligibility = paper_label_eligibility(candidate=candidate, context=outcome_context)
             for field, value in label_eligibility.items():
                 outcome_context.setdefault(field, value)
@@ -3427,7 +6790,7 @@ def record_due_horizon_outcomes(
                 candidate,
                 context=outcome_context,
                 selected_hold_minutes=outcome_context.get("selected_hold_minutes"),
-                outcome_horizon_minutes=int(horizon),
+                outcome_horizon_minutes=horizon_minutes,
             )
             if diagnostic_tags:
                 outcome_context["paper_trade_diagnostic_tags"] = diagnostic_tags
@@ -3450,35 +6813,140 @@ def record_due_horizon_outcomes(
                     }
             if pnl_bps is not None and cost_audit is not None:
                 outcome_context["paper_realized_cost_audit"] = cost_audit
-            conn.execute(
-                """
-                insert into paper_trade_outcomes (
-                    trade_id, horizon_minutes, measured_at, price, pnl_bps, context_json,
-                    target_at, observed_at, delay_seconds, measurement_status, price_source
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row["id"],
-                    int(horizon),
-                    utc_now(),
-                    price,
-                    round(pnl_bps, 3) if pnl_bps is not None else None,
-                    json.dumps(outcome_context, sort_keys=True),
-                    target.isoformat(),
-                    observed_at.isoformat() if observed_at else None,
-                    round(delay_seconds, 3),
-                    measurement_status,
-                    price_source,
-                ),
+            if price_observation is not None:
+                outcome_context["paper_price_observation"] = {
+                    key: price_observation[key]
+                    for key in (
+                        "observation_id",
+                        "source_kind",
+                        "source_name",
+                        "source_parser",
+                        "source_endpoint",
+                        "source_event_id",
+                        "source_identity",
+                        "candle_open_at",
+                        "event_at",
+                        "received_at",
+                    )
+                }
+                if price_observations and isinstance(paired_context, Mapping):
+                    outcome_context["paired_direct_v1_outcome"] = dict(paired_context)
+                    outcome_context["paper_price_observations"] = {
+                        component: {
+                            key: observation[key]
+                            for key in (
+                                "observation_id",
+                                "venue",
+                                "inst_id",
+                                "source_kind",
+                                "source_name",
+                                "source_parser",
+                                "source_endpoint",
+                                "source_event_id",
+                                "source_identity",
+                                "candle_open_at",
+                                "event_at",
+                                "received_at",
+                            )
+                        }
+                        for component, observation in sorted(price_observations.items())
+                    }
+                    outcome_context["paper_outcome_measurement_contract"] = "paired_direct_v1"
+                else:
+                    outcome_context["paper_outcome_measurement_contract"] = (
+                        "event_time_exchange_candle_v1"
+                    )
+                outcome_context.pop("paper_outcome_missing_reason", None)
+            elif measurement_status == "missing" and bounded_mode:
+                outcome_context["paper_outcome_missing_reason"] = (
+                    measurement_reason or "canonical_candle_unavailable"
+                )
+
+            if (
+                existing is not None
+                and bounded_mode
+                and str(existing["measurement_status"] or "").strip().lower() == "missing"
+                and measurement_status == "missing"
+            ):
+                # Repeated collection failures are operational retries, not new
+                # outcomes and not repeated close events.
+                continue
+            values = (
+                now.isoformat(),
+                price,
+                round(pnl_bps, 3) if pnl_bps is not None else None,
+                json.dumps(outcome_context, sort_keys=True),
+                target.isoformat(),
+                observed_at.isoformat() if observed_at else None,
+                round(delay_seconds, 3),
+                measurement_status,
+                price_source,
+                row["admission_key"],
+                row["admission_episode_id"],
+                price_observation_id,
             )
+            if existing is None:
+                cursor = conn.execute(
+                    """
+                    insert into paper_trade_outcomes (
+                        trade_id,horizon_minutes,measured_at,price,pnl_bps,context_json,
+                        target_at,observed_at,delay_seconds,measurement_status,price_source,
+                        admission_key,admission_episode_id,price_observation_id
+                    ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (row["id"], horizon_minutes, *values),
+                )
+                outcome_id = int(cursor.lastrowid)
+            else:
+                outcome_id = int(existing["id"])
+                conn.execute(
+                    """
+                    update paper_trade_outcomes
+                    set measured_at=?,price=?,pnl_bps=?,context_json=?,target_at=?,
+                        observed_at=?,delay_seconds=?,measurement_status=?,price_source=?,
+                        admission_key=?,admission_episode_id=?,price_observation_id=?
+                    where id=?
+                    """,
+                    (*values, outcome_id),
+                )
+            referenced_observations = price_observations or (
+                {"primary": price_observation} if price_observation is not None else {}
+            )
+            if referenced_observations:
+                conn.execute(
+                    "delete from paper_trade_outcome_price_observations where outcome_id=?",
+                    (outcome_id,),
+                )
+                conn.executemany(
+                    """
+                    insert into paper_trade_outcome_price_observations (
+                        outcome_id,observation_id,component
+                    ) values (?,?,?)
+                    """,
+                    [
+                        (outcome_id, str(observation["observation_id"]), component)
+                        for component, observation in sorted(referenced_observations.items())
+                    ],
+                )
+            if funding_batch_id:
+                conn.execute(
+                    """
+                    insert or ignore into paper_trade_outcome_funding_batches(outcome_id,batch_id)
+                    values (?,?)
+                    """,
+                    (outcome_id, str(funding_batch_id)),
+                )
             recorded.append(
                 {
                     "trade_id": row["id"],
-                    "horizon_minutes": int(horizon),
+                    "horizon_minutes": horizon_minutes,
                     "pnl_bps": round(pnl_bps, 3) if pnl_bps is not None else None,
                     "measurement_status": measurement_status,
                     "delay_seconds": round(delay_seconds, 3),
                     "price_source": price_source,
+                    "price_observation_id": price_observation_id,
+                    "funding_coverage_batch_id": funding_batch_id,
+                    "backfilled": existing is not None and price_observation_id is not None,
                     "paper_realized_cost_audit": cost_audit if pnl_bps is not None else None,
                 }
             )
@@ -3494,13 +6962,22 @@ def record_due_horizon_outcomes(
 def performance_summary(conn: sqlite3.Connection) -> dict:
     closed_rows = conn.execute(
         """
-        select status, signal_key, pnl_bps, candidate_json, review_json, context_json,
-               close_measurement_status
-        from paper_trades
-        where status = 'closed'
-          and coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
-          and signal_key not like 'SYNTHETIC_RESEARCH|%'
-          and signal_key not like 'PAPER_PROXY|%'
+        select p.status, p.signal_key, p.pnl_bps, p.direction,
+               p.candidate_json, p.review_json, p.context_json,
+               p.close_measurement_status,
+               o.context_json as outcome_context_json,
+               o.measurement_status as selected_outcome_measurement_status,
+               o.pnl_bps as selected_outcome_pnl_bps
+        from paper_trades p
+        left join paper_trade_outcomes o
+          on o.trade_id=p.id
+         and o.horizon_minutes=p.selected_hold_minutes
+         and (p.admission_key is null or o.admission_key=p.admission_key)
+         and (p.admission_episode_id is null or o.admission_episode_id=p.admission_episode_id)
+        where p.status = 'closed'
+          and coalesce(json_extract(p.context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
+          and p.signal_key not like 'SYNTHETIC_RESEARCH|%'
+          and p.signal_key not like 'PAPER_PROXY|%'
         """
     ).fetchall()
     pnls = []
@@ -3648,6 +7125,7 @@ def record_llm_cost_event(
     prompt_cache_key: str | None = None,
     frontier_escalation_reason: str | None = None,
     structured_json: bool = False,
+    event_id: str | None = None,
 ) -> None:
     conn.execute(
         """
@@ -3655,8 +7133,8 @@ def record_llm_cost_event(
             created_at, agent_name, model_tier, model_name, provider, api,
             reasoning_effort, verbosity, operation, prompt_cache_key,
             frontier_escalation_reason, structured_json, prompt_tokens,
-            completion_tokens, estimated_cost_usd, status
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            completion_tokens, estimated_cost_usd, status, event_id
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utc_now(),
@@ -3675,45 +7153,76 @@ def record_llm_cost_event(
             int(completion_tokens),
             float(estimated_cost_usd),
             status,
+            str(event_id).strip() if event_id else None,
         ),
     )
     conn.commit()
 
 
 def llm_cost_summary(conn: sqlite3.Connection) -> dict:
+    paid_attempt = (
+        "(status='model_call' or status like 'model_call:%' "
+        "or status='model_call_reserved' "
+        "or (event_id is not null and status like 'fallback_error:%'))"
+    )
     rows = conn.execute(
-        """
+        f"""
         select agent_name, sum(estimated_cost_usd) as cost, count(*) as calls
         from llm_cost_events
-        where created_at >= datetime('now', '-1 day')
+        where julianday(created_at) >= julianday('now', '-1 day')
+          and {paid_attempt}
         group by agent_name
         order by cost desc
         """
     ).fetchall()
     by_model = conn.execute(
-        """
+        f"""
         select model_tier, model_name, reasoning_effort, api,
                sum(estimated_cost_usd) as cost, count(*) as calls
         from llm_cost_events
-        where created_at >= datetime('now', '-1 day')
+        where julianday(created_at) >= julianday('now', '-1 day')
+          and {paid_attempt}
         group by model_tier, model_name, reasoning_effort, api
         order by cost desc
         """
     ).fetchall()
     by_operation = conn.execute(
-        """
+        f"""
         select coalesce(operation, 'unknown') as operation,
                sum(estimated_cost_usd) as cost,
                count(*) as calls
         from llm_cost_events
-        where created_at >= datetime('now', '-1 day')
+        where julianday(created_at) >= julianday('now', '-1 day')
+          and {paid_attempt}
         group by coalesce(operation, 'unknown')
         order by cost desc
         """
     ).fetchall()
-    total = sum(float(row["cost"] or 0) for row in rows)
+    rolling = conn.execute(
+        f"""
+        select coalesce(sum(estimated_cost_usd), 0) as cost, count(*) as calls
+        from llm_cost_events
+        where julianday(created_at) >= julianday('now', '-1 day')
+          and {paid_attempt}
+        """
+    ).fetchone()
+    utc_day = conn.execute(
+        f"""
+        select coalesce(sum(estimated_cost_usd), 0) as cost, count(*) as calls
+        from llm_cost_events
+        where date(created_at) = date('now')
+          and {paid_attempt}
+        """
+    ).fetchone()
+    rolling_cost = float(rolling["cost"] or 0)
+    utc_day_cost = float(utc_day["cost"] or 0)
     return {
-        "daily_estimated_cost_usd": round(total, 6),
+        # Retained for compatibility; "daily" now means the current UTC day.
+        "daily_estimated_cost_usd": round(utc_day_cost, 6),
+        "utc_day_estimated_cost_usd": round(utc_day_cost, 6),
+        "utc_day_paid_attempt_count": int(utc_day["calls"] or 0),
+        "rolling_24h_estimated_cost_usd": round(rolling_cost, 6),
+        "rolling_24h_paid_attempt_count": int(rolling["calls"] or 0),
         "cost_measurement": "local_estimate_from_logged_usage_not_provider_invoice",
         "provider_billing_authoritative": True,
         "by_agent": [dict(row) for row in rows],
@@ -4617,37 +8126,84 @@ def save_execution_order(
     review: dict,
     *,
     opportunity_id: int | None = None,
+    commit: bool = True,
+    settings: dict | None = None,
 ) -> int:
-    cur = conn.execute(
-        """
-        insert into execution_orders (
-            created_at, mode, route_id, venue, inst_id, direction, trade_type,
-            status, notional_usd, order_json, candidate_json, review_json,
-            strategy_lab_id, strategy_lab_version, opportunity_id,
-            strategy_lineage_root_id
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            utc_now(),
-            order["mode"],
-            order["route_id"],
-            candidate["venue"],
-            candidate["inst_id"],
-            candidate["direction"],
-            candidate.get("trade_type", "unknown"),
-            order["status"],
-            order["notional_usd"],
-            json.dumps(order, sort_keys=True),
-            json.dumps(candidate, sort_keys=True),
-            json.dumps(review, sort_keys=True),
-            candidate.get("strategy_lab_id"),
-            int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
-            opportunity_id,
-            strategy_lineage_root_id(candidate),
-        ),
+    admission_key, admission_episode_id = _paper_admission_identity(candidate)
+    queue_id, _queue_key, _queue_episode, claim_token = _paper_queue_claim_identity(
+        candidate
     )
-    conn.commit()
-    return int(cur.lastrowid)
+    bounded_order = str(order.get("status") or "") == "paper_filled" and (
+        paper_queue_claim_required(settings)
+        or bool(queue_id and admission_key and admission_episode_id and claim_token)
+    )
+    savepoint = "bounded_execution_order_binding"
+    started_transaction = False
+    if bounded_order:
+        if not conn.in_transaction:
+            conn.execute("begin immediate")
+            started_transaction = True
+        conn.execute(f"savepoint {savepoint}")
+    try:
+        if bounded_order:
+            _prepare_bounded_execution_order_binding(conn, candidate, settings)
+        cur = conn.execute(
+            """
+            insert into execution_orders (
+                created_at, mode, route_id, venue, inst_id, direction, trade_type,
+                status, notional_usd, order_json, candidate_json, review_json,
+                strategy_lab_id, strategy_lab_version, opportunity_id,
+                strategy_lineage_root_id, admission_key, admission_episode_id
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now(),
+                order["mode"],
+                order["route_id"],
+                candidate["venue"],
+                candidate["inst_id"],
+                candidate["direction"],
+                candidate.get("trade_type", "unknown"),
+                order["status"],
+                order["notional_usd"],
+                json.dumps(order, sort_keys=True),
+                json.dumps(candidate, sort_keys=True),
+                json.dumps(review, sort_keys=True),
+                candidate.get("strategy_lab_id"),
+                int(candidate["strategy_lab_version"])
+                if candidate.get("strategy_lab_version") is not None
+                else None,
+                opportunity_id,
+                strategy_lineage_root_id(candidate),
+                admission_key,
+                admission_episode_id,
+            ),
+        )
+        order_id = int(cur.lastrowid)
+        if bounded_order and not _bind_bounded_execution_order(
+            conn, candidate, order_id
+        ):
+            raise ValueError("bounded_paper_execution_order_binding_failed")
+        if bounded_order:
+            conn.execute(f"release savepoint {savepoint}")
+        if commit:
+            conn.commit()
+        return order_id
+    except sqlite3.IntegrityError as exc:
+        if bounded_order:
+            conn.execute(f"rollback to savepoint {savepoint}")
+            conn.execute(f"release savepoint {savepoint}")
+            if started_transaction:
+                conn.rollback()
+            raise ValueError(f"bounded_paper_execution_order_rejected: {exc}") from exc
+        raise
+    except Exception:
+        if bounded_order:
+            conn.execute(f"rollback to savepoint {savepoint}")
+            conn.execute(f"release savepoint {savepoint}")
+            if started_transaction:
+                conn.rollback()
+        raise
 
 
 def save_frontier_paper_shadow_observation(
@@ -4658,12 +8214,13 @@ def save_frontier_paper_shadow_observation(
     opportunity_id: int | None = None,
 ) -> int:
     """Persist a rejected frontier candidate without creating an order or fill."""
+    admission_key, admission_episode_id = _paper_admission_identity(candidate)
     cur = conn.execute(
         """
         insert into frontier_paper_shadow_observations (
             opportunity_id, observed_at, venue, inst_id, direction, trade_type, reject_reason,
-            candidate_json, review_json
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            candidate_json, review_json, admission_key, admission_episode_id
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             opportunity_id,
@@ -4679,13 +8236,21 @@ def save_frontier_paper_shadow_observation(
             ),
             json.dumps(candidate, sort_keys=True),
             json.dumps(review, sort_keys=True),
+            admission_key,
+            admission_episode_id,
         ),
     )
     conn.commit()
     return int(cur.lastrowid)
 
 
-def save_execution_fill(conn: sqlite3.Connection, order_id: int, fill: dict) -> int:
+def save_execution_fill(
+    conn: sqlite3.Connection,
+    order_id: int,
+    fill: dict,
+    *,
+    commit: bool = True,
+) -> int:
     cur = conn.execute(
         """
         insert into execution_fills (
@@ -4707,7 +8272,8 @@ def save_execution_fill(conn: sqlite3.Connection, order_id: int, fill: dict) -> 
             json.dumps(fill, sort_keys=True),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(cur.lastrowid)
 
 

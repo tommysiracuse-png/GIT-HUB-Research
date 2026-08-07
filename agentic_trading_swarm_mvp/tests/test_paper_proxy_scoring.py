@@ -57,7 +57,7 @@ class PaperProxyScoringTests(unittest.TestCase):
         self.assertEqual(0.25, routed["paper_allocation_multiplier"])
         self.assertEqual("okx_derivatives_paper", routed["paper_proxy_counterfactual"]["route_id"])
 
-    def test_weak_proxy_is_a_reduced_counterfactual_not_a_score_zero_shadow(self) -> None:
+    def test_weak_one_leg_proxy_is_scored_but_fails_closed_at_execution(self) -> None:
         candidate = proxy_candidate()
         candidate.update({"score": 0.0, "funding_bps": 0.0, "basis_bps": 0.0})
         routed = enrich_candidates([candidate], self.settings)[0]
@@ -79,8 +79,17 @@ class PaperProxyScoringTests(unittest.TestCase):
         init_db(conn)
         execution = execute_order(conn, scored, review, self.settings)
 
-        self.assertTrue(execution["paper_filled"])
-        self.assertEqual(250.0, execution["order"]["notional_usd"])
+        self.assertFalse(execution["paper_filled"])
+        self.assertEqual([], execution["fills"])
+        self.assertEqual(0.0, execution["order"]["notional_usd"])
+        self.assertEqual(
+            "blocked_paired_direct_requires_bounded_queue",
+            execution["order"]["status"],
+        )
+        self.assertEqual(
+            "invalid_or_incomplete",
+            execution["order"]["paired_direct_contract_status"],
+        )
         self.assertEqual("paper_proxy", execution["order"]["signal_stats_scope"])
 
 

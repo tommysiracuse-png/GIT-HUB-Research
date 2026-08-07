@@ -1437,15 +1437,26 @@ def _create_review_diagnostic(conn: sqlite3.Connection, state: dict[str, Any]) -
 
 
 def run_market_admission_bridge(conn: sqlite3.Connection, settings: dict, admission_report: dict) -> dict:
-    if not settings.get("market_admission", {}).get("enabled", True):
-        return {"summary": {"enabled": False}, "actions": []}
+    cfg = settings.get("market_admission", {})
+    master_enabled = bool(cfg.get("enabled", True))
+    bridge_enabled = bool(cfg.get("bridge_enabled", master_enabled))
+    if not master_enabled or not bridge_enabled:
+        return {
+            "summary": {
+                "enabled": False,
+                "master_enabled": master_enabled,
+                "bridge_enabled": bridge_enabled,
+                "reason": "market_admission_bridge_disabled",
+            },
+            "actions": [],
+        }
     actions: list[dict[str, Any]] = []
     resolved_topics = 0
     states = list(admission_report.get("states") or [])
     for state in states:
         resolved_topics += _resolve_prior_stage_topics(conn, state)
     grouped_states = _group_actionable_states(states)
-    max_actions = int(settings.get("market_admission", {}).get("bridge_max_actions_per_loop", 50))
+    max_actions = int(cfg.get("bridge_max_actions_per_loop", 50))
     for state in grouped_states[:max_actions]:
         resolved_topics += _resolve_prior_stage_topics(conn, state)
         stage = str(state.get("current_stage") or "")

@@ -1260,6 +1260,64 @@ class StrategyProgramTests(unittest.TestCase):
         self.assertEqual([101.0, 102.0], [row["last"] for row in rows])
         self.assertTrue(all(dt.datetime.fromisoformat(row["bucket_at"]).minute % 5 == 0 for row in rows))
 
+    def test_gapped_snapshot_history_cannot_create_short_horizon_signal(self) -> None:
+        cfg = settings()
+        now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        now -= dt.timedelta(minutes=now.minute % 5)
+        with memory_db() as conn:
+            record_feature_snapshots(
+                conn,
+                [observation(100.0, (now - dt.timedelta(minutes=10)).isoformat())],
+                cfg,
+            )
+            frames, summary = record_feature_snapshots(
+                conn,
+                [observation(110.0, now.isoformat())],
+                cfg,
+            )
+            generated, diagnostic = generate_program_candidates(
+                {
+                    "strategy_lab_id": "gapped_history_v1",
+                    "version": 1,
+                    "hypothesis": "A five-minute return requires the immediately prior bucket.",
+                    "strategy_logic": program_logic(),
+                },
+                frames,
+                cfg,
+            )
+
+        self.assertTrue(summary["enabled"])
+        self.assertEqual(0, frames[0]["feature_history_contiguous_points"])
+        self.assertEqual(0.0, frames[0]["return_5m_bps"])
+        self.assertEqual([], generated)
+        self.assertEqual(1, diagnostic["reject_reasons"]["feature_history_not_contiguous"])
+
+    def test_snapshot_input_caps_are_venue_balanced_and_instrument_bounded(self) -> None:
+        cfg = settings()
+        cfg["strategy_lab"]["snapshot_max_inputs_per_loop"] = 3
+        cfg["strategy_lab"]["snapshot_max_instruments_per_loop"] = 3
+        observed_at = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0).isoformat()
+        rows = []
+        for venue, inst_ids in (("A", ("A1", "A2", "A3")), ("B", ("B1", "B2", "B3"))):
+            for inst_id in inst_ids:
+                rows.append(
+                    {
+                        **observation(100.0, observed_at),
+                        "venue": venue,
+                        "inst_id": inst_id,
+                    }
+                )
+        with memory_db() as conn:
+            frames, summary = record_feature_snapshots(conn, rows, cfg)
+            stored = conn.execute(
+                "select venue, inst_id from strategy_feature_snapshots order by venue, inst_id"
+            ).fetchall()
+
+        self.assertEqual(3, len(frames))
+        self.assertEqual(3, summary["input_rows_selected"])
+        self.assertEqual(3, summary["instruments_selected"])
+        self.assertEqual({"A", "B"}, {row["venue"] for row in stored})
+
     def test_missing_basis_snapshots_do_not_become_ready_zero_history(self) -> None:
         cfg = settings()
         now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
@@ -1514,6 +1572,11 @@ class StrategyProgramTests(unittest.TestCase):
 
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            record_feature_snapshots(
+                conn,
+                [observation(99.0, (now - dt.timedelta(minutes=5)).isoformat())],
+                cfg,
+            )
             generated, report = generate_strategy_lab_candidates(
                 conn,
                 cfg,
@@ -2500,6 +2563,11 @@ class StrategyProgramTests(unittest.TestCase):
 
         with memory_db() as conn:
             ingest_strategy_lab_recommendation(conn, recommendation, cfg)
+            record_feature_snapshots(
+                conn,
+                [observation(99.0, (now - dt.timedelta(minutes=5)).isoformat())],
+                cfg,
+            )
             generated, report = generate_strategy_lab_candidates(
                 conn,
                 cfg,
