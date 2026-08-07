@@ -277,13 +277,39 @@ class CrossMarketResearcherRetryTests(unittest.TestCase):
 
         self.assertEqual(metadata["prompt_tokens"], 120)
         self.assertEqual(metadata["completion_tokens"], 30)
+        self.assertEqual(metadata["total_tokens"], 150)
+        self.assertEqual(metadata["token_count"], 150)
         self.assertEqual(metadata["stop_reason"], "completed")
+        self.assertEqual(metadata["finish_reason"], "completed")
         self.assertEqual(
             metadata["transport_integrity"]["raw_payload_size_bytes"],
             len(raw.encode("utf-8")),
         )
         self.assertEqual(metadata["transport_integrity"]["prompt_tokens"], 120)
+        self.assertEqual(metadata["transport_integrity"]["total_tokens"], 150)
+        self.assertEqual(metadata["transport_integrity"]["token_count"], 150)
         self.assertEqual(metadata["transport_integrity"]["stop_reason"], "completed")
+        self.assertEqual(metadata["transport_integrity"]["finish_reason"], "completed")
+
+    def test_post_processor_audit_records_serialization_exception(self):
+        attempt = {}
+
+        llm_swarm_runner._record_post_processor_output(
+            attempt,
+            {
+                "action": "no_action",
+                "priority": 1,
+                "title": "Schema guard",
+                "rationale": "Record the serialization failure.",
+                "market_key": "paper.market_scout.schema_guard",
+                "evidence": {"issue": "serializer"},
+                "proposed_change": {"summary": float("nan")},
+            },
+        )
+
+        self.assertIsNone(attempt["post_processor_output"])
+        self.assertFalse(attempt["post_processor_schema_valid"])
+        self.assertIn("ValueError", attempt["post_processor_serialization_error"])
 
 
 class RedTeamStrictRetryTests(unittest.TestCase):

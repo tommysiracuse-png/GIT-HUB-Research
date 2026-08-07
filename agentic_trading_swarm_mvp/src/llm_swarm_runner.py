@@ -1574,11 +1574,26 @@ def run_agent(agent: dict, packet: dict, memory: list[dict]) -> dict:
 def _generation_metadata(result: Any) -> dict[str, Any]:
     """Keep model output context with a fallback without exposing configuration secrets."""
     response_text = str(getattr(result, "text", "") or "")
+    prompt_tokens = getattr(result, "prompt_tokens", None)
+    completion_tokens = getattr(result, "completion_tokens", None)
     stop_reason = (
         getattr(result, "stop_reason", None)
         or getattr(result, "finish_reason", None)
         or getattr(result, "status", None)
     )
+    finish_reason = (
+        getattr(result, "finish_reason", None)
+        or getattr(result, "stop_reason", None)
+        or getattr(result, "status", None)
+    )
+    total_tokens = None
+    if (
+        isinstance(prompt_tokens, int)
+        and not isinstance(prompt_tokens, bool)
+        and isinstance(completion_tokens, int)
+        and not isinstance(completion_tokens, bool)
+    ):
+        total_tokens = prompt_tokens + completion_tokens
     return {
         # ``response_text`` remains for existing report readers.  The explicit
         # raw/post-processor fields make it possible to distinguish provider
@@ -1589,9 +1604,12 @@ def _generation_metadata(result: Any) -> dict[str, Any]:
         "model_tier": getattr(result, "model_tier", None),
         "status": getattr(result, "status", None),
         "api": getattr(result, "api", None),
-        "prompt_tokens": getattr(result, "prompt_tokens", None),
-        "completion_tokens": getattr(result, "completion_tokens", None),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "token_count": total_tokens,
         "stop_reason": stop_reason,
+        "finish_reason": finish_reason,
         "reasoning_effort": getattr(result, "reasoning_effort", None),
         "reasoning_mode": getattr(result, "reasoning_mode", None),
         "verbosity": getattr(result, "verbosity", None),
@@ -1624,6 +1642,19 @@ def _transport_integrity(raw_response: str, result: Any) -> dict[str, Any]:
         or getattr(result, "finish_reason", None)
         or getattr(result, "status", None)
     )
+    finish_reason = (
+        getattr(result, "finish_reason", None)
+        or getattr(result, "stop_reason", None)
+        or getattr(result, "status", None)
+    )
+    total_tokens = None
+    if (
+        isinstance(prompt_tokens, int)
+        and not isinstance(prompt_tokens, bool)
+        and isinstance(completion_tokens, int)
+        and not isinstance(completion_tokens, bool)
+    ):
+        total_tokens = prompt_tokens + completion_tokens
     token_limit_reached = (
         isinstance(completion_tokens, int)
         and not isinstance(completion_tokens, bool)
@@ -1646,8 +1677,11 @@ def _transport_integrity(raw_response: str, result: Any) -> dict[str, Any]:
         "raw_payload_size_bytes": len(raw_response.encode("utf-8")),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "token_count": total_tokens,
         "max_output_tokens": max_output_tokens,
         "stop_reason": stop_reason,
+        "finish_reason": finish_reason,
         "token_limit_reached": token_limit_reached,
         "raw_schema_valid": raw_schema_valid,
         "raw_schema_error": raw_schema_error,
@@ -1670,9 +1704,13 @@ def _record_post_processor_output(attempt: dict[str, Any], recommendation: Any) 
         attempt["post_processor_schema_valid"] = _has_complete_recommendation_schema(
             recommendation
         )
-    except (TypeError, ValueError):
+        attempt["post_processor_serialization_error"] = None
+    except (TypeError, ValueError) as exc:
         attempt["post_processor_output"] = None
         attempt["post_processor_schema_valid"] = False
+        attempt["post_processor_serialization_error"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _has_complete_recommendation_schema(candidate: Any) -> bool:
