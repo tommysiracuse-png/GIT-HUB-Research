@@ -49,11 +49,11 @@ def insert_closed_trade(
         insert into paper_trades (
             opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
             base_score, learned_score, entry, exit, pnl_bps, status, thesis,
-            candidate_json, review_json, context_json
+            candidate_json, review_json, context_json, close_measurement_status
         ) values (
             '2026-08-06T10:00:00+00:00', '2026-08-06T11:00:00+00:00', ?, ?, ?, ?, ?,
             80.0, 80.0, 100.0, 101.0, ?, 'closed', 'test',
-            ?, ?, ?
+            ?, ?, ?, 'valid'
         )
         """,
         (

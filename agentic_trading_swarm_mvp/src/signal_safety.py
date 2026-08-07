@@ -21,7 +21,7 @@ from storage import (
     add_memory_fact,
     add_self_improvement_experiment,
     add_signal_policy,
-    paper_label_eligibility_for_trade_row,
+    reliable_paper_label_eligibility_for_trade_row,
     utc_now,
 )
 
@@ -96,23 +96,31 @@ def _closed_metrics(conn: sqlite3.Connection, signal_key: str, *, since: str | N
     if since:
         clause += " and closed_at >= ?"
         params.append(since)
+    available_columns = {
+        str(row[1]) for row in conn.execute("pragma table_info(paper_trades)").fetchall()
+    }
+    label_columns = [
+        column if column in available_columns else f"null as {column}"
+        for column in ("candidate_json", "review_json", "context_json")
+    ]
+    if "close_measurement_status" in available_columns:
+        label_columns.append("close_measurement_status")
     sql = f"""
-        select pnl_bps, closed_at, candidate_json, review_json, context_json
+        select signal_key, pnl_bps, closed_at, {", ".join(label_columns)}
         from paper_trades
         where {clause}
         order by closed_at desc
     """
-    if limit:
-        sql += " limit ?"
-        params.append(int(limit))
     rows = conn.execute(sql, params).fetchall()
     pnls: list[float] = []
     for row in rows:
-        if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+        if not reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
             continue
         pnl = _coerce_finite_pnl_bps(row["pnl_bps"])
         if pnl is not None:
             pnls.append(pnl)
+            if limit and len(pnls) >= int(limit):
+                break
     if not pnls:
         return {"closed_count": 0, "avg_pnl_bps": None, "win_rate": None, "best_bps": None, "worst_bps": None}
     wins = sum(1 for pnl in pnls if pnl > 0)

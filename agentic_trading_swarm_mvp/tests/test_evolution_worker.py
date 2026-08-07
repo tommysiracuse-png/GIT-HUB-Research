@@ -21,6 +21,18 @@ import storage
 
 
 class EvolutionWorkerSeparationTests(unittest.TestCase):
+    def test_disabled_worker_exits_before_any_expensive_stage(self) -> None:
+        with mock.patch.object(evolution_worker, "_write_report", side_effect=lambda report: report):
+            with mock.patch.object(evolution_worker, "_run_research_stage") as research:
+                with mock.patch.object(evolution_worker, "_run_swarm_stage") as swarm:
+                    report = evolution_worker.run_once(
+                        {"allow_live_trading": False, "evolution_worker": {"enabled": False}}
+                    )
+
+        self.assertEqual("disabled", report["status"])
+        research.assert_not_called()
+        swarm.assert_not_called()
+
     def test_radar_defaults_skip_slow_llm_and_builder_work(self) -> None:
         policy = radar_loop._auxiliary_runtime_policy(
             {

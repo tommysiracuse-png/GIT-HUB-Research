@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
 
 from radar_loop import _select_runtime_strategy_lab_candidates
 from settings import DEFAULT_SETTINGS
-from signals.runtime import run_signal_plugins
+from signals.runtime import _bounded_runtime_observations, run_signal_plugins
 from storage import init_db, open_paper_trade
 from strategy_lab import (
     _experiment_outcomes,
@@ -84,6 +84,29 @@ def candidate(inst_id: str, surface: str | None, score: float = 70.0) -> dict:
 
 
 class StrategyLabSurfacePolicyTests(unittest.TestCase):
+    def test_promoted_runtime_respects_strategy_lab_master_switch(self) -> None:
+        cfg = self.settings()
+        cfg["strategy_lab"]["enabled"] = False
+        with connection() as conn, patch("signals.runtime.discover_signals") as discover:
+            generated, report = run_signal_plugins(conn, [{"venue": "A"}], cfg)
+
+        self.assertEqual([], generated)
+        self.assertEqual("strategy_lab_disabled", report["reason"])
+        discover.assert_not_called()
+
+    def test_promoted_runtime_observation_cap_round_robins_venues(self) -> None:
+        observations = [
+            {"venue": "A", "id": 1},
+            {"venue": "A", "id": 2},
+            {"venue": "B", "id": 3},
+            {"venue": "B", "id": 4},
+            {"venue": "C", "id": 5},
+        ]
+
+        selected = _bounded_runtime_observations(observations, 4)
+
+        self.assertEqual([1, 3, 5, 2], [row["id"] for row in selected])
+
     def settings(self) -> dict:
         result = copy.deepcopy(DEFAULT_SETTINGS)
         result["allow_live_trading"] = False

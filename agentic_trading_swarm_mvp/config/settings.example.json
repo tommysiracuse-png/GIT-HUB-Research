@@ -13,19 +13,21 @@
   },
   "scanner": {
     "scan_universe": 500,
-    "review_top": 250,
+    "review_top": 100,
     "enable_global_proxy_scan": true,
     "enable_global_market_discovery_scan": true,
     "enable_prediction_market_scan": true,
     "enable_crypto_venue_health_scan": true,
     "enable_frontier_crypto_adapter_scan": true,
+    "enable_public_market_adapter_scan": true,
     "global_review_top": 100,
     "global_market_discovery_review_top": 150,
     "prediction_review_top": 100,
     "frontier_crypto_review_top": 120,
     "paper_trade_conditional": true,
     "min_base_score": 35.0,
-    "max_new_paper_trades": 50,
+    "max_new_paper_trades": 10,
+    "max_new_paper_observations": 10,
     "hold_minutes": 60
   },
   "paper_exploration": {
@@ -234,6 +236,8 @@
     "intraday_feature_workers": 6,
     "intraday_feature_max_observations": 24,
     "intraday_feature_max_per_venue": 6,
+    "report_max_observations": 250,
+    "report_max_candidates": 100,
     "marketability_gates": {
       "enabled": true,
       "paper_only": true,
@@ -500,7 +504,7 @@
     "max_abs_24h_move_pct": 60.0,
     "taker_fee_bps_per_leg": 5.0,
     "slippage_bps_per_leg": 3.0,
-    "max_open_paper_trades": 500,
+    "max_open_paper_trades": 100,
     "paper_notional_usd": 1000.0,
     "max_live_notional_usd": 0.0
   },
@@ -575,10 +579,11 @@
     "feature_snapshot_minutes": 5,
     "feature_snapshot_retention_days": 14,
     "feature_snapshot_max_rows": 2000000,
-    "feature_history_max_points": 4032,
-    "max_candidates_per_loop": 100,
+    "feature_history_max_points": 288,
+    "promoted_signal_runtime_max_observations": 500,
+    "max_candidates_per_loop": 30,
     "max_candidates_per_experiment": 10,
-    "runtime_review_reserved_slots": 50,
+    "runtime_review_reserved_slots": 15,
     "candidate_score_bonus": 1.0,
     "max_candidate_score_bonus": 5.0,
     "evaluation_horizon_minutes": 60,
@@ -723,12 +728,17 @@
     "report_limit": 100
   },
   "evolution_worker": {
-    "enabled": true,
+    "enabled": false,
     "interval_seconds": 300,
     "defer_generic_builder_when_targeted_code_attempted": true
   },
-  "codex_worker_pool": {
+  "autonomous_cost_guard": {
     "enabled": true,
+    "daily_paid_attempt_limit": 10,
+    "ledger_path": "runs/autonomous_paid_attempts.sqlite"
+  },
+  "codex_worker_pool": {
+    "enabled": false,
     "coordination_db": "runs/codex_coordination.sqlite",
     "max_workers": 3,
     "max_verifiers": 2,
@@ -741,8 +751,11 @@
     "max_quick_task_hops": 8,
     "quick_task_seconds": 5,
     "promotion_reconcile_log_limit": 500,
-    "defer_full_regression": true,
-    "keep_repairing_after_verification_failure": true,
+    "defer_full_regression": false,
+    "keep_repairing_after_verification_failure": false,
+    "max_task_claims": 3,
+    "daily_task_claim_limit": 10,
+    "max_verification_repairs": 1,
     "revert_only_on_catastrophic_health_failure": true,
     "worker_roles": [
       {"worker_id": "strategy-codex", "preferred_lanes": ["strategy", "activation", "adapter", "general"]},
@@ -943,6 +956,7 @@
     "create_policies": true,
     "min_closed_for_filter": 5,
     "max_new_policies_per_loop": 3,
+    "opportunity_sample_limit": 5000,
     "max_active_policies_per_signal": 4,
     "default_policy_trade_ttl": 30,
     "policy_priority": 91,

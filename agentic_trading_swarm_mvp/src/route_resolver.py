@@ -517,9 +517,23 @@ def _paper_gate_proxy_alternative(candidate: dict, route: dict) -> dict | None:
             return proxy
 
     alternatives = []
+    explicit_route = candidate.get("route")
+
+    def alternative_enabled(item: dict, structurally_explicit: bool) -> bool:
+        flags = [
+            item[key]
+            for key in ("activated", "active", "paper_proxy_activated")
+            if key in item
+        ]
+        if not flags:
+            return structurally_explicit
+        normalized = [_paper_gate_bool(value) for value in flags]
+        return False not in normalized and True in normalized
+
     for container in (route, _paper_gate_feasibility(candidate), candidate):
         if not isinstance(container, dict):
             continue
+        structurally_explicit = container is explicit_route
         for field in ("paper_route_alternatives", "route_alternatives"):
             value = container.get(field) or []
             if isinstance(value, list):
@@ -527,18 +541,10 @@ def _paper_gate_proxy_alternative(candidate: dict, route: dict) -> dict | None:
                     item
                     for item in value
                     if isinstance(item, dict)
-                    and _paper_gate_bool(
-                        item.get("activated")
-                        or item.get("active")
-                        or item.get("paper_proxy_activated")
-                    )
+                    and alternative_enabled(item, structurally_explicit)
                 )
         best = container.get("best_route_alternative")
-        if isinstance(best, dict) and _paper_gate_bool(
-            best.get("activated")
-            or best.get("active")
-            or best.get("paper_proxy_activated")
-        ):
+        if isinstance(best, dict) and alternative_enabled(best, structurally_explicit):
             alternatives.append(best)
     for alternative in alternatives:
         if not isinstance(alternative, dict):

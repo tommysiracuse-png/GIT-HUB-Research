@@ -13870,8 +13870,9 @@ def build_scan_batch(
     secondary_cex_snapshot = _secondary_cex_spot_strength_snapshot(observations, candidates, settings)
     if limit:
         candidates = candidates[: int(limit)]
+    preliminary_report = {}
     if write_preliminary_report:
-        write_outputs(observations, candidates, settings)
+        preliminary_report = write_outputs(observations, candidates, settings)
     price_observations = [
         normalize_observation(row, source=f"{row.get('venue')} public REST")
         for row in all_observations
@@ -13887,6 +13888,10 @@ def build_scan_batch(
             "intraday_features": intraday_summary,
             "secondary_cex_spot_strength": secondary_cex_snapshot,
             "report": str(REPORT_JSON),
+            "report_summary": preliminary_report.get("summary", {}),
+            "report_artifact_compaction": preliminary_report.get("artifact_compaction", {}),
+            "report_observation_sample": preliminary_report.get("observations", [])[:20],
+            "report_candidate_sample": preliminary_report.get("candidates", [])[:20],
         },
     )
 
@@ -14492,13 +14497,30 @@ def write_outputs(
     quality_summary: dict | None = None,
 ) -> dict:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    adapter_cfg = (settings or {}).get("frontier_crypto_adapter", {})
+    observation_limit = max(0, int(adapter_cfg.get("report_max_observations", 250)))
+    candidate_limit = max(0, int(adapter_cfg.get("report_max_candidates", 100)))
+    stored_observations = observations[:observation_limit]
+    stored_candidates = candidates[:candidate_limit]
     report = {
         "generated_at": _utc_now(),
         "mode": (settings or {}).get("mode", "paper"),
         "live_trading_allowed": bool((settings or {}).get("allow_live_trading", False)),
         "summary": summarize(observations, candidates, quality_summary=quality_summary),
-        "observations": observations,
-        "candidates": candidates,
+        "artifact_compaction": {
+            "enabled": True,
+            "observation_limit": observation_limit,
+            "observation_count": len(observations),
+            "observation_count_stored": len(stored_observations),
+            "observation_count_omitted": len(observations) - len(stored_observations),
+            "candidate_limit": candidate_limit,
+            "candidate_count": len(candidates),
+            "candidate_count_stored": len(stored_candidates),
+            "candidate_count_omitted": len(candidates) - len(stored_candidates),
+            "policy": "aggregate_summary_plus_bounded_detail_sample",
+        },
+        "observations": stored_observations,
+        "candidates": stored_candidates,
         "hard_limits": [
             "Public market-data only.",
             "No credentials, account APIs, order APIs, or live trading.",

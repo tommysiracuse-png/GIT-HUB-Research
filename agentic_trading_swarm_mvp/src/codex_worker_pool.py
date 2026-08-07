@@ -27,7 +27,11 @@ from typing import Any
 
 from adapter_implementation_owner import run_once as run_adapter_owner
 from autonomous_builder import run_autonomous_builder
-from code_evolution import backfill_code_evolution_work_registry, process_code_change_recommendation
+from code_evolution import (
+    _revert_promoted_commit,
+    backfill_code_evolution_work_registry,
+    process_code_change_recommendation,
+)
 from codex_coordination import (
     ACTIVE_TASK_STATUSES,
     CLAIMABLE_TASK_STATUSES,
@@ -78,6 +82,13 @@ RETRYABLE_STATUSES = {
 }
 PENDING_VERIFICATION_STATUSES = {"promoted_pending_verification"}
 PROPOSAL_QUEUE_STATUSES = sorted(RETRYABLE_STATUSES | {"proposed"})
+TASK_RETRY_LIMIT_STATUS = "parked_retry_limit"
+VERIFICATION_FAILURE_STATUS = "parked_verification_failure"
+TERMINAL_BACKPRESSURE_STATUSES = {
+    TASK_RETRY_LIMIT_STATUS,
+    VERIFICATION_FAILURE_STATUS,
+    "reverted_verification_failure",
+}
 
 
 def _utc_now() -> str:
@@ -109,7 +120,7 @@ def _runtime_heartbeat(stop: threading.Event, settings: dict) -> None:
 
 def _cfg(settings: dict) -> dict[str, Any]:
     defaults = {
-        "enabled": True,
+        "enabled": False,
         "coordination_db": "runs/codex_coordination.sqlite",
         "max_workers": 3,
         "max_verifiers": 2,
@@ -117,11 +128,14 @@ def _cfg(settings: dict) -> dict[str, Any]:
         "worker_heartbeat_seconds": 30,
         "promotion_lease_seconds": 180,
         "verification_timeout_seconds": 900,
-    "queue_batch_size": 100,
-    "max_quick_task_hops": 8,
-    "quick_task_seconds": 5,
-        "defer_full_regression": True,
-        "keep_repairing_after_verification_failure": True,
+        "queue_batch_size": 100,
+        "max_quick_task_hops": 8,
+        "quick_task_seconds": 5,
+        "max_task_claims": 3,
+        "daily_task_claim_limit": 10,
+        "defer_full_regression": False,
+        "keep_repairing_after_verification_failure": False,
+        "max_verification_repairs": 1,
         "worker_roles": [
             {"worker_id": "strategy-codex", "preferred_lanes": ["strategy"]},
             {"worker_id": "market-codex", "preferred_lanes": ["adapter"]},
@@ -162,6 +176,12 @@ def _enqueue_owner_turn(
     work_fingerprint: str | None = None,
     work_scope: str | None = None,
 ) -> dict[str, Any] | None:
+    existing = coord.execute(
+        "select status from codex_tasks where source_kind=? and source_id=?",
+        (source_kind, source_id),
+    ).fetchone()
+    if existing is not None and str(existing["status"]) in TERMINAL_BACKPRESSURE_STATUSES:
+        return None
     if _coordination_has_open_kind(coord, source_kind):
         return None
     return enqueue_task(
@@ -565,7 +585,7 @@ def _worker_settings(
     output["_codex_worker_id"] = worker_id
     output.setdefault("codex_repo_agent", {})["parallel_sessions_enabled"] = True
     output["codex_repo_agent"]["coordination_context"] = coordination_context or {}
-    if _cfg(settings).get("defer_full_regression", True):
+    if _cfg(settings).get("defer_full_regression", False):
         output.setdefault("code_evolution", {})["run_full_regression"] = False
     output.setdefault("self_improvement", {})["process_code_changes_in_radar_loop"] = True
     return output
@@ -678,6 +698,100 @@ def _lease_heartbeat(stop: threading.Event, db_path: pathlib.Path, task: dict, w
             continue
 
 
+def _max_task_claims(cfg: dict[str, Any]) -> int:
+    return max(0, int(cfg.get("max_task_claims", 3)))
+
+
+def _proposal_id_for_task(task: dict[str, Any], proposal_id: str | None = None) -> str:
+    return str(
+        proposal_id
+        or (task.get("payload") or {}).get("proposal_id")
+        or task.get("source_id")
+        or ""
+    )
+
+
+def _park_code_proposal(
+    task: dict[str, Any],
+    *,
+    status: str,
+    reason: str,
+    proposal_id: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    if str(task.get("source_kind") or "") != "code_evolution_proposal":
+        return
+    resolved_id = _proposal_id_for_task(task, proposal_id)
+    if not resolved_id:
+        return
+    with closing(connect()) as radar:
+        row = get_code_evolution_proposal(radar, resolved_id)
+        if not row:
+            return
+        evaluation = dict(row.get("evaluation") or {})
+        evaluation["codex_worker_backpressure"] = {
+            "at": _utc_now(),
+            "reason": reason,
+            **(details or {}),
+        }
+        update_code_evolution_proposal(
+            radar,
+            resolved_id,
+            status=status,
+            evaluation=evaluation,
+        )
+
+
+def _park_claimed_task(
+    task: dict[str, Any],
+    *,
+    worker_id: str,
+    db_path: pathlib.Path,
+    reason: str,
+    proposal_id: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "reason": reason,
+        "claim_count": int(task.get("claim_count") or 0),
+        **(details or {}),
+    }
+    with closing(connect_coordination(db_path)) as coord:
+        complete_task(
+            coord,
+            str(task["task_id"]),
+            worker_id=worker_id,
+            claim_token=str(task["claim_token"]),
+            status=TASK_RETRY_LIMIT_STATUS,
+            result=payload,
+        )
+        heartbeat_worker(
+            coord,
+            worker_id,
+            preferred_lane=str(task.get("lane") or "general"),
+            pid=os.getpid(),
+            state="idle",
+            details={"last_task_id": task["task_id"], "last_status": TASK_RETRY_LIMIT_STATUS},
+        )
+    _park_code_proposal(
+        task,
+        status=TASK_RETRY_LIMIT_STATUS,
+        reason=reason,
+        proposal_id=proposal_id,
+        details=payload,
+    )
+    return {
+        "worker_id": worker_id,
+        "status": TASK_RETRY_LIMIT_STATUS,
+        "proposal_id": _proposal_id_for_task(task, proposal_id) or None,
+        "task_id": task["task_id"],
+        "source_kind": task["source_kind"],
+        "elapsed_seconds": 0.0,
+        "model_usage": {},
+        **payload,
+    }
+
+
 def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
     cfg = _cfg(settings)
     worker_id = str(worker.get("worker_id") or f"codex-{uuid.uuid4().hex[:8]}")
@@ -690,10 +804,69 @@ def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
     db_path = coordination_db_path(settings)
     with closing(connect_coordination(db_path)) as coord:
         heartbeat_worker(coord, worker_id, preferred_lane=preferred, pid=os.getpid(), state="claiming")
-        task = claim_task(
-            coord, worker_id, preferred_lane=preferred, pid=os.getpid(),
-            lease_seconds=int(cfg.get("task_lease_seconds", 2700)),
+        budget_lease = acquire_resource_lease(
+            coord,
+            "daily_task_claim_budget",
+            worker_id,
+            pid=os.getpid(),
+            lease_seconds=30,
+            details={"purpose": "serialize_daily_task_claim_limit"},
         )
+        if not budget_lease:
+            heartbeat_worker(
+                coord,
+                worker_id,
+                preferred_lane=preferred,
+                pid=os.getpid(),
+                state="idle",
+                details={"last_status": "daily_claim_budget_busy"},
+            )
+            return {"worker_id": worker_id, "status": "daily_claim_budget_busy"}
+        try:
+            start_of_day = dt.datetime.now(dt.timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+            claims_today = int(
+                coord.execute(
+                    """
+                    select count(*)
+                    from codex_coordination_events
+                    where entity_kind='task' and event_type='claimed' and occurred_at >= ?
+                    """,
+                    (start_of_day,),
+                ).fetchone()[0]
+            )
+            daily_limit = max(0, int(cfg.get("daily_task_claim_limit", 10)))
+            if claims_today >= daily_limit:
+                heartbeat_worker(
+                    coord,
+                    worker_id,
+                    preferred_lane=preferred,
+                    pid=os.getpid(),
+                    state="idle",
+                    details={
+                        "last_status": "daily_task_claim_limit",
+                        "claims_today": claims_today,
+                        "daily_task_claim_limit": daily_limit,
+                    },
+                )
+                return {
+                    "worker_id": worker_id,
+                    "status": "daily_task_claim_limit",
+                    "claims_today": claims_today,
+                    "daily_task_claim_limit": daily_limit,
+                }
+            task = claim_task(
+                coord, worker_id, preferred_lane=preferred, pid=os.getpid(),
+                lease_seconds=int(cfg.get("task_lease_seconds", 2700)),
+            )
+        finally:
+            release_resource_lease(
+                coord,
+                "daily_task_claim_budget",
+                worker_id,
+                str(budget_lease.get("lease_token") or ""),
+            )
         if task:
             task["coordination_context"] = peer_work_context(
                 coord, task_id=str(task.get("task_id") or ""), limit=16
@@ -702,6 +875,17 @@ def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
         with closing(connect_coordination(db_path)) as coord:
             heartbeat_worker(coord, worker_id, preferred_lane=preferred, pid=os.getpid(), state="idle")
         return {"worker_id": worker_id, "status": "idle"}
+
+    max_claims = _max_task_claims(cfg)
+    claim_count = int(task.get("claim_count") or 0)
+    if claim_count > max_claims:
+        return _park_claimed_task(
+            task,
+            worker_id=worker_id,
+            db_path=db_path,
+            reason="max_task_claims_exhausted_before_dispatch",
+            details={"max_task_claims": max_claims},
+        )
 
     stop = threading.Event()
     heartbeat = threading.Thread(
@@ -723,7 +907,8 @@ def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
         status, proposal_id = _proposal_result(result)
         elapsed = round(time.monotonic() - started, 3)
         model_usage = _proposal_model_usage(proposal_id)
-        if status == "implementation_paused" and proposal_id:
+        retry_limit_reached = status in RETRYABLE_STATUSES and claim_count >= max_claims
+        if status == "implementation_paused" and proposal_id and not retry_limit_reached:
             with closing(connect()) as radar:
                 paused = get_code_evolution_proposal(radar, proposal_id)
                 evaluation = dict((paused or {}).get("evaluation") or {})
@@ -744,11 +929,27 @@ def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
             if status in PENDING_VERIFICATION_STATUSES:
                 enqueue_verification_job(
                     coord, str(task["task_id"]), priority=int(task.get("priority") or 0),
-                    payload={"proposal_id": proposal_id, "worker_id": worker_id},
+                    payload={
+                        "proposal_id": proposal_id,
+                        "worker_id": worker_id,
+                        "verification_revision": claim_count,
+                    },
                 )
                 complete_task(
                     coord, str(task["task_id"]), worker_id=worker_id, claim_token=str(task["claim_token"]),
                     status="promoted_pending_verification", result={"elapsed_seconds": elapsed, "result": result},
+                )
+            elif retry_limit_reached:
+                complete_task(
+                    coord, str(task["task_id"]), worker_id=worker_id, claim_token=str(task["claim_token"]),
+                    status=TASK_RETRY_LIMIT_STATUS,
+                    result={
+                        "elapsed_seconds": elapsed,
+                        "result": result,
+                        "reason": "max_task_claims_exhausted_after_retryable_result",
+                        "claim_count": claim_count,
+                        "max_task_claims": max_claims,
+                    },
                 )
             elif status in RETRYABLE_STATUSES:
                 requeue_task(
@@ -767,23 +968,67 @@ def _run_one_worker_task(worker: dict, settings: dict) -> dict[str, Any]:
                     "elapsed_seconds": elapsed, "model_usage": model_usage,
                 },
             )
+        if retry_limit_reached:
+            _park_code_proposal(
+                task,
+                status=TASK_RETRY_LIMIT_STATUS,
+                reason="max_task_claims_exhausted_after_retryable_result",
+                proposal_id=proposal_id,
+                details={
+                    "claim_count": claim_count,
+                    "max_task_claims": max_claims,
+                    "last_status": status,
+                },
+            )
         return {
-            "worker_id": worker_id, "status": status or "completed", "proposal_id": proposal_id,
+            "worker_id": worker_id,
+            "status": TASK_RETRY_LIMIT_STATUS if retry_limit_reached else status or "completed",
+            "proposal_id": proposal_id,
             "task_id": task["task_id"], "source_kind": task["source_kind"], "elapsed_seconds": elapsed,
             "model_usage": model_usage,
         }
     except Exception as exc:  # noqa: BLE001 - durable queue must survive arbitrary owner failures.
         elapsed = round(time.monotonic() - started, 3)
+        retry_limit_reached = claim_count >= max_claims
         with closing(connect_coordination(db_path)) as coord:
-            requeue_task(
-                coord, str(task["task_id"]), worker_id=worker_id, claim_token=str(task["claim_token"]),
-                delay_seconds=120, error=f"{type(exc).__name__}:{str(exc)[:500]}",
-            )
+            error = f"{type(exc).__name__}:{str(exc)[:500]}"
+            if retry_limit_reached:
+                complete_task(
+                    coord, str(task["task_id"]), worker_id=worker_id, claim_token=str(task["claim_token"]),
+                    status=TASK_RETRY_LIMIT_STATUS,
+                    result={
+                        "reason": "max_task_claims_exhausted_after_exception",
+                        "claim_count": claim_count,
+                        "max_task_claims": max_claims,
+                        "error": error,
+                    },
+                )
+            else:
+                requeue_task(
+                    coord, str(task["task_id"]), worker_id=worker_id, claim_token=str(task["claim_token"]),
+                    delay_seconds=120, error=error,
+                )
             heartbeat_worker(
                 coord, worker_id, preferred_lane=preferred, pid=os.getpid(), state="error",
                 details={"task_id": task["task_id"], "error": str(exc)[:500]},
             )
-        return {"worker_id": worker_id, "status": "requeued_after_exception", "error": str(exc)[:1000], "elapsed_seconds": elapsed}
+        if retry_limit_reached:
+            _park_code_proposal(
+                task,
+                status=TASK_RETRY_LIMIT_STATUS,
+                reason="max_task_claims_exhausted_after_exception",
+                details={
+                    "claim_count": claim_count,
+                    "max_task_claims": max_claims,
+                    "error": f"{type(exc).__name__}:{str(exc)[:500]}",
+                },
+            )
+        return {
+            "worker_id": worker_id,
+            "status": TASK_RETRY_LIMIT_STATUS if retry_limit_reached else "requeued_after_exception",
+            "error": str(exc)[:1000],
+            "elapsed_seconds": elapsed,
+        }
     finally:
         stop.set()
         heartbeat.join(timeout=2)
@@ -924,6 +1169,52 @@ def _cleanup_verified_worktree(
             release_resource_lease(coord, "main_promotion", worker_id, str(lease.get("lease_token") or ""))
 
 
+def _recover_failed_promoted_candidate(
+    row: dict[str, Any],
+    evaluation: dict[str, Any],
+    *,
+    db_path: pathlib.Path,
+    worker_id: str,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Revert a failed deferred candidate before any repair or terminal park."""
+
+    prior = evaluation.get("verification_failure_recovery")
+    if isinstance(prior, dict) and prior.get("reverted"):
+        return {**prior, "already_recovered": True}
+    promotion = evaluation.get("promotion")
+    promoted_commit = str(
+        (promotion.get("promoted_commit") if isinstance(promotion, dict) else None)
+        or row.get("candidate_commit")
+        or ""
+    )
+    root = repo_root(ROOT)
+    if root is None:
+        return {"reverted": False, "reason": "ambiguous_repo_root"}
+    with closing(connect_coordination(db_path)) as coord:
+        lease = _acquire_promotion_lease(
+            coord,
+            worker_id,
+            cfg,
+            {"proposal_id": row.get("proposal_id"), "stage": "failed_verification_revert"},
+        )
+        if not lease:
+            return {"reverted": False, "reason": "main_promotion_lease_timeout"}
+        try:
+            return _revert_promoted_commit(
+                root,
+                promoted_commit,
+                int(cfg.get("verification_recovery_timeout_seconds", 120)),
+            )
+        finally:
+            release_resource_lease(
+                coord,
+                "main_promotion",
+                worker_id,
+                str(lease.get("lease_token") or ""),
+            )
+
+
 def _prepare_repair_worktree(row: dict, release: CandidateRelease | None) -> dict[str, Any]:
     if release is None or not pathlib.Path(release.worktree_path).exists():
         return {"prepared": False, "reason": "candidate_worktree_missing"}
@@ -935,6 +1226,57 @@ def _prepare_repair_worktree(row: dict, release: CandidateRelease | None) -> dic
     if reset["returncode"] != 0:
         return {"prepared": False, "reason": "repair_worktree_reset_failed", "reset": reset}
     return {"prepared": True, "parent_commit": head, "reset": reset}
+
+
+def _verification_repairs_attempted(coord: sqlite3.Connection, job_id: str) -> int:
+    rows = coord.execute(
+        """
+        select details_json from codex_coordination_events
+        where entity_kind='verification' and entity_id=? and event_type='finished'
+        """,
+        (job_id,),
+    ).fetchall()
+    attempted = 0
+    for row in rows:
+        try:
+            details = json.loads(str(row["details_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        attempted += int(str(details.get("status") or "") == "failed_needs_repair")
+    return attempted
+
+
+def _verification_repair_policy(
+    coord: sqlite3.Connection,
+    job: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    repairs_attempted = _verification_repairs_attempted(coord, str(job["job_id"]))
+    max_repairs = max(0, int(cfg.get("max_verification_repairs", 1)))
+    max_claims = _max_task_claims(cfg)
+    task = coord.execute(
+        "select claim_count from codex_tasks where task_id=?",
+        (str(job["task_id"]),),
+    ).fetchone()
+    task_claim_count = int(task["claim_count"] or 0) if task is not None else 0
+    keep_repairing = bool(cfg.get("keep_repairing_after_verification_failure", False))
+    if not keep_repairing:
+        reason = "verification_repairs_disabled"
+    elif repairs_attempted >= max_repairs:
+        reason = "max_verification_repairs_exhausted"
+    elif task_claim_count >= max_claims:
+        reason = "max_task_claims_exhausted_before_verification_repair"
+    else:
+        reason = "verification_repair_allowed"
+    return {
+        "allowed": reason == "verification_repair_allowed",
+        "reason": reason,
+        "keep_repairing_after_verification_failure": keep_repairing,
+        "verification_repairs_attempted": repairs_attempted,
+        "max_verification_repairs": max_repairs,
+        "task_claim_count": task_claim_count,
+        "max_task_claims": max_claims,
+    }
 
 
 def run_verifier_once(index: int, settings: dict) -> dict[str, Any]:
@@ -1047,9 +1389,98 @@ def run_verifier_once(index: int, settings: dict) -> dict[str, Any]:
         )
         return {"worker_id": worker_id, "status": "verified", "proposal_id": proposal_id, "cleanup": cleanup}
 
+    with closing(connect_coordination(db_path)) as coord:
+        repair_policy = _verification_repair_policy(coord, job, cfg)
+    recovery = _recover_failed_promoted_candidate(
+        row,
+        evaluation,
+        db_path=db_path,
+        worker_id=worker_id,
+        cfg=cfg,
+    )
+    evaluation["verification_failure_recovery"] = recovery
+    if not recovery.get("reverted"):
+        evaluation["reason"] = "failed_verification_recovery_pending"
+        with closing(connect()) as radar:
+            update_code_evolution_proposal(
+                radar,
+                proposal_id,
+                status="verification_failure_recovery_pending",
+                tests={**(row.get("tests") or {}), "async_full_regression": verification},
+                evaluation=evaluation,
+            )
+        with closing(connect_coordination(db_path)) as coord:
+            finish_verification_job(
+                coord,
+                str(job["job_id"]),
+                worker_id=worker_id,
+                claim_token=str(job["claim_token"]),
+                status="requeued",
+                result={**verification, "repair_policy": repair_policy, "recovery": recovery},
+                task_status="promoted_pending_verification",
+                requeue_after_seconds=60,
+            )
+        return {
+            "worker_id": worker_id,
+            "status": "verification_failure_recovery_pending",
+            "proposal_id": proposal_id,
+            "verification": verification,
+            "repair_policy": repair_policy,
+            "recovery": recovery,
+        }
+
+    # Persist the recovery commit before any later cleanup/repair operation so
+    # a retried verifier can never revert the same original commit twice.
+    with closing(connect()) as radar:
+        update_code_evolution_proposal(
+            radar,
+            proposal_id,
+            status="verification_failure_reverted",
+            tests={**(row.get("tests") or {}), "async_full_regression": verification},
+            evaluation=evaluation,
+        )
+    if not repair_policy["allowed"]:
+        evaluation["reason"] = str(repair_policy["reason"])
+        evaluation["verification_repair_policy"] = repair_policy
+        with closing(connect()) as radar:
+            update_code_evolution_proposal(
+                radar,
+                proposal_id,
+                status="reverted_verification_failure",
+                tests={**(row.get("tests") or {}), "async_full_regression": verification},
+                evaluation=evaluation,
+            )
+        with closing(connect_coordination(db_path)) as coord:
+            finish_verification_job(
+                coord,
+                str(job["job_id"]),
+                worker_id=worker_id,
+                claim_token=str(job["claim_token"]),
+                status="failed_terminal",
+                result={**verification, "repair_policy": repair_policy, "recovery": recovery},
+                task_status="reverted_verification_failure",
+            )
+        cleanup = _cleanup_verified_worktree(
+            release,
+            db_path=db_path,
+            worker_id=worker_id,
+            cfg=cfg,
+            proposal_id=proposal_id,
+        )
+        return {
+            "worker_id": worker_id,
+            "status": "reverted_verification_failure",
+            "proposal_id": proposal_id,
+            "verification": verification,
+            "repair_policy": repair_policy,
+            "recovery": recovery,
+            "cleanup": cleanup,
+        }
+
     repair = _prepare_repair_worktree(row, release)
     evaluation["reason"] = "async_full_regression_failed_repair_required"
     evaluation["repair_worktree"] = repair
+    evaluation["verification_repair_policy"] = repair_policy
     with closing(connect()) as radar:
         update_code_evolution_proposal(
             radar, proposal_id, status="implementation_paused", tests={**(row.get("tests") or {}), "async_full_regression": verification},

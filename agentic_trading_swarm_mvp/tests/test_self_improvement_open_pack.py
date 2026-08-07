@@ -304,8 +304,8 @@ class SelfImprovementOpenPackTests(unittest.TestCase):
                 insert into paper_trades (
                     opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
                     base_score, learned_score, entry, exit, pnl_bps, status, thesis,
-                    candidate_json, review_json, context_json
-                ) values (?, ?, 'YAHOO_PROXY', ?, ?, 'global_proxy_momentum', ?, 70, 70, 100, 101, ?, 'closed', 'test', ?, '{}', ?)
+                    candidate_json, review_json, context_json, close_measurement_status
+                ) values (?, ?, 'YAHOO_PROXY', ?, ?, 'global_proxy_momentum', ?, 70, 70, 100, 101, ?, 'closed', 'test', ?, '{}', ?, 'valid')
                 """,
                 (
                     utc_now(),
@@ -356,6 +356,44 @@ class SelfImprovementOpenPackTests(unittest.TestCase):
         self.assertIn("Yahoo bounded hypothesis windows", markdown)
         self.assertIn("Yahoo realized_post_entry failure labels", markdown)
         self.assertIn("Yahoo closed-trade attribution buckets", markdown)
+
+    def test_yahoo_realized_window_excludes_invalid_parent_close_but_keeps_valid_horizons(self) -> None:
+        conn = make_conn()
+        for symbol, close_status, realized_pnl, horizon_pnl in (
+            ("VALID", "valid", 10.0, 4.0),
+            ("LATE", "late", 1000.0, -2.0),
+        ):
+            cur = conn.execute(
+                """
+                insert into paper_trades (
+                    opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
+                    base_score, learned_score, entry, exit, pnl_bps, status, thesis,
+                    candidate_json, review_json, context_json, close_measurement_status
+                ) values (?, ?, 'YAHOO_PROXY', ?, 'long_proxy', 'global_proxy_momentum',
+                          'YAHOO_PROXY|global_proxy_momentum|long_proxy|standard',
+                          70, 70, 100, 101, ?, 'closed', 'test', '{}', '{}', '{}', ?)
+                """,
+                (utc_now(), utc_now(), symbol, realized_pnl, close_status),
+            )
+            conn.execute(
+                """
+                insert into paper_trade_outcomes (
+                    trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                    context_json, measurement_status, delay_seconds
+                ) values (?, 60, ?, 100, ?, '{}', 'valid', 5)
+                """,
+                (cur.lastrowid, utc_now(), horizon_pnl),
+            )
+        conn.commit()
+
+        analysis = pack._yahoo_proxy_decay_analysis(conn)
+        conn.close()
+        windows = analysis["bounded_hypothesis_labels"]["windows"]
+
+        self.assertEqual(2, analysis["reliable_label_count"])
+        self.assertEqual(2, windows["60m"]["overall"]["count"])
+        self.assertEqual(1, windows["realized_post_entry"]["overall"]["count"])
+        self.assertEqual(10.0, windows["realized_post_entry"]["overall"]["avg_pnl_bps"])
 
     def test_duplicate_text_matches_open_pack_scope(self) -> None:
         self.assertTrue(pack.is_duplicate_open_pack_text("Add Kalshi read-only public event market coverage"))

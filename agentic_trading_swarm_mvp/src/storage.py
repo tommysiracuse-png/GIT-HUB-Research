@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import pathlib
+import re
 import sqlite3
 from collections.abc import Mapping
 
@@ -22,6 +23,12 @@ DB_PATH = RUNS_DIR / "radar.sqlite"
 SQLITE_BUSY_TIMEOUT_MS = 60_000
 UNRESOLVED_ROUTE_REQUIREMENT_EXCLUSION_REASON = "unresolved_route_requirement"
 SHADOW_EXCLUDED_FROM_LEARNING_REASON = "shadow_excluded_from_learning"
+UNRELIABLE_CLOSE_MEASUREMENT_REASON = "unreliable_close_measurement"
+NON_DIRECT_SIGNAL_SCOPE_REASON = "non_direct_signal_scope"
+RELIABLE_CLOSE_MEASUREMENT_STATUSES = frozenset({"valid"})
+NON_DIRECT_SIGNAL_STATS_SCOPES = frozenset(
+    {"synthetic_research", "shadow", "reference", "observation_only"}
+)
 
 _PAPER_LONG_DIRECTIONS = frozenset(
     {
@@ -367,6 +374,79 @@ def paper_label_eligibility_for_trade_row(row: sqlite3.Row | Mapping[str, object
     return paper_label_eligibility(candidate=candidate, review=review, context=row_context)
 
 
+def reliable_paper_label_eligibility_for_trade_row(
+    row: sqlite3.Row | Mapping[str, object],
+) -> dict[str, object]:
+    """Require an explicitly timely close before a trade can steer learning.
+
+    Older/simplified schemas that do not expose ``close_measurement_status``
+    retain the route-quality behavior for compatibility.  Production rows do
+    expose it, so NULL legacy, late, missing, and forced measurements cannot
+    create score adjustments or strategy promotions.
+    """
+
+    if isinstance(row, sqlite3.Row):
+        row_mapping = {key: row[key] for key in row.keys()}
+    else:
+        row_mapping = dict(row)
+    eligibility = paper_label_eligibility_for_trade_row(row_mapping)
+    candidate = _storage_json_mapping(row_mapping.get("candidate_json"))
+    context = _storage_json_mapping(row_mapping.get("context_json"))
+    signal_scope = str(
+        row_mapping.get("signal_stats_scope")
+        or context.get("signal_stats_scope")
+        or candidate.get("signal_stats_scope")
+        or ""
+    ).strip().lower()
+    signal_key_value = str(
+        row_mapping.get("signal_key")
+        or context.get("signal_key")
+        or candidate.get("signal_key")
+        or ""
+    ).strip().upper()
+    non_direct_scope = (
+        signal_scope in NON_DIRECT_SIGNAL_STATS_SCOPES
+        or signal_key_value.startswith("SYNTHETIC_RESEARCH|")
+    )
+    if "close_measurement_status" not in row_mapping:
+        return {
+            **eligibility,
+            "paper_label_eligible": bool(eligibility.get("paper_label_eligible"))
+            and not non_direct_scope,
+            "paper_label_exclusion_reason": (
+                eligibility.get("paper_label_exclusion_reason")
+                if not eligibility.get("paper_label_eligible")
+                else NON_DIRECT_SIGNAL_SCOPE_REASON if non_direct_scope else None
+            ),
+            "paper_outcome_reliable": not non_direct_scope,
+            "paper_outcome_measurement_status": "schema_unavailable",
+            "paper_signal_stats_scope": signal_scope or "direct_or_legacy",
+        }
+    measurement_status = str(row_mapping.get("close_measurement_status") or "").strip().lower()
+    reliable = measurement_status in RELIABLE_CLOSE_MEASUREMENT_STATUSES
+    label_eligible = (
+        bool(eligibility.get("paper_label_eligible"))
+        and reliable
+        and not non_direct_scope
+    )
+    return {
+        **eligibility,
+        "paper_label_eligible": label_eligible,
+        "paper_label_exclusion_reason": (
+            eligibility.get("paper_label_exclusion_reason")
+            if not eligibility.get("paper_label_eligible")
+            else NON_DIRECT_SIGNAL_SCOPE_REASON
+            if non_direct_scope
+            else None
+            if reliable
+            else UNRELIABLE_CLOSE_MEASUREMENT_REASON
+        ),
+        "paper_outcome_reliable": reliable and not non_direct_scope,
+        "paper_outcome_measurement_status": measurement_status or "missing",
+        "paper_signal_stats_scope": signal_scope or "direct_or_legacy",
+    }
+
+
 def _paper_label_shadow_summary(
     conn: sqlite3.Connection,
     *,
@@ -374,7 +454,8 @@ def _paper_label_shadow_summary(
 ) -> dict[str, object]:
     rows = conn.execute(
         """
-        select status, pnl_bps, candidate_json, review_json, context_json
+        select status, signal_key, pnl_bps, candidate_json, review_json, context_json,
+               close_measurement_status
         from paper_trades
         where coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
         """
@@ -393,7 +474,7 @@ def _paper_label_shadow_summary(
     by_blocker: dict[str, dict[str, object]] = {}
     by_trigger: dict[str, dict[str, object]] = {}
     for row in rows:
-        eligibility = paper_label_eligibility_for_trade_row(row)
+        eligibility = reliable_paper_label_eligibility_for_trade_row(row)
         if eligibility["paper_label_exclusion_reason"] != exclusion_reason:
             continue
         status = str(row["status"] or "").strip().lower()
@@ -556,7 +637,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             status text not null,
             thesis text not null,
             candidate_json text not null,
-            review_json text not null
+            review_json text not null,
+            opportunity_id integer,
+            strategy_lineage_root_id text
         )
         """
     )
@@ -578,6 +661,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "paper_trades", "hold_decision_json", "text")
     _ensure_column(conn, "paper_trades", "strategy_lab_id", "text")
     _ensure_column(conn, "paper_trades", "strategy_lab_version", "integer")
+    _ensure_column(conn, "paper_trades", "opportunity_id", "integer")
+    _ensure_column(conn, "paper_trades", "strategy_lineage_root_id", "text")
     conn.execute(
         """
         create table if not exists execution_orders (
@@ -593,7 +678,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             notional_usd real not null,
             order_json text not null,
             candidate_json text not null,
-            review_json text not null
+            review_json text not null,
+            opportunity_id integer,
+            strategy_lineage_root_id text
         )
         """
     )
@@ -620,6 +707,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
         create table if not exists frontier_paper_shadow_observations (
             id integer primary key autoincrement,
+            opportunity_id integer,
             observed_at text not null,
             venue text not null,
             inst_id text not null,
@@ -631,6 +719,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "frontier_paper_shadow_observations", "opportunity_id", "integer")
     conn.execute(
         """
         create table if not exists frontier_paper_shadow_outcomes (
@@ -672,6 +761,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     _ensure_column(conn, "execution_orders", "strategy_lab_id", "text")
     _ensure_column(conn, "execution_orders", "strategy_lab_version", "integer")
+    _ensure_column(conn, "execution_orders", "opportunity_id", "integer")
+    _ensure_column(conn, "execution_orders", "strategy_lineage_root_id", "text")
     _migrate_paper_trade_outcomes(conn)
     conn.execute(
         """
@@ -1581,10 +1672,24 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("create index if not exists idx_opportunities_seen on opportunities(seen_at)")
+    conn.execute(
+        "create index if not exists idx_opportunities_decision_id "
+        "on opportunities(decision, id)"
+    )
     conn.execute("create index if not exists idx_paper_open on paper_trades(status, inst_id, direction)")
+    conn.execute("create index if not exists idx_execution_orders_opportunity on execution_orders(opportunity_id)")
+    conn.execute("create index if not exists idx_paper_trades_opportunity on paper_trades(opportunity_id)")
+    conn.execute(
+        "create index if not exists idx_paper_lineage_open "
+        "on paper_trades(status, strategy_lineage_root_id, inst_id, direction)"
+    )
     conn.execute(
         "create index if not exists idx_frontier_shadow_observation_reason "
         "on frontier_paper_shadow_observations(reject_reason, observed_at)"
+    )
+    conn.execute(
+        "create index if not exists idx_frontier_shadow_opportunity "
+        "on frontier_paper_shadow_observations(opportunity_id)"
     )
     conn.execute(
         "create index if not exists idx_frontier_shadow_outcome_observation "
@@ -1631,6 +1736,18 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute("create index if not exists idx_signal_policies_active on signal_policies(status, signal_key)")
     conn.execute("create index if not exists idx_self_improvement_status on self_improvement_experiments(status)")
+    conn.execute(
+        "create index if not exists idx_improvement_tasks_status_priority "
+        "on improvement_tasks(status, priority desc, id)"
+    )
+    conn.execute(
+        "create index if not exists idx_growth_experiments_status_priority "
+        "on growth_experiments(status, priority desc, id)"
+    )
+    conn.execute(
+        "create index if not exists idx_hunter_directives_status_priority "
+        "on market_hunter_directives(status, priority desc, id)"
+    )
     conn.execute("create index if not exists idx_code_evolution_status on code_evolution_proposals(status, updated_at)")
     conn.execute("create index if not exists idx_signal_variants_status on signal_variants(signal_family, status)")
     conn.execute("create index if not exists idx_strategy_lab_status on strategy_lab_experiments(status, updated_at)")
@@ -1865,6 +1982,117 @@ def update_opportunity_decision(
     conn.commit()
 
 
+def reconcile_pending_opportunities(
+    conn: sqlite3.Connection,
+    *,
+    stale_after_minutes: float = 15.0,
+    limit: int = 1000,
+) -> dict[str, object]:
+    """Repair in-flight opportunity decisions after an interrupted radar cycle."""
+
+    rows = conn.execute(
+        """
+        select id, seen_at, review_json
+        from opportunities
+        where decision = 'pending_execution'
+        order by id asc
+        limit ?
+        """,
+        (max(1, int(limit)),),
+    ).fetchall()
+    now = dt.datetime.now(dt.timezone.utc)
+    by_decision: dict[str, int] = {}
+    reconciled = 0
+    for row in rows:
+        opportunity_id = int(row["id"])
+        trade = conn.execute(
+            """
+            select id, execution_order_id
+            from paper_trades
+            where opportunity_id = ?
+            order by id desc limit 1
+            """,
+            (opportunity_id,),
+        ).fetchone()
+        order = conn.execute(
+            """
+            select id, status
+            from execution_orders
+            where opportunity_id = ?
+            order by id desc limit 1
+            """,
+            (opportunity_id,),
+        ).fetchone()
+        shadow = conn.execute(
+            """
+            select id
+            from frontier_paper_shadow_observations
+            where opportunity_id = ?
+            order by id desc limit 1
+            """,
+            (opportunity_id,),
+        ).fetchone()
+        decision = ""
+        artifact: dict[str, object] = {}
+        if trade is not None:
+            decision = (
+                "paper_filled"
+                if order is not None and str(order["status"] or "") == "paper_filled"
+                else "paper_observation_opened"
+            )
+            artifact = {
+                "paper_trade_id": int(trade["id"]),
+                "execution_order_id": int(order["id"]) if order is not None else None,
+            }
+        elif shadow is not None:
+            decision = "shadow_observed"
+            artifact = {"shadow_observation_id": int(shadow["id"])}
+        elif order is not None:
+            order_status = str(order["status"] or "execution_interrupted")
+            decision = (
+                "execution_incomplete_after_fill"
+                if order_status == "paper_filled"
+                else order_status
+            )
+            artifact = {"execution_order_id": int(order["id"]), "order_status": order_status}
+        else:
+            try:
+                seen_at = dt.datetime.fromisoformat(str(row["seen_at"] or "").replace("Z", "+00:00"))
+                if seen_at.tzinfo is None:
+                    seen_at = seen_at.replace(tzinfo=dt.timezone.utc)
+                stale = (now - seen_at).total_seconds() >= max(0.0, stale_after_minutes) * 60.0
+            except (TypeError, ValueError):
+                stale = True
+            if stale:
+                decision = "execution_abandoned"
+        if not decision:
+            continue
+        try:
+            review = json.loads(row["review_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            review = {}
+        review.update(
+            {
+                "decision": decision,
+                "execution_status": decision,
+                "reconciled_after_interruption": True,
+                **artifact,
+            }
+        )
+        conn.execute(
+            "update opportunities set decision=?, review_json=? where id=?",
+            (decision, json.dumps(review, sort_keys=True), opportunity_id),
+        )
+        reconciled += 1
+        by_decision[decision] = by_decision.get(decision, 0) + 1
+    conn.commit()
+    return {
+        "pending_examined": len(rows),
+        "reconciled": reconciled,
+        "by_decision": by_decision,
+    }
+
+
 def count_open_trades(conn: sqlite3.Connection) -> int:
     row = conn.execute("select count(*) as n from paper_trades where status = 'open'").fetchone()
     return int(row["n"])
@@ -1904,7 +2132,68 @@ def open_signal_trial_instruments(conn: sqlite3.Connection, signal_family: str) 
     return {str(row["inst_id"]) for row in rows}
 
 
-def has_open_trade(conn: sqlite3.Connection, inst_id: str, direction: str) -> bool:
+def strategy_lineage_root_id(candidate: Mapping[str, object]) -> str | None:
+    """Return one stable paper-exposure key for a Strategy Lab lineage."""
+
+    explicit = str(candidate.get("strategy_lab_lineage_root_id") or "").strip()
+    if explicit:
+        return explicit
+    relaxation = candidate.get("strategy_lab_relaxation")
+    parent = relaxation.get("parent") if isinstance(relaxation, Mapping) else None
+    current = str(
+        candidate.get("strategy_lab_root_id")
+        or candidate.get("parent_strategy_lab_id")
+        or parent
+        or candidate.get("strategy_lab_id")
+        or ""
+    ).strip()
+    previous = None
+    while current and current != previous:
+        previous = current
+        current = re.sub(r"__relaxed_r\d+$", "", current)
+    return current or None
+
+
+def has_open_trade(
+    conn: sqlite3.Connection,
+    inst_id: str,
+    direction: str,
+    *,
+    strategy_lineage_root: str | None = None,
+) -> bool:
+    if strategy_lineage_root:
+        escaped_lineage_prefix = (
+            f"{strategy_lineage_root}__relaxed_r"
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        row = conn.execute(
+            """
+            select 1
+            from paper_trades
+            where status = 'open' and inst_id = ? and direction = ?
+              and (
+                    strategy_lineage_root_id = ?
+                    or (
+                        strategy_lineage_root_id is null
+                        and (
+                            strategy_lab_id = ?
+                            or strategy_lab_id like ? escape '\\'
+                        )
+                    )
+                  )
+            limit 1
+            """,
+            (
+                inst_id,
+                direction,
+                strategy_lineage_root,
+                strategy_lineage_root,
+                f"{escaped_lineage_prefix}%",
+            ),
+        ).fetchone()
+        return row is not None
     row = conn.execute(
         "select 1 from paper_trades where status = 'open' and inst_id = ? and direction = ? limit 1",
         (inst_id, direction),
@@ -1923,6 +2212,7 @@ def _candidate_context(candidate: dict, review: dict | None = None) -> dict:
         "signal_variant_id": candidate.get("signal_variant_id"),
         "strategy_lab_id": candidate.get("strategy_lab_id"),
         "strategy_lab_version": candidate.get("strategy_lab_version"),
+        "strategy_lineage_root_id": strategy_lineage_root_id(candidate),
         "region": candidate.get("region"),
         "timezone": candidate.get("timezone") or candidate.get("market_timezone") or candidate.get("exchange_timezone"),
         "asset_class": candidate.get("asset_class"),
@@ -2019,11 +2309,13 @@ def open_paper_trade(
         candidate = execution["candidate"]
     entry = candidate["last"]
     execution_order_id = None
+    opportunity_id = None
     route_id = None
     entry_fee_bps = 0.0
     entry_slippage_bps = 0.0
     if execution:
         execution_order_id = execution.get("order_id")
+        opportunity_id = execution.get("opportunity_id")
         route_id = execution.get("order", {}).get("route_id")
         fills = execution.get("fills") or []
         if fills:
@@ -2057,8 +2349,9 @@ def open_paper_trade(
             learned_score, entry, status, thesis, candidate_json, review_json,
             execution_order_id, route_id, entry_fee_bps, entry_slippage_bps, context_json,
             signal_variant_id, selected_hold_minutes, hold_decision_json,
-            strategy_lab_id, strategy_lab_version
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            strategy_lab_id, strategy_lab_version, opportunity_id,
+            strategy_lineage_root_id
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utc_now(),
@@ -2083,6 +2376,8 @@ def open_paper_trade(
             json.dumps(hold_decision, sort_keys=True),
             candidate.get("strategy_lab_id"),
             int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
+            opportunity_id,
+            strategy_lineage_root_id(candidate),
         ),
     )
     conn.commit()
@@ -3199,25 +3494,30 @@ def record_due_horizon_outcomes(
 def performance_summary(conn: sqlite3.Connection) -> dict:
     closed_rows = conn.execute(
         """
-        select status, pnl_bps, candidate_json, review_json, context_json
+        select status, signal_key, pnl_bps, candidate_json, review_json, context_json,
+               close_measurement_status
         from paper_trades
         where status = 'closed'
           and coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
+          and signal_key not like 'SYNTHETIC_RESEARCH|%'
+          and signal_key not like 'PAPER_PROXY|%'
         """
     ).fetchall()
     pnls = []
     for row in closed_rows:
         if row["pnl_bps"] is None:
             continue
-        eligibility = paper_label_eligibility_for_trade_row(row)
+        eligibility = reliable_paper_label_eligibility_for_trade_row(row)
         if eligibility["paper_label_eligible"]:
             pnls.append(float(row["pnl_bps"]))
     open_rows = conn.execute(
         """
-        select status, pnl_bps, candidate_json, review_json, context_json
+        select status, signal_key, pnl_bps, candidate_json, review_json, context_json
         from paper_trades
         where status = 'open'
           and coalesce(json_extract(context_json, '$.signal_stats_scope'), 'direct') != 'synthetic_research'
+          and signal_key not like 'SYNTHETIC_RESEARCH|%'
+          and signal_key not like 'PAPER_PROXY|%'
         """
     ).fetchall()
     open_count = sum(
@@ -3225,21 +3525,39 @@ def performance_summary(conn: sqlite3.Connection) -> dict:
         for row in open_rows
         if paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]
     )
-    synthetic_row = conn.execute(
+    synthetic_rows = conn.execute(
         """
-        select count(*) as total,
-               sum(case when status = 'open' then 1 else 0 end) as open_count,
-               sum(case when status = 'closed' and pnl_bps is not null then 1 else 0 end) as closed_count,
-               avg(case when status = 'closed' then pnl_bps end) as avg_pnl_bps
+        select status, pnl_bps, close_measurement_status
         from paper_trades
         where json_extract(context_json, '$.signal_stats_scope') = 'synthetic_research'
         """
-    ).fetchone()
+    ).fetchall()
+    synthetic_closed_pnls = [
+        float(row["pnl_bps"])
+        for row in synthetic_rows
+        if str(row["status"] or "").lower() == "closed"
+        and row["pnl_bps"] is not None
+        and str(row["close_measurement_status"] or "").lower()
+        in RELIABLE_CLOSE_MEASUREMENT_STATUSES
+    ]
+    synthetic_unreliable_closed = sum(
+        1
+        for row in synthetic_rows
+        if str(row["status"] or "").lower() == "closed"
+        and row["pnl_bps"] is not None
+        and str(row["close_measurement_status"] or "").lower()
+        not in RELIABLE_CLOSE_MEASUREMENT_STATUSES
+    )
     synthetic = {
-        "total": int(synthetic_row["total"] or 0),
-        "open": int(synthetic_row["open_count"] or 0),
-        "closed": int(synthetic_row["closed_count"] or 0),
-        "avg_pnl_bps": round(float(synthetic_row["avg_pnl_bps"]), 3) if synthetic_row["avg_pnl_bps"] is not None else None,
+        "total": len(synthetic_rows),
+        "open": sum(str(row["status"] or "").lower() == "open" for row in synthetic_rows),
+        "closed": len(synthetic_closed_pnls),
+        "unreliable_closed_excluded": synthetic_unreliable_closed,
+        "avg_pnl_bps": (
+            round(sum(synthetic_closed_pnls) / len(synthetic_closed_pnls), 3)
+            if synthetic_closed_pnls
+            else None
+        ),
     }
     unresolved_shadow = unresolved_route_requirement_shadow_summary(conn)
     shadow_excluded = shadow_excluded_from_learning_summary(conn)
@@ -4292,14 +4610,22 @@ def open_adapter_specs(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
     return output
 
 
-def save_execution_order(conn: sqlite3.Connection, order: dict, candidate: dict, review: dict) -> int:
+def save_execution_order(
+    conn: sqlite3.Connection,
+    order: dict,
+    candidate: dict,
+    review: dict,
+    *,
+    opportunity_id: int | None = None,
+) -> int:
     cur = conn.execute(
         """
         insert into execution_orders (
             created_at, mode, route_id, venue, inst_id, direction, trade_type,
             status, notional_usd, order_json, candidate_json, review_json,
-            strategy_lab_id, strategy_lab_version
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            strategy_lab_id, strategy_lab_version, opportunity_id,
+            strategy_lineage_root_id
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utc_now(),
@@ -4316,6 +4642,8 @@ def save_execution_order(conn: sqlite3.Connection, order: dict, candidate: dict,
             json.dumps(review, sort_keys=True),
             candidate.get("strategy_lab_id"),
             int(candidate["strategy_lab_version"]) if candidate.get("strategy_lab_version") is not None else None,
+            opportunity_id,
+            strategy_lineage_root_id(candidate),
         ),
     )
     conn.commit()
@@ -4326,16 +4654,19 @@ def save_frontier_paper_shadow_observation(
     conn: sqlite3.Connection,
     candidate: dict,
     review: dict,
+    *,
+    opportunity_id: int | None = None,
 ) -> int:
     """Persist a rejected frontier candidate without creating an order or fill."""
     cur = conn.execute(
         """
         insert into frontier_paper_shadow_observations (
-            observed_at, venue, inst_id, direction, trade_type, reject_reason,
+            opportunity_id, observed_at, venue, inst_id, direction, trade_type, reject_reason,
             candidate_json, review_json
-        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            opportunity_id,
             utc_now(),
             str(candidate.get("venue") or "unknown"),
             str(candidate.get("inst_id") or candidate.get("instrument_id") or "unknown"),
@@ -4407,18 +4738,28 @@ def perform_maintenance(conn: sqlite3.Connection, settings: dict) -> dict:
 
     if opportunity_count > max_rows:
         overflow = opportunity_count - max_rows
-        conn.execute(
+        cursor = conn.execute(
             """
             delete from opportunities
             where id in (
-                select id from opportunities
+                select o.id from opportunities o
+                where not exists (
+                    select 1 from execution_orders e where e.opportunity_id = o.id
+                )
+                  and not exists (
+                    select 1 from paper_trades p where p.opportunity_id = o.id
+                )
+                  and not exists (
+                    select 1 from frontier_paper_shadow_observations s
+                    where s.opportunity_id = o.id
+                )
                 order by id asc
                 limit ?
             )
             """,
             (overflow,),
         )
-        deleted = overflow
+        deleted = max(0, int(cursor.rowcount))
         conn.commit()
         if cfg.get("vacuum_after_prune", False):
             conn.execute("vacuum")

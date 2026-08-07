@@ -16,11 +16,66 @@ if str(SRC) not in sys.path:
 from execution_engine import build_order_ticket, execute_order  # noqa: E402
 from paper_order_router import FRONTIER_PAPER_ADMISSION_REASON_PREFIX  # noqa: E402
 from settings import DEFAULT_SETTINGS  # noqa: E402
-from storage import execution_summary, init_db, open_paper_trade, record_due_horizon_outcomes  # noqa: E402
+from storage import (  # noqa: E402
+    execution_summary,
+    has_open_trade,
+    init_db,
+    open_paper_trade,
+    record_due_horizon_outcomes,
+)
 import strategy_reliability  # noqa: E402
 
 
 class ExecutionEnginePaperGuardTests(unittest.TestCase):
+    def test_fill_capacity_deferral_creates_no_fill(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        candidate = {
+            "venue": "COINBASE",
+            "inst_id": "COINBASE:BTC-USD",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "market_surface": "frontier_crypto_venue_map",
+            "last": 100.0,
+            "score": 80.0,
+            "edge_bps_estimate": 12.0,
+            "gross_edge_bps_estimate": 35.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "anomaly_flags": [],
+            "quality_status": "verified",
+            "quality_action": "normal",
+        }
+        review = {
+            "decision": "approve_paper_trade",
+            "learned_score": 80.0,
+            "confidence": 0.8,
+            "paper_allocation_multiplier": 1.0,
+            "net_edge_bps_estimate": 12.0,
+            "feasibility_status": "standard",
+            "route_status": "standard",
+        }
+
+        result = execute_order(
+            conn,
+            candidate,
+            review,
+            DEFAULT_SETTINGS,
+            opportunity_id=7,
+            allow_paper_fill=False,
+        )
+
+        self.assertTrue(result["paper_fill_deferred"])
+        self.assertFalse(result["paper_filled"])
+        self.assertEqual([], result["fills"])
+        self.assertEqual("deferred_capacity", result["order"]["status"])
+        self.assertEqual(0, conn.execute("select count(*) from execution_fills").fetchone()[0])
+        saved = conn.execute(
+            "select opportunity_id,status from execution_orders where id=?", (result["order_id"],)
+        ).fetchone()
+        self.assertEqual(7, saved["opportunity_id"])
+        self.assertEqual("deferred_capacity", saved["status"])
+
     def test_route_requirement_report_sizes_paper_ticket_without_blocking_it(self) -> None:
         candidate = {
             "venue": "CME_GROUP",
@@ -156,6 +211,27 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
         self.assertEqual(0, counters["accepted"])
         self.assertEqual(1, counters["shadowed"])
 
+        deferred_conn = sqlite3.connect(":memory:")
+        deferred_conn.row_factory = sqlite3.Row
+        init_db(deferred_conn)
+        deferred = execute_order(
+            deferred_conn,
+            candidate,
+            review,
+            DEFAULT_SETTINGS,
+            opportunity_id=42,
+            record_shadow_observation=False,
+        )
+        self.assertTrue(deferred["shadow_observation_deferred"])
+        self.assertFalse(deferred["shadow_observation_recorded"])
+        self.assertEqual(
+            0,
+            deferred_conn.execute(
+                "select count(*) from frontier_paper_shadow_observations"
+            ).fetchone()[0],
+        )
+        deferred_conn.close()
+
         observed_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=61)
         conn.execute(
             "update frontier_paper_shadow_observations set observed_at = ?",
@@ -198,6 +274,100 @@ class ExecutionEnginePaperGuardTests(unittest.TestCase):
         counters = execution_summary(conn)["frontier_paper_candidates"]
         self.assertEqual(1, counters["accepted"])
         self.assertEqual(0, counters["shadowed"])
+
+    def test_execution_and_trade_preserve_opportunity_and_lineage(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        candidate = {
+            "venue": "COINBASE",
+            "inst_id": "COINBASE:BTC-USD",
+            "direction": "long_frontier_spot",
+            "trade_type": "frontier_crypto_venue_map",
+            "market_surface": "frontier_crypto_venue_map",
+            "strategy_lab_id": "route_rich_spot_v1__relaxed_r1__relaxed_r2",
+            "strategy_lab_version": 3,
+            "last": 100.0,
+            "score": 82.0,
+            "edge_bps_estimate": 12.0,
+            "gross_edge_bps_estimate": 35.0,
+            "estimated_round_trip_cost_bps": 20.0,
+            "anomaly_flags": [],
+            "quality_status": "verified",
+            "quality_action": "normal",
+        }
+        review = {
+            "decision": "approve_paper_trade",
+            "paper_allocation_multiplier": 1.0,
+            "net_edge_bps_estimate": 12.0,
+            "learned_score": 82.0,
+            "confidence": 0.8,
+        }
+
+        execution = execute_order(
+            conn,
+            candidate,
+            review,
+            DEFAULT_SETTINGS,
+            opportunity_id=321,
+        )
+        trade_id = open_paper_trade(
+            conn,
+            candidate,
+            review,
+            execution=execution,
+            settings=DEFAULT_SETTINGS,
+        )
+
+        order = conn.execute(
+            "select opportunity_id, strategy_lineage_root_id from execution_orders where id = ?",
+            (execution["order_id"],),
+        ).fetchone()
+        trade = conn.execute(
+            "select opportunity_id, strategy_lineage_root_id from paper_trades where id = ?",
+            (trade_id,),
+        ).fetchone()
+        self.assertEqual(321, order["opportunity_id"])
+        self.assertEqual("route_rich_spot_v1", order["strategy_lineage_root_id"])
+        self.assertEqual(321, trade["opportunity_id"])
+        self.assertEqual("route_rich_spot_v1", trade["strategy_lineage_root_id"])
+        self.assertTrue(
+            has_open_trade(
+                conn,
+                candidate["inst_id"],
+                candidate["direction"],
+                strategy_lineage_root="route_rich_spot_v1",
+            )
+        )
+        self.assertFalse(
+            has_open_trade(
+                conn,
+                candidate["inst_id"],
+                candidate["direction"],
+                strategy_lineage_root="unrelated_lab",
+            )
+        )
+        conn.execute(
+            "update paper_trades set strategy_lineage_root_id = null where id = ?",
+            (trade_id,),
+        )
+        conn.commit()
+        self.assertTrue(
+            has_open_trade(
+                conn,
+                candidate["inst_id"],
+                candidate["direction"],
+                strategy_lineage_root="route_rich_spot_v1",
+            )
+        )
+        self.assertFalse(
+            has_open_trade(
+                conn,
+                candidate["inst_id"],
+                candidate["direction"],
+                strategy_lineage_root="routeXrichXspotXv1",
+            )
+        )
 
     def test_frontier_fill_gate_uses_bounded_net_edge_reason(self) -> None:
         conn = sqlite3.connect(":memory:")

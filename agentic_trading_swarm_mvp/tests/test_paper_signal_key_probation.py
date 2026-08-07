@@ -71,6 +71,40 @@ class PaperSignalKeyProbationMetricsTests(unittest.TestCase):
             },
         )
 
+    def test_recent_window_is_applied_after_reliable_label_filtering(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            create table paper_trades (
+                signal_key text, status text, pnl_bps text, closed_at text,
+                candidate_json text, review_json text, context_json text,
+                close_measurement_status text
+            )
+            """
+        )
+        conn.executemany(
+            "insert into paper_trades values (?,?,?,?,?,?,?,?)",
+            [
+                (
+                    "window_key", "closed", str(pnl), timestamp,
+                    "{}", "{}", "{}", measurement,
+                )
+                for pnl, timestamp, measurement in (
+                    (10, "2026-07-18T00:00:00+00:00", "valid"),
+                    (20, "2026-07-18T00:01:00+00:00", "valid"),
+                    (999, "2026-07-18T00:12:00+00:00", "late"),
+                    (999, "2026-07-18T00:11:00+00:00", "missing"),
+                    (999, "2026-07-18T00:10:00+00:00", "late"),
+                )
+            ],
+        )
+
+        metrics = _closed_metrics(conn, "window_key", limit=2)
+
+        self.assertEqual(2, metrics["closed_count"])
+        self.assertEqual(15.0, metrics["avg_pnl_bps"])
+
 
 if __name__ == "__main__":
     unittest.main()

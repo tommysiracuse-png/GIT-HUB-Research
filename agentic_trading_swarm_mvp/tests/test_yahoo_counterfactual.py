@@ -244,8 +244,9 @@ class YahooCounterfactualTests(unittest.TestCase):
                     insert into paper_trades (
                         opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
                         base_score, learned_score, entry, exit, pnl_bps, status, thesis,
-                        candidate_json, review_json, context_json, selected_hold_minutes
-                    ) values (?, ?, 'YAHOO_PROXY', ?, ?, 'global_proxy_momentum', ?, 70, 70, ?, ?, ?, 'closed', 'test', ?, '{}', '{}', ?)
+                        candidate_json, review_json, context_json, selected_hold_minutes,
+                        close_measurement_status
+                    ) values (?, ?, 'YAHOO_PROXY', ?, ?, 'global_proxy_momentum', ?, 70, 70, ?, ?, ?, 'closed', 'test', ?, '{}', '{}', ?, 'valid')
                     """,
                     (
                         candidate["seen_at"],
@@ -291,6 +292,53 @@ class YahooCounterfactualTests(unittest.TestCase):
         self.assertEqual(-18.0, session["closed"]["avg_pnl_bps"])
         self.assertEqual(-18.0, spread["extreme_gt_15bps"]["avg_pnl_bps"])
         self.assertEqual(-18.0, routing["synthetic_proxy_not_live_equivalent"]["avg_pnl_bps"])
+
+    def test_valid_horizons_survive_late_parent_close_without_realized_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(pathlib.Path(tmp) / "radar.sqlite")
+            for symbol, close_status, realized_pnl, horizon_pnl in (
+                ("VALID", "valid", 8.0, 4.0),
+                ("LATE", "late", 1000.0, -2.0),
+            ):
+                cur = conn.execute(
+                    """
+                    insert into paper_trades (
+                        opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
+                        base_score, learned_score, entry, exit, pnl_bps, status, thesis,
+                        candidate_json, review_json, context_json, selected_hold_minutes,
+                        close_measurement_status
+                    ) values (
+                        '2026-08-01T12:00:00+00:00', '2026-08-01T13:00:00+00:00',
+                        'YAHOO_PROXY', ?, 'long_proxy', 'global_proxy_momentum',
+                        'YAHOO_PROXY|global_proxy_momentum|long_proxy|standard',
+                        70, 70, 100, 101, ?, 'closed', 'test', '{}', '{}', '{}', 60, ?
+                    )
+                    """,
+                    (symbol, realized_pnl, close_status),
+                )
+                conn.execute(
+                    """
+                    insert into paper_trade_outcomes (
+                        trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                        context_json, measurement_status, delay_seconds
+                    ) values (?, 60, '2026-08-01T13:00:00+00:00', 100, ?, '{}', 'valid', 5)
+                    """,
+                    (cur.lastrowid, horizon_pnl),
+                )
+            conn.commit()
+
+            report = yahoo.build_report(conn)
+            conn.close()
+
+        self.assertEqual(2, report["reliable_label_count"])
+        self.assertEqual(2, report["horizon_metrics"]["60"]["count"])
+        self.assertEqual(1.0, report["horizon_metrics"]["60"]["avg_pnl_bps"])
+        closed = report["diagnostic_attribution"]["closed_trade_bucket_attribution"]
+        self.assertEqual(1, closed["closed_trade_count"])
+        self.assertEqual(
+            8.0,
+            closed["selected_holding_horizon_outcomes"][0]["avg_pnl_bps"],
+        )
 
     def test_late_and_strategy_lab_labels_are_excluded(self) -> None:
         conn = sqlite3.connect(":memory:")

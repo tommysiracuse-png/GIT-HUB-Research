@@ -93,18 +93,18 @@ class PaperContextDragTests(unittest.TestCase):
         payload = candidate()
         drag = estimate_context_drag(payload, SETTINGS)
         payload["paper_context_drag"] = drag
-        for pnl in (-12.0, -8.0):
+        for pnl, measurement_status in ((-12.0, "valid"), (-8.0, "valid"), (500.0, "late")):
             conn.execute(
                 """
                 insert into paper_trades (
                     opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
                     base_score, learned_score, entry, exit, pnl_bps, status, thesis,
-                    candidate_json, review_json
+                    candidate_json, review_json, close_measurement_status
                 ) values ('2026-01-01T00:00:00+00:00', '2026-01-01T01:00:00+00:00',
                     'TARGET', 'ABC', 'long_frontier_spot', 'frontier_crypto_venue_map',
-                    'frontier', 80, 80, 100, 99, ?, 'closed', '', ?, '{}')
+                    'frontier', 80, 80, 100, 99, ?, 'closed', '', ?, '{}', ?)
                 """,
-                (pnl, json.dumps(payload)),
+                (pnl, json.dumps(payload), measurement_status),
             )
         conn.commit()
 

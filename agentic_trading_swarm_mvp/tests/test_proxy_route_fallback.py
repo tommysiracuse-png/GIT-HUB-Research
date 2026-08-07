@@ -42,6 +42,29 @@ class ProxyRouteFallbackTests(unittest.TestCase):
         self.assertEqual(assessment["allocation_multiplier"], 0.25)
         self.assertEqual(assessment["missing_requirements"], ["spot_borrow"])
 
+    def test_explicitly_disabled_structural_proxy_stays_disabled(self) -> None:
+        candidate = {
+            "venue": "OKX",
+            "surface": "spot",
+            "direction": "short",
+            "route": {
+                "route_status": "conditional",
+                "requirements": [{"requirement_id": "spot_borrow", "status": "missing"}],
+                "paper_route_alternatives": [
+                    {
+                        "status": "paper_testable_proxy",
+                        "route_id": "okx_derivatives_paper",
+                        "activated": False,
+                    }
+                ],
+            },
+        }
+
+        assessment = assess_paper_short_route_gate(candidate)
+
+        self.assertFalse(assessment["paper_trade_allowed"])
+        self.assertEqual("suppressed_no_proxy", assessment["gate_status"])
+
     @patch("src.llm_state_packet.build_route_requirements_report", return_value={"summary": {}})
     def test_llm_packet_exposes_proxy_gate_summary(self, _mock_report) -> None:
         opportunities = [

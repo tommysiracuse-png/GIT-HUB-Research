@@ -68,6 +68,29 @@ def group(
 
 
 class SmartFailureFilterTests(unittest.TestCase):
+    def test_opportunity_count_sampling_is_bounded(self) -> None:
+        candidate = {
+            "venue": "TEST",
+            "inst_id": "TEST:ABC",
+            "direction": "long",
+            "trade_type": "demo",
+            "score": 70.0,
+        }
+        review = {"learned_score": 70.0, "decision": "reject", "applied_policies": []}
+        groups = [
+            {
+                "signal_key": "TEST|demo|long|unknown",
+                "dimension": "venue",
+                "value": "TEST",
+            }
+        ]
+        with memory_conn() as conn:
+            for _ in range(3):
+                storage.save_opportunity(conn, candidate, review)
+            filters._augment_counts(conn, groups, opportunity_sample_limit=2)
+
+        self.assertEqual(2, groups[0]["opportunity_count"])
+
     def test_low_sample_signals_are_observed_not_filtered(self) -> None:
         status = filters._classify({"closed_count": 2, "avg_pnl_bps": -200.0, "win_rate": 0.0}, settings(), "hour_utc")
 

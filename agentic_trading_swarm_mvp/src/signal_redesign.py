@@ -1907,7 +1907,7 @@ def run_frontier_redesign(
         "market_testing_progress": market_testing_progress(conn),
         "dislocation_quality_cohort_outcomes": dislocation_quality_cohort_outcomes(conn),
     }
-    write_frontier_outputs(
+    frontier_output = write_frontier_outputs(
         enriched_observations,
         active_candidates[:active_limit],
         settings,
@@ -1921,4 +1921,10 @@ def run_frontier_redesign(
         evaluations,
         frontier_quality=quality_summary,
     )
+    report["frontier_report_summary"] = frontier_output.get("summary", {})
+    report["frontier_report_artifact_compaction"] = frontier_output.get(
+        "artifact_compaction", {}
+    )
+    report["frontier_report_observation_sample"] = frontier_output.get("observations", [])[:20]
+    report["frontier_report_candidate_sample"] = frontier_output.get("candidates", [])[:20]
     return active_candidates[:active_limit], report

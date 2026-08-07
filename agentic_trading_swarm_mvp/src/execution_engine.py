@@ -429,7 +429,16 @@ def _route_feasibility_shadow_recoverable_for_exploration(candidate: dict, setti
     return bool(gate.get("applies") and not gate.get("eligible"))
 
 
-def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, settings: dict) -> dict:
+def execute_order(
+    conn: sqlite3.Connection,
+    candidate: dict,
+    review: dict,
+    settings: dict,
+    *,
+    opportunity_id: int | None = None,
+    record_shadow_observation: bool = True,
+    allow_paper_fill: bool = True,
+) -> dict:
     paper_mode = settings.get("mode", "paper") == "paper" and not settings.get(
         "allow_live_trading", False
     )
@@ -526,9 +535,13 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         candidate = _restore_yahoo_proxy_freshness_shadow(candidate)
         candidate = _restore_okx_basis_decay_shadow(candidate)
     if candidate.get("paper_nav_reference"):
-        return _nav_reference_execution(candidate, settings)
+        result = _nav_reference_execution(candidate, settings)
+        result["opportunity_id"] = opportunity_id
+        return result
     if candidate.get("paper_auction_reference"):
-        return _auction_reference_execution(candidate, settings)
+        result = _auction_reference_execution(candidate, settings)
+        result["opportunity_id"] = opportunity_id
+        return result
     if paper_mode:
         candidate = apply_frontier_paper_fill_gate(candidate, settings)
     order = build_order_ticket(candidate, review, settings)
@@ -550,7 +563,9 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             order["notes"].append(
                 "Yahoo proxy paper entry converted to a synthetic-research shadow observation; no paper fill was created."
             )
-            order_id = save_execution_order(conn, order, candidate, review)
+            order_id = save_execution_order(
+                conn, order, candidate, review, opportunity_id=opportunity_id
+            )
             return {
                 "order_id": order_id,
                 "order": order,
@@ -559,6 +574,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
                 "paper_filled": False,
                 "paper_observation_ready": True,
                 "candidate": candidate,
+                "opportunity_id": opportunity_id,
             }
         okx_basis_decay_shadow = (
             candidate.get("paper_observation_only")
@@ -582,7 +598,9 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             order["notes"].append(
                 "OKX basis candidate recorded as a synthetic-research shadow observation due to decayed paper performance."
             )
-            order_id = save_execution_order(conn, order, candidate, review)
+            order_id = save_execution_order(
+                conn, order, candidate, review, opportunity_id=opportunity_id
+            )
             return {
                 "order_id": order_id,
                 "order": order,
@@ -591,6 +609,7 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
                 "paper_filled": False,
                 "paper_observation_ready": True,
                 "candidate": candidate,
+                "opportunity_id": opportunity_id,
             }
         reject_reason = candidate.get("candidate_reject_reason")
         reject_detail = candidate.get("candidate_reject_detail") or {}
@@ -611,7 +630,16 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             )
         )
         if shadow_observation:
-            observation_id = save_frontier_paper_shadow_observation(conn, candidate, review)
+            observation_id = (
+                save_frontier_paper_shadow_observation(
+                    conn,
+                    candidate,
+                    review,
+                    opportunity_id=opportunity_id,
+                )
+                if record_shadow_observation
+                else None
+            )
             order["status"] = (
                 "shadow_only"
                 if (
@@ -625,52 +653,88 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
             order["shadow_reason"] = candidate.get("shadow_reason") or reject_reason
             order["notes"].append(
                 "Frontier candidate recorded as a shadow observation; no paper order or fill was created."
+                if record_shadow_observation
+                else "Frontier shadow observation deferred by the per-cycle observation cap."
             )
             return {
                 "order_id": None,
                 "shadow_observation_id": observation_id,
+                "shadow_observation_recorded": bool(observation_id),
+                "shadow_observation_deferred": not record_shadow_observation,
                 "order": order,
                 "fills": [],
                 "fill_ids": [],
                 "paper_filled": False,
                 "candidate": candidate,
+                "opportunity_id": opportunity_id,
             }
         order["status"] = "shadow_filtered"
         order["shadow_filter"] = candidate.get("candidate_reject_detail")
         order["notes"].append("Paper fill suppressed by a paper-only candidate guard.")
-        order_id = save_execution_order(conn, order, candidate, review)
+        order_id = save_execution_order(
+            conn, order, candidate, review, opportunity_id=opportunity_id
+        )
         return {
             "order_id": order_id,
             "order": order,
             "fills": [],
             "paper_filled": False,
             "candidate": candidate,
+            "opportunity_id": opportunity_id,
         }
 
     if settings.get("mode") == "live" or settings.get("allow_live_trading"):
         order["status"] = "blocked_live_trading_not_implemented"
-        order_id = save_execution_order(conn, order, candidate, review)
+        order_id = save_execution_order(
+            conn, order, candidate, review, opportunity_id=opportunity_id
+        )
         return {
             "order_id": order_id,
             "order": order,
             "fills": [],
             "paper_filled": False,
             "candidate": candidate,
+            "opportunity_id": opportunity_id,
         }
 
     if order["status"] != "ready_for_paper_execution":
-        order_id = save_execution_order(conn, order, candidate, review)
+        order_id = save_execution_order(
+            conn, order, candidate, review, opportunity_id=opportunity_id
+        )
         return {
             "order_id": order_id,
             "order": order,
             "fills": [],
             "paper_filled": False,
             "candidate": candidate,
+            "opportunity_id": opportunity_id,
+        }
+
+    if paper_mode and not allow_paper_fill:
+        order["status"] = "deferred_capacity"
+        order["capacity_reason"] = "paper_fill_capacity_unavailable"
+        order["notes"].append(
+            "Paper fill deferred before fill creation because the cycle or open-trade capacity is exhausted."
+        )
+        order_id = save_execution_order(
+            conn, order, candidate, review, opportunity_id=opportunity_id
+        )
+        return {
+            "order_id": order_id,
+            "order": order,
+            "fills": [],
+            "fill_ids": [],
+            "paper_filled": False,
+            "paper_fill_deferred": True,
+            "candidate": candidate,
+            "opportunity_id": opportunity_id,
         }
 
     fills = [_paper_fill_for_leg(leg, settings) for leg in order["legs"]]
     order["status"] = "paper_filled"
-    order_id = save_execution_order(conn, order, candidate, review)
+    order_id = save_execution_order(
+        conn, order, candidate, review, opportunity_id=opportunity_id
+    )
     fill_ids = []
     for fill in fills:
         fill_id = save_execution_fill(conn, order_id, fill)
@@ -684,4 +748,5 @@ def execute_order(conn: sqlite3.Connection, candidate: dict, review: dict, setti
         "fill_ids": fill_ids,
         "paper_filled": True,
         "candidate": candidate,
+        "opportunity_id": opportunity_id,
     }

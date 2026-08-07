@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 
 from adapter_implementation_owner import run_once as run_adapter_implementation_owner
+from autonomous_cost_guard import autonomous_paid_attempt_status, autonomous_paid_scope_for
 from autonomous_builder import run_autonomous_builder
 from evolution_owner_scheduler import lane_order, record_turn, scheduler_summary
 from llm_bridge import STATE_JSON, ingest_llm_recommendations
@@ -131,6 +132,8 @@ def _write_report(report: dict) -> dict:
         f"- Writer lane: `{(report.get('owner_scheduler') or {}).get('last_lane')}`",
         f"- Autonomous builder status: `{(report.get('autonomous_builder') or {}).get('status')}`",
         f"- Concurrent Codex queue: `{((report.get('codex_worker_pool') or {}).get('summary') or {}).get('queue_depth', 0)}`",
+        f"- Autonomous paid attempts today: `{(report.get('autonomous_cost_guard') or {}).get('used', 0)}` / "
+        f"`{(report.get('autonomous_cost_guard') or {}).get('daily_paid_attempt_limit', 0)}`",
     ]
     if report.get("reason"):
         lines.extend(["", "## Reason", "", str(report["reason"])])
@@ -138,6 +141,7 @@ def _write_report(report: dict) -> dict:
     return report
 
 
+@autonomous_paid_scope_for("evolution_worker")
 def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool = False) -> dict:
     if settings.get("allow_live_trading"):
         return _write_report(
@@ -145,6 +149,15 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
                 "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "status": "blocked_live_trading",
                 "reason": "Evolution worker refuses to run when allow_live_trading is true.",
+            }
+        )
+
+    if not bool((settings.get("evolution_worker") or {}).get("enabled", False)):
+        return _write_report(
+            {
+                "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "status": "disabled",
+                "reason": "evolution_worker.enabled is false; no research, model, or code-owner stages ran.",
             }
         )
 
@@ -328,6 +341,7 @@ def run_once(settings: dict, *, force_swarm: bool = False, force_builder: bool =
         ),
         "llm_inbox": inbox_summary or {},
         "llm_cost_summary": cost_summary or {},
+        "autonomous_cost_guard": autonomous_paid_attempt_status(),
         "database_errors": database_errors,
     }
     return _write_report(report)

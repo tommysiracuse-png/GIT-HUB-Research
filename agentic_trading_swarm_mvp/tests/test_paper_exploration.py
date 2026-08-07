@@ -396,6 +396,91 @@ class PaperExplorationTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_frontier_short_realized_fallback_requires_valid_parent_close(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            try:
+                observed_at = dt.datetime.now(dt.timezone.utc).isoformat()
+
+                def record_trade(
+                    inst_id: str,
+                    *,
+                    close_status: str,
+                    realized_pnl_bps: float,
+                    horizon_pnl_bps: float | None,
+                ) -> None:
+                    candidate = {
+                        "seen_at": observed_at,
+                        "venue": "FRONTIER_TEST",
+                        "inst_id": inst_id,
+                        "trade_type": "frontier_crypto_venue_map",
+                        "direction": "short_frontier_spot",
+                        "last": 100.0,
+                        "score": 65.0,
+                        "thesis": "reliable close fallback test",
+                        "signal_stats_scope": "synthetic_research",
+                        "premium_vs_reference_bps": 20.0,
+                    }
+                    review = {
+                        "decision": "approve_paper_trade",
+                        "learned_score": 65.0,
+                        "net_edge_bps_estimate": 12.0,
+                    }
+                    trade_id = open_paper_trade(conn, candidate, review, settings=self.settings)
+                    conn.execute(
+                        """
+                        update paper_trades
+                        set status = 'closed', closed_at = ?, pnl_bps = ?,
+                            close_measurement_status = ?
+                        where id = ?
+                        """,
+                        (observed_at, realized_pnl_bps, close_status, trade_id),
+                    )
+                    if horizon_pnl_bps is not None:
+                        conn.execute(
+                            """
+                            insert into paper_trade_outcomes (
+                                trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                                context_json, target_at, observed_at, delay_seconds,
+                                measurement_status, price_source
+                            ) values (?, 60, ?, 100, ?, '{}', ?, ?, 0, 'valid', 'unit_test')
+                            """,
+                            (trade_id, observed_at, horizon_pnl_bps, observed_at, observed_at),
+                        )
+
+                record_trade(
+                    "FRONTIER_TEST:VALID-HORIZON",
+                    close_status="late",
+                    realized_pnl_bps=900.0,
+                    horizon_pnl_bps=-8.0,
+                )
+                record_trade(
+                    "FRONTIER_TEST:INVALID-PARENT",
+                    close_status="late",
+                    realized_pnl_bps=700.0,
+                    horizon_pnl_bps=None,
+                )
+                record_trade(
+                    "FRONTIER_TEST:VALID-PARENT",
+                    close_status="valid",
+                    realized_pnl_bps=-4.0,
+                    horizon_pnl_bps=None,
+                )
+                conn.commit()
+
+                diagnostics = build_paper_exploration_report(conn, self.settings)[
+                    "frontier_short_diagnostics"
+                ]
+
+                self.assertEqual(3, diagnostics["frontier_short_count"])
+                self.assertEqual(2, diagnostics["frontier_short_valid_outcome_count"])
+                self.assertEqual(
+                    -6.0,
+                    diagnostics["cohort_comparison"]["frontier_short_avg_pnl_bps"],
+                )
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

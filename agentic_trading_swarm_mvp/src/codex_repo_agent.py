@@ -19,6 +19,8 @@ import subprocess
 import time
 from typing import Any, Callable, Iterator
 
+from autonomous_cost_guard import claim_autonomous_paid_attempt
+
 
 PINNED_CODEX_PACKAGE = "openai-codex==0.144.4"
 PINNED_CODEX_NPM_FALLBACK = "@openai/codex@0.146.0"
@@ -619,6 +621,23 @@ def run_codex_repo_agent(
     if not key and not cfg.get("chatgpt_account_fallback_enabled", True):
         return {"status": "unavailable", "reason": "missing_codex_api_key", "runtime": runtime}
 
+    autonomous_attempt = claim_autonomous_paid_attempt(
+        agent_name="codex_repo_agent",
+        operation="codex_repository_implementation",
+        metadata={
+            "proposal_id": proposal_id,
+            "model": str(cfg.get("model") or ""),
+            "resumed": bool(session_id),
+        },
+    )
+    if not autonomous_attempt.get("allowed", False):
+        return {
+            "status": "implementation_paused",
+            "reason": autonomous_attempt.get("reason") or autonomous_attempt.get("status"),
+            "cost_guard": autonomous_attempt,
+            "runtime": {name: value for name, value in runtime.items() if name != "command_prefix"},
+        }
+
     pathlib.Path(str(cfg["codex_home"])).expanduser().mkdir(parents=True, exist_ok=True)
     log_path = pathlib.Path(str(cfg["session_log_dir"])) / f"{proposal_id.replace(':', '_')}.jsonl"
     command_for_session = lambda resume_id: _command(runtime, cfg, worktree_root.resolve(), resume_id)
@@ -740,6 +759,22 @@ def run_structured_codex_turn(
         with codex_write_lock(cfg, f"strategy-owner:{task_id}") as lock:
             if not lock.get("acquired"):
                 return {"status": "implementation_paused", "reason": lock.get("reason"), **lock}
+            autonomous_attempt = claim_autonomous_paid_attempt(
+                agent_name="strategy_owner_codex",
+                operation="codex_strategy_contract",
+                metadata={
+                    "task_id": task_id,
+                    "model": str(cfg.get("model") or ""),
+                    "resumed": bool(session_id),
+                },
+            )
+            if not autonomous_attempt.get("allowed", False):
+                return {
+                    "status": "implementation_paused",
+                    "reason": autonomous_attempt.get("reason") or autonomous_attempt.get("status"),
+                    "cost_guard": autonomous_attempt,
+                    "runtime": runtime_meta,
+                }
             def record_started(pid: int) -> None:
                 _lock_path_for_owner(cfg, f"strategy-owner:{task_id}").write_text(
                     json.dumps(

@@ -17,6 +17,7 @@ import time
 
 from okx_perp_scanner import build_candidates
 from settings import load_settings
+from storage import reliable_paper_label_eligibility_for_trade_row
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -49,7 +50,8 @@ def utc_now() -> dt.datetime:
 
 
 def parse_iso(value: str) -> dt.datetime:
-    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
 def direction_sign(direction: str) -> int:
@@ -76,10 +78,25 @@ def init_db(conn: sqlite3.Connection) -> None:
             pnl_bps real,
             status text not null,
             thesis text not null,
-            snapshot_json text not null
+            snapshot_json text not null,
+            target_close_at text,
+            close_observed_at text,
+            close_delay_seconds real,
+            close_measurement_status text not null default 'legacy_unverified',
+            close_price_source text
         )
         """
     )
+    columns = {str(row[1]) for row in conn.execute("pragma table_info(paper_trades)").fetchall()}
+    for column, ddl in (
+        ("target_close_at", "text"),
+        ("close_observed_at", "text"),
+        ("close_delay_seconds", "real"),
+        ("close_measurement_status", "text not null default 'legacy_unverified'"),
+        ("close_price_source", "text"),
+    ):
+        if column not in columns:
+            conn.execute(f"alter table paper_trades add column {column} {ddl}")
     conn.execute("create index if not exists idx_paper_open on paper_trades(status, inst_id, direction)")
     conn.commit()
 
@@ -113,7 +130,52 @@ def open_trade(conn: sqlite3.Connection, candidate: dict) -> None:
     conn.commit()
 
 
-def close_due_trades(conn: sqlite3.Connection, latest_by_inst: dict[str, dict], hold_minutes: int) -> list[dict]:
+def _close_measurement(
+    latest: dict,
+    target_at: dt.datetime,
+    max_delay_seconds: float,
+) -> dict | None:
+    raw_observed_at = latest.get("observed_at") or latest.get("seen_at") or latest.get("last_checked_at")
+    observed_at = None
+    if raw_observed_at:
+        try:
+            observed_at = parse_iso(str(raw_observed_at))
+            signal_age_seconds = float(latest.get("signal_age_seconds") or 0.0)
+            if signal_age_seconds > 0.0:
+                observed_at -= dt.timedelta(seconds=signal_age_seconds)
+        except (TypeError, ValueError):
+            observed_at = None
+    if observed_at is not None and observed_at < target_at:
+        return None
+    delay_seconds = (
+        max(0.0, (observed_at - target_at).total_seconds())
+        if observed_at is not None
+        else None
+    )
+    measurement_status = (
+        "missing"
+        if observed_at is None
+        else "valid"
+        if delay_seconds <= max(0.0, float(max_delay_seconds))
+        else "late"
+    )
+    data_source = latest.get("data_source")
+    source_provider = data_source.get("provider") if isinstance(data_source, dict) else data_source
+    return {
+        "target_at": target_at.isoformat(),
+        "observed_at": observed_at.isoformat() if observed_at is not None else None,
+        "delay_seconds": round(delay_seconds, 3) if delay_seconds is not None else None,
+        "measurement_status": measurement_status,
+        "price_source": latest.get("price_source") or source_provider or latest.get("venue") or "scanner",
+    }
+
+
+def close_due_trades(
+    conn: sqlite3.Connection,
+    latest_by_inst: dict[str, dict],
+    hold_minutes: int,
+    max_delay_seconds: float = 300.0,
+) -> list[dict]:
     now = utc_now()
     closed = []
     rows = conn.execute(
@@ -129,30 +191,73 @@ def close_due_trades(conn: sqlite3.Connection, latest_by_inst: dict[str, dict], 
         sign = direction_sign(direction)
         if sign == 0:
             continue
-        exit_px = float(latest["last"])
+        target_at = parse_iso(opened_at) + dt.timedelta(minutes=hold_minutes)
+        measurement = _close_measurement(latest, target_at, max_delay_seconds)
+        if measurement is None:
+            continue
+        try:
+            exit_px = float(latest["last"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if exit_px <= 0.0:
+            continue
         pnl_bps = (exit_px / float(entry) - 1.0) * 10_000.0 * sign
         conn.execute(
             """
             update paper_trades
-            set closed_at = ?, exit = ?, pnl_bps = ?, status = 'closed'
+            set closed_at = ?, exit = ?, pnl_bps = ?, status = 'closed',
+                target_close_at = ?, close_observed_at = ?,
+                close_delay_seconds = ?, close_measurement_status = ?,
+                close_price_source = ?
             where id = ?
             """,
-            (now.isoformat(), exit_px, round(pnl_bps, 3), trade_id),
+            (
+                now.isoformat(), exit_px, round(pnl_bps, 3),
+                measurement["target_at"], measurement["observed_at"],
+                measurement["delay_seconds"], measurement["measurement_status"],
+                measurement["price_source"], trade_id,
+            ),
         )
-        closed.append({"id": trade_id, "inst_id": inst_id, "direction": direction, "pnl_bps": round(pnl_bps, 3)})
+        closed.append({
+            "id": trade_id,
+            "inst_id": inst_id,
+            "direction": direction,
+            "pnl_bps": round(pnl_bps, 3),
+            **measurement,
+        })
     conn.commit()
     return closed
 
 
 def performance_summary(conn: sqlite3.Connection) -> dict:
-    rows = conn.execute("select pnl_bps from paper_trades where status = 'closed'").fetchall()
-    pnls = [float(row[0]) for row in rows if row[0] is not None]
+    rows = conn.execute(
+        """select pnl_bps, snapshot_json, close_measurement_status
+           from paper_trades where status = 'closed' and pnl_bps is not null"""
+    ).fetchall()
+    pnls = []
+    for pnl_bps, snapshot_json, measurement_status in rows:
+        eligibility = reliable_paper_label_eligibility_for_trade_row({
+            "candidate_json": snapshot_json,
+            "review_json": "{}",
+            "context_json": "{}",
+            "close_measurement_status": measurement_status,
+        })
+        if eligibility.get("paper_label_eligible"):
+            pnls.append(float(pnl_bps))
     open_count = conn.execute("select count(*) from paper_trades where status = 'open'").fetchone()[0]
+    unreliable_closed = len(rows) - len(pnls)
     if not pnls:
-        return {"closed": 0, "open": open_count, "avg_pnl_bps": None, "win_rate": None}
+        return {
+            "closed": 0,
+            "unreliable_closed": unreliable_closed,
+            "open": open_count,
+            "avg_pnl_bps": None,
+            "win_rate": None,
+        }
     wins = sum(1 for pnl in pnls if pnl > 0)
     return {
         "closed": len(pnls),
+        "unreliable_closed": unreliable_closed,
         "open": open_count,
         "avg_pnl_bps": round(sum(pnls) / len(pnls), 3),
         "win_rate": round(wins / len(pnls), 3),
@@ -169,7 +274,12 @@ def run_iteration(conn: sqlite3.Connection, args: argparse.Namespace) -> dict:
         settings=settings,
     )
     latest_by_inst = {row["inst_id"]: row for row in candidates}
-    closed = close_due_trades(conn, latest_by_inst, args.hold_minutes)
+    closed = close_due_trades(
+        conn,
+        latest_by_inst,
+        args.hold_minutes,
+        float(settings.get("learning", {}).get("max_outcome_delay_seconds", 300)),
+    )
     opened = []
     for candidate in candidates:
         if len(opened) >= args.max_new:
@@ -221,7 +331,10 @@ def print_payload(payload: dict) -> None:
     if payload["closed"]:
         print("Closed:")
         for row in payload["closed"]:
-            print(f"  #{row['id']:<4} {row['inst_id']:<20} {row['direction']:<31} pnl_bps={row['pnl_bps']}")
+            print(
+                f"  #{row['id']:<4} {row['inst_id']:<20} {row['direction']:<31} "
+                f"pnl_bps={row['pnl_bps']} measurement={row.get('measurement_status', 'unknown')}"
+            )
     else:
         print("Closed: none")
     print(f"Summary: {payload['summary']}")

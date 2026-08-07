@@ -370,7 +370,8 @@ def build_report(conn: sqlite3.Connection) -> dict:
             select p.id, p.opened_at, p.inst_id, p.direction, p.signal_key, p.entry,
                    p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
                    p.context_json as trade_context_json, p.status as trade_status,
-                   p.pnl_bps as realized_trade_pnl_bps, p.selected_hold_minutes,
+                   p.pnl_bps as realized_trade_pnl_bps, p.close_measurement_status,
+                   p.selected_hold_minutes,
                    o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds, o.context_json
             from paper_trade_outcomes o
             join paper_trades p on p.id = o.trade_id
@@ -389,7 +390,8 @@ def build_report(conn: sqlite3.Connection) -> dict:
                 select p.id, p.opened_at, p.inst_id, p.direction, '' as signal_key, p.entry,
                        p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
                        '{}' as trade_context_json, 'closed' as trade_status,
-                       p.pnl_bps as realized_trade_pnl_bps, null as selected_hold_minutes,
+                       p.pnl_bps as realized_trade_pnl_bps, p.close_measurement_status,
+                       null as selected_hold_minutes,
                        o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds, '{}' as context_json
                 from paper_trade_outcomes o
                 join paper_trades p on p.id = o.trade_id
@@ -407,7 +409,8 @@ def build_report(conn: sqlite3.Connection) -> dict:
                 select p.id, p.opened_at, p.inst_id, p.direction, '' as signal_key, p.entry,
                        p.entry_fee_bps, p.entry_slippage_bps, p.candidate_json,
                        '{}' as trade_context_json, 'closed' as trade_status,
-                       null as realized_trade_pnl_bps, null as selected_hold_minutes,
+                       null as realized_trade_pnl_bps, null as close_measurement_status,
+                       null as selected_hold_minutes,
                        o.horizon_minutes, o.price, o.pnl_bps, o.delay_seconds, '{}' as context_json
                 from paper_trade_outcomes o
                 join paper_trades p on p.id = o.trade_id
@@ -452,7 +455,11 @@ def build_report(conn: sqlite3.Connection) -> dict:
             timing_coverage["provider_age_present"] += int(provider_age is not None)
             timing_coverage["source_bar_end_present"] += int(bool(candidate.get("source_bar_end_utc") or candidate.get("last_bar_utc")))
             timing_coverage["decision_time_present"] += int(bool(candidate.get("decision_time_utc") or candidate.get("seen_at")))
-            if str(row["trade_status"] or "").lower() == "closed" and row["realized_trade_pnl_bps"] is not None:
+            if (
+                str(row["trade_status"] or "").lower() == "closed"
+                and str(row["close_measurement_status"] or "").strip().lower() == "valid"
+                and row["realized_trade_pnl_bps"] is not None
+            ):
                 persisted_trade_tags = trade_context.get("paper_trade_diagnostic_tags")
                 persisted_trade_tags = persisted_trade_tags if isinstance(persisted_trade_tags, dict) else {}
                 computed_trade_tags = proxy_paper_trade_diagnostic_tags(

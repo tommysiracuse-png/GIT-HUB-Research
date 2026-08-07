@@ -91,10 +91,11 @@ class PaperContextLossQuarantineTests(unittest.TestCase):
                     insert into paper_trades (
                         opened_at, closed_at, venue, inst_id, direction, trade_type,
                         signal_key, base_score, learned_score, entry, exit, pnl_bps,
-                        status, thesis, candidate_json, review_json
+                        status, thesis, candidate_json, review_json,
+                        close_measurement_status
                     ) values (?, ?, 'MEXC', 'MEXC:ABC-USDT', 'long_frontier_spot',
                               'frontier_crypto_venue_map', 'MEXC|frontier|long',
-                              80, 80, 100, 99, ?, 'closed', 'test', ?, '{}')
+                              80, 80, 100, 99, ?, 'closed', 'test', ?, '{}', 'valid')
                     """,
                     (f"2026-08-01T00:{index:02d}:00+00:00", f"2026-08-01T01:{index:02d}:00+00:00", pnl, payload),
                 )

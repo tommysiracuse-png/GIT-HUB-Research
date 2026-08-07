@@ -255,6 +255,22 @@ class StrategyReliabilityTests(unittest.TestCase):
                             json.dumps(payload),
                         ),
                     )
+            conn.execute("update paper_trades set close_measurement_status = 'valid'")
+            conn.execute(
+                """
+                insert into paper_trades (
+                    opened_at, closed_at, venue, inst_id, direction, trade_type,
+                    signal_key, base_score, learned_score, entry, exit, pnl_bps,
+                    status, thesis, candidate_json, review_json, close_measurement_status
+                ) values (
+                    '2026-08-05T02:00:00+00:00', '2026-08-05T03:00:00+00:00',
+                    'BYBIT_SPOT', 'BYBIT_SPOT:BTC_USDT', 'long_frontier_spot',
+                    'spot_carry', 'late-outlier', 80, 80, 100, 200, 10000,
+                    'closed', 'must not steer reliability', ?, '{}', 'late'
+                )
+                """,
+                (json.dumps(standard),),
+            )
             conn.commit()
             rows, report = strategy_reliability.apply_strategy_reliability(
                 [standard, conditional],
@@ -272,6 +288,7 @@ class StrategyReliabilityTests(unittest.TestCase):
         self.assertEqual(conditional_row["paper_context_prior"]["realized_context_key"], "BYBIT_SPOT|long|conditional")
         self.assertEqual(standard_row["paper_context_prior"]["context_slice_key"], "BYBIT_SPOT|long|standard")
         self.assertEqual(conditional_row["paper_context_prior"]["context_slice_key"], "BYBIT_SPOT|long|conditional")
+        self.assertEqual(standard_row["paper_context_prior"]["realized_context_closed_count"], 8)
         self.assertEqual(standard_row["paper_context_prior"]["realized_context_prior"], 4.0)
         self.assertEqual(conditional_row["paper_context_prior"]["realized_context_prior"], -15.75)
         self.assertGreater(standard_row["score"], conditional_row["score"])
@@ -325,6 +342,7 @@ class StrategyReliabilityTests(unittest.TestCase):
                         json.dumps({"feasibility_status": "conditional", "route_status": "conditional"}),
                     ),
                 )
+            conn.execute("update paper_trades set close_measurement_status = 'valid'")
             conn.commit()
             rows, _ = strategy_reliability.apply_strategy_reliability(
                 [candidate],
@@ -387,6 +405,7 @@ class StrategyReliabilityTests(unittest.TestCase):
                         json.dumps({"feasibility_status": "standard", "route_status": "standard"}),
                     ),
                 )
+            conn.execute("update paper_trades set close_measurement_status = 'valid'")
             conn.commit()
             rows, _ = strategy_reliability.apply_strategy_reliability(
                 [candidate],
@@ -786,6 +805,7 @@ class StrategyReliabilityTests(unittest.TestCase):
                             json.dumps(payload),
                         ),
                     )
+            conn.execute("update paper_trades set close_measurement_status = 'valid'")
             conn.commit()
             rows, report = strategy_reliability.apply_strategy_reliability(
                 [candidate], {"mode": "paper"}, conn=conn
@@ -884,6 +904,7 @@ class StrategyReliabilityTests(unittest.TestCase):
                         ),
                     ),
                 )
+            conn.execute("update paper_trades set close_measurement_status = 'valid'")
             conn.commit()
             rows, _ = strategy_reliability.apply_strategy_reliability(
                 [candidate],
@@ -1081,6 +1102,7 @@ class StrategyReliabilityTests(unittest.TestCase):
                     "basis_bps": 18.0,
                 },
             )
+            conn.execute("update paper_trades set close_measurement_status = 'valid'")
             conn.commit()
 
             _, report = strategy_reliability.apply_strategy_reliability([], {"mode": "paper"}, conn=conn)
@@ -1189,6 +1211,7 @@ class StrategyReliabilityTests(unittest.TestCase):
                     ),
                 ),
             )
+            conn.execute("update paper_trades set close_measurement_status = 'valid'")
             conn.commit()
 
             _, report = strategy_reliability.apply_strategy_reliability([], {"mode": "paper"}, conn=conn)

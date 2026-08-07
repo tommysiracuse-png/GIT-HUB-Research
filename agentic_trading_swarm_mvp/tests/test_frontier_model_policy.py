@@ -16,12 +16,99 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import cost_router
+import llm_bridge
 import llm_swarm_runner
 import storage
 from cost_router import ModelResult
 
 
 class FrontierModelPolicyTests(unittest.TestCase):
+    def test_force_cannot_run_a_disabled_or_cooled_down_swarm(self) -> None:
+        disabled = {"llm_swarm": {"enabled": False, "auto_run": True}}
+        enabled = {"llm_swarm": {"enabled": True, "auto_run": True}}
+        with mock.patch.object(llm_swarm_runner, "load_state_packet") as load_packet:
+            self.assertEqual([], llm_swarm_runner.run_once(disabled, force=True))
+        load_packet.assert_not_called()
+
+        with mock.patch.object(
+            llm_swarm_runner, "_latest_failure_cooldown_active", return_value=True
+        ), mock.patch.object(llm_swarm_runner, "load_state_packet") as load_packet:
+            self.assertEqual([], llm_swarm_runner.run_once(enabled, force=True))
+        load_packet.assert_not_called()
+
+    def test_compact_json_value_records_omissions_without_invalid_json(self) -> None:
+        value = {"rows": [{"payload": "x" * 10_000, "rank": index} for index in range(100)]}
+
+        compact = llm_bridge.compact_json_value(
+            value,
+            max_depth=3,
+            list_limit=5,
+            dict_limit=10,
+            string_limit=50,
+        )
+        encoded = json.dumps(compact)
+
+        self.assertLess(len(encoded), 1_000)
+        self.assertEqual(95, compact["rows"][-1]["_remaining_items"])
+        self.assertIn("chars omitted", compact["rows"][0]["payload"])
+
+    def test_role_prompts_are_bounded_and_keep_relevant_evidence(self) -> None:
+        repeated = [{"detail": "x" * 50_000, "rank": index} for index in range(100)]
+        packet = {
+            "summary": {"closed": 100, "avg_pnl_bps": -5, "rows": repeated},
+            "frontier_gap_summary": {"priority": "quote_adapter_marker", "rows": repeated},
+            "horizon_outcomes": [{"market": "cross_market_marker", "rows": repeated}],
+            "contextual_stats": repeated,
+            "improvement_tasks": [{"title": "planner_task_marker", "rows": repeated}],
+            "code_evolution": {"status": "planner_code_marker", "rows": repeated},
+            "short_frontier_spot_route_outcomes": {"route": "route_marker", "rows": repeated},
+            "paper_route_requirement_summaries": {"route": "paper_route_marker", "rows": repeated},
+            "strategy_lab": {
+                "recent": [
+                    {
+                        "strategy_lab_id": "lab_marker",
+                        "hypothesis": "Reusable cross-market carry behavior.",
+                        "rows": repeated,
+                    }
+                ]
+            },
+            "top_reviewed": repeated,
+            "allowed_recommendation_actions": ["no_action"],
+        }
+        expected = {
+            "market_scout": "quote_adapter_marker",
+            "cross_market_researcher": "cross_market_marker",
+            "red_team": "planner_task_marker",
+            "execution_route_hunter": "route_marker",
+            "build_planner": "planner_task_marker",
+            "strategy_lab": "lab_marker",
+        }
+
+        for agent in llm_swarm_runner.AGENTS:
+            prompt = llm_swarm_runner.agent_prompt(agent, packet, [])
+            self.assertLessEqual(len(prompt), 12_000, agent["name"])
+            self.assertIn(expected[agent["name"]], prompt)
+
+    def test_dynamic_role_prompt_prioritizes_declared_evidence(self) -> None:
+        agent = {
+            "name": "specialized_dynamic_researcher",
+            "objective": "Inspect the declared evidence only.",
+            "evidence_inputs": ["strategy_lab.recent", "horizon_outcomes"],
+        }
+        packet = {
+            "summary": {"status": "ok"},
+            "strategy_lab": {"marker": "declared_lab_marker"},
+            "horizon_outcomes": {"marker": "declared_outcome_marker"},
+            "top_reviewed": [{"noise": "x" * 20_000}],
+        }
+
+        compact = llm_swarm_runner._bounded_prompt_state(agent, packet, [])
+        prompt = json.dumps(compact)
+
+        self.assertLessEqual(len(prompt), 12_000)
+        self.assertIn("declared_lab_marker", prompt)
+        self.assertIn("declared_outcome_marker", prompt)
+
     def test_config_is_mini_first_with_explicit_escalation_tiers(self) -> None:
         cfg = cost_router.load_llm_config()
         self.assertEqual(cfg["tiers"]["frontier"]["model"], "openai/gpt-5.6-sol")
@@ -34,9 +121,9 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(cfg["agents"]["cross_market_researcher"]["tier"], "fast")
         self.assertEqual(cfg["agents"]["red_team"]["tier"], "fast")
         self.assertEqual(cfg["agents"]["build_planner"]["tier"], "fast")
-        self.assertGreaterEqual(cfg["daily_budget_usd"], 500.0)
-        self.assertGreaterEqual(cfg["agents"]["autonomous_builder"]["daily_budget_usd"], 100.0)
-        self.assertGreaterEqual(cfg["agents"]["code_evolution"]["daily_budget_usd"], 100.0)
+        self.assertLessEqual(cfg["daily_budget_usd"], 25.0)
+        self.assertLessEqual(cfg["agents"]["autonomous_builder"]["daily_budget_usd"], 8.0)
+        self.assertLessEqual(cfg["agents"]["code_evolution"]["daily_budget_usd"], 8.0)
 
     def test_router_fallback_logs_responses_metadata_without_key(self) -> None:
         captured: list[ModelResult] = []
@@ -78,7 +165,7 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(result.reasoning_effort, "xhigh")
         self.assertEqual(result.prompt_tokens, 10)
         self.assertEqual(result.completion_tokens, 20)
-        self.assertEqual(result.max_output_tokens, 8000)
+        self.assertEqual(result.max_output_tokens, 4000)
         self.assertGreater(result.estimated_cost_usd, 0)
         kwargs = call.call_args.kwargs
         self.assertEqual(kwargs["model_name"], "gpt-5.6-sol")
@@ -280,6 +367,147 @@ class FrontierModelPolicyTests(unittest.TestCase):
         self.assertEqual(rec["title"], "Retry ok")
         self.assertEqual(rec["retry_count"], 1)
         self.assertEqual(rec["initial_parse_status"], "truncated_json")
+
+    def test_schema_retry_never_runs_for_non_model_statuses(self) -> None:
+        packet = {"allowed_recommendation_actions": ["propose_hunter_directive"], "growth_experiments": []}
+        agent = next(row for row in llm_swarm_runner.AGENTS if row["name"] == "market_scout")
+        statuses = (
+            "quota_circuit_open_until:2026-08-07T02:00:00+00:00",
+            "quota_429",
+            "fallback_error:429 rate_limit_exceeded",
+            "fallback_error:insufficient_quota",
+            "credit_balance_exhausted",
+            "preflight_input_validation_failed",
+            "agent_budget_guard",
+            "global_budget_guard",
+            "fallback_no_cost",
+            "provider_temporarily_unavailable",
+            "",
+        )
+
+        for status in statuses:
+            with self.subTest(status=status):
+                result = ModelResult(
+                    text='{"action":"propose_hunter_directive"',
+                    model_name="openai/gpt-5.4",
+                    model_tier="standard",
+                    prompt_tokens=10,
+                    completion_tokens=10,
+                    estimated_cost_usd=0.0,
+                    status=status,
+                    api="responses",
+                    structured_json=True,
+                )
+                with mock.patch.object(llm_swarm_runner, "complete", return_value=result) as call:
+                    rec = llm_swarm_runner.run_agent(agent, packet, [])
+
+                self.assertEqual(1, call.call_count)
+                self.assertNotIn("retry", rec.get("model_output_audit", {}))
+                self.assertEqual(status, rec["model"]["status"])
+
+    def test_latest_failure_cooldown_reads_agent_outputs_and_quota_aliases(self) -> None:
+        statuses = (
+            "quota_circuit_open_until:2026-08-07T02:00:00+00:00",
+            "quota_429",
+            "fallback_error:429 Too Many Requests",
+            "fallback_error:rate-limit exceeded",
+            "fallback_error:insufficient_quota",
+            "fallback_error:credit_balance_exhausted",
+        )
+        settings = {
+            "llm_swarm": {
+                "cooldown_on_model_unavailable": True,
+                "model_failure_cooldown_minutes": 60,
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            llm_swarm_runner, "RUNS_DIR", pathlib.Path(tmp)
+        ):
+            report = pathlib.Path(tmp) / "llm_swarm_latest.json"
+            for status in statuses:
+                with self.subTest(status=status):
+                    report.write_text(
+                        json.dumps(
+                            {
+                                "generated_at": llm_swarm_runner.dt.datetime.now(
+                                    llm_swarm_runner.dt.timezone.utc
+                                ).isoformat(),
+                                "recommendations": [],
+                                "suppressed_recommendations": [],
+                                "agent_outputs": [
+                                    {"recommendation": {"model": {"status": status}}},
+                                    {
+                                        "recommendation": {
+                                            "model": {"status": "preflight_input_validation_failed"}
+                                        }
+                                    },
+                                ],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    self.assertTrue(llm_swarm_runner._latest_failure_cooldown_active(settings))
+
+            report.write_text(
+                json.dumps(
+                    {
+                        "generated_at": llm_swarm_runner.dt.datetime.now(
+                            llm_swarm_runner.dt.timezone.utc
+                        ).isoformat(),
+                        "agent_outputs": [
+                            {"recommendation": {"model": {"status": "model_call:responses"}}}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertFalse(llm_swarm_runner._latest_failure_cooldown_active(settings))
+
+    def test_run_once_skips_unchanged_evidence_with_bounded_refresh(self) -> None:
+        packet = {
+            "summary": {"closed": 10, "avg_pnl_bps": 2.5, "generated_at": "first"},
+            "top_reviewed": [{"market_key": "OKX|funding", "score": 0.8}],
+            "llm_cost_summary": {"estimated_cost_usd": 99.0},
+        }
+        settings = {
+            "llm_swarm": {
+                "skip_unchanged_evidence": True,
+                "unchanged_evidence_max_age_minutes": 360,
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            llm_swarm_runner, "RUNS_DIR", pathlib.Path(tmp)
+        ):
+            llm_swarm_runner._record_evidence_fingerprint(packet)
+            state_path = pathlib.Path(tmp) / "llm_swarm_evidence_state.json"
+            self.assertLess(state_path.stat().st_size, 512)
+            self.assertTrue(
+                llm_swarm_runner._unchanged_evidence_cooldown_active(
+                    {
+                        **packet,
+                        "summary": {**packet["summary"], "generated_at": "later"},
+                        "llm_cost_summary": {"estimated_cost_usd": 500.0},
+                    },
+                    settings,
+                )
+            )
+            self.assertFalse(
+                llm_swarm_runner._unchanged_evidence_cooldown_active(
+                    {**packet, "summary": {**packet["summary"], "closed": 11}},
+                    settings,
+                )
+            )
+
+            with mock.patch.object(llm_swarm_runner, "should_auto_run", return_value=True), mock.patch.object(
+                llm_swarm_runner, "load_state_packet", return_value=packet
+            ), mock.patch.object(llm_swarm_runner, "connect") as connect_call, mock.patch.object(
+                llm_swarm_runner, "mark_auto_run"
+            ) as mark_call:
+                recs = llm_swarm_runner.run_once(settings=settings)
+
+            self.assertEqual([], recs)
+            connect_call.assert_not_called()
+            mark_call.assert_called_once_with()
 
     def test_strategy_lab_prompt_puts_invention_evidence_before_generic_state(self) -> None:
         packet = {

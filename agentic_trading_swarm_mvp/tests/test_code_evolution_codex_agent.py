@@ -27,6 +27,41 @@ def git_available() -> bool:
 
 @unittest.skipUnless(git_available(), "git executable is required")
 class CodeEvolutionCodexAgentTests(unittest.TestCase):
+    def test_revert_success_is_not_retried_when_champion_tagging_fails(self) -> None:
+        responses = [
+            {"returncode": 0, "stdout_tail": "", "stderr_tail": ""},
+            {"returncode": 0, "stdout_tail": "", "stderr_tail": ""},
+            {"returncode": 0, "stdout_tail": "reverted", "stderr_tail": ""},
+            {"returncode": 0, "stdout_tail": "committed", "stderr_tail": ""},
+            {"returncode": 0, "stdout_tail": "c" * 40, "stderr_tail": ""},
+            {"returncode": 1, "stdout_tail": "", "stderr_tail": "tag failed"},
+        ]
+        with mock.patch.object(code_evolution, "_run", side_effect=responses):
+            result = code_evolution._revert_promoted_commit(
+                pathlib.Path("."), "b" * 40, timeout=30
+            )
+
+        self.assertTrue(result["reverted"])
+        self.assertFalse(result["champion_tag_ok"])
+        self.assertEqual("c" * 40, result["recovery_commit"])
+
+    def test_revert_detects_prior_recovery_marker_after_database_write_crash(self) -> None:
+        responses = [
+            {"returncode": 0, "stdout_tail": "c" * 40, "stderr_tail": ""},
+            {"returncode": 0, "stdout_tail": "", "stderr_tail": ""},
+        ]
+        with mock.patch.object(code_evolution, "_run", side_effect=responses) as run:
+            result = code_evolution._revert_promoted_commit(
+                pathlib.Path("."), "b" * 40, timeout=30
+            )
+
+        self.assertTrue(result["reverted"])
+        self.assertTrue(result["already_reverted"])
+        self.assertEqual("c" * 40, result["recovery_commit"])
+        self.assertEqual(2, run.call_count)
+        self.assertEqual("git", run.call_args_list[0].args[0][0])
+        self.assertEqual("log", run.call_args_list[0].args[0][1])
+
     def test_candidate_diff_handles_missing_subprocess_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release = code_evolution.CandidateRelease(

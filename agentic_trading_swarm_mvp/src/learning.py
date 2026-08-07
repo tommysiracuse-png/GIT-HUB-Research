@@ -12,7 +12,7 @@ from storage import (
     add_improvement_task,
     open_experiments,
     open_tasks,
-    paper_label_eligibility_for_trade_row,
+    reliable_paper_label_eligibility_for_trade_row,
 )
 
 
@@ -55,14 +55,15 @@ def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, d
 
     rows = conn.execute(
         """
-        select signal_key, pnl_bps, candidate_json, review_json, context_json
+        select signal_key, pnl_bps, candidate_json, review_json, context_json,
+               close_measurement_status
         from paper_trades
         where status = 'closed' and pnl_bps is not null
         """
     ).fetchall()
     grouped: dict[str, list[float]] = {}
     for row in rows:
-        if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+        if not reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
             continue
         grouped.setdefault(row["signal_key"], []).append(float(row["pnl_bps"]))
 
@@ -122,14 +123,15 @@ def update_signal_stats(conn: sqlite3.Connection, settings: dict) -> dict[str, d
 def update_contextual_stats(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
-        select pnl_bps, candidate_json, review_json, context_json
+        select signal_key, pnl_bps, candidate_json, review_json, context_json,
+               close_measurement_status
         from paper_trades
         where status = 'closed' and pnl_bps is not null and context_json is not null
         """
     ).fetchall()
     grouped: dict[str, list[float]] = {}
     for row in rows:
-        if not paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+        if not reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
             continue
         try:
             context = json.loads(row["context_json"] or "{}")

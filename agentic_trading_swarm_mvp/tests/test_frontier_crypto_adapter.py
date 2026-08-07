@@ -127,7 +127,16 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             mock.patch.object(frontier, "_select_observations", return_value=[observation]),
             mock.patch.object(frontier, "_reference_prices", return_value={"ABC": 95.0}),
             mock.patch.object(frontier, "_candidate_from_observation", return_value=candidate),
-            mock.patch.object(frontier, "write_outputs") as write_outputs,
+            mock.patch.object(
+                frontier,
+                "write_outputs",
+                return_value={
+                    "summary": {"observation_count": 1},
+                    "artifact_compaction": {"enabled": True},
+                    "observations": [observation],
+                    "candidates": [candidate],
+                },
+            ) as write_outputs,
         ):
             deferred = frontier.build_scan_batch(
                 cfg,
@@ -137,12 +146,14 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
             self.assertEqual(1, len(deferred.candidates))
             write_outputs.assert_not_called()
 
-            frontier.build_scan_batch(
+            immediate = frontier.build_scan_batch(
                 cfg,
                 conn=object(),
                 write_preliminary_report=True,
             )
             write_outputs.assert_called_once()
+            self.assertEqual([observation], immediate.metadata["report_observation_sample"])
+            self.assertEqual([candidate], immediate.metadata["report_candidate_sample"])
 
     def test_scan_batch_adds_active_program_universe_for_bounded_intraday_coverage(self) -> None:
         cfg = settings()
@@ -875,6 +886,8 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
 
     def test_report_contains_counts_dislocations_and_route_blockers(self) -> None:
         cfg = settings()
+        cfg["frontier_crypto_adapter"]["report_max_observations"] = 2
+        cfg["frontier_crypto_adapter"]["report_max_candidates"] = 2
         observations = [
             self._obs("A", "ABC-USDT", "ABC", "USDT", 100, 100000),
             self._obs("B", "ABC-USDT", "ABC", "USDT", 98, 100000),
@@ -944,6 +957,10 @@ class FrontierCryptoAdapterTests(unittest.TestCase):
                 frontier.REPORT_MD = old_md
 
         summary = report["summary"]
+        self.assertEqual(3, summary["observation_count"])
+        self.assertEqual(2, len(report["observations"]))
+        self.assertEqual(1, report["artifact_compaction"]["observation_count_omitted"])
+        self.assertEqual(2, len(report["candidates"]))
         self.assertEqual(summary["venue_count"], 3)
         self.assertEqual(summary["symbol_count"], 1)
         self.assertTrue(summary["top_dislocations"])

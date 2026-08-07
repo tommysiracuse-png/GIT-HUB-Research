@@ -14,6 +14,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import llm_swarm_runner  # noqa: E402
+import memory_graph  # noqa: E402
 from storage import (  # noqa: E402
     add_code_evolution_proposal,
     add_llm_recommendation,
@@ -37,6 +38,54 @@ class TemporalMemoryTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.conn.close()
+
+    def test_disabled_radar_memory_is_a_true_noop(self) -> None:
+        disabled = {"agent_memory": {"enabled": False}}
+        with mock.patch.object(memory_graph, "upsert_memory_fact") as upsert, mock.patch.object(
+            memory_graph, "memory_system_summary"
+        ) as summarize, mock.patch.object(
+            memory_graph, "retrieve_role_memories"
+        ) as retrieve, mock.patch.object(
+            memory_graph, "build_role_memory_contexts"
+        ) as build_contexts, mock.patch.object(
+            memory_graph, "record_swarm_reflection"
+        ) as reflect, mock.patch.object(
+            memory_graph, "sync_graphiti_memories"
+        ) as sync, mock.patch.object(
+            memory_graph, "write_memory_reports"
+        ) as write_reports:
+            changes = memory_graph.ingest_radar_memory(
+                self.conn,
+                {"summary": {"closed": 10}},
+                disabled,
+            )
+            summary = memory_graph.memory_summary(self.conn, disabled)
+            role_memory = memory_graph.query_role_memory(
+                self.conn, {}, "market_scout", disabled, "cycle"
+            )
+            swarm_memory, cycle_id = memory_graph.build_swarm_memory(
+                self.conn, {}, disabled, ["market_scout", "red_team"]
+            )
+            reflection = memory_graph.reflect_swarm(
+                self.conn, {}, cycle_id, disabled
+            )
+            graphiti = memory_graph.sync_graphiti(self.conn, disabled)
+            memory_graph.write_memory_exports(self.conn, disabled)
+
+        self.assertEqual([], changes)
+        self.assertEqual({"enabled": False, "status": "disabled_by_config"}, summary)
+        self.assertEqual([], role_memory)
+        self.assertEqual({"market_scout": [], "red_team": []}, swarm_memory)
+        self.assertTrue(cycle_id.startswith("swarm:memory-disabled:"))
+        self.assertEqual({"status": "disabled"}, reflection)
+        self.assertEqual({"status": "disabled", "synced": 0}, graphiti)
+        upsert.assert_not_called()
+        summarize.assert_not_called()
+        retrieve.assert_not_called()
+        build_contexts.assert_not_called()
+        reflect.assert_not_called()
+        sync.assert_not_called()
+        write_reports.assert_not_called()
 
     def test_repeated_fact_reinforces_and_material_change_versions(self) -> None:
         first = upsert_memory_fact(

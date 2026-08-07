@@ -325,16 +325,65 @@ class DynamicAgentPersistenceTests(unittest.TestCase):
             """insert into paper_trades(
             opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
             base_score, learned_score, entry, exit, pnl_bps, status, thesis,
-            candidate_json, review_json, strategy_lab_id
-            ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now, now, "TEST", "ABC", "long", "lab", "lab1", 1, 1, 100, 101, 100, "closed", "test", "{}", "{}", "lab1"),
+            candidate_json, review_json, context_json, strategy_lab_id,
+            close_measurement_status
+            ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                now, now, "TEST", "ABC", "long", "lab", "lab1", 1, 1,
+                100, 101, 100, "closed", "test", "{}", "{}", "{}", "lab1", "valid",
+            ),
         )
+        direct_trade_id = int(self.conn.execute("select last_insert_rowid()").fetchone()[0])
+        self.conn.execute(
+            """insert into paper_trades(
+            opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
+            base_score, learned_score, entry, exit, pnl_bps, status, thesis,
+            candidate_json, review_json, context_json, strategy_lab_id,
+            close_measurement_status
+            ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                now, now, "TEST", "LATE", "long", "lab", "lab1", 1, 1,
+                100, 109, 900, "closed", "test", "{}", "{}", "{}", "lab1", "late",
+            ),
+        )
+        late_trade_id = int(self.conn.execute("select last_insert_rowid()").fetchone()[0])
+        self.conn.execute(
+            """insert into paper_trades(
+            opened_at, closed_at, venue, inst_id, direction, trade_type, signal_key,
+            base_score, learned_score, entry, exit, pnl_bps, status, thesis,
+            candidate_json, review_json, context_json, strategy_lab_id,
+            close_measurement_status
+            ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                now, now, "TEST", "PROXY", "long_proxy", "lab", "PAPER_PROXY|lab1", 1, 1,
+                100, 101.2, 120, "closed", "test", '{"signal_key":"PAPER_PROXY|lab1"}',
+                "{}", "{}", "lab1", "valid",
+            ),
+        )
+        proxy_trade_id = int(self.conn.execute("select last_insert_rowid()").fetchone()[0])
+        for trade_id in (direct_trade_id, late_trade_id, proxy_trade_id):
+            self.conn.execute(
+                """insert into paper_trade_outcomes(
+                    trade_id, horizon_minutes, measured_at, price, pnl_bps,
+                    context_json, measurement_status
+                ) values(?,60,?,101,10,'{}','valid')""",
+                (trade_id, now),
+            )
         self.conn.commit()
 
         summary = dynamic_agents.dynamic_agent_summary(self.conn)
         downstream = summary["latest_runs"][0]["downstream"]
         self.assertEqual(downstream["code_proposals"][0]["proposal_id"], "p1")
-        self.assertEqual(downstream["strategy_experiments"][0]["paper_outcomes"]["closed"], 1)
+        paper_outcomes = downstream["strategy_experiments"][0]["paper_outcomes"]
+        self.assertEqual(paper_outcomes["trades"], 3)
+        self.assertEqual(paper_outcomes["closed"], 2)
+        self.assertEqual(paper_outcomes["unreliable_closed"], 1)
+        self.assertEqual(paper_outcomes["avg_pnl_bps"], 110.0)
+        spec = self.conn.execute(
+            "select reliable_outcomes_count from agent_specs where agent_id=?",
+            (created["agent_id"],),
+        ).fetchone()
+        self.assertEqual(spec["reliable_outcomes_count"], 2)
         linked = self.conn.execute("select code_proposal_id, strategy_lab_id from agent_runs").fetchone()
         self.assertEqual(tuple(linked), ("p1", "lab1"))
 

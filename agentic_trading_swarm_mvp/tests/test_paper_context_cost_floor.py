@@ -644,7 +644,11 @@ class PaperContextCostFloorTests(unittest.TestCase):
 
         self.assertTrue(result["paper_filled"])
         self.assertEqual(result["order"]["status"], "paper_filled")
-        self.assertEqual(result["order"]["signal_stats_scope"], "direct")
+        self.assertEqual(result["order"]["signal_stats_scope"], "synthetic_research")
+        self.assertEqual(
+            result["order"]["execution_semantics"],
+            "counterfactual_family_decay_guard",
+        )
 
     def test_new_outcome_persists_realized_cost_backfill_audit(self) -> None:
         conn = sqlite3.connect(":memory:")

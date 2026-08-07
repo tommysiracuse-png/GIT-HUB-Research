@@ -578,7 +578,8 @@ def _closed_label_statistics(
     try:
         rows = conn.execute(
             """
-            select direction, candidate_json, pnl_bps
+            select direction, candidate_json, review_json, context_json, pnl_bps,
+                   close_measurement_status
             from paper_trades
             where status = 'closed' and pnl_bps is not null and closed_at >= ?
               and venue = 'OKX' and trade_type = 'perp_funding_basis'
@@ -597,6 +598,11 @@ def _closed_label_statistics(
         }
     pnls: list[float] = []
     for row in rows:
+        # These are deliberately diagnostic shadow labels used to decide when
+        # the quarantine itself may be released. They retain their established
+        # shadow-route semantics, but only a timely measured close can count.
+        if str(row["close_measurement_status"] or "").strip().lower() != "valid":
+            continue
         try:
             candidate = json.loads(row["candidate_json"] or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):

@@ -364,27 +364,30 @@ def _load_history(
     max_points: int,
 ) -> dict[tuple[str, str], list[dict]]:
     history: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for start in range(0, len(keys), 300):
-        chunk = keys[start : start + 300]
-        clauses = " or ".join("(venue = ? and inst_id = ?)" for _ in chunk)
-        params: list[Any] = [cutoff]
-        for venue, inst_id in chunk:
-            params.extend([venue, inst_id])
+    # Query each indexed instrument independently so SQLite and Python never
+    # materialize every retained snapshot for a large observation universe.
+    # Feature generation currently needs at most the configured tail for each
+    # instrument; enforce that bound in SQL rather than slicing after fetchall.
+    for venue, inst_id in dict.fromkeys(keys):
+        params: list[Any] = [cutoff, venue, inst_id]
+        limit_sql = ""
+        if max_points > 0:
+            limit_sql = " limit ?"
+            params.append(max_points)
         rows = conn.execute(
             f"""
             select bucket_at, observed_at, venue, inst_id, trade_type, last, price_source, features_json
             from strategy_feature_snapshots
-            where bucket_at >= ? and ({clauses})
-            order by venue, inst_id, bucket_at
+            where bucket_at >= ? and venue = ? and inst_id = ?
+            order by bucket_at desc
+            {limit_sql}
             """,
             params,
         ).fetchall()
-        for raw in rows:
+        for raw in reversed(rows):
             item = dict(raw)
             item["features"] = _json(item.pop("features_json"), {})
             history[(str(item["venue"]), str(item["inst_id"]))].append(item)
-    if max_points > 0:
-        history = {key: rows[-max_points:] for key, rows in history.items()}
     return history
 
 

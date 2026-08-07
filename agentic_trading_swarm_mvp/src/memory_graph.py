@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sqlite3
 from typing import Iterable
@@ -19,10 +20,17 @@ from temporal_memory import (
 )
 
 
+def _memory_enabled(settings: dict | None) -> bool:
+    effective = settings or {"agent_memory": {"enabled": True}}
+    return bool(effective.get("agent_memory", {}).get("enabled", True))
+
+
 def ingest_radar_memory(conn: sqlite3.Connection, payload: dict, settings: dict | None = None) -> list[dict]:
     """Persist compact, deduplicated facts and refresh outcome-linked memory."""
     settings = settings or {"agent_memory": {"enabled": True}}
     cfg = settings.get("agent_memory", {})
+    if not _memory_enabled(settings):
+        return []
     profile_hours = float(cfg.get("profile_version_hours", 6.0))
     added: list[dict] = []
 
@@ -229,6 +237,8 @@ def query_role_memory(
     settings: dict,
     cycle_id: str,
 ) -> list[dict]:
+    if not _memory_enabled(settings):
+        return []
     return retrieve_role_memories(conn, packet, agent_name, settings, cycle_id=cycle_id)
 
 
@@ -238,22 +248,34 @@ def build_swarm_memory(
     settings: dict,
     agent_names: Iterable[str],
 ) -> tuple[dict, str]:
-    return build_role_memory_contexts(conn, packet, settings, agent_names)
+    names = list(agent_names)
+    if not _memory_enabled(settings):
+        cycle_id = f"swarm:memory-disabled:{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+        return {name: [] for name in names}, cycle_id
+    return build_role_memory_contexts(conn, packet, settings, names)
 
 
 def reflect_swarm(conn: sqlite3.Connection, state: dict, cycle_id: str, settings: dict) -> dict:
+    if not _memory_enabled(settings):
+        return {"status": "disabled"}
     result = record_swarm_reflection(conn, state, cycle_id, settings)
     write_memory_reports(conn, settings)
     return result
 
 
 def memory_summary(conn: sqlite3.Connection, settings: dict) -> dict:
+    if not _memory_enabled(settings):
+        return {"enabled": False, "status": "disabled_by_config"}
     return memory_system_summary(conn, settings)
 
 
 def sync_graphiti(conn: sqlite3.Connection, settings: dict) -> dict:
+    if not _memory_enabled(settings):
+        return {"status": "disabled", "synced": 0}
     return sync_graphiti_memories(conn, settings)
 
 
 def write_memory_exports(conn: sqlite3.Connection, settings: dict | None = None) -> None:
+    if not _memory_enabled(settings):
+        return
     write_memory_reports(conn, settings)

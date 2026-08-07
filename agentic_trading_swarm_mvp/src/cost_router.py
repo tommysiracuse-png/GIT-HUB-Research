@@ -15,6 +15,7 @@ import pathlib
 import sqlite3
 from dataclasses import dataclass
 
+from autonomous_cost_guard import autonomous_paid_attempt_status, claim_autonomous_paid_attempt
 from storage import connect, record_llm_cost_event
 
 
@@ -315,6 +316,11 @@ def completion_preflight_status(
         }
 
     allowed, budget_status = _budget_allows_call(agent_name, cfg, agent_cfg, tier_cfg, prompt_tokens)
+    if allowed:
+        autonomous_status = autonomous_paid_attempt_status()
+        if not autonomous_status.get("allowed", False):
+            allowed = False
+            budget_status = str(autonomous_status.get("reason") or autonomous_status.get("status"))
     return {
         "ok": bool(allowed),
         "status": budget_status,
@@ -454,6 +460,42 @@ def complete(
             completion_tokens,
             0.0,
             budget_status,
+            provider=provider,
+            api=api,
+            reasoning_effort=reasoning_effort,
+            reasoning_mode=reasoning_mode,
+            verbosity=verbosity,
+            operation=operation,
+            prompt_cache_key=prompt_cache_key,
+            frontier_escalation_reason=frontier_escalation_reason,
+            structured_json=structured_json_enabled,
+            max_output_tokens=max_output_tokens,
+        )
+        _log(agent_name, result)
+        return result
+
+    autonomous_attempt = claim_autonomous_paid_attempt(
+        agent_name=agent_name,
+        operation=operation,
+        metadata={
+            "model_name": model_name,
+            "model_tier": tier_name,
+            "provider": provider,
+            "api": api,
+            "prompt_tokens": prompt_tokens,
+        },
+    )
+    if not autonomous_attempt.get("allowed", False):
+        text = _fallback_response(agent_name, prompt)
+        completion_tokens = estimate_tokens(text)
+        result = ModelResult(
+            text,
+            model_name,
+            tier_name,
+            prompt_tokens,
+            completion_tokens,
+            0.0,
+            str(autonomous_attempt.get("reason") or autonomous_attempt.get("status")),
             provider=provider,
             api=api,
             reasoning_effort=reasoning_effort,

@@ -15,7 +15,7 @@ from collections import Counter
 from typing import Any
 
 from proxy_signal_quality import proxy_short_quality_review
-from storage import RUNS_DIR, signal_key, utc_now
+from storage import RUNS_DIR, reliable_paper_label_eligibility_for_trade_row, signal_key, utc_now
 
 
 REPORT_JSON = RUNS_DIR / "market_admission_report.json"
@@ -214,28 +214,73 @@ def _stage_for(item: dict, review: dict | None, stats: dict, config: dict | None
 
 def _paper_stats(conn: sqlite3.Connection) -> dict[tuple[str, str], dict]:
     output: dict[tuple[str, str], dict] = {}
-    rows = conn.execute(
-        """
-        select inst_id, signal_key, count(*) as trades,
-               sum(case when status = 'closed' then 1 else 0 end) as closed_trades,
-               avg(case when status = 'closed' then pnl_bps end) as avg_pnl_bps
-        from paper_trades
-        group by inst_id, signal_key
-        """
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            select id, inst_id, signal_key, status, pnl_bps, candidate_json,
+                   review_json, context_json, close_measurement_status
+            from paper_trades
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # A partial read-only schema may not have completed the measurement
+        # migration. Keep operational counts, but conservatively expose no
+        # performance or promotion evidence until an explicit valid close is
+        # available.
+        rows = conn.execute(
+            """
+            select id, inst_id, signal_key, status, pnl_bps, candidate_json,
+                   review_json, context_json, null as close_measurement_status
+            from paper_trades
+            """
+        ).fetchall()
     for row in rows:
-        output[(str(row["inst_id"]), str(row["signal_key"]))] = dict(row)
-    labels = conn.execute(
-        """
-        select p.inst_id, p.signal_key, count(*) as valid_labels
-        from paper_trade_outcomes o
-        join paper_trades p on p.id = o.trade_id
-        where o.measurement_status = 'valid'
-        group by p.inst_id, p.signal_key
-        """
-    ).fetchall()
+        key = (str(row["inst_id"]), str(row["signal_key"]))
+        stats = output.setdefault(
+            key,
+            {"trades": 0, "closed_trades": 0, "valid_labels": 0, "avg_pnl_bps": None, "_pnl_sum": 0.0},
+        )
+        stats["trades"] += 1
+        if str(row["status"] or "").strip().lower() != "closed":
+            continue
+        if not reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
+        try:
+            pnl_bps = float(row["pnl_bps"])
+        except (TypeError, ValueError):
+            continue
+        stats["closed_trades"] += 1
+        stats["_pnl_sum"] += pnl_bps
+
+    for stats in output.values():
+        if stats["closed_trades"]:
+            stats["avg_pnl_bps"] = stats["_pnl_sum"] / stats["closed_trades"]
+        stats.pop("_pnl_sum", None)
+
+    try:
+        labels = conn.execute(
+            """
+            select p.inst_id, p.signal_key, p.status, p.candidate_json,
+                   p.review_json, p.context_json, p.close_measurement_status,
+                   count(*) as valid_label_count
+            from paper_trade_outcomes o
+            join paper_trades p on p.id = o.trade_id
+            where o.measurement_status = 'valid' and p.status = 'closed'
+            group by p.id
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        labels = []
     for row in labels:
-        output.setdefault((str(row["inst_id"]), str(row["signal_key"])), {})["valid_labels"] = int(row["valid_labels"])
+        if not reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
+        stats = output.setdefault(
+            (str(row["inst_id"]), str(row["signal_key"])),
+            {"trades": 0, "closed_trades": 0, "valid_labels": 0, "avg_pnl_bps": None},
+        )
+        stats["valid_labels"] = int(stats.get("valid_labels") or 0) + int(
+            row["valid_label_count"] or 0
+        )
     return output
 
 

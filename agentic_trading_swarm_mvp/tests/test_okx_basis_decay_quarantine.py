@@ -78,6 +78,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
         settings: dict | None = None,
         count: int = 30,
         pnl_bps: float = 6.0,
+        measurement_status: str = "valid",
     ) -> None:
         runtime_settings = settings or self.settings
         guarded = apply_quarantine(candidate or self.candidate(), runtime_settings, conn=conn)
@@ -92,8 +93,8 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
                 insert into paper_trades (
                     opened_at, closed_at, venue, inst_id, direction, trade_type,
                     signal_key, base_score, learned_score, entry, exit, pnl_bps,
-                    status, thesis, candidate_json, review_json
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?, ?, ?)
+                    status, thesis, candidate_json, review_json, close_measurement_status
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?, ?, ?, ?)
                 """,
                 (
                     closed_at,
@@ -111,6 +112,7 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
                     "shadow label",
                     json.dumps(shadow_candidate),
                     "{}",
+                    measurement_status,
                 ),
             )
         conn.commit()
@@ -360,6 +362,26 @@ class OkxBasisDecayQuarantineTests(unittest.TestCase):
                 paper_report["okx_basis_decay_quarantine"]["reason"],
             )
             self.assertEqual(30, paper_report["summary"]["okx_basis_decay_quarantine_closed_labels"])
+            conn.close()
+
+    def test_late_shadow_labels_cannot_release_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn = connect(pathlib.Path(temp_dir) / "radar.sqlite")
+            candidate = self.candidate()
+            self.assertTrue(quarantine_record(candidate, self.settings, conn=conn)["active"])
+            self.add_closed_shadow_labels(
+                conn,
+                candidate=candidate,
+                count=30,
+                pnl_bps=100.0,
+                measurement_status="late",
+            )
+
+            report = runtime_report(conn, self.settings)
+
+            self.assertEqual("active", report["status"])
+            self.assertEqual(0, report["closed_label_count"])
+            self.assertIsNone(report["avg_pnl_bps"])
             conn.close()
 
     def test_runtime_report_exposes_quarantine_counts_and_shadow_pnl(self) -> None:

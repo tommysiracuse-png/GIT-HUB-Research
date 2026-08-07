@@ -398,7 +398,10 @@ def _frontier_short_diagnostic_report(rows: list[sqlite3.Row], horizon: int) -> 
         pnl_bps = None
         if row["measurement_status"] == "valid" and row["horizon_pnl_bps"] is not None:
             pnl_bps = float(row["horizon_pnl_bps"])
-        elif row["pnl_bps"] is not None:
+        elif (
+            str(row["close_measurement_status"] or "").strip().lower() == "valid"
+            and row["pnl_bps"] is not None
+        ):
             pnl_bps = float(row["pnl_bps"])
         base_edge_bps = (
             _maybe_float(candidate.get("net_edge_bps"))
@@ -606,7 +609,8 @@ def build_paper_exploration_report(
     horizon = int(cfg.get("guard_value_horizon_minutes", 60))
     rows = conn.execute(
         """
-        select p.id, p.status, p.pnl_bps, p.candidate_json, p.review_json, p.context_json,
+        select p.id, p.status, p.pnl_bps, p.close_measurement_status,
+               p.candidate_json, p.review_json, p.context_json,
                o.pnl_bps as horizon_pnl_bps, o.measurement_status
         from paper_trades p
         left join paper_trade_outcomes o

@@ -54,6 +54,87 @@ except ModuleNotFoundError:  # pragma: no cover - package import fallback
 _strategy_lab_summary_original = strategy_lab_summary
 
 
+def compact_json_value(
+    value: Any,
+    *,
+    max_depth: int = 5,
+    list_limit: int = 10,
+    dict_limit: int = 60,
+    string_limit: int = 800,
+    _depth: int = 0,
+) -> Any:
+    """Return a bounded, JSON-safe copy of a potentially enormous report.
+
+    Runtime reports often repeat candidate, task, and model artifacts at
+    several levels. Preserve representative evidence and explicit omission
+    counts instead of silently slicing serialized JSON.
+    """
+
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if len(value) <= string_limit:
+            return value
+        omitted = len(value) - string_limit
+        return f"{value[:string_limit]}... [{omitted} chars omitted]"
+    if isinstance(value, (list, tuple)):
+        items = [
+            compact_json_value(
+                item,
+                max_depth=max_depth,
+                list_limit=list_limit,
+                dict_limit=dict_limit,
+                string_limit=string_limit,
+                _depth=_depth + 1,
+            )
+            for item in value[:list_limit]
+        ]
+        if len(value) > list_limit:
+            items.append({"_remaining_items": len(value) - list_limit})
+        return items
+    if isinstance(value, dict):
+        source_items = list(value.items())[:dict_limit]
+        if _depth >= max_depth:
+            output = {
+                str(key): compact_json_value(
+                    item,
+                    max_depth=max_depth,
+                    list_limit=list_limit,
+                    dict_limit=dict_limit,
+                    string_limit=string_limit,
+                    _depth=_depth + 1,
+                )
+                for key, item in source_items
+                if item is None or isinstance(item, (bool, int, float, str))
+            }
+            omitted_nested = len(source_items) - len(output)
+            if omitted_nested:
+                output["_omitted_nested_fields"] = omitted_nested
+        else:
+            output = {
+                str(key): compact_json_value(
+                    item,
+                    max_depth=max_depth,
+                    list_limit=list_limit,
+                    dict_limit=dict_limit,
+                    string_limit=string_limit,
+                    _depth=_depth + 1,
+                )
+                for key, item in source_items
+            }
+        if len(value) > dict_limit:
+            output["_remaining_fields"] = len(value) - dict_limit
+        return output
+    return compact_json_value(
+        str(value),
+        max_depth=max_depth,
+        list_limit=list_limit,
+        dict_limit=dict_limit,
+        string_limit=string_limit,
+        _depth=_depth,
+    )
+
+
 ROUTE_REQUIREMENT_SUMMARY_VERSION = "paper_candidate_route_feasibility_v1"
 ROUTE_REQUIREMENT_CANDIDATE_FIELDS = (
     "venue", "exchange", "inst_id", "direction", "trade_type", "signal_family",
@@ -1619,8 +1700,20 @@ def write_llm_state_packet(conn: sqlite3.Connection, payload: dict, settings: di
             "Recommendation responses must be a single top-level JSON object only; do not emit markdown, commentary, or wrapper arrays.",
         ],
     }
-    STATE_JSON.write_text(json.dumps(packet, indent=2), encoding="utf-8")
-    STATE_MD.write_text(_packet_to_markdown(packet), encoding="utf-8")
+    disk_packet = compact_json_value(packet)
+    disk_packet = {
+        "state_packet_compaction": {
+            "enabled": True,
+            "max_depth": 5,
+            "list_limit": 10,
+            "dict_limit": 60,
+            "string_limit": 800,
+            "policy": "representative_evidence_with_explicit_omission_counts",
+        },
+        **disk_packet,
+    }
+    STATE_JSON.write_text(json.dumps(disk_packet, indent=2), encoding="utf-8")
+    STATE_MD.write_text(_packet_to_markdown(disk_packet), encoding="utf-8")
     return packet
 
 

@@ -9,7 +9,12 @@ import re
 import sqlite3
 from typing import Any, Iterable
 
-from storage import RUNS_DIR, link_recommendation_artifact, utc_now
+from storage import (
+    RUNS_DIR,
+    link_recommendation_artifact,
+    reliable_paper_label_eligibility_for_trade_row,
+    utc_now,
+)
 
 
 REPORT_JSON = RUNS_DIR / "dynamic_agents_latest.json"
@@ -169,6 +174,73 @@ def _safe_name(value: Any) -> str:
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return bool(conn.execute("select 1 from sqlite_master where type='table' and name=?", (table,)).fetchone())
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"pragma table_info({table})").fetchall()}
+
+
+def _reliable_closed_paper_rows(rows: Iterable[sqlite3.Row]) -> list[sqlite3.Row]:
+    """Keep only closed PnL rows that may safely steer agent evaluation."""
+
+    reliable: list[sqlite3.Row] = []
+    for row in rows:
+        if str(row["status"] or "").lower() != "closed" or row["pnl_bps"] is None:
+            continue
+        eligibility = reliable_paper_label_eligibility_for_trade_row(row)
+        if eligibility.get("paper_label_eligible"):
+            reliable.append(row)
+    return reliable
+
+
+def _strategy_paper_metrics(conn: sqlite3.Connection, strategy_lab_id: str) -> dict[str, Any]:
+    counts = conn.execute(
+        """select count(*) as trades,
+                  sum(case when status='closed' and pnl_bps is not null then 1 else 0 end) as closed
+           from paper_trades where strategy_lab_id=?""",
+        (strategy_lab_id,),
+    ).fetchone()
+    total = int(counts["trades"] or 0)
+    closed_count = int(counts["closed"] or 0)
+    reliable_rows: list[sqlite3.Row] = []
+    if "close_measurement_status" in _table_columns(conn, "paper_trades"):
+        candidates = conn.execute(
+            """select * from paper_trades
+               where strategy_lab_id=? and status='closed' and pnl_bps is not null
+                 and lower(coalesce(close_measurement_status,''))='valid'""",
+            (strategy_lab_id,),
+        ).fetchall()
+        reliable_rows = _reliable_closed_paper_rows(candidates)
+    pnls = [float(row["pnl_bps"]) for row in reliable_rows]
+    return {
+        "trades": total,
+        "closed": len(reliable_rows),
+        "unreliable_closed": closed_count - len(reliable_rows),
+        "avg_pnl_bps": (sum(pnls) / len(pnls)) if pnls else None,
+    }
+
+
+def _reliable_agent_outcome_count(conn: sqlite3.Connection, agent_id: str) -> int:
+    """Count valid horizon outcomes only after the parent close is reliable."""
+
+    if not (_table_exists(conn, "paper_trade_outcomes") and _table_exists(conn, "paper_trades")):
+        return 0
+    if "close_measurement_status" not in _table_columns(conn, "paper_trades"):
+        return 0
+    rows = conn.execute(
+        """select p.*
+           from paper_trade_outcomes o
+           join paper_trades p on p.id=o.trade_id
+           where o.measurement_status='valid'
+             and p.status='closed'
+             and lower(coalesce(p.close_measurement_status,''))='valid'
+             and p.strategy_lab_id in (
+                 select strategy_lab_id from agent_runs
+                 where agent_id=? and strategy_lab_id is not null
+             )""",
+        (agent_id,),
+    ).fetchall()
+    return len(_reliable_closed_paper_rows(rows))
 
 
 def ensure_dynamic_agent_schema(conn: sqlite3.Connection) -> None:
@@ -1155,12 +1227,7 @@ def _artifact_links(conn: sqlite3.Connection, run: dict) -> dict:
             item = dict(row)
             item["evaluation"] = _decode(item.pop("evaluation_json", None), {})
             if _table_exists(conn, "paper_trades"):
-                metrics = conn.execute(
-                    """select count(*) as trades, sum(case when status='closed' then 1 else 0 end) as closed,
-                    avg(case when status='closed' then pnl_bps end) as avg_pnl_bps
-                    from paper_trades where strategy_lab_id=?""", (item["strategy_lab_id"],),
-                ).fetchone()
-                item["paper_outcomes"] = dict(metrics) if metrics else {}
+                item["paper_outcomes"] = _strategy_paper_metrics(conn, item["strategy_lab_id"])
             strategies.append(item)
         if strategies: links["strategy_experiments"] = strategies
     return links
@@ -1233,12 +1300,7 @@ def reconcile_dynamic_agent_artifacts(conn: sqlite3.Connection) -> int:
                (select strategy_lab_id from agent_runs where agent_id=? and strategy_lab_id is not null)""",
             (agent_id,),
         ).fetchone()[0]) if _table_exists(conn, "paper_trades") else 0
-        outcomes = int(conn.execute(
-            """select count(*) from paper_trade_outcomes o join paper_trades p on p.id=o.trade_id
-               where o.measurement_status='valid' and p.strategy_lab_id in
-               (select strategy_lab_id from agent_runs where agent_id=? and strategy_lab_id is not null)""",
-            (agent_id,),
-        ).fetchone()[0]) if _table_exists(conn, "paper_trade_outcomes") else 0
+        outcomes = _reliable_agent_outcome_count(conn, agent_id)
         conn.execute(
             """update agent_specs set code_promotions_count=?, strategy_materializations_count=?,
                paper_trades_count=?, reliable_outcomes_count=? where agent_id=?""",

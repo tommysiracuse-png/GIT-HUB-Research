@@ -34,7 +34,7 @@ from storage import (
     record_policy_open,
     update_experiment_evaluation,
     update_llm_recommendation_status,
-    paper_label_eligibility_for_trade_row,
+    reliable_paper_label_eligibility_for_trade_row,
 )
 from signal_redesign import create_proposed_variant
 from strategy_lab import (
@@ -1545,7 +1545,7 @@ def _closed_metrics_since(conn: sqlite3.Connection, signal_key: str, since: str 
         params.append(since)
     rows = conn.execute(
         f"""
-        select pnl_bps, candidate_json, review_json, context_json
+        select pnl_bps, candidate_json, review_json, context_json, close_measurement_status
         from paper_trades
         where {clause}
         """,
@@ -1554,7 +1554,7 @@ def _closed_metrics_since(conn: sqlite3.Connection, signal_key: str, since: str 
     pnls = [
         float(row["pnl_bps"])
         for row in rows
-        if paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]
+        if reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]
     ]
     if not pnls:
         return {"closed_count": 0, "avg_pnl_bps": None, "win_rate": None, "best_bps": None, "worst_bps": None}
@@ -1576,7 +1576,7 @@ def _overall_metrics(conn: sqlite3.Connection, since: str | None = None) -> dict
         params.append(since)
     rows = conn.execute(
         f"""
-        select pnl_bps, candidate_json, review_json, context_json
+        select pnl_bps, candidate_json, review_json, context_json, close_measurement_status
         from paper_trades
         where {clause}
         """,
@@ -1585,7 +1585,7 @@ def _overall_metrics(conn: sqlite3.Connection, since: str | None = None) -> dict
     pnls = [
         float(row["pnl_bps"])
         for row in rows
-        if paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]
+        if reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]
     ]
     if not pnls:
         return {"closed_count": 0, "avg_pnl_bps": None, "win_rate": None, "best_bps": None, "worst_bps": None}

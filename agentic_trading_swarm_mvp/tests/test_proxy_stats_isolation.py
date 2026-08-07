@@ -17,7 +17,7 @@ import learning  # noqa: E402
 from agent_review import review_candidate  # noqa: E402
 from route_resolver import enrich_candidates  # noqa: E402
 from settings import DEFAULT_SETTINGS  # noqa: E402
-from storage import init_db, open_paper_trade, signal_key  # noqa: E402
+from storage import init_db, open_paper_trade, performance_summary, signal_key  # noqa: E402
 from tests.test_proxy_route_activation import proxy_candidate  # noqa: E402
 
 
@@ -60,6 +60,19 @@ class ProxyStatsIsolationTests(unittest.TestCase):
         self.assertTrue(review["signal_key"].startswith("PAPER_PROXY|"))
         self.assertEqual([], review["applied_policies"])
 
+    def test_proxy_open_trade_is_excluded_from_direct_headline_count(self) -> None:
+        proxy = enrich_candidates([proxy_candidate()], self.settings)[0]
+        open_paper_trade(
+            self.conn,
+            proxy,
+            review_for(proxy),
+            settings=self.settings,
+        )
+
+        summary = performance_summary(self.conn)
+
+        self.assertEqual(0, summary["open"])
+
     def test_proxy_outcome_has_separate_signal_and_context_stats(self) -> None:
         proxy = enrich_candidates([proxy_candidate()], self.settings)[0]
         direct = proxy_candidate()
@@ -80,11 +93,11 @@ class ProxyStatsIsolationTests(unittest.TestCase):
             settings=self.settings,
         )
         self.conn.execute(
-            "update paper_trades set status = 'closed', pnl_bps = 12.0, closed_at = datetime('now') where id = ?",
+            "update paper_trades set status = 'closed', pnl_bps = 12.0, closed_at = datetime('now'), close_measurement_status = 'valid' where id = ?",
             (proxy_trade_id,),
         )
         self.conn.execute(
-            "update paper_trades set status = 'closed', pnl_bps = -8.0, closed_at = datetime('now') where id = ?",
+            "update paper_trades set status = 'closed', pnl_bps = -8.0, closed_at = datetime('now'), close_measurement_status = 'valid' where id = ?",
             (direct_trade_id,),
         )
         self.conn.commit()

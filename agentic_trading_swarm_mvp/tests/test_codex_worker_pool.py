@@ -47,7 +47,40 @@ class CodexWorkerPoolTests(unittest.TestCase):
     def _radar_connect(self):
         return storage.connect(self.radar_path)
 
+    def _enqueue_promoted_candidate(self, proposal_id: str):
+        worktree = self.root / proposal_id
+        app_worktree = worktree / "agentic_trading_swarm_mvp"
+        app_worktree.mkdir(parents=True)
+        with closing(self._radar_connect()) as radar:
+            storage.add_code_evolution_proposal(
+                radar, proposal_id, None, "test", "openai/test", "standard", None,
+                "Verify candidate", "runtime_pipeline_integration", 90, {}, {},
+                status="promoted_pending_verification",
+            )
+            storage.update_code_evolution_proposal(
+                radar, proposal_id, status="promoted_pending_verification", parent_commit="a" * 40,
+                candidate_commit="b" * 40, branch_name=f"evolution/{proposal_id}",
+                worktree_path=str(worktree),
+                evaluation={"release": {
+                    "app_worktree_path": str(app_worktree),
+                    "worktree_path": str(worktree),
+                }},
+            )
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            task = codex_coordination.enqueue_task(
+                coord, "code_evolution_proposal", proposal_id, lane="general", priority=90,
+                payload={"proposal_id": proposal_id},
+            )
+            codex_coordination.complete_task(
+                coord, task["task_id"], status="promoted_pending_verification"
+            )
+            job = codex_coordination.enqueue_verification_job(
+                coord, task["task_id"], payload={"proposal_id": proposal_id},
+            )
+        return task, job
+
     def test_worker_settings_defer_only_full_regression(self) -> None:
+        self.settings["codex_worker_pool"]["defer_full_regression"] = True
         peer_context = {"active_peer_work": [{"work_scope": "adapter:one"}]}
         configured = codex_worker_pool._worker_settings(
             self.settings, "strategy-codex", peer_context
@@ -62,6 +95,99 @@ class CodexWorkerPoolTests(unittest.TestCase):
             self.settings, "strategy-codex", peer_context, execute_code_changes=True
         )
         self.assertTrue(proposal_worker["_codex_worker_execute"])
+
+    def test_retry_caps_have_bounded_defaults(self) -> None:
+        cfg = codex_worker_pool._cfg({})
+
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(3, cfg["max_task_claims"])
+        self.assertEqual(10, cfg["daily_task_claim_limit"])
+        self.assertFalse(cfg["defer_full_regression"])
+        self.assertFalse(cfg["keep_repairing_after_verification_failure"])
+        self.assertEqual(1, cfg["max_verification_repairs"])
+
+    def test_worker_parks_already_exhausted_task_without_dispatch(self) -> None:
+        self.settings["codex_worker_pool"]["max_task_claims"] = 1
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            task = codex_coordination.enqueue_task(
+                coord, "general_owner_turn", "exhausted", lane="general", priority=90,
+            )
+            coord.execute(
+                "update codex_tasks set claim_count=1 where task_id=?", (task["task_id"],)
+            )
+            coord.commit()
+
+        with mock.patch.object(codex_worker_pool, "_dispatch") as dispatch:
+            result = codex_worker_pool._run_one_worker_task(
+                {"worker_id": "system-codex", "preferred_lanes": ["general"]}, self.settings
+            )
+
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            saved = coord.execute(
+                "select status,claim_count from codex_tasks where task_id=?", (task["task_id"],)
+            ).fetchone()
+        dispatch.assert_not_called()
+        self.assertEqual("parked_retry_limit", result["status"])
+        self.assertEqual("parked_retry_limit", saved["status"])
+        self.assertEqual(2, saved["claim_count"])
+
+    def test_worker_does_not_claim_after_daily_limit(self) -> None:
+        self.settings["codex_worker_pool"]["daily_task_claim_limit"] = 1
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            task = codex_coordination.enqueue_task(
+                coord, "general_owner_turn", "daily-capped", lane="general", priority=90,
+            )
+            coord.execute(
+                """
+                insert into codex_coordination_events(
+                    occurred_at,entity_kind,entity_id,event_type,details_json
+                ) values(?,?,?,?,?)
+                """,
+                (
+                    codex_coordination.utc_now(),
+                    "task",
+                    "prior-task",
+                    "claimed",
+                    "{}",
+                ),
+            )
+            coord.commit()
+
+        with mock.patch.object(codex_worker_pool, "_dispatch") as dispatch:
+            result = codex_worker_pool._run_one_worker_task(
+                {"worker_id": "system-codex", "preferred_lanes": ["general"]}, self.settings
+            )
+
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            saved = coord.execute(
+                "select status,claim_count from codex_tasks where task_id=?", (task["task_id"],)
+            ).fetchone()
+        dispatch.assert_not_called()
+        self.assertEqual("daily_task_claim_limit", result["status"])
+        self.assertEqual("queued", saved["status"])
+        self.assertEqual(0, saved["claim_count"])
+
+    def test_worker_parks_retryable_result_on_last_allowed_claim(self) -> None:
+        self.settings["codex_worker_pool"]["max_task_claims"] = 1
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            task = codex_coordination.enqueue_task(
+                coord, "general_owner_turn", "last-attempt", lane="general", priority=90,
+            )
+
+        with mock.patch.object(
+            codex_worker_pool, "_dispatch", return_value={"status": "implementation_paused"}
+        ) as dispatch:
+            result = codex_worker_pool._run_one_worker_task(
+                {"worker_id": "system-codex", "preferred_lanes": ["general"]}, self.settings
+            )
+
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            saved = coord.execute(
+                "select status from codex_tasks where task_id=?", (task["task_id"],)
+            ).fetchone()
+        dispatch.assert_called_once()
+        self.assertEqual("parked_retry_limit", result["status"])
+        self.assertEqual("parked_retry_limit", saved["status"])
 
     def test_semantic_work_identity_collapses_action_word_variants(self) -> None:
         base = {
@@ -283,6 +409,7 @@ class CodexWorkerPoolTests(unittest.TestCase):
         self.assertIn("coordination_context", submitted["payload"])
 
     def test_failed_async_verification_keeps_code_active_and_requeues_same_task(self) -> None:
+        self.settings["codex_worker_pool"]["keep_repairing_after_verification_failure"] = True
         worktree = self.root / "candidate"
         app_worktree = worktree / "agentic_trading_swarm_mvp"
         app_worktree.mkdir(parents=True)
@@ -310,6 +437,11 @@ class CodexWorkerPoolTests(unittest.TestCase):
             mock.patch.object(codex_worker_pool, "connect", side_effect=self._radar_connect),
             mock.patch.object(codex_worker_pool, "_run_full_regression", return_value={"passed": False, "returncode": 1}),
             mock.patch.object(
+                codex_worker_pool,
+                "_recover_failed_promoted_candidate",
+                return_value={"reverted": True, "recovery_commit": "c" * 40},
+            ) as recover,
+            mock.patch.object(
                 codex_worker_pool, "_prepare_repair_worktree",
                 return_value={"prepared": True, "parent_commit": "c" * 40},
             ),
@@ -323,6 +455,135 @@ class CodexWorkerPoolTests(unittest.TestCase):
         self.assertEqual("implementation_paused", proposal["status"])
         self.assertIsNone(proposal["candidate_commit"])
         self.assertEqual("requeued", queued)
+        recover.assert_called_once()
+        self.assertEqual(1, result["verification"]["returncode"])
+
+    def test_failed_verification_is_terminal_when_repairs_are_disabled(self) -> None:
+        self.settings["codex_worker_pool"]["keep_repairing_after_verification_failure"] = False
+        task, job = self._enqueue_promoted_candidate("proposal-repairs-disabled")
+
+        with (
+            mock.patch.object(codex_worker_pool, "connect", side_effect=self._radar_connect),
+            mock.patch.object(
+                codex_worker_pool, "_run_full_regression",
+                return_value={"passed": False, "returncode": 1},
+            ),
+            mock.patch.object(
+                codex_worker_pool,
+                "_recover_failed_promoted_candidate",
+                return_value={"reverted": True, "recovery_commit": "c" * 40},
+            ),
+            mock.patch.object(codex_worker_pool, "_prepare_repair_worktree") as prepare,
+        ):
+            result = codex_worker_pool.run_verifier_once(0, self.settings)
+
+        with closing(self._radar_connect()) as radar:
+            proposal = storage.get_code_evolution_proposal(radar, "proposal-repairs-disabled")
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            saved_task = coord.execute(
+                "select status from codex_tasks where task_id=?", (task["task_id"],)
+            ).fetchone()
+            saved_job = coord.execute(
+                "select status from codex_verification_jobs where job_id=?", (job["job_id"],)
+            ).fetchone()
+        prepare.assert_not_called()
+        self.assertEqual("reverted_verification_failure", result["status"])
+        self.assertEqual("verification_repairs_disabled", result["repair_policy"]["reason"])
+        self.assertEqual("reverted_verification_failure", proposal["status"])
+        self.assertEqual("reverted_verification_failure", saved_task["status"])
+        self.assertEqual("failed_terminal", saved_job["status"])
+
+    def test_failed_verification_stops_after_repair_cap(self) -> None:
+        self.settings["codex_worker_pool"]["keep_repairing_after_verification_failure"] = True
+        self.settings["codex_worker_pool"]["max_verification_repairs"] = 1
+        task, job = self._enqueue_promoted_candidate("proposal-repair-cap")
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            coord.execute(
+                """
+                insert into codex_coordination_events(
+                    occurred_at,entity_kind,entity_id,event_type,details_json
+                ) values(?,?,?,?,?)
+                """,
+                (
+                    "2026-08-06T00:00:00+00:00", "verification", job["job_id"], "finished",
+                    '{"status":"failed_needs_repair"}',
+                ),
+            )
+            coord.commit()
+
+        with (
+            mock.patch.object(codex_worker_pool, "connect", side_effect=self._radar_connect),
+            mock.patch.object(
+                codex_worker_pool, "_run_full_regression",
+                return_value={"passed": False, "returncode": 1},
+            ),
+            mock.patch.object(
+                codex_worker_pool,
+                "_recover_failed_promoted_candidate",
+                return_value={"reverted": True, "recovery_commit": "c" * 40},
+            ),
+            mock.patch.object(codex_worker_pool, "_prepare_repair_worktree") as prepare,
+        ):
+            result = codex_worker_pool.run_verifier_once(0, self.settings)
+
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            saved = coord.execute(
+                "select status from codex_tasks where task_id=?", (task["task_id"],)
+            ).fetchone()
+        prepare.assert_not_called()
+        self.assertEqual("reverted_verification_failure", result["status"])
+        self.assertEqual("max_verification_repairs_exhausted", result["repair_policy"]["reason"])
+        self.assertEqual(1, result["repair_policy"]["verification_repairs_attempted"])
+        self.assertEqual("reverted_verification_failure", saved["status"])
+
+    def test_failed_verification_requeues_until_promoted_commit_is_reverted(self) -> None:
+        task, job = self._enqueue_promoted_candidate("proposal-recovery-pending")
+
+        with (
+            mock.patch.object(codex_worker_pool, "connect", side_effect=self._radar_connect),
+            mock.patch.object(
+                codex_worker_pool,
+                "_run_full_regression",
+                return_value={"passed": False, "returncode": 1},
+            ),
+            mock.patch.object(
+                codex_worker_pool,
+                "_recover_failed_promoted_candidate",
+                return_value={"reverted": False, "reason": "main_promotion_lease_timeout"},
+            ),
+            mock.patch.object(codex_worker_pool, "_prepare_repair_worktree") as prepare,
+        ):
+            result = codex_worker_pool.run_verifier_once(0, self.settings)
+
+        with closing(self._radar_connect()) as radar:
+            proposal = storage.get_code_evolution_proposal(radar, "proposal-recovery-pending")
+        with closing(codex_coordination.connect(self.coord_path)) as coord:
+            saved_task = coord.execute(
+                "select status from codex_tasks where task_id=?", (task["task_id"],)
+            ).fetchone()
+            saved_job = coord.execute(
+                "select status from codex_verification_jobs where job_id=?", (job["job_id"],)
+            ).fetchone()
+        prepare.assert_not_called()
+        self.assertEqual("verification_failure_recovery_pending", result["status"])
+        self.assertEqual("verification_failure_recovery_pending", proposal["status"])
+        self.assertEqual("promoted_pending_verification", saved_task["status"])
+        self.assertEqual("requeued", saved_job["status"])
+
+    def test_prior_successful_verification_recovery_is_idempotent(self) -> None:
+        prior = {"reverted": True, "recovery_commit": "c" * 40}
+
+        result = codex_worker_pool._recover_failed_promoted_candidate(
+            {"proposal_id": "already-recovered"},
+            {"verification_failure_recovery": prior},
+            db_path=self.coord_path,
+            worker_id="verifier-1",
+            cfg=codex_worker_pool._cfg(self.settings),
+        )
+
+        self.assertTrue(result["reverted"])
+        self.assertTrue(result["already_recovered"])
+        self.assertEqual("c" * 40, result["recovery_commit"])
 
     def test_runtime_sync_pushes_newer_main_while_tagging_verified_commit(self) -> None:
         commands = []

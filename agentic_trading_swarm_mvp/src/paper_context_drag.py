@@ -15,6 +15,8 @@ from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
 
+from storage import reliable_paper_label_eligibility_for_trade_row
+
 
 DEFAULT_CONTEXT_DRAG_POLICY = {
     "enabled": True,
@@ -141,13 +143,15 @@ def context_drag_statistics(conn: sqlite3.Connection, settings: Mapping[str, Any
     policy = _policy(settings)
     rows = conn.execute(
         """
-        select candidate_json, pnl_bps
+        select candidate_json, review_json, context_json, pnl_bps, close_measurement_status
         from paper_trades
         where status = 'closed' and pnl_bps is not null
         """
     ).fetchall()
     grouped: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
+        if not reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
         try:
             candidate = json.loads(row["candidate_json"] or "{}")
         except (TypeError, ValueError):

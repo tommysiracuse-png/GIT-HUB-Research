@@ -24,7 +24,7 @@ from typing import Annotated, Any, TypedDict
 
 from cost_router import complete, load_llm_config
 from evolution.builder_context import resolve_repo_targets
-from llm_bridge import INBOX, STATE_JSON
+from llm_bridge import INBOX, STATE_JSON, compact_json_value
 from memory_graph import (
     build_swarm_memory,
     query_memory,
@@ -73,6 +73,38 @@ PUBLISH_REQUIRED_ACTION_PAYLOADS = {
     "propose_strategy_lab_experiment": "strategy_lab_experiment",
     "propose_code_change": "code_change",
     "propose_signal_variant": "variant_config",
+}
+_EVIDENCE_FINGERPRINT_EXCLUDED_TOP_LEVEL = {
+    # These sections are outputs of the LLM/orchestration cycle itself. Including
+    # them would make every completed swarm run look like fresh input evidence.
+    "agent_memory",
+    "dynamic_agents",
+    "llm_cost_summary",
+    "llm_inbox",
+    "memory_artifacts",
+    "recommendation_registry",
+    "recommendation_schema",
+}
+_EVIDENCE_FINGERPRINT_VOLATILE_KEYS = {
+    "age_seconds",
+    "as_of",
+    "collected_at",
+    "cycle_id",
+    "elapsed_seconds",
+    "finished_at",
+    "freshness_age_seconds",
+    "generated_at",
+    "last_run_at",
+    "now",
+    "observed_at",
+    "refreshed_at",
+    "reported_at",
+    "run_id",
+    "runtime_seconds",
+    "seen_at",
+    "started_at",
+    "timestamp",
+    "updated_at",
 }
 
 
@@ -198,6 +230,91 @@ def load_state_packet(path: pathlib.Path = STATE_JSON) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Missing LLM state packet: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _stable_evidence_value(value: Any) -> Any:
+    """Remove clock/cycle noise while preserving decision-relevant packet data."""
+
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_evidence_value(child)
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+            if str(key).lower() not in _EVIDENCE_FINGERPRINT_VOLATILE_KEYS
+            and not str(key).lower().endswith("_generated_at")
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_evidence_value(child) for child in value]
+    return value
+
+
+def _evidence_fingerprint(packet: dict) -> str:
+    evidence = {
+        str(key): value
+        for key, value in packet.items()
+        if str(key) not in _EVIDENCE_FINGERPRINT_EXCLUDED_TOP_LEVEL
+    }
+    canonical = json.dumps(
+        _stable_evidence_value(evidence),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _evidence_fingerprint_path() -> pathlib.Path:
+    return RUNS_DIR / "llm_swarm_evidence_state.json"
+
+
+def _unchanged_evidence_cooldown_active(packet: dict, settings: dict) -> bool:
+    cfg = settings.get("llm_swarm", {})
+    if not cfg.get("skip_unchanged_evidence", True):
+        return False
+    max_age_minutes = float(cfg.get("unchanged_evidence_max_age_minutes", 360))
+    if max_age_minutes <= 0:
+        return False
+    path = _evidence_fingerprint_path()
+    if not path.exists():
+        return False
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        recorded_at = dt.datetime.fromisoformat(
+            str(state.get("last_attempt_at") or "").replace("Z", "+00:00")
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=dt.timezone.utc)
+    age_minutes = (dt.datetime.now(dt.timezone.utc) - recorded_at).total_seconds() / 60.0
+    if age_minutes < 0 or age_minutes >= max_age_minutes:
+        return False
+    return str(state.get("fingerprint") or "") == _evidence_fingerprint(packet)
+
+
+def _record_evidence_fingerprint(packet: dict) -> None:
+    """Persist only the evidence digest, never another copy of the state packet."""
+
+    path = _evidence_fingerprint_path()
+    payload = {
+        "schema_version": 1,
+        "fingerprint": _evidence_fingerprint(packet),
+        "last_attempt_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    temporary = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        # This optimization must never discard already-generated recommendations.
+        return
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def _first_route_value(*values: Any) -> Any:
@@ -733,6 +850,142 @@ def _strategy_invention_context(packet: dict, memory: list[dict]) -> dict:
     }
 
 
+def _fit_prompt_value(value: Any, max_chars: int) -> Any:
+    """Fit one evidence section without cutting serialized JSON mid-object."""
+
+    profiles = (
+        (3, 4, 20, 350),
+        (2, 3, 14, 220),
+        (2, 2, 8, 140),
+        (1, 1, 6, 100),
+    )
+    for max_depth, list_limit, dict_limit, string_limit in profiles:
+        compact = compact_json_value(
+            value,
+            max_depth=max_depth,
+            list_limit=list_limit,
+            dict_limit=dict_limit,
+            string_limit=string_limit,
+        )
+        if len(json.dumps(compact, separators=(",", ":"), default=str)) <= max_chars:
+            return compact
+    count = len(value) if isinstance(value, (dict, list, tuple)) else None
+    return {
+        "_section_compacted": True,
+        "value_type": type(value).__name__,
+        "item_count": count,
+    }
+
+
+_PROMPT_TRAILING_KEYS = (
+    "execution_summary",
+    "llm_cost_summary",
+    "top_reviewed",
+    "allowed_recommendation_actions",
+)
+
+_PROMPT_ROLE_KEYS = {
+    "market_scout": (
+        "frontier_gap_summary",
+        "global_market_discovery",
+        "crypto_venue_health",
+        "expansion_map",
+        "hunter_directives",
+    ),
+    "cross_market_researcher": (
+        "horizon_outcomes",
+        "contextual_stats",
+        "signal_redesign",
+        "strategy_reliability",
+        "strategy_lab",
+    ),
+    "red_team": (
+        "contextual_stats",
+        "improvement_tasks",
+        "current_cycle_agent_outputs",
+        "current_cycle_critiques",
+        "code_evolution",
+    ),
+    "execution_route_hunter": (
+        "short_frontier_spot_route_outcomes",
+        "paper_route_requirement_summaries",
+        "frontier_gap_summary",
+        "crypto_venue_health",
+        "frontier_execution_quality",
+    ),
+    "build_planner": (
+        "improvement_tasks",
+        "code_evolution",
+        "self_improvement",
+        "repository_grounding",
+        "current_cycle_ranked_actions",
+    ),
+}
+
+_PROMPT_STATE_BUDGETS = {
+    "market_scout": 3400,
+    "cross_market_researcher": 3000,
+    "red_team": 3400,
+    "execution_route_hunter": 2800,
+    "build_planner": 1600,
+}
+
+
+def _bounded_prompt_state(agent: dict, packet: dict, memory: list[dict]) -> dict:
+    """Select role-relevant evidence in priority order under a hard budget."""
+
+    name = str(agent.get("name") or "")
+    budget = int(_PROMPT_STATE_BUDGETS.get(name, 2600))
+    declared_keys: list[str] = []
+    for value in agent.get("evidence_inputs") or []:
+        if not isinstance(value, str):
+            continue
+        # Dynamic-agent specs describe packet evidence, sometimes with a
+        # dotted child path. The prompt packet is already curated; expose only
+        # a matching top-level section and never interpret arbitrary paths.
+        key = value.strip().split(".", 1)[0].split("[", 1)[0]
+        if key and key in packet:
+            declared_keys.append(key)
+    keys = list(
+        dict.fromkeys(
+            (
+                "summary",
+                *_PROMPT_ROLE_KEYS.get(name, ()),
+                *declared_keys,
+                *_PROMPT_TRAILING_KEYS,
+            )
+        )
+    )
+    output: dict[str, Any] = {}
+    omitted = 0
+    for key in keys:
+        if key not in packet:
+            continue
+        remaining = budget - len(json.dumps(output, separators=(",", ":"), default=str))
+        if remaining < 140:
+            omitted += 1
+            continue
+        section = _fit_prompt_value(packet.get(key), min(1100, max(120, remaining - len(key) - 8)))
+        candidate = {**output, key: section}
+        if len(json.dumps(candidate, separators=(",", ":"), default=str)) <= budget:
+            output = candidate
+        else:
+            omitted += 1
+    if memory and name not in {"build_planner", "execution_route_hunter"}:
+        remaining = budget - len(json.dumps(output, separators=(",", ":"), default=str))
+        if remaining >= 180:
+            memory_value = _fit_prompt_value(memory, min(600, remaining - 30))
+            candidate = {**output, "relevant_long_term_memory": memory_value}
+            if len(json.dumps(candidate, separators=(",", ":"), default=str)) <= budget:
+                output = candidate
+    output["evidence_packet"] = {
+        "bounded": True,
+        "role": name,
+        "omitted_sections": omitted,
+    }
+    return output
+
+
 def _requested_model_controls(
     agent: dict,
     *,
@@ -926,7 +1179,7 @@ def _preflight_no_action_recommendation(
 
 
 def _strategy_lab_agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
-    context = _strategy_invention_context(packet, memory)
+    context = _fit_prompt_value(_strategy_invention_context(packet, memory), 7000)
     return (
         f"You are {agent['name']}. Your job is to invent one genuinely reusable paper-testable trading hypothesis from the current evidence.\n"
         "Return exactly one JSON object. action must be propose_strategy_lab_experiment or no_action. "
@@ -948,53 +1201,14 @@ def _strategy_lab_agent_prompt(agent: dict, packet: dict, memory: list[dict]) ->
         "If an idea needs a missing feature, state it in data_requirements; do not pretend the feature already exists. "
         "Keep live trading disabled and keep route limits diagnostic so synthetic paper research remains possible.\n"
         "CURRENT INVENTION CONTEXT\n"
-        + json.dumps(context, sort_keys=True, default=str)
+        + json.dumps(context, separators=(",", ":"), default=str)
     )
 
 
 def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
     if agent.get("name") == "strategy_lab":
         return _strategy_lab_agent_prompt(agent, packet, memory)
-    compact = {
-        "summary": packet.get("summary"),
-        "execution_summary": packet.get("execution_summary"),
-        "llm_cost_summary": packet.get("llm_cost_summary"),
-        "buckets": packet.get("buckets"),
-        "top_reviewed": packet.get("top_reviewed", [])[:10],
-        "horizon_outcomes": packet.get("horizon_outcomes", [])[:20],
-        "contextual_stats": packet.get("contextual_stats", [])[:20],
-        "crypto_venue_health": packet.get("crypto_venue_health", [])[:10],
-        "frontier_gap_summary": packet.get("frontier_gap_summary", {}),
-        "frontier_crypto_venues": packet.get("frontier_crypto_venues", {}),
-        "expansion_map": packet.get("expansion_map", {}),
-        "route_intelligence": (packet.get("expansion_map", {}) or {}).get("route_intelligence", {}),
-        "short_frontier_spot_route_outcomes": packet.get("short_frontier_spot_route_outcomes", {}),
-        "execution_route_requirement_summary": packet.get("execution_route_requirement_summary", {}),
-        "paper_route_requirement_summaries": packet.get("paper_route_requirement_summaries", {}),
-        "prediction_markets": (packet.get("expansion_map", {}) or {}).get("prediction_markets", {}),
-        "hunter_directives": packet.get("hunter_directives", [])[:10],
-        "growth_experiments": packet.get("growth_experiments", [])[:10],
-        "improvement_tasks": packet.get("improvement_tasks", [])[:10],
-        "signal_redesign": packet.get("signal_redesign", {}),
-        "okx_signal_research": packet.get("okx_signal_research", {}),
-        "strategy_reliability": packet.get("strategy_reliability", {}),
-        "strategy_lab": packet.get("strategy_lab", {}),
-        "self_improvement": packet.get("self_improvement", {}),
-        "code_evolution": packet.get("code_evolution", {}),
-        "agent_memory": packet.get("agent_memory", {}),
-        "dynamic_agents": packet.get("dynamic_agents", {}),
-        "relevant_long_term_memory": memory,
-        "allowed_actions": packet.get("allowed_recommendation_actions", []),
-        "current_cycle_agent_outputs": packet.get("current_cycle_agent_outputs", [])[:10],
-        "current_cycle_critiques": packet.get("current_cycle_critiques", [])[:10],
-        "current_cycle_ranked_actions": packet.get("current_cycle_ranked_actions", [])[:10],
-        "repository_grounding": packet.get("repository_grounding", {}),
-        "strategy_invention_context": (
-            _strategy_invention_context(packet, memory)
-            if "propose_strategy_lab_experiment" in set(agent.get("allowed_actions") or [])
-            else {}
-        ),
-    }
+    compact = _bounded_prompt_state(agent, packet, memory)
     build_planner_instruction = ""
     if agent["name"] == "build_planner":
         build_planner_instruction = (
@@ -1048,9 +1262,10 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
     if agent.get("dynamic_agent_id"):
         invention_context = ""
         if "propose_strategy_lab_experiment" in set(agent.get("allowed_actions") or []):
+            bounded_invention = _fit_prompt_value(_strategy_invention_context(packet, memory), 4500)
             invention_context = (
                 "Current strategy-invention context: "
-                + json.dumps(_strategy_invention_context(packet, memory), sort_keys=True, default=str)[:6000]
+                + json.dumps(bounded_invention, separators=(",", ":"), default=str)
                 + "\n"
             )
         dynamic_instruction = (
@@ -1067,6 +1282,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         f"{build_planner_instruction}"
         f"{route_hunter_instruction}"
         f"{cross_market_instruction}"
+        f"Your allowed actions are exactly: {agent.get('allowed_actions', [])}.\n"
         "Paper exploration is enabled. Treat weak performance, route limits, low quality, spread, liquidity, and cost as diagnostic evidence, ranking, sizing, synthetic-paper routing, or guard-value measurement; do not propose new hard quarantines, candidate suppression, or paper-entry blocks for priceable candidates. Only invalid or dangerously stale prices, critically malformed data, undefined PnL, missing required multi-leg prices without a proxy, duplicate exposure, or capacity deferral may prevent a paper experiment.\n"
         "Return exactly one JSON object matching this schema:\n"
         "{"
@@ -1154,7 +1370,7 @@ def agent_prompt(agent: dict, packet: dict, memory: list[dict]) -> str:
         "A hold, no-change conclusion, malformed-input warning, or request to rerun an agent is not an actionable "
         "recommendation. Return action='no_action' for those cases. Only use your default action when you have a "
         "concrete, evidence-backed next step.\n\n"
-        f"STATE:\n{json.dumps(compact, sort_keys=True)}"
+        f"STATE:\n{json.dumps(compact, separators=(',', ':'), default=str)}"
     )
 
 
@@ -1974,7 +2190,11 @@ def _is_rejected(rec: dict) -> bool:
 
 def _should_retry_schema(rec: dict, model: dict) -> bool:
     status = str(model.get("status") or "").lower()
-    if status.startswith("fallback_") or "budget_guard" in status:
+    # A repair call is only justified when the provider actually returned model
+    # output.  Cost-router fallbacks contain JSON-shaped text too, so a deny-list
+    # here can silently miss a new quota, preflight, or provider status and turn
+    # one blocked call into a second paid/blocked call.
+    if not status.startswith("model_call:"):
         return False
     return _is_rejected(rec) and rec.get("parse_status") in {
         "invalid_json",
@@ -2846,15 +3066,39 @@ def _latest_failure_cooldown_active(settings: dict) -> bool:
     if age_minutes >= cooldown_minutes:
         return False
     recommendations = (payload.get("recommendations") or []) + (payload.get("suppressed_recommendations") or [])
-    if not recommendations:
-        return False
     statuses = [
         str((rec.get("model") if isinstance(rec.get("model"), dict) else {}).get("status") or "").lower()
         for rec in recommendations
         if isinstance(rec, dict)
     ]
-    unavailable = ("fallback_error", "fallback_missing_provider_key", "fallback_no_cost", "agent_budget_guard", "global_budget_guard")
-    return bool(statuses) and all(any(token in status for token in unavailable) for status in statuses)
+    # Published/suppressed payloads intentionally omit internal model metadata.
+    # The full per-agent outputs retain it and are therefore the authoritative
+    # source for quota-circuit and provider-failure cooldown decisions.
+    for output in payload.get("agent_outputs") or []:
+        if not isinstance(output, dict):
+            continue
+        recommendation = output.get("recommendation")
+        if not isinstance(recommendation, dict):
+            recommendation = output
+        model = recommendation.get("model")
+        if isinstance(model, dict):
+            statuses.append(str(model.get("status") or "").lower())
+    statuses = [status for status in statuses if status]
+    unavailable = (
+        "fallback_",
+        "budget_guard",
+        "quota_circuit",
+        "quota_429",
+        "429",
+        "rate_limit",
+        "rate-limit",
+        "rate limit",
+        "insufficient_quota",
+        "credit_balance",
+        "credit-balance",
+        "credit balance",
+    )
+    return bool(statuses) and any(any(token in status for token in unavailable) for status in statuses)
 
 
 def write_recommendations(
@@ -2981,9 +3225,21 @@ def _record_post_model_state(settings: dict, cycle_id: str, dynamic_cycle: dict)
 def run_once(settings: dict | None = None, force: bool = False) -> list[dict]:
     global LAST_SWARM_STATE
     settings = settings or load_settings()
+    # Force is a cadence override, not permission to bypass a disabled swarm
+    # or a durable provider/quota cooldown.
+    if not bool((settings.get("llm_swarm") or {}).get("enabled", True)):
+        return []
+    if _latest_failure_cooldown_active(settings):
+        return []
     if not force and not should_auto_run(settings):
         return []
     packet = load_state_packet()
+    if not force and _unchanged_evidence_cooldown_active(packet, settings):
+        # Treat the skipped check as this cadence's run so a fast outer loop does
+        # not repeatedly parse/hash the packet. The evidence state's timestamp is
+        # deliberately left untouched so the bounded max-age refresh still fires.
+        mark_auto_run()
+        return []
     with connect() as conn:
         try:
             memory, cycle_id = build_swarm_memory(
@@ -3027,6 +3283,7 @@ def run_once(settings: dict | None = None, force: bool = False) -> list[dict]:
         settings=settings,
         swarm_state=LAST_SWARM_STATE,
     )
+    _record_evidence_fingerprint(packet)
     mark_auto_run()
     return recommendations
 

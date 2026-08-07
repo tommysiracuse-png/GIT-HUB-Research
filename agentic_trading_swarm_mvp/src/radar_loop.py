@@ -37,6 +37,7 @@ from global_proxy_scanner import build_scan_batch as build_global_proxy_scan_bat
 from hunter_allocation import allocate_candidate_review, write_hunter_allocation_report
 from learning import load_adjustments, stats_snapshot, update_signal_stats
 from llm_bridge import (
+    compact_json_value,
     cross_context_reliability,
     ingest_llm_recommendations,
     route_requirement_candidate_inputs,
@@ -92,6 +93,7 @@ from storage import (
     open_tasks,
     perform_maintenance,
     performance_summary,
+    reconcile_pending_opportunities,
     record_due_horizon_outcomes,
     save_opportunity,
     update_opportunity_decision,
@@ -327,6 +329,43 @@ strategy_lab_runtime = SimpleNamespace(
 )
 
 
+_PAPER_APPROVAL_DECISIONS = frozenset(
+    {"approve_paper_trade", "approve_conditional_paper_trade"}
+)
+
+
+def _pending_execution_review(review: dict) -> dict:
+    """Persist approvals as in-flight until execution produces a real state."""
+
+    intended = str(review.get("decision") or "unknown")
+    if intended not in _PAPER_APPROVAL_DECISIONS:
+        return dict(review)
+    return {
+        **review,
+        "decision": "pending_execution",
+        "intended_decision": intended,
+        "execution_status": "pending",
+    }
+
+
+def _terminal_execution_review(review: dict, execution: dict, decision: str) -> dict:
+    order = execution.get("order") if isinstance(execution.get("order"), dict) else {}
+    return {
+        **review,
+        "decision": decision,
+        "intended_decision": review.get("intended_decision") or review.get("decision"),
+        "execution_status": order.get("status") or decision,
+        "execution_order_id": execution.get("order_id"),
+        "execution_reason": order.get("shadow_reason") or order.get("status") or decision,
+    }
+
+
+def _attach_execution_review(item: dict, execution_review: dict) -> None:
+    """Record the terminal execution state without erasing admission intent."""
+
+    item["execution_review"] = execution_review
+
+
 def _select_runtime_strategy_lab_candidates(candidates: list[dict], settings: dict) -> tuple[list[dict], dict]:
     cfg = settings.get("strategy_lab", {})
     enabled = bool(cfg.get("runtime_candidate_filters_enabled", True))
@@ -430,6 +469,7 @@ def run_once(settings: dict) -> dict:
     allow_short_spot = bool(capabilities.get("spot_borrow", False))
 
     with connect() as conn:
+        pending_opportunity_reconciliation = reconcile_pending_opportunities(conn)
         required = open_trade_instruments(conn)
         required_okx = set(required.get("perp_funding_basis", set()))
         required_okx.update(open_signal_trial_instruments(conn, "OKX|perp_funding_basis"))
@@ -464,12 +504,20 @@ def run_once(settings: dict) -> dict:
             batches.append(global_batch)
             candidates.extend(global_batch.candidates)
             candidates.sort(key=lambda row: row["score"], reverse=True)
-        public_adapter_batch = build_public_adapter_scan_batch(settings)
-        public_market_adapters = public_adapter_batch.metadata.get("public_market_adapters", {})
-        batches.append(public_adapter_batch)
-        candidates.extend(public_adapter_batch.candidates)
-        admission_observations.extend(public_adapter_batch.observations)
-        adapter_capabilities = reconcile_adapter_specs(conn)
+        public_market_adapters = {
+            "summary": {"enabled": False, "status": "disabled_by_scanner_config"}
+        }
+        adapter_capabilities = {
+            "summary": {"enabled": False, "status": "disabled_by_scanner_config"},
+            "specs": [],
+        }
+        if scan_cfg.get("enable_public_market_adapter_scan", True):
+            public_adapter_batch = build_public_adapter_scan_batch(settings)
+            public_market_adapters = public_adapter_batch.metadata.get("public_market_adapters", {})
+            batches.append(public_adapter_batch)
+            candidates.extend(public_adapter_batch.candidates)
+            admission_observations.extend(public_adapter_batch.observations)
+            adapter_capabilities = reconcile_adapter_specs(conn)
         global_market_discovery_scan = {}
         if scan_cfg.get("enable_global_market_discovery_scan", True) and settings.get(
             "global_market_discovery_scanner", {}
@@ -529,6 +577,16 @@ def run_once(settings: dict) -> dict:
                     active_limit=frontier_limit,
                     scan_id=frontier_batch.generated_at,
                 )
+                frontier_report_summary = signal_redesign.get("frontier_report_summary", {})
+                frontier_report_artifact_compaction = signal_redesign.get(
+                    "frontier_report_artifact_compaction", {}
+                )
+                frontier_report_observation_sample = signal_redesign.get(
+                    "frontier_report_observation_sample", []
+                )
+                frontier_report_candidate_sample = signal_redesign.get(
+                    "frontier_report_candidate_sample", []
+                )
                 frontier_batch.observations.extend(
                     normalize_observation(
                         row,
@@ -539,10 +597,25 @@ def run_once(settings: dict) -> dict:
                 )
             else:
                 frontier_candidates = frontier_batch.candidates
+                frontier_report_summary = frontier_batch.metadata.get("report_summary", {})
+                frontier_report_artifact_compaction = frontier_batch.metadata.get(
+                    "report_artifact_compaction", {}
+                )
+                frontier_report_observation_sample = frontier_batch.metadata.get(
+                    "report_observation_sample", []
+                )
+                frontier_report_candidate_sample = frontier_batch.metadata.get(
+                    "report_candidate_sample", []
+                )
             candidates.extend(frontier_candidates)
             candidates.sort(key=lambda row: row["score"], reverse=True)
-            if FRONTIER_CRYPTO_REPORT_JSON.exists():
-                frontier_crypto_venues = json.loads(FRONTIER_CRYPTO_REPORT_JSON.read_text(encoding="utf-8"))
+            frontier_crypto_venues = {
+                "summary": frontier_report_summary,
+                "artifact_compaction": frontier_report_artifact_compaction,
+                "observations": frontier_report_observation_sample,
+                "candidates": frontier_report_candidate_sample,
+                "report": str(FRONTIER_CRYPTO_REPORT_JSON),
+            }
             admission_observations.extend(frontier_batch.metadata.get("selected_observations", []))
         price_observations = merge_observations(batches)
         promoted_signal_candidates, promoted_signal_runtime = run_signal_plugins(
@@ -658,7 +731,7 @@ def run_once(settings: dict) -> dict:
         opened = []
         for candidate in review_candidates:
             review = review_candidate(candidate, settings, adjustments, policies=policies)
-            opportunity_id = save_opportunity(conn, candidate, review)
+            opportunity_id = save_opportunity(conn, candidate, _pending_execution_review(review))
             record_review_policy_effects(conn, review)
             reviewed.append({"candidate": candidate, "review": review, "opportunity_id": opportunity_id})
 
@@ -669,26 +742,39 @@ def run_once(settings: dict) -> dict:
             offset = int(time.time() // 60) % len(reviewed)
             execution_queue = reviewed[offset:] + reviewed[:offset]
 
+        paper_fill_count = 0
+        paper_observation_count = 0
+        paper_fill_limit = int(scan_cfg["max_new_paper_trades"])
+        paper_observation_limit = max(
+            0,
+            int(scan_cfg.get("max_new_paper_observations", paper_fill_limit)),
+        )
         for item in execution_queue:
             candidate = item["candidate"]
             review = item["review"]
-            if len(opened) >= int(scan_cfg["max_new_paper_trades"]):
-                if exploration_enabled(settings):
-                    deferred = dict(review, decision="deferred_capacity", deferral_reason="max_new_paper_trades")
-                    update_opportunity_decision(conn, item["opportunity_id"], "deferred_capacity", deferred)
-                    item["review"] = deferred
-                    continue
-                break
-            if count_open_trades(conn) >= int(risk_cfg["max_open_paper_trades"]):
-                if exploration_enabled(settings):
-                    deferred = dict(review, decision="deferred_capacity", deferral_reason="max_open_paper_trades")
-                    update_opportunity_decision(conn, item["opportunity_id"], "deferred_capacity", deferred)
-                    item["review"] = deferred
-                    continue
-                break
-            if review["decision"] not in {"approve_paper_trade", "approve_conditional_paper_trade"}:
+            if review["decision"] not in _PAPER_APPROVAL_DECISIONS:
                 continue
-            if has_open_trade(conn, candidate["inst_id"], candidate["direction"]):
+            open_trade_capacity_available = count_open_trades(conn) < int(
+                risk_cfg["max_open_paper_trades"]
+            )
+            fill_capacity_reason = (
+                "max_new_paper_trades"
+                if paper_fill_count >= paper_fill_limit
+                else "max_open_paper_trades"
+                if not open_trade_capacity_available
+                else None
+            )
+            lineage_root = (
+                _strategy_lab_lineage_root_id(candidate)
+                if candidate.get("strategy_lab_id")
+                else None
+            )
+            if has_open_trade(
+                conn,
+                candidate["inst_id"],
+                candidate["direction"],
+                strategy_lineage_root=lineage_root,
+            ):
                 duplicate = dict(
                     review,
                     decision="reject_duplicate_open_exposure",
@@ -700,12 +786,109 @@ def run_once(settings: dict) -> dict:
                     "reject_duplicate_open_exposure",
                     duplicate,
                 )
-                item["review"] = duplicate
+                _attach_execution_review(item, duplicate)
                 continue
-            execution = execute_order(conn, candidate, review, settings)
-            if not execution["paper_filled"]:
-                if execution.get("paper_observation_ready"):
+            try:
+                execution = execute_order(
+                    conn,
+                    candidate,
+                    review,
+                    settings,
+                    opportunity_id=item["opportunity_id"],
+                    record_shadow_observation=(
+                        paper_observation_count < paper_observation_limit
+                    ),
+                    allow_paper_fill=fill_capacity_reason is None,
+                )
+            except Exception as exc:
+                failed = {
+                    **review,
+                    "decision": "execution_error",
+                    "intended_decision": review.get("decision"),
+                    "execution_status": "error",
+                    "execution_error": f"{type(exc).__name__}: {exc}"[:500],
+                }
+                update_opportunity_decision(
+                    conn,
+                    item["opportunity_id"],
+                    "execution_error",
+                    failed,
+                )
+                _attach_execution_review(item, failed)
+                continue
+
+            if execution.get("shadow_observation_recorded"):
+                paper_observation_count += 1
+                terminal_status = str((execution.get("order") or {}).get("status") or "shadow_observed")
+                terminal = _terminal_execution_review(review, execution, terminal_status)
+                terminal["shadow_observation_id"] = execution.get("shadow_observation_id")
+                update_opportunity_decision(
+                    conn,
+                    item["opportunity_id"],
+                    terminal_status,
+                    terminal,
+                )
+                _attach_execution_review(item, terminal)
+                continue
+            if execution.get("shadow_observation_deferred"):
+                deferred = _terminal_execution_review(
+                    review,
+                    execution,
+                    "deferred_observation_capacity",
+                )
+                deferred["deferral_reason"] = "max_new_paper_observations"
+                update_opportunity_decision(
+                    conn,
+                    item["opportunity_id"],
+                    "deferred_observation_capacity",
+                    deferred,
+                )
+                _attach_execution_review(item, deferred)
+                continue
+
+            if execution.get("paper_fill_deferred"):
+                deferred = _terminal_execution_review(
+                    review,
+                    execution,
+                    "deferred_capacity",
+                )
+                deferred["deferral_reason"] = (
+                    fill_capacity_reason or "paper_fill_capacity_unavailable"
+                )
+                update_opportunity_decision(
+                    conn,
+                    item["opportunity_id"],
+                    "deferred_capacity",
+                    deferred,
+                )
+                _attach_execution_review(item, deferred)
+                continue
+
+            actual_paper_fill = bool(execution.get("paper_filled") and execution.get("fills"))
+            paper_observation_ready = bool(
+                execution.get("paper_observation_ready")
+                or (execution.get("paper_filled") and not execution.get("fills"))
+            )
+            if not actual_paper_fill:
+                if (
+                    paper_observation_ready
+                    and paper_observation_count < paper_observation_limit
+                    and open_trade_capacity_available
+                ):
                     trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=settings)
+                    paper_observation_count += 1
+                    terminal = _terminal_execution_review(
+                        review,
+                        execution,
+                        "paper_observation_opened",
+                    )
+                    update_opportunity_decision(
+                        conn,
+                        item["opportunity_id"],
+                        "paper_observation_opened",
+                        terminal,
+                    )
+                    _attach_execution_review(item, terminal)
                     opened.append(
                         {
                             "id": trade_id,
@@ -729,11 +912,56 @@ def run_once(settings: dict) -> dict:
                             "proxy_not_live_equivalent": execution["order"].get("proxy_not_live_equivalent", False),
                             "signal_stats_scope": execution["order"].get("signal_stats_scope", "synthetic_research"),
                             "strategy_lab_id": candidate.get("strategy_lab_id"),
+                            "paper_filled": False,
                         }
                     )
+                elif paper_observation_ready:
+                    deferred = _terminal_execution_review(
+                        review,
+                        execution,
+                        "deferred_observation_capacity",
+                    )
+                    deferred["deferral_reason"] = (
+                        "max_open_paper_trades"
+                        if not open_trade_capacity_available
+                        else "max_new_paper_observations"
+                    )
+                    update_opportunity_decision(
+                        conn,
+                        item["opportunity_id"],
+                        "deferred_observation_capacity",
+                        deferred,
+                    )
+                    _attach_execution_review(item, deferred)
+                else:
+                    terminal_status = str(
+                        (execution.get("order") or {}).get("status")
+                        or "not_paper_filled"
+                    )
+                    terminal = _terminal_execution_review(
+                        review,
+                        execution,
+                        terminal_status,
+                    )
+                    update_opportunity_decision(
+                        conn,
+                        item["opportunity_id"],
+                        terminal_status,
+                        terminal,
+                    )
+                    _attach_execution_review(item, terminal)
                 continue
             trade_id = open_paper_trade(conn, candidate, review, execution=execution, settings=settings)
             record_open_policy_effects(conn, review)
+            paper_fill_count += 1
+            terminal = _terminal_execution_review(review, execution, "paper_filled")
+            update_opportunity_decision(
+                conn,
+                item["opportunity_id"],
+                "paper_filled",
+                terminal,
+            )
+            _attach_execution_review(item, terminal)
             opened.append(
                 {
                     "id": trade_id,
@@ -757,6 +985,7 @@ def run_once(settings: dict) -> dict:
                     "proxy_not_live_equivalent": execution["order"].get("proxy_not_live_equivalent", False),
                     "signal_stats_scope": execution["order"].get("signal_stats_scope", "direct"),
                     "strategy_lab_id": candidate.get("strategy_lab_id"),
+                    "paper_filled": True,
                 }
             )
 
@@ -790,7 +1019,10 @@ def run_once(settings: dict) -> dict:
         auto_improvement["paper_context_drag"] = paper_context_drag
         auto_improvement = write_self_improvement_reports(conn, auto_improvement)
         summary = performance_summary(conn)
-        maintenance = perform_maintenance(conn, settings)
+        maintenance = {
+            **perform_maintenance(conn, settings),
+            "pending_opportunity_reconciliation": pending_opportunity_reconciliation,
+        }
         payload = {
             "mode": settings["mode"],
             "closed": closed,
@@ -824,7 +1056,10 @@ def run_once(settings: dict) -> dict:
                     "direction": item["candidate"]["direction"],
                     "base_score": item["candidate"]["score"],
                     "learned_score": item["review"]["learned_score"],
-                    "decision": item["review"]["decision"],
+                    "decision": (
+                        item.get("execution_review") or item["review"]
+                    )["decision"],
+                    "intended_decision": item["review"]["decision"],
                     "confidence": item["review"]["confidence"],
                     "gross_edge_bps": item["review"].get("gross_edge_bps"),
                     "modeled_cost_bps": item["review"].get("modeled_cost_bps"),
@@ -891,7 +1126,21 @@ def run_once(settings: dict) -> dict:
 
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     latest_path = RUNS_DIR / "radar_state_latest.json"
-    latest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    latest_snapshot = compact_json_value(
+        payload,
+        max_depth=5,
+        list_limit=10,
+        dict_limit=60,
+        string_limit=800,
+    )
+    latest_snapshot = {
+        "state_snapshot_compaction": {
+            "enabled": True,
+            "policy": "representative_evidence_with_explicit_omission_counts",
+        },
+        **latest_snapshot,
+    }
+    latest_path.write_text(json.dumps(latest_snapshot, indent=2), encoding="utf-8")
     return payload
 
 

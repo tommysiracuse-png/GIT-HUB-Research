@@ -25,6 +25,7 @@ from storage import (
     add_signal_policy,
     active_signal_policies,
     connect,
+    reliable_paper_label_eligibility_for_trade_row,
     signal_key as candidate_signal_key,
 )
 
@@ -258,7 +259,8 @@ def _closed_trade_rows(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """
         select id, opened_at, closed_at, venue, inst_id, direction, trade_type,
-               signal_key, pnl_bps, candidate_json, review_json, context_json
+               signal_key, pnl_bps, candidate_json, review_json, context_json,
+               close_measurement_status
         from paper_trades
         where status = 'closed' and pnl_bps is not null
         order by closed_at asc, id asc
@@ -266,6 +268,8 @@ def _closed_trade_rows(conn: sqlite3.Connection) -> list[dict]:
     ).fetchall()
     output = []
     for row in rows:
+        if not reliable_paper_label_eligibility_for_trade_row(row)["paper_label_eligible"]:
+            continue
         candidate = _parse_json(row["candidate_json"], {})
         review = _parse_json(row["review_json"], {})
         features = build_context_features(
@@ -706,7 +710,11 @@ def _build_groups(trades: list[dict], settings: dict) -> list[dict]:
     return output
 
 
-def _augment_counts(conn: sqlite3.Connection, groups: list[dict]) -> None:
+def _augment_counts(
+    conn: sqlite3.Connection,
+    groups: list[dict],
+    opportunity_sample_limit: int = 5_000,
+) -> None:
     index = {(item["signal_key"], item["dimension"], item["value"]): item for item in groups}
     for item in groups:
         item["opportunity_count"] = 0
@@ -718,9 +726,10 @@ def _augment_counts(conn: sqlite3.Connection, groups: list[dict]) -> None:
         select candidate_json, review_json, seen_at
         from opportunities
         order by id desc
-        limit 50000
-        """
-    ).fetchall()
+        limit ?
+        """,
+        (max(0, int(opportunity_sample_limit)),),
+    )
     for row in rows:
         candidate = _parse_json(row["candidate_json"], {})
         review = _parse_json(row["review_json"], {})
@@ -740,7 +749,7 @@ def _augment_counts(conn: sqlite3.Connection, groups: list[dict]) -> None:
         select opened_at, candidate_json, review_json, signal_key
         from paper_trades
         """
-    ).fetchall()
+    )
     for row in rows:
         candidate = _parse_json(row["candidate_json"], {})
         review = _parse_json(row["review_json"], {})
@@ -1024,7 +1033,11 @@ def run_contextual_failure_filters(conn: sqlite3.Connection, settings: dict) -> 
     trades = _closed_trade_rows(conn)
     groups = _build_groups(trades, settings)
     cross_context_observations = cross_context_failure_observations(trades, settings)
-    _augment_counts(conn, groups)
+    _augment_counts(
+        conn,
+        groups,
+        opportunity_sample_limit=int(cfg.get("opportunity_sample_limit", 5_000)),
+    )
     _upsert_contextual_stats(conn, groups)
     capped = _consolidate_contextual_policy_caps(conn, settings)
     created, skipped = _create_policies(conn, groups, settings)

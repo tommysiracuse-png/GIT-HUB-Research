@@ -498,7 +498,8 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
     rows = conn.execute(
         """
         select p.id, p.direction, p.signal_key, p.context_json, p.candidate_json, p.review_json,
-               p.pnl_bps as realized_pnl_bps, o.horizon_minutes, o.pnl_bps
+               p.pnl_bps as realized_pnl_bps, p.close_measurement_status,
+               o.horizon_minutes, o.pnl_bps
         from paper_trade_outcomes o
         join paper_trades p on p.id = o.trade_id
         where p.venue = 'YAHOO_PROXY'
@@ -602,7 +603,11 @@ def _yahoo_proxy_decay_analysis(conn: sqlite3.Connection) -> dict[str, Any]:
             )
         trade_id = int(row["id"])
         realized_pnl_bps = _as_float(row["realized_pnl_bps"])
-        if trade_id not in realized_trade_ids and realized_pnl_bps is not None:
+        if (
+            trade_id not in realized_trade_ids
+            and str(row["close_measurement_status"] or "").strip().lower() == "valid"
+            and realized_pnl_bps is not None
+        ):
             realized_trade_ids.add(trade_id)
             bounded_window_rows[YAHOO_PROXY_REALIZED_WINDOW].append(
                 {

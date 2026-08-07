@@ -5510,7 +5510,7 @@ def _run_git_release_pipeline(
     deferred_verification = bool(
         _pool_enabled(settings)
         and _pool_worker(settings)
-        and _pool_cfg(settings).get("defer_full_regression", True)
+        and _pool_cfg(settings).get("defer_full_regression", False)
     )
     if cfg.get("promote_candidate_after_canary", False):
         with _main_promotion_lease(settings, proposal_id) as promotion_lease:
@@ -6467,22 +6467,82 @@ def _tail_text(path: pathlib.Path, limit: int = 12000) -> str:
 def _revert_promoted_commit(root: pathlib.Path, promoted_commit: str, timeout: int) -> dict:
     if not re.fullmatch(r"[0-9a-fA-F]{7,40}", promoted_commit):
         return {"reverted": False, "reason": "invalid_promoted_commit"}
+    recovery_marker = f"Codex-Recovery-Of: {promoted_commit.lower()}"
+    prior_recovery = _run(
+        [
+            "git",
+            "log",
+            "-n",
+            "1",
+            "--format=%H",
+            "--fixed-strings",
+            f"--grep={recovery_marker}",
+            "HEAD",
+        ],
+        root,
+        timeout,
+    )
+    prior_recovery_commit = prior_recovery.get("stdout_tail", "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", prior_recovery_commit):
+        tag = _run(
+            ["git", "tag", "-f", "champion/latest", prior_recovery_commit],
+            root,
+            timeout,
+        )
+        return {
+            "reverted": True,
+            "already_reverted": True,
+            "reason": "post_promotion_health_failure",
+            "reverted_commit": promoted_commit,
+            "recovery_commit": prior_recovery_commit,
+            "recovery_marker": recovery_marker,
+            "recovery_lookup": prior_recovery,
+            "champion_tag_ok": tag["returncode"] == 0,
+            "champion_tag": tag,
+        }
     ancestor = _run(["git", "merge-base", "--is-ancestor", promoted_commit, "HEAD"], root, timeout)
     if ancestor["returncode"] != 0:
         return {"reverted": False, "reason": "promoted_commit_not_in_head", "ancestor": ancestor}
-    revert = _run(["git", "revert", "--no-edit", promoted_commit], root, timeout)
+    revert = _run(["git", "revert", "--no-commit", promoted_commit], root, timeout)
     if revert["returncode"] != 0:
         abort = _run(["git", "revert", "--abort"], root, timeout)
         return {"reverted": False, "reason": "git_revert_failed", "revert": revert, "abort": abort}
+    commit = _run(
+        [
+            "git",
+            "commit",
+            "-m",
+            f"Revert autonomous promotion {promoted_commit[:12]}",
+            "-m",
+            recovery_marker,
+        ],
+        root,
+        timeout,
+    )
+    if commit["returncode"] != 0:
+        abort = _run(["git", "revert", "--abort"], root, timeout)
+        return {
+            "reverted": False,
+            "reason": "git_revert_commit_failed",
+            "revert": revert,
+            "commit": commit,
+            "abort": abort,
+        }
     head = _run(["git", "rev-parse", "HEAD"], root, timeout)
     promoted_head = head.get("stdout_tail", "").strip()
     tag = _run(["git", "tag", "-f", "champion/latest", promoted_head], root, timeout)
     return {
-        "reverted": tag["returncode"] == 0,
+        # The safety recovery is complete once Git has created the revert
+        # commit. Champion tagging is useful metadata, but a tag failure must
+        # never cause a verifier to attempt the same revert again.
+        "reverted": True,
         "reason": "post_promotion_health_failure",
         "reverted_commit": promoted_commit,
         "recovery_commit": promoted_head,
+        "recovery_marker": recovery_marker,
         "revert": revert,
+        "commit": commit,
+        "champion_tag_ok": tag["returncode"] == 0,
         "champion_tag": tag,
     }
 

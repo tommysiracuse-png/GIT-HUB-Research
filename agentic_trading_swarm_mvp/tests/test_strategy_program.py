@@ -31,6 +31,7 @@ from strategy_lab import (  # noqa: E402
 )
 from strategy_program import (  # noqa: E402
     ProgramValidationError,
+    _load_history,
     assert_plugin_parity,
     compile_observation_program,
     evaluate_expression,
@@ -1073,6 +1074,28 @@ def anp_opc_companion_logic() -> dict:
 
 
 class StrategyProgramTests(unittest.TestCase):
+    def test_feature_history_limit_is_applied_before_materialization(self) -> None:
+        with memory_db() as conn:
+            for index in range(5):
+                conn.execute(
+                    """
+                    insert into strategy_feature_snapshots (
+                        bucket_at, observed_at, venue, inst_id, trade_type,
+                        last, price_source, features_json
+                    ) values (?, ?, 'TEST', 'TEST:ABC', 'test', ?, 'unit', '{}')
+                    """,
+                    (f"2026-08-01T00:0{index}:00+00:00", f"2026-08-01T00:0{index}:00+00:00", 100 + index),
+                )
+            history = _load_history(
+                conn,
+                [("TEST", "TEST:ABC")],
+                "2026-08-01T00:00:00+00:00",
+                2,
+            )
+
+        rows = history[("TEST", "TEST:ABC")]
+        self.assertEqual([103.0, 104.0], [row["last"] for row in rows])
+
     def test_safe_expression_rejects_code_and_attribute_access(self) -> None:
         with self.assertRaises(ProgramValidationError):
             evaluate_expression("__import__('os').system('whoami')", {})

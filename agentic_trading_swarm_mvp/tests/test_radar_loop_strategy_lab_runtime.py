@@ -1,9 +1,22 @@
+import pathlib
+import sys
 import unittest
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 try:
     import radar_loop as radar_loop_module
 except Exception:  # pragma: no cover
     radar_loop_module = None
+
+try:
+    import market_admission as market_admission_module
+except Exception:  # pragma: no cover
+    market_admission_module = None
 
 try:
     from radar_loop import strategy_lab_runtime as strategy_lab_runtime_module
@@ -59,6 +72,83 @@ class StrategyLabRuntimeSelectionTests(unittest.TestCase):
         self.assertEqual(summary["runtime_selection_mode"], "lab_generation")
         self.assertEqual(summary["generated_count"], 1)
         self.assertEqual(summary["accepted_count"], 1)
+
+    def test_approved_review_is_persisted_as_pending_until_execution(self):
+        review = {
+            "decision": "approve_paper_trade",
+            "learned_score": 81.0,
+            "confidence": 0.7,
+        }
+
+        persisted = radar_loop_module._pending_execution_review(review)
+
+        self.assertEqual("pending_execution", persisted["decision"])
+        self.assertEqual("approve_paper_trade", persisted["intended_decision"])
+        self.assertEqual("approve_paper_trade", review["decision"])
+
+    def test_rejected_review_is_persisted_as_terminal_decision(self):
+        review = {
+            "decision": "reject_low_edge",
+            "learned_score": 41.0,
+            "hard_blocks": ["edge below floor"],
+        }
+
+        persisted = radar_loop_module._pending_execution_review(review)
+
+        self.assertEqual("reject_low_edge", persisted["decision"])
+        self.assertNotIn("intended_decision", persisted)
+        self.assertEqual("reject_low_edge", review["decision"])
+
+    def test_shadow_execution_finalizes_pending_approval_truthfully(self):
+        review = {
+            "decision": "approve_conditional_paper_trade",
+            "learned_score": 81.0,
+        }
+        execution = {
+            "order_id": 99,
+            "order": {
+                "status": "shadow_filtered",
+                "shadow_reason": "paper_context_loss_quarantine",
+            },
+        }
+
+        terminal = radar_loop_module._terminal_execution_review(
+            review,
+            execution,
+            "shadow_filtered",
+        )
+
+        self.assertEqual("shadow_filtered", terminal["decision"])
+        self.assertEqual("approve_conditional_paper_trade", terminal["intended_decision"])
+        self.assertEqual(99, terminal["execution_order_id"])
+        self.assertEqual("paper_context_loss_quarantine", terminal["execution_reason"])
+
+    def test_terminal_execution_state_does_not_erase_admission_approval(self):
+        item = {
+            "candidate": {
+                "data_status": "reachable",
+                "venue": "TEST",
+                "inst_id": "TEST:ABC-USD",
+                "asset_class": "crypto",
+                "last": 100.0,
+                "quality_status": "verified",
+                "direction": "long",
+                "route_status": "standard",
+            },
+            "review": {"decision": "approve_paper_trade"},
+        }
+        terminal = {"decision": "paper_filled", "intended_decision": "approve_paper_trade"}
+
+        radar_loop_module._attach_execution_review(item, terminal)
+
+        self.assertEqual("approve_paper_trade", item["review"]["decision"])
+        self.assertEqual("paper_filled", item["execution_review"]["decision"])
+        self.assertEqual(
+            "paper_eligible",
+            market_admission_module._stage_for(
+                item["candidate"], item["review"], {"valid_labels": 0}
+            ),
+        )
 
     def test_expansion_summary_uses_strategy_lab_generator_count(self):
         summary = radar_loop_module._strategy_lab_runtime_summary(
