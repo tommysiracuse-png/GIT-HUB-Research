@@ -1,11 +1,11 @@
 """B3 official public-data-hub surface catalog adapter.
 
 The hub entries describe public data and product catalogs; they are not
-executable quotes.  Reachable entries are emitted as official observations,
+executable quotes. Reachable entries are emitted as official observations,
 but remain watch-only so neither paper nor live order routing can infer a
-price from catalog availability.  The BDR ETF surface is additionally paired
-with a public Brazil ETF companion quote so Strategy Lab can paper-test that
-reference surface without fabricating a native B3 price.
+price from catalog availability. The BDR ETF and CBIO surfaces are
+additionally paired with defensible public companion quotes so Strategy Lab
+can paper-test those reference surfaces without fabricating native B3 prices.
 """
 
 from __future__ import annotations
@@ -29,9 +29,15 @@ DISTRIBUTOR_FAQ_URL = (
     "https://www.b3.com.br/en_us/market-data-and-indices/data-services/"
     "market-data/distributors/faq/"
 )
-COMPANION_QUOTE_SYMBOL = "EWZ"
-COMPANION_QUOTE_URL = "https://www.tradingview.com/symbols/AMEX-EWZ/"
-COMPANION_MARKET_SURFACE = "b3_bdr_etf_public_data"
+B3_BDR_ETF_COMPANION_QUOTE_SYMBOL = "EWZ"
+B3_BDR_ETF_COMPANION_QUOTE_URL = "https://www.tradingview.com/symbols/AMEX-EWZ/"
+B3_BDR_ETF_COMPANION_MARKET_SURFACE = "b3_bdr_etf_public_data"
+B3_CBIO_COMPANION_QUOTE_SYMBOL = "KRBN"
+B3_CBIO_COMPANION_QUOTE_URL = "https://www.tradingview.com/symbols/NYSEARCA-KRBN/"
+B3_CBIO_COMPANION_MARKET_SURFACE = "b3_cbio_public_data"
+COMPANION_QUOTE_SYMBOL = B3_BDR_ETF_COMPANION_QUOTE_SYMBOL
+COMPANION_QUOTE_URL = B3_BDR_ETF_COMPANION_QUOTE_URL
+COMPANION_MARKET_SURFACE = B3_BDR_ETF_COMPANION_MARKET_SURFACE
 MARKET_SURFACE = "b3_public_data_hub"
 
 
@@ -221,18 +227,67 @@ def parse_b3_public_data_hub(
 def parse_tradingview_b3_etf_quote(
     payload: str,
     *,
-    symbol: str = COMPANION_QUOTE_SYMBOL,
-    source_url: str = COMPANION_QUOTE_URL,
+    symbol: str = B3_BDR_ETF_COMPANION_QUOTE_SYMBOL,
+    source_url: str = B3_BDR_ETF_COMPANION_QUOTE_URL,
     received_at: str | None = None,
 ) -> dict[str, Any]:
     """Parse a public Brazil ETF quote page used as a paper-only companion price."""
 
+    return _parse_tradingview_companion_quote(
+        payload,
+        symbol=symbol,
+        source_url=source_url,
+        price_basis="public_companion_brazil_equity_etf_quote",
+        proxy_symbol=f"AMEX:{str(symbol or '').strip().upper()}",
+        price_reference_role="brazil_equity_etf_proxy",
+        price_source="TradingView public Brazil ETF companion quote",
+        error_prefix="TradingView Brazil ETF quote page",
+        received_at=received_at,
+    )
+
+
+def parse_tradingview_cbio_companion_quote(
+    payload: str,
+    *,
+    symbol: str = B3_CBIO_COMPANION_QUOTE_SYMBOL,
+    source_url: str = B3_CBIO_COMPANION_QUOTE_URL,
+    received_at: str | None = None,
+) -> dict[str, Any]:
+    """Parse a public carbon ETF quote page used as a paper-only CBIO companion price."""
+
+    return _parse_tradingview_companion_quote(
+        payload,
+        symbol=symbol,
+        source_url=source_url,
+        price_basis="public_companion_global_carbon_etf_quote",
+        proxy_symbol=f"NYSEARCA:{str(symbol or '').strip().upper()}",
+        price_reference_role="listed_carbon_market_proxy",
+        price_source="TradingView public carbon ETF companion quote",
+        error_prefix="TradingView CBIO companion quote page",
+        received_at=received_at,
+    )
+
+
+def _parse_tradingview_companion_quote(
+    payload: str,
+    *,
+    symbol: str,
+    source_url: str,
+    price_basis: str,
+    proxy_symbol: str,
+    price_reference_role: str,
+    price_source: str,
+    error_prefix: str,
+    received_at: str | None = None,
+) -> dict[str, Any]:
+    """Parse a public TradingView quote page used as a paper-only companion price."""
+
     text = str(payload or "").strip()
     quote_symbol = str(symbol or "").strip().upper()
     if not text:
-        raise B3PublicDataParseError("TradingView Brazil ETF quote page is empty")
+        raise B3PublicDataParseError(f"{error_prefix} is empty")
     if not quote_symbol:
-        raise B3PublicDataParseError("TradingView Brazil ETF quote symbol is missing")
+        raise B3PublicDataParseError(f"{error_prefix} symbol is missing")
     match = re.search(
         rf"The current price of {re.escape(quote_symbol)} is ([0-9]+(?:\.[0-9]+)?)\s*USD",
         text,
@@ -240,26 +295,26 @@ def parse_tradingview_b3_etf_quote(
     )
     if not match:
         raise B3PublicDataParseError(
-            f"TradingView Brazil ETF quote page missing current price for {quote_symbol}"
+            f"{error_prefix} missing current price for {quote_symbol}"
         )
     try:
         last = float(match.group(1))
     except ValueError as exc:
         raise B3PublicDataParseError(
-            f"TradingView Brazil ETF quote page has invalid current price for {quote_symbol}"
+            f"{error_prefix} has invalid current price for {quote_symbol}"
         ) from exc
     if last <= 0:
         raise B3PublicDataParseError(
-            f"TradingView Brazil ETF quote page current price must be positive for {quote_symbol}"
+            f"{error_prefix} current price must be positive for {quote_symbol}"
         )
     fetched_at = _received_time(received_at)
     return {
         "last": last,
         "price_available": True,
-        "price_basis": "public_companion_brazil_equity_etf_quote",
+        "price_basis": price_basis,
         "quality_status": "verified_proxy",
         "proxy_quality_status": "verified_proxy",
-        "proxy_symbol": f"AMEX:{quote_symbol}",
+        "proxy_symbol": proxy_symbol,
         "companion_quote_symbol": quote_symbol,
         "companion_quote_url": source_url,
         "freshness_state": "fresh",
@@ -267,16 +322,16 @@ def parse_tradingview_b3_etf_quote(
         "freshness_age_seconds": 0.0,
         "session_status": "unknown",
         "session_basis": "public_quote_page_has_no_session_clock",
-        "price_reference_role": "brazil_equity_etf_proxy",
-        "price_source": "TradingView public Brazil ETF companion quote",
+        "price_reference_role": price_reference_role,
+        "price_source": price_source,
         "source_record_type": "tradingview_public_symbol_faq",
         "observed_at": fetched_at.isoformat(),
         "fetched_at": fetched_at.isoformat(),
     }
 
 
-def _apply_bdr_etf_companion_quote(observation: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
-    """Preserve B3 surface provenance while attaching a public Brazil ETF proxy price."""
+def _apply_companion_quote(observation: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
+    """Preserve B3 surface provenance while attaching a public companion quote."""
 
     updated = dict(observation)
     updated["last"] = float(quote["last"])
@@ -302,6 +357,18 @@ def _apply_bdr_etf_companion_quote(observation: dict[str, Any], quote: dict[str,
     updated["fetched_at"] = str(quote["fetched_at"])
     updated["candidate_reject_reason"] = "public_companion_price_requires_strategy_logic"
     return updated
+
+
+def _apply_bdr_etf_companion_quote(observation: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
+    """Preserve B3 surface provenance while attaching a public Brazil ETF proxy price."""
+
+    return _apply_companion_quote(observation, quote)
+
+
+def _apply_cbio_companion_quote(observation: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
+    """Preserve B3 CBIO provenance while attaching a public carbon ETF proxy price."""
+
+    return _apply_companion_quote(observation, quote)
 
 
 def _fetch_evidence(result: dict[str, Any], source_url: str) -> dict[str, Any]:
@@ -390,10 +457,17 @@ class B3PublicDataHubAdapter:
         cfg = _adapter_config(settings or {}, self.info.adapter_id)
         timeout = max(1, int(cfg.get("timeout_seconds", 15)))
         source_url = str(cfg.get("source_url") or HUB_URL)
-        companion_source_url = str(cfg.get("companion_quote_url") or COMPANION_QUOTE_URL)
-        companion_symbol = str(cfg.get("companion_quote_symbol") or COMPANION_QUOTE_SYMBOL)
+        companion_source_url = str(cfg.get("companion_quote_url") or B3_BDR_ETF_COMPANION_QUOTE_URL)
+        companion_symbol = str(cfg.get("companion_quote_symbol") or B3_BDR_ETF_COMPANION_QUOTE_SYMBOL)
+        cbio_companion_source_url = str(
+            cfg.get("cbio_companion_quote_url") or B3_CBIO_COMPANION_QUOTE_URL
+        )
+        cbio_companion_symbol = str(
+            cfg.get("cbio_companion_quote_symbol") or B3_CBIO_COMPANION_QUOTE_SYMBOL
+        )
         result = fetch_text(source_url, timeout)
         companion_result: dict[str, Any] | None = None
+        cbio_companion_result: dict[str, Any] | None = None
         parser_failures: list[dict[str, str]] = []
         companion_failures: list[dict[str, str]] = []
 
@@ -420,7 +494,7 @@ class B3PublicDataHubAdapter:
                         )
                         observations = [
                             _apply_bdr_etf_companion_quote(row, companion_quote)
-                            if row.get("market_surface") == COMPANION_MARKET_SURFACE
+                            if row.get("market_surface") == B3_BDR_ETF_COMPANION_MARKET_SURFACE
                             else row
                             for row in observations
                         ]
@@ -436,6 +510,37 @@ class B3PublicDataHubAdapter:
                         {
                             "source_url": companion_source_url,
                             "error": str(companion_result.get("error") or "companion quote unavailable")[:300],
+                        }
+                    )
+                cbio_companion_result = fetch_text(cbio_companion_source_url, timeout)
+                if cbio_companion_result.get("ok"):
+                    try:
+                        cbio_companion_quote = parse_tradingview_cbio_companion_quote(
+                            cbio_companion_result.get("text") or "",
+                            symbol=cbio_companion_symbol,
+                            source_url=cbio_companion_source_url,
+                            received_at=cbio_companion_result.get("received_at"),
+                        )
+                        observations = [
+                            _apply_cbio_companion_quote(row, cbio_companion_quote)
+                            if row.get("market_surface") == B3_CBIO_COMPANION_MARKET_SURFACE
+                            else row
+                            for row in observations
+                        ]
+                    except (B3PublicDataParseError, TypeError, ValueError) as exc:
+                        companion_failures.append(
+                            {
+                                "source_url": cbio_companion_source_url,
+                                "error": f"B3 CBIO companion quote parser failed: {exc}"[:300],
+                            }
+                        )
+                else:
+                    companion_failures.append(
+                        {
+                            "source_url": cbio_companion_source_url,
+                            "error": str(
+                                cbio_companion_result.get("error") or "CBIO companion quote unavailable"
+                            )[:300],
                         }
                     )
                 source_status = "reachable"
@@ -459,7 +564,13 @@ class B3PublicDataHubAdapter:
                 "adapter_id": self.info.adapter_id,
                 "adapter_spec_id": 622,
                 "source_status": source_status,
-                "source_urls": [HUB_URL, PORTUGUESE_HUB_URL, DISTRIBUTOR_FAQ_URL, COMPANION_QUOTE_URL],
+                "source_urls": [
+                    HUB_URL,
+                    PORTUGUESE_HUB_URL,
+                    DISTRIBUTOR_FAQ_URL,
+                    B3_BDR_ETF_COMPANION_QUOTE_URL,
+                    B3_CBIO_COMPANION_QUOTE_URL,
+                ],
                 "fetch_status": {
                     "hub": _fetch_evidence(result, source_url),
                     "bdr_etf_companion": (
@@ -467,6 +578,18 @@ class B3PublicDataHubAdapter:
                         if companion_result is not None
                         else {
                             "source_url": companion_source_url,
+                            "fetch_status": "not_attempted",
+                            "http_status": None,
+                            "fetched_at": None,
+                            "latency_ms": None,
+                            "error": None,
+                        }
+                    ),
+                    "cbio_companion": (
+                        _fetch_evidence(cbio_companion_result, cbio_companion_source_url)
+                        if cbio_companion_result is not None
+                        else {
+                            "source_url": cbio_companion_source_url,
                             "fetch_status": "not_attempted",
                             "http_status": None,
                             "fetched_at": None,

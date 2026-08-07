@@ -184,6 +184,47 @@ class MarketAdmissionTests(unittest.TestCase):
             self.assertEqual("blocked", state["health_status"])
             self.assertEqual("adapter_observation", state["strategy_lineage"])
 
+    def test_b3_cbio_companion_observation_advances_to_quality_verified(self):
+        observation = {
+            "venue": "B3",
+            "inst_id": "B3:PUBLIC_DATA_SURFACE:CBIO",
+            "trade_type": "official_market_catalog",
+            "market_type": "otc_environmental_reference",
+            "market_surface": "b3_cbio_public_data",
+            "asset_class": "decarbonization_credit",
+            "base": "CBIO",
+            "quote": "USD",
+            "last": 31.42,
+            "price_available": True,
+            "price_basis": "public_companion_global_carbon_etf_quote",
+            "quality_status": "verified_proxy",
+            "proxy_quality_status": "verified_proxy",
+            "candidate_reject_reason": "public_companion_price_requires_strategy_logic",
+            "direction": "watch_only",
+            "freshness_state": "fresh",
+            "session_status": "unknown",
+            "data_status": "reachable",
+            "price_source": "TradingView public carbon ETF companion quote",
+            "source_url": "https://www.tradingview.com/symbols/NYSEARCA-KRBN/",
+            "source_contract_url": "https://www.b3.com.br/en_us/b3/esg/otc-market.htm",
+            "companion_quote_symbol": "KRBN",
+            "proxy_symbol": "NYSEARCA:KRBN",
+        }
+
+        with memory_db() as conn:
+            report = market_admission.run_market_admission_monitor(
+                conn,
+                settings(),
+                [],
+                [],
+                [observation],
+            )
+
+        state = report["states"][0]
+        self.assertEqual("quality_verified", state["current_stage"])
+        self.assertEqual("public_companion_price_requires_strategy_logic", state["blocker_code"])
+        self.assertEqual("adapter_observation", state["strategy_lineage"])
+
     def test_stall_creates_one_task_and_progress_resolves_it(self):
         stalled = global_candidate(direction="watch_only", candidate_reject_reason="surface_confirmation_missing")
         with memory_db() as conn:

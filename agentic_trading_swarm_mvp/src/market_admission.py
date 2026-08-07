@@ -79,6 +79,17 @@ def _lineage(item: dict) -> str:
         return f"STRATEGY_LAB|{item['strategy_lab_id']}|v{item.get('strategy_lab_version', 1)}"
     if item.get("signal_variant_id"):
         return _text(item.get("signal_variant_id"))
+    direction = str(item.get("direction") or "").strip().lower()
+    if direction == "watch_only":
+        strategy_markers = (
+            item.get("score"),
+            item.get("edge_bps_estimate"),
+            item.get("execution_feasibility"),
+            item.get("execution_route"),
+            item.get("proxy_surface"),
+        )
+        if all(marker in (None, "", [], {}, ()) for marker in strategy_markers):
+            return "adapter_observation"
     if item.get("direction") and item.get("trade_type"):
         return f"{item.get('trade_type')}|{item.get('direction')}"
     return "adapter_observation"
