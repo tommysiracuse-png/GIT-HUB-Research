@@ -121,7 +121,15 @@ class AutonomousCostGuardTests(unittest.TestCase):
             ):
                 with mock.patch.object(cost_router, "load_llm_config", return_value=model_cfg), mock.patch.object(
                     cost_router, "_log"
-                ), mock.patch.dict(os.environ, {"RADAR_USE_LITELLM": "1"}, clear=False), mock.patch.object(
+                ), mock.patch.dict(
+                    os.environ,
+                    {
+                        "RADAR_USE_LITELLM": "1",
+                        "RADAR_MODEL_CREDENTIAL_LOCK": "0",
+                        "RADAR_MODELS_DISABLED": "0",
+                    },
+                    clear=False,
+                ), mock.patch.object(
                     cost_router, "_complete_litellm", return_value=("paid", 4, "stop")
                 ) as provider:
                     first = cost_router.complete("test-agent", "first", operation="test_call")

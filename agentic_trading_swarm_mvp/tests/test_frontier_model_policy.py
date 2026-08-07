@@ -127,7 +127,15 @@ class FrontierModelPolicyTests(unittest.TestCase):
 
     def test_router_fallback_logs_responses_metadata_without_key(self) -> None:
         captured: list[ModelResult] = []
-        with mock.patch.dict(os.environ, {"RADAR_USE_LITELLM": ""}, clear=False):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "RADAR_USE_LITELLM": "",
+                "RADAR_MODEL_CREDENTIAL_LOCK": "0",
+                "RADAR_MODELS_DISABLED": "0",
+            },
+            clear=False,
+        ):
             with mock.patch.object(cost_router, "_log", lambda _agent, result: captured.append(result)):
                 result = cost_router.complete(
                     "build_planner",
@@ -148,7 +156,16 @@ class FrontierModelPolicyTests(unittest.TestCase):
 
     def test_router_uses_openai_responses_for_frontier_when_enabled(self) -> None:
         captured: list[ModelResult] = []
-        with mock.patch.dict(os.environ, {"RADAR_USE_LITELLM": "1", "OPENAI_API_KEY": "test"}, clear=False):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "RADAR_USE_LITELLM": "1",
+                "OPENAI_API_KEY": "test",
+                "RADAR_MODEL_CREDENTIAL_LOCK": "0",
+                "RADAR_MODELS_DISABLED": "0",
+            },
+            clear=False,
+        ):
             with mock.patch.object(cost_router, "_spent_today", return_value=0.0):
                 with mock.patch.object(cost_router, "_log", lambda _agent, result: captured.append(result)):
                     with mock.patch.object(cost_router, "_complete_openai_responses", return_value=('{"ok": true}', 10, 20)) as call:
@@ -179,7 +196,14 @@ class FrontierModelPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
             cost_router, "QUOTA_STATE_PATH", pathlib.Path(tmp) / "quota.json"
         ), mock.patch.dict(
-            os.environ, {"RADAR_USE_LITELLM": "1", "OPENAI_API_KEY": "test"}, clear=False
+            os.environ,
+            {
+                "RADAR_USE_LITELLM": "1",
+                "OPENAI_API_KEY": "test",
+                "RADAR_MODEL_CREDENTIAL_LOCK": "0",
+                "RADAR_MODELS_DISABLED": "0",
+            },
+            clear=False,
         ), mock.patch.object(
             cost_router, "_spent_today", return_value=0.0
         ), mock.patch.object(

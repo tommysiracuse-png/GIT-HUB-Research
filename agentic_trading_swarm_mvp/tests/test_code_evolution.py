@@ -498,7 +498,11 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                 "evidence": {"quality_80_100_avg_pnl_bps": 32.0},
             },
         )
-        with mock.patch.object(code_evolution, "complete") as complete:
+        with mock.patch.object(
+            code_evolution,
+            "completion_preflight_status",
+            return_value={"ok": True},
+        ), mock.patch.object(code_evolution, "complete") as complete:
             complete.return_value = type(
                 "Result",
                 (),
@@ -1035,7 +1039,11 @@ class CodeEvolutionGovernorTests(unittest.TestCase):
                         change_category="llm_prompt_state_packet",
                     ),
                 }
-                with mock.patch.object(code_evolution, "complete", return_value=result):
+                with mock.patch.object(
+                    code_evolution,
+                    "completion_preflight_status",
+                    return_value={"ok": True},
+                ), mock.patch.object(code_evolution, "complete", return_value=result):
                     created = code_evolution.process_code_change_recommendation(
                         conn,
                         rec,
