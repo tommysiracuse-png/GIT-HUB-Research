@@ -250,6 +250,10 @@ try {
                 "--iterations", "1", "--interval", "$CadenceSeconds"
             )
             $child = Start-Process -FilePath $PythonExe -ArgumentList $childArgs -WorkingDirectory $ProjectRoot -NoNewWindow -PassThru -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
+            # PowerShell may release the native process handle before a later
+            # ExitCode read when Start-Process redirects output.  Materialize
+            # it immediately so WaitForExit can return the real numeric code.
+            $null = $child.Handle
             $timedOut = $false
             while (-not $child.HasExited) {
                 $elapsed = ([DateTimeOffset]::UtcNow - $CycleStarted).TotalSeconds
@@ -271,12 +275,64 @@ try {
                 $child.Refresh()
             }
             $child.Refresh()
-            $exitCode = if ($timedOut) { 124 } elseif ($child.HasExited) { $child.ExitCode } else { 125 }
+            $exitCode = 125
+            $exitCodeCaptureFailed = $false
+            $exitCodeCaptureDetail = ""
+            if ($timedOut) {
+                $exitCode = 124
+            }
+            else {
+                try {
+                    # With redirected output, Process.ExitCode is not reliably
+                    # populated until WaitForExit has completed and the process
+                    # object has been refreshed, even after HasExited is true.
+                    $child.WaitForExit()
+                    $child.Refresh()
+                    if (-not $child.HasExited) {
+                        throw "Radar child did not reach an exited state."
+                    }
+                    $rawExitCode = $child.ExitCode
+                    $parsedExitCode = 0
+                    $hasIntegerExitCode = $false
+                    if ($null -ne $rawExitCode) {
+                        $hasIntegerExitCode = [int]::TryParse(
+                            [string]$rawExitCode,
+                            [ref]$parsedExitCode
+                        )
+                    }
+                    if (-not $hasIntegerExitCode) {
+                        throw "Radar child exit code was missing or non-integer."
+                    }
+                    $exitCode = $parsedExitCode
+                }
+                catch {
+                    # Record an explicit supervisor failure rather than passing
+                    # a blank value (or accidentally treating it as success).
+                    $exitCode = 125
+                    $exitCodeCaptureFailed = $true
+                    $exitCodeCaptureDetail = $_.Exception.Message
+                }
+            }
+            $validatedExitCode = 0
+            $hasValidatedExitCode = $false
+            if ($null -ne $exitCode) {
+                $hasValidatedExitCode = [int]::TryParse(
+                    [string]$exitCode,
+                    [ref]$validatedExitCode
+                )
+            }
+            if (-not $hasValidatedExitCode) {
+                $validatedExitCode = 125
+                $exitCodeCaptureFailed = $true
+                $exitCodeCaptureDetail = "Supervisor could not validate the radar child exit code."
+            }
+            $exitCode = $validatedExitCode
             $runtimeSeconds = ([DateTimeOffset]::UtcNow - $CycleStarted).TotalSeconds
             if ($exitCode -ne 0) {
                 $eventArgs = @(
                     "-B", $SupervisorEventEntryPoint, "--config", $ResolvedConfig,
-                    "--exit-code", "$exitCode", "--runtime-seconds", "$runtimeSeconds"
+                    "--exit-code", $exitCode.ToString([System.Globalization.CultureInfo]::InvariantCulture),
+                    "--runtime-seconds", "$runtimeSeconds"
                 )
                 if ($timedOut) { $eventArgs += "--timed-out" }
                 & $PythonExe @eventArgs
@@ -284,6 +340,10 @@ try {
                     Write-Heartbeat -State "supervisor_failure_record_blocked" -CycleNumber $Cycle -ChildPid $null -Detail "exit_code=$exitCode recorder_exit=$LASTEXITCODE"
                     throw "Unable to persist the failed in-flight campaign cycle."
                 }
+            }
+            if ($exitCodeCaptureFailed) {
+                Write-Heartbeat -State "child_exit_code_unavailable" -CycleNumber $Cycle -ChildPid $null -Detail "recorded_exit_code=$exitCode capture_error=$exitCodeCaptureDetail"
+                throw "Radar child exit code was unavailable; the in-flight cycle was recorded as failed with exit code 125."
             }
         }
         finally {

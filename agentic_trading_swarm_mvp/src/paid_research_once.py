@@ -14,7 +14,13 @@ import uuid
 from itertools import product
 
 from autonomous_cost_guard import autonomous_paid_scope
-from cost_router import complete, completion_preflight_status, cost_budget_status
+from cost_router import (
+    COST_LOG_DEFERRED_PATH,
+    complete,
+    completion_preflight_status,
+    cost_budget_status,
+    deferred_cost_reconciliation_status,
+)
 from settings import SettingsError, config_fingerprint, load_settings
 from storage import (
     RUNS_DIR,
@@ -255,6 +261,40 @@ def _require_scoped_override() -> None:
         raise SettingsError("explicit RADAR_RESEARCH_MODEL_OVERRIDE is required")
     if os.environ.get("RADAR_USE_LITELLM") != "1":
         raise SettingsError("RADAR_USE_LITELLM=1 is required only in this one-shot process")
+
+
+def _require_deferred_cost_reconciliation(settings: dict) -> dict:
+    """Block paid work until the append-only deferred ledger matches SQLite."""
+
+    expansion = settings.get("paper_expansion") or {}
+    source = pathlib.Path(
+        str(expansion.get("deferred_cost_path") or COST_LOG_DEFERRED_PATH)
+    ).expanduser().resolve()
+    try:
+        with connect(initialize=False) as conn:
+            report = deferred_cost_reconciliation_status(conn, source)
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        raise SettingsError(
+            f"deferred_cost_reconciliation_blocked:unavailable:{type(exc).__name__}"
+        ) from exc
+    if not isinstance(report, dict):
+        raise SettingsError(
+            "deferred_cost_reconciliation_blocked:invalid_status_contract"
+        )
+    if report.get("complete") is not True:
+        status = str(report.get("status") or "incomplete").strip() or "incomplete"
+        count_values: list[str] = []
+        for key in ("pending", "reserved", "invalid", "conflicting"):
+            try:
+                value = str(int(report.get(key, 0) or 0))
+            except (TypeError, ValueError, OverflowError):
+                value = "unknown"
+            count_values.append(f"{key}={value}")
+        counts = ",".join(count_values)
+        raise SettingsError(
+            f"deferred_cost_reconciliation_blocked:{status}:{counts}"
+        )
+    return report
 
 
 def _direct_crypto_venue_allowlist() -> set[str]:
@@ -727,6 +767,7 @@ def run_once(config_path: str | pathlib.Path) -> dict:
     settings = load_settings(path, require_explicit=True)
     expansion = settings.get("paper_expansion") or {}
     campaign_id = str(expansion.get("campaign_id") or "")
+    _require_deferred_cost_reconciliation(settings)
     now = dt.datetime.now(dt.timezone.utc)
     day = now.date().isoformat()
     output_dir = RUNS_DIR / "paid_research"
@@ -811,7 +852,10 @@ def run_once(config_path: str | pathlib.Path) -> dict:
                 raise SettingsError(
                     str(preflight.get("status") or "paid model preflight blocked")
                 )
-            budget = cost_budget_status(agent_name="global_research_worker")
+            budget = cost_budget_status(
+                agent_name="global_research_worker",
+                replay_deferred=False,
+            )
             if not budget.get("allowed", False):
                 budget_reason = str(budget.get("reason") or budget.get("status") or "")
                 unknown_budget = any(

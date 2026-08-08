@@ -39,6 +39,21 @@ class PaidResearchOnceTests(unittest.TestCase):
             ),
         )
         self.runs_patch = mock.patch.object(research, "RUNS_DIR", self.root / "runs")
+        self.reconciliation_patch = mock.patch.object(
+            research,
+            "deferred_cost_reconciliation_status",
+            return_value={
+                "status": "deferred_cost_reconciled",
+                "source_digest": "unit-test-reconciled-ledger",
+                "read": 3,
+                "invalid": 0,
+                "pending": 0,
+                "reserved": 0,
+                "conflicting": 0,
+                "reconciled": 3,
+                "complete": True,
+            },
+        )
         self.env_patch = mock.patch.dict(
             os.environ,
             {
@@ -50,11 +65,13 @@ class PaidResearchOnceTests(unittest.TestCase):
         )
         self.connect_patch.start()
         self.runs_patch.start()
+        self.reconciliation_mock = self.reconciliation_patch.start()
         self.env_patch.start()
         self.seed_campaign(research._campaign_hash(self.settings))
 
     def tearDown(self) -> None:
         self.env_patch.stop()
+        self.reconciliation_patch.stop()
         self.runs_patch.stop()
         self.connect_patch.stop()
         self.temp.cleanup()
@@ -243,6 +260,72 @@ class PaidResearchOnceTests(unittest.TestCase):
             return_value=self.evidence_context(),
         ):
             return research.run_once(ROOT / "config" / "settings.bounded_crypto_paper.json")
+
+    def test_incomplete_deferred_cost_reconciliation_blocks_before_any_paid_state(self) -> None:
+        self.reconciliation_mock.return_value = {
+            "status": "deferred_cost_reconciliation_incomplete",
+            "source_digest": "unit-test-pending-ledger",
+            "read": 4,
+            "invalid": 1,
+            "pending": 1,
+            "reserved": 1,
+            "conflicting": 1,
+            "reconciled": 0,
+            "complete": False,
+        }
+        with mock.patch.object(
+            research,
+            "_claim_paid_research_lease",
+        ) as lease_mock, mock.patch.object(
+            research,
+            "autonomous_paid_scope",
+        ) as scope_mock, mock.patch.object(
+            research,
+            "completion_preflight_status",
+        ) as preflight_mock, mock.patch.object(
+            research,
+            "cost_budget_status",
+        ) as budget_mock, mock.patch.object(
+            research,
+            "complete",
+        ) as complete_mock:
+            with self.assertRaisesRegex(
+                SettingsError,
+                "deferred_cost_reconciliation_blocked",
+            ):
+                research.run_once(
+                    ROOT / "config" / "settings.bounded_crypto_paper.json"
+                )
+        lease_mock.assert_not_called()
+        scope_mock.assert_not_called()
+        preflight_mock.assert_not_called()
+        budget_mock.assert_not_called()
+        complete_mock.assert_not_called()
+        self.assertEqual(
+            [],
+            list((self.root / "runs" / "paid_research").glob("*.claim.json")),
+        )
+        campaign_id = self.settings["paper_expansion"]["campaign_id"]
+        with storage.connect(self.db_path, initialize=False) as conn:
+            state = json.loads(
+                conn.execute(
+                    "select state_json from paper_expansion_campaign_state where campaign_id=?",
+                    (campaign_id,),
+                ).fetchone()[0]
+            )
+        self.assertNotIn("paid_research_inflight", state)
+        self.assertNotIn("last_paid_research_lease", state)
+
+    def test_fully_reconciled_deferred_cost_ledger_allows_paid_path(self) -> None:
+        report = self.run_with_payload({"strategy_contracts": []})
+        self.assertEqual("model_call:responses", report["status"])
+        self.reconciliation_mock.assert_called_once()
+        reconciliation_args = self.reconciliation_mock.call_args.args
+        self.assertEqual(2, len(reconciliation_args))
+        self.assertEqual(
+            research.COST_LOG_DEFERRED_PATH.resolve(),
+            pathlib.Path(reconciliation_args[1]),
+        )
 
     def seed_active_roots(
         self,
@@ -493,7 +576,7 @@ class PaidResearchOnceTests(unittest.TestCase):
             research,
             "cost_budget_status",
             return_value={"allowed": False, "reason": "global_utc_call_guard"},
-        ), mock.patch.object(
+        ) as budget_mock, mock.patch.object(
             research,
             "_research_context",
             return_value=self.evidence_context(),
@@ -503,6 +586,10 @@ class PaidResearchOnceTests(unittest.TestCase):
                     ROOT / "config" / "settings.bounded_crypto_paper.json"
                 )
         complete_mock.assert_not_called()
+        budget_mock.assert_called_once_with(
+            agent_name="global_research_worker",
+            replay_deferred=False,
+        )
         campaign_id = self.settings["paper_expansion"]["campaign_id"]
         with storage.connect(self.db_path, initialize=False) as conn:
             state = json.loads(

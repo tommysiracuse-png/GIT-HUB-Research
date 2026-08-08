@@ -473,36 +473,56 @@ def _deferred_line_count(path: pathlib.Path = DEFERRED_COST_PATH) -> int:
         return 0
 
 
-def _deferred_cost_state(path: pathlib.Path) -> dict:
-    if not path.exists():
-        return {"line_count": 0, "invalid_count": 0, "known": True}
-    line_count = 0
-    invalid_count = 0
+def _deferred_cost_state(conn: sqlite3.Connection, path: pathlib.Path) -> dict:
+    """Return database-aware truth for the append-only fallback ledger."""
+
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for raw in handle:
-                if not raw.strip():
-                    continue
-                line_count += 1
-                try:
-                    payload = json.loads(raw)
-                    if not isinstance(payload, dict):
-                        invalid_count += 1
-                        continue
-                    cost = float(payload["estimated_cost_usd"])
-                    status = str(payload.get("status") or "").strip()
-                    if not math.isfinite(cost) or cost < 0 or not status:
-                        invalid_count += 1
-                except (KeyError, TypeError, ValueError, OverflowError):
-                    invalid_count += 1
-                except json.JSONDecodeError:
-                    invalid_count += 1
-    except (OSError, UnicodeError):
-        return {"line_count": -1, "invalid_count": -1, "known": False}
+        from cost_router import deferred_cost_reconciliation_status
+
+        status = deferred_cost_reconciliation_status(conn, path)
+    except (OSError, sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+        return {
+            "line_count": -1,
+            "invalid_count": -1,
+            "pending_count": -1,
+            "reserved_count": -1,
+            "conflicting_count": -1,
+            "reconciled_count": -1,
+            "source_digest": None,
+            "source_path": str(path),
+            "complete": False,
+            "known": False,
+            "reason": f"deferred_cost_reconciliation_unavailable:{type(exc).__name__}",
+        }
+    invalid = int(status.get("invalid", -1))
+    pending = int(status.get("pending", -1))
+    reserved = int(status.get("reserved", -1))
+    conflicting = int(status.get("conflicting", -1))
+    reconciled = int(status.get("reconciled", -1))
+    line_count = int(status.get("read", -1))
+    source_digest = status.get("source_digest")
+    if not bool(status.get("source_exists", False)) and source_digest in (None, ""):
+        source_digest = hashlib.sha256(b"").hexdigest()
+    complete = bool(status.get("complete", False))
+    known = bool(
+        complete
+        and line_count >= 0
+        and invalid == 0
+        and pending == 0
+        and reserved == 0
+        and conflicting == 0
+        and reconciled == line_count
+    )
     return {
+        **status,
+        "source_digest": source_digest,
         "line_count": line_count,
-        "invalid_count": invalid_count,
-        "known": invalid_count == 0,
+        "invalid_count": invalid,
+        "pending_count": pending,
+        "reserved_count": reserved,
+        "conflicting_count": conflicting,
+        "reconciled_count": reconciled,
+        "known": known,
     }
 
 
@@ -600,6 +620,7 @@ def _safety_snapshot(conn: sqlite3.Connection, cfg: dict, now: dt.datetime) -> d
         invalid_llm_costs = -1
         cost_ledger_known = False
     deferred = _deferred_cost_state(
+        conn,
         pathlib.Path(str(cfg.get("deferred_cost_path") or DEFERRED_COST_PATH))
     )
     autonomous_state = _autonomous_attempt_state(
@@ -687,6 +708,13 @@ def _safety_snapshot(conn: sqlite3.Connection, cfg: dict, now: dt.datetime) -> d
         ),
         "deferred_cost_lines": deferred["line_count"],
         "invalid_deferred_cost_lines": deferred["invalid_count"],
+        "pending_deferred_cost_lines": deferred["pending_count"],
+        "reserved_deferred_cost_lines": deferred["reserved_count"],
+        "conflicting_deferred_cost_lines": deferred["conflicting_count"],
+        "reconciled_deferred_cost_lines": deferred["reconciled_count"],
+        "deferred_cost_reconciliation_complete": bool(deferred.get("complete")),
+        "deferred_cost_source_digest": deferred.get("source_digest"),
+        "deferred_cost_source_path": deferred.get("source_path"),
         "autonomous_attempts_today": autonomous_attempts,
         "autonomous_attempts_digest": autonomous_state.get("digest"),
     }
@@ -1226,12 +1254,33 @@ def _intercycle_safety_check(
         if cost_delta < -1.0e-9:
             reasons.append("intercycle_counter_regression:llm_cost_usd")
 
-    for key in ("invalid_llm_timestamps", "invalid_llm_costs", "invalid_deferred_cost_lines"):
+    for key in (
+        "invalid_llm_timestamps",
+        "invalid_llm_costs",
+        "invalid_deferred_cost_lines",
+        "pending_deferred_cost_lines",
+        "reserved_deferred_cost_lines",
+        "conflicting_deferred_cost_lines",
+    ):
         value = _snapshot_integer(current, key)
         if value is None or value != 0:
             reasons.append(f"intercycle_unknown_cost_state:{key}")
     if current.get("cost_ledger_known") is not True:
         reasons.append("intercycle_cost_ledger_unknown")
+    if current.get("deferred_cost_reconciliation_complete") is not True:
+        reasons.append("intercycle_deferred_cost_reconciliation_incomplete")
+    before_deferred_digest = str(before.get("deferred_cost_source_digest") or "")
+    current_deferred_digest = str(current.get("deferred_cost_source_digest") or "")
+    if len(before_deferred_digest) != 64:
+        reasons.append("intercycle_watermark_deferred_digest_unknown")
+    if len(current_deferred_digest) != 64:
+        reasons.append("intercycle_current_deferred_digest_unknown")
+    if (
+        len(before_deferred_digest) == 64
+        and len(current_deferred_digest) == 64
+        and before_deferred_digest != current_deferred_digest
+    ):
+        reasons.append("intercycle_deferred_cost_source_changed")
 
     marker_changed = False
     for key in ("llm_cost_event_max_id", "llm_cost_event_sequence"):
@@ -1506,11 +1555,10 @@ def _paid_cost_capacity_revalidation(
         }
     expansion = settings.get("paper_expansion") or {}
     deferred = _deferred_cost_state(
+        conn,
         pathlib.Path(str(expansion.get("deferred_cost_path") or DEFERRED_COST_PATH))
     )
-    deferred_clear = bool(deferred.get("known")) and int(
-        deferred.get("line_count", -1) or 0
-    ) == 0
+    deferred_clear = bool(deferred.get("known")) and bool(deferred.get("complete"))
     autonomous_path = pathlib.Path(
         str(expansion.get("autonomous_ledger_path") or AUTONOMOUS_LEDGER_PATH)
     )
@@ -1555,6 +1603,12 @@ def _paid_cost_capacity_revalidation(
         "windows": windows,
         "deferred_cost_lines": deferred.get("line_count"),
         "deferred_cost_known": bool(deferred.get("known")),
+        "deferred_cost_reconciliation_complete": bool(deferred.get("complete")),
+        "deferred_cost_pending": deferred.get("pending_count"),
+        "deferred_cost_reserved": deferred.get("reserved_count"),
+        "deferred_cost_conflicting": deferred.get("conflicting_count"),
+        "deferred_cost_reconciled": deferred.get("reconciled_count"),
+        "deferred_cost_source_digest": deferred.get("source_digest"),
         "autonomous_attempts_utc_day": autonomous_calls,
         "autonomous_attempts_known": autonomous_known,
     }
@@ -1874,6 +1928,53 @@ def _atomic_claim_campaign_cycle(
         raise
 
 
+def _bootstrap_deferred_cost_reconciliation(
+    conn: sqlite3.Connection,
+    *,
+    campaign_id: str,
+    cfg: dict,
+) -> dict | None:
+    """Reconcile legacy fallback rows only before the first campaign watermark.
+
+    Once a campaign row exists, deferred changes are never replayed implicitly;
+    they must go through the audited stopped-runtime maintenance path.
+    """
+
+    any_state = conn.execute(
+        "select 1 from paper_expansion_campaign_state limit 1"
+    ).fetchone()
+    any_cycle = conn.execute(
+        "select 1 from paper_expansion_campaign_cycles limit 1"
+    ).fetchone()
+    if any_state is not None or any_cycle is not None:
+        return None
+    from cost_router import deferred_cost_reconciliation_status, replay_deferred_cost_events
+
+    path = pathlib.Path(str(cfg.get("deferred_cost_path") or DEFERRED_COST_PATH))
+    before = deferred_cost_reconciliation_status(conn, path)
+    if int(before.get("invalid", 0) or 0) != 0:
+        raise CampaignError("bootstrap_deferred_cost_ledger_invalid")
+    if int(before.get("conflicting", 0) or 0) != 0:
+        raise CampaignError("bootstrap_deferred_cost_ledger_conflict")
+    replay = None
+    if not bool(before.get("complete", False)):
+        process_guard = _bounded_process_guard()
+        if not process_guard.get("authorized", False):
+            raise CampaignError("bootstrap_deferred_replay_process_guard_failed")
+        replay = replay_deferred_cost_events(conn, path)
+    after = deferred_cost_reconciliation_status(conn, path)
+    if not bool(after.get("complete", False)):
+        raise CampaignError("bootstrap_deferred_cost_reconciliation_incomplete")
+    return {
+        "status": "complete",
+        "source_path": after.get("source_path"),
+        "source_digest": after.get("source_digest"),
+        "read": int(after.get("read", 0) or 0),
+        "reconciled": int(after.get("reconciled", 0) or 0),
+        "replay": replay,
+    }
+
+
 def apply_campaign_controls(conn: sqlite3.Connection, settings: dict) -> tuple[dict, dict]:
     """Return fail-closed effective settings and a per-cycle campaign token."""
 
@@ -1881,13 +1982,24 @@ def apply_campaign_controls(conn: sqlite3.Connection, settings: dict) -> tuple[d
     if not cfg:
         return copy.deepcopy(settings), {"enabled": False, "status": "campaign_disabled"}
     _assert_fail_closed_settings(settings)
+    _require_schema(conn)
     now = _utc_now()
     campaign_id = str(cfg.get("campaign_id") or "bounded_crypto_paper_v1")
     # Lock the complete normalized runtime profile, not only the phase block.
     # Queue freshness/lease rules, scanner toggles, route gates, and every
     # other effective safety knob must participate in drift detection.
     config_hash = _config_hash(settings)
+    bootstrap_reconciliation = _bootstrap_deferred_cost_reconciliation(
+        conn,
+        campaign_id=campaign_id,
+        cfg=cfg,
+    )
     state = _load_or_create_state(conn, campaign_id, now, config_hash)
+    if bootstrap_reconciliation is not None:
+        state["bootstrap_deferred_cost_reconciliation"] = bootstrap_reconciliation
+        state["updated_at"] = _iso(now)
+        _persist_state(conn, state)
+        conn.commit()
     process_guard = _bounded_process_guard()
     if not process_guard["authorized"] and state["run_status"] != "hard_halted":
         reason = "bounded_process_guard:" + ",".join(process_guard["reasons"])
@@ -2062,6 +2174,12 @@ def apply_campaign_controls(conn: sqlite3.Connection, settings: dict) -> tuple[d
         ledger_halt_reason = "cost_ledger_invalid_costs_at_cycle_start"
     elif int(baseline.get("invalid_deferred_cost_lines", 0) or 0) != 0:
         ledger_halt_reason = "deferred_cost_ledger_invalid_at_cycle_start"
+    elif int(baseline.get("conflicting_deferred_cost_lines", 0) or 0) != 0:
+        ledger_halt_reason = "deferred_cost_ledger_conflict_at_cycle_start"
+    elif int(baseline.get("pending_deferred_cost_lines", 0) or 0) != 0:
+        ledger_halt_reason = "deferred_cost_ledger_pending_at_cycle_start"
+    elif int(baseline.get("reserved_deferred_cost_lines", 0) or 0) != 0:
+        ledger_halt_reason = "deferred_cost_ledger_reserved_at_cycle_start"
     elif not bool(baseline.get("cost_ledger_known", False)):
         ledger_halt_reason = "cost_ledger_unknown_at_cycle_start"
     if ledger_halt_reason and state["run_status"] != "hard_halted":
@@ -2180,6 +2298,19 @@ def _merged_metrics(conn: sqlite3.Connection, state: dict, metrics: dict, cfg: d
             "invalid_deferred_cost_lines": int(
                 current.get("invalid_deferred_cost_lines", -1) or 0
             ),
+            "pending_deferred_cost_lines": int(
+                current.get("pending_deferred_cost_lines", -1) or 0
+            ),
+            "reserved_deferred_cost_lines": int(
+                current.get("reserved_deferred_cost_lines", -1) or 0
+            ),
+            "conflicting_deferred_cost_lines": int(
+                current.get("conflicting_deferred_cost_lines", -1) or 0
+            ),
+            "deferred_cost_reconciliation_complete": bool(
+                current.get("deferred_cost_reconciliation_complete", False)
+            ),
+            "deferred_cost_source_digest": current.get("deferred_cost_source_digest"),
             "new_llm_cost_events": int(_delta(current, baseline, "llm_cost_events")),
             "new_llm_cost_usd": round(_delta(current, baseline, "llm_cost_usd"), 10),
             "new_paid_model_attempts": int(_delta(current, baseline, "paid_model_attempts")),
@@ -3136,6 +3267,444 @@ def record_inflight_failure(
         ),
     )
     return record_campaign_cycle(conn, token, failure_metrics)
+
+
+def _maintenance_event_details(
+    conn: sqlite3.Connection,
+    maintenance_id: str,
+    event_type: str,
+) -> dict | None:
+    row = conn.execute(
+        """
+        select details_json from paper_expansion_campaign_maintenance_events
+        where maintenance_id=? and event_type=?
+        """,
+        (maintenance_id, event_type),
+    ).fetchone()
+    if row is None:
+        return None
+    raw = row["details_json"] if isinstance(row, sqlite3.Row) else row[0]
+    parsed = _json_value(raw, {})
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _insert_maintenance_event(
+    conn: sqlite3.Connection,
+    *,
+    maintenance_id: str,
+    campaign_id: str,
+    event_type: str,
+    now: dt.datetime,
+    details: dict,
+) -> None:
+    conn.execute(
+        """
+        insert into paper_expansion_campaign_maintenance_events(
+            maintenance_id,campaign_id,event_type,created_at,details_json
+        ) values(?,?,?,?,?)
+        """,
+        (
+            maintenance_id,
+            campaign_id,
+            event_type,
+            _iso(now),
+            json.dumps(details, sort_keys=True, default=str),
+        ),
+    )
+
+
+def _ensure_maintenance_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        create table if not exists paper_expansion_campaign_maintenance_events (
+            id integer primary key autoincrement,
+            maintenance_id text not null,
+            campaign_id text not null,
+            event_type text not null,
+            created_at text not null,
+            details_json text not null default '{}',
+            unique(maintenance_id, event_type),
+            foreign key(campaign_id) references paper_expansion_campaign_state(campaign_id)
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_paper_expansion_maintenance_campaign "
+        "on paper_expansion_campaign_maintenance_events(campaign_id, created_at desc)"
+    )
+    conn.commit()
+
+
+def _deferred_event_rows(conn: sqlite3.Connection, event_ids: list[str]) -> dict[str, dict]:
+    rows: dict[str, dict] = {}
+    for offset in range(0, len(event_ids), 400):
+        batch = event_ids[offset : offset + 400]
+        if not batch:
+            continue
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            f"""
+            select event_id,estimated_cost_usd,status from llm_cost_events
+            where event_id in ({placeholders})
+            """,
+            tuple(batch),
+        ).fetchall():
+            item = dict(row) if isinstance(row, sqlite3.Row) else {
+                "event_id": row[0],
+                "estimated_cost_usd": row[1],
+                "status": row[2],
+            }
+            rows[str(item["event_id"])] = item
+    return rows
+
+
+def _maintenance_paid_status(status: object) -> bool:
+    value = str(status or "")
+    return bool(
+        value == "model_call"
+        or value.startswith("model_call:")
+        or value == "model_call_reserved"
+        or value.startswith("fallback_error:")
+    )
+
+
+def _assert_maintenance_counters_unchanged(
+    before: dict,
+    current: dict,
+    *,
+    allow_deferred_source_change: bool = False,
+) -> None:
+    ignored = {"llm_cost_events", "paid_model_attempts"}
+    if allow_deferred_source_change:
+        ignored.add("deferred_cost_lines")
+    reasons: list[str] = []
+    for key in INTERCYCLE_INTEGER_COUNTERS:
+        if key in ignored:
+            continue
+        prior = _snapshot_integer(before, key)
+        observed = _snapshot_integer(current, key)
+        if prior is None or observed is None or prior != observed:
+            reasons.append(key)
+    if str(before.get("autonomous_attempts_digest") or "") != str(
+        current.get("autonomous_attempts_digest") or ""
+    ):
+        reasons.append("autonomous_attempts_digest")
+    if reasons:
+        raise CampaignError("deferred_maintenance_unrelated_delta:" + ",".join(sorted(reasons)))
+
+
+def _maintenance_replay_summary(report: dict | None) -> dict | None:
+    if not isinstance(report, dict):
+        return None
+    omitted = {
+        "event_ids",
+        "pending_event_ids",
+        "reserved_event_ids",
+        "conflicting_event_ids",
+        "reconciled_event_ids",
+        "expected_events",
+    }
+    summary = {key: value for key, value in report.items() if key not in omitted}
+    post = summary.get("post_verification")
+    if isinstance(post, dict):
+        summary["post_verification"] = {
+            key: value for key, value in post.items() if key not in omitted
+        }
+    return summary
+
+
+def adopt_deferred_cost_ledger(
+    conn: sqlite3.Connection,
+    settings: dict,
+    *,
+    campaign_id: str,
+    operator_reason: str,
+    expected_source_path: str | pathlib.Path,
+    expected_source_sha256: str,
+    expected_line_count: int,
+    active_runtime_processes: list[dict] | None,
+) -> dict:
+    """Replay and adopt a legacy deferred ledger with all runtimes stopped.
+
+    A durable ``started`` event is committed before replay.  If the process
+    exits after replay but before adoption, a later invocation proves that the
+    only database delta is the pinned source and safely completes the adoption.
+    """
+
+    if not operator_reason.strip():
+        raise CampaignError("operator_reason_required")
+    if active_runtime_processes is None:
+        raise CampaignError("runtime_process_check_required")
+    if active_runtime_processes:
+        raise CampaignError("active_runtime_processes_block_maintenance")
+    _ensure_maintenance_schema(conn)
+    cfg = _campaign_config(settings)
+    if not cfg or str(cfg.get("campaign_id") or "") != str(campaign_id):
+        raise CampaignError("campaign_id_mismatch")
+    now = _utc_now()
+    config_hash = _config_hash(settings)
+    state = _load_or_create_state(conn, campaign_id, now, config_hash)
+    if str(state.get("phase") or "") != "burn_in":
+        raise CampaignError("deferred_maintenance_requires_burn_in")
+    if str(state.get("run_status") or "") != "soft_paused":
+        raise CampaignError("deferred_maintenance_requires_soft_paused_campaign")
+    if isinstance(state.get("inflight_cycle"), dict) and state.get("inflight_cycle"):
+        raise CampaignError("inflight_cycle_blocks_deferred_maintenance")
+    if isinstance(state.get("paid_research_inflight"), dict) and state.get(
+        "paid_research_inflight"
+    ):
+        raise CampaignError("paid_research_lease_blocks_deferred_maintenance")
+    watermark = state.get("last_completed_safety_watermark")
+    if not isinstance(watermark, dict) or not isinstance(watermark.get("safety_snapshot"), dict):
+        raise CampaignError("completed_safety_watermark_required")
+    if str(watermark.get("config_hash") or "") != config_hash:
+        raise CampaignError("deferred_maintenance_config_hash_mismatch")
+
+    from cost_router import deferred_cost_reconciliation_status, replay_deferred_cost_events
+
+    configured_path = pathlib.Path(
+        str(cfg.get("deferred_cost_path") or DEFERRED_COST_PATH)
+    ).expanduser().resolve()
+    supplied_path = pathlib.Path(expected_source_path).expanduser().resolve()
+    if configured_path != supplied_path:
+        raise CampaignError("deferred_maintenance_source_path_mismatch")
+    reconciliation = deferred_cost_reconciliation_status(
+        conn,
+        configured_path,
+        include_event_ids=True,
+    )
+    digest = str(reconciliation.get("source_digest") or "")
+    if len(expected_source_sha256) != 64 or digest != expected_source_sha256.lower():
+        raise CampaignError("deferred_maintenance_source_digest_mismatch")
+    if int(reconciliation.get("read", -1)) != int(expected_line_count):
+        raise CampaignError("deferred_maintenance_source_line_count_mismatch")
+    if int(reconciliation.get("invalid", 0) or 0) != 0:
+        raise CampaignError("deferred_maintenance_source_invalid")
+    if int(reconciliation.get("conflicting", 0) or 0) != 0:
+        raise CampaignError("deferred_maintenance_source_conflict")
+
+    pending_row = conn.execute(
+        """
+        select s.maintenance_id,s.details_json
+        from paper_expansion_campaign_maintenance_events s
+        where s.campaign_id=? and s.event_type='started'
+          and not exists (
+              select 1 from paper_expansion_campaign_maintenance_events a
+              where a.maintenance_id=s.maintenance_id and a.event_type='adopted'
+          )
+        order by s.id desc limit 1
+        """,
+        (campaign_id,),
+    ).fetchone()
+    resumed = pending_row is not None
+    if pending_row is None:
+        before = _safety_snapshot(conn, cfg, now)
+        watermark_before = watermark["safety_snapshot"]
+        _assert_maintenance_counters_unchanged(
+            watermark_before,
+            before,
+            allow_deferred_source_change=True,
+        )
+        for key in (
+            "llm_cost_events",
+            "llm_cost_event_max_id",
+            "llm_cost_event_sequence",
+            "paid_model_attempts",
+        ):
+            if _snapshot_integer(watermark_before, key) != _snapshot_integer(before, key):
+                raise CampaignError(f"deferred_maintenance_unrelated_delta:{key}")
+        prior_cost = _snapshot_cost(watermark_before)
+        current_cost = _snapshot_cost(before)
+        if prior_cost is None or current_cost is None or abs(prior_cost - current_cost) > 1.0e-9:
+            raise CampaignError("deferred_maintenance_unrelated_delta:llm_cost_usd")
+        if _snapshot_integer(before, "live_orders") != 0:
+            raise CampaignError("live_orders_block_deferred_maintenance")
+        if _snapshot_integer(before, "nonpaper_fills") != 0:
+            raise CampaignError("nonpaper_fills_block_deferred_maintenance")
+        prior_lease_digest = str(watermark.get("last_paid_research_lease_digest") or "")
+        if prior_lease_digest != _json_digest(state.get("last_paid_research_lease")):
+            raise CampaignError("deferred_maintenance_paid_lease_changed")
+
+        source_expected_events = list(reconciliation.get("expected_events") or [])
+        expected_by_id: dict[str, dict] = {}
+        for item in source_expected_events:
+            event_id = str(item.get("event_id") or "")
+            if event_id and event_id not in expected_by_id:
+                expected_by_id[event_id] = item
+        expected_events = list(expected_by_id.values())
+        event_ids = list(expected_by_id)
+        if not event_ids or any(not item for item in event_ids):
+            raise CampaignError("deferred_maintenance_expected_event_ids_missing")
+        existing = _deferred_event_rows(conn, event_ids)
+        expected_inserted = sum(1 for event_id in event_ids if event_id not in existing)
+        expected_cost_delta = 0.0
+        expected_paid_delta = 0
+        for item in expected_events:
+            event_id = str(item["event_id"])
+            target_cost = float(item["cost"])
+            target_status = str(item["status"])
+            prior = existing.get(event_id)
+            prior_cost_value = float(prior["estimated_cost_usd"] or 0.0) if prior else 0.0
+            prior_paid = _maintenance_paid_status(prior.get("status")) if prior else False
+            expected_cost_delta += target_cost - prior_cost_value
+            expected_paid_delta += int(_maintenance_paid_status(target_status)) - int(prior_paid)
+        maintenance_id = "deferred-ledger-" + uuid.uuid4().hex
+        started_details = {
+            "operator_reason": operator_reason.strip(),
+            "config_hash": config_hash,
+            "source_path": str(configured_path),
+            "source_sha256": digest,
+            "source_size_bytes": reconciliation.get("source_size_bytes"),
+            "line_count": int(reconciliation.get("read", 0) or 0),
+            "event_ids_digest": reconciliation.get("event_ids_digest"),
+            "first_event_id": event_ids[0],
+            "last_event_id": event_ids[-1],
+            "expected_inserted": expected_inserted,
+            "expected_finalized": len(
+                set(reconciliation.get("reserved_event_ids") or [])
+            ),
+            "expected_cost_delta_usd": round(expected_cost_delta, 12),
+            "expected_paid_attempt_delta": expected_paid_delta,
+            "before_snapshot": before,
+            "watermark_cycle_id": watermark.get("cycle_id"),
+            "initial_reconciliation": _maintenance_replay_summary(reconciliation),
+        }
+        _insert_maintenance_event(
+            conn,
+            maintenance_id=maintenance_id,
+            campaign_id=campaign_id,
+            event_type="started",
+            now=now,
+            details=started_details,
+        )
+        conn.commit()
+    else:
+        maintenance_id = str(
+            pending_row["maintenance_id"] if isinstance(pending_row, sqlite3.Row) else pending_row[0]
+        )
+        raw_details = pending_row["details_json"] if isinstance(pending_row, sqlite3.Row) else pending_row[1]
+        started_details = _json_value(raw_details, {})
+        if not isinstance(started_details, dict):
+            raise CampaignError("deferred_maintenance_started_event_invalid")
+        for key, expected in (
+            ("source_path", str(configured_path)),
+            ("source_sha256", digest),
+            ("line_count", int(expected_line_count)),
+            ("config_hash", config_hash),
+        ):
+            if started_details.get(key) != expected:
+                raise CampaignError(f"deferred_maintenance_resume_mismatch:{key}")
+        before = started_details.get("before_snapshot")
+        if not isinstance(before, dict):
+            raise CampaignError("deferred_maintenance_before_snapshot_missing")
+
+    replay_report = replay_deferred_cost_events(conn, configured_path)
+    after_reconciliation = deferred_cost_reconciliation_status(
+        conn,
+        configured_path,
+        include_event_ids=True,
+    )
+    if not bool(after_reconciliation.get("complete", False)):
+        raise CampaignError("deferred_maintenance_replay_incomplete")
+    if str(after_reconciliation.get("source_digest") or "") != digest:
+        raise CampaignError("deferred_maintenance_source_changed_during_replay")
+    after = _safety_snapshot(conn, cfg, _utc_now())
+    _assert_maintenance_counters_unchanged(before, after)
+    expected_inserted = int(started_details.get("expected_inserted", -1))
+    expected_paid_delta = int(started_details.get("expected_paid_attempt_delta", -1))
+    expected_cost_delta = float(started_details.get("expected_cost_delta_usd", math.nan))
+    if _snapshot_integer(after, "llm_cost_events") - _snapshot_integer(before, "llm_cost_events") != expected_inserted:
+        raise CampaignError("deferred_maintenance_unexpected_cost_row_delta")
+    if _snapshot_integer(after, "llm_cost_event_sequence") - _snapshot_integer(before, "llm_cost_event_sequence") != expected_inserted:
+        raise CampaignError("deferred_maintenance_unexpected_cost_sequence_delta")
+    if _snapshot_integer(after, "paid_model_attempts") - _snapshot_integer(before, "paid_model_attempts") != expected_paid_delta:
+        raise CampaignError("deferred_maintenance_unexpected_paid_attempt_delta")
+    observed_cost_delta = float(_snapshot_cost(after)) - float(_snapshot_cost(before))
+    if not math.isfinite(expected_cost_delta) or abs(observed_cost_delta - expected_cost_delta) > 1.0e-8:
+        raise CampaignError("deferred_maintenance_unexpected_cost_delta")
+
+    finished_at = _utc_now()
+    replay_summary = _maintenance_replay_summary(replay_report)
+    if _maintenance_event_details(conn, maintenance_id, "replayed") is None:
+        _insert_maintenance_event(
+            conn,
+            maintenance_id=maintenance_id,
+            campaign_id=campaign_id,
+            event_type="replayed",
+            now=finished_at,
+            details={
+                "resumed": resumed,
+                "replay": replay_summary,
+                "after_reconciliation": _maintenance_replay_summary(after_reconciliation),
+                "observed_cost_delta_usd": round(observed_cost_delta, 12),
+                "after_snapshot": after,
+            },
+        )
+        conn.commit()
+
+    last_paid_lease = state.get("last_paid_research_lease")
+    adopted_watermark = {
+        "version": SAFETY_WATERMARK_VERSION,
+        "cycle_id": f"maintenance:{maintenance_id}",
+        "cycle_phase": "burn_in",
+        "phase_after": "burn_in",
+        "captured_at": _iso(finished_at),
+        "config_hash": config_hash,
+        "safety_snapshot": after,
+        "last_paid_research_lease_id": (
+            str(last_paid_lease.get("lease_id") or "") or None
+            if isinstance(last_paid_lease, dict)
+            else None
+        ),
+        "last_paid_research_lease_digest": _json_digest(last_paid_lease),
+        "authorized_paid_research": None,
+        "maintenance_adoption_id": maintenance_id,
+    }
+    state["run_status"] = "soft_paused"
+    state["healthy_streak"] = 0
+    state["hard_halt_reason"] = None
+    state["stop_reason"] = f"deferred_cost_maintenance_adopted:{maintenance_id}"
+    state["last_completed_safety_watermark"] = adopted_watermark
+    state["last_deferred_cost_maintenance"] = {
+        "maintenance_id": maintenance_id,
+        "adopted_at": _iso(finished_at),
+        "source_sha256": digest,
+        "line_count": int(expected_line_count),
+        "cost_delta_usd": round(observed_cost_delta, 12),
+    }
+    state["updated_at"] = _iso(finished_at)
+    _persist_state(conn, state)
+    if _maintenance_event_details(conn, maintenance_id, "adopted") is None:
+        _insert_maintenance_event(
+            conn,
+            maintenance_id=maintenance_id,
+            campaign_id=campaign_id,
+            event_type="adopted",
+            now=finished_at,
+            details={
+                "operator_reason": operator_reason.strip(),
+                "source_path": str(configured_path),
+                "source_sha256": digest,
+                "line_count": int(expected_line_count),
+                "replay": replay_summary,
+                "cost_delta_usd": round(observed_cost_delta, 12),
+                "before_snapshot": before,
+                "after_snapshot": after,
+                "adopted_watermark": adopted_watermark,
+            },
+        )
+    conn.commit()
+    return {
+        "status": "deferred_cost_ledger_adopted",
+        "maintenance_id": maintenance_id,
+        "resumed": resumed,
+        "source_path": str(configured_path),
+        "source_sha256": digest,
+        "line_count": int(expected_line_count),
+        "cost_delta_usd": round(observed_cost_delta, 12),
+        "replay": replay_summary,
+        "state": state,
+    }
 
 
 def reset_hard_halt(

@@ -1965,6 +1965,24 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        create table if not exists paper_expansion_campaign_maintenance_events (
+            id integer primary key autoincrement,
+            maintenance_id text not null,
+            campaign_id text not null,
+            event_type text not null,
+            created_at text not null,
+            details_json text not null default '{}',
+            unique(maintenance_id, event_type),
+            foreign key(campaign_id) references paper_expansion_campaign_state(campaign_id)
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_paper_expansion_maintenance_campaign "
+        "on paper_expansion_campaign_maintenance_events(campaign_id, created_at desc)"
+    )
+    conn.execute(
+        """
         create table if not exists market_activation_tasks (
             task_id text primary key,
             created_at text not null,

@@ -252,6 +252,32 @@ def _deferred_event_id(path: pathlib.Path, line_number: int, raw: str) -> str:
     return "deferred-" + hashlib.sha256(material).hexdigest()
 
 
+_COST_EVENT_COLUMNS = (
+    "event_id",
+    "created_at",
+    "agent_name",
+    "model_tier",
+    "model_name",
+    "provider",
+    "api",
+    "reasoning_effort",
+    "verbosity",
+    "operation",
+    "prompt_cache_key",
+    "frontier_escalation_reason",
+    "structured_json",
+    "prompt_tokens",
+    "completion_tokens",
+    "estimated_cost_usd",
+    "status",
+)
+_RESERVATION_IDENTITY_INDEXES = tuple(range(14))
+
+
+def _optional_text(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
 def _cost_payload_values(payload: dict, *, event_id: str, created_at: str) -> tuple:
     if "estimated_cost_usd" not in payload:
         raise ValueError("deferred cost is missing")
@@ -273,17 +299,259 @@ def _cost_payload_values(payload: dict, *, event_id: str, created_at: str) -> tu
         str(payload.get("model_name") or "unknown"),
         str(payload.get("provider") or ""),
         str(payload.get("api") or ""),
-        payload.get("reasoning_effort"),
-        payload.get("verbosity"),
-        payload.get("operation"),
-        payload.get("prompt_cache_key"),
-        payload.get("frontier_escalation_reason"),
+        _optional_text(payload.get("reasoning_effort")),
+        _optional_text(payload.get("verbosity")),
+        _optional_text(payload.get("operation")),
+        _optional_text(payload.get("prompt_cache_key")),
+        _optional_text(payload.get("frontier_escalation_reason")),
         1 if bool(payload.get("structured_json", False)) else 0,
         prompt_tokens,
         completion_tokens,
         estimated_cost,
         status,
     )
+
+
+def _deferred_report_aliases(report: dict) -> dict:
+    report["line_count"] = int(report.get("read", 0) or 0)
+    for key in ("invalid", "pending", "reserved", "conflicting", "reconciled"):
+        report[f"{key}_count"] = int(report.get(key, 0) or 0)
+    return report
+
+
+def _load_deferred_cost_records(source: pathlib.Path) -> tuple[dict, list[dict]]:
+    report = {
+        "status": "deferred_cost_log_missing",
+        "source_path": str(source.resolve()),
+        "source_exists": False,
+        "source_digest": hashlib.sha256(b"").hexdigest(),
+        "source_size_bytes": 0,
+        "read": 0,
+        "invalid": 0,
+        "pending": 0,
+        "reserved": 0,
+        "conflicting": 0,
+        "reconciled": 0,
+        "inferred_timestamps": 0,
+        "unique_event_count": 0,
+        "expected_cost_usd": 0.0,
+        "event_ids_digest": hashlib.sha256(b"").hexdigest(),
+        "complete": True,
+    }
+    if not source.exists():
+        return _deferred_report_aliases(report), []
+    report["source_exists"] = True
+    try:
+        with source.open("rb") as handle:
+            source_bytes = handle.read()
+            file_mtime = dt.datetime.fromtimestamp(
+                os.fstat(handle.fileno()).st_mtime,
+                tz=dt.timezone.utc,
+            )
+        report["source_digest"] = hashlib.sha256(source_bytes).hexdigest()
+        report["source_size_bytes"] = len(source_bytes)
+        text = source_bytes.decode("utf-8")
+    except (OSError, UnicodeError):
+        report["status"] = "deferred_cost_log_unreadable"
+        report["invalid"] = 1
+        report["complete"] = False
+        return _deferred_report_aliases(report), []
+
+    records: list[dict] = []
+    for line_number, raw in enumerate(text.splitlines(), start=1):
+        if not raw.strip():
+            continue
+        report["read"] += 1
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("event is not an object")
+            event_id = str(payload.get("event_id") or "").strip()
+            if not event_id:
+                event_id = _deferred_event_id(source, line_number, raw)
+            created_at = _normalise_event_timestamp(payload.get("created_at"))
+            inferred_timestamp = created_at is None
+            if inferred_timestamp:
+                created_at = (file_mtime + dt.timedelta(microseconds=line_number)).isoformat()
+                report["inferred_timestamps"] += 1
+            values = _cost_payload_values(payload, event_id=event_id, created_at=created_at)
+        except (TypeError, ValueError, json.JSONDecodeError, OverflowError):
+            report["invalid"] += 1
+            continue
+        records.append(
+            {
+                "line_number": line_number,
+                "event_id": event_id,
+                "values": values,
+                "inferred_timestamp": inferred_timestamp,
+            }
+        )
+
+    event_ids = [str(record["event_id"]) for record in records]
+    unique_values: dict[str, tuple] = {}
+    for record in records:
+        unique_values.setdefault(str(record["event_id"]), tuple(record["values"]))
+    report["unique_event_count"] = len(unique_values)
+    report["expected_cost_usd"] = float(sum(float(values[15]) for values in unique_values.values()))
+    report["event_ids_digest"] = hashlib.sha256(
+        json.dumps(event_ids, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    report["complete"] = report["invalid"] == 0 and not records
+    report["status"] = (
+        "deferred_cost_log_invalid"
+        if report["invalid"]
+        else "deferred_cost_log_reconciled"
+        if not records
+        else "deferred_cost_log_pending"
+    )
+    return _deferred_report_aliases(report), records
+
+
+def _row_cost_values(row: sqlite3.Row | tuple) -> tuple:
+    if isinstance(row, sqlite3.Row):
+        return tuple(row[column] for column in _COST_EVENT_COLUMNS)
+    return tuple(row)
+
+
+def _reservation_matches(existing: tuple, expected: tuple) -> bool:
+    return str(existing[16]) == "model_call_reserved" and all(
+        existing[index] == expected[index] for index in _RESERVATION_IDENTITY_INDEXES
+    )
+
+
+def _classify_deferred_cost_records(
+    conn: sqlite3.Connection,
+    report: dict,
+    records: list[dict],
+    *,
+    include_event_ids: bool,
+) -> dict:
+    result = dict(report)
+    event_ids = [str(record["event_id"]) for record in records]
+    expected_by_id: dict[str, tuple] = {}
+    source_conflicts: set[str] = set()
+    for record in records:
+        event_id = str(record["event_id"])
+        values = tuple(record["values"])
+        previous = expected_by_id.get(event_id)
+        if previous is not None and previous != values:
+            source_conflicts.add(event_id)
+        else:
+            expected_by_id[event_id] = values
+
+    category_ids: dict[str, list[str]] = {
+        "pending": [],
+        "reserved": [],
+        "conflicting": [],
+        "reconciled": [],
+    }
+    select_sql = f"select {','.join(_COST_EVENT_COLUMNS)} from llm_cost_events where event_id=?"
+    for record in records:
+        event_id = str(record["event_id"])
+        if event_id in source_conflicts:
+            category = "conflicting"
+        else:
+            existing_row = conn.execute(select_sql, (event_id,)).fetchone()
+            if existing_row is None:
+                category = "pending"
+            else:
+                existing = _row_cost_values(existing_row)
+                expected_values = list(record["values"])
+                if record.get("inferred_timestamp"):
+                    # A legacy line has no timestamp of its own.  Once replayed,
+                    # its database timestamp is the durable anchor; appending a
+                    # new line changes file mtime and must not rewrite history.
+                    expected_values[1] = existing[1]
+                    record["values"] = tuple(expected_values)
+                expected = tuple(expected_values)
+                if existing == expected:
+                    category = "reconciled"
+                elif _reservation_matches(existing, expected):
+                    category = "reserved"
+                else:
+                    category = "conflicting"
+        result[category] = int(result.get(category, 0) or 0) + 1
+        category_ids[category].append(event_id)
+
+    result["complete"] = (
+        int(result.get("invalid", 0) or 0) == 0
+        and int(result.get("pending", 0) or 0) == 0
+        and int(result.get("reserved", 0) or 0) == 0
+        and int(result.get("conflicting", 0) or 0) == 0
+    )
+    if result["invalid"]:
+        result["status"] = "deferred_cost_log_invalid"
+    elif result["conflicting"]:
+        result["status"] = "deferred_cost_log_conflict"
+    elif result["pending"] or result["reserved"]:
+        result["status"] = "deferred_cost_log_pending"
+    elif result.get("source_exists"):
+        result["status"] = "deferred_cost_log_reconciled"
+    else:
+        result["status"] = "deferred_cost_log_missing"
+
+    if include_event_ids:
+        result["event_ids"] = event_ids
+        for category, values in category_ids.items():
+            result[f"{category}_event_ids"] = list(dict.fromkeys(values))
+        result["expected_events"] = [
+            {
+                "line_number": int(record["line_number"]),
+                "event_id": str(record["event_id"]),
+                "cost": float(record["values"][15]),
+                "estimated_cost_usd": float(record["values"][15]),
+                "status": str(record["values"][16]),
+            }
+            for record in records
+        ]
+    return _deferred_report_aliases(result)
+
+
+def deferred_cost_reconciliation_status(
+    conn: sqlite3.Connection | None = None,
+    path: pathlib.Path | None = None,
+    *,
+    include_event_ids: bool = False,
+) -> dict:
+    """Read-only, exact reconciliation status for the append-only cost ledger."""
+
+    source = pathlib.Path(path) if path is not None else COST_LOG_DEFERRED_PATH
+    report, records = _load_deferred_cost_records(source)
+    if not report.get("source_exists") or report.get("invalid"):
+        if include_event_ids:
+            report["event_ids"] = [str(record["event_id"]) for record in records]
+            report["pending_event_ids"] = []
+            report["reserved_event_ids"] = []
+            report["conflicting_event_ids"] = []
+            report["reconciled_event_ids"] = []
+            report["expected_events"] = []
+        return _deferred_report_aliases(report)
+
+    owns_connection = conn is None
+    working = conn
+    try:
+        if working is None:
+            working = connect(initialize=False)
+        columns = {str(row[1]) for row in working.execute("pragma table_info(llm_cost_events)")}
+        if not set(_COST_EVENT_COLUMNS).issubset(columns):
+            report["status"] = "cost_event_schema_missing"
+            report["invalid"] = max(1, int(report.get("invalid", 0) or 0))
+            report["complete"] = False
+            return _deferred_report_aliases(report)
+        return _classify_deferred_cost_records(
+            working,
+            report,
+            records,
+            include_event_ids=include_event_ids,
+        )
+    except (OSError, sqlite3.Error):
+        report["status"] = "deferred_cost_reconciliation_failed"
+        report["invalid"] = max(1, int(report.get("invalid", 0) or 0))
+        report["complete"] = False
+        return _deferred_report_aliases(report)
+    finally:
+        if owns_connection and working is not None:
+            working.close()
 
 
 def replay_deferred_cost_events(
@@ -299,57 +567,42 @@ def replay_deferred_cost_events(
     """
 
     source = pathlib.Path(path) if path is not None else COST_LOG_DEFERRED_PATH
+    source_report, records = _load_deferred_cost_records(source)
     report = {
-        "status": "deferred_cost_log_missing",
-        "read": 0,
+        **source_report,
         "inserted": 0,
         "finalized": 0,
         "skipped": 0,
-        "invalid": 0,
-        "inferred_timestamps": 0,
+        "event_ids": [str(record["event_id"]) for record in records],
+        "inserted_event_ids": [],
+        "finalized_event_ids": [],
+        "skipped_event_ids": [],
     }
-    if not source.exists():
-        return report
-    try:
-        file_mtime = dt.datetime.fromtimestamp(source.stat().st_mtime, tz=dt.timezone.utc)
-        lines = source.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        report["status"] = "deferred_cost_log_unreadable"
-        report["invalid"] = 1
-        return report
+    if not source_report.get("source_exists"):
+        report["post_verification"] = dict(source_report)
+        return _deferred_report_aliases(report)
 
     owns_connection = conn is None
     working = conn
     try:
         if working is None:
             working = connect(initialize=False)
-        columns = {str(row[1]) for row in working.execute("pragma table_info(llm_cost_events)").fetchall()}
-        if "event_id" not in columns:
-            report["status"] = "cost_event_id_schema_missing"
-            report["invalid"] = 1
-            return report
-        for line_number, raw in enumerate(lines, start=1):
-            if not raw.strip():
-                continue
-            report["read"] += 1
-            try:
-                payload = json.loads(raw)
-                if not isinstance(payload, dict):
-                    raise ValueError("event is not an object")
-                event_id = str(payload.get("event_id") or "").strip()
-                if not event_id:
-                    event_id = _deferred_event_id(source, line_number, raw)
-                created_at = _normalise_event_timestamp(payload.get("created_at"))
-                if created_at is None:
-                    created_at = (file_mtime + dt.timedelta(microseconds=line_number)).isoformat()
-                    report["inferred_timestamps"] += 1
-                values = _cost_payload_values(payload, event_id=event_id, created_at=created_at)
-            except (TypeError, ValueError, json.JSONDecodeError, OverflowError):
-                report["invalid"] += 1
-                continue
-
+        before = _classify_deferred_cost_records(
+            working,
+            source_report,
+            records,
+            include_event_ids=True,
+        )
+        report.update(before)
+        if int(before.get("invalid", 0) or 0) > 0 or int(before.get("conflicting", 0) or 0) > 0:
+            report["post_verification"] = dict(before)
+            return _deferred_report_aliases(report)
+        select_sql = f"select {','.join(_COST_EVENT_COLUMNS)} from llm_cost_events where event_id=?"
+        for record in records:
+            values = tuple(record["values"])
+            event_id = str(record["event_id"])
             existing = working.execute(
-                "select status from llm_cost_events where event_id=?",
+                select_sql,
                 (event_id,),
             ).fetchone()
             if existing is None:
@@ -365,39 +618,83 @@ def replay_deferred_cost_events(
                     values,
                 )
                 report["inserted"] += 1
+                report["inserted_event_ids"].append(event_id)
                 continue
-            existing_status = str(existing["status"] if isinstance(existing, sqlite3.Row) else existing[0])
-            if existing_status != "model_call_reserved":
+            existing_values = _row_cost_values(existing)
+            if existing_values == values:
                 report["skipped"] += 1
+                report["skipped_event_ids"].append(event_id)
                 continue
-            working.execute(
+            if not _reservation_matches(existing_values, values):
+                raise ValueError(f"deferred cost event conflict:{event_id}")
+            updated = working.execute(
                 """
                 update llm_cost_events set
-                    agent_name=?,model_tier=?,model_name=?,provider=?,api=?,
+                    created_at=?,agent_name=?,model_tier=?,model_name=?,provider=?,api=?,
                     reasoning_effort=?,verbosity=?,operation=?,prompt_cache_key=?,
                     frontier_escalation_reason=?,structured_json=?,prompt_tokens=?,
                     completion_tokens=?,estimated_cost_usd=?,status=?
                 where event_id=? and status='model_call_reserved'
                 """,
                 (
-                    values[2], values[3], values[4], values[5], values[6], values[7],
-                    values[8], values[9], values[10], values[11], values[12], values[13],
-                    values[14], values[15], values[16], values[0],
+                    values[1], values[2], values[3], values[4], values[5], values[6],
+                    values[7], values[8], values[9], values[10], values[11], values[12],
+                    values[13], values[14], values[15], values[16], values[0],
                 ),
             )
+            if updated.rowcount != 1:
+                raise ValueError(f"deferred reservation changed during replay:{event_id}")
             report["finalized"] += 1
+            report["finalized_event_ids"].append(event_id)
         working.commit()
-        report["status"] = "deferred_cost_log_replayed" if report["invalid"] == 0 else "deferred_cost_log_invalid"
-        return report
-    except (OSError, sqlite3.Error):
+        post_verification = deferred_cost_reconciliation_status(
+            working,
+            source,
+            include_event_ids=True,
+        )
+        report.update(
+            {
+                key: value
+                for key, value in post_verification.items()
+                if key not in {"event_ids", "expected_events"}
+            }
+        )
+        report["post_verification"] = post_verification
+        report["status"] = (
+            "deferred_cost_log_replayed"
+            if post_verification.get("complete")
+            else "deferred_cost_replay_incomplete"
+        )
+        report["complete"] = bool(post_verification.get("complete"))
+        return _deferred_report_aliases(report)
+    except (OSError, sqlite3.Error, ValueError):
+        attempted_inserted = int(report.get("inserted", 0) or 0)
+        attempted_finalized = int(report.get("finalized", 0) or 0)
         if working is not None:
             try:
                 working.rollback()
             except sqlite3.Error:
                 pass
-        report["status"] = "deferred_cost_replay_failed"
-        report["invalid"] = max(1, int(report["invalid"]))
-        return report
+        report["attempted_inserted"] = attempted_inserted
+        report["attempted_finalized"] = attempted_finalized
+        report["inserted"] = 0
+        report["finalized"] = 0
+        report["inserted_event_ids"] = []
+        report["finalized_event_ids"] = []
+        post_verification = deferred_cost_reconciliation_status(
+            working,
+            source,
+            include_event_ids=True,
+        ) if working is not None else None
+        report["post_verification"] = post_verification
+        if post_verification and int(post_verification.get("conflicting", 0) or 0) > 0:
+            report.update(post_verification)
+            report["status"] = "deferred_cost_log_conflict"
+        else:
+            report["status"] = "deferred_cost_replay_failed"
+            report["invalid"] = max(1, int(report.get("invalid", 0) or 0))
+        report["complete"] = False
+        return _deferred_report_aliases(report)
     finally:
         if owns_connection and working is not None:
             working.close()
@@ -488,19 +785,38 @@ def cost_budget_status(
     cfg: dict | None = None,
     *,
     agent_name: str | None = None,
-    replay_deferred: bool = True,
+    replay_deferred: bool = False,
 ) -> dict:
-    """Return authoritative UTC-day and rolling-24h usage without calling a model."""
+    """Return authoritative usage without mutating the deferred cost ledger.
+
+    ``replay_deferred`` remains accepted for older callers, but replay is only
+    authorized by the audited maintenance workflow.  A pending ledger therefore
+    fails closed even when the legacy flag is true.
+    """
 
     effective_cfg = cfg or load_llm_config()
     try:
         with connect(initialize=False) as conn:
-            replay = replay_deferred_cost_events(conn) if replay_deferred else {"status": "not_requested"}
-            if int(replay.get("invalid", 0) or 0) > 0:
+            reconciliation = deferred_cost_reconciliation_status(conn)
+            replay = {
+                **reconciliation,
+                "legacy_replay_requested": bool(replay_deferred),
+                "mutation_performed": False,
+            }
+            if not bool(reconciliation.get("complete")):
+                reconciliation_status = str(
+                    reconciliation.get("status")
+                    or "deferred_cost_reconciliation_incomplete"
+                )
+                reason = (
+                    f"explicit_maintenance_required:{reconciliation_status}"
+                    if replay_deferred
+                    else reconciliation_status
+                )
                 return {
                     "allowed": False,
                     "status": "cost_budget_unavailable",
-                    "reason": str(replay.get("status") or "deferred_cost_replay_invalid"),
+                    "reason": reason,
                     "deferred_replay": replay,
                 }
             now = _utc_now()
@@ -747,9 +1063,11 @@ def _budget_allows_call(
     estimated_call_cost = _cost_usd(prompt_tokens, completion_tokens, tier_cfg)
     try:
         with connect(initialize=False) as conn:
-            replay = replay_deferred_cost_events(conn)
-            if int(replay.get("invalid", 0) or 0) > 0:
-                return False, str(replay.get("status") or "deferred_cost_replay_invalid")
+            reconciliation = deferred_cost_reconciliation_status(conn)
+            if not bool(reconciliation.get("complete")):
+                return False, str(
+                    reconciliation.get("status") or "deferred_cost_reconciliation_incomplete"
+                )
             usage = _budget_usage_for_call(conn, agent_name, _utc_now())
     except (OSError, sqlite3.Error) as exc:
         return False, f"cost_budget_unavailable:{type(exc).__name__}"
@@ -784,11 +1102,13 @@ def _reserve_model_call(
     conn: sqlite3.Connection | None = None
     try:
         conn = connect(initialize=False)
-        replay = replay_deferred_cost_events(conn)
-        if int(replay.get("invalid", 0) or 0) > 0:
+        reconciliation = deferred_cost_reconciliation_status(conn)
+        if not bool(reconciliation.get("complete")):
             return {
                 "allowed": False,
-                "status": str(replay.get("status") or "deferred_cost_replay_invalid"),
+                "status": str(
+                    reconciliation.get("status") or "deferred_cost_reconciliation_incomplete"
+                ),
             }
         columns = {str(row[1]) for row in conn.execute("pragma table_info(llm_cost_events)").fetchall()}
         if "event_id" not in columns:

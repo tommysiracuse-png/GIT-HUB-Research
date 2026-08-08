@@ -25,6 +25,7 @@ from recovery_preflight import (  # noqa: E402
     inspect_persisted_worker_claims,
     run_preflight,
 )
+import bounded_campaign_control as campaign_control  # noqa: E402
 from settings import SettingsError, load_settings, validate_recovery_settings  # noqa: E402
 
 
@@ -32,6 +33,31 @@ CONFIG = ROOT / "config" / "settings.bounded_crypto_paper.json"
 
 
 class RecoveryProfileTests(unittest.TestCase):
+    def test_maintenance_process_scan_blocks_relative_bounded_runner(self) -> None:
+        class FakeProcess:
+            info = {
+                "pid": 424242,
+                "name": "powershell.exe",
+                "cmdline": [
+                    "powershell.exe",
+                    "-File",
+                    ".\\scripts\\run_bounded_paper_forever.ps1",
+                ],
+            }
+
+            @staticmethod
+            def cwd() -> str:
+                return "C:\\somewhere\\else"
+
+        fake_psutil = mock.Mock()
+        fake_psutil.Error = OSError
+        fake_psutil.process_iter.return_value = [FakeProcess()]
+        with mock.patch.dict(sys.modules, {"psutil": fake_psutil}):
+            matches = campaign_control._active_bounded_runtime_processes(ROOT)
+        self.assertEqual(1, len(matches))
+        self.assertEqual("run_bounded_paper_forever.ps1", matches[0]["marker"])
+        self.assertFalse(matches[0]["workspace_match"])
+
     def test_missing_explicit_config_fails_when_required(self) -> None:
         with mock.patch.dict(os.environ, {"RADAR_REQUIRE_EXPLICIT_CONFIG": "1"}, clear=False):
             with self.assertRaisesRegex(SettingsError, "explicit --config"):
@@ -341,6 +367,22 @@ class RecoveryProfileTests(unittest.TestCase):
         self.assertIn("RADAR_MODEL_CREDENTIAL_LOCK", runner)
         self.assertIn("RADAR_MODELS_DISABLED", runner)
         self.assertIn("campaign_supervisor_event.py", runner)
+        self.assertIn("$child.WaitForExit()", runner)
+        self.assertIn("$child.Refresh()", runner)
+        self.assertIn("$null = $child.Handle", runner)
+        self.assertLess(
+            runner.index("$null = $child.Handle"),
+            runner.index("$child.WaitForExit()"),
+        )
+        self.assertIn("$null -ne $rawExitCode", runner)
+        self.assertIn("[int]::TryParse(", runner)
+        self.assertIn("$exitCode = 125", runner)
+        self.assertIn('$exitCodeCaptureFailed = $true', runner)
+        self.assertIn(
+            '$exitCode.ToString([System.Globalization.CultureInfo]::InvariantCulture)',
+            runner,
+        )
+        self.assertNotIn('"--exit-code", "$exitCode"', runner)
         for marker in FORBIDDEN_WORKER_COMMAND_MARKERS:
             self.assertIn(marker, runner)
         self.assertIn("requiring the absolute workspace path creates a trivial bypass", runner)

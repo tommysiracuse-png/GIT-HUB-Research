@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -20,6 +21,7 @@ if str(SRC) not in sys.path:
 
 import paper_expansion_campaign as campaign  # noqa: E402
 import paper_admission_queue as queue  # noqa: E402
+import cost_router  # noqa: E402
 from execution_engine import execute_order  # noqa: E402
 from settings import load_settings  # noqa: E402
 from storage import connect, save_opportunity  # noqa: E402
@@ -104,6 +106,85 @@ class PaperExpansionCampaignTests(unittest.TestCase):
     def initialize(self, conn) -> None:
         _effective, token = campaign.apply_campaign_controls(conn, self.settings)
         campaign.record_campaign_cycle(conn, token, self.healthy())
+
+    def deferred_payload(self, **updates: object) -> dict:
+        payload = {
+            "agent_name": "legacy-deferred-agent",
+            "model_tier": "fast",
+            "model_name": "legacy/deferred-model",
+            "provider": "openai",
+            "api": "responses",
+            "operation": "bounded_crypto_paid_research",
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "estimated_cost_usd": 0.01,
+            "status": "model_call:responses",
+        }
+        payload.update(updates)
+        return payload
+
+    def write_deferred_payloads(self, *payloads: dict) -> tuple[pathlib.Path, bytes, str]:
+        path = pathlib.Path(self.settings["paper_expansion"]["deferred_cost_path"])
+        raw = "".join(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            for payload in payloads
+        ).encode("utf-8")
+        path.write_bytes(raw)
+        return path, raw, hashlib.sha256(raw).hexdigest()
+
+    def campaign_state(self, conn) -> dict:
+        campaign_id = self.settings["paper_expansion"]["campaign_id"]
+        row = conn.execute(
+            "select state_json from paper_expansion_campaign_state where campaign_id=?",
+            (campaign_id,),
+        ).fetchone()
+        return json.loads(row["state_json"])
+
+    def persist_campaign_state(self, conn, state: dict) -> None:
+        campaign_id = self.settings["paper_expansion"]["campaign_id"]
+        conn.execute(
+            """
+            update paper_expansion_campaign_state
+            set phase=?,run_status=?,healthy_streak=?,state_json=?
+            where campaign_id=?
+            """,
+            (
+                state["phase"],
+                state["run_status"],
+                int(state.get("healthy_streak", 0) or 0),
+                json.dumps(state),
+                campaign_id,
+            ),
+        )
+        conn.commit()
+
+    def prepare_deferred_maintenance(
+        self,
+        conn,
+    ) -> tuple[pathlib.Path, bytes, str]:
+        self.initialize(conn)
+        path, raw, digest = self.write_deferred_payloads(self.deferred_payload())
+        state = self.campaign_state(conn)
+        state["phase"] = "burn_in"
+        state["run_status"] = "soft_paused"
+        state["healthy_streak"] = 2
+        state["stop_reason"] = "operator_maintenance_pause"
+        state.pop("inflight_cycle", None)
+        state.pop("paid_research_inflight", None)
+        self.persist_campaign_state(conn, state)
+        return path, raw, digest
+
+    def adopt_deferred(self, conn, path: pathlib.Path, digest: str, **updates):
+        kwargs = {
+            "campaign_id": self.settings["paper_expansion"]["campaign_id"],
+            "operator_reason": "reconcile legacy deferred cost ledger",
+            "expected_source_path": path,
+            "expected_source_sha256": digest,
+            "expected_line_count": 1,
+            "active_runtime_processes": [],
+        }
+        kwargs.update(updates)
+        return campaign.adopt_deferred_cost_ledger(conn, self.settings, **kwargs)
 
     def add_paid_autonomous_attempt(
         self,
@@ -2035,6 +2116,394 @@ class PaperExpansionCampaignTests(unittest.TestCase):
             self.assertTrue(retry["metrics"]["db_finalization_accounted"])
             self.assertNotIn("inflight_cycle", retry["state"])
             self.assertEqual(1, retry["state"]["total_cycle_count"])
+
+    def test_deferred_maintenance_adopts_append_only_source_and_audits_every_step(
+        self,
+    ) -> None:
+        with self.connection() as conn:
+            path, source_before, digest = self.prepare_deferred_maintenance(conn)
+            total_changes_before = conn.total_changes
+
+            result = self.adopt_deferred(conn, path, digest)
+
+            self.assertEqual("deferred_cost_ledger_adopted", result["status"])
+            self.assertFalse(result["resumed"])
+            self.assertEqual(source_before, path.read_bytes())
+            self.assertEqual(digest, result["source_sha256"])
+            self.assertEqual(1, result["line_count"])
+            self.assertAlmostEqual(0.01, result["cost_delta_usd"])
+            state = result["state"]
+            self.assertEqual("soft_paused", state["run_status"])
+            self.assertEqual(0, state["healthy_streak"])
+            self.assertIsNone(state["hard_halt_reason"])
+            watermark = state["last_completed_safety_watermark"]
+            self.assertEqual(
+                result["maintenance_id"], watermark["maintenance_adoption_id"]
+            )
+            self.assertEqual(
+                f"maintenance:{result['maintenance_id']}", watermark["cycle_id"]
+            )
+            self.assertTrue(
+                watermark["safety_snapshot"][
+                    "deferred_cost_reconciliation_complete"
+                ]
+            )
+            self.assertEqual(
+                digest,
+                watermark["safety_snapshot"]["deferred_cost_source_digest"],
+            )
+            self.assertEqual(
+                1, watermark["safety_snapshot"]["reconciled_deferred_cost_lines"]
+            )
+            events = conn.execute(
+                """
+                select event_type,details_json
+                from paper_expansion_campaign_maintenance_events
+                where maintenance_id=? order by id
+                """,
+                (result["maintenance_id"],),
+            ).fetchall()
+            self.assertEqual(
+                ["started", "replayed", "adopted"],
+                [row["event_type"] for row in events],
+            )
+            for event in events:
+                details = json.loads(event["details_json"])
+                self.assertEqual(digest, details.get("source_sha256", digest))
+            self.assertEqual(
+                1,
+                conn.execute("select count(*) from llm_cost_events").fetchone()[0],
+            )
+            self.assertGreater(conn.total_changes, total_changes_before)
+
+    def test_fully_reconciled_nonempty_ledger_passes_paid_capacity_read_only(
+        self,
+    ) -> None:
+        with self.connection() as conn:
+            path, source_before, digest = self.prepare_deferred_maintenance(conn)
+            self.adopt_deferred(conn, path, digest)
+            rows_before = conn.execute(
+                "select count(*),coalesce(max(id),0) from llm_cost_events"
+            ).fetchone()
+            total_changes_before = conn.total_changes
+
+            detail = campaign._paid_cost_capacity_revalidation(
+                conn,
+                dt.datetime.now(dt.timezone.utc),
+                self.settings,
+            )
+
+            self.assertTrue(detail["healthy"], detail)
+            self.assertEqual("cost_capacity_available", detail["reason"])
+            self.assertEqual(1, detail["deferred_cost_lines"])
+            self.assertTrue(detail["deferred_cost_reconciliation_complete"])
+            self.assertEqual(0, detail["deferred_cost_pending"])
+            self.assertEqual(1, detail["deferred_cost_reconciled"])
+            self.assertEqual(digest, detail["deferred_cost_source_digest"])
+            self.assertEqual(source_before, path.read_bytes())
+            self.assertEqual(total_changes_before, conn.total_changes)
+            self.assertEqual(
+                tuple(rows_before),
+                tuple(
+                    conn.execute(
+                        "select count(*),coalesce(max(id),0) from llm_cost_events"
+                    ).fetchone()
+                ),
+            )
+
+    def test_deferred_maintenance_rejects_unsafe_or_mismatched_preconditions(
+        self,
+    ) -> None:
+        with self.connection() as conn:
+            path, _source_before, digest = self.prepare_deferred_maintenance(conn)
+
+            with self.assertRaisesRegex(
+                campaign.CampaignError,
+                "active_runtime_processes_block_maintenance",
+            ):
+                self.adopt_deferred(
+                    conn,
+                    path,
+                    digest,
+                    active_runtime_processes=[
+                        {"pid": 4242, "role": "bounded_paper_radar"}
+                    ],
+                )
+            with self.assertRaisesRegex(
+                campaign.CampaignError,
+                "deferred_maintenance_source_path_mismatch",
+            ):
+                self.adopt_deferred(
+                    conn,
+                    path,
+                    digest,
+                    expected_source_path=path.with_name("wrong-ledger.jsonl"),
+                )
+            with self.assertRaisesRegex(
+                campaign.CampaignError,
+                "deferred_maintenance_source_digest_mismatch",
+            ):
+                self.adopt_deferred(
+                    conn,
+                    path,
+                    digest,
+                    expected_source_sha256="0" * 64,
+                )
+            with self.assertRaisesRegex(
+                campaign.CampaignError,
+                "deferred_maintenance_source_line_count_mismatch",
+            ):
+                self.adopt_deferred(
+                    conn,
+                    path,
+                    digest,
+                    expected_line_count=2,
+                )
+
+            state = self.campaign_state(conn)
+            state["phase"] = "measurement"
+            self.persist_campaign_state(conn, state)
+            with self.assertRaisesRegex(
+                campaign.CampaignError,
+                "deferred_maintenance_requires_burn_in",
+            ):
+                self.adopt_deferred(conn, path, digest)
+            state["phase"] = "burn_in"
+            state["run_status"] = "hard_halted"
+            state["hard_halt_reason"] = "live_order_attempt"
+            self.persist_campaign_state(conn, state)
+            with self.assertRaisesRegex(
+                campaign.CampaignError,
+                "deferred_maintenance_requires_soft_paused_campaign",
+            ):
+                self.adopt_deferred(conn, path, digest)
+            state["run_status"] = "soft_paused"
+            state["hard_halt_reason"] = None
+            state["inflight_cycle"] = {"cycle_id": "still-running"}
+            self.persist_campaign_state(conn, state)
+            with self.assertRaisesRegex(
+                campaign.CampaignError,
+                "inflight_cycle_blocks_deferred_maintenance",
+            ):
+                self.adopt_deferred(conn, path, digest)
+            state.pop("inflight_cycle")
+            state["paid_research_inflight"] = {"lease_id": "active-paid-lease"}
+            self.persist_campaign_state(conn, state)
+            with self.assertRaisesRegex(
+                campaign.CampaignError,
+                "paid_research_lease_blocks_deferred_maintenance",
+            ):
+                self.adopt_deferred(conn, path, digest)
+            state.pop("paid_research_inflight")
+            self.persist_campaign_state(conn, state)
+
+            conn.execute(
+                """
+                insert into agent_runs(
+                    run_id,agent_id,cycle_id,started_at,duration_ms,status,
+                    trigger_match_json,memory_ids_json,model_json,
+                    recommendation_json,outcome_json
+                ) values(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "unrelated-maintenance-delta",
+                    "unexpected-agent",
+                    "outside-maintenance",
+                    dt.datetime.now(dt.timezone.utc).isoformat(),
+                    1,
+                    "completed",
+                    "{}",
+                    "[]",
+                    "{}",
+                    "{}",
+                    "{}",
+                ),
+            )
+            conn.commit()
+            with self.assertRaisesRegex(
+                campaign.CampaignError,
+                "deferred_maintenance_unrelated_delta:agent_runs",
+            ):
+                self.adopt_deferred(conn, path, digest)
+            self.assertEqual(
+                0,
+                conn.execute(
+                    "select count(*) from paper_expansion_campaign_maintenance_events"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                conn.execute("select count(*) from llm_cost_events").fetchone()[0],
+            )
+
+    def test_deferred_maintenance_recovers_after_replay_before_adoption_crash(
+        self,
+    ) -> None:
+        with self.connection() as conn:
+            path, source_before, digest = self.prepare_deferred_maintenance(conn)
+            real_replay = cost_router.replay_deferred_cost_events
+            calls = 0
+
+            def replay_then_crash(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                report = real_replay(*args, **kwargs)
+                if calls == 1:
+                    raise RuntimeError("simulated crash after durable replay")
+                return report
+
+            with mock.patch.object(
+                cost_router,
+                "replay_deferred_cost_events",
+                side_effect=replay_then_crash,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "simulated crash after durable replay",
+                ):
+                    self.adopt_deferred(conn, path, digest)
+
+            self.assertEqual(source_before, path.read_bytes())
+            reconciliation = cost_router.deferred_cost_reconciliation_status(
+                conn,
+                path,
+            )
+            self.assertTrue(reconciliation["complete"], reconciliation)
+            pending_events = conn.execute(
+                """
+                select maintenance_id,event_type
+                from paper_expansion_campaign_maintenance_events order by id
+                """
+            ).fetchall()
+            self.assertEqual(["started"], [row["event_type"] for row in pending_events])
+
+            resumed = self.adopt_deferred(conn, path, digest)
+
+            self.assertTrue(resumed["resumed"])
+            self.assertEqual(
+                pending_events[0]["maintenance_id"], resumed["maintenance_id"]
+            )
+            self.assertEqual(source_before, path.read_bytes())
+            self.assertEqual("soft_paused", resumed["state"]["run_status"])
+            self.assertEqual(0, resumed["state"]["healthy_streak"])
+            self.assertEqual(
+                ["started", "replayed", "adopted"],
+                [
+                    row["event_type"]
+                    for row in conn.execute(
+                        """
+                        select event_type
+                        from paper_expansion_campaign_maintenance_events
+                        where maintenance_id=? order by id
+                        """,
+                        (resumed["maintenance_id"],),
+                    ).fetchall()
+                ],
+            )
+            self.assertEqual(
+                1,
+                conn.execute("select count(*) from llm_cost_events").fetchone()[0],
+            )
+
+    def test_appended_pending_deferred_line_hard_halts_before_admission(self) -> None:
+        with self.connection() as conn:
+            self.initialize(conn)
+            path, first_source, _digest = self.write_deferred_payloads(
+                self.deferred_payload(status="fallback_error:provider_failure")
+            )
+            queue_before = conn.execute(
+                "select count(*) from paper_admission_queue"
+            ).fetchone()[0]
+            cost_rows_before = conn.execute(
+                "select count(*) from llm_cost_events"
+            ).fetchone()[0]
+
+            effective, token = campaign.apply_campaign_controls(conn, self.settings)
+
+            self.assertEqual("hard_halted", token["run_status"])
+            self.assertEqual(0, effective["scanner"]["scan_universe"])
+            self.assertEqual(0, effective["scanner"]["review_top"])
+            self.assertEqual(0, effective["scanner"]["max_new_paper_trades"])
+            self.assertEqual(
+                0,
+                effective["market_admission"]["paper_queue"][
+                    "max_select_per_cycle"
+                ],
+            )
+            self.assertTrue(effective["paper_expansion"]["reconciliation_only"])
+            self.assertTrue(token["intercycle_safety_check"]["hard_halt"])
+            self.assertIn(
+                "intercycle_deferred_cost_source_changed",
+                token["intercycle_safety_check"]["reasons"],
+            )
+            self.assertIn(
+                "intercycle_deferred_cost_reconciliation_incomplete",
+                token["intercycle_safety_check"]["reasons"],
+            )
+            self.assertEqual(first_source, path.read_bytes())
+            self.assertEqual(
+                queue_before,
+                conn.execute("select count(*) from paper_admission_queue").fetchone()[0],
+            )
+            self.assertEqual(
+                cost_rows_before,
+                conn.execute("select count(*) from llm_cost_events").fetchone()[0],
+            )
+
+    def test_campaign_id_change_cannot_trigger_implicit_deferred_replay(self) -> None:
+        with self.connection() as conn:
+            self.initialize(conn)
+            path, source_before, _digest = self.write_deferred_payloads(
+                self.deferred_payload()
+            )
+            renamed = copy.deepcopy(self.settings)
+            renamed["paper_expansion"]["campaign_id"] = "renamed-campaign"
+
+            effective, token = campaign.apply_campaign_controls(conn, renamed)
+
+            self.assertEqual("hard_halted", token["run_status"])
+            self.assertEqual(0, effective["scanner"]["scan_universe"])
+            self.assertEqual(source_before, path.read_bytes())
+            self.assertEqual(
+                0,
+                conn.execute("select count(*) from llm_cost_events").fetchone()[0],
+            )
+            self.assertEqual(
+                2,
+                conn.execute(
+                    "select count(*) from paper_expansion_campaign_state"
+                ).fetchone()[0],
+            )
+
+    def test_deferred_maintenance_deduplicates_identical_explicit_event_ids(self) -> None:
+        with self.connection() as conn:
+            self.initialize(conn)
+            payload = self.deferred_payload(
+                event_id="same-explicit-event",
+                created_at="2026-08-07T00:00:00+00:00",
+            )
+            path, source_before, digest = self.write_deferred_payloads(payload, payload)
+            state = self.campaign_state(conn)
+            state["run_status"] = "soft_paused"
+            state["healthy_streak"] = 0
+            state.pop("inflight_cycle", None)
+            self.persist_campaign_state(conn, state)
+
+            result = self.adopt_deferred(
+                conn,
+                path,
+                digest,
+                expected_line_count=2,
+            )
+
+            self.assertEqual("deferred_cost_ledger_adopted", result["status"])
+            self.assertEqual(source_before, path.read_bytes())
+            self.assertEqual(2, result["line_count"])
+            self.assertAlmostEqual(0.01, result["cost_delta_usd"])
+            self.assertEqual(
+                1,
+                conn.execute("select count(*) from llm_cost_events").fetchone()[0],
+            )
 
 
 if __name__ == "__main__":
